@@ -9,4 +9,4 @@
 若机器上仍有旧 `swbridge` 登录任务，迁移时应由操作者停用该任务，再部署新 worker。
 不要同时运行两套采集服务，也不要自动结束操作者的 SolidWorks 进程。
 
-[迁移步骤](../tools/solidworks_export/MIGRATION.md)
+[迁移步骤](../tools/solidworks_export/MIGRATION.md) · [历史接口与证据记录](history/solidworks_export.md)

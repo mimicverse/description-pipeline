@@ -139,7 +139,8 @@ git -C $Model push -u origin feature/myrobot
 `http://127.0.0.1:8765`）；需要额外键（`documented_masses`、`coordinate_systems`、`elements` 等）时，
 改用 `--source-config source.yaml` 传入完整文件。初始化后先运行 `& $Python -m description_pipeline doctor --root $Model`
 确认工作区状态，再继续下一步。
-替换 Git 身份；每条命令成功后再继续。初次推送建立该硬件的开发分支，后续提交通过 PR 更新它。
+替换仓库名称和 Git 身份；每条命令成功后再继续。私有仓库的 `main` 保存工具，`feature/myrobot` 与
+`release/myrobot` 保存模型；公共仓库保留为 `upstream`，用于取得工具更新。初次推送建立该硬件的开发分支，后续提交通过 PR 更新它。
 初始化后只维护 `$Model\config\robot.yaml`（装配路径、配置与来源键都在其中）。
 
 已有模型时，将该硬件分支检出到本机的专用工作区，运行 `git lfs pull` 取得完整资产。必要时设置该工作区的提交身份：

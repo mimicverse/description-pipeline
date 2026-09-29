@@ -399,6 +399,45 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(git(self.repo, "ls-remote", "origin", "refs/heads/release/testbot").stdout.split()[0], sha)
         self.assertEqual(git(self.repo, "ls-remote", "origin", "refs/tags/*").stdout.strip(), "")
 
+    def test_promotion_accepts_a_public_tool_commit_without_putting_cad_on_public_main(self):
+        public = self.base / "public-tool"
+        public_remote = self.base / "public-tool.git"
+        subprocess.run(["git", "init", "--bare", str(public_remote)], check=True, capture_output=True)
+        subprocess.run(["git", "init", "-b", "main", str(public)], check=True, capture_output=True)
+        git(public, "config", "user.email", "fixture@example.invalid")
+        git(public, "config", "user.name", "Fixture")
+        (public / "pipeline.py").write_text("public tool\n")
+        git(public, "add", ".")
+        git(public, "commit", "-m", "public tool")
+        tool_sha = git(public, "rev-parse", "HEAD").stdout.strip()
+        git(public, "remote", "add", "origin", str(public_remote))
+        git(public, "push", "origin", "main")
+
+        model_sha = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        git(self.repo, "push", "origin", f"{model_sha}:refs/heads/feature/testbot")
+        report = {
+            "passed": True,
+            "hardware_id": "testbot",
+            "subject": "c" * 64,
+            "source": {"evidence_class": "cad"},
+            "toolchain": {"development": False, "source_commit": tool_sha},
+        }
+        with (
+            patch("description_pipeline.repository.PUBLIC_TOOL_REMOTE", str(public_remote)),
+            patch("description_pipeline.repository.validate_commit", return_value=report),
+        ):
+            plan = promotion_plan(self.repo, "testbot", model_sha, "kinematics")
+            self.assertEqual(plan["tool_main"], "public_tool_main")
+            self.assertEqual(git(self.repo, "ls-remote", "origin", "main").stdout.split()[0], model_sha)
+            with (
+                patch(
+                    "description_pipeline.repository.validate_commit",
+                    return_value={**report, "toolchain": {"development": False, "source_commit": "0" * 40}},
+                ),
+                self.assertRaisesRegex(PipelineError, "not been accepted"),
+            ):
+                promotion_plan(self.repo, "testbot", model_sha, "kinematics")
+
     def test_promotion_carries_the_lock_check_it_could_not_run(self):
         """A retried lock query is recorded, not hidden: the release record has to say so."""
 

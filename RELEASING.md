@@ -184,25 +184,20 @@ python tools/audit_releases.py                     # downloads each release into
 python tools/audit_releases.py --assets <dir>      # or reads <dir>/<tag>/ asset sets already downloaded
 ```
 
-Point `GH_TOKEN` at the release page while the project is private. A release whose bytes have moved, or
-whose artifact names a different commit than its tag, is a finding: re-upload the verified bytes rather
-than rebuild.
+A release whose bytes have moved, or whose artifact names a different commit than its tag, is a
+finding: re-upload the verified bytes rather than rebuild.
 
 ### Publishing the same artifacts to PyPI
 
-The wheel and the sdist are what `pip install` would fetch, so they are checked before an upload rather
-than after one:
+The wheel and the sdist are what `pip install` would fetch, so check them before an upload:
 
 ```sh
 python -m pip install twine           # twine is not in any lock; it only renders the metadata
 twine check dist/<short-sha>-a/*.whl dist/<short-sha>-a/*.tar.gz
 ```
 
-Both passed on 2026-09-24 for the 0.3.17 artifacts and the 0.3.18 release candidate, and again on
-2026-09-28 for the published 0.3.20 wheel and sdist (`twine` 7.0.0), so the metadata and the rendered
-long description are fine wherever they are published. One boundary matters: the sdist
-carries no captured source identities from 0.3.16 onwards, and the 0.3.15 sdist is the last one that
-did — publishing anything older than 0.3.16 to PyPI would ship them.
+The public repository starts with 0.3.23. Audit both packages for private data before any PyPI
+upload; a valid GitHub release does not itself authorize a PyPI publication.
 
 ## 7. Accept the published release
 
@@ -213,8 +208,7 @@ checklist:
 python tools/accept_release.py v<version> <version> --report dist/acceptance-<version>.json
 ```
 
-`tools/accept_release.py` reads the release page over HTTPS (set `GH_TOKEN` while the project is
-private) and requires: every artifact to match the digest `SHA256SUMS` publishes, the release page to
+`tools/accept_release.py` reads the public release page over HTTPS and requires: every artifact to match the digest `SHA256SUMS` publishes, the release page to
 carry nothing the checksum file does not list, the Linux bundle to install offline into an empty
 environment whose CLI reports `<version>`, both archives to pass `tools/verify_distribution.py`, the
 wheel and the sdist to install offline and pass their own `doctor`, both shipped examples (`demo-arm`
@@ -234,16 +228,6 @@ v0.3.21 under 3.12.14 is refused with `Installed tool identity differs — pytho
 '3.12.14' installed … verify it with that exact interpreter`. A refusal that misses the interpreter
 is usually a dependency-set difference, and the same message names the missing, extra and changed
 pins.
-
-A repository whose history was rewritten before publication — the export that removes third-party CAD
-material, for example — carries `git filter-repo`'s map as `docs/history/commit-map.txt`, one
-`<before> <after>` pair per rewritten commit. Both `tools/accept_release.py` and
-`tools/audit_releases.py` read that file when it exists, accept an artifact that names a
-pre-publication commit only when the map says the tag's commit is its successor, and say in the report
-and on the printed line which identities needed it (`--commit-map FILE` names one explicitly). A
-malformed map is refused rather than half-read: "this artifact came from that commit" has to stay a
-claim a reader can check. Releases built from the published history are unaffected — the artifact names
-the commit the tag points at, and the map is never consulted.
 
 ## 8. Record the release and open the next version
 

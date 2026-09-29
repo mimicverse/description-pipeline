@@ -32,6 +32,7 @@ from .tunnel import worker_health, worker_tunnel
 
 MODEL_DIRECTORIES = {"config", "sources", "model", "urdf", "mjcf", "meshes", "docs"}
 MODEL_FILES = {"README.md", "manifest.json", ".gitignore", ".gitattributes"}
+PUBLIC_TOOL_REMOTE = "https://github.com/mimicverse/description-pipeline.git"
 
 
 def git(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -755,6 +756,26 @@ def compare_models(repository: Path, before: Path, after: Path) -> dict:
         shutil.rmtree(temporary, ignore_errors=True)
 
 
+def _accepted_tool_main(repository: Path, tool_sha: str) -> str:
+    """Require the locked tool commit in the model or public tool main history."""
+
+    git(repository, "fetch", "origin", "main:refs/remotes/origin/main")
+    if (
+        git(repository, "merge-base", "--is-ancestor", tool_sha, "refs/remotes/origin/main", check=False).returncode
+        == 0
+    ):
+        return "model_main"
+    try:
+        git(repository, "fetch", "--no-tags", PUBLIC_TOOL_REMOTE, "main")
+    except subprocess.CalledProcessError as error:
+        raise PipelineError(
+            "Locked tool commit is not on model main, and public tool main could not be checked"
+        ) from error
+    if git(repository, "merge-base", "--is-ancestor", tool_sha, "FETCH_HEAD", check=False).returncode:
+        raise PipelineError("Locked tool commit has not been accepted on model or public tool main")
+    return "public_tool_main"
+
+
 def promotion_plan(
     repository: Path, hardware: str, sha: str, profile: str, tag: str | None = None, *, ci: bool = False
 ) -> dict:
@@ -786,9 +807,7 @@ def promotion_plan(
     tool_sha = tool.get("source_commit", "")
     if not re.fullmatch(r"[0-9a-f]{40}", tool_sha or ""):
         raise PipelineError("Tool lock requires an exact source commit")
-    git(repository, "fetch", "origin", "main:refs/remotes/origin/main")
-    if git(repository, "merge-base", "--is-ancestor", tool_sha, "refs/remotes/origin/main", check=False).returncode:
-        raise PipelineError("Locked tool commit has not been accepted on main")
+    tool_main = _accepted_tool_main(repository, tool_sha)
     return {
         "schema_version": "description.promotion/v1",
         "hardware": hardware,
@@ -799,6 +818,7 @@ def promotion_plan(
         "profile": profile,
         "ci": ci,
         "subject": report["subject"],
+        "tool_main": tool_main,
         "report": report,
     }
 

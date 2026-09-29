@@ -171,7 +171,10 @@ class AttestationTests(unittest.TestCase):
     def test_unregistered_private_producer_is_refused(self):
         record = copy.deepcopy(self.record)
         record["attestation"]["repository"] = "mimicverse/description"
-        with patch("description_pipeline.verification.attestation.read_data", return_value={"schema_version": "description.acceptance-trust/v1", "sources": []}):
+        with patch(
+            "description_pipeline.verification.attestation.read_data",
+            return_value={"schema_version": "description.acceptance-trust/v1", "sources": []},
+        ):
             result = verify_external_record(record, "simulation")
         self.assertFalse(result["trusted"])
         self.assertIn("not registered", result["reason"])

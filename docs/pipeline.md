@@ -35,7 +35,7 @@ main 不承载某台机器的可消费模型；`tests/fixtures` 中的机器人�
 跑通冻结 → 构建 → 检查，真实机器人仍在 `feature/<hardware>` 与 `release/<hardware>` 分支上。
 
 公共仓库负责分发工具。若 CAD 需保密，先以公共 `main` 初始化可写的私有仓库，再在那里创建模型分支；
-`model init`、提交和发布使用该仓库的 `origin`，模型锁定的工具提交必须属于它的 `main` 历史。
+`model init`、提交和发布使用该仓库的 `origin`，本机发布会核对模型 `main` 或公共工具 `main` 中的锁定工具提交。
 没有另一个生产导出引擎或长期运行的 Linux 调度服务。
 
 ## 输入与权威来源
@@ -105,6 +105,8 @@ Windows 环境由随包 `win-py312.lock` 固定。平台或 Python 变化时显�
 
 GitHub 校验先用 main 上的标准库脚本解析模型工具锁，要求：完整工具 SHA、非开发状态、
 工具提交已属于 main 历史、包摘要明确。依据锁中的平台选择固定的 Ubuntu 或 Windows runner，并安装精确 Python 与该工具的依赖锁；模型不能指定任意 runner 或安装命令。验证、仿真验收和发布共用这一环境选择，不要求工具标签。
+托管验证目前停用。本机发布允许工具提交属于模型仓库 `main` 或固定的公共工具仓库 `main`；必要时才拉取公共历史，
+记录接受该提交的历史。两者都不包含该提交或无法核对公共历史时，发布停止。
 CI 使用受信任工具的精确 Git 检出，源码身份、开发状态和内容摘要均须与模型锁一致。
 安装包由 `tools/build_release.py` 注入可核对的源码身份；裸 `python -m build` 只用于开发，不是发布命令。
 
@@ -221,6 +223,7 @@ profile 的 `acceptance_suites` 明确所需测试名，`consumer_environment` �
 确认成功运行标题为 `accept <subject> (<purpose>)`，并从该运行的 GitHub artifact 下载原始材料。
 artifact 内须含不带 attestation 字段的 `acceptance.json` 及同路径日志，记录和字节均须一致。
 信任方由工具维护者在接入真实应用测试时登记；候选模型不能自行添加。未登记、无法取得或过期的证据不授予资格。
+公共发行版默认不登记外部验收方。仿真采用独立重放的本地实验；新增外部信任源需要经过审查的工具新版本。
 实机记录只接受 physical_measurement；拟合数据、模型输入的副本和环境不符的记录均被拒绝。
 报告分别标记 `local_replay` 或 `external_attestation`。本地仿真可离线重放；需要外部凭证的用途在证据无法核实时保持未获资格。
 
@@ -301,7 +304,7 @@ GitHub Actions 当前停用，不参与提交、验收或发布。所有资格�
 ## 失败处理
 
 - source 配置改变：重新冻结，不手工改 lock。
-- 工具锁不同：确认工具升级，运行 `description tool lock` 后重建；正式模型须锁定 main 历史中的工具提交。
+- 工具锁不同：确认工具升级，运行 `description tool lock` 后重建；正式模型须锁定模型 `main` 或公共工具 `main` 已接受的工具提交。
 - source 或 cache 摘要不同：查明变更原因，删除损坏缓存后从保存的权威输入重建；不重新计算哈希掩盖篡改。
 - `build/failed/`：查看完整 quality.json，修输入或补证据；不要把失败目录手工覆盖到消费者入口。
 - publication.json 存在：先确认没有活动发布者，再 `description recover`；恢复会回到发布前入口。

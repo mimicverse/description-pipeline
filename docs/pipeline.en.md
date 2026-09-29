@@ -39,7 +39,7 @@ and no long-running Linux scheduling service.
 
 The public repository distributes the tool. To keep CAD private, seed a writable private repository
 from public `main` and create model branches there; `model init`, submission and promotion use that
-repository's `origin`. The pinned tool commit must remain in its `main` ancestry.
+repository's `origin`. A local release checks the pinned tool commit against its `main` or the public tool `main`.
 
 ## Inputs and authoritative sources
 
@@ -136,6 +136,10 @@ history and an explicit package digest. It selects the pinned Ubuntu or Windows 
 platform in the lock and installs the exact Python and that tool's dependency lock; a model can never
 choose an arbitrary runner or installation command. Verification, simulation acceptance and release
 share this environment selection and do not require a tool tag.
+Hosted validation is currently disabled. Local promotion accepts a locked tool commit from the
+model repository's `main` or the fixed public tool repository's `main`; it fetches the latter only
+when needed and records which history accepted the commit. If neither history contains it, or the
+public history cannot be checked, promotion stops.
 CI uses an exact Git checkout of the trusted tool, and the source identity, development state and
 content digests must match the model lock. `tools/build_release.py` injects verifiable source
 identity into the installation packages; a bare `python -m build` is for development and is not a
@@ -293,6 +297,8 @@ artifact. The artifact must contain an `acceptance.json` without the attestation
 at the same paths, and both records and bytes must agree. A trust entry is registered by the tool
 maintainers when a real application test is integrated; a candidate model may not add one.
 Evidence that is unregistered, unreachable or expired grants nothing.
+The public distribution registers no external producer by default. Simulation uses independently
+replayed local experiments; additional external trust requires a reviewed tool release.
 Hardware records accept only `physical_measurement`; fitted data, copies of model inputs and records
 from a mismatched environment are rejected.
 Reports label `local_replay` and `external_attestation` separately. Local simulation replays offline;
@@ -417,7 +423,7 @@ Apply them to the writable model repository without removing its existing protec
 
 - **Source configuration changed:** freeze again; never hand-edit the lock.
 - **Tool lock differs:** confirm the tool upgrade, run `description tool lock` and rebuild; a
-  production model must lock a tool commit from `main` history.
+  production model must lock a tool commit accepted by model `main` or public tool `main`.
 - **Source or cache digest differs:** find out why it changed, delete the corrupt cache and rebuild
   from the saved authoritative input; never rewrite a hash to hide tampering.
 - **`build/failed/`:** read the complete quality.json and fix the input or add evidence; never copy a

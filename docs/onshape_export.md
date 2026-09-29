@@ -6,4 +6,4 @@
 `tools/onshape_to_urdf.py` 保留 `check`、`fetch`、`fetch-geometry`、`verify`，用于读取既有资料和历史回归。
 这些检查不授予当前模型发布资格。旧缓存可作为回放输入；缺失的逐请求修订证据不能由回放补齐。
 
-[迁移映射](../tools/onshape_export/MIGRATION.md)
+[迁移映射](../tools/onshape_export/MIGRATION.md) · [历史接口与规则](history/onshape_export.md)

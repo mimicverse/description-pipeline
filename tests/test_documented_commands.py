@@ -73,6 +73,7 @@ EXTERNAL_FLAGS = {
     "--notes-file",
     "--only-binary",
     "--platform",
+    "--private",  # gh repo create, for a writable model repository
     "--python",  # uv, in the contributor venv note
     "--python-version",
     "--require-hashes",

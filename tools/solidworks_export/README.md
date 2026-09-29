@@ -9,4 +9,4 @@
 python -m unittest discover -s tests/solidworks_export -t .
 ```
 
-[迁移说明](MIGRATION.md)
+[迁移说明](MIGRATION.md) · [历史接口与证据](../../docs/history/solidworks_export.md)
