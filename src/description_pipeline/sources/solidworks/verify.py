@@ -13,6 +13,7 @@ import contextlib
 import math
 from pathlib import Path
 from collections.abc import Sequence
+from typing import Any, cast
 
 import numpy as np
 
@@ -110,6 +111,74 @@ def _model_root(snapshot_root: Path) -> Path | None:
         if (folder / "config" / "robot.yaml").is_file():
             return folder
     return None
+
+
+#: Advisory thresholds for the capture-time mass closure (not gates).
+CLOSURE_MASS_RTOL = 1e-6
+CLOSURE_COM_ATOL_M = 1e-6
+CLOSURE_INERTIA_RTOL = 1e-4
+
+
+def _mass_closure_check(snapshot: Path) -> dict:
+    """Assembly-versus-leaf mass closure, reported as an advisory — never a blocker.
+
+    The record is capture-time evidence: the assembly document's own mass properties next to the
+    parallel-axis combination of the leaf readings.  Snapshots without it are ``not_applicable``; a
+    mismatch is surfaced in ``details.advisory`` so `description check` prints it as a note while the
+    model still qualifies; a malformed record is a defect.
+    """
+
+    path = Path(snapshot) / "raw" / "mass_closure.json"
+    if not path.is_file():
+        return _result(
+            "source.normalization.mass_closure",
+            True,
+            status="not_applicable",
+            details={"reason": "snapshot carries no assembly mass closure record"},
+        )
+    try:
+        payload = read_json(path)
+        if not isinstance(payload, dict):
+            raise ValueError("mass closure record is not an object")
+        top = payload.get("top_level")
+        leaf = payload.get("leaf_total")
+        if not isinstance(top, dict) or not isinstance(leaf, dict):
+            raise ValueError("mass closure readings are not objects")
+        top = cast("dict[str, Any]", top)
+        leaf = cast("dict[str, Any]", leaf)
+        top_mass = float(top["mass"])
+        leaf_mass = float(leaf["mass"])
+        top_com = np.asarray([float(value) for value in top["com"]], dtype=float)
+        leaf_com = np.asarray([float(value) for value in leaf["com"]], dtype=float)
+        top_inertia = np.asarray([[float(value) for value in row] for row in top["inertia"]], dtype=float)
+        leaf_inertia = np.asarray([[float(value) for value in row] for row in leaf["inertia"]], dtype=float)
+        if top_com.shape != (3,) or leaf_com.shape != (3,):
+            raise ValueError("mass closure COM is not a 3-vector")
+        if top_inertia.shape != (3, 3) or leaf_inertia.shape != (3, 3):
+            raise ValueError("mass closure inertia is not a 3x3 tensor")
+    except (KeyError, TypeError, ValueError, OSError, PipelineError) as exc:
+        return _result(
+            "source.normalization.mass_closure",
+            False,
+            details={"error": str(exc), "record": str(path)},
+        )
+    mass_rel = abs(top_mass - leaf_mass) / max(abs(top_mass), abs(leaf_mass), 1e-12)
+    com_abs = float(np.max(np.abs(top_com - leaf_com)))
+    scale = max(float(np.max(np.abs(top_inertia))), 1e-12)
+    inertia_rel = float(np.max(np.abs(top_inertia - leaf_inertia))) / scale
+    details = {
+        "top_level_mass_kg": top_mass,
+        "leaf_total_mass_kg": leaf_mass,
+        "delta": {"mass_rel": mass_rel, "com_abs_max_m": com_abs, "inertia_rel": inertia_rel},
+    }
+    if mass_rel > CLOSURE_MASS_RTOL or com_abs > CLOSURE_COM_ATOL_M or inertia_rel > CLOSURE_INERTIA_RTOL:
+        details["advisory"] = (
+            "the assembly document's own mass properties disagree with the recombined leaf readings "
+            f"(mass {top_mass:.9g} kg vs {leaf_mass:.9g} kg, {mass_rel:.3g} relative); the CAD tree "
+            "may have been repaired or re-materialed after the leaf files were written — review the "
+            "CAD and any declared masses"
+        )
+    return _result("source.normalization.mass_closure", True, details=details)
 
 
 def _mass_evidence_check(
@@ -624,6 +693,7 @@ def verify_normalization(
     evidence_check = _mass_evidence_check(definition, snapshot, included, declared)
     if evidence_check is not None:
         results.append(evidence_check)
+    results.append(_mass_closure_check(snapshot))
 
     # F4: reconcile the raw assembly-frame quantities with the canonical chain at
     # q=0.  This is what catches a body frame that disagrees with the joint

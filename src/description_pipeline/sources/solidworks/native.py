@@ -609,6 +609,63 @@ class SolidWorksBackend(CadBackend):
             },
         }
 
+    def assembly_mass_properties(self, path):
+        """Whole-assembly mass/COM/inertia, for the capture's mass-closure record.
+
+        The leaf reader above answers "what does this part weigh"; this answers "what does the
+        assembly document say the whole thing weighs", with the same settings and the same refusal
+        of mass/COM/inertia overrides.  The capture records both readings; a difference between them
+        is reported by the verification side as an advisory, never as a capture failure.
+        """
+
+        doc = self._document_by_path(path)
+        if _member(doc, "GetType") != 2:
+            raise CadError("cad_not_assembly", "assembly mass reader requires a saved SLDASM")
+        configuration = _member(_member(doc, "ConfigurationManager"), "ActiveConfiguration")
+        root = _member(configuration, "GetRootComponent3", True)
+        mp = _member(_member(doc, "Extension"), "CreateMassProperty2")
+        if mp is None or root is None:
+            raise CadError("cad_empty_mass_property", "assembly mass property is unavailable")
+        import pythoncom
+
+        mp.UseSystemUnits = True
+        mp.IncludeHiddenBodiesOrComponents = True
+        # Calculation-object selection only; the root component is the whole assembly.
+        mp.SelectedItems = _win32().VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, (root,))
+        _member(mp, "Recalculate")
+        override = _member(mp, "GetOverrideOptions")
+        overrides = {
+            name: bool(_member(override, name))
+            for name in ("OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia")
+        }
+        if any(overrides.values()):
+            raise CadError("cad_mass_override", "pure-CAD export refuses overrides", overrides)
+        mass = float(_member(mp, "Mass"))
+        com = tuple(map(float, _member(mp, "CenterOfMass")))
+        values = tuple(map(float, _member(mp, "GetMomentOfInertia", 0)))
+        if len(values) != 9:
+            raise CadError("cad_mass_property_inertia_unsupported", "GetMomentOfInertia(0) must return 9 values")
+        inertia, _ = _inertia_from_raw(values, _member(doc, "GetTitle"))
+        if mass <= 0 or not math.isfinite(mass) or len(com) != 3 or not all(map(math.isfinite, com)):
+            raise CadError("cad_mass_property_invalid", "mass/COM are not finite and positive")
+        return {
+            "mass": mass,
+            "com": com,
+            "inertia": inertia,
+            "reference": {
+                "used_api": "IMassProperty2.GetMomentOfInertia(0)",
+                "reference_point": "center_of_mass",
+                "axes": "assembly_document_axes",
+                "use_system_units": True,
+                "product_convention": "solidworks_positive",
+                "volume_m3": float(_member(mp, "Volume")),
+                "density_kg_m3": float(_member(mp, "Density")),
+                "overrides": overrides,
+                "document": str(_member(doc, "GetPathName")),
+                "configuration": str(_member(configuration, "Name")),
+            },
+        }
+
     def collect_scene(self, doc_path, coordinate_systems, progress=None, require_material=True):
         doc = self._document_by_path(doc_path)
         if _member(doc, "GetType") != 2:

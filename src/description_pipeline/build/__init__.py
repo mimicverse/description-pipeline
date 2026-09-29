@@ -676,7 +676,20 @@ def assess(root: Path, profile_name: str, *, verify_manifest: bool = True) -> di
         "qualified_for": [profile["purpose"]] if passed else [],
         "blockers": [check["id"] for check in checks if check["status"] not in {"passed", "not_applicable"}],
     }
+    advisories = report_advisories(checks)
+    if advisories:
+        report["advisories"] = advisories
     return report
+
+
+def report_advisories(checks: list[dict]) -> list[dict]:
+    """The non-blocking notes the checks recorded; the CLI prints them as `note:` lines."""
+
+    return [
+        {"code": str(check["id"]), "message": str(check["details"]["advisory"])}
+        for check in checks
+        if isinstance(check.get("details"), dict) and check["details"].get("advisory")
+    ]
 
 
 def build(root: Path, profile_name: str, destination: Path | None = None) -> dict:

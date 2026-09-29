@@ -22,7 +22,7 @@ from collections.abc import Callable
 from .errors import BridgeError, ConfigError
 from .evidence import build_evidence, capture_environment
 from .jsonio import digest_json, sha256_file, write_json
-from .scene import build_scene
+from .scene import assembly_leaf_total, build_scene, closure_delta
 
 # The pipeline-wide STL reader owns the acceptance standard for meshes; the
 # adapter only writes geometry and then asks that reader what it produced.
@@ -888,6 +888,34 @@ def _retain_failure(
     return None
 
 
+def _mass_closure(backend: Any, cfg: dict[str, Any], scene: Any) -> dict[str, Any] | None:
+    """The assembly's own reading next to the recombined leaf readings, as capture evidence.
+
+    A backend that cannot read the whole assembly (fixtures, other providers) records nothing; the
+    verification side then reports the check as not applicable instead of failing it.  A difference
+    between the two readings is evidence about the CAD tree, so it is recorded here and reported as
+    an advisory there — this capture never fails because of it.
+    """
+
+    reader = getattr(backend, "assembly_mass_properties", None)
+    if not callable(reader):
+        return None
+    top_level = reader(cfg["assembly"])
+    leaf_total = assembly_leaf_total(scene.components, scene.mass_properties)
+    return {
+        "schema_version": "description-pipeline.solidworks-mass-closure/v1",
+        "top_level": {
+            "mass": float(top_level["mass"]),
+            "com": [float(value) for value in top_level["com"]],
+            "inertia": [[float(value) for value in row] for row in top_level["inertia"]],
+            "reference": dict(top_level.get("reference") or {}),
+        },
+        "leaf_total": leaf_total,
+        "leaf_components": len(list(scene.components)),
+        "delta": closure_delta(top_level, leaf_total),
+    }
+
+
 def _capture_readings(
     backend: Any, cfg: dict[str, Any], closure: dict[str, Any], source_root: Path
 ) -> tuple[Any, dict[str, Any]]:
@@ -1082,6 +1110,9 @@ def _freeze_local(
         write_json(staging / "raw" / "dependency_closure.json", closure)
         write_json(staging / "raw" / "coordinate_systems.json", raw["coordinate_systems"])
         write_json(staging / "raw" / "mass_properties.json", raw["mass_properties"])
+        mass_closure = _mass_closure(backend, cfg, scene)
+        if mass_closure is not None:
+            write_json(staging / "raw" / "mass_closure.json", mass_closure)
         # Declared author decisions are recorded as declared input, never as CAD
         # readings: freeze keeps the snapshot raw and load_scene applies them.
         write_json(
