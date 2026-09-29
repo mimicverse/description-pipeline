@@ -5,9 +5,9 @@ re-materialed leaf (a leaf that no longer matches the tree the assembly was buil
 visible without turning into a release gate.  Snapshots that predate the record stay not_applicable.
 
 A build whose legacy ``Extension.GetMassProperties2`` answers instead of ``CreateMassProperty2``
-records a **mass-only** closure: only the mass the existing recovery reports corroborate is
-recorded and evaluated, with volume as context, and COM/inertia are never inferred from the
-unproven legacy layout.
+records a **mass-only** closure: only the mass the existing recovery reports (and the 2026-09-29
+native pairing) corroborate is recorded and evaluated, with volume as context, and COM/inertia are
+never inferred from the legacy vector.
 
 The native assembly reading itself is exercised on Windows by the release rehearsal; these tests
 cover the combination, the recorded evidence, the advisory, the mass-only fallback and the
@@ -50,6 +50,26 @@ LEGACY_VECTOR = [
     -3.422827134582382e-09,
     -9.15973707170355e-10,
     3.100156271697507e-08,
+    1.0,
+]
+
+#: The top assembly's vector from the 2026-09-29 native run on the released SolidWorks session
+#: (revision 34.0.0).  ``IMassProperty2`` answered the same document with the same mass
+#: (0.9725657158217046 kg), volume (0.00039948748506975424 m3), COM and flat inertia group, which is
+#: the pairing that justifies reading indices 3 and 5 from this legacy layout.
+NATIVE_PAIRED_VECTOR = [
+    0.03946502173048552,
+    -0.11223884967499032,
+    0.014740075853236983,
+    0.00039948748506975424,
+    0.4976448806684602,
+    0.9725657158217046,
+    0.0054004439999385916,
+    0.004873310164924872,
+    0.009637775942651533,
+    -4.479127033952855e-05,
+    -1.5587880809548364e-05,
+    -0.000585822484508229,
     1.0,
 ]
 
@@ -336,6 +356,14 @@ class LegacyMassReadingTests(unittest.TestCase):
         self.assertAlmostEqual(reading["volume_m3"], 5.067549822493321e-06, places=18)
         self.assertNotIn("com", reading)
         self.assertNotIn("inertia", reading)
+
+    def test_the_native_pairing_vector_parses_to_what_imassproperty2_returned(self):
+        """The 2026-09-29 run paired both APIs on one document; indices 3 and 5 have to hold up."""
+
+        reading = legacy_mass_reading(NATIVE_PAIRED_VECTOR, 0)
+        self.assertEqual(reading["mode"], "mass_only")
+        self.assertAlmostEqual(reading["mass"], 0.9725657158217046, places=15)
+        self.assertAlmostEqual(reading["volume_m3"], 0.00039948748506975424, places=18)
 
     def test_malformed_vectors_and_statuses_are_capture_errors(self):
         cases = {

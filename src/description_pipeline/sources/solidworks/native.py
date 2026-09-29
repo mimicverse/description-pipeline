@@ -349,11 +349,12 @@ def _material_assignments_document(doc, bodies):
 def legacy_mass_reading(values, status) -> dict:
     """Mass-only reading from ``IModelDocExtension.GetMassProperties2``'s 13-value vector.
 
-    Only **mass** (index 5) is used: the existing M3.0 recovery reports corroborate it exactly
-    (0.0247 kg pre-restore, 0.00506754982 kg post-restore, each matching the leaf sums), and volume
-    (index 3) is kept as context.  COM and inertia are deliberately not inferred from this legacy
-    layout — its reference point and sign convention are unproven — so a caller that needs them has
-    to use ``IMassProperty2``.
+    Only **mass** (index 5) is used, with volume (index 3) as context.  Mass is corroborated twice:
+    the M3.0 recovery reports match it against the leaf sums exactly (0.0247 kg pre-restore,
+    0.00506754982 kg post-restore), and a 2026-09-29 native pairing on the top assembly returned
+    the same mass — and the same volume, COM and flat inertia group — as ``IMassProperty2`` on that
+    document.  COM and inertia stay out anyway: one paired document is not a layout guarantee, and
+    a caller that needs them has to read ``IMassProperty2``.
 
     A malformed vector is a *capture* error for the caller to turn into an unavailable record, never
     a reason to fail an otherwise valid freeze.
@@ -654,10 +655,11 @@ class SolidWorksBackend(CadBackend):
         of mass/COM/inertia overrides.  The capture records both readings; a difference between them
         is reported by the verification side as an advisory, never as a capture failure.
 
-        ``CreateMassProperty2`` is tried first.  Builds without it (this SolidWorks generation, per
-        the M3.0 recovery reports) fall back to ``Extension.GetMassProperties2`` and keep **only its
-        mass** — the one value the existing reports corroborate independently — with volume as
-        context; COM and inertia are deliberately not inferred from that legacy layout.
+        ``CreateMassProperty2`` is tried first.  A session or build where it is unavailable — late
+        binding saw it return nothing during the M3.0 review, even though the 2026-09-29 native run
+        found it working on the release session — falls back to ``Extension.GetMassProperties2`` and
+        keeps **only its mass**, the value the recovery reports and the native pairing both
+        corroborate, with volume as context; COM and inertia are never inferred from the vector.
         """
 
         doc = self._document_by_path(path)

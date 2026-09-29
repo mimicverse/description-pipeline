@@ -11,12 +11,12 @@
   the leaf reader answers per part, the gyration-based rules are mass-scale invariant, and the
   material checks say nothing about magnitude. Snapshots that predate the record stay
   `not_applicable`. The native assembly read is exercised on Windows by the release rehearsal.
-- Builds without `CreateMassProperty2` (this SolidWorks generation) fall back to the legacy
-  `Extension.GetMassProperties2` read and record a **mass-only** closure: only the mass the M3.0
-  recovery reports corroborate independently, with volume as context — COM and inertia are never
-  inferred from the unproven legacy layout. `description check` evaluates such a record on its mass
-  alone (a mismatch is still just a note), while a record with no usable mass stays a defect and a
-  capture whose assembly read is unavailable stays `not_applicable`.
+- When `CreateMassProperty2` is unavailable, the capture falls back to the legacy
+  `Extension.GetMassProperties2` read and records a **mass-only** closure: only the mass the M3.0
+  recovery reports and the 2026-09-29 native pairing corroborate, with volume as context — COM and
+  inertia are never inferred from the vector. `description check` evaluates such a record on its
+  mass alone (a mismatch is still just a note), while a record with no usable mass stays a defect
+  and a capture whose assembly read is unavailable stays `not_applicable`.
 
 ## [0.3.23] - 2026-09-29
 

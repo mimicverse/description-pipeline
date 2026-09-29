@@ -122,12 +122,12 @@ CLOSURE_INERTIA_RTOL = 1e-4
 def _mass_only_closure_check(path: Path, payload: dict[str, Any]) -> dict:
     """Evaluate the mass-only closure the legacy assembly API produced.
 
-    ``Extension.GetMassProperties2`` answers with a vector whose mass alone the M3.0 recovery
-    reports corroborate independently; its COM and inertia layout is unproven, so the capture marks
-    them ``not_inferred`` and this check reads nothing but the two masses (the recorded volumes stay
-    visible as context).  The comparison is therefore an advisory on the mass ratio only — but a
-    mass that is absent, non-numeric or not finite is corrupt evidence, exactly like a malformed
-    full record, and fails.
+    ``Extension.GetMassProperties2`` answers with a vector whose mass the M3.0 recovery reports and
+    the 2026-09-29 native pairing both corroborate; its COM and inertia are not trusted per
+    document, so the capture marks them ``not_inferred`` and this check reads nothing but the two
+    masses (the recorded volumes stay visible as context).  The comparison is therefore an advisory
+    on the mass ratio only — but a mass that is absent, non-numeric or not finite is corrupt
+    evidence, exactly like a malformed full record, and fails.
     """
 
     try:
