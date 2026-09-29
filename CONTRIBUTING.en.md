@@ -6,6 +6,18 @@ This public repository accepts tool changes on `main`. Hardware `feature`/`relea
 in a writable model repository, which can stay private. Branch and release contracts are in the [README](README.md) and the
 [engineering contract](docs/pipeline.md).
 
+## Code of conduct and contribution license
+
+Every form of participation - issues, pull requests, discussions and reviews - follows the
+[Contributor Covenant 2.1 Code of Conduct](CODE_OF_CONDUCT.md); report violations to
+andy.cui@mimicverse.ai. Every report is reviewed promptly and fairly, and the reporter's privacy is
+respected.
+
+The tool and its documentation accept contributions under [Apache-2.0](LICENSE): opening a pull
+request means you agree to license your contribution under it (inbound = outbound) and that you have
+the right to submit it; no separate CLA is required. The wheel, the sdist and the offline
+distributions must keep carrying `LICENSE`.
+
 ## Tool changes
 
 Branch `work/tooling/<change>` from `main`, install `requirements/linux-py312.lock` and the editable

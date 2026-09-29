@@ -5,6 +5,14 @@
 公共仓库的 main 接收工具变更；硬件 feature/release 分支放在可写的模型仓库中，模型仓库可以保持私有。分支与发布合同见 [README](README.md) 和
 [工程契约](docs/pipeline.md)。
 
+## 行为准则与贡献许可
+
+issue、PR、讨论和评审等一切参与形式都适用 [Contributor Covenant 2.1 行为准则](CODE_OF_CONDUCT.md)；违规行为请报告到
+andy.cui@mimicverse.ai。报告会被及时、公平地处理，报告人隐私受保护。
+
+工具与文档按 [Apache-2.0](LICENSE) 接受贡献：提交 PR 即表示你同意自己的贡献同样以 Apache-2.0 授权
+（inbound = outbound），并确认你有权提交它；不需要另签 CLA。wheel、sdist 与离线分发包必须继续随包携带 `LICENSE`。
+
 ## 工具改动
 
 从 main 创建 `work/tooling/<change>`，安装 `requirements/linux-py312.lock` 和可编辑包。
