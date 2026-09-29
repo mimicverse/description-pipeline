@@ -1,5 +1,7 @@
 # Changelog
 
+## [Unreleased]
+
 ## [0.3.23] - 2026-09-29
 
 First public release of the CAD-to-URDF/MJCF tool in
