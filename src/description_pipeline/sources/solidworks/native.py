@@ -346,6 +346,42 @@ def _material_assignments_document(doc, bodies):
     return evidence
 
 
+def legacy_mass_reading(values, status) -> dict:
+    """Mass-only reading from ``IModelDocExtension.GetMassProperties2``'s 13-value vector.
+
+    Only **mass** (index 5) is used: the existing M3.0 recovery reports corroborate it exactly
+    (0.0247 kg pre-restore, 0.00506754982 kg post-restore, each matching the leaf sums), and volume
+    (index 3) is kept as context.  COM and inertia are deliberately not inferred from this legacy
+    layout — its reference point and sign convention are unproven — so a caller that needs them has
+    to use ``IMassProperty2``.
+
+    A malformed vector is a *capture* error for the caller to turn into an unavailable record, never
+    a reason to fail an otherwise valid freeze.
+    """
+
+    if status not in (0, None):
+        raise CadError("cad_mass_property_unavailable", "legacy mass properties reported a status", {"status": status})
+    numbers = list(values or ())
+    if len(numbers) < 6:
+        raise CadError(
+            "cad_mass_property_unavailable", "legacy mass property vector is too short", {"length": len(numbers)}
+        )
+    try:
+        mass = float(numbers[5])
+        volume = float(numbers[3])
+    except (TypeError, ValueError) as error:
+        raise CadError(
+            "cad_mass_property_unavailable", "legacy mass property values are not numbers", {"error": str(error)}
+        ) from error
+    if not math.isfinite(mass) or mass <= 0.0:
+        raise CadError("cad_mass_property_invalid", "legacy mass is not finite and positive", {"mass": mass})
+    return {
+        "mass": mass,
+        "volume_m3": volume if math.isfinite(volume) else None,
+        "mode": "mass_only",
+    }
+
+
 class SolidWorksBackend(CadBackend):
     name = "solidworks"
 
@@ -593,6 +629,7 @@ class SolidWorksBackend(CadBackend):
             "mass": mass,
             "com": com,
             "inertia": inertia,
+            "mode": "full",
             "reference": {
                 "used_api": "IMassProperty2.GetMomentOfInertia(0)",
                 "reference_point": "center_of_mass",
@@ -610,12 +647,17 @@ class SolidWorksBackend(CadBackend):
         }
 
     def assembly_mass_properties(self, path):
-        """Whole-assembly mass/COM/inertia, for the capture's mass-closure record.
+        """Whole-assembly reading for the capture's mass-closure record.
 
         The leaf reader above answers "what does this part weigh"; this answers "what does the
         assembly document say the whole thing weighs", with the same settings and the same refusal
         of mass/COM/inertia overrides.  The capture records both readings; a difference between them
         is reported by the verification side as an advisory, never as a capture failure.
+
+        ``CreateMassProperty2`` is tried first.  Builds without it (this SolidWorks generation, per
+        the M3.0 recovery reports) fall back to ``Extension.GetMassProperties2`` and keep **only its
+        mass** — the one value the existing reports corroborate independently — with volume as
+        context; COM and inertia are deliberately not inferred from that legacy layout.
         """
 
         doc = self._document_by_path(path)
@@ -624,7 +666,9 @@ class SolidWorksBackend(CadBackend):
         configuration = _member(_member(doc, "ConfigurationManager"), "ActiveConfiguration")
         root = _member(configuration, "GetRootComponent3", True)
         mp = _member(_member(doc, "Extension"), "CreateMassProperty2")
-        if mp is None or root is None:
+        if mp is None:
+            return self._legacy_assembly_mass_properties(doc)
+        if root is None:
             raise CadError("cad_empty_mass_property", "assembly mass property is unavailable")
         import pythoncom
 
@@ -665,6 +709,24 @@ class SolidWorksBackend(CadBackend):
                 "configuration": str(_member(configuration, "Name")),
             },
         }
+
+    def _legacy_assembly_mass_properties(self, doc):
+        """Mass-only fallback through ``Extension.GetMassProperties2(1, status, False)``."""
+
+        import pythoncom
+
+        status = _win32().VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+        values = _member(_member(doc, "Extension"), "GetMassProperties2", 1, status, False)
+        reading = legacy_mass_reading(values, getattr(status, "value", None))
+        reading["reference"] = {
+            "used_api": "IModelDocExtension.GetMassProperties2(1, status, False)",
+            "mass_index": 5,
+            "volume_index": 3,
+            "com": "not_inferred",
+            "inertia": "not_inferred",
+            "document": str(_member(doc, "GetPathName")),
+        }
+        return reading
 
     def collect_scene(self, doc_path, coordinate_systems, progress=None, require_material=True):
         doc = self._document_by_path(doc_path)

@@ -119,13 +119,64 @@ CLOSURE_COM_ATOL_M = 1e-6
 CLOSURE_INERTIA_RTOL = 1e-4
 
 
+def _mass_only_closure_check(path: Path, payload: dict[str, Any]) -> dict:
+    """Evaluate the mass-only closure the legacy assembly API produced.
+
+    ``Extension.GetMassProperties2`` answers with a vector whose mass alone the M3.0 recovery
+    reports corroborate independently; its COM and inertia layout is unproven, so the capture marks
+    them ``not_inferred`` and this check reads nothing but the two masses (the recorded volumes stay
+    visible as context).  The comparison is therefore an advisory on the mass ratio only — but a
+    mass that is absent, non-numeric or not finite is corrupt evidence, exactly like a malformed
+    full record, and fails.
+    """
+
+    try:
+        top = payload.get("top_level")
+        leaf = payload.get("leaf_total")
+        if not isinstance(top, dict) or not isinstance(leaf, dict):
+            raise ValueError("mass closure readings are not objects")
+        top_mass = float(cast("dict[str, Any]", top)["mass"])
+        leaf_mass = float(cast("dict[str, Any]", leaf)["mass"])
+        if not (math.isfinite(top_mass) and math.isfinite(leaf_mass)) or top_mass <= 0.0 or leaf_mass <= 0.0:
+            raise ValueError("mass closure readings are not finite and positive")
+    except (KeyError, TypeError, ValueError, OSError, PipelineError) as exc:
+        return _result(
+            "source.normalization.mass_closure",
+            False,
+            details={"error": str(exc), "record": str(path), "mode": "mass_only"},
+        )
+    mass_rel = abs(top_mass - leaf_mass) / max(abs(top_mass), abs(leaf_mass), 1e-12)
+    details: dict[str, Any] = {
+        "mode": "mass_only",
+        "top_level_mass_kg": top_mass,
+        "leaf_total_mass_kg": leaf_mass,
+        "delta": {"mass_rel": mass_rel},
+    }
+    for name, source in (("top_level_volume_m3", top), ("leaf_total_volume_m3", leaf)):
+        with contextlib.suppress(KeyError, TypeError, ValueError):
+            volume = float(source["volume_m3"])
+            if math.isfinite(volume):
+                details[name] = volume
+    if mass_rel > CLOSURE_MASS_RTOL:
+        details["advisory"] = (
+            "the assembly document's own mass disagrees with the recombined leaf readings "
+            f"(mass {top_mass:.9g} kg vs {leaf_mass:.9g} kg, {mass_rel:.3g} relative); the CAD tree "
+            "may have been repaired or re-materialed after the leaf files were written — review the "
+            "CAD and any declared masses (this capture's legacy API reported mass only, so COM and "
+            "inertia were not compared)"
+        )
+    return _result("source.normalization.mass_closure", True, details=details)
+
+
 def _mass_closure_check(snapshot: Path) -> dict:
     """Assembly-versus-leaf mass closure, reported as an advisory — never a blocker.
 
     The record is capture-time evidence: the assembly document's own mass properties next to the
     parallel-axis combination of the leaf readings.  Snapshots without it are ``not_applicable``; a
     mismatch is surfaced in ``details.advisory`` so `description check` prints it as a note while the
-    model still qualifies; a malformed record is a defect.
+    model still qualifies; a malformed record is a defect.  A ``mass_only`` record (from a build
+    whose legacy assembly API reports mass alone) is evaluated by
+    :func:`_mass_only_closure_check` on that mass only.
     """
 
     path = Path(snapshot) / "raw" / "mass_closure.json"
@@ -151,6 +202,8 @@ def _mass_closure_check(snapshot: Path) -> dict:
                     "message": str(payload.get("message") or ""),
                 },
             )
+        if str(payload.get("mode") or "full") == "mass_only":
+            return _mass_only_closure_check(path, payload)
         top = payload.get("top_level")
         leaf = payload.get("leaf_total")
         if not isinstance(top, dict) or not isinstance(leaf, dict):
