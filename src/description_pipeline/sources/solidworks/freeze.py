@@ -927,8 +927,9 @@ def _mass_closure(backend: Any, cfg: dict[str, Any], scene: Any) -> dict[str, An
         }
     leaf_total = assembly_leaf_total(scene.components, scene.mass_properties)
     if str((top_level or {}).get("mode") or "") == "mass_only":
-        # The legacy API gives a corroborated mass only; volume travels as context and nothing else
-        # is inferred from its unproven layout.
+        # The legacy API gives a corroborated mass only; volume travels as context.  The 2026-09-29
+        # native pairing matched COM and the inertia group too, but one document is not a layout
+        # guarantee, so nothing else is taken from the vector here.
         volumes = sum(_leaf_volume(scene.mass_properties, component.name) for component in scene.components)
         top_mass = float(top_level["mass"])
         leaf_mass = float(leaf_total["mass"])
