@@ -177,7 +177,9 @@ class RootFreezeLoopTests(unittest.TestCase):
         checks = verify_normalization(raw_scene, definition, snapshot, normalized)
         statuses = {check["id"]: check["status"] for check in checks}
         self.assertTrue(statuses, checks)
-        self.assertTrue(all(entry["status"] == "passed" for entry in checks), checks)
+        # The same vocabulary `assess` uses: a check that has no input yet (e.g. a snapshot recorded
+        # before the assembly mass closure existed) is `not_applicable`, not a failure.
+        self.assertTrue(all(entry["status"] in {"passed", "not_applicable"} for entry in checks), checks)
 
     def test_native_failure_diagnostics_do_not_leak_into_author_sources(self) -> None:
         self._write_definition()
