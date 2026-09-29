@@ -1,0 +1,680 @@
+{
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "enum": [
+        "description.scene/v1",
+        "description.robot/v1"
+      ]
+    },
+    "name": {
+      "const": "robot"
+    },
+    "units": {
+      "const": "SI"
+    },
+    "links": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
+          },
+          "inertial": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "mass": {
+                    "type": "number",
+                    "exclusiveMinimum": 0
+                  },
+                  "xyz": {
+                    "type": "array",
+                    "items": {
+                      "type": "number"
+                    },
+                    "minItems": 3,
+                    "maxItems": 3
+                  },
+                  "rpy": {
+                    "type": "array",
+                    "items": {
+                      "type": "number"
+                    },
+                    "minItems": 3,
+                    "maxItems": 3
+                  },
+                  "inertia": {
+                    "type": "array",
+                    "items": {
+                      "type": "number"
+                    },
+                    "minItems": 6,
+                    "maxItems": 6
+                  }
+                },
+                "required": [
+                  "mass",
+                  "xyz",
+                  "rpy",
+                  "inertia"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "visuals": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "mesh",
+                    "box",
+                    "sphere",
+                    "cylinder"
+                  ]
+                },
+                "xyz": {
+                  "type": "array",
+                  "items": {
+                    "type": "number"
+                  },
+                  "minItems": 3,
+                  "maxItems": 3
+                },
+                "rpy": {
+                  "type": "array",
+                  "items": {
+                    "type": "number"
+                  },
+                  "minItems": 3,
+                  "maxItems": 3
+                },
+                "filename": {
+                  "type": "string"
+                },
+                "scale": {
+                  "type": "array",
+                  "items": {
+                    "type": "number"
+                  },
+                  "minItems": 3,
+                  "maxItems": 3
+                },
+                "size": {
+                  "type": "array",
+                  "items": {
+                    "type": "number"
+                  },
+                  "minItems": 3,
+                  "maxItems": 3
+                },
+                "radius": {
+                  "type": "number",
+                  "exclusiveMinimum": 0
+                },
+                "length": {
+                  "type": "number",
+                  "exclusiveMinimum": 0
+                },
+                "rgba": {
+                  "type": "array",
+                  "items": {
+                    "type": "number"
+                  },
+                  "minItems": 4,
+                  "maxItems": 4
+                },
+                "provenance": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "kind",
+                "xyz",
+                "rpy"
+              ],
+              "additionalProperties": false,
+              "allOf": [
+                {
+                  "if": {
+                    "properties": {
+                      "kind": {
+                        "const": "mesh"
+                      }
+                    }
+                  },
+                  "then": {
+                    "required": [
+                      "filename",
+                      "scale"
+                    ]
+                  }
+                },
+                {
+                  "if": {
+                    "properties": {
+                      "kind": {
+                        "const": "box"
+                      }
+                    }
+                  },
+                  "then": {
+                    "required": [
+                      "size"
+                    ]
+                  }
+                },
+                {
+                  "if": {
+                    "properties": {
+                      "kind": {
+                        "const": "sphere"
+                      }
+                    }
+                  },
+                  "then": {
+                    "required": [
+                      "radius"
+                    ]
+                  }
+                },
+                {
+                  "if": {
+                    "properties": {
+                      "kind": {
+                        "const": "cylinder"
+                      }
+                    }
+                  },
+                  "then": {
+                    "required": [
+                      "radius",
+                      "length"
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          "collisions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "mesh",
+                    "box",
+                    "sphere",
+                    "cylinder"
+                  ]
+                },
+                "xyz": {
+                  "type": "array",
+                  "items": {
+                    "type": "number"
+                  },
+                  "minItems": 3,
+                  "maxItems": 3
+                },
+                "rpy": {
+                  "type": "array",
+                  "items": {
+                    "type": "number"
+                  },
+                  "minItems": 3,
+                  "maxItems": 3
+                },
+                "filename": {
+                  "type": "string"
+                },
+                "scale": {
+                  "type": "array",
+                  "items": {
+                    "type": "number"
+                  },
+                  "minItems": 3,
+                  "maxItems": 3
+                },
+                "size": {
+                  "type": "array",
+                  "items": {
+                    "type": "number"
+                  },
+                  "minItems": 3,
+                  "maxItems": 3
+                },
+                "radius": {
+                  "type": "number",
+                  "exclusiveMinimum": 0
+                },
+                "length": {
+                  "type": "number",
+                  "exclusiveMinimum": 0
+                },
+                "rgba": {
+                  "type": "array",
+                  "items": {
+                    "type": "number"
+                  },
+                  "minItems": 4,
+                  "maxItems": 4
+                },
+                "provenance": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "kind",
+                "xyz",
+                "rpy"
+              ],
+              "additionalProperties": false,
+              "allOf": [
+                {
+                  "if": {
+                    "properties": {
+                      "kind": {
+                        "const": "mesh"
+                      }
+                    }
+                  },
+                  "then": {
+                    "required": [
+                      "filename",
+                      "scale"
+                    ]
+                  }
+                },
+                {
+                  "if": {
+                    "properties": {
+                      "kind": {
+                        "const": "box"
+                      }
+                    }
+                  },
+                  "then": {
+                    "required": [
+                      "size"
+                    ]
+                  }
+                },
+                {
+                  "if": {
+                    "properties": {
+                      "kind": {
+                        "const": "sphere"
+                      }
+                    }
+                  },
+                  "then": {
+                    "required": [
+                      "radius"
+                    ]
+                  }
+                },
+                {
+                  "if": {
+                    "properties": {
+                      "kind": {
+                        "const": "cylinder"
+                      }
+                    }
+                  },
+                  "then": {
+                    "required": [
+                      "radius",
+                      "length"
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          "provenance": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "inertial",
+          "visuals",
+          "collisions",
+          "provenance"
+        ],
+        "additionalProperties": false
+      },
+      "minItems": 1
+    },
+    "joints": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
+          },
+          "type": {
+            "enum": [
+              "fixed",
+              "revolute",
+              "continuous",
+              "prismatic"
+            ]
+          },
+          "parent": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
+          },
+          "child": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
+          },
+          "xyz": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "rpy": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "axis": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "limits": {
+            "type": "object",
+            "properties": {
+              "lower": {
+                "type": "number"
+              },
+              "upper": {
+                "type": "number"
+              },
+              "effort": {
+                "type": "number"
+              },
+              "velocity": {
+                "type": "number"
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "dynamics": {
+            "type": "object",
+            "properties": {
+              "damping": {
+                "type": "number",
+                "minimum": 0
+              },
+              "friction": {
+                "type": "number",
+                "minimum": 0
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "mimic": {
+            "type": "object",
+            "properties": {
+              "joint": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
+              },
+              "multiplier": {
+                "type": "number"
+              },
+              "offset": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "joint",
+              "multiplier",
+              "offset"
+            ],
+            "additionalProperties": false
+          },
+          "provenance": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "type",
+          "parent",
+          "child",
+          "xyz",
+          "rpy",
+          "provenance"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "frames": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
+          },
+          "parent": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
+          },
+          "xyz": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "rpy": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "provenance": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "parent",
+          "xyz",
+          "rpy",
+          "provenance"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "actuators": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
+          },
+          "joint": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
+          },
+          "type": {
+            "enum": [
+              "motor"
+            ]
+          },
+          "gear": {
+            "type": "number"
+          },
+          "control_range": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "provenance": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "joint",
+          "type",
+          "gear",
+          "control_range",
+          "provenance"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "sensors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
+          },
+          "type": {
+            "enum": [
+              "gyro",
+              "accelerometer",
+              "framequat",
+              "framepos",
+              "force",
+              "torque"
+            ]
+          },
+          "frame": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
+          },
+          "provenance": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "type",
+          "frame",
+          "provenance"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "constraints": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "control": {
+      "type": "object"
+    },
+    "contact_excludes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "body1": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
+          },
+          "body2": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "body1",
+          "body2",
+          "reason"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "provenance": {
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema_version",
+    "name",
+    "units",
+    "links",
+    "joints",
+    "frames",
+    "actuators",
+    "sensors",
+    "constraints",
+    "control",
+    "contact_excludes",
+    "provenance"
+  ],
+  "additionalProperties": false,
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mimicverse.org/description/robot-v1.schema.json"
+}

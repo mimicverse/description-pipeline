@@ -1,0 +1,50 @@
+name: Feature request
+description: Propose a capability, rule, source adapter or workflow change.
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This project keeps one invariant: a claim is only as strong as the evidence behind it.
+        Describe the problem and the independent check that would prove the new behavior, not only
+        the API you would like to call.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What can you not do today, and who is blocked by it?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Source adapter (SolidWorks or Onshape)
+        - Model build and URDF/MJCF generation
+        - Verification and acceptance
+        - CLI and automation entry points
+        - Documentation and onboarding
+        - Distribution and packaging
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence and verification
+      description: Which independent check proves the behavior, and which seeded defect or negative case must fail?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false

@@ -1,0 +1,23 @@
+# The secret scan is a publication blocker, so it has to be repeatable and quiet enough to trust.
+#
+# `gitleaks detect` reports two patterns as "generic-api-key". Both were inspected by hand on
+# 2026-09-24 and neither carries a credential:
+#
+#   * `"generation_key": "<8 hex>"` inside the generated `docs/quality.json` — a digest of the build
+#     inputs, written by the build itself, not a value anyone can use.
+#   * `native_swapi._win32 = ...` in `tests/solidworks_export/test_com_threading.py` — a module
+#     attribute the test patches, again not a value.
+#
+# Everything else stays on: the default rules cover provider keys, private keys and tokens, and a real
+# finding there is a release blocker rather than something to allow-list.
+title = "mimicverse/description"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "build generation keys and the threaded-export test's module attribute are not credentials"
+paths = [
+  '''(^|/)docs/quality\.json$''',
+  '''(^|/)tests/solidworks_export/test_com_threading\.py$''',
+]

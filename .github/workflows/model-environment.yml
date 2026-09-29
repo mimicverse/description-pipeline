@@ -1,0 +1,58 @@
+name: Resolve model environment
+
+on:
+  workflow_call:
+    inputs:
+      model_sha:
+        required: true
+        type: string
+      profile:
+        required: true
+        type: string
+    outputs:
+      runner:
+        value: ${{ jobs.resolve.outputs.runner }}
+      python:
+        value: ${{ jobs.resolve.outputs.python }}
+      requirements:
+        value: ${{ jobs.resolve.outputs.requirements }}
+      tool_sha:
+        value: ${{ jobs.resolve.outputs.tool_sha }}
+      driver_sha:
+        value: ${{ jobs.resolve.outputs.driver_sha }}
+
+env:
+  GIT_CONFIG_COUNT: 1
+  GIT_CONFIG_KEY_0: core.longpaths
+  GIT_CONFIG_VALUE_0: true
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      runner: ${{ steps.resolve.outputs.runner }}
+      python: ${{ steps.resolve.outputs.python }}
+      requirements: ${{ steps.resolve.outputs.requirements }}
+      tool_sha: ${{ steps.resolve.outputs.tool_sha }}
+      driver_sha: ${{ steps.resolve.outputs.driver_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: main
+          path: driver
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.model_sha }}
+          path: model
+          persist-credentials: false
+      - id: resolve
+        env:
+          MODEL_SHA: ${{ inputs.model_sha }}
+          PROFILE: ${{ inputs.profile }}
+        run: python driver/.github/scripts/resolve_model_tool.py

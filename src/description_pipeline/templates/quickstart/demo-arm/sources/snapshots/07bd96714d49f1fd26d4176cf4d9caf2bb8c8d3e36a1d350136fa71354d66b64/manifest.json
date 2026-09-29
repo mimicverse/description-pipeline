@@ -1,0 +1,13 @@
+{
+  "evidence_class": "fixture",
+  "files": {
+    "scene.json": "f2c8d643c76982f817ca9bb96d01459f42a30ecbcab003f2cce45c614d1b8eab"
+  },
+  "identity": {
+    "fixture": true,
+    "robot": "demo-arm"
+  },
+  "kind": "fixture",
+  "scene": "scene.json",
+  "schema_version": "description.source/v1"
+}

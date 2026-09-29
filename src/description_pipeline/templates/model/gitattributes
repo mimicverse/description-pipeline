@@ -1,0 +1,4 @@
+# Frozen inputs and manifests bind exact bytes, including original line endings.
+* -text
+*.stl binary
+sources/snapshots/**/source/** filter=lfs diff=lfs merge=lfs -text

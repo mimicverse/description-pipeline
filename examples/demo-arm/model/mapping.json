@@ -1,0 +1,16 @@
+{
+  "actuators": {},
+  "frames": {
+    "tool": "tool"
+  },
+  "joints": {
+    "elbow_joint": "elbow_joint",
+    "shoulder_joint": "shoulder_joint"
+  },
+  "links": {
+    "base_link": "base_link",
+    "forearm_link": "forearm_link",
+    "shoulder_link": "shoulder_link"
+  },
+  "sensors": {}
+}

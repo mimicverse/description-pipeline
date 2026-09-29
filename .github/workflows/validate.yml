@@ -1,0 +1,70 @@
+name: Tooling validation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tooling:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12.14'
+      - name: Install locked tooling and consumer
+        run: |
+          python -m pip install -r requirements/linux-py312.lock
+          python -m pip install --no-deps --no-build-isolation -e .
+      - name: Shared developer checks on the candidate tooling
+        run: |
+          python tools/quality.py lint
+          python tools/quality.py format
+          python tools/quality.py typecheck
+          python tools/quality.py test
+          description model layout --root . --role tooling
+      - name: Build distributable package
+        run: |
+          python tools/build_release.py --require-clean --offline
+          python tools/verify_distribution.py dist/*-linux-*.zip --report result/installation-verification.json
+          python tools/verify_distribution.py dist/*-windows-*.zip --windows --report result/windows-archive.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: distribution-verification
+          path: result/
+  windows-deployment:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12.14'
+      - name: Install complete Windows runtime
+        shell: bash
+        run: |
+          python -m pip install -r src/description_pipeline/sources/solidworks/deploy/requirements/win-py312.lock
+          python -m pip install setuptools==84.0.0 wheel==0.46.3
+          python -m pip install --no-deps --no-build-isolation -e .
+      - name: Build and independently verify models on Windows
+        shell: bash
+        run: |
+          for suite in pipeline repository local_platform publication io cache model_update cli_failures acceptance; do
+            python -m unittest discover -s tests/pipeline -p "test_$suite.py"
+          done
+          python -m unittest tests.sources.test_solidworks_remote tests.windows.test_single_machine_runtime
+      - name: Verify PowerShell deployment transitions without live CAD
+        shell: powershell
+        run: .\tests\windows\test_deployment.ps1
+      - name: Verify the one-click submit entry (doubles + native stdin encoding)
+        shell: powershell
+        run: .\tests\windows\test_submit.ps1

@@ -1,0 +1,44 @@
+# Windows development and test environment - Python 3.12 (cp312, win_amd64).
+#
+# The packaged worker runtime (src/description_pipeline/sources/solidworks/deploy/requirements/
+# win-py312.lock) plus the tools the quality gate runs, resolved for win_amd64. Names are canonical
+# (PEP 503) because the set below is generated from the resolved wheel filenames:
+#
+#   python -m pip download --only-binary=:all: --platform win_amd64 --python-version 3.12 \
+#       --implementation cp --abi cp312 -d wheels -r requirements/win-py312-dev.lock
+#
+# ``--platform`` selects wheels but evaluates markers on the machine that runs the command, so a
+# dependency guarded by ``os_name == "nt"`` (colorama, for build) has to be listed explicitly; an
+# offline install on Windows is what proves the set is complete.
+#
+# CONTRIBUTING documents the two commands that consume it; tests/test_repo_hygiene.py keeps the
+# versions it shares with the runtime lock from drifting.
+absl-py==2.5.0
+ast-serialize==0.11.2
+attrs==26.1.0
+build==1.6.1
+colorama==0.4.6
+etils==1.14.0
+fsspec==2026.9.0
+glfw==2.10.2
+jsonschema==4.26.0
+jsonschema-specifications==2025.9.1
+librt==0.15.0
+mujoco==3.13.0
+mypy==2.3.1
+mypy-extensions==1.1.0
+numpy==2.5.3
+packaging==26.3
+pathspec==1.1.1
+pyopengl==3.1.10
+pyproject-hooks==1.3.3
+pywin32==311
+pyyaml==6.0.3
+referencing==0.37.0
+rpds-py==2026.6.3
+ruff==0.16.8
+setuptools==84.0.0
+types-pyyaml==6.0.12.20260906
+typing-extensions==4.16.0
+wheel==0.46.3
+zipp==4.1.0

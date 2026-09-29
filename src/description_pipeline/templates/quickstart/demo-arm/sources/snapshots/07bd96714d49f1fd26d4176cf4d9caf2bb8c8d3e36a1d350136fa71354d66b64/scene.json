@@ -1,0 +1,321 @@
+{
+  "actuators": [],
+  "constraints": [],
+  "contact_excludes": [],
+  "control": {},
+  "frames": [
+    {
+      "id": "tool",
+      "name": "tool",
+      "parent": "forearm_link",
+      "provenance": {},
+      "rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "xyz": [
+        0.0,
+        0.0,
+        0.16
+      ]
+    }
+  ],
+  "joints": [
+    {
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "child": "shoulder_link",
+      "dynamics": {
+        "damping": 0.05,
+        "friction": 0.0
+      },
+      "id": "shoulder_joint",
+      "limits": {
+        "effort": 10.0,
+        "lower": -1.4,
+        "upper": 1.4,
+        "velocity": 3.0
+      },
+      "name": "shoulder_joint",
+      "parent": "base_link",
+      "provenance": {
+        "reference": "analytic_fixture"
+      },
+      "rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "type": "revolute",
+      "xyz": [
+        0.0,
+        0.0,
+        0.06
+      ]
+    },
+    {
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "child": "forearm_link",
+      "dynamics": {
+        "damping": 0.03,
+        "friction": 0.0
+      },
+      "id": "elbow_joint",
+      "limits": {
+        "effort": 6.0,
+        "lower": -2.2,
+        "upper": 2.2,
+        "velocity": 3.0
+      },
+      "name": "elbow_joint",
+      "parent": "shoulder_link",
+      "provenance": {
+        "reference": "analytic_fixture"
+      },
+      "rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "type": "revolute",
+      "xyz": [
+        0.0,
+        0.0,
+        0.18
+      ]
+    }
+  ],
+  "links": [
+    {
+      "collisions": [
+        {
+          "kind": "box",
+          "rpy": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [
+            0.1,
+            0.1,
+            0.06
+          ],
+          "xyz": [
+            0.0,
+            0.0,
+            0.03
+          ]
+        }
+      ],
+      "id": "base_link",
+      "inertial": {
+        "inertia": [
+          0.00102,
+          0.0,
+          0.0,
+          0.00102,
+          0.0,
+          0.0015000000000000005
+        ],
+        "mass": 0.9,
+        "rpy": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "xyz": [
+          0.0,
+          0.0,
+          0.03
+        ]
+      },
+      "name": "base_link",
+      "provenance": {
+        "source_entities": [
+          "base"
+        ]
+      },
+      "visuals": [
+        {
+          "kind": "box",
+          "rpy": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [
+            0.1,
+            0.1,
+            0.06
+          ],
+          "xyz": [
+            0.0,
+            0.0,
+            0.03
+          ]
+        }
+      ]
+    },
+    {
+      "collisions": [
+        {
+          "kind": "box",
+          "rpy": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [
+            0.05,
+            0.06,
+            0.18
+          ],
+          "xyz": [
+            0.0,
+            0.0,
+            0.09
+          ]
+        }
+      ],
+      "id": "shoulder_link",
+      "inertial": {
+        "inertia": [
+          0.0013499999999999999,
+          0.0,
+          0.0,
+          0.00130875,
+          0.0,
+          0.00022875
+        ],
+        "mass": 0.45,
+        "rpy": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "xyz": [
+          0.0,
+          0.0,
+          0.09
+        ]
+      },
+      "name": "shoulder_link",
+      "provenance": {
+        "source_entities": [
+          "shoulder"
+        ]
+      },
+      "visuals": [
+        {
+          "kind": "box",
+          "rpy": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [
+            0.05,
+            0.06,
+            0.18
+          ],
+          "xyz": [
+            0.0,
+            0.0,
+            0.09
+          ]
+        }
+      ]
+    },
+    {
+      "collisions": [
+        {
+          "kind": "box",
+          "rpy": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [
+            0.04,
+            0.05,
+            0.16
+          ],
+          "xyz": [
+            0.0,
+            0.0,
+            0.08
+          ]
+        }
+      ],
+      "id": "forearm_link",
+      "inertial": {
+        "inertia": [
+          0.0007025,
+          0.0,
+          0.0,
+          0.00068,
+          0.0,
+          0.0001025
+        ],
+        "mass": 0.3,
+        "rpy": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "xyz": [
+          0.0,
+          0.0,
+          0.08
+        ]
+      },
+      "name": "forearm_link",
+      "provenance": {
+        "source_entities": [
+          "forearm"
+        ]
+      },
+      "visuals": [
+        {
+          "kind": "box",
+          "rpy": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "size": [
+            0.04,
+            0.05,
+            0.16
+          ],
+          "xyz": [
+            0.0,
+            0.0,
+            0.08
+          ]
+        }
+      ]
+    }
+  ],
+  "name": "robot",
+  "provenance": {
+    "expected_entities": [
+      "base",
+      "shoulder",
+      "forearm"
+    ],
+    "fixture": true,
+    "note": "hand-written analytic fixture, not CAD evidence"
+  },
+  "schema_version": "description.scene/v1",
+  "sensors": [],
+  "units": "SI"
+}

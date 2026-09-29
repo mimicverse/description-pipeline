@@ -1,0 +1,2 @@
+# Structural inspection order only; NOT controller/policy/hardware order.
+structural_joint_names: []

@@ -1,0 +1,6 @@
+2026-09-18T00:15:52 evidence_class: synthetic
+2026-09-18T00:15:52 environment: {"active_document": "FAKE.SLDASM", "backend": "fake", "bridge_version": "1.0.0", "platform": "Linux-7.0.0-31-generic-x86_64-with-glibc2.43", "python": "3.14.4", "sw_version": "fake-2026"}
+2026-09-18T00:15:52 collecting scene from FAKE.SLDASM
+2026-09-18T00:15:52 fake backend: collecting scene for FAKE.SLDASM
+2026-09-18T00:15:52 model built: 2 links, 1 joints
+2026-09-18T00:15:52 meshes written: 2 link mesh(es)

@@ -1,0 +1,37 @@
+{
+  "api_contact": {
+    "backend": "fake"
+  },
+  "bridge_version": "1.0.0",
+  "cad_source_files": {},
+  "document": "FAKE.SLDASM",
+  "environment": {
+    "active_document": "FAKE.SLDASM",
+    "backend": "fake",
+    "bridge_version": "1.0.0",
+    "platform": "Linux-7.0.0-31-generic-x86_64-with-glibc2.43",
+    "python": "3.14.4",
+    "sw_version": "fake-2026"
+  },
+  "evidence_class": "synthetic",
+  "export_config_sha256": "a8fee38bb8ff1f3178c2c48075f50c6a0c8e33f8af5f9f14528299f65715eab7",
+  "exported_at": "2026-09-17T16:15:52Z",
+  "mass_provenance": {
+    "density_source": "synthetic_fixture",
+    "kind": "synthetic",
+    "measured_override": false,
+    "note": "Synthetic mathematical fixture; no CAD materials or physical hardware verified.",
+    "policy": "pure_cad_v1",
+    "schema_version": "swbridge.mass-provenance/v1",
+    "values_from": "synthetic_fixture"
+  },
+  "model": "fake_robot_v1",
+  "notes": {
+    "authoring": "component names must match the SolidWorks assembly tree; joint coordinate systems must exist as named reference coordinate systems",
+    "root_link": "base_link"
+  },
+  "schema_version": "swbridge.native-source/v1",
+  "source_kind": "synthetic",
+  "source_length_unit": "m",
+  "urdf_sha256": "2e823f7c82ea02802c5cdb586af10ca440af3728c25b34fdf8b1a96cb5a7555c"
+}

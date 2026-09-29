@@ -1,0 +1,29 @@
+{
+  "acceptance_suites": [],
+  "consumer_environment": {},
+  "contact": null,
+  "dynamics_atol": 1e-08,
+  "dynamics_rtol": 1e-06,
+  "gravity": [
+    0,
+    0,
+    -9.81
+  ],
+  "ground": false,
+  "inertia_atol": 1e-10,
+  "inertia_rtol": 1e-06,
+  "penetration_m": 0.001,
+  "position_atol": 1e-07,
+  "purpose": "simulation",
+  "random_poses": 12,
+  "require_native_source": false,
+  "root_mode": "fixed",
+  "rotation_atol": 1e-07,
+  "schema_version": "description.profile/v1",
+  "seed": 0,
+  "steps": 100,
+  "timestep": 0.002,
+  "uniform_density_com_atol_m": 1e-06,
+  "uniform_density_rtol": 0.001,
+  "validation_poses": null
+}

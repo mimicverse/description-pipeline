@@ -1,0 +1,79 @@
+name: Build fixed tool distribution
+
+on:
+  workflow_dispatch:
+    inputs:
+      tool_sha:
+        description: Exact tool commit already accepted on main
+        required: true
+        type: string
+      tag:
+        description: Optional existing tag for GitHub Release publication
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.tool_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12.14'
+      - name: Verify release identity
+        env:
+          TOOL_SHA: ${{ inputs.tool_sha }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          git merge-base --is-ancestor HEAD origin/main
+          python - <<'PY'
+          import os, re, subprocess
+          sha = os.environ['TOOL_SHA']
+          assert re.fullmatch(r'[0-9a-f]{40}', sha)
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == sha
+          tag = os.environ['RELEASE_TAG']
+          if tag:
+              subprocess.run(['git', 'check-ref-format', 'refs/tags/' + tag], check=True)
+              assert subprocess.check_output(['git', 'rev-parse', 'refs/tags/' + tag + '^{commit}'], text=True).strip() == sha
+          PY
+      - run: |
+          python -m pip install -r requirements/linux-py312.lock
+          python -m pip install --no-deps --no-build-isolation -e .
+          python tools/quality.py all
+          python tools/build_release.py --require-clean --offline
+          python tools/verify_distribution.py dist/*-linux-*.zip --report result/installation-verification.json
+          python tools/verify_distribution.py dist/*-windows-*.zip --windows --report result/windows-archive.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: installation-verification
+          path: result/
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: tool-distribution
+          path: dist/
+  publish:
+    needs: build
+    if: inputs.tag != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Fetch exact run artifact and publish once
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          gh run download "$RUN_ID" --name tool-distribution --dir dist
+          gh release create "$RELEASE_TAG" dist/* --verify-tag --title "$RELEASE_TAG" \
+            --notes 'Models pin the source commit, package digest and runtime environment recorded in the distribution.'

@@ -1,0 +1,118 @@
+{
+  "export_config_sha256": "a8fee38bb8ff1f3178c2c48075f50c6a0c8e33f8af5f9f14528299f65715eab7",
+  "generator": {
+    "tool": "solidworks_export",
+    "version": "1.0.0"
+  },
+  "links": {
+    "arm_link": {
+      "L_at_com": {
+        "ixx": 0.01,
+        "ixy": -0.002,
+        "ixz": 0.0,
+        "iyy": 0.02,
+        "iyz": 0.0,
+        "izz": 0.03
+      },
+      "com_in_output_m": [
+        0.0,
+        0.0,
+        0.05
+      ],
+      "component_selection_confirmed": false,
+      "components_declared": [
+        "Arm-1"
+      ],
+      "frame_mapping_confirmed": false,
+      "link_frame_source": "joint_coordinate_system:CS_dof_arm",
+      "mass_kg": 1.0,
+      "output_frame": "arm_link_link_frame",
+      "output_frame_in_link": {
+        "rpy_rad": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "xyz_m": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "product_convention": "negative_products",
+      "uncertainty": {
+        "com_m": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "inertia_kg_m2": 0.0,
+        "mass_kg": 0.0,
+        "principal_kg_m2": 0.0
+      }
+    },
+    "base_link": {
+      "L_at_com": {
+        "ixx": 0.1,
+        "ixy": 0.0,
+        "ixz": 0.0,
+        "iyy": 0.2,
+        "iyz": 0.0,
+        "izz": 0.3
+      },
+      "com_in_output_m": [
+        0.0,
+        0.0,
+        0.05
+      ],
+      "component_selection_confirmed": false,
+      "components_declared": [
+        "Base-1"
+      ],
+      "frame_mapping_confirmed": false,
+      "link_frame_source": "frame_component:Base-1",
+      "mass_kg": 2.0,
+      "output_frame": "base_link_link_frame",
+      "output_frame_in_link": {
+        "rpy_rad": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "xyz_m": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "product_convention": "negative_products",
+      "uncertainty": {
+        "com_m": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "inertia_kg_m2": 0.0,
+        "mass_kg": 0.0,
+        "principal_kg_m2": 0.0
+      }
+    }
+  },
+  "notes": "Generated from CAD raw mass properties and placement transforms. Values are converted to the standard inertia convention (negative products) in the original part axes before rotation into the link frame. Frame mapping and component selection are NOT independently confirmed; synthetic packages are software fixtures.",
+  "schema_version": "solidworks-mass-properties/v1",
+  "source": {
+    "cad_document": "FAKE.SLDASM",
+    "kind": "synthetic",
+    "name": "cad_evidence.json",
+    "sha256": "eb6f9bf48ff102a73155fe480416ba5191c36f4e8d01160ac66438e6cd0cad1e",
+    "sha256_basis": "SHA256 of the in-package cad_evidence.json (CAD API raw readings and placement transforms); not a hash of the CAD binary. The native document path is recorded in native_source.json.document and in source.cad_document.",
+    "synthetic": true
+  },
+  "units": {
+    "angle": "rad",
+    "inertia": "kg*m^2",
+    "length": "m",
+    "mass": "kg"
+  },
+  "urdf_sha256": "2e823f7c82ea02802c5cdb586af10ca440af3728c25b34fdf8b1a96cb5a7555c"
+}

@@ -1,0 +1,5 @@
+# Structural inspection order only; NOT controller, policy or hardware order.
+# List every movable joint the built URDF declares, in design order. The delivery audit reads this
+# file (URDF208), and `description check` refuses the build until every one of them is registered
+# here, so fill it in together with the joints you declare in config/robot.yaml.
+structural_joint_names: []

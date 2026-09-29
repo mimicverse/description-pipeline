@@ -1,0 +1,245 @@
+{
+  "actuators": [],
+  "constraints": [],
+  "contact_excludes": [],
+  "control": {},
+  "frames": [
+    {
+      "id": "tool",
+      "name": "tool",
+      "parent": "arm_link",
+      "provenance": {},
+      "rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "xyz": [
+        0.0,
+        0.0,
+        0.1875
+      ]
+    }
+  ],
+  "joints": [
+    {
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "child": "arm_link",
+      "dynamics": {
+        "damping": 0.04,
+        "friction": 0.0
+      },
+      "id": "shoulder_joint",
+      "limits": {
+        "effort": 8.0,
+        "lower": -1.25,
+        "upper": 1.25,
+        "velocity": 4.0
+      },
+      "name": "shoulder_joint",
+      "parent": "base_link",
+      "provenance": {
+        "reference": "analytic_fixture"
+      },
+      "rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "type": "revolute",
+      "xyz": [
+        0.0,
+        0.0,
+        0.0625
+      ]
+    }
+  ],
+  "links": [
+    {
+      "collisions": [
+        {
+          "filename": "geometry/parts/base.stl",
+          "kind": "mesh",
+          "rgba": [
+            0.7,
+            0.7,
+            0.72,
+            1.0
+          ],
+          "rpy": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "xyz": [
+            0.0,
+            0.0,
+            0.03125
+          ]
+        }
+      ],
+      "id": "base_link",
+      "inertial": {
+        "inertia": [
+          0.0007748603820800781,
+          0.0,
+          0.0,
+          0.0011920928955078125,
+          0.0,
+          0.0014901161193847656
+        ],
+        "mass": 0.732421875,
+        "rpy": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "xyz": [
+          0.0,
+          0.0,
+          0.03125
+        ]
+      },
+      "name": "base_link",
+      "provenance": {
+        "inertia_model": "uniform_density_visual",
+        "source_entities": [
+          "base"
+        ]
+      },
+      "visuals": [
+        {
+          "filename": "geometry/parts/base.stl",
+          "kind": "mesh",
+          "rgba": [
+            0.7,
+            0.7,
+            0.72,
+            1.0
+          ],
+          "rpy": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "xyz": [
+            0.0,
+            0.0,
+            0.03125
+          ]
+        }
+      ]
+    },
+    {
+      "collisions": [
+        {
+          "filename": "geometry/parts/arm.stl",
+          "kind": "mesh",
+          "rgba": [
+            0.7,
+            0.7,
+            0.72,
+            1.0
+          ],
+          "rpy": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "xyz": [
+            0.0,
+            0.0,
+            0.09375
+          ]
+        }
+      ],
+      "id": "arm_link",
+      "inertial": {
+        "inertia": [
+          0.002384185791015625,
+          0.0,
+          0.0,
+          0.002384185791015625,
+          0.0,
+          0.000476837158203125
+        ],
+        "mass": 0.732421875,
+        "rpy": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "xyz": [
+          0.0,
+          0.0,
+          0.09375
+        ]
+      },
+      "name": "arm_link",
+      "provenance": {
+        "inertia_model": "uniform_density_visual",
+        "source_entities": [
+          "arm"
+        ]
+      },
+      "visuals": [
+        {
+          "filename": "geometry/parts/arm.stl",
+          "kind": "mesh",
+          "rgba": [
+            0.7,
+            0.7,
+            0.72,
+            1.0
+          ],
+          "rpy": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "xyz": [
+            0.0,
+            0.0,
+            0.09375
+          ]
+        }
+      ]
+    }
+  ],
+  "name": "robot",
+  "provenance": {
+    "expected_entities": [
+      "base",
+      "arm"
+    ],
+    "fixture": true,
+    "note": "hand-written mesh fixture (binary STL), not CAD evidence"
+  },
+  "schema_version": "description.scene/v1",
+  "sensors": [],
+  "units": "SI"
+}

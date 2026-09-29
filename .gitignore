@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+/build/
+/dist/
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+tools/solidworks_export/dist/
+.coverage
+/src/description_pipeline/tool-release.json

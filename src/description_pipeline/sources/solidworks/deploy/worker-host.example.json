@@ -1,0 +1,13 @@
+{
+  "install_root": "C:\\Users\\<user>\\description-worker",
+  "jobs_root": "C:\\Users\\<user>\\description-worker\\jobs",
+  "user": "<user>",
+  "host": "127.0.0.1",
+  "port": 8765,
+  "task_name": "description-pipeline-worker",
+  "python": "C:\\Users\\<user>\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
+  "keep_versions": 3,
+  "bundle_sha256": "<64 hex characters printed by the bundle build>",
+  "assembly": "D:\\models\\robot.SLDASM",
+  "configuration": "Default"
+}

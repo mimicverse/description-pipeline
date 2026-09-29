@@ -1,0 +1,61 @@
+<?xml version='1.0' encoding='utf-8'?>
+<robot name="robot">
+  <link name="base_link">
+    <inertial>
+      <origin xyz="0 0 0.03125" rpy="0 0 0" />
+      <mass value="0.732421875" />
+      <inertia ixx="0.00077486038208007812" ixy="0" ixz="0" iyy="0.0011920928955078125" iyz="0" izz="0.0014901161193847656" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0.03125" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/visual/base_link_0.stl" scale="1 1 1" />
+      </geometry>
+      <material name="base_link_color">
+        <color rgba="0.69999999999999996 0.69999999999999996 0.71999999999999997 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.03125" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/collision/base_link_0.stl" scale="1 1 1" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="arm_link">
+    <inertial>
+      <origin xyz="0 0 0.09375" rpy="0 0 0" />
+      <mass value="0.732421875" />
+      <inertia ixx="0.002384185791015625" ixy="0" ixz="0" iyy="0.002384185791015625" iyz="0" izz="0.000476837158203125" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0.09375" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/visual/arm_link_0.stl" scale="1 1 1" />
+      </geometry>
+      <material name="arm_link_color">
+        <color rgba="0.69999999999999996 0.69999999999999996 0.71999999999999997 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.09375" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/collision/arm_link_0.stl" scale="1 1 1" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="shoulder_joint" type="revolute">
+    <parent link="base_link" />
+    <child link="arm_link" />
+    <origin xyz="0 0 0.0625" rpy="0 0 0" />
+    <axis xyz="0 1 0" />
+    <limit effort="8" lower="-1.25" upper="1.25" velocity="4" />
+    <dynamics damping="0.040000000000000001" friction="0" />
+  </joint>
+  <link name="tool" />
+  <joint name="tool_fixed" type="fixed">
+    <parent link="arm_link" />
+    <child link="tool" />
+    <origin xyz="0 0 0.1875" rpy="0 0 0" />
+  </joint>
+</robot>

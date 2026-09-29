@@ -1,0 +1,1250 @@
+{
+  "blockers": [],
+  "checks": [
+    {
+      "checked": [],
+      "details": {
+        "differences": [],
+        "fields": [],
+        "input_schema": "description.scene/v1",
+        "output_schema": "description.robot/v1"
+      },
+      "expected": [],
+      "id": "source.derivation",
+      "missing": [],
+      "status": "passed",
+      "version": 1
+    },
+    {
+      "checked": [
+        "arm",
+        "base"
+      ],
+      "details": {
+        "declared": true,
+        "excluded": []
+      },
+      "expected": [
+        "arm",
+        "base"
+      ],
+      "id": "source.coverage",
+      "missing": [],
+      "status": "passed",
+      "version": 1
+    },
+    {
+      "checked": [],
+      "details": {
+        "evidence_class": "fixture"
+      },
+      "expected": [],
+      "id": "source.native",
+      "missing": [],
+      "status": "not_applicable",
+      "version": 1
+    },
+    {
+      "checked": [
+        "arm_link",
+        "base_link",
+        "tool"
+      ],
+      "details": [
+        {
+          "object": "base_link",
+          "passed": true
+        },
+        {
+          "object": "arm_link",
+          "passed": true
+        }
+      ],
+      "expected": [
+        "arm_link",
+        "base_link",
+        "tool"
+      ],
+      "id": "urdf.links",
+      "missing": [],
+      "status": "passed",
+      "version": 1
+    },
+    {
+      "checked": [
+        "shoulder_joint",
+        "tool_fixed"
+      ],
+      "details": [
+        {
+          "object": "shoulder_joint",
+          "passed": true
+        }
+      ],
+      "expected": [
+        "shoulder_joint",
+        "tool_fixed"
+      ],
+      "id": "urdf.joints",
+      "missing": [],
+      "status": "passed",
+      "version": 1
+    },
+    {
+      "checked": [],
+      "details": [
+        {
+          "object": "tool",
+          "passed": true
+        }
+      ],
+      "expected": [],
+      "id": "urdf.frames",
+      "missing": [],
+      "status": "passed",
+      "version": 1
+    },
+    {
+      "checked": [],
+      "details": [
+        {
+          "object": "shoulder_joint",
+          "passed": true
+        }
+      ],
+      "expected": [],
+      "id": "urdf.dynamics_mimic",
+      "missing": [],
+      "status": "passed",
+      "version": 1
+    },
+    {
+      "checked": [],
+      "details": [
+        {
+          "object": "base_link/visuals",
+          "passed": true
+        },
+        {
+          "object": "base_link/collisions",
+          "passed": true
+        },
+        {
+          "object": "arm_link/visuals",
+          "passed": true
+        },
+        {
+          "object": "arm_link/collisions",
+          "passed": true
+        }
+      ],
+      "expected": [],
+      "id": "urdf.geometry",
+      "missing": [],
+      "status": "passed",
+      "version": 1
+    },
+    {
+      "checked": [],
+      "details": {},
+      "expected": [],
+      "id": "bundle.interfaces",
+      "missing": [],
+      "status": "passed",
+      "version": 1
+    },
+    {
+      "checked": [],
+      "details": "Kinematic qualification does not attest contact behavior",
+      "expected": [],
+      "id": "simulation.collision_policy",
+      "missing": [],
+      "status": "not_applicable",
+      "version": 1
+    },
+    {
+      "checked": [
+        "arm_link",
+        "base_link"
+      ],
+      "details": {
+        "coverage": {
+          "applicable": [
+            "arm_link",
+            "base_link"
+          ],
+          "failed": [],
+          "not_applicable": [],
+          "not_run": [],
+          "ok": true,
+          "passed": [
+            "arm_link",
+            "base_link"
+          ]
+        },
+        "links": [
+          {
+            "claimed": true,
+            "com_error_m": 0.0,
+            "density_kg_m3": 1000.0,
+            "expected_tensor": [
+              [
+                0.0007748603820800781,
+                0.0,
+                0.0
+              ],
+              [
+                0.0,
+                0.0011920928955078125,
+                0.0
+              ],
+              [
+                0.0,
+                0.0,
+                0.0014901161193847656
+              ]
+            ],
+            "geometry": [
+              "mesh"
+            ],
+            "geometry_com_m": [
+              0.0,
+              0.0,
+              0.03125
+            ],
+            "model_tensor": [
+              [
+                0.0007748603820800781,
+                0.0,
+                0.0
+              ],
+              [
+                0.0,
+                0.0011920928955078125,
+                0.0
+              ],
+              [
+                0.0,
+                0.0,
+                0.0014901161193847656
+              ]
+            ],
+            "object": "base_link",
+            "overlap_declared": null,
+            "status": "passed",
+            "tensor_error": 0.0,
+            "tolerances": {
+              "inertia_atol": 1e-10,
+              "tensor_tolerance": 2.0596970801318876e-06,
+              "uniform_density_com_atol_m": 1e-06,
+              "uniform_density_rtol": 0.001
+            },
+            "volume_m3": 0.000732421875
+          },
+          {
+            "claimed": true,
+            "com_error_m": 0.0,
+            "density_kg_m3": 1000.0,
+            "expected_tensor": [
+              [
+                0.002384185791015625,
+                0.0,
+                0.0
+              ],
+              [
+                0.0,
+                0.002384185791015625,
+                0.0
+              ],
+              [
+                0.0,
+                0.0,
+                0.000476837158203125
+              ]
+            ],
+            "geometry": [
+              "mesh"
+            ],
+            "geometry_com_m": [
+              0.0,
+              0.0,
+              0.09375
+            ],
+            "model_tensor": [
+              [
+                0.002384185791015625,
+                0.0,
+                0.0
+              ],
+              [
+                0.0,
+                0.002384185791015625,
+                0.0
+              ],
+              [
+                0.0,
+                0.0,
+                0.000476837158203125
+              ]
+            ],
+            "object": "arm_link",
+            "overlap_declared": null,
+            "status": "passed",
+            "tensor_error": 0.0,
+            "tolerances": {
+              "inertia_atol": 1e-10,
+              "tensor_tolerance": 3.4053984373773813e-06,
+              "uniform_density_com_atol_m": 1e-06,
+              "uniform_density_rtol": 0.001
+            },
+            "volume_m3": 0.000732421875
+          }
+        ]
+      },
+      "expected": [
+        "arm_link",
+        "base_link"
+      ],
+      "id": "physics.uniform_density_oracle",
+      "missing": [],
+      "status": "passed",
+      "version": 1
+    },
+    {
+      "checked": [],
+      "details": {
+        "code": "URDF408",
+        "context": {
+          "sha256": "0710cb2b9c4e8859"
+        },
+        "message": "2 个网格文件内容相同：base_link_0.stl, base_link_0.stl",
+        "severity": "info"
+      },
+      "expected": [],
+      "id": "URDF408",
+      "missing": [],
+      "status": "passed",
+      "version": 1
+    },
+    {
+      "checked": [],
+      "details": {
+        "code": "URDF408",
+        "context": {
+          "sha256": "ca8c82e79c0b123d"
+        },
+        "message": "2 个网格文件内容相同：arm_link_0.stl, arm_link_0.stl",
+        "severity": "info"
+      },
+      "expected": [],
+      "id": "URDF408",
+      "missing": [],
+      "status": "passed",
+      "version": 1
+    },
+    {
+      "checked": [],
+      "details": {
+        "format": "robot include and optional ground"
+      },
+      "expected": [],
+      "id": "consumer.scene_contract",
+      "missing": [],
+      "status": "passed",
+      "version": 1
+    },
+    {
+      "checked": [],
+      "details": {
+        "nq": 1,
+        "nu": 0,
+        "nv": 1,
+        "version": "3.13.0"
+      },
+      "expected": [],
+      "id": "consumer.compile",
+      "missing": [],
+      "status": "passed",
+      "version": 1
+    },
+    {
+      "checked": [
+        "arm_link",
+        "base_link"
+      ],
+      "details": [
+        {
+          "compiled_tensor": [
+            [
+              0.002384185791015625,
+              0.0,
+              0.0
+            ],
+            [
+              0.0,
+              0.002384185791015625,
+              0.0
+            ],
+            [
+              0.0,
+              0.0,
+              0.000476837158203125
+            ]
+          ],
+          "expected_tensor": [
+            [
+              0.002384185791015625,
+              0.0,
+              0.0
+            ],
+            [
+              0.0,
+              0.002384185791015625,
+              0.0
+            ],
+            [
+              0.0,
+              0.0,
+              0.000476837158203125
+            ]
+          ],
+          "object": "arm_link",
+          "passed": true,
+          "tensor_error_kg_m2": 0.0
+        },
+        {
+          "compiled_tensor": [
+            [
+              0.0007748603820800844,
+              0.0,
+              0.0
+            ],
+            [
+              0.0,
+              0.001192092895507822,
+              0.0
+            ],
+            [
+              0.0,
+              0.0,
+              0.0014901161193847773
+            ]
+          ],
+          "expected_tensor": [
+            [
+              0.0007748603820800781,
+              0.0,
+              0.0
+            ],
+            [
+              0.0,
+              0.0011920928955078125,
+              0.0
+            ],
+            [
+              0.0,
+              0.0,
+              0.0014901161193847656
+            ]
+          ],
+          "object": "base_link",
+          "passed": true,
+          "tensor_error_kg_m2": 1.6361038279071758e-17
+        }
+      ],
+      "expected": [
+        "arm_link",
+        "base_link"
+      ],
+      "id": "consumer.inertia",
+      "missing": [],
+      "status": "passed",
+      "version": 1
+    },
+    {
+      "checked": [
+        "shoulder_joint"
+      ],
+      "details": [
+        {
+          "object": "shoulder_joint",
+          "passed": true
+        }
+      ],
+      "expected": [
+        "shoulder_joint"
+      ],
+      "id": "consumer.joints",
+      "missing": [],
+      "status": "passed",
+      "version": 1
+    },
+    {
+      "checked": [],
+      "details": {
+        "contact_policy": "all_samples",
+        "file": null,
+        "note": "no validation poses declared: the legacy all-sample contact policy applies",
+        "poses": [],
+        "reset_source": "default_qpos"
+      },
+      "expected": [],
+      "id": "consumer.validation_poses",
+      "missing": [],
+      "status": "not_applicable",
+      "version": 1
+    },
+    {
+      "checked": [],
+      "details": [
+        {
+          "object": "base_link_visuals_0",
+          "passed": true,
+          "position_or_bounds_error_m": 3.363037852658522e-16
+        },
+        {
+          "object": "base_link_collisions_0",
+          "passed": true,
+          "position_or_bounds_error_m": 3.363037852658522e-16
+        },
+        {
+          "object": "arm_link_visuals_0",
+          "passed": true,
+          "position_or_bounds_error_m": 0.0
+        },
+        {
+          "object": "arm_link_collisions_0",
+          "passed": true,
+          "position_or_bounds_error_m": 0.0
+        }
+      ],
+      "expected": [],
+      "id": "consumer.geometry",
+      "missing": [],
+      "status": "passed",
+      "version": 1
+    },
+    {
+      "checked": [
+        "arm_link",
+        "base_link",
+        "tool"
+      ],
+      "details": {
+        "base_poses": [],
+        "position_error_m": 5.551115123125783e-17,
+        "rotation_matrix_error": 3.1401849173675503e-16,
+        "samples": [
+          {
+            "shoulder_joint": 0.0
+          },
+          {
+            "shoulder_joint": -1.225
+          },
+          {
+            "shoulder_joint": 0.0
+          },
+          {
+            "shoulder_joint": 1.225
+          },
+          {
+            "shoulder_joint": 0.34240421830363577
+          },
+          {
+            "shoulder_joint": -0.5755332155903242
+          },
+          {
+            "shoulder_joint": -1.1475661901595133
+          },
+          {
+            "shoulder_joint": -1.2086809111786772
+          },
+          {
+            "shoulder_joint": 0.7831755980006809
+          },
+          {
+            "shoulder_joint": 1.0318889431943044
+          },
+          {
+            "shoulder_joint": 0.26658943941794977
+          },
+          {
+            "shoulder_joint": 0.573741402459996
+          },
+          {
+            "shoulder_joint": 0.10906247866355723
+          },
+          {
+            "shoulder_joint": 1.0876810594694204
+          },
+          {
+            "shoulder_joint": 0.7896338853038305
+          },
+          {
+            "shoulder_joint": -1.2431537495746299
+          }
+        ]
+      },
+      "expected": [
+        "arm_link",
+        "base_link",
+        "tool"
+      ],
+      "id": "consumer.kinematics",
+      "missing": [],
+      "status": "passed",
+      "version": 1
+    },
+    {
+      "checked": [],
+      "details": {
+        "atol": 1e-08,
+        "oracle": "URDF rigid-body Jacobians; full mass matrix and zero-velocity gravity forces",
+        "rtol": 1e-06,
+        "samples": [
+          {
+            "gravity_force_max_abs_error": 0.0,
+            "mass_matrix_max_abs_error": 0.0,
+            "passed": true,
+            "pose": 0
+          },
+          {
+            "gravity_force_max_abs_error": 0.0,
+            "mass_matrix_max_abs_error": 0.0,
+            "passed": true,
+            "pose": 1
+          },
+          {
+            "gravity_force_max_abs_error": 0.0,
+            "mass_matrix_max_abs_error": 0.0,
+            "passed": true,
+            "pose": 2
+          },
+          {
+            "gravity_force_max_abs_error": 0.0,
+            "mass_matrix_max_abs_error": 0.0,
+            "passed": true,
+            "pose": 3
+          },
+          {
+            "gravity_force_max_abs_error": 2.7755575615628914e-17,
+            "mass_matrix_max_abs_error": 1.734723475976807e-18,
+            "passed": true,
+            "pose": 4
+          },
+          {
+            "gravity_force_max_abs_error": 0.0,
+            "mass_matrix_max_abs_error": 3.469446951953614e-18,
+            "passed": true,
+            "pose": 5
+          },
+          {
+            "gravity_force_max_abs_error": 1.1102230246251565e-16,
+            "mass_matrix_max_abs_error": 0.0,
+            "passed": true,
+            "pose": 6
+          },
+          {
+            "gravity_force_max_abs_error": 0.0,
+            "mass_matrix_max_abs_error": 3.469446951953614e-18,
+            "passed": true,
+            "pose": 7
+          },
+          {
+            "gravity_force_max_abs_error": 1.6653345369377348e-16,
+            "mass_matrix_max_abs_error": 6.938893903907228e-18,
+            "passed": true,
+            "pose": 8
+          },
+          {
+            "gravity_force_max_abs_error": 0.0,
+            "mass_matrix_max_abs_error": 0.0,
+            "passed": true,
+            "pose": 9
+          },
+          {
+            "gravity_force_max_abs_error": 5.551115123125783e-17,
+            "mass_matrix_max_abs_error": 0.0,
+            "passed": true,
+            "pose": 10
+          },
+          {
+            "gravity_force_max_abs_error": 1.6653345369377348e-16,
+            "mass_matrix_max_abs_error": 3.469446951953614e-18,
+            "passed": true,
+            "pose": 11
+          },
+          {
+            "gravity_force_max_abs_error": 0.0,
+            "mass_matrix_max_abs_error": 1.734723475976807e-18,
+            "passed": true,
+            "pose": 12
+          },
+          {
+            "gravity_force_max_abs_error": 0.0,
+            "mass_matrix_max_abs_error": 0.0,
+            "passed": true,
+            "pose": 13
+          },
+          {
+            "gravity_force_max_abs_error": 0.0,
+            "mass_matrix_max_abs_error": 0.0,
+            "passed": true,
+            "pose": 14
+          },
+          {
+            "gravity_force_max_abs_error": 1.1102230246251565e-16,
+            "mass_matrix_max_abs_error": 3.469446951953614e-18,
+            "passed": true,
+            "pose": 15
+          }
+        ]
+      },
+      "expected": [],
+      "id": "consumer.dynamics",
+      "missing": [],
+      "status": "passed",
+      "version": 1
+    },
+    {
+      "checked": [],
+      "details": {
+        "error": null,
+        "fk_samples": 16,
+        "max_penetration_m": 0.001,
+        "policy": "all_samples",
+        "poses_checked": 16,
+        "violations": [
+          {
+            "depth_m": 0.02940018247418375,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-1",
+            "position": [
+              -0.010592061673003667,
+              -0.03125,
+              0.047799908762908426
+            ]
+          },
+          {
+            "depth_m": 0.02940018247418375,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-1",
+            "position": [
+              -0.010592061673003667,
+              0.03125,
+              0.047799908762908426
+            ]
+          },
+          {
+            "depth_m": 0.02940018247418375,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-3",
+            "position": [
+              0.010592061673003667,
+              0.03125,
+              0.047799908762908426
+            ]
+          },
+          {
+            "depth_m": 0.02940018247418375,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-3",
+            "position": [
+              0.010592061673003667,
+              -0.03125,
+              0.047799908762908426
+            ]
+          },
+          {
+            "depth_m": 0.010492272317450438,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-4",
+            "position": [
+              0.02943594268265358,
+              0.03125,
+              0.05725386384127497
+            ]
+          },
+          {
+            "depth_m": 0.010492272317450438,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-4",
+            "position": [
+              0.02943594268265358,
+              -0.03125,
+              0.05725386384127497
+            ]
+          },
+          {
+            "depth_m": 0.01700881824281661,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-5",
+            "position": [
+              -0.026215693810823223,
+              0.031249999999999997,
+              0.053995590878591924
+            ]
+          },
+          {
+            "depth_m": 0.01700881824281661,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-5",
+            "position": [
+              -0.026215693810823223,
+              -0.031249999999999997,
+              0.053995590878591924
+            ]
+          },
+          {
+            "depth_m": 0.028492720535725272,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-6",
+            "position": [
+              -0.012834616335250251,
+              -0.03125,
+              0.048253639732137664
+            ]
+          },
+          {
+            "depth_m": 0.028492720535725272,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-6",
+            "position": [
+              -0.012834616335250251,
+              0.03125,
+              0.048253639732137664
+            ]
+          },
+          {
+            "depth_m": 0.02922342261746763,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-7",
+            "position": [
+              -0.011070414198253636,
+              -0.03125,
+              0.04788828869126649
+            ]
+          },
+          {
+            "depth_m": 0.02922342261746763,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-7",
+            "position": [
+              -0.011070414198253636,
+              0.03125,
+              0.04788828869126649
+            ]
+          },
+          {
+            "depth_m": 0.022047920154235016,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-8",
+            "position": [
+              0.022146144514846977,
+              -0.031249999999999997,
+              0.05147603992288275
+            ]
+          },
+          {
+            "depth_m": 0.022047920154235016,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-8",
+            "position": [
+              0.022146144514846977,
+              0.031249999999999997,
+              0.05147603992288275
+            ]
+          },
+          {
+            "depth_m": 0.02682093508428941,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-9",
+            "position": [
+              0.0160374543243105,
+              -0.03125,
+              0.04908953245785558
+            ]
+          },
+          {
+            "depth_m": 0.02682093508428941,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-9",
+            "position": [
+              0.0160374543243105,
+              0.03125,
+              0.04908953245785558
+            ]
+          },
+          {
+            "depth_m": 0.008232590397924558,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-10",
+            "position": [
+              0.03014609353365711,
+              -0.03125,
+              0.0583837048010379
+            ]
+          },
+          {
+            "depth_m": 0.008232590397924558,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-10",
+            "position": [
+              0.03014609353365711,
+              0.03125,
+              0.0583837048010379
+            ]
+          },
+          {
+            "depth_m": 0.016961817339361168,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-11",
+            "position": [
+              0.026246128334406833,
+              -0.031249999999999997,
+              0.054019091330319645
+            ]
+          },
+          {
+            "depth_m": 0.016961817339361168,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-11",
+            "position": [
+              0.026246128334406833,
+              0.031249999999999997,
+              0.054019091330319645
+            ]
+          },
+          {
+            "depth_m": 0.003401449927492375,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-12",
+            "position": [
+              0.031064330644499056,
+              -0.03125,
+              0.06079927503625396
+            ]
+          },
+          {
+            "depth_m": 0.003401449927492375,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-12",
+            "position": [
+              0.031064330644499056,
+              0.03125,
+              0.06079927503625396
+            ]
+          },
+          {
+            "depth_m": 0.02767350173244286,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-13",
+            "position": [
+              0.014516879894264298,
+              0.03125,
+              0.04866324913377886
+            ]
+          },
+          {
+            "depth_m": 0.02767350173244286,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-13",
+            "position": [
+              0.014516879894264298,
+              -0.03125,
+              0.04866324913377886
+            ]
+          },
+          {
+            "depth_m": 0.022190485521925492,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-14",
+            "position": [
+              0.022003291851475884,
+              -0.03125,
+              0.051404757239037514
+            ]
+          },
+          {
+            "depth_m": 0.022190485521925492,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-14",
+            "position": [
+              0.022003291851475884,
+              0.03125,
+              0.051404757239037514
+            ]
+          },
+          {
+            "depth_m": 0.029587613139093742,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-15",
+            "position": [
+              -0.010056622133268314,
+              -0.03125,
+              0.04770619343045343
+            ]
+          },
+          {
+            "depth_m": 0.029587613139093742,
+            "geom1": 1,
+            "geom2": 3,
+            "pose": "sample-15",
+            "position": [
+              -0.010056622133268314,
+              0.03125,
+              0.04770619343045343
+            ]
+          }
+        ]
+      },
+      "expected": [],
+      "id": "consumer.contacts",
+      "missing": [],
+      "status": "not_applicable",
+      "version": 1
+    },
+    {
+      "checked": [],
+      "details": [
+        {
+          "actual": [],
+          "expected": [],
+          "object": "actuators",
+          "passed": true
+        },
+        {
+          "actual": [],
+          "expected": [],
+          "object": "sensors",
+          "passed": true
+        },
+        {
+          "object": "contact_excludes",
+          "passed": true
+        },
+        {
+          "object": "mimic_equalities",
+          "passed": true
+        }
+      ],
+      "expected": [],
+      "id": "consumer.interfaces",
+      "missing": [],
+      "status": "passed",
+      "version": 1
+    },
+    {
+      "checked": [],
+      "details": {
+        "declared": null,
+        "objects": [
+          {
+            "object": "base_link_collisions_0",
+            "passed": false
+          },
+          {
+            "object": "arm_link_collisions_0",
+            "passed": false
+          }
+        ]
+      },
+      "expected": [],
+      "id": "consumer.contact_parameters",
+      "missing": [],
+      "status": "not_applicable",
+      "version": 1
+    },
+    {
+      "checked": [],
+      "details": {},
+      "expected": [],
+      "id": "consumer.scene",
+      "missing": [],
+      "status": "passed",
+      "version": 1
+    },
+    {
+      "checked": [],
+      "details": {
+        "error": null,
+        "finite": true,
+        "max_penetration_m": 0.001,
+        "pose_source": "default_qpos",
+        "start_min_contact_m": null,
+        "steps": 100,
+        "warning_counts": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "expected": [],
+      "id": "consumer.reset_step",
+      "missing": [],
+      "status": "passed",
+      "version": 1
+    }
+  ],
+  "environment": {
+    "PyYAML": "6.0.3",
+    "jsonschema": "4.26.0",
+    "mimicverse-description": "0.3.15",
+    "mujoco": "3.13.0",
+    "numpy": "2.5.3",
+    "platform": "Linux-7.0.0-31-generic-x86_64-with-glibc2.43",
+    "python": "3.12.14"
+  },
+  "evidence_scope": {
+    "execution": "frozen_snapshot_replay",
+    "live_cad_connection_tested": false,
+    "sampling": "Conclusions cover recorded samples and conditions, not the continuous workspace",
+    "source_evidence_class": "fixture",
+    "source_identity": {
+      "fixture": true,
+      "robot": "mesh-arm"
+    }
+  },
+  "execution": {
+    "generation": "executed",
+    "generation_key": "e47540bb5c5b2d43af1e35b46536e471ca7831faeb46683c22ddeb4cf16a2c91",
+    "verification": "executed"
+  },
+  "files": {
+    "config/consumer.json": "93850cf0db56d9e3fea80c2db3cf6c3c9bbf0177a1d6e57f806b748748ceb5c3",
+    "config/joint_names.yaml": "b93448eb83d7c763b4e981796d16d44532f4d4d46a7aa013c7f1187c4f14a79d",
+    "config/profiles/hardware.json": "349c5a4ba38c82d6fb182413ec210e11c84e1c376b3437ea9ac7cc745452aae2",
+    "config/profiles/kinematics.json": "4255b15b284b25d0b6f53ff44a42538f6c04f926f6422841548f62498f4157a3",
+    "config/profiles/simulation.json": "c561d142b65a5fd406e9e6153e6c3f48f8e5368d31ed61794172b2be9f8b5b39",
+    "config/profiles/training.json": "cb8137ab6221719ec1abbc69ba9f29a134ba1d7844cbdcaf0263f8ffb3839cb4",
+    "config/robot.yaml": "f39ee0e9de7468c79cb0c7ee3f16fbd153c9094166acbe3fb6faadd88b0a00c6",
+    "config/toolchain.lock.json": "92abb9736ef715f1e20616b171ed9a9546fa808aff4f031dff83b9433a9f3a1c",
+    "docs/decisions.md": "eebd6e6a2ea9bb61bdb8a56a74d98e867b9d5ef7e97770477d5ee57071ab78e3",
+    "meshes/collision/arm_link_0.stl": "ca8c82e79c0b123d4df90add9f90775efd7162daf0f253085431d71c9b0e4d90",
+    "meshes/collision/base_link_0.stl": "0710cb2b9c4e885933881598c961ea8c46a61d1887d0540ae6def39dd376f023",
+    "meshes/visual/arm_link_0.stl": "ca8c82e79c0b123d4df90add9f90775efd7162daf0f253085431d71c9b0e4d90",
+    "meshes/visual/base_link_0.stl": "0710cb2b9c4e885933881598c961ea8c46a61d1887d0540ae6def39dd376f023",
+    "mjcf/robot.xml": "ac9166d07e15e07d8baa533dc464d781b3ee3eaeca94c1f36cc211de066af493",
+    "mjcf/scene.xml": "2983976a743c14ec2a5b1755c7adaa8c79420b739a1bb125cddc04536562edb0",
+    "model/mapping.json": "53e8d3aadee0ebc79668883897ef6d2a571a61bdaeb6ad2a80751c47eba74040",
+    "model/robot.json": "7a4d5eae27d0d5172e400b404f4c5c1a4e1ab8b84490b348089ce0346817c967",
+    "sources/fixture/geometry/parts/arm.stl": "ca8c82e79c0b123d4df90add9f90775efd7162daf0f253085431d71c9b0e4d90",
+    "sources/fixture/geometry/parts/base.stl": "0710cb2b9c4e885933881598c961ea8c46a61d1887d0540ae6def39dd376f023",
+    "sources/fixture/manifest.json": "c198308d213d71d7e0c8e1e69d047ed2f63033a33da7360f5e54e173b9c5f0c7",
+    "sources/fixture/scene.json": "48c61a0d235494b646515e1bc7c24f315d2a049abac71edbbf06f06a39a16034",
+    "sources/snapshots/c198308d213d71d7e0c8e1e69d047ed2f63033a33da7360f5e54e173b9c5f0c7/geometry/parts/arm.stl": "ca8c82e79c0b123d4df90add9f90775efd7162daf0f253085431d71c9b0e4d90",
+    "sources/snapshots/c198308d213d71d7e0c8e1e69d047ed2f63033a33da7360f5e54e173b9c5f0c7/geometry/parts/base.stl": "0710cb2b9c4e885933881598c961ea8c46a61d1887d0540ae6def39dd376f023",
+    "sources/snapshots/c198308d213d71d7e0c8e1e69d047ed2f63033a33da7360f5e54e173b9c5f0c7/manifest.json": "c198308d213d71d7e0c8e1e69d047ed2f63033a33da7360f5e54e173b9c5f0c7",
+    "sources/snapshots/c198308d213d71d7e0c8e1e69d047ed2f63033a33da7360f5e54e173b9c5f0c7/scene.json": "48c61a0d235494b646515e1bc7c24f315d2a049abac71edbbf06f06a39a16034",
+    "sources/source.lock.json": "a77d6abeaeb0262191b51b9f10c04fec5c5cc1cf353ffa15ab1168af49ab43fb",
+    "urdf/robot.urdf": "e1c90d10b227123648501641a318665ecefec072ba3cd9ab1ea31dd972620b30"
+  },
+  "hardware_id": "mesh-arm",
+  "passed": true,
+  "profile": {
+    "acceptance_suites": [],
+    "consumer_environment": {},
+    "contact": null,
+    "dynamics_atol": 1e-08,
+    "dynamics_rtol": 1e-06,
+    "gravity": [
+      0,
+      0,
+      -9.81
+    ],
+    "ground": false,
+    "inertia_atol": 1e-10,
+    "inertia_rtol": 1e-06,
+    "penetration_m": 0.001,
+    "position_atol": 1e-07,
+    "purpose": "kinematics",
+    "random_poses": 12,
+    "require_native_source": false,
+    "root_mode": "fixed",
+    "rotation_atol": 1e-07,
+    "schema_version": "description.profile/v1",
+    "seed": 0,
+    "steps": 100,
+    "timestep": 0.002,
+    "uniform_density_com_atol_m": 1e-06,
+    "uniform_density_rtol": 0.001,
+    "validation_poses": null
+  },
+  "profile_digest": "4255b15b284b25d0b6f53ff44a42538f6c04f926f6422841548f62498f4157a3",
+  "profile_name": "kinematics",
+  "qualified_for": [
+    "kinematics"
+  ],
+  "schema_version": "description.quality/v1",
+  "source": {
+    "evidence_class": "fixture",
+    "manifest_digest": "c198308d213d71d7e0c8e1e69d047ed2f63033a33da7360f5e54e173b9c5f0c7",
+    "provider": "fixture",
+    "schema_version": "description.source-lock/v1",
+    "snapshot": "sources/snapshots/c198308d213d71d7e0c8e1e69d047ed2f63033a33da7360f5e54e173b9c5f0c7",
+    "source_config_digest": "3c8b2a83f1f75b6b1b29825b1e02434971dc16dc5aaf5435a0678054f91247b0"
+  },
+  "subject": "516b3f04c42ec9178c7014b2a5416eeea8d3f3197a256617e1139b79eee7541b",
+  "toolchain": {
+    "dependencies": {
+      "absl-py": "2.5.0",
+      "attrs": "26.1.0",
+      "etils": "1.14.0",
+      "fsspec": "2026.9.0",
+      "glfw": "2.10.2",
+      "jsonschema": "4.26.0",
+      "jsonschema-specifications": "2025.9.1",
+      "mujoco": "3.13.0",
+      "numpy": "2.5.3",
+      "packaging": "26.3",
+      "pyopengl": "3.1.10",
+      "pyyaml": "6.0.3",
+      "referencing": "0.37.0",
+      "rpds-py": "2026.6.3",
+      "typing-extensions": "4.16.0",
+      "zipp": "4.1.0"
+    },
+    "development": false,
+    "package_digest": "73c92367be7095cc75a2c337347fe53b98e5830d373425833b6eee2543a80902",
+    "platform": {
+      "implementation": "CPython",
+      "machine": "x86_64",
+      "system": "Linux"
+    },
+    "python": "3.12.14",
+    "schema_version": "description.toolchain/v1",
+    "source_commit": "5d681fdbb6e7b2d90b1e7be2ab3a3a244dbce54d",
+    "version": "0.3.15"
+  }
+}

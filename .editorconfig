@@ -1,0 +1,21 @@
+# 仓库级编辑器配置：与 ruff format（ruff.toml）保持一致，避免编辑器各写各的。
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.py]
+indent_style = space
+indent_size = 4
+max_line_length = 120
+
+[*.{json,toml,yaml,yml,ps1}]
+indent_style = space
+indent_size = 2
+
+[*.md]
+# Markdown 里行尾两个空格表示硬换行，不能裁掉。
+trim_trailing_whitespace = false

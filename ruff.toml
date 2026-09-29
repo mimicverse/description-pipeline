@@ -1,0 +1,43 @@
+# 开发期静态检查配置（ruff 只用于开发与 CI）。
+# 风格与正确性都强制：行长 120；历史 SolidWorks 兼容层保留原 typing 风格。
+line-length = 120
+target-version = "py312"
+
+[lint]
+select = [
+  "E",     # pycodestyle 错误（含 E501 行长、E4 导入结构）
+  "W",     # pycodestyle 警告
+  "F",     # pyflakes：未定义名、未用导入、f-string 问题
+  "B",     # bugbear：异常链、zip strict、循环变量等
+  "UP",    # pyupgrade：printf 格式化、typing 现代化、冗余 open 模式
+  "SIM",   # 可简化的等价写法
+  "C4",    # 推导式清理
+  "PIE",   # 明显冗余代码
+  "RUF",   # ruff 自有规则：隐式 Optional、冗余类型转换、集合拼接等
+]
+
+ignore = [
+  # 中文注释与文案里的全角标点是刻意的，不按"易混 Unicode"报错。
+  "RUF001",
+  "RUF002",
+  "RUF003",
+  # 本仓库的 # noqa 常带理由文字（如 `# noqa: BLE001 - 网络瞬断重试`），
+  # RUF100 会把"当前未启用的规则"的注释整条删掉，等于抹掉这些说明。
+  "RUF100",
+]
+
+# 不启用 isort（I）：ruff 的导入排序会把带 `# noqa: E402` 的分组导入拆成多条语句
+# （见 tests/test_onshape*.py 的 sys.path 注入段），并在改写时丢掉这些必要注释。
+# 现有导入顺序（标准库 / 第三方 / 本项目）已经一致，收益低于扰动风险。
+
+[lint.per-file-ignores]
+# 历史兼容层保留 typing.* 与字符串化注解，避免无关迁移噪声：
+# PEP 585/604（3.9/3.10）与 datetime.UTC（3.11）现代化在后续清理兼容层时完成；当前统一运行时为 Python 3.12。
+"tools/solidworks_export/*.py" = ["UP006", "UP035", "UP037", "UP045", "UP017"]
+"tests/solidworks_export/*.py" = ["UP006", "UP035", "UP037", "UP045", "UP017"]
+
+[format]
+# 仓库统一的格式化器（与 lint 共用上面的 line-length = 120）。
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"

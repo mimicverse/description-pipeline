@@ -1,0 +1,125 @@
+name: Simulation acceptance
+run-name: accept ${{ inputs.subject }} (simulation)
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_sha:
+        description: Full 40-character asset commit SHA
+        required: true
+        type: string
+      profile:
+        description: Declared model profile (must be a simulation profile)
+        required: true
+        default: simulation
+        type: string
+      subject:
+        description: Subject digest of the rebuilt simulation candidate (64 hex)
+        required: true
+        type: string
+
+env:
+  GIT_CONFIG_COUNT: 1
+  GIT_CONFIG_KEY_0: core.longpaths
+  GIT_CONFIG_VALUE_0: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: simulation-${{ inputs.model_sha }}-${{ inputs.profile }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    uses: ./.github/workflows/model-environment.yml
+    with:
+      model_sha: ${{ inputs.model_sha }}
+      profile: ${{ inputs.profile }}
+  accept:
+    needs: resolve
+    runs-on: ${{ needs.resolve.outputs.runner }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.resolve.outputs.driver_sha }}
+          fetch-depth: 0
+          path: driver
+          persist-credentials: false
+      # The model is read-only input: only data files are consumed, never executed.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.model_sha }}
+          lfs: true
+          path: model
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: ${{ needs.resolve.outputs.python }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.resolve.outputs.tool_sha }}
+          path: tooling
+          persist-credentials: false
+      - name: Install exact consumer environment
+        env:
+          REQUIREMENTS: ${{ needs.resolve.outputs.requirements }}
+        run: |
+          python -m pip install -r "tooling/$REQUIREMENTS"
+          python -m pip install setuptools==84.0.0 wheel==0.46.3
+          python -m pip install --no-deps --no-build-isolation -e ./tooling
+      # The model is usually published under another profile; the trusted tool turns the
+      # same commit into the simulation candidate this run measures.  Only the external
+      # attestation may still be pending.
+      - name: Hold the simulation candidate
+        env:
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          python driver/.github/scripts/build_simulation_candidate.py \
+            --root model \
+            --profile "$PROFILE" \
+            --destination result/candidate \
+            --report result/candidate-report.json
+      - name: Run the declared simulation acceptance
+        env:
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          python tooling/tools/run_simulation_acceptance.py \
+            --root "$CANDIDATE" \
+            --profile "$PROFILE" \
+            --config config/simulation-acceptance.json \
+            --external \
+            --out result/simulation
+      - name: Verify the produced record qualifies the dispatched subject
+        if: always()
+        env:
+          INPUT_MODEL_SHA: ${{ inputs.model_sha }}
+          INPUT_PROFILE: ${{ inputs.profile }}
+          INPUT_SUBJECT: ${{ inputs.subject }}
+        run: |
+          python driver/.github/scripts/verify_simulation_record.py \
+            --record result/simulation/acceptance.json \
+            --candidate "$CANDIDATE" \
+            --identity result/run-identity.json \
+            --driver driver
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: simulation-acceptance
+          path: result/simulation/
+          if-no-files-found: error
+      # Diagnostics stay in their own artifact: the evidence archive must keep
+      # acceptance.json at its root for a trusted run to verify it byte for byte.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: simulation-diagnostics
+          path: |
+            result/candidate-report.json
+            result/run-identity.json
+            result/simulation.failed-*/
+          if-no-files-found: ignore

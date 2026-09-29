@@ -1,0 +1,25 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mujoco model="robot">
+  <compiler angle="radian" eulerseq="XYZ" inertiafromgeom="false" fusestatic="false" />
+  <option timestep="0.002" gravity="0 0 -9.8100000000000005" />
+  <asset>
+    <mesh name="base_link_visuals_0" file="../meshes/visual/base_link_0.stl" scale="1 1 1" />
+    <mesh name="base_link_collisions_0" file="../meshes/collision/base_link_0.stl" scale="1 1 1" />
+    <mesh name="arm_link_visuals_0" file="../meshes/visual/arm_link_0.stl" scale="1 1 1" />
+    <mesh name="arm_link_collisions_0" file="../meshes/collision/arm_link_0.stl" scale="1 1 1" />
+  </asset>
+  <worldbody>
+    <body name="base_link" pos="0 0 0" euler="0 0 0">
+      <inertial mass="0.732421875" pos="0 0 0.03125" fullinertia="0.00077486038208007812 0.0011920928955078125 0.0014901161193847656 0 0 0" />
+      <geom name="base_link_visuals_0" pos="0 0 0.03125" euler="0 0 0" group="1" contype="0" conaffinity="0" density="0" type="mesh" mesh="base_link_visuals_0" rgba="0.69999999999999996 0.69999999999999996 0.71999999999999997 1" />
+      <geom name="base_link_collisions_0" pos="0 0 0.03125" euler="0 0 0" group="3" contype="1" conaffinity="1" density="0" type="mesh" mesh="base_link_collisions_0" rgba="0.69999999999999996 0.69999999999999996 0.71999999999999997 1" />
+      <body name="arm_link" pos="0 0 0.0625" euler="0 0 0">
+        <joint name="shoulder_joint" type="hinge" axis="0 1 0" limited="true" range="-1.25 1.25" actuatorfrclimited="true" actuatorfrcrange="-8 8" damping="0.040000000000000001" frictionloss="0" />
+        <inertial mass="0.732421875" pos="0 0 0.09375" fullinertia="0.002384185791015625 0.002384185791015625 0.000476837158203125 0 0 0" />
+        <geom name="arm_link_visuals_0" pos="0 0 0.09375" euler="0 0 0" group="1" contype="0" conaffinity="0" density="0" type="mesh" mesh="arm_link_visuals_0" rgba="0.69999999999999996 0.69999999999999996 0.71999999999999997 1" />
+        <geom name="arm_link_collisions_0" pos="0 0 0.09375" euler="0 0 0" group="3" contype="1" conaffinity="1" density="0" type="mesh" mesh="arm_link_collisions_0" rgba="0.69999999999999996 0.69999999999999996 0.71999999999999997 1" />
+        <site name="tool" pos="0 0 0.1875" euler="0 0 0" size="0.001" />
+      </body>
+    </body>
+  </worldbody>
+</mujoco>

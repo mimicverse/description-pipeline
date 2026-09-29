@@ -1,0 +1,8 @@
+{
+  "name": "description immutable delivery tags",
+  "target": "tag",
+  "enforcement": "active",
+  "bypass_actors": [],
+  "conditions": {"ref_name": {"include": ["refs/tags/tool/v*", "refs/tags/model/**"], "exclude": []}},
+  "rules": [{"type": "update"}, {"type": "deletion"}]
+}

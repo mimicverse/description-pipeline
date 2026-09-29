@@ -1,0 +1,8 @@
+{
+  "evidence_class": "fixture",
+  "manifest_digest": "07bd96714d49f1fd26d4176cf4d9caf2bb8c8d3e36a1d350136fa71354d66b64",
+  "provider": "fixture",
+  "schema_version": "description.source-lock/v1",
+  "snapshot": "sources/snapshots/07bd96714d49f1fd26d4176cf4d9caf2bb8c8d3e36a1d350136fa71354d66b64",
+  "source_config_digest": "3c8b2a83f1f75b6b1b29825b1e02434971dc16dc5aaf5435a0678054f91247b0"
+}

@@ -1,0 +1,112 @@
+"""Raw CAD shapes and the contact-layer protocol the freeze path depends on.
+
+The SolidWorks adapter is the only place that talks COM.  Everything above it
+works on these plain containers so the rest of the pipeline can run, and be
+tested, without Windows or SolidWorks.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from collections.abc import Sequence
+
+Matrix = tuple[
+    float,
+    float,
+    float,
+    float,
+    float,
+    float,
+    float,
+    float,
+    float,
+    float,
+    float,
+    float,
+    float,
+    float,
+    float,
+    float,
+]
+
+
+def identity() -> Matrix:
+    """A row-major 4x4 identity matrix."""
+
+    return (
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    )
+
+
+@dataclass
+class RawComponent:
+    """One SolidWorks component instance found while walking an assembly."""
+
+    name: str
+    path: str = ""
+    transform: Matrix = field(default_factory=identity)
+    is_fixed: bool = False
+    document_type: str = ""
+
+
+@dataclass
+class RawScene:
+    """Everything the contact layer read from one document, unmodified."""
+
+    document: str
+    components: list[RawComponent] = field(default_factory=list)
+    coordinate_systems: dict[str, Matrix] = field(default_factory=dict)
+    mass_properties: dict[str, dict] = field(default_factory=dict)
+    notes: dict[str, str] = field(default_factory=dict)
+
+
+class CadBackend:
+    """What the freeze path needs from a CAD host.
+
+    Implementations raise the errors in :mod:`.errors`; a missing environment is
+    reported as ``EnvironmentError_`` and never as an empty successful read.
+    """
+
+    name = "abstract"
+
+    def health(self) -> dict:
+        raise NotImplementedError
+
+    def list_documents(self) -> list[str]:
+        raise NotImplementedError
+
+    def open_document(self, path: str) -> dict:
+        raise NotImplementedError
+
+    def close_document(self, name: str, confirm: bool = False) -> dict:
+        raise NotImplementedError
+
+    def collect_scene(
+        self,
+        doc_path: str,
+        coordinate_systems: Sequence[str],
+        progress=None,
+        require_material: bool = True,
+    ) -> RawScene:
+        raise NotImplementedError
+
+    def export_component_mesh(self, component: str, dest_path: str, progress=None) -> dict:
+        raise NotImplementedError
+
+    def verify_sources_unchanged(self) -> dict[str, dict]:
+        raise NotImplementedError

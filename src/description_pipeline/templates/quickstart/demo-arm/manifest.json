@@ -1,0 +1,70 @@
+{
+  "acceptance": {},
+  "files": {
+    "config/consumer.json": "f43c0ff3e2cbe0b2ee8b9ca383361d182bd3c553a3edc31ba27f66e8328fe1f2",
+    "config/joint_names.yaml": "ecaec1b0f3413beedacca9b37ae11579b40074bcbbd388597d28a0cb8dbc78df",
+    "config/profiles/hardware.json": "349c5a4ba38c82d6fb182413ec210e11c84e1c376b3437ea9ac7cc745452aae2",
+    "config/profiles/kinematics.json": "4255b15b284b25d0b6f53ff44a42538f6c04f926f6422841548f62498f4157a3",
+    "config/profiles/simulation.json": "c561d142b65a5fd406e9e6153e6c3f48f8e5368d31ed61794172b2be9f8b5b39",
+    "config/profiles/training.json": "cb8137ab6221719ec1abbc69ba9f29a134ba1d7844cbdcaf0263f8ffb3839cb4",
+    "config/robot.yaml": "365ff227b980d4f7860a0f6de6ff1516c7dcb074c87c23d0136fc2b0ea1f4449",
+    "config/toolchain.lock.json": "92abb9736ef715f1e20616b171ed9a9546fa808aff4f031dff83b9433a9f3a1c",
+    "docs/decisions.md": "eebd6e6a2ea9bb61bdb8a56a74d98e867b9d5ef7e97770477d5ee57071ab78e3",
+    "mjcf/robot.xml": "a8693987f00ad5090a784bf488af7db51d7c1e1cda67168b44e881dcc5c567fa",
+    "mjcf/scene.xml": "2983976a743c14ec2a5b1755c7adaa8c79420b739a1bb125cddc04536562edb0",
+    "model/mapping.json": "31313d0d6afce2f89d33ef08d107746b9b588896a97d511a739db9e72b4d968d",
+    "model/robot.json": "57decb899130c5cff987e54e89d024ddbec91ba7b530631416f680a810e30622",
+    "sources/fixture/manifest.json": "07bd96714d49f1fd26d4176cf4d9caf2bb8c8d3e36a1d350136fa71354d66b64",
+    "sources/fixture/scene.json": "f2c8d643c76982f817ca9bb96d01459f42a30ecbcab003f2cce45c614d1b8eab",
+    "sources/snapshots/07bd96714d49f1fd26d4176cf4d9caf2bb8c8d3e36a1d350136fa71354d66b64/manifest.json": "07bd96714d49f1fd26d4176cf4d9caf2bb8c8d3e36a1d350136fa71354d66b64",
+    "sources/snapshots/07bd96714d49f1fd26d4176cf4d9caf2bb8c8d3e36a1d350136fa71354d66b64/scene.json": "f2c8d643c76982f817ca9bb96d01459f42a30ecbcab003f2cce45c614d1b8eab",
+    "sources/source.lock.json": "a1bbfd861d1b8b75df42aaed4365f78f06b896baf71c1058b9ee8c75e7486c30",
+    "urdf/robot.urdf": "d96e39d9bbcad540a473f450bde3a3e8c95ededeebf60991da2ce482bf685980"
+  },
+  "profile": "kinematics",
+  "reports": {
+    "docs/quality.json": "fb991372caf469f8583ffd8d697c92d8781e7b417c0eb48c37f1058e8d302d98",
+    "docs/quality.md": "5027eb7466834379724ce01fa0841e5f89d4fff8a3bd28a8de7074657c0fa202"
+  },
+  "schema_version": "description.bundle/v1",
+  "source": {
+    "evidence_class": "fixture",
+    "manifest_digest": "07bd96714d49f1fd26d4176cf4d9caf2bb8c8d3e36a1d350136fa71354d66b64",
+    "provider": "fixture",
+    "schema_version": "description.source-lock/v1",
+    "snapshot": "sources/snapshots/07bd96714d49f1fd26d4176cf4d9caf2bb8c8d3e36a1d350136fa71354d66b64",
+    "source_config_digest": "3c8b2a83f1f75b6b1b29825b1e02434971dc16dc5aaf5435a0678054f91247b0"
+  },
+  "subject": "afe5d1e96c3b85c861138b8e486bd31fc33b1cebecc681f54a8ddbf59c0223b9",
+  "toolchain": {
+    "dependencies": {
+      "absl-py": "2.5.0",
+      "attrs": "26.1.0",
+      "etils": "1.14.0",
+      "fsspec": "2026.9.0",
+      "glfw": "2.10.2",
+      "jsonschema": "4.26.0",
+      "jsonschema-specifications": "2025.9.1",
+      "mujoco": "3.13.0",
+      "numpy": "2.5.3",
+      "packaging": "26.3",
+      "pyopengl": "3.1.10",
+      "pyyaml": "6.0.3",
+      "referencing": "0.37.0",
+      "rpds-py": "2026.6.3",
+      "typing-extensions": "4.16.0",
+      "zipp": "4.1.0"
+    },
+    "development": false,
+    "package_digest": "73c92367be7095cc75a2c337347fe53b98e5830d373425833b6eee2543a80902",
+    "platform": {
+      "implementation": "CPython",
+      "machine": "x86_64",
+      "system": "Linux"
+    },
+    "python": "3.12.14",
+    "schema_version": "description.toolchain/v1",
+    "source_commit": "5d681fdbb6e7b2d90b1e7be2ab3a3a244dbce54d",
+    "version": "0.3.15"
+  }
+}

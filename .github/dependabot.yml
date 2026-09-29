@@ -1,0 +1,10 @@
+# 保持 CI 里按 SHA 固定的 action 有安全更新（更新后仍需人工过一遍 diff）。
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"

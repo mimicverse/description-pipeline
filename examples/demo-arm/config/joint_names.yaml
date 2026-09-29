@@ -1,0 +1,5 @@
+# Structural inspection order only; NOT controller, policy or hardware order.
+# demo-arm has two revolute joints; keep this list in the same order as the design.
+structural_joint_names:
+  - shoulder_joint
+  - elbow_joint

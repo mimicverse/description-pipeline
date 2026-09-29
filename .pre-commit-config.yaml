@@ -1,0 +1,18 @@
+# 可选的本地钩子：`pip install pre-commit && pre-commit install` 后生效。
+# 完整门禁仍是 `python tools/quality.py all`（CI 与提交前用的是同一套检查）。
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.8
+    hooks:
+      - id: ruff
+        args: ["--config", "ruff.toml", "--fix"]
+      - id: ruff-format
+        args: ["--config", "ruff.toml"]
+  - repo: local
+    hooks:
+      - id: quality-tests
+        name: 工具与模型回归（tools/quality.py test）
+        entry: python tools/quality.py test
+        language: system
+        pass_filenames: false
+        stages: [pre-push]

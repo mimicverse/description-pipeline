@@ -1,0 +1,31 @@
+{
+  "dependencies": {
+    "absl-py": "2.5.0",
+    "attrs": "26.1.0",
+    "etils": "1.14.0",
+    "fsspec": "2026.9.0",
+    "glfw": "2.10.2",
+    "jsonschema": "4.26.0",
+    "jsonschema-specifications": "2025.9.1",
+    "mujoco": "3.13.0",
+    "numpy": "2.5.3",
+    "packaging": "26.3",
+    "pyopengl": "3.1.10",
+    "pyyaml": "6.0.3",
+    "referencing": "0.37.0",
+    "rpds-py": "2026.6.3",
+    "typing-extensions": "4.16.0",
+    "zipp": "4.1.0"
+  },
+  "development": false,
+  "package_digest": "73c92367be7095cc75a2c337347fe53b98e5830d373425833b6eee2543a80902",
+  "platform": {
+    "implementation": "CPython",
+    "machine": "x86_64",
+    "system": "Linux"
+  },
+  "python": "3.12.14",
+  "schema_version": "description.toolchain/v1",
+  "source_commit": "5d681fdbb6e7b2d90b1e7be2ab3a3a244dbce54d",
+  "version": "0.3.15"
+}
