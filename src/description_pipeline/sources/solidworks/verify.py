@@ -140,6 +140,17 @@ def _mass_closure_check(snapshot: Path) -> dict:
         payload = read_json(path)
         if not isinstance(payload, dict):
             raise ValueError("mass closure record is not an object")
+        if payload.get("status") == "unavailable":
+            return _result(
+                "source.normalization.mass_closure",
+                True,
+                status="not_applicable",
+                details={
+                    "reason": "the capture could not read the assembly mass properties",
+                    "unavailable": str(payload.get("reason") or "unknown"),
+                    "message": str(payload.get("message") or ""),
+                },
+            )
         top = payload.get("top_level")
         leaf = payload.get("leaf_total")
         if not isinstance(top, dict) or not isinstance(leaf, dict):

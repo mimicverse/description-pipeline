@@ -895,15 +895,29 @@ def _mass_closure(backend: Any, cfg: dict[str, Any], scene: Any) -> dict[str, An
     verification side then reports the check as not applicable instead of failing it.  A difference
     between the two readings is evidence about the CAD tree, so it is recorded here and reported as
     an advisory there — this capture never fails because of it.
+
+    The assembly read itself is best-effort: builds where ``CreateMassProperty2`` is unavailable, or
+    assemblies that refuse the read, record an explicit ``unavailable`` status.  A capture is never
+    aborted by the optional probe; malformed *standard* readings (the leaf data the combination
+    needs) still fail the freeze through the code below.
     """
 
     reader = getattr(backend, "assembly_mass_properties", None)
     if not callable(reader):
         return None
-    top_level = reader(cfg["assembly"])
+    try:
+        top_level = reader(cfg["assembly"])
+    except Exception as error:  # noqa: BLE001 - an optional probe must not fail a valid capture
+        return {
+            "schema_version": "description-pipeline.solidworks-mass-closure/v1",
+            "status": "unavailable",
+            "reason": str(getattr(error, "code", "") or type(error).__name__),
+            "message": " ".join(str(error).split())[:200],
+        }
     leaf_total = assembly_leaf_total(scene.components, scene.mass_properties)
     return {
         "schema_version": "description-pipeline.solidworks-mass-closure/v1",
+        "status": "recorded",
         "top_level": {
             "mass": float(top_level["mass"]),
             "com": [float(value) for value in top_level["com"]],

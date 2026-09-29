@@ -18,6 +18,7 @@ from pathlib import Path
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
 from description_pipeline.build import report_advisories  # noqa: E402
+from description_pipeline.sources.solidworks.errors import CadError  # noqa: E402
 from description_pipeline.sources.solidworks.freeze import freeze  # noqa: E402
 from description_pipeline.sources.solidworks.verify import _mass_closure_check  # noqa: E402
 
@@ -61,6 +62,16 @@ class ClosureBackend(support.FixtureCadBackend):
 
     def assembly_mass_properties(self, path: str) -> dict:
         return {**self.assembly_reading, "reference": {"used_api": "fixture"}}
+
+
+def unsupported(error: Exception) -> type:
+    """A backend whose whole-assembly read fails the way a missing COM API does."""
+
+    class Unsupported(support.FixtureCadBackend):
+        def assembly_mass_properties(self, path: str) -> dict:
+            raise error
+
+    return Unsupported
 
 
 class MassClosureTests(unittest.TestCase):
@@ -151,6 +162,41 @@ class MassClosureTests(unittest.TestCase):
         check = _mass_closure_check(snapshot)
         self.assertEqual(check["status"], "not_applicable")
         self.assertEqual(report_advisories([check]), [])
+
+    def test_an_unsupported_assembly_mass_api_never_blocks_the_freeze(self):
+        """A SolidWorks build without CreateMassProperty2 records 'unavailable'; the capture stands."""
+
+        cases = (
+            CadError("cad_empty_mass_property", "CreateMassProperty2 returned null"),
+            AttributeError("CreateMassProperty2"),
+        )
+        for error in cases:
+            with self.subTest(error=type(error).__name__):
+                backend = unsupported(error)(self.assembly, self.components, dependencies=self.dependencies)
+                snapshot = self.build(f"unsupported-{type(error).__name__}", backend)
+                record = self.record(snapshot)
+                self.assertEqual(record["status"], "unavailable")
+                self.assertTrue(record["reason"], record)
+                self.assertNotIn("top_level", record)
+                check = _mass_closure_check(snapshot)
+                self.assertEqual(check["status"], "not_applicable")
+                self.assertEqual(check["details"]["unavailable"], record["reason"])
+                self.assertEqual(report_advisories([check]), [])
+
+    def test_a_malformed_closure_record_is_a_failure(self):
+        """A recorded reading that is not a number is corrupt evidence, unlike an absent probe."""
+
+        backend = ClosureBackend(
+            self.assembly, self.components, dependencies=self.dependencies, assembly_reading=LEAF_TOTAL
+        )
+        snapshot = self.build("malformed", backend)
+        (snapshot / "raw/mass_closure.json").write_text(
+            json.dumps({"status": "recorded", "top_level": {"mass": "not-a-number"}, "leaf_total": {}}),
+            encoding="utf-8",
+        )
+        check = _mass_closure_check(snapshot)
+        self.assertEqual(check["status"], "failed")
+        self.assertNotIn("advisory", check["details"])
 
 
 if __name__ == "__main__":
