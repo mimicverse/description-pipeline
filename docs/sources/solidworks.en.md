@@ -101,6 +101,13 @@ Every capture process joins a Windows Job Object before it starts and COM binds 
 normal completion, failure and timeouts clean up only that job's process tree and never attach to or
 terminate the operator's SolidWorks.
 
+`raw/mass_closure.json` records the assembly document's own reading and the leaf readings, and now
+also `component_context`: each component instance's assembly-context mass and its three override
+flags; the leaf/document masses stay a separate basis. Totals use only the **disjoint depth-0 rows**;
+nested rows exist to detect overrides a clean parent would otherwise hide. Missing or duplicate rows,
+non-boolean flags, or a depth that disagrees with the name make the independent check
+(`source.normalization.mass_closure`) fail.
+
 ## Mass and inertia contract
 
 ### Two material modes
@@ -118,6 +125,13 @@ The coverage check runs independently in three places: configuration validation
 independent check (`source.normalization.mass_provenance`, whose details report
 `missing_declared` / `unknown_declared` / `cad_mass_without_verified_material`); the check side never
 reads the generator's report.
+
+`material_source: cad` also requires that no **component-level** override exists anywhere in the
+assembly tree (mass, center of mass or inertia): when one is recorded,
+`source.normalization.mass_closure` fails, because pure CAD reads part documents and cannot represent
+instance overrides. `documented_table` reports them as a note, never redistributes or rewrites a
+declared mass, and the note states the two readings and that **no cause is inferred**. Snapshots
+without the record keep their previous verdict.
 
 ### Inertia model for documented masses
 

@@ -11,6 +11,7 @@ number in ``raw/`` comes from the CAD API during this capture.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import shutil
@@ -899,6 +900,150 @@ def _leaf_volume(mass_properties: dict[str, Any], name: Any) -> float:
         return 0.0
 
 
+def _component_context_record(reading: dict[str, Any], scene: Any, assembly_mass: float | None) -> dict[str, Any]:
+    """Align the assembly context's per-instance readings with the leaf/document basis.
+
+    ``document_basis_mass_kg`` is the sum of the existing leaf/document readings under that
+    instance (itself, for a leaf).  Totals use only the disjoint depth-0 rows; nested rows are kept
+    to detect overrides a clean parent would otherwise hide.  Everything here is recorded for
+    comparison only: no total is forced to agree and nothing is distributed into any declared mass.
+    """
+
+    leaves = [
+        (str(component.name), float((scene.mass_properties.get(str(component.name)) or {}).get("mass") or 0.0))
+        for component in scene.components
+    ]
+
+    def document_basis(name: str) -> float:
+        prefix = name + "/"
+        return sum(mass for leaf, mass in leaves if leaf == name or leaf.startswith(prefix))
+
+    instances = []
+    errors = list(reading.get("errors") or [])
+    for entry in reading.get("instances") or []:
+        name = str(entry.get("name"))
+        try:
+            if not name:
+                raise ValueError("component instance row has no name")
+            raw_depth = entry.get("depth")
+            if not isinstance(raw_depth, int) or isinstance(raw_depth, bool):
+                raise ValueError(f"row for {name} has no integer depth")
+            depth = raw_depth
+            expected_depth = name.count("/")
+            if depth != expected_depth:
+                raise ValueError(f"row for {name} has depth {depth}, expected {expected_depth}")
+            parent = name.rsplit("/", 1)[0] if "/" in name else None
+            if entry.get("parent") != parent:
+                raise ValueError(f"row for {name} has parent {entry.get('parent')!r}, expected {parent!r}")
+            mass = float(entry["context_mass_kg"])
+            if not math.isfinite(mass) or mass <= 0.0:
+                raise ValueError("component mass is not finite and positive")
+            volume = entry.get("context_volume_m3")
+            volume = None if volume is None else float(volume)
+            if volume is not None and not math.isfinite(volume):
+                raise ValueError("component volume is not finite")
+            raw_overrides = entry.get("overrides")
+            if not isinstance(raw_overrides, dict):
+                raise ValueError("component row has no override flags")
+            if not {"OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia"} <= set(raw_overrides):
+                raise ValueError("component row is missing override flags")
+            overrides: dict[str, bool] = {}
+            for key, value in raw_overrides.items():
+                if not isinstance(value, bool):
+                    raise ValueError(f"override flag {key!r} is not a boolean")
+                overrides[str(key)] = value
+        except (KeyError, TypeError, ValueError) as exc:
+            errors.append({"name": name, "error": "cad_component_context_invalid", "message": str(exc)[:200]})
+            continue
+        basis = document_basis(name)
+        instances.append(
+            {
+                "name": name,
+                "parent": parent,
+                "depth": depth,
+                "document": entry.get("document"),
+                "document_type": str(entry.get("document_type") or ""),
+                "context_mass_kg": mass,
+                "context_volume_m3": volume,
+                "overrides": overrides,
+                "document_basis_mass_kg": basis,
+                "delta_kg": mass - basis,
+            }
+        )
+    leaf_names = {leaf for leaf, _ in leaves}
+    covered = {
+        leaf
+        for leaf in leaf_names
+        if any(leaf == entry["name"] or leaf.startswith(entry["name"] + "/") for entry in instances)
+    }
+    top_level = [entry for entry in instances if entry["depth"] == 0]
+    context_total = sum(entry["context_mass_kg"] for entry in top_level)
+    document_total = sum(entry["document_basis_mass_kg"] or 0.0 for entry in top_level)
+    assembly_kg = None if assembly_mass is None else float(assembly_mass)
+    return {
+        "schema_version": "description-pipeline.solidworks-component-mass-context/v1",
+        "status": "recorded" if not errors else "partial",
+        "assembly_mass_kg": assembly_kg,
+        "instances": instances,
+        "totals": {
+            "context_kg": context_total,
+            "document_kg": document_total,
+            "assembly_kg": assembly_kg,
+            "context_minus_document_kg": context_total - document_total,
+            "context_minus_assembly_kg": None if assembly_kg is None else context_total - assembly_kg,
+        },
+        "overridden": {
+            "top_level_instances": len(top_level),
+            "mass": sum(1 for entry in instances if entry["overrides"].get("OverrideMass")),
+            "com": sum(1 for entry in instances if entry["overrides"].get("OverrideCenterOfMass")),
+            "inertia": sum(1 for entry in instances if entry["overrides"].get("OverrideMomentsOfInertia")),
+            "any": sum(1 for entry in instances if any(entry["overrides"].values())),
+            "top_level_overridden": sum(1 for entry in top_level if any(entry["overrides"].values())),
+            "examples": [entry["name"] for entry in instances if entry["overrides"].get("OverrideMass")][:50],
+        },
+        "leaf_documents": len(leaf_names),
+        "leaf_documents_covered": len(covered),
+        "leaf_documents_uncovered": sorted(leaf_names - covered)[:50],
+        "errors": errors,
+        "reference": dict(reading.get("reference") or {}),
+    }
+
+
+def _component_mass_context(
+    backend: Any, cfg: dict[str, Any], scene: Any, assembly_mass: float | None
+) -> dict[str, Any] | None:
+    """The assembly context reading when the backend can produce it; best-effort, never fatal."""
+
+    reader = getattr(backend, "assembly_component_mass_properties", None)
+    if not callable(reader):
+        return None
+    try:
+        reading = reader(cfg["assembly"])
+    except Exception as error:  # noqa: BLE001 - an optional probe must not fail a valid capture
+        return {
+            "schema_version": "description-pipeline.solidworks-component-mass-context/v1",
+            "status": "unavailable",
+            "reason": str(getattr(error, "code", "") or type(error).__name__),
+            "message": " ".join(str(error).split())[:200],
+        }
+    if not isinstance(reading, dict):
+        return {
+            "schema_version": "description-pipeline.solidworks-component-mass-context/v1",
+            "status": "unavailable",
+            "reason": "cad_component_context_malformed",
+            "message": "the backend returned no component mass context object",
+        }
+    try:
+        return _component_context_record(reading, scene, assembly_mass)
+    except Exception as error:  # noqa: BLE001 - an optional probe must never abort a capture
+        return {
+            "schema_version": "description-pipeline.solidworks-component-mass-context/v1",
+            "status": "unavailable",
+            "reason": "cad_component_context_invalid",
+            "message": " ".join(str(error).split())[:200],
+        }
+
+
 def _mass_closure(backend: Any, cfg: dict[str, Any], scene: Any) -> dict[str, Any] | None:
     """The assembly's own reading next to the recombined leaf readings, as capture evidence.
 
@@ -913,27 +1058,60 @@ def _mass_closure(backend: Any, cfg: dict[str, Any], scene: Any) -> dict[str, An
     needs) still fail the freeze through the code below.
     """
 
-    reader = getattr(backend, "assembly_mass_properties", None)
-    if not callable(reader):
+    closure_reader = getattr(backend, "assembly_mass_properties", None)
+    context_reader = getattr(backend, "assembly_component_mass_properties", None)
+    if not callable(closure_reader) and not callable(context_reader):
         return None
-    try:
-        top_level = reader(cfg["assembly"])
-    except Exception as error:  # noqa: BLE001 - an optional probe must not fail a valid capture
-        return {
+    top_level: dict[str, Any] | None = None
+    failure: dict[str, str] | None = None
+    if callable(closure_reader):
+        try:
+            top_level = closure_reader(cfg["assembly"])
+        except Exception as error:  # noqa: BLE001 - an optional probe must not fail a valid capture
+            failure = {
+                "reason": str(getattr(error, "code", "") or type(error).__name__),
+                "message": " ".join(str(error).split())[:200],
+            }
+    top_mass: float | None = None
+    if isinstance(top_level, dict):
+        try:
+            top_mass = float(top_level["mass"])
+        except (KeyError, TypeError, ValueError):
+            top_level = None
+            failure = failure or {
+                "reason": "cad_mass_property_invalid",
+                "message": "the assembly reading carried no usable mass",
+            }
+    elif top_level is not None:
+        top_level = None
+        failure = failure or {
+            "reason": "cad_mass_property_invalid",
+            "message": "the assembly reading is not an object",
+        }
+    # The override evidence is required for a pure-CAD claim, so it is collected even when the
+    # optional assembly reading failed (or the record would earn cad equivalence by omission).
+    component_context = _component_mass_context(backend, cfg, scene, top_mass)
+    if top_level is None or top_mass is None:
+        unavailable_record: dict[str, Any] = {
             "schema_version": "description-pipeline.solidworks-mass-closure/v1",
             "status": "unavailable",
-            "reason": str(getattr(error, "code", "") or type(error).__name__),
-            "message": " ".join(str(error).split())[:200],
+            **(
+                failure
+                or {"reason": "cad_mass_property_unavailable", "message": "no assembly mass reading was recorded"}
+            ),
         }
+        if component_context is not None:
+            unavailable_record["component_context"] = component_context
+        return unavailable_record
     leaf_total = assembly_leaf_total(scene.components, scene.mass_properties)
-    if str((top_level or {}).get("mode") or "") == "mass_only":
+    record: dict[str, Any]
+    if str(top_level.get("mode") or "") == "mass_only":
         # The legacy API gives a corroborated mass only; volume travels as context.  The 2026-09-29
         # native pairing matched COM and the inertia group too, but one document is not a layout
         # guarantee, so nothing else is taken from the vector here.
         volumes = sum(_leaf_volume(scene.mass_properties, component.name) for component in scene.components)
-        top_mass = float(top_level["mass"])
         leaf_mass = float(leaf_total["mass"])
-        return {
+        record = {
             "schema_version": "description-pipeline.solidworks-mass-closure/v1",
             "status": "recorded",
             "mode": "mass_only",
@@ -950,20 +1128,24 @@ def _mass_closure(backend: Any, cfg: dict[str, Any], scene: Any) -> dict[str, An
                 "mass_rel": abs(top_mass - leaf_mass) / max(abs(top_mass), abs(leaf_mass), 1e-12),
             },
         }
-    return {
-        "schema_version": "description-pipeline.solidworks-mass-closure/v1",
-        "status": "recorded",
-        "mode": "full",
-        "top_level": {
-            "mass": float(top_level["mass"]),
-            "com": [float(value) for value in top_level["com"]],
-            "inertia": [[float(value) for value in row] for row in top_level["inertia"]],
-            "reference": dict(top_level.get("reference") or {}),
-        },
-        "leaf_total": leaf_total,
-        "leaf_components": len(list(scene.components)),
-        "delta": closure_delta(top_level, leaf_total),
-    }
+    else:
+        record = {
+            "schema_version": "description-pipeline.solidworks-mass-closure/v1",
+            "status": "recorded",
+            "mode": "full",
+            "top_level": {
+                "mass": top_mass,
+                "com": [float(value) for value in top_level["com"]],
+                "inertia": [[float(value) for value in row] for row in top_level["inertia"]],
+                "reference": dict(top_level.get("reference") or {}),
+            },
+            "leaf_total": leaf_total,
+            "leaf_components": len(list(scene.components)),
+            "delta": closure_delta(top_level, leaf_total),
+        }
+    if component_context is not None:
+        record["component_context"] = component_context
+    return record
 
 
 def _capture_readings(

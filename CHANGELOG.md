@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### Added
+
+- A capture records the assembly's per-component context masses in `raw/mass_closure.json`
+  (`component_context`): every component instance's assembly-context mass and its three override
+  flags next to the part-document basis, with disjoint depth-0 totals, per-row errors and leaf
+  coverage. Nested rows exist to detect overrides a clean parent would hide; nothing is distributed
+  or forced — the documented table stays the author's. `description check` reports the two bases as
+  a **note** for a `documented_table` model, and fails a `cad` model when any instance override
+  (mass, COM or inertia) is recorded or the context is unavailable/incomplete; older snapshots
+  without the record keep their verdict. The `require_material=False` fallback also keeps the full
+  material-assignment detail the CAD error carried, instead of reducing it to a code and a message.
+
+### Changed
+
+- The mass-closure advisory states the two readings and that no cause is inferred, instead of
+  speculating that the CAD tree was repaired or re-materialed.
+
+### Fixed
+
+- `description check` rejects non-finite or misshaped mass-closure readings. A NaN or infinite
+  mass, COM component or inertia entry — and a COM or inertia that is not a 3-vector or 3x3 tensor —
+  used to read as "no difference" and pass, because every comparison with NaN is false. The new
+  component-context rows get the same finite/positive and shape validation.
+
 ## [0.3.24] - 2026-09-29
 
 ### Added

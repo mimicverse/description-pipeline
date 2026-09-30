@@ -346,6 +346,29 @@ def _material_assignments_document(doc, bodies):
     return evidence
 
 
+def unverified_material_record(exc, configuration) -> dict:
+    """The material evidence kept when a documented-table capture cannot verify a part.
+
+    The CAD error carries the full part/body assignment in its detail; reducing the fallback to a
+    code and a message would throw away what the document actually held.  Every detail key the
+    reader produced travels with the record instead.
+    """
+
+    record = {
+        "schema_version": "swbridge.material-assignment/v1",
+        "configuration": configuration,
+        "query_configuration": "",
+        "unverified_reason": exc.code,
+        "message": exc.message,
+    }
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, dict):
+        for key in ("missing_body_indices", "material_assignment"):
+            if key in detail:
+                record[key] = detail[key]
+    return record
+
+
 def legacy_mass_reading(values, status) -> dict:
     """Mass-only reading from ``IModelDocExtension.GetMassProperties2``'s 13-value vector.
 
@@ -594,13 +617,7 @@ class SolidWorksBackend(CadBackend):
                 materials = _material_assignments_document(doc, bodies)
             except CadError as exc:
                 active = _member(_member(doc, "ConfigurationManager"), "ActiveConfiguration")
-                materials = {
-                    "schema_version": "swbridge.material-assignment/v1",
-                    "configuration": str(_member(active, "Name")),
-                    "query_configuration": "",
-                    "unverified_reason": exc.code,
-                    "message": exc.message,
-                }
+                materials = unverified_material_record(exc, str(_member(active, "Name")))
         mp = _member(_member(doc, "Extension"), "CreateMassProperty2")
         if mp is None:
             raise CadError("cad_empty_mass_property", "CreateMassProperty2 returned null")
@@ -729,6 +746,97 @@ class SolidWorksBackend(CadBackend):
             "document": str(_member(doc, "GetPathName")),
         }
         return reading
+
+    def assembly_component_mass_properties(self, path):
+        """Per-instance mass in the *assembly context*, with the instance's override flags.
+
+        The leaf reader answers "what does this part document weigh".  This answers "what mass does
+        the assembly use for this component instance": ``SelectedItems = (instance,)`` includes
+        component-level mass overrides that the part document does not carry, and
+        ``GetOverrideOptions`` with the same selection reports which overrides are active.  Every
+        instance is walked, not just the top-level children, so a nested override cannot hide
+        behind a clean parent.  The capture records the two bases side by side and never
+        distributes, scales or rewrites a value.
+
+        Returns ``{"assembly", "configuration", "instances", "errors", "reference"}``.  An instance
+        that cannot be read is reported in ``errors`` with its code and message instead of being
+        dropped silently.
+        """
+
+        doc = self._document_by_path(path)
+        if _member(doc, "GetType") != 2:
+            raise CadError("cad_not_assembly", "component mass context requires a saved SLDASM")
+        configuration = _member(_member(doc, "ConfigurationManager"), "ActiveConfiguration")
+        root = _member(configuration, "GetRootComponent3", True)
+        if root is None:
+            raise CadError("cad_empty_mass_property", "assembly mass context has no root component")
+        import pythoncom
+
+        entries: list[dict] = []
+        errors: list[dict] = []
+        stack: list[tuple[object, str | None, int]] = [
+            (component, None, 0) for component in reversed(list(_member(root, "GetChildren") or ()))
+        ]
+        while stack:
+            raw, parent, depth = stack.pop()
+            component = _dynamic(raw)
+            name = str(_member(component, "Name2"))
+            if _member(component, "IsSuppressed"):
+                continue
+            children = list(_member(component, "GetChildren") or ())
+            stack.extend((child, name, depth + 1) for child in reversed(children))
+            try:
+                mp = _member(_member(doc, "Extension"), "CreateMassProperty2")
+                if mp is None:
+                    raise CadError("cad_empty_mass_property", "CreateMassProperty2 returned null")
+                mp.UseSystemUnits = True
+                mp.IncludeHiddenBodiesOrComponents = True
+                mp.SelectedItems = _win32().VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, (component,))
+                _member(mp, "Recalculate")
+                override = _member(mp, "GetOverrideOptions")
+                mass = float(_member(mp, "Mass"))
+                if not math.isfinite(mass) or mass <= 0.0:
+                    raise CadError(
+                        "cad_mass_property_invalid", "component mass is not finite and positive", {"name": name}
+                    )
+                volume = float(_member(mp, "Volume"))
+                entries.append(
+                    {
+                        "name": name,
+                        "parent": parent,
+                        "depth": depth,
+                        "document": str(_member(component, "GetPathName")),
+                        "document_type": "assembly" if children else "part",
+                        "context_mass_kg": mass,
+                        "context_volume_m3": volume if math.isfinite(volume) else None,
+                        "overrides": {
+                            key: bool(_member(override, key))
+                            for key in ("OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia")
+                        },
+                    }
+                )
+            except Exception as error:  # noqa: BLE001 - one unreadable instance is reported, not fatal
+                errors.append(
+                    {
+                        "name": name,
+                        "parent": parent,
+                        "depth": depth,
+                        "error": str(getattr(error, "code", "") or type(error).__name__),
+                        "message": " ".join(str(error).split())[:200],
+                    }
+                )
+        return {
+            "assembly": str(_member(doc, "GetPathName")),
+            "configuration": str(_member(configuration, "Name")),
+            "instances": entries,
+            "errors": errors,
+            "reference": {
+                "method": "IMassProperty2 (SelectedItems = component instance)",
+                "override_api": "IMassProperty2.GetOverrideOptions (same selection)",
+                "document": str(_member(doc, "GetPathName")),
+                "configuration": str(_member(configuration, "Name")),
+            },
+        }
 
     def collect_scene(self, doc_path, coordinate_systems, progress=None, require_material=True):
         doc = self._document_by_path(doc_path)
