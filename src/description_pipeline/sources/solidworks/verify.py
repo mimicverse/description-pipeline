@@ -119,7 +119,376 @@ CLOSURE_COM_ATOL_M = 1e-6
 CLOSURE_INERTIA_RTOL = 1e-4
 
 
-def _mass_only_closure_check(path: Path, payload: dict[str, Any]) -> dict:
+def _finite_positive(value: Any, what: str) -> float:
+    """A finite, positive number, or a ``ValueError`` naming the field."""
+
+    number = float(value)
+    if not math.isfinite(number) or number <= 0.0:
+        raise ValueError(f"{what} is not finite and positive")
+    return number
+
+
+def _finite_non_negative(value: Any, what: str) -> float:
+    """A finite, non-negative number, or a ``ValueError`` naming the field."""
+
+    number = float(value)
+    if not math.isfinite(number) or number < 0.0:
+        raise ValueError(f"{what} is not finite and non-negative")
+    return number
+
+
+def _finite_vector(value: Any, what: str) -> np.ndarray:
+    """A finite 3-vector, or a ``ValueError`` naming the field."""
+
+    array = np.asarray([float(item) for item in value], dtype=float)
+    if array.shape != (3,):
+        raise ValueError(f"{what} is not a 3-vector")
+    if not np.isfinite(array).all():
+        raise ValueError(f"{what} is not finite")
+    return array
+
+
+def _finite_tensor(value: Any, what: str) -> np.ndarray:
+    """A finite 3x3 tensor, or a ``ValueError`` naming the field."""
+
+    array = np.asarray([[float(item) for item in row] for row in value], dtype=float)
+    if array.shape != (3, 3):
+        raise ValueError(f"{what} is not a 3x3 tensor")
+    if not np.isfinite(array).all():
+        raise ValueError(f"{what} is not finite")
+    return array
+
+
+def _append_note(details: dict[str, Any], note: str) -> None:
+    """Append one sentence to the single advisory string the CLI prints."""
+
+    existing = details.get("advisory")
+    details["advisory"] = f"{existing}  {note}" if existing else note
+
+
+def _component_context_findings(
+    payload: dict[str, Any],
+    material_source: str,
+    assembly_mass: float | None,
+    scene_masses: dict[str, float] | None,
+) -> tuple[dict[str, Any], str | None]:
+    """Read the recorded component-context evidence; return ``(details, error)``.
+
+    The section records, per component instance, the mass the *assembly context* uses next to the
+    part-document basis and the three override flags.  Totals use only the disjoint depth-0 rows;
+    nested rows exist to detect overrides a clean parent would otherwise hide.
+
+    A pure-CAD model reads part documents, so it cannot represent any instance override (mass, COM
+    or inertia), and it cannot claim equivalence while the evidence is unavailable or incomplete.
+    A documented table may legitimately choose either basis, so those findings are notes, never
+    enforcement.  Malformed rows and inconsistent status/error pairs are a defect, exactly like a
+    malformed closure record.
+    """
+
+    context = payload.get("component_context")
+    if context is None:
+        return {}, None
+    if not isinstance(context, dict):
+        return {}, "component mass context is not an object"
+    status = str(context.get("status") or "")
+    if status == "unavailable":
+        return (
+            {
+                "component_context": {
+                    "status": "unavailable",
+                    "reason": str(context.get("reason") or "unknown"),
+                    "message": str(context.get("message") or ""),
+                }
+            },
+            "the component mass context could not be read" if material_source != "documented_table" else None,
+        )
+    if status not in {"recorded", "partial"}:
+        return {}, f"component mass context status is {status!r}"
+    rows = context.get("instances")
+    if not isinstance(rows, list) or not rows:
+        return {}, "component mass context has no instances"
+    row_errors = context.get("errors")
+    if not isinstance(row_errors, list):
+        return {}, "component mass context errors are not a list"
+    if status == "recorded" and row_errors:
+        return {}, "component mass context is recorded but carries row errors"
+    if status == "partial" and not row_errors:
+        return {}, "component mass context is partial but carries no row errors"
+    entries: list[dict[str, Any]] = []
+    try:
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("component mass context row is not an object")
+            name = str(row.get("name") or "").strip()
+            if not name:
+                raise ValueError("component mass context row has no name")
+            raw_depth = row.get("depth")
+            if not isinstance(raw_depth, int) or isinstance(raw_depth, bool):
+                raise ValueError(f"component mass context row for {name} has no integer depth")
+            depth = raw_depth
+            expected_depth = name.count("/")
+            if depth != expected_depth:
+                raise ValueError(f"component mass context row for {name} has depth {depth}, expected {expected_depth}")
+            parent = name.rsplit("/", 1)[0] if "/" in name else None
+            if row.get("parent") != parent:
+                raise ValueError(
+                    f"component mass context row for {name} has parent {row.get('parent')!r}, expected {parent!r}"
+                )
+            overrides = row.get("overrides")
+            if not isinstance(overrides, dict):
+                raise ValueError(f"component mass context row for {name} has no override flags")
+            if not {"OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia"} <= set(overrides):
+                raise ValueError(f"component mass context row for {name} is missing override flags")
+            flags: dict[str, bool] = {}
+            for key, value in overrides.items():
+                if not isinstance(value, bool):
+                    raise ValueError(f"component mass context row for {name} has a non-boolean flag {key!r}")
+                flags[str(key)] = value
+            document_mass = row.get("document_basis_mass_kg")
+            volume = row.get("context_volume_m3")
+            entries.append(
+                {
+                    "name": name,
+                    "depth": depth,
+                    "parent": parent,
+                    "document_type": str(row.get("document_type") or ""),
+                    "context_mass_kg": _finite_positive(
+                        row["context_mass_kg"], f"component mass context mass for {name}"
+                    ),
+                    "document_basis_mass_kg": (
+                        None
+                        if document_mass is None
+                        else _finite_non_negative(document_mass, f"component document mass for {name}")
+                    ),
+                    "context_volume_m3": (
+                        None if volume is None else _finite_non_negative(volume, f"component volume for {name}")
+                    ),
+                    "overrides": flags,
+                }
+            )
+    except (KeyError, TypeError, ValueError) as exc:
+        return {}, f"malformed component mass context: {exc}"
+    names = [entry["name"] for entry in entries]
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        return {}, f"malformed component mass context: duplicated instance rows {duplicates[:5]}"
+    top_level = [entry for entry in entries if entry["depth"] == 0]
+    if not top_level:
+        return {}, "malformed component mass context: no top-level rows"
+    mass_overridden = [entry["name"] for entry in entries if entry["overrides"]["OverrideMass"]]
+    com_overridden = [entry["name"] for entry in entries if entry["overrides"]["OverrideCenterOfMass"]]
+    inertia_overridden = [entry["name"] for entry in entries if entry["overrides"]["OverrideMomentsOfInertia"]]
+    any_overridden = [entry["name"] for entry in entries if any(entry["overrides"].values())]
+    context_total = sum(entry["context_mass_kg"] for entry in top_level)
+    recorded_document_total = sum(
+        entry["document_basis_mass_kg"] or 0.0 for entry in top_level if entry["document_basis_mass_kg"] is not None
+    )
+    missing_document_basis = [entry["name"] for entry in top_level if entry["document_basis_mass_kg"] is None]
+    leaf_rows = [entry["name"] for entry in entries if entry["document_type"] == "part"]
+    if scene_masses is not None:
+        expected_nodes = _expected_instance_nodes(scene_masses)
+        node_names = {entry["name"] for entry in entries}
+        missing_nodes = sorted(expected_nodes - node_names)[:20]
+        unexpected_nodes = sorted(node_names - expected_nodes)[:20]
+        missing_parents = sorted(
+            entry["name"] for entry in entries if entry["parent"] is not None and entry["parent"] not in node_names
+        )[:20]
+        wrong_types = sorted(
+            entry["name"] for entry in entries if entry["name"] in scene_masses if entry["document_type"] != "part"
+        ) or sorted(
+            entry["name"]
+            for entry in entries
+            if entry["name"] not in scene_masses and entry["document_type"] != "assembly"
+        )
+        if wrong_types:
+            return {}, f"malformed component mass context: invalid node types {wrong_types[:5]}"
+        equivalence = []
+        cached_mismatches = []
+        basis_by_node: dict[str, float] = {}
+        for entry in entries:
+            basis = sum(
+                mass
+                for leaf, mass in scene_masses.items()
+                if leaf == entry["name"] or leaf.startswith(entry["name"] + "/")
+            )
+            basis_by_node[entry["name"]] = basis
+            recorded_basis = entry["document_basis_mass_kg"]
+            if recorded_basis is not None and not _mass_close(recorded_basis, basis):
+                cached_mismatches.append(
+                    {
+                        "name": entry["name"],
+                        "recorded_document_basis_mass_kg": recorded_basis,
+                        "recomputed_document_basis_mass_kg": basis,
+                    }
+                )
+            if not _mass_close(entry["context_mass_kg"], basis):
+                equivalence.append(
+                    {
+                        "name": entry["name"],
+                        "context_mass_kg": entry["context_mass_kg"],
+                        "document_basis_mass_kg": basis,
+                    }
+                )
+        if cached_mismatches:
+            return {}, (
+                "malformed component mass context: the cached document basis contradicts the raw "
+                f"readings for {len(cached_mismatches)} node(s) (examples: {cached_mismatches[:3]})"
+            )
+        coverage: dict[str, Any] = {
+            "known": True,
+            "expected_nodes": len(expected_nodes),
+            "recorded_nodes": len(node_names),
+            "missing_nodes": missing_nodes,
+            "unexpected_nodes": unexpected_nodes,
+            "missing_parent_rows": missing_parents,
+            "effective_vs_document_mismatches": equivalence[:20],
+        }
+        recomputed_document_total: float | None = sum(basis_by_node.get(entry["name"], 0.0) for entry in top_level)
+    else:
+        coverage = {"known": False}
+        equivalence = []
+        recomputed_document_total = None
+    recorded_assembly = context.get("assembly_mass_kg")
+    details = {
+        "component_context": {
+            "status": status,
+            "instances": len(entries),
+            "top_level_instances": len(top_level),
+            "leaf_instances": len(leaf_rows),
+            "mass_overridden": len(mass_overridden),
+            "mass_overridden_examples": mass_overridden[:5],
+            "com_overridden": len(com_overridden),
+            "inertia_overridden": len(inertia_overridden),
+            "any_override": len(any_overridden),
+            "document_total_kg": recomputed_document_total,
+            "recorded_document_total_kg": recorded_document_total,
+            "context_total_kg": context_total,
+            "context_minus_document_kg": (
+                None if recomputed_document_total is None else context_total - recomputed_document_total
+            ),
+            "assembly_mass_kg": assembly_mass,
+            "context_minus_assembly_kg": None if assembly_mass is None else context_total - assembly_mass,
+            "recorded_assembly_mass_kg": recorded_assembly,
+            "top_level_instances_without_document_basis": missing_document_basis[:20],
+            "coverage": coverage,
+            "effective_vs_document_mismatches": len(equivalence),
+            "row_errors": row_errors,
+        }
+    }
+    incomplete: list[str] = []
+    if status == "partial" or row_errors:
+        incomplete.append(f"{len(row_errors)} row error(s)")
+    if scene_masses is None:
+        incomplete.append("no raw scene and mass readings to prove node coverage against")
+    else:
+        if coverage["missing_nodes"]:
+            incomplete.append(f"{len(coverage['missing_nodes'])} expected instance node(s) not recorded")
+        if coverage["unexpected_nodes"]:
+            incomplete.append(f"{len(coverage['unexpected_nodes'])} unexpected node row(s)")
+        if coverage["missing_parent_rows"]:
+            incomplete.append(f"{len(coverage['missing_parent_rows'])} node row(s) whose parent row is absent")
+    if material_source != "documented_table":
+        if any_overridden:
+            return details, (
+                "the CAD assembly carries component-level overrides "
+                f"({len(any_overridden)} instance(s): {len(mass_overridden)} mass, "
+                f"{len(com_overridden)} center of mass, {len(inertia_overridden)} inertia) that the "
+                "part-document readings do not include; a pure-CAD (material_source=cad) model "
+                "cannot represent them.  Record the effective properties with matching evidence — "
+                "a documented mass only rescales the CAD tensor at an unchanged center of mass — or "
+                "remove the overrides in CAD"
+            )
+        if isinstance(coverage, dict) and coverage.get("effective_vs_document_mismatches"):
+            examples = coverage["effective_vs_document_mismatches"][:3]
+            return details, (
+                "the assembly context's effective mass differs from the selected part-document "
+                f"reading for {len(equivalence)} node(s) with no recorded override "
+                f"(examples: {examples}); a pure-CAD (material_source=cad) model cannot claim "
+                "source equivalence — record the effective masses through source.documented_masses"
+            )
+        if incomplete:
+            return details, (
+                "the component mass context is incomplete (" + "; ".join(incomplete) + "), so a "
+                "pure-CAD (material_source=cad) model cannot prove its part-document masses are the "
+                "effective ones"
+            )
+    if any_overridden:
+        top_level_overridden = sum(1 for entry in top_level if any(entry["overrides"].values()))
+        _append_note(
+            details,
+            "the assembly context carries overrides on "
+            f"{len(any_overridden)} of {len(entries)} recorded component instances "
+            f"({len(mass_overridden)} mass, {len(com_overridden)} COM, {len(inertia_overridden)} "
+            f"inertia; {top_level_overridden} at the top level); the assembly reading uses the "
+            "context values while the leaf readings use part-document values — no cause is inferred "
+            "and no mass is distributed automatically",
+        )
+    if equivalence:
+        _append_note(
+            details,
+            "the assembly-context effective mass differs from the recomputed part-document basis "
+            f"for {len(equivalence)} node(s); the documented table may choose either basis — no mass "
+            "is changed automatically",
+        )
+    if incomplete:
+        _append_note(details, "component mass context is incomplete: " + "; ".join(incomplete))
+    return details, None
+
+
+def _scene_leaf_masses(snapshot: Path) -> dict[str, float] | None:
+    """Leaf instance name to raw document mass, from the snapshot's own readings.
+
+    The context guard recomputes every node's document basis from these values; it never uses a
+    recorded sum.  A snapshot without both raw files cannot support the source-equivalence claim.
+    """
+
+    scene_path = Path(snapshot) / "raw" / "scene_raw.json"
+    masses_path = Path(snapshot) / "raw" / "mass_properties.json"
+    if not scene_path.is_file() or not masses_path.is_file():
+        return None
+    try:
+        scene_raw = read_json(scene_path)
+        masses = read_json(masses_path)
+    except (OSError, ValueError, PipelineError):
+        return None
+    components = scene_raw.get("components") if isinstance(scene_raw, dict) else None
+    if not isinstance(components, list) or not isinstance(masses, dict):
+        return None
+    found: dict[str, float] = {}
+    for entry in components:
+        if not isinstance(entry, dict) or not entry.get("name"):
+            return None
+        name = str(entry["name"])
+        payload = masses.get(name)
+        if not isinstance(payload, dict):
+            return None
+        try:
+            mass = _finite_positive(payload["mass"], f"scene leaf mass for {name}")
+        except (KeyError, TypeError, ValueError):
+            return None
+        found[name] = mass
+    return found or None
+
+
+def _expected_instance_nodes(scene_masses: dict[str, float]) -> set[str]:
+    """Every ancestor prefix of every scene leaf instance, the full expected node coverage."""
+
+    nodes: set[str] = set()
+    for leaf in scene_masses:
+        segments = leaf.split("/")
+        nodes.update("/".join(segments[: index + 1]) for index in range(len(segments)))
+    return nodes
+
+
+def _mass_close(first: float, second: float) -> bool:
+    """Source-equivalence tolerance for an effective mass against its document basis."""
+
+    return abs(first - second) <= max(1e-12, CLOSURE_MASS_RTOL * max(abs(first), abs(second)))
+
+
+def _mass_only_closure_check(
+    path: Path, payload: dict[str, Any], material_source: str, scene_masses: dict[str, float] | None
+) -> dict:
     """Evaluate the mass-only closure the legacy assembly API produced.
 
     ``Extension.GetMassProperties2`` answers with a vector whose mass the M3.0 recovery reports and
@@ -135,10 +504,8 @@ def _mass_only_closure_check(path: Path, payload: dict[str, Any]) -> dict:
         leaf = payload.get("leaf_total")
         if not isinstance(top, dict) or not isinstance(leaf, dict):
             raise ValueError("mass closure readings are not objects")
-        top_mass = float(cast("dict[str, Any]", top)["mass"])
-        leaf_mass = float(cast("dict[str, Any]", leaf)["mass"])
-        if not (math.isfinite(top_mass) and math.isfinite(leaf_mass)) or top_mass <= 0.0 or leaf_mass <= 0.0:
-            raise ValueError("mass closure readings are not finite and positive")
+        top_mass = _finite_positive(cast("dict[str, Any]", top)["mass"], "mass closure top mass")
+        leaf_mass = _finite_positive(cast("dict[str, Any]", leaf)["mass"], "mass closure leaf mass")
     except (KeyError, TypeError, ValueError, OSError, PipelineError) as exc:
         return _result(
             "source.normalization.mass_closure",
@@ -160,23 +527,32 @@ def _mass_only_closure_check(path: Path, payload: dict[str, Any]) -> dict:
     if mass_rel > CLOSURE_MASS_RTOL:
         details["advisory"] = (
             "the assembly document's own mass disagrees with the recombined leaf readings "
-            f"(mass {top_mass:.9g} kg vs {leaf_mass:.9g} kg, {mass_rel:.3g} relative); the CAD tree "
-            "may have been repaired or re-materialed after the leaf files were written — review the "
-            "CAD and any declared masses (this capture's legacy API reported mass only, so COM and "
-            "inertia were not compared)"
+            f"(mass {top_mass:.9g} kg vs {leaf_mass:.9g} kg, {mass_rel:.3g} relative); no cause is "
+            "inferred here — review the CAD and any declared masses (this capture's legacy API "
+            "reported mass only, so COM and inertia were not compared)"
+        )
+    context_details, context_error = _component_context_findings(payload, material_source, top_mass, scene_masses)
+    details.update(context_details)
+    if context_error is not None:
+        return _result(
+            "source.normalization.mass_closure",
+            False,
+            details={**details, "error": context_error, "mode": "mass_only"},
         )
     return _result("source.normalization.mass_closure", True, details=details)
 
 
-def _mass_closure_check(snapshot: Path) -> dict:
-    """Assembly-versus-leaf mass closure, reported as an advisory — never a blocker.
+def _mass_closure_check(snapshot: Path, material_source: str = "cad") -> dict:
+    """Assembly-versus-leaf mass closure, plus the component-context source guard.
 
     The record is capture-time evidence: the assembly document's own mass properties next to the
-    parallel-axis combination of the leaf readings.  Snapshots without it are ``not_applicable``; a
-    mismatch is surfaced in ``details.advisory`` so `description check` prints it as a note while the
-    model still qualifies; a malformed record is a defect.  A ``mass_only`` record (from a build
-    whose legacy assembly API reports mass alone) is evaluated by
-    :func:`_mass_only_closure_check` on that mass only.
+    parallel-axis combination of the leaf readings.  The whole-assembly delta is an *advisory*:
+    a mismatch lands in ``details.advisory`` and the model still qualifies, and snapshots without
+    the record are ``not_applicable``.  Invalid or unsupported *source policy* is a blocker: a
+    recorded component instance override, or an effective mass the selected part documents cannot
+    explain under ``material_source: cad``, or malformed/incomplete evidence, fails the check.  A
+    ``mass_only`` record (from a build whose legacy assembly API reports mass alone) is evaluated
+    by :func:`_mass_only_closure_check` on that mass only, with the same source guard.
     """
 
     path = Path(snapshot) / "raw" / "mass_closure.json"
@@ -191,35 +567,43 @@ def _mass_closure_check(snapshot: Path) -> dict:
         payload = read_json(path)
         if not isinstance(payload, dict):
             raise ValueError("mass closure record is not an object")
+        scene_masses = _scene_leaf_masses(snapshot)
         if payload.get("status") == "unavailable":
+            evidence: dict[str, Any] = {
+                "reason": "the capture could not read the assembly mass properties",
+                "unavailable": str(payload.get("reason") or "unknown"),
+                "message": str(payload.get("message") or ""),
+            }
+            # The override evidence stands on its own: an unavailable assembly reading must not
+            # let a pure-CAD model earn equivalence by omission.
+            context_details, context_error = _component_context_findings(payload, material_source, None, scene_masses)
+            evidence.update(context_details)
+            if context_error is not None:
+                return _result(
+                    "source.normalization.mass_closure",
+                    False,
+                    details={**evidence, "error": context_error},
+                )
             return _result(
                 "source.normalization.mass_closure",
                 True,
                 status="not_applicable",
-                details={
-                    "reason": "the capture could not read the assembly mass properties",
-                    "unavailable": str(payload.get("reason") or "unknown"),
-                    "message": str(payload.get("message") or ""),
-                },
+                details=evidence,
             )
         if str(payload.get("mode") or "full") == "mass_only":
-            return _mass_only_closure_check(path, payload)
+            return _mass_only_closure_check(path, payload, material_source, scene_masses)
         top = payload.get("top_level")
         leaf = payload.get("leaf_total")
         if not isinstance(top, dict) or not isinstance(leaf, dict):
             raise ValueError("mass closure readings are not objects")
         top = cast("dict[str, Any]", top)
         leaf = cast("dict[str, Any]", leaf)
-        top_mass = float(top["mass"])
-        leaf_mass = float(leaf["mass"])
-        top_com = np.asarray([float(value) for value in top["com"]], dtype=float)
-        leaf_com = np.asarray([float(value) for value in leaf["com"]], dtype=float)
-        top_inertia = np.asarray([[float(value) for value in row] for row in top["inertia"]], dtype=float)
-        leaf_inertia = np.asarray([[float(value) for value in row] for row in leaf["inertia"]], dtype=float)
-        if top_com.shape != (3,) or leaf_com.shape != (3,):
-            raise ValueError("mass closure COM is not a 3-vector")
-        if top_inertia.shape != (3, 3) or leaf_inertia.shape != (3, 3):
-            raise ValueError("mass closure inertia is not a 3x3 tensor")
+        top_mass = _finite_positive(top["mass"], "mass closure top mass")
+        leaf_mass = _finite_positive(leaf["mass"], "mass closure leaf mass")
+        top_com = _finite_vector(top["com"], "mass closure top COM")
+        leaf_com = _finite_vector(leaf["com"], "mass closure leaf COM")
+        top_inertia = _finite_tensor(top["inertia"], "mass closure top inertia")
+        leaf_inertia = _finite_tensor(leaf["inertia"], "mass closure leaf inertia")
     except (KeyError, TypeError, ValueError, OSError, PipelineError) as exc:
         return _result(
             "source.normalization.mass_closure",
@@ -238,9 +622,16 @@ def _mass_closure_check(snapshot: Path) -> dict:
     if mass_rel > CLOSURE_MASS_RTOL or com_abs > CLOSURE_COM_ATOL_M or inertia_rel > CLOSURE_INERTIA_RTOL:
         details["advisory"] = (
             "the assembly document's own mass properties disagree with the recombined leaf readings "
-            f"(mass {top_mass:.9g} kg vs {leaf_mass:.9g} kg, {mass_rel:.3g} relative); the CAD tree "
-            "may have been repaired or re-materialed after the leaf files were written — review the "
-            "CAD and any declared masses"
+            f"(mass {top_mass:.9g} kg vs {leaf_mass:.9g} kg, {mass_rel:.3g} relative); no cause is "
+            "inferred here — review the CAD and any declared masses"
+        )
+    context_details, context_error = _component_context_findings(payload, material_source, top_mass, scene_masses)
+    details.update(context_details)
+    if context_error is not None:
+        return _result(
+            "source.normalization.mass_closure",
+            False,
+            details={**details, "error": context_error},
         )
     return _result("source.normalization.mass_closure", True, details=details)
 
@@ -757,7 +1148,7 @@ def verify_normalization(
     evidence_check = _mass_evidence_check(definition, snapshot, included, declared)
     if evidence_check is not None:
         results.append(evidence_check)
-    results.append(_mass_closure_check(snapshot))
+    results.append(_mass_closure_check(snapshot, material_source))
 
     # F4: reconcile the raw assembly-frame quantities with the canonical chain at
     # q=0.  This is what catches a body frame that disagrees with the joint

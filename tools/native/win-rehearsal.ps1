@@ -280,7 +280,8 @@ try {
     $localPipeline = ''
     $match = [regex]::Match($statusText, 'local pipeline\s*:\s*(.+)')
     if ($match.Success) { $localPipeline = $match.Groups[1].Value.Trim() }
-    $mujocoMatch = [regex]::Match($localPipeline, 'mujoco\s+(\S+)')
+    # Only a numeric version counts: "mujoco is not importable" must never parse as version "is".
+    $mujocoMatch = [regex]::Match($localPipeline, 'mujoco\s+v?(\d+(?:\.\d+)*)')
     if ($mujocoMatch.Success) { $mujoco = $mujocoMatch.Groups[1].Value }
     $collection = [regex]::Match($doctorText, 'collection\s*:\s*(.+)')
 

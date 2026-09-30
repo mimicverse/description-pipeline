@@ -59,6 +59,10 @@ masses, prepare the complete declaration table and evidence described by the
 [mass evidence contract](sources/solidworks.en.md#mass-and-inertia-contract).
 
 Windows needs a valid SolidWorks licence, x64 CPython 3.12, Git (with Git LFS) and the GitHub CLI.
+Windows App Control must also allow MuJoCo's native dependencies. If Doctor reports `WinError 4551`,
+the package is installed but Windows refused to load a file. Use an approved runtime or ask the
+administrator to review that dependency before building and checking models on Windows.
+
 Without 3.12, install one first (any 3.12.x; 3.13 and 3.14 are not supported here):
 
 ```powershell

@@ -15,6 +15,7 @@ import tempfile
 import unittest
 from collections.abc import Callable
 from pathlib import Path
+from unittest import mock
 
 from description_pipeline import cli
 from description_pipeline.build import build, freeze, lock_toolchain
@@ -163,6 +164,23 @@ class HostileInputTests(unittest.TestCase):
             code, output = run_cli(["tool", "lock", "--root", str(empty)])
             self.assert_diagnostic(code, output, "config/robot.yaml")
             self.assertFalse((empty / "config").exists(), "a rejected run must not write anything")
+
+
+class AppControlDiagnosticTests(unittest.TestCase):
+    """A blocked MuJoCo DLL reaches the caller as the OS evidence, not a traceback."""
+
+    def test_a_blocked_mujoco_import_is_reported_with_its_library(self):
+        error = OSError(4551, "An application control policy has blocked this file")
+        error.filename = r"C:\mujoco\plugin\elasticity.dll"
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(cli, "scaffold", side_effect=error):
+            code, output = run_cli(["quickstart", str(Path(temporary) / "demo")])
+        payload = json.loads(output.strip().splitlines()[-1])
+        self.assertEqual(code, 2)
+        self.assertEqual(payload["code"], "windows_app_control")
+        self.assertEqual(payload["winerror"], 4551)
+        self.assertEqual(payload["library"], r"C:\mujoco\plugin\elasticity.dll")
+        self.assertIn("Windows App Control", payload["message"])
+        self.assertIn("OSError", payload["cause"])
 
 
 if __name__ == "__main__":

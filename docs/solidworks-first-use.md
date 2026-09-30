@@ -39,6 +39,10 @@ SolidWorks 可能将 worker 只读打开的文档标记为“需要保存”。D
 本文使用 CAD 材料计算质量属性。使用规格或实测质量时，按[质量证据合同](sources/solidworks.md#质量与惯量合同)准备完整声明表与证据。
 
 Windows 需要有效的 SolidWorks 许可、x64 CPython 3.12.10、Git（含 Git LFS）和 GitHub CLI。
+Windows 应用控制策略还须允许加载 MuJoCo 的原生依赖。Doctor 报告 `WinError 4551` 时，
+包已安装，但 Windows 拒绝加载其中的文件。须使用获准的运行环境，或由管理员审查该依赖，
+再在 Windows 上构建和验收模型。
+
 本机没有 3.12 时先装一个（3.12.x 均可；3.13/3.14 不受支持）：
 
 ```powershell

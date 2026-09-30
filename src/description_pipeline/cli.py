@@ -555,6 +555,17 @@ def main(argv: list[str] | None = None) -> int:
             "message": " ".join(part for part in (_failure_message(error), _path_advice(error)) if part)
             or "Operation interrupted",
         }
+        block = None
+        if isinstance(error, OSError):
+            from .doctor import app_control_message, app_control_rejection
+
+            block = app_control_rejection(error)
+        if block is not None:
+            value["code"] = block["code"]
+            value["winerror"] = block["winerror"]
+            value["library"] = block.get("library")
+            value["cause"] = block["error"]
+            value["message"] = app_control_message(block)
         if vars(error).get("diagnostic_path"):
             value["diagnostic_path"] = str(vars(error)["diagnostic_path"])
         if isinstance(error, (OnshapeSourceError, BridgeError)):

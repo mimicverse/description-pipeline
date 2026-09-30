@@ -88,6 +88,14 @@ snapshot/
 每个采集进程启动前加入 Windows Job Object，COM 只绑定该 PID；正常结束、失败或超时都只清理
 本作业的进程树，不附着、不终止操作者的 SolidWorks。
 
+`raw/mass_closure.json` 记录装配文档自身的读数与叶读数之外，还记录 `component_context`：逐组件
+实例的装配上下文质量与三个 override 标志；叶/文档质量仍单列。汇总只使用**互不重叠的顶层
+（depth 0）行**，嵌套行只用于发现被"干净父级"掩盖的 override。节点覆盖由叶实例的**全前缀闭包**
+推导：祖先行缺失、父行不存在、重复行、类型不符或未知多余行都会被拒绝；纯 CAD 还要求每个节点的
+装配上下文质量与其"所选零件文档质量之和"在容差内一致。缺失/重复行、非布尔标志或深度与名称不符
+时，独立校验判失败（`source.normalization.mass_closure`）。记录中的缓存基线与汇总只是辅助：
+独立校验一律从原始读数重算，缓存值与原始读数矛盾时直接拒绝。
+
 ## 质量与惯量合同
 
 ### 两种材料模式
@@ -102,6 +110,11 @@ snapshot/
 覆盖检查在三处独立执行：配置校验（`validate_source_config`）、生成侧（`build_scene`，按实际读数）、
 独立校验（`source.normalization.mass_provenance`，details 给 `missing_declared` / `unknown_declared` /
 `cad_mass_without_verified_material`）；校验侧不读生成器报告。
+
+`material_source: cad` 还要求装配树里没有任何**组件级** override（质量、质心或惯量）：一旦记录到
+任一 override，`source.normalization.mass_closure` 判失败——纯 CAD 只读零件文档，无法表达实例
+覆盖。`documented_table` 只把它们作为提示，既不自动分摊也不改写声明质量；提示只陈述两个读数并
+说明**不做因果推断**。没有该记录的历史快照维持原判。
 
 ### 声明质量的惯量模型
 
