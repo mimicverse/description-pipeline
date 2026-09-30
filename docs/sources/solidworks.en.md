@@ -109,7 +109,9 @@ as the **full prefix closure** of the scene leaves: missing ancestor rows, absen
 duplicates, wrong node types or unknown extra rows are rejected, and pure CAD additionally requires
 each node's assembly-context mass to match the sum of its selected part-document readings within
 tolerance. Missing or duplicate rows, non-boolean flags, or a depth that disagrees with the name make
-the independent check (`source.normalization.mass_closure`) fail.
+the independent check (`source.normalization.mass_closure`) fail. Cached bases and totals in the
+record are auxiliary: the check always recomputes from the raw readings and rejects a cached value
+that contradicts them.
 
 ## Mass and inertia contract
 

@@ -280,7 +280,7 @@ def _component_context_findings(
     inertia_overridden = [entry["name"] for entry in entries if entry["overrides"]["OverrideMomentsOfInertia"]]
     any_overridden = [entry["name"] for entry in entries if any(entry["overrides"].values())]
     context_total = sum(entry["context_mass_kg"] for entry in top_level)
-    document_total = sum(
+    recorded_document_total = sum(
         entry["document_basis_mass_kg"] or 0.0 for entry in top_level if entry["document_basis_mass_kg"] is not None
     )
     missing_document_basis = [entry["name"] for entry in top_level if entry["document_basis_mass_kg"] is None]
@@ -303,12 +303,24 @@ def _component_context_findings(
         if wrong_types:
             return {}, f"malformed component mass context: invalid node types {wrong_types[:5]}"
         equivalence = []
+        cached_mismatches = []
+        basis_by_node: dict[str, float] = {}
         for entry in entries:
             basis = sum(
                 mass
                 for leaf, mass in scene_masses.items()
                 if leaf == entry["name"] or leaf.startswith(entry["name"] + "/")
             )
+            basis_by_node[entry["name"]] = basis
+            recorded_basis = entry["document_basis_mass_kg"]
+            if recorded_basis is not None and not _mass_close(recorded_basis, basis):
+                cached_mismatches.append(
+                    {
+                        "name": entry["name"],
+                        "recorded_document_basis_mass_kg": recorded_basis,
+                        "recomputed_document_basis_mass_kg": basis,
+                    }
+                )
             if not _mass_close(entry["context_mass_kg"], basis):
                 equivalence.append(
                     {
@@ -317,6 +329,11 @@ def _component_context_findings(
                         "document_basis_mass_kg": basis,
                     }
                 )
+        if cached_mismatches:
+            return {}, (
+                "malformed component mass context: the cached document basis contradicts the raw "
+                f"readings for {len(cached_mismatches)} node(s) (examples: {cached_mismatches[:3]})"
+            )
         coverage: dict[str, Any] = {
             "known": True,
             "expected_nodes": len(expected_nodes),
@@ -326,9 +343,11 @@ def _component_context_findings(
             "missing_parent_rows": missing_parents,
             "effective_vs_document_mismatches": equivalence[:20],
         }
+        recomputed_document_total: float | None = sum(basis_by_node.get(entry["name"], 0.0) for entry in top_level)
     else:
         coverage = {"known": False}
         equivalence = []
+        recomputed_document_total = None
     recorded_assembly = context.get("assembly_mass_kg")
     details = {
         "component_context": {
@@ -341,9 +360,12 @@ def _component_context_findings(
             "com_overridden": len(com_overridden),
             "inertia_overridden": len(inertia_overridden),
             "any_override": len(any_overridden),
-            "document_total_kg": document_total,
+            "document_total_kg": recomputed_document_total,
+            "recorded_document_total_kg": recorded_document_total,
             "context_total_kg": context_total,
-            "context_minus_document_kg": context_total - document_total,
+            "context_minus_document_kg": (
+                None if recomputed_document_total is None else context_total - recomputed_document_total
+            ),
             "assembly_mass_kg": assembly_mass,
             "context_minus_assembly_kg": None if assembly_mass is None else context_total - assembly_mass,
             "recorded_assembly_mass_kg": recorded_assembly,
@@ -356,8 +378,6 @@ def _component_context_findings(
     incomplete: list[str] = []
     if status == "partial" or row_errors:
         incomplete.append(f"{len(row_errors)} row error(s)")
-    if missing_document_basis:
-        incomplete.append(f"{len(missing_document_basis)} top-level instance(s) without a document basis")
     if scene_masses is None:
         incomplete.append("no raw scene and mass readings to prove node coverage against")
     else:
@@ -367,18 +387,16 @@ def _component_context_findings(
             incomplete.append(f"{len(coverage['unexpected_nodes'])} unexpected node row(s)")
         if coverage["missing_parent_rows"]:
             incomplete.append(f"{len(coverage['missing_parent_rows'])} node row(s) whose parent row is absent")
-        if equivalence:
-            incomplete.append(
-                f"{len(equivalence)} node(s) whose effective mass differs from the selected part-document reading"
-            )
     if material_source != "documented_table":
         if any_overridden:
             return details, (
-                "the CAD assembly carries component-level mass/COM/inertia overrides "
-                f"({len(any_overridden)} instance(s); {len(mass_overridden)} mass) that the "
+                "the CAD assembly carries component-level overrides "
+                f"({len(any_overridden)} instance(s): {len(mass_overridden)} mass, "
+                f"{len(com_overridden)} center of mass, {len(inertia_overridden)} inertia) that the "
                 "part-document readings do not include; a pure-CAD (material_source=cad) model "
-                "cannot represent them — record the effective masses through "
-                "source.documented_masses, or remove the overrides in CAD"
+                "cannot represent them.  Record the effective properties with matching evidence — "
+                "a documented mass only rescales the CAD tensor at an unchanged center of mass — or "
+                "remove the overrides in CAD"
             )
         if isinstance(coverage, dict) and coverage.get("effective_vs_document_mismatches"):
             examples = coverage["effective_vs_document_mismatches"][:3]
@@ -405,15 +423,15 @@ def _component_context_findings(
             "context values while the leaf readings use part-document values — no cause is inferred "
             "and no mass is distributed automatically",
         )
-    if incomplete:
-        _append_note(details, "component mass context is incomplete: " + "; ".join(incomplete))
     if equivalence:
         _append_note(
             details,
             "the assembly-context effective mass differs from the recomputed part-document basis "
-            f"for {len(equivalence)} node(s) without a recorded override; the documented table may "
-            "choose either basis — no mass is changed automatically",
+            f"for {len(equivalence)} node(s); the documented table may choose either basis — no mass "
+            "is changed automatically",
         )
+    if incomplete:
+        _append_note(details, "component mass context is incomplete: " + "; ".join(incomplete))
     return details, None
 
 

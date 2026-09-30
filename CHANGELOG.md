@@ -13,9 +13,10 @@
   (mass, COM or inertia) is recorded, when the full ancestor closure derived from the scene leaves
   is not covered exactly, or when a node's effective mass disagrees with its selected part-document
   reading beyond tolerance; the context being unavailable/incomplete fails `cad` as well. Older
-  snapshots without the record keep their verdict. The `require_material=False` fallback also keeps
-  the full material-assignment detail the CAD error carried, instead of reducing it to a code and a
-  message.
+  snapshots without the record keep their verdict. Displayed bases and totals are recomputed from the
+  raw readings, and a cached basis that contradicts them is rejected. The `require_material=False`
+  fallback also keeps the full material-assignment detail the CAD error carried, instead of reducing
+  it to a code and a message.
 
 ### Changed
 

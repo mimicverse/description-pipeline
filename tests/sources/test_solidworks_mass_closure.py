@@ -494,8 +494,8 @@ class MassContextTests(ClosureFixture):
         snapshot = self.build("context-cad", self.context(rows=rows))
         check = _mass_closure_check(snapshot, "cad")
         self.assertEqual(check["status"], "failed", check)
-        self.assertIn("component-level mass/COM/inertia overrides", check["details"]["error"])
-        self.assertIn("documented_masses", check["details"]["error"])
+        self.assertIn("component-level overrides", check["details"]["error"])
+        self.assertIn("center of mass", check["details"]["error"])
 
     def test_an_unavailable_component_context_only_blocks_a_pure_cad_model(self):
         backend = self.context(rows=[], error=CadError("cad_empty_mass_property", "no root component"))
@@ -640,7 +640,7 @@ class MassContextTests(ClosureFixture):
         self.assertIn("overrides on", documented["details"]["advisory"])
         cad = _mass_closure_check(snapshot, "cad")
         self.assertEqual(cad["status"], "failed", cad)
-        self.assertIn("mass/COM/inertia overrides", cad["details"]["error"])
+        self.assertIn("component-level overrides", cad["details"]["error"])
 
     def test_an_inertia_only_override_fails_pure_cad(self):
         rows = [context_row("base-1", 1.0), context_row("arm-1", 0.5, overrides={"OverrideMomentsOfInertia": True})]
@@ -691,7 +691,10 @@ class MassContextTests(ClosureFixture):
             *self.nested_rows(),
             context_row("module/other", 0.5, depth=1, parent="module", document_type="assembly"),
         ]
-        snapshot = self.handwritten("extra-row", self.closure_record(rows), {"p-1/a": 0.5, "p-1/b": 1.0})
+        record = self.closure_record(rows)
+        extra = next(row for row in record["component_context"]["instances"] if row["name"] == "module/other")
+        extra["document_basis_mass_kg"] = 0.0
+        snapshot = self.handwritten("extra-row", record, {"p-1/a": 0.5, "p-1/b": 1.0})
         documented = _mass_closure_check(snapshot, "documented_table")
         self.assertEqual(documented["status"], "passed", documented)
         self.assertIn("unexpected node row", documented["details"]["advisory"])
@@ -709,7 +712,9 @@ class MassContextTests(ClosureFixture):
 
     def test_an_effective_mass_the_documents_cannot_explain_blocks_pure_cad(self):
         rows = [context_row("base-1", 1.0)]
-        snapshot = self.handwritten("effective-mismatch", self.closure_record(rows), {"base-1": 0.5})
+        record = self.closure_record(rows)
+        record["component_context"]["instances"][0]["document_basis_mass_kg"] = 0.5
+        snapshot = self.handwritten("effective-mismatch", record, {"base-1": 0.5})
         documented = _mass_closure_check(snapshot, "documented_table")
         self.assertEqual(documented["status"], "passed", documented)
         self.assertEqual(documented["details"]["component_context"]["effective_vs_document_mismatches"], 1)
@@ -717,6 +722,23 @@ class MassContextTests(ClosureFixture):
         cad = _mass_closure_check(snapshot, "cad")
         self.assertEqual(cad["status"], "failed", cad)
         self.assertIn("differs from the selected part-document reading", cad["details"]["error"])
+
+    def test_a_cached_document_basis_that_contradicts_the_raw_readings_is_rejected(self):
+        rows = [context_row("base-1", 1.0)]
+        rows[0]["document_basis_mass_kg"] = 1000.0
+        snapshot = self.handwritten("cached-basis", self.closure_record(rows), {"base-1": 1.0})
+        check = _mass_closure_check(snapshot, "documented_table")
+        self.assertEqual(check["status"], "failed", check)
+        self.assertIn("cached document basis contradicts", check["details"]["error"])
+        self.assertNotIn("document_total_kg", check["details"])
+
+    def test_a_missing_cached_basis_displays_the_recomputed_total(self):
+        record = self.closure_record([context_row("base-1", 1.0)])
+        record["component_context"]["instances"][0].pop("document_basis_mass_kg")
+        snapshot = self.handwritten("cached-basis-missing", record, {"base-1": 1.0})
+        cad = _mass_closure_check(snapshot, "cad")
+        self.assertEqual(cad["status"], "passed", cad)
+        self.assertEqual(cad["details"]["component_context"]["document_total_kg"], 1.0)
 
     def test_an_unavailable_assembly_probe_still_records_and_gates_the_context(self):
         class Raised(ContextBackend):
@@ -745,7 +767,7 @@ class MassContextTests(ClosureFixture):
         self.assertIn("overrides on", documented["details"]["advisory"])
         cad = _mass_closure_check(snapshot, "cad")
         self.assertEqual(cad["status"], "failed", cad)
-        self.assertIn("mass/COM/inertia overrides", cad["details"]["error"])
+        self.assertIn("component-level overrides", cad["details"]["error"])
 
     def test_a_backend_without_the_context_reader_leaves_no_section(self):
         backend = ClosureBackend(
