@@ -20,18 +20,22 @@ backward-compatible absence.
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
 from description_pipeline.build import report_advisories  # noqa: E402
+from description_pipeline.sources.solidworks import native as native_module  # noqa: E402
 from description_pipeline.sources.solidworks.errors import CadError  # noqa: E402
 from description_pipeline.sources.solidworks.freeze import _component_context_record, freeze  # noqa: E402
 from description_pipeline.sources.solidworks.native import (  # noqa: E402
+    SolidWorksBackend,
     legacy_mass_reading,
     unverified_material_record,
 )
@@ -854,6 +858,181 @@ class ClosureRecordValidationTests(ClosureFixture):
                 error = check["details"]["error"]
                 self.assertTrue(any(word in error for word in ("finite", "3-vector", "3x3 tensor")), error)
         path.write_text(json.dumps(baseline), encoding="utf-8")
+
+
+class FakeMassProperty:
+    """Minimal COM stand-in whose readings follow the currently selected component."""
+
+    def __init__(self) -> None:
+        self.UseSystemUnits = False
+        self.IncludeHiddenBodiesOrComponents = False
+        self.selected: tuple = ()
+        self.history: list[tuple] = []
+        self.recalculated = 0
+        self.overrides = SimpleNamespace(OverrideMass=False, OverrideCenterOfMass=False, OverrideMomentsOfInertia=False)
+
+    @property
+    def SelectedItems(self):
+        return self.selected
+
+    @SelectedItems.setter
+    def SelectedItems(self, value) -> None:
+        self.selected = tuple(value)
+        self.history.append(self.selected)
+
+    @property
+    def Mass(self) -> float:
+        if len(self.selected) != 1:
+            raise AssertionError(f"selection must hold exactly one component, got {self.selected!r}")
+        return self.selected[0].mass
+
+    @property
+    def Volume(self) -> float:
+        return self.selected[0].volume
+
+    def Recalculate(self) -> None:
+        self.recalculated += 1
+
+    @property
+    def GetOverrideOptions(self):
+        return self.overrides
+
+
+class FakeComponent:
+    """A component instance whose hierarchy or name can be made to fail on demand."""
+
+    def __init__(
+        self,
+        name,
+        *,
+        mass: float = 1.0,
+        volume: float = 1e-6,
+        children=(),
+        suppressed: bool = False,
+        name_raises: bool = False,
+        children_raise: bool = False,
+    ) -> None:
+        self._name = name
+        self.mass = mass
+        self.volume = volume
+        self._children = list(children)
+        self._suppressed = suppressed
+        self._name_raises = name_raises
+        self._children_raise = children_raise
+
+    @property
+    def Name2(self):
+        if self._name_raises:
+            raise RuntimeError("Name2 failed")
+        return self._name
+
+    @property
+    def IsSuppressed(self) -> bool:
+        return self._suppressed
+
+    def GetChildren(self):
+        if self._children_raise:
+            raise RuntimeError("GetChildren failed")
+        return list(self._children)
+
+    def GetPathName(self) -> str:
+        return f"{self._name or 'unnamed'}.SLDPRT"
+
+
+class FakeRoot:
+    def __init__(self, children) -> None:
+        self._children = list(children)
+
+    def GetChildren(self):
+        return list(self._children)
+
+
+class FakeComDocument:
+    def __init__(
+        self, root, mp: FakeMassProperty, path: str = r"C:\fake\asm.SLDASM", configuration: str = "Default"
+    ) -> None:
+        self.Extension = SimpleNamespace(CreateMassProperty2=mp)
+        self._path = path
+        active = SimpleNamespace(Name=configuration, GetRootComponent3=lambda strict: root)
+        self.ConfigurationManager = SimpleNamespace(ActiveConfiguration=active)
+
+    def GetType(self) -> int:
+        return 2
+
+    def GetPathName(self) -> str:
+        return self._path
+
+
+class ComponentContextNativeTests(unittest.TestCase):
+    """Traversal robustness of ``assembly_component_mass_properties`` (no SolidWorks)."""
+
+    def read(self, root) -> tuple[dict, FakeMassProperty]:
+        mp = FakeMassProperty()
+        doc = FakeComDocument(root, mp)
+        backend = SolidWorksBackend()
+        with (
+            patch.object(backend, "_document_by_path", lambda path: doc),
+            patch.dict(sys.modules, {"pythoncom": SimpleNamespace(VT_ARRAY=1, VT_DISPATCH=2)}),
+            patch.object(native_module, "_win32", lambda: SimpleNamespace(VARIANT=lambda vt, value: value)),
+        ):
+            reading = backend.assembly_component_mass_properties(r"C:\fake\asm.SLDASM")
+        return reading, mp
+
+    def test_a_name2_failure_becomes_a_hierarchy_error_and_the_walk_continues(self):
+        bad = FakeComponent(None, name_raises=True)
+        first = FakeComponent("first", mass=1.5)
+        second = FakeComponent("second", mass=2.5)
+        reading, mp = self.read(FakeRoot([bad, first, second]))
+        self.assertEqual([row["name"] for row in reading["instances"]], ["first", "second"])
+        self.assertEqual([row["context_mass_kg"] for row in reading["instances"]], [1.5, 2.5])
+        self.assertEqual(len(reading["errors"]), 1)
+        self.assertEqual(reading["errors"][0]["stage"], "hierarchy")
+        self.assertEqual(reading["errors"][0]["error"], "RuntimeError")
+        self.assertEqual(mp.recalculated, 2)
+
+    def test_a_children_failure_keeps_siblings_and_names_the_stage(self):
+        broken = FakeComponent("broken", children_raise=True)
+        good = FakeComponent("good", children=[FakeComponent("good/child", mass=0.5)])
+        reading, _ = self.read(FakeRoot([broken, good]))
+        self.assertEqual([row["name"] for row in reading["instances"]], ["good", "good/child"])
+        self.assertEqual(reading["errors"][0]["stage"], "hierarchy")
+        self.assertEqual(reading["errors"][0]["name"], "broken")
+        child = reading["instances"][1]
+        self.assertEqual(child["depth"], 1)
+        self.assertEqual(child["parent"], "good")
+
+    def test_a_missing_name2_is_a_named_hierarchy_error(self):
+        reading, _ = self.read(FakeRoot([FakeComponent(None), FakeComponent("ok")]))
+        self.assertEqual([row["name"] for row in reading["instances"]], ["ok"])
+        self.assertEqual(reading["errors"][0]["error"], "cad_component_name_missing")
+        self.assertEqual(reading["errors"][0]["stage"], "hierarchy")
+
+    def test_a_mass_reading_failure_is_staged_and_the_walk_continues(self):
+        reading, _ = self.read(FakeRoot([FakeComponent("bad", mass=float("nan")), FakeComponent("good", mass=1.0)]))
+        self.assertEqual([row["name"] for row in reading["instances"]], ["good"])
+        self.assertEqual(reading["errors"][0]["stage"], "mass_property")
+        self.assertEqual(reading["errors"][0]["error"], "cad_mass_property_invalid")
+
+    def test_each_read_selects_exactly_its_instance_in_document_order(self):
+        children = [
+            FakeComponent("a", mass=1.0),
+            FakeComponent("b", mass=2.0),
+            FakeComponent("c", mass=3.0),
+        ]
+        reading, mp = self.read(FakeRoot(children))
+        self.assertEqual([row["name"] for row in reading["instances"]], ["a", "b", "c"])
+        self.assertEqual([row["context_mass_kg"] for row in reading["instances"]], [1.0, 2.0, 3.0])
+        self.assertEqual([selection[0].Name2 for selection in mp.history], ["a", "b", "c"])
+        for selection in mp.history:
+            self.assertEqual(len(selection), 1)
+
+    def test_suppressed_instances_are_skipped_with_their_children(self):
+        suppressed = FakeComponent("hidden", suppressed=True, children=[FakeComponent("hidden/child")])
+        visible = FakeComponent("visible")
+        reading, mp = self.read(FakeRoot([suppressed, visible]))
+        self.assertEqual([row["name"] for row in reading["instances"]], ["visible"])
+        self.assertEqual(reading["errors"], [])
+        self.assertEqual([selection[0].Name2 for selection in mp.history], ["visible"])
 
 
 class MaterialFallbackTests(unittest.TestCase):

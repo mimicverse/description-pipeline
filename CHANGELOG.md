@@ -29,6 +29,9 @@
   mass, COM component or inertia entry — and a COM or inertia that is not a 3-vector or 3x3 tensor —
   used to read as "no difference" and pass, because every comparison with NaN is false. The new
   component-context rows get the same finite/positive and shape validation.
+- One unreadable component instance no longer discards the whole component-context section: a name,
+  hierarchy or mass-property failure is recorded as a staged row error and the walk keeps the rows
+  it could read.
 
 ## [0.3.24] - 2026-09-29
 

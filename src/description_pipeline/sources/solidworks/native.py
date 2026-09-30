@@ -369,6 +369,19 @@ def unverified_material_record(exc, configuration) -> dict:
     return record
 
 
+def _instance_error(name: str, parent: str | None, depth: int, stage: str, error: BaseException) -> dict:
+    """One unreadable component instance, naming the traversal stage that failed."""
+
+    return {
+        "name": name,
+        "parent": parent,
+        "depth": depth,
+        "stage": stage,
+        "error": str(getattr(error, "code", "") or type(error).__name__),
+        "message": " ".join(str(error).split())[:200],
+    }
+
+
 def legacy_mass_reading(values, status) -> dict:
     """Mass-only reading from ``IModelDocExtension.GetMassProperties2``'s 13-value vector.
 
@@ -779,11 +792,20 @@ class SolidWorksBackend(CadBackend):
         ]
         while stack:
             raw, parent, depth = stack.pop()
-            component = _dynamic(raw)
-            name = str(_member(component, "Name2"))
-            if _member(component, "IsSuppressed"):
+            name = ""
+            children: list = []
+            try:
+                component = _dynamic(raw)
+                raw_name = _member(component, "Name2")
+                if raw_name is None or not str(raw_name):
+                    raise CadError("cad_component_name_missing", "component instance has no Name2")
+                name = str(raw_name)
+                if _member(component, "IsSuppressed"):
+                    continue
+                children = list(_member(component, "GetChildren") or ())
+            except Exception as error:  # noqa: BLE001 - one unreadable instance must not stop the walk
+                errors.append(_instance_error(name, parent, depth, "hierarchy", error))
                 continue
-            children = list(_member(component, "GetChildren") or ())
             stack.extend((child, name, depth + 1) for child in reversed(children))
             try:
                 mp = _member(_member(doc, "Extension"), "CreateMassProperty2")
@@ -791,7 +813,10 @@ class SolidWorksBackend(CadBackend):
                     raise CadError("cad_empty_mass_property", "CreateMassProperty2 returned null")
                 mp.UseSystemUnits = True
                 mp.IncludeHiddenBodiesOrComponents = True
-                mp.SelectedItems = _win32().VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, (component,))
+                # Keep the array alive until every read below has returned; a temporary released
+                # right after the property put would leave the selection's lifetime to the binder.
+                selection = _win32().VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, (component,))
+                mp.SelectedItems = selection
                 _member(mp, "Recalculate")
                 override = _member(mp, "GetOverrideOptions")
                 mass = float(_member(mp, "Mass"))
@@ -816,15 +841,7 @@ class SolidWorksBackend(CadBackend):
                     }
                 )
             except Exception as error:  # noqa: BLE001 - one unreadable instance is reported, not fatal
-                errors.append(
-                    {
-                        "name": name,
-                        "parent": parent,
-                        "depth": depth,
-                        "error": str(getattr(error, "code", "") or type(error).__name__),
-                        "message": " ".join(str(error).split())[:200],
-                    }
-                )
+                errors.append(_instance_error(name, parent, depth, "mass_property", error))
         return {
             "assembly": str(_member(doc, "GetPathName")),
             "configuration": str(_member(configuration, "Name")),
