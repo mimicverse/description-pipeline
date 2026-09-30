@@ -32,6 +32,10 @@
 - One unreadable component instance no longer discards the whole component-context section: a name,
   hierarchy or mass-property failure is recorded as a staged row error and the walk keeps the rows
   it could read.
+- A Windows App Control rejection of a MuJoCo DLL (for example Smart App Control blocking the
+  unsigned `plugin\elasticity.dll`) is reported as such — with the affected library and the original
+  `OSError` — by `description doctor`, the worker's local-pipeline probe and `quickstart`'s error
+  payload, instead of being classified as a missing package or parsed as a MuJoCo version.
 
 ## [0.3.24] - 2026-09-29
 

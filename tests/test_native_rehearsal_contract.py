@@ -171,5 +171,24 @@ class NativeRehearsalContractTests(unittest.TestCase):
         )
 
 
+WORKER = ROOT / "src" / "description_pipeline" / "sources" / "solidworks" / "deploy" / "worker.ps1"
+
+
+class AppControlDiagnosticContractTests(unittest.TestCase):
+    def test_the_mujoco_version_parse_requires_a_number(self):
+        """A blocked pipeline line must never surface as version "is"."""
+
+        script = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn(r"mujoco\s+v?(\d+(?:\.\d+)*)", script)
+        self.assertIsNone(re.search(r"mujoco\s+v?(\d+(?:\.\d+)*)", "mujoco is not importable in this runtime"))
+
+    def test_the_worker_probe_is_structured(self):
+        """The worker has to classify the OS error instead of flattening it into missing."""
+
+        worker = WORKER.read_text(encoding="utf-8")
+        self.assertIn("local_pipeline_probe", worker)
+        self.assertIn("ConvertFrom-Json", worker)
+
+
 if __name__ == "__main__":
     unittest.main()

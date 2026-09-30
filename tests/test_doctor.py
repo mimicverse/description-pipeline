@@ -6,10 +6,12 @@ rather than a traceback.
 """
 
 import contextlib
+import importlib
 import io
 import json
 import shutil
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -17,6 +19,10 @@ from unittest import mock
 from description_pipeline import cli, doctor
 from description_pipeline.build import lock_toolchain
 from description_pipeline.io import PipelineError
+
+#: Captured before any test patches ``importlib.import_module``, so the fake can pass non-MuJoCo
+#: lookups through to the real function instead of recursing into the patch.
+REAL_IMPORT = importlib.import_module
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = ROOT / "examples" / "demo-arm"
@@ -354,6 +360,71 @@ class DoctorCliTests(unittest.TestCase):
         self.assertEqual(exit_code.exception.code, 0)
         self.assertIn("description doctor", output)
         self.assertIn("description model update", output)
+
+
+class AppControlDiagnosticTests(unittest.TestCase):
+    """A blocked MuJoCo DLL is neither a missing package nor a version string."""
+
+    @staticmethod
+    def blocked() -> OSError:
+        # A generic path: the real machine's paths and policy ids never enter the public tree.
+        error = OSError(4551, "An application control policy has blocked this file")
+        error.filename = r"C:\mujoco\plugin\elasticity.dll"
+        return error
+
+    def fake_import(self, name, *args, **kwargs):
+        if name == "mujoco":
+            raise self.blocked()
+        return REAL_IMPORT(name, *args, **kwargs)
+
+    def test_only_the_app_control_winerror_is_classified(self):
+        state = doctor.app_control_rejection(self.blocked())
+        assert state is not None
+        self.assertEqual(state["code"], "windows_app_control")
+        self.assertEqual(state["winerror"], 4551)
+        self.assertEqual(state["library"], r"C:\mujoco\plugin\elasticity.dll")
+        self.assertIn("OSError", state["error"])
+        self.assertIsNone(doctor.app_control_rejection(OSError(22, "no such file")))
+        self.assertIsNone(doctor.app_control_rejection(ImportError("no module")))
+
+    def test_a_blocked_optional_package_is_not_reported_as_missing(self):
+        with (
+            mock.patch.object(doctor, "_external", return_value="tool 1.0"),
+            mock.patch.object(doctor.importlib, "import_module", side_effect=self.fake_import),
+        ):
+            report = doctor.run()
+        check = next(item for item in report["checks"] if item["name"] == "optional packages")
+        self.assertEqual(check["status"], doctor.FAIL)
+        self.assertIn("Windows App Control", check["detail"])
+        self.assertIn("elasticity.dll", check["detail"])
+        self.assertNotIn("missing", check["detail"])
+        self.assertIn("do not edit file attributes", check["fix"])
+        self.assertIn("optional packages", report["failed"])
+
+    def test_the_probe_keeps_the_library_and_the_os_error(self):
+        with (
+            mock.patch.object(doctor.importlib, "import_module", side_effect=self.fake_import),
+            mock.patch.object(doctor, "_installed_version", return_value="3.13.0"),
+        ):
+            probe = doctor.local_pipeline_probe()
+        self.assertEqual(probe["status"], "blocked")
+        self.assertEqual(probe["version"], "3.13.0")
+        self.assertEqual(probe["library"], r"C:\mujoco\plugin\elasticity.dll")
+        self.assertEqual(probe["winerror"], 4551)
+        self.assertIn("OSError", probe["error"])
+        self.assertIn("Windows App Control", probe["detail"])
+        self.assertNotEqual(probe.get("version"), "is")
+
+    def test_the_probe_reports_a_healthy_runtime(self):
+        module = types.SimpleNamespace(__version__="3.13.0")
+        with (
+            mock.patch.object(doctor.importlib, "import_module", return_value=module),
+            mock.patch.object(doctor, "_installed_version", return_value="3.13.0"),
+        ):
+            probe = doctor.local_pipeline_probe()
+        self.assertEqual(probe["status"], "ok")
+        self.assertEqual(probe["version"], "3.13.0")
+        self.assertEqual(probe["detail"], "mujoco 3.13.0")
 
 
 if __name__ == "__main__":

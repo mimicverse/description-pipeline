@@ -12,6 +12,7 @@ import importlib
 import importlib.metadata
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -81,6 +82,90 @@ def _version(distribution: str) -> str | None:
         return importlib.metadata.version(distribution)
     except importlib.metadata.PackageNotFoundError:  # pragma: no cover - unusual layouts only
         return "unknown"
+
+
+#: The Windows error an App Control policy raises when it blocks an unsigned DLL.
+APP_CONTROL_WINERROR = 4551
+
+
+def app_control_rejection(error: BaseException) -> dict | None:
+    """Classify a DLL load failure as a Windows App Control rejection, if it is one.
+
+    Generic on purpose: the machine's policy id is never captured, only the OS error and the
+    affected library.  ``ctypes`` sets ``OSError.filename`` to the blocked DLL; when a caller
+    re-wraps the error the path is recovered from the message instead.
+    """
+
+    codes = {getattr(error, "winerror", None), getattr(error, "errno", None)}
+    if APP_CONTROL_WINERROR not in codes:
+        return None
+    library = getattr(error, "filename", None)
+    if not library:
+        match = re.search(r"[A-Za-z]:\\[^\"'\r\n]*\.(?:dll|pyd)", str(error))
+        library = match.group(0) if match else None
+    return {
+        "code": "windows_app_control",
+        "winerror": APP_CONTROL_WINERROR,
+        "library": str(library) if library else None,
+        "error": f"{type(error).__name__}: {error}",
+    }
+
+
+def app_control_message(state: dict) -> str:
+    """The one-line, actionable sentence for an App Control rejection."""
+
+    library = state.get("library") or "a bundled DLL"
+    return (
+        f"Windows App Control rejected {library} (WinError {state.get('winerror')}); the package is "
+        "installed but its DLLs are unsigned.  Windows keeps its own trust state for such files — do "
+        "not edit file attributes or replace the DLLs; run the pipeline where the policy allows the "
+        "MuJoCo binaries, or ask IT to review the policy"
+    )
+
+
+def _installed_version(distribution: str) -> str | None:
+    try:
+        return importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:  # pragma: no cover - unusual layouts only
+        return None
+
+
+def local_pipeline_probe() -> dict:
+    """JSON-ready answer for the Windows worker: does this runtime import the pipeline and MuJoCo?
+
+    A Windows App Control rejection is reported as ``blocked`` with the affected library and the
+    original OS error, never flattened into "mujoco is not importable" or "missing".
+    """
+
+    try:
+        importlib.import_module("description_pipeline")
+    except Exception as error:  # noqa: BLE001 - the probe reports, it does not judge
+        return {
+            "status": "error",
+            "detail": f"the pipeline itself is not importable: {error}",
+            "version": None,
+            "error": f"{type(error).__name__}: {error}",
+        }
+    version = _installed_version("mujoco")
+    try:
+        mujoco = importlib.import_module("mujoco")
+    except Exception as error:  # noqa: BLE001 - every import failure is data
+        state = app_control_rejection(error)
+        if state is not None:
+            detail = (
+                f"mujoco {version or '(installed)'} is blocked by Windows App Control "
+                f"(WinError {state['winerror']}): {state.get('library') or 'a bundled DLL'}; "
+                f"{state['error']}"
+            )
+            return {"status": "blocked", "detail": detail, "version": version, **state}
+        return {
+            "status": "error",
+            "detail": f"mujoco is not importable: {error}",
+            "version": version,
+            "error": f"{type(error).__name__}: {error}",
+        }
+    reported = str(getattr(mujoco, "__version__", "") or version or "unknown")
+    return {"status": "ok", "detail": f"mujoco {reported}", "version": reported}
 
 
 def _external(name: str) -> str | None:
@@ -200,6 +285,25 @@ def _environment(*, github: bool) -> list[dict]:
         checks.append(_check("packages", OK, found))
 
     optional_missing = [name for name in OPTIONAL if _version(name) is None]
+    blocked: dict[str, dict] = {}
+    for name in optional_missing:
+        try:
+            importlib.import_module(OPTIONAL[name])
+        except Exception as error:  # noqa: BLE001 - the doctor reports every import failure as data
+            state = app_control_rejection(error)
+            if state is not None:
+                blocked[name] = state
+    if blocked:
+        checks.append(
+            _check(
+                "optional packages",
+                FAIL,
+                "; ".join(f"{name}: {app_control_message(state)}" for name, state in blocked.items()),
+                "run the pipeline where Windows App Control allows the MuJoCo binaries, or ask IT to "
+                "review the policy; do not edit file attributes or replace the plugin DLLs",
+            )
+        )
+        optional_missing = [name for name in optional_missing if name not in blocked]
     if optional_missing:
         checks.append(
             _check(
@@ -211,7 +315,7 @@ def _environment(*, github: bool) -> list[dict]:
                 "its version",
             )
         )
-    else:
+    elif not blocked:
         found = ", ".join(f"{name} {_version(name)}" for name in OPTIONAL)
         checks.append(_check("optional packages", OK, found))
 

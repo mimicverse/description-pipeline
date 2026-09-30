@@ -440,25 +440,44 @@ function Invoke-WorkerEndpoint($ConfigHost, [string]$Path, [string]$Method = 'GE
     }
 }
 
-function Test-LocalPipeline([string]$Python) {
-    # The single-machine entry runs the public pipeline (build + independent verification)
-    # from this same runtime, so the installed venv must carry the consumer dependencies
-    # (MuJoCo) and not only the collection worker's.
-    if (-not (Test-Path -LiteralPath $Python)) {
-        return @{ status = 'missing'; detail = 'runtime interpreter not installed' }
-    }
+function Invoke-PythonProbe([string]$Python, [string]$Code) {
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $probe = & $Python -c "import mujoco, description_pipeline; print(mujoco.__version__)" 2>&1 | Out-String
-        $code = $LASTEXITCODE
+        $output = & $Python -c $Code 2>&1 | Out-String
+        $exit = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previous
     }
-    if ($code -ne 0) {
-        return @{ status = 'missing'; detail = "mujoco is not importable in this runtime" }
+    return @{ output = $output; exit = $exit }
+}
+
+function Test-LocalPipeline([string]$Python) {
+    # The single-machine entry runs the public pipeline (build + independent verification)
+    # from this same runtime, so the installed venv must carry the consumer dependencies
+    # (MuJoCo) and not only the collection worker's.  The structured probe keeps the OS error
+    # and the affected library, and reports a Windows App Control rejection as blocked
+    # (the package is installed; the machine's policy refuses its unsigned DLL) rather than
+    # flattening it into "mujoco is not importable".
+    if (-not (Test-Path -LiteralPath $Python)) {
+        return @{ status = 'missing'; detail = 'runtime interpreter not installed' }
     }
-    return @{ status = 'ok'; detail = ('mujoco ' + $probe.Trim()) }
+    $structured = Invoke-PythonProbe $Python "import json; from description_pipeline.doctor import local_pipeline_probe as probe; print(json.dumps(probe()))"
+    $state = $null
+    if ($structured.exit -eq 0) {
+        try { $state = ($structured.output.Trim() | ConvertFrom-Json) } catch { $state = $null }
+    }
+    if ($state -and $state.status) {
+        return @{ status = [string]$state.status; detail = [string]$state.detail }
+    }
+    # Older runtimes and stand-ins do not carry the structured probe yet; keep the old contract,
+    # but keep the last line of the failure (the OSError itself) as the evidence.
+    $legacy = Invoke-PythonProbe $Python "import mujoco, description_pipeline; print(mujoco.__version__)"
+    if ($legacy.exit -ne 0) {
+        $reason = ($legacy.output.Trim() -split "`r?`n" | Where-Object { $_ } | Select-Object -Last 1)
+        return @{ status = 'error'; detail = ("mujoco is not importable in this runtime: " + $reason) }
+    }
+    return @{ status = 'ok'; detail = ('mujoco ' + $legacy.output.Trim()) }
 }
 
 function Publish-VersionRuntime([string]$VersionDir, [string]$Venv) {
