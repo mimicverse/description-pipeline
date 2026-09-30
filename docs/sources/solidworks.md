@@ -174,10 +174,11 @@ source:
 
 解压目录与 `install_root` 分开：日常使用解压目录中的 `submit.ps1` 和同目录的 `submit-host.json`。
 `worker-host.json` 的 `assembly`、`configuration` 只供 Doctor 检查；每次采集的真实目标来自模型的 `config/robot.yaml`。
+`install_root` 应保持较短，以免 PowerShell 解包触及旧版路径长度限制。
 
 ```powershell
-$Bundle = '.\description-worker-0.3.23-windows-x86_64.zip'
-$Deploy = '.\worker-0.3.23'
+$Bundle = '.\description-worker-0.3.24-windows-x86_64.zip'
+$Deploy = '.\worker-0.3.24'
 $Config = "$Deploy\worker-host.json"
 Expand-Archive $Bundle -DestinationPath $Deploy -Force
 Copy-Item "$Deploy\worker-host.example.json" $Config

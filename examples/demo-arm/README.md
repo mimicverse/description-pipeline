@@ -24,7 +24,7 @@ The committed artifacts were produced by the released tool recorded in `config/t
 
 ## Run it
 
-Requires CPython 3.12 and `description` (release 0.3.23 or a source checkout).
+Requires CPython 3.12 and `description` (release 0.3.24 or a source checkout).
 
 ```sh
 description quickstart --run

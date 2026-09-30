@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.3.24] - 2026-09-29
+
 ### Added
 
 - A capture records the assembly's own mass properties next to the parallel-axis combination of its

@@ -204,10 +204,11 @@ The extracted directory and `install_root` are separate: day to day you use `sub
 extracted directory with `submit-host.json` next to it. The `assembly` and `configuration` in
 `worker-host.json` are for Doctor only; each capture's real target comes from the model's
 `config/robot.yaml`.
+Keep `install_root` short to avoid PowerShell's legacy archive path limit.
 
 ```powershell
-$Bundle = '.\description-worker-0.3.23-windows-x86_64.zip'
-$Deploy = '.\worker-0.3.23'
+$Bundle = '.\description-worker-0.3.24-windows-x86_64.zip'
+$Deploy = '.\worker-0.3.24'
 $Config = "$Deploy\worker-host.json"
 Expand-Archive $Bundle -DestinationPath $Deploy -Force
 Copy-Item "$Deploy\worker-host.example.json" $Config

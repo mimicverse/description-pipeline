@@ -4,7 +4,7 @@
 
 | Version | Supported |
 | --- | --- |
-| Latest published release (currently `0.3.23`) | fixes are released here |
+| Latest published release (currently `0.3.24`) | fixes are released here |
 | Older public releases | supported only when stated in their release notes |
 
 ## Reporting a vulnerability
