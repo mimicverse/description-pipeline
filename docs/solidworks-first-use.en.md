@@ -83,8 +83,8 @@ If GitHub HTTPS negotiation stalls on the current network, pin Git to protocol v
 git config --global protocol.version 0
 ```
 
-Download `description-worker-0.3.23-windows-x86_64.zip` and `SHA256SUMS` from the
-[0.3.23 distribution page](https://github.com/mimicverse/description-pipeline/releases/tag/v0.3.23) and read
+Download `description-worker-0.3.24-windows-x86_64.zip` and `SHA256SUMS` from the
+[0.3.24 distribution page](https://github.com/mimicverse/description-pipeline/releases/tag/v0.3.24) and read
 the validation status on that page first. The archive contains the complete runtime for capture,
 build and MuJoCo verification; the offline installation downloads no Python dependencies.
 
@@ -96,21 +96,24 @@ administrator rights are needed. Put the ZIP and `SHA256SUMS` in your Downloads 
 against the adjacent `SHA256SUMS`):
 
 ```powershell
-$Bundle = "$env:USERPROFILE\Downloads\description-worker-0.3.23-windows-x86_64.zip"
-$Deploy = "$env:USERPROFILE\description-setup\0.3.23"
+$Bundle = "$env:USERPROFILE\Downloads\description-worker-0.3.24-windows-x86_64.zip"
+$Deploy = "$env:USERPROFILE\description-setup\0.3.24"
 Expand-Archive -LiteralPath $Bundle -DestinationPath $Deploy -Force
 powershell -ExecutionPolicy Bypass -File "$Deploy\worker.ps1" -Action Setup -Bundle $Bundle `
-    -Assembly 'D:\robots\myrobot\robot.SLDASM' -AssemblyConfiguration Default
+    -InstallRoot "$env:USERPROFILE\dw" -Assembly 'D:\robots\myrobot\robot.SLDASM' `
+    -AssemblyConfiguration Default
 if ($LASTEXITCODE -ne 0) { throw 'Doctor failed' }
-$Python = "$env:LOCALAPPDATA\DescriptionWorker\versions\0.3.23\venv\Scripts\python.exe"
+$Python = "$env:USERPROFILE\dw\versions\0.3.24\venv\Scripts\python.exe"
 & $Python -m description_pipeline --version
 ```
 
-`Setup` writes `worker-host.json` (installing under `%LOCALAPPDATA%\DescriptionWorker`, port 8765,
+`Setup` writes `worker-host.json` (installing under `%USERPROFILE%\dw` as shown, port 8765,
 the current user and the CPython 3.12 on PATH), then runs `Install` and `Doctor`; the archive digest
 is checked against the adjacent `SHA256SUMS`, and when that file is missing the digest of the file as
 provided is pinned with a note. Add `-NoInstall` to only write the configuration, or keep editing
 `worker-host.json` and calling `-Action Install` / `-Action Doctor` yourself.
+Keep `-InstallRoot` short: a longer custom root made PowerShell's archive extraction exceed its
+legacy path limit in the Windows release rehearsal.
 
 `Setup` is safe to repeat: when the command line matches the installed machine it skips the
 installation and only re-checks, and to change a setting add `-Force` and then `-Action Install` to
@@ -300,7 +303,7 @@ From then on: save the CAD, keep the desktop logged in and the machine awake, an
 directory:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\description-setup\0.3.23\submit.ps1"
+powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\description-setup\0.3.24\submit.ps1"
 ```
 
 That command performs preflight, capture, build, verification, Git push and pull-request creation or

@@ -62,8 +62,8 @@ gh auth status
 git config --global protocol.version 0
 ```
 
-从 [0.3.23 分发页](https://github.com/mimicverse/description-pipeline/releases/tag/v0.3.23) 下载
-`description-worker-0.3.23-windows-x86_64.zip` 和 `SHA256SUMS`，并先查看页面上的验收状态。
+从 [0.3.24 分发页](https://github.com/mimicverse/description-pipeline/releases/tag/v0.3.24) 下载
+`description-worker-0.3.24-windows-x86_64.zip` 和 `SHA256SUMS`，并先查看页面上的验收状态。
 此包包含采集、构建和 MuJoCo 验证所需的完整运行环境；离线安装不下载 Python 依赖。
 
 ## 2. 安装并检查本机环境
@@ -72,19 +72,21 @@ git config --global protocol.version 0
 然后让 `Setup` 一次完成配置、安装与 Doctor（它会用旁边的 `SHA256SUMS` 校验安装包摘要）：
 
 ```powershell
-$Bundle = "$env:USERPROFILE\Downloads\description-worker-0.3.23-windows-x86_64.zip"
-$Deploy = "$env:USERPROFILE\description-setup\0.3.23"
+$Bundle = "$env:USERPROFILE\Downloads\description-worker-0.3.24-windows-x86_64.zip"
+$Deploy = "$env:USERPROFILE\description-setup\0.3.24"
 Expand-Archive -LiteralPath $Bundle -DestinationPath $Deploy -Force
 powershell -ExecutionPolicy Bypass -File "$Deploy\worker.ps1" -Action Setup -Bundle $Bundle `
-    -Assembly 'D:\robots\myrobot\robot.SLDASM' -AssemblyConfiguration Default
+    -InstallRoot "$env:USERPROFILE\dw" -Assembly 'D:\robots\myrobot\robot.SLDASM' `
+    -AssemblyConfiguration Default
 if ($LASTEXITCODE -ne 0) { throw 'Doctor failed' }
-$Python = "$env:LOCALAPPDATA\DescriptionWorker\versions\0.3.23\venv\Scripts\python.exe"
+$Python = "$env:USERPROFILE\dw\versions\0.3.24\venv\Scripts\python.exe"
 & $Python -m description_pipeline --version
 ```
 
-`Setup` 写出 `worker-host.json`（默认装到 `%LOCALAPPDATA%\DescriptionWorker`，端口 8765，用当前用户与 PATH 上的
+`Setup` 写出 `worker-host.json`（上述命令安装到 `%USERPROFILE%\dw`，端口 8765，用当前用户与 PATH 上的
 CPython 3.12），接着执行 `Install` 并运行 `Doctor`；摘要从旁边的 `SHA256SUMS` 核对，找不到时会把当前文件摘要固定下来
 并提示。想自己检查每一项时，可加 `-NoInstall` 只写配置，或改完 `worker-host.json` 后照旧用 `-Action Install` / `-Action Doctor`。
+`-InstallRoot` 应保持较短：Windows 发布验收中，自定义的较长路径曾使 PowerShell 解包超过旧版路径长度限制。
 
 `Setup` 可以安全重复：命令行与已装好的一致时会直接跳过安装，只重新检查；只想改设置就加 `-Force`，
 再用 `-Action Install` 让新设置生效——它不会重装文件，只会重建启动命令并重启同一版本。
@@ -251,7 +253,7 @@ powershell -ExecutionPolicy Bypass -File "$Deploy\submit.ps1" -DescribeOnly
 以后保存 CAD，保持桌面登录、电脑唤醒，在任意目录运行：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\description-setup\0.3.23\submit.ps1"
+powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\description-setup\0.3.24\submit.ps1"
 ```
 
 该命令在本机完成预检、采集、构建、验证、Git 推送和 PR 创建或更新。
