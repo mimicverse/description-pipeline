@@ -10,9 +10,12 @@
   coverage. Nested rows exist to detect overrides a clean parent would hide; nothing is distributed
   or forced — the documented table stays the author's. `description check` reports the two bases as
   a **note** for a `documented_table` model, and fails a `cad` model when any instance override
-  (mass, COM or inertia) is recorded or the context is unavailable/incomplete; older snapshots
-  without the record keep their verdict. The `require_material=False` fallback also keeps the full
-  material-assignment detail the CAD error carried, instead of reducing it to a code and a message.
+  (mass, COM or inertia) is recorded, when the full ancestor closure derived from the scene leaves
+  is not covered exactly, or when a node's effective mass disagrees with its selected part-document
+  reading beyond tolerance; the context being unavailable/incomplete fails `cad` as well. Older
+  snapshots without the record keep their verdict. The `require_material=False` fallback also keeps
+  the full material-assignment detail the CAD error carried, instead of reducing it to a code and a
+  message.
 
 ### Changed
 

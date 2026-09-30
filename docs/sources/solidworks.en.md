@@ -104,9 +104,12 @@ terminate the operator's SolidWorks.
 `raw/mass_closure.json` records the assembly document's own reading and the leaf readings, and now
 also `component_context`: each component instance's assembly-context mass and its three override
 flags; the leaf/document masses stay a separate basis. Totals use only the **disjoint depth-0 rows**;
-nested rows exist to detect overrides a clean parent would otherwise hide. Missing or duplicate rows,
-non-boolean flags, or a depth that disagrees with the name make the independent check
-(`source.normalization.mass_closure`) fail.
+nested rows exist to detect overrides a clean parent would otherwise hide. Node coverage is derived
+as the **full prefix closure** of the scene leaves: missing ancestor rows, absent parent rows,
+duplicates, wrong node types or unknown extra rows are rejected, and pure CAD additionally requires
+each node's assembly-context mass to match the sum of its selected part-document readings within
+tolerance. Missing or duplicate rows, non-boolean flags, or a depth that disagrees with the name make
+the independent check (`source.normalization.mass_closure`) fail.
 
 ## Mass and inertia contract
 

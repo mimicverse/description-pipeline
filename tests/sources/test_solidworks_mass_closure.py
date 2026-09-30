@@ -1,8 +1,11 @@
 """Capture-time mass closure: the assembly's own reading next to the recombined leaf readings.
 
-The record is evidence, and the verification side reports a mismatch as an advisory: a repaired or
-re-materialed leaf (a leaf that no longer matches the tree the assembly was built from) becomes
-visible without turning into a release gate.  Snapshots that predate the record stay not_applicable.
+The record is evidence, and the verification side reports a whole-assembly mismatch as an advisory:
+a leaf that no longer matches the tree the assembly was built from becomes visible without turning
+into a release gate.  The component-context source guard is stricter on purpose: a recorded instance
+override, or an effective mass the selected part documents cannot explain, fails a pure-CAD
+(`material_source: cad`) model, while a documented table keeps it as a note.  Snapshots that predate
+the record stay not_applicable.
 
 A build whose legacy ``Extension.GetMassProperties2`` answers instead of ``CreateMassProperty2``
 records a **mass-only** closure: only the mass the existing recovery reports (and the 2026-09-29
@@ -604,12 +607,15 @@ class MassContextTests(ClosureFixture):
             },
         }
 
-    def handwritten(self, name: str, record: dict, leaves: list[str]) -> Path:
+    def handwritten(self, name: str, record: dict, leaves: dict[str, float]) -> Path:
         snapshot = self.tmp / name
         (snapshot / "raw").mkdir(parents=True)
         (snapshot / "raw/mass_closure.json").write_text(json.dumps(record), encoding="utf-8")
         (snapshot / "raw/scene_raw.json").write_text(
             json.dumps({"components": [{"name": leaf} for leaf in leaves]}), encoding="utf-8"
+        )
+        (snapshot / "raw/mass_properties.json").write_text(
+            json.dumps({leaf: {"mass": mass} for leaf, mass in leaves.items()}), encoding="utf-8"
         )
         return snapshot
 
@@ -623,7 +629,7 @@ class MassContextTests(ClosureFixture):
     def test_a_nested_override_under_a_clean_parent_fails_pure_cad(self):
         rows = self.nested_rows()
         rows[1]["overrides"]["OverrideCenterOfMass"] = True
-        snapshot = self.handwritten("nested-override", self.closure_record(rows), ["p-1/a", "p-1/b"])
+        snapshot = self.handwritten("nested-override", self.closure_record(rows), {"p-1/a": 0.5, "p-1/b": 1.0})
         documented = _mass_closure_check(snapshot, "documented_table")
         self.assertEqual(documented["status"], "passed", documented)
         context = documented["details"]["component_context"]
@@ -638,14 +644,16 @@ class MassContextTests(ClosureFixture):
 
     def test_an_inertia_only_override_fails_pure_cad(self):
         rows = [context_row("base-1", 1.0), context_row("arm-1", 0.5, overrides={"OverrideMomentsOfInertia": True})]
-        snapshot = self.handwritten("inertia-override", self.closure_record(rows), ["base-1", "arm-1"])
+        snapshot = self.handwritten("inertia-override", self.closure_record(rows), {"base-1": 1.0, "arm-1": 0.5})
         self.assertEqual(_mass_closure_check(snapshot, "documented_table")["status"], "passed")
         cad = _mass_closure_check(snapshot, "cad")
         self.assertEqual(cad["status"], "failed", cad)
         self.assertEqual(cad["details"]["component_context"]["inertia_overridden"], 1)
 
     def test_totals_use_only_the_disjoint_top_level_rows(self):
-        snapshot = self.handwritten("nested-totals", self.closure_record(self.nested_rows()), ["p-1/a", "p-1/b"])
+        snapshot = self.handwritten(
+            "nested-totals", self.closure_record(self.nested_rows()), {"p-1/a": 0.5, "p-1/b": 1.0}
+        )
         check = _mass_closure_check(snapshot, "cad")
         self.assertEqual(check["status"], "passed", check)
         context = check["details"]["component_context"]
@@ -654,14 +662,61 @@ class MassContextTests(ClosureFixture):
 
     def test_an_omitted_leaf_row_blocks_pure_cad_and_is_named(self):
         rows = self.nested_rows()[:2]
-        snapshot = self.handwritten("omitted-leaf", self.closure_record(rows), ["p-1/a", "p-1/b"])
+        snapshot = self.handwritten("omitted-leaf", self.closure_record(rows), {"p-1/a": 0.5, "p-1/b": 1.0})
         documented = _mass_closure_check(snapshot, "documented_table")
         self.assertEqual(documented["status"], "passed", documented)
-        self.assertIn("not covered", documented["details"]["advisory"])
+        self.assertIn("not recorded", documented["details"]["advisory"])
         cad = _mass_closure_check(snapshot, "cad")
         self.assertEqual(cad["status"], "failed")
-        self.assertIn("not covered", cad["details"]["error"])
-        self.assertEqual(cad["details"]["component_context"]["coverage"]["missing"], ["p-1/b"])
+        self.assertIn("not recorded", cad["details"]["error"])
+        self.assertEqual(cad["details"]["component_context"]["coverage"]["missing_nodes"], ["p-1/b"])
+
+    def test_a_missing_intermediate_ancestor_row_blocks_pure_cad(self):
+        rows = [
+            context_row("module", 1.5, document_type="assembly"),
+            context_row("module/drive/part", 1.5, depth=2, parent="module/drive"),
+        ]
+        snapshot = self.handwritten("ancestor-omitted", self.closure_record(rows), {"module/drive/part": 1.5})
+        documented = _mass_closure_check(snapshot, "documented_table")
+        self.assertEqual(documented["status"], "passed", documented)
+        self.assertIn("not recorded", documented["details"]["advisory"])
+        cad = _mass_closure_check(snapshot, "cad")
+        self.assertEqual(cad["status"], "failed", cad)
+        coverage = cad["details"]["component_context"]["coverage"]
+        self.assertEqual(coverage["missing_nodes"], ["module/drive"])
+        self.assertEqual(coverage["missing_parent_rows"], ["module/drive/part"])
+
+    def test_an_extra_unknown_assembly_row_blocks_pure_cad(self):
+        rows = [
+            *self.nested_rows(),
+            context_row("module/other", 0.5, depth=1, parent="module", document_type="assembly"),
+        ]
+        snapshot = self.handwritten("extra-row", self.closure_record(rows), {"p-1/a": 0.5, "p-1/b": 1.0})
+        documented = _mass_closure_check(snapshot, "documented_table")
+        self.assertEqual(documented["status"], "passed", documented)
+        self.assertIn("unexpected node row", documented["details"]["advisory"])
+        cad = _mass_closure_check(snapshot, "cad")
+        self.assertEqual(cad["status"], "failed", cad)
+        self.assertEqual(cad["details"]["component_context"]["coverage"]["unexpected_nodes"], ["module/other"])
+
+    def test_a_wrong_node_type_is_malformed(self):
+        rows = self.nested_rows()
+        rows[1]["document_type"] = "assembly"
+        snapshot = self.handwritten("wrong-type", self.closure_record(rows), {"p-1/a": 0.5, "p-1/b": 1.0})
+        check = _mass_closure_check(snapshot, "documented_table")
+        self.assertEqual(check["status"], "failed", check)
+        self.assertIn("invalid node types", check["details"]["error"])
+
+    def test_an_effective_mass_the_documents_cannot_explain_blocks_pure_cad(self):
+        rows = [context_row("base-1", 1.0)]
+        snapshot = self.handwritten("effective-mismatch", self.closure_record(rows), {"base-1": 0.5})
+        documented = _mass_closure_check(snapshot, "documented_table")
+        self.assertEqual(documented["status"], "passed", documented)
+        self.assertEqual(documented["details"]["component_context"]["effective_vs_document_mismatches"], 1)
+        self.assertIn("differs from the recomputed part-document basis", documented["details"]["advisory"])
+        cad = _mass_closure_check(snapshot, "cad")
+        self.assertEqual(cad["status"], "failed", cad)
+        self.assertIn("differs from the selected part-document reading", cad["details"]["error"])
 
     def test_an_unavailable_assembly_probe_still_records_and_gates_the_context(self):
         class Raised(ContextBackend):

@@ -170,7 +170,7 @@ def _component_context_findings(
     payload: dict[str, Any],
     material_source: str,
     assembly_mass: float | None,
-    scene_leaves: set[str] | None,
+    scene_masses: dict[str, float] | None,
 ) -> tuple[dict[str, Any], str | None]:
     """Read the recorded component-context evidence; return ``(details, error)``.
 
@@ -285,17 +285,50 @@ def _component_context_findings(
     )
     missing_document_basis = [entry["name"] for entry in top_level if entry["document_basis_mass_kg"] is None]
     leaf_rows = [entry["name"] for entry in entries if entry["document_type"] == "part"]
-    if scene_leaves is None:
-        coverage: dict[str, Any] = {"known": False}
-    else:
-        leaf_set = set(leaf_rows)
-        coverage = {
+    if scene_masses is not None:
+        expected_nodes = _expected_instance_nodes(scene_masses)
+        node_names = {entry["name"] for entry in entries}
+        missing_nodes = sorted(expected_nodes - node_names)[:20]
+        unexpected_nodes = sorted(node_names - expected_nodes)[:20]
+        missing_parents = sorted(
+            entry["name"] for entry in entries if entry["parent"] is not None and entry["parent"] not in node_names
+        )[:20]
+        wrong_types = sorted(
+            entry["name"] for entry in entries if entry["name"] in scene_masses if entry["document_type"] != "part"
+        ) or sorted(
+            entry["name"]
+            for entry in entries
+            if entry["name"] not in scene_masses and entry["document_type"] != "assembly"
+        )
+        if wrong_types:
+            return {}, f"malformed component mass context: invalid node types {wrong_types[:5]}"
+        equivalence = []
+        for entry in entries:
+            basis = sum(
+                mass
+                for leaf, mass in scene_masses.items()
+                if leaf == entry["name"] or leaf.startswith(entry["name"] + "/")
+            )
+            if not _mass_close(entry["context_mass_kg"], basis):
+                equivalence.append(
+                    {
+                        "name": entry["name"],
+                        "context_mass_kg": entry["context_mass_kg"],
+                        "document_basis_mass_kg": basis,
+                    }
+                )
+        coverage: dict[str, Any] = {
             "known": True,
-            "expected": len(scene_leaves),
-            "matched": len(leaf_set & scene_leaves),
-            "missing": sorted(scene_leaves - leaf_set)[:20],
-            "unexpected": sorted(leaf_set - scene_leaves)[:20],
+            "expected_nodes": len(expected_nodes),
+            "recorded_nodes": len(node_names),
+            "missing_nodes": missing_nodes,
+            "unexpected_nodes": unexpected_nodes,
+            "missing_parent_rows": missing_parents,
+            "effective_vs_document_mismatches": equivalence[:20],
         }
+    else:
+        coverage = {"known": False}
+        equivalence = []
     recorded_assembly = context.get("assembly_mass_kg")
     details = {
         "component_context": {
@@ -316,6 +349,7 @@ def _component_context_findings(
             "recorded_assembly_mass_kg": recorded_assembly,
             "top_level_instances_without_document_basis": missing_document_basis[:20],
             "coverage": coverage,
+            "effective_vs_document_mismatches": len(equivalence),
             "row_errors": row_errors,
         }
     }
@@ -324,13 +358,19 @@ def _component_context_findings(
         incomplete.append(f"{len(row_errors)} row error(s)")
     if missing_document_basis:
         incomplete.append(f"{len(missing_document_basis)} top-level instance(s) without a document basis")
-    if scene_leaves is None:
-        incomplete.append("no raw scene to check leaf coverage against")
+    if scene_masses is None:
+        incomplete.append("no raw scene and mass readings to prove node coverage against")
     else:
-        if coverage["missing"]:
-            incomplete.append(f"{len(coverage['missing'])} leaf instance(s) not covered")
-        if coverage["unexpected"]:
-            incomplete.append(f"{len(coverage['unexpected'])} unexpected leaf row(s)")
+        if coverage["missing_nodes"]:
+            incomplete.append(f"{len(coverage['missing_nodes'])} expected instance node(s) not recorded")
+        if coverage["unexpected_nodes"]:
+            incomplete.append(f"{len(coverage['unexpected_nodes'])} unexpected node row(s)")
+        if coverage["missing_parent_rows"]:
+            incomplete.append(f"{len(coverage['missing_parent_rows'])} node row(s) whose parent row is absent")
+        if equivalence:
+            incomplete.append(
+                f"{len(equivalence)} node(s) whose effective mass differs from the selected part-document reading"
+            )
     if material_source != "documented_table":
         if any_overridden:
             return details, (
@@ -339,6 +379,14 @@ def _component_context_findings(
                 "part-document readings do not include; a pure-CAD (material_source=cad) model "
                 "cannot represent them — record the effective masses through "
                 "source.documented_masses, or remove the overrides in CAD"
+            )
+        if isinstance(coverage, dict) and coverage.get("effective_vs_document_mismatches"):
+            examples = coverage["effective_vs_document_mismatches"][:3]
+            return details, (
+                "the assembly context's effective mass differs from the selected part-document "
+                f"reading for {len(equivalence)} node(s) with no recorded override "
+                f"(examples: {examples}); a pure-CAD (material_source=cad) model cannot claim "
+                "source equivalence — record the effective masses through source.documented_masses"
             )
         if incomplete:
             return details, (
@@ -359,28 +407,69 @@ def _component_context_findings(
         )
     if incomplete:
         _append_note(details, "component mass context is incomplete: " + "; ".join(incomplete))
+    if equivalence:
+        _append_note(
+            details,
+            "the assembly-context effective mass differs from the recomputed part-document basis "
+            f"for {len(equivalence)} node(s) without a recorded override; the documented table may "
+            "choose either basis — no mass is changed automatically",
+        )
     return details, None
 
 
-def _scene_leaf_names(snapshot: Path) -> set[str] | None:
-    """Leaf component names from the snapshot's raw scene, when one is present."""
+def _scene_leaf_masses(snapshot: Path) -> dict[str, float] | None:
+    """Leaf instance name to raw document mass, from the snapshot's own readings.
 
-    path = Path(snapshot) / "raw" / "scene_raw.json"
-    if not path.is_file():
+    The context guard recomputes every node's document basis from these values; it never uses a
+    recorded sum.  A snapshot without both raw files cannot support the source-equivalence claim.
+    """
+
+    scene_path = Path(snapshot) / "raw" / "scene_raw.json"
+    masses_path = Path(snapshot) / "raw" / "mass_properties.json"
+    if not scene_path.is_file() or not masses_path.is_file():
         return None
     try:
-        scene_raw = read_json(path)
+        scene_raw = read_json(scene_path)
+        masses = read_json(masses_path)
     except (OSError, ValueError, PipelineError):
         return None
     components = scene_raw.get("components") if isinstance(scene_raw, dict) else None
-    if not isinstance(components, list):
+    if not isinstance(components, list) or not isinstance(masses, dict):
         return None
-    names = {str(entry.get("name")) for entry in components if isinstance(entry, dict) and entry.get("name")}
-    return names or None
+    found: dict[str, float] = {}
+    for entry in components:
+        if not isinstance(entry, dict) or not entry.get("name"):
+            return None
+        name = str(entry["name"])
+        payload = masses.get(name)
+        if not isinstance(payload, dict):
+            return None
+        try:
+            mass = _finite_positive(payload["mass"], f"scene leaf mass for {name}")
+        except (KeyError, TypeError, ValueError):
+            return None
+        found[name] = mass
+    return found or None
+
+
+def _expected_instance_nodes(scene_masses: dict[str, float]) -> set[str]:
+    """Every ancestor prefix of every scene leaf instance, the full expected node coverage."""
+
+    nodes: set[str] = set()
+    for leaf in scene_masses:
+        segments = leaf.split("/")
+        nodes.update("/".join(segments[: index + 1]) for index in range(len(segments)))
+    return nodes
+
+
+def _mass_close(first: float, second: float) -> bool:
+    """Source-equivalence tolerance for an effective mass against its document basis."""
+
+    return abs(first - second) <= max(1e-12, CLOSURE_MASS_RTOL * max(abs(first), abs(second)))
 
 
 def _mass_only_closure_check(
-    path: Path, payload: dict[str, Any], material_source: str, scene_leaves: set[str] | None
+    path: Path, payload: dict[str, Any], material_source: str, scene_masses: dict[str, float] | None
 ) -> dict:
     """Evaluate the mass-only closure the legacy assembly API produced.
 
@@ -424,7 +513,7 @@ def _mass_only_closure_check(
             "inferred here — review the CAD and any declared masses (this capture's legacy API "
             "reported mass only, so COM and inertia were not compared)"
         )
-    context_details, context_error = _component_context_findings(payload, material_source, top_mass, scene_leaves)
+    context_details, context_error = _component_context_findings(payload, material_source, top_mass, scene_masses)
     details.update(context_details)
     if context_error is not None:
         return _result(
@@ -436,14 +525,16 @@ def _mass_only_closure_check(
 
 
 def _mass_closure_check(snapshot: Path, material_source: str = "cad") -> dict:
-    """Assembly-versus-leaf mass closure, reported as an advisory — never a blocker.
+    """Assembly-versus-leaf mass closure, plus the component-context source guard.
 
     The record is capture-time evidence: the assembly document's own mass properties next to the
-    parallel-axis combination of the leaf readings.  Snapshots without it are ``not_applicable``; a
-    mismatch is surfaced in ``details.advisory`` so `description check` prints it as a note while the
-    model still qualifies; a malformed record is a defect.  A ``mass_only`` record (from a build
-    whose legacy assembly API reports mass alone) is evaluated by
-    :func:`_mass_only_closure_check` on that mass only.
+    parallel-axis combination of the leaf readings.  The whole-assembly delta is an *advisory*:
+    a mismatch lands in ``details.advisory`` and the model still qualifies, and snapshots without
+    the record are ``not_applicable``.  Invalid or unsupported *source policy* is a blocker: a
+    recorded component instance override, or an effective mass the selected part documents cannot
+    explain under ``material_source: cad``, or malformed/incomplete evidence, fails the check.  A
+    ``mass_only`` record (from a build whose legacy assembly API reports mass alone) is evaluated
+    by :func:`_mass_only_closure_check` on that mass only, with the same source guard.
     """
 
     path = Path(snapshot) / "raw" / "mass_closure.json"
@@ -458,7 +549,7 @@ def _mass_closure_check(snapshot: Path, material_source: str = "cad") -> dict:
         payload = read_json(path)
         if not isinstance(payload, dict):
             raise ValueError("mass closure record is not an object")
-        scene_leaves = _scene_leaf_names(snapshot)
+        scene_masses = _scene_leaf_masses(snapshot)
         if payload.get("status") == "unavailable":
             evidence: dict[str, Any] = {
                 "reason": "the capture could not read the assembly mass properties",
@@ -467,7 +558,7 @@ def _mass_closure_check(snapshot: Path, material_source: str = "cad") -> dict:
             }
             # The override evidence stands on its own: an unavailable assembly reading must not
             # let a pure-CAD model earn equivalence by omission.
-            context_details, context_error = _component_context_findings(payload, material_source, None, scene_leaves)
+            context_details, context_error = _component_context_findings(payload, material_source, None, scene_masses)
             evidence.update(context_details)
             if context_error is not None:
                 return _result(
@@ -482,7 +573,7 @@ def _mass_closure_check(snapshot: Path, material_source: str = "cad") -> dict:
                 details=evidence,
             )
         if str(payload.get("mode") or "full") == "mass_only":
-            return _mass_only_closure_check(path, payload, material_source, scene_leaves)
+            return _mass_only_closure_check(path, payload, material_source, scene_masses)
         top = payload.get("top_level")
         leaf = payload.get("leaf_total")
         if not isinstance(top, dict) or not isinstance(leaf, dict):
@@ -516,7 +607,7 @@ def _mass_closure_check(snapshot: Path, material_source: str = "cad") -> dict:
             f"(mass {top_mass:.9g} kg vs {leaf_mass:.9g} kg, {mass_rel:.3g} relative); no cause is "
             "inferred here — review the CAD and any declared masses"
         )
-    context_details, context_error = _component_context_findings(payload, material_source, top_mass, scene_leaves)
+    context_details, context_error = _component_context_findings(payload, material_source, top_mass, scene_masses)
     details.update(context_details)
     if context_error is not None:
         return _result(

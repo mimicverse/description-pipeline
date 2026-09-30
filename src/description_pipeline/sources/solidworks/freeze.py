@@ -905,8 +905,9 @@ def _component_context_record(reading: dict[str, Any], scene: Any, assembly_mass
 
     ``document_basis_mass_kg`` is the sum of the existing leaf/document readings under that
     instance (itself, for a leaf).  Totals use only the disjoint depth-0 rows; nested rows are kept
-    to detect overrides a clean parent would otherwise hide.  Everything here is recorded for
-    comparison only: no total is forced to agree and nothing is distributed into any declared mass.
+    to detect overrides a clean parent would otherwise hide.  ``leaf_documents_covered`` counts
+    exact part-row matches, not ancestors.  Everything here is recorded for comparison only: no
+    total is forced to agree and nothing is distributed into any declared mass.
     """
 
     leaves = [
@@ -971,11 +972,8 @@ def _component_context_record(reading: dict[str, Any], scene: Any, assembly_mass
             }
         )
     leaf_names = {leaf for leaf, _ in leaves}
-    covered = {
-        leaf
-        for leaf in leaf_names
-        if any(leaf == entry["name"] or leaf.startswith(entry["name"] + "/") for entry in instances)
-    }
+    part_rows = {entry["name"] for entry in instances if entry["document_type"] == "part"}
+    covered = {leaf for leaf in leaf_names if leaf in part_rows}
     top_level = [entry for entry in instances if entry["depth"] == 0]
     context_total = sum(entry["context_mass_kg"] for entry in top_level)
     document_total = sum(entry["document_basis_mass_kg"] or 0.0 for entry in top_level)
@@ -1049,8 +1047,10 @@ def _mass_closure(backend: Any, cfg: dict[str, Any], scene: Any) -> dict[str, An
 
     A backend that cannot read the whole assembly (fixtures, other providers) records nothing; the
     verification side then reports the check as not applicable instead of failing it.  A difference
-    between the two readings is evidence about the CAD tree, so it is recorded here and reported as
-    an advisory there — this capture never fails because of it.
+    between the two readings is evidence about the CAD tree, so the closure delta is an advisory
+    there; the *capture* never fails because of it.  The component-context section can still make
+    the check fail for a pure-CAD source (recorded instance overrides, or an effective mass that
+    the part documents cannot explain) — that is a source-policy verdict, not a capture failure.
 
     The assembly read itself is best-effort: builds where ``CreateMassProperty2`` is unavailable, or
     assemblies that refuse the read, record an explicit ``unavailable`` status.  A capture is never

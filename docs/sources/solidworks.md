@@ -90,8 +90,10 @@ snapshot/
 
 `raw/mass_closure.json` 记录装配文档自身的读数与叶读数之外，还记录 `component_context`：逐组件
 实例的装配上下文质量与三个 override 标志；叶/文档质量仍单列。汇总只使用**互不重叠的顶层
-（depth 0）行**，嵌套行只用于发现被"干净父级"掩盖的 override；缺失/重复行、非布尔标志或深度与
-名称不符时，独立校验判失败（`source.normalization.mass_closure`）。
+（depth 0）行**，嵌套行只用于发现被"干净父级"掩盖的 override。节点覆盖由叶实例的**全前缀闭包**
+推导：祖先行缺失、父行不存在、重复行、类型不符或未知多余行都会被拒绝；纯 CAD 还要求每个节点的
+装配上下文质量与其"所选零件文档质量之和"在容差内一致。缺失/重复行、非布尔标志或深度与名称不符
+时，独立校验判失败（`source.normalization.mass_closure`）。
 
 ## 质量与惯量合同
 
