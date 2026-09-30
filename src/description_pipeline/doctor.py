@@ -84,7 +84,7 @@ def _version(distribution: str) -> str | None:
         return "unknown"
 
 
-#: The Windows error an App Control policy raises when it blocks an unsigned DLL.
+#: The Windows error raised when App Control rejects loading a file.
 APP_CONTROL_WINERROR = 4551
 
 
@@ -92,8 +92,8 @@ def app_control_rejection(error: BaseException) -> dict | None:
     """Classify a DLL load failure as a Windows App Control rejection, if it is one.
 
     Generic on purpose: the machine's policy id is never captured, only the OS error and the
-    affected library.  ``ctypes`` sets ``OSError.filename`` to the blocked DLL; when a caller
-    re-wraps the error the path is recovered from the message instead.
+    affected library when available. Some loaders omit ``OSError.filename``; recover a path
+    from the message if present, without guessing which file the policy rejected.
     """
 
     codes = {getattr(error, "winerror", None), getattr(error, "errno", None)}
@@ -116,10 +116,9 @@ def app_control_message(state: dict) -> str:
 
     library = state.get("library") or "a bundled DLL"
     return (
-        f"Windows App Control rejected {library} (WinError {state.get('winerror')}); the package is "
-        "installed but its DLLs are unsigned.  Windows keeps its own trust state for such files — do "
-        "not edit file attributes or replace the DLLs; run the pipeline where the policy allows the "
-        "MuJoCo binaries, or ask IT to review the policy"
+        f"Windows App Control rejected {library} (WinError {state.get('winerror')}). "
+        "Use a runtime allowed by your machine's policy, or ask your administrator to review "
+        f"MuJoCo's native dependencies. {state.get('error', '')}"
     )
 
 
@@ -299,8 +298,8 @@ def _environment(*, github: bool) -> list[dict]:
                 "optional packages",
                 FAIL,
                 "; ".join(f"{name}: {app_control_message(state)}" for name, state in blocked.items()),
-                "run the pipeline where Windows App Control allows the MuJoCo binaries, or ask IT to "
-                "review the policy; do not edit file attributes or replace the plugin DLLs",
+                "use a runtime allowed by Windows App Control, or ask your administrator to "
+                "review MuJoCo's native dependencies",
             )
         )
         optional_missing = [name for name in optional_missing if name not in blocked]

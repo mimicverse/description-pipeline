@@ -387,6 +387,15 @@ class AppControlDiagnosticTests(unittest.TestCase):
         self.assertIsNone(doctor.app_control_rejection(OSError(22, "no such file")))
         self.assertIsNone(doctor.app_control_rejection(ImportError("no module")))
 
+    def test_a_loader_without_a_filename_does_not_invent_a_dll_or_signing_status(self):
+        error = OSError(4551, "An application control policy has blocked this file")
+        state = doctor.app_control_rejection(error)
+        assert state is not None
+        self.assertIsNone(state["library"])
+        message = doctor.app_control_message(state)
+        self.assertIn(str(error), message)
+        self.assertNotIn("unsigned", message)
+
     def test_a_blocked_optional_package_is_not_reported_as_missing(self):
         with (
             mock.patch.object(doctor, "_external", return_value="tool 1.0"),
@@ -398,7 +407,8 @@ class AppControlDiagnosticTests(unittest.TestCase):
         self.assertIn("Windows App Control", check["detail"])
         self.assertIn("elasticity.dll", check["detail"])
         self.assertNotIn("missing", check["detail"])
-        self.assertIn("do not edit file attributes", check["fix"])
+        self.assertIn("administrator", check["fix"])
+        self.assertIn("OSError", check["detail"])
         self.assertIn("optional packages", report["failed"])
 
     def test_the_probe_keeps_the_library_and_the_os_error(self):

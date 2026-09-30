@@ -102,6 +102,11 @@ environment problem, not a distribution problem.
 
 ## 4. Exercise the native Windows host
 
+Windows App Control must allow MuJoCo's native dependencies. `WinError 4551` means the machine's
+policy rejected loading a file, even if the package is installed. Ask the administrator to review
+that dependency or use an approved runtime. Keep the failed rehearsal as evidence; a successful
+older installation does not establish that a fresh install is allowed.
+
 Rehearse the candidate on the machine that runs SolidWorks. One script installs it into an isolated
 root, proves the bytes, runs the CAD probe and the offline first run, and keeps the evidence:
 
