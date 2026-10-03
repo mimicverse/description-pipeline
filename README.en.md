@@ -156,10 +156,11 @@ the [first-use guide](docs/solidworks-first-use.en.md) gives the PowerShell form
    prints that report alone. Failure diagnostics stay in `build/`; fix the input and rebuild.
 6. **Application acceptance and submission.** For simulation, run the declared experiments with
    `description model accept` as described in the [simulation guide](docs/simulation.en.md) and rebuild;
-   for other purposes supply the independent evidence their procedure requires. Then submit the
-   candidate with `description model submit --root /path/to/model --profile kinematics --message
-   "Update model"`, replacing the profile with the target purpose. Later checks and releases replay
-   the experiments, so no CI is required.
+   for a mechanical kinematics suite, follow the [reference workflow](docs/mechanical-acceptance.en.md)
+   and run `description model update --reuse-source --mechanical-reference /approved/mechanism.json`.
+   It accepts, rebuilds and submits. An already built candidate uses `description model submit` with
+   the same reference option. Training and hardware need their own independent evidence. Local
+   replays need no CI; consumers and release owners must re-select the approved reference.
 7. **Qualify and release.** Once the candidate is on its feature branch, run the command below with
    the model's pinned tool environment to inspect the plan; add `--apply` to execute it. The release
    fetches the complete candidate from the remote, verifies the actual bytes and the purpose
@@ -231,6 +232,6 @@ bundle content and its offline dependency closure; native CAD acceptance runs se
 
 [Engineering standard](docs/engineering_standard.en.md) · [URDF rules](docs/urdf_standard.en.md) · [Contributing](CONTRIBUTING.en.md) · [Quality entry point](tools/quality.py)
 
-[Simulation acceptance](docs/simulation.en.md) · [Model template](src/description_pipeline/templates/model/README.md)
+[Mechanical acceptance](docs/mechanical-acceptance.en.md) · [Simulation acceptance](docs/simulation.en.md) · [Model template](src/description_pipeline/templates/model/README.md)
 
 [Historical Onshape migration](docs/onshape_export.md) · [Historical SolidWorks migration](docs/solidworks_export.md)

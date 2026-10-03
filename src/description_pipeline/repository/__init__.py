@@ -27,7 +27,7 @@ from ..build import (
     semantic_diff,
     verify_toolchain,
 )
-from ..io import PipelineError, write_json
+from ..io import PipelineError, quote_argument, write_json
 from .tunnel import worker_health, worker_tunnel
 
 MODEL_DIRECTORIES = {"config", "sources", "model", "urdf", "mjcf", "meshes", "docs"}
@@ -406,6 +406,7 @@ def update(
     worker_host: str | None = None,
     worker_port: int | None = None,
     ci: bool = False,
+    mechanical_reference: Path | None = None,
 ) -> dict:
     """Author one revision end to end: preflight, freeze, build, submit.
 
@@ -415,6 +416,10 @@ def update(
     """
 
     root = Path(root).resolve()
+    if mechanical_reference is not None:
+        from ..verification.mechanics import reference_path
+
+        mechanical_reference = reference_path(mechanical_reference, root)
     if reuse_source and (worker_host is not None or worker_port is not None or expect_worker_url is not None):
         raise PipelineError("--reuse-source cannot be combined with worker connection options")
     if worker_port is not None and not worker_host:
@@ -444,7 +449,7 @@ def update(
         # ``build`` already attaches the exact preserved diagnostic to a raised error and
         # to a report that did not qualify; both are propagated, never guessed from the
         # workspace's failure history.
-        report = build(root, profile)
+        report = build(root, profile, mechanical_reference=mechanical_reference)
         if (
             report.get("blockers") == ["consumer.application"]
             and report.get("profile", {}).get("purpose") == "simulation"
@@ -453,13 +458,17 @@ def update(
             from ..verification.simulation import complete_pending
 
             report = complete_pending(root, profile, report)
+        elif report.get("blockers") == ["consumer.application"] and mechanical_reference is not None:
+            from ..verification.mechanics import complete_pending as complete_mechanics
+
+            report = complete_mechanics(root, profile, report, mechanical_reference)
         if not report.get("passed"):
             failure = PipelineError(f"Candidate does not qualify: {report.get('blockers')}")
             if report.get("diagnostic_path"):
                 failure.diagnostic_path = str(report["diagnostic_path"])
             raise failure
         # The workspace lock is already held here; ``_submit`` is the unlocked body.
-        submitted = _submit(root, profile, message, ci=ci)
+        submitted = _submit(root, profile, message, ci=ci, mechanical_reference=mechanical_reference)
         return {
             "ok": bool(submitted.get("passed", False)),
             "state": submitted.get("state"),
@@ -539,6 +548,13 @@ def _base_moved_advisory(root: Path, hardware: str) -> dict | None:
     }
 
 
+def _mechanical_digest(report: dict) -> str | None:
+    for check in report.get("checks", []):
+        if check["id"] == "consumer.application":
+            return check.get("details", {}).get("authority", {}).get("reference_sha256")
+    return None
+
+
 def _review_request(
     root: Path, branch: str, hardware: str, sha: str, profile: str, report: dict, message: str, *, ci: bool = False
 ) -> tuple[dict, int]:
@@ -560,6 +576,12 @@ def _review_request(
         + ("GitHub CI was explicitly requested; its result is pending.\n\n" if ci else "")
         + f"Re-running on `{branch}` updates this pull request instead of opening another one."
     )
+    mechanical_digest = _mechanical_digest(report)
+    if mechanical_digest:
+        body += (
+            f"\n\nKinematics was checked against the operator-selected mechanical reference `{mechanical_digest}`. "
+            "This does not establish physical, training or hardware qualification."
+        )
     if pull is None:
         created = github_api(
             f"repos/{slug}/pulls",
@@ -581,7 +603,9 @@ def _review_request(
     return updated, number
 
 
-def submit(root: Path, profile: str, message: str, *, ci: bool = False) -> dict:
+def submit(
+    root: Path, profile: str, message: str, *, ci: bool = False, mechanical_reference: Path | None = None
+) -> dict:
     """Publish one candidate for review, holding the workspace lock.
 
     ``update`` already owns the lock and calls :func:`_submit` directly, so the
@@ -592,13 +616,15 @@ def submit(root: Path, profile: str, message: str, *, ci: bool = False) -> dict:
     root = Path(root).resolve()
     path, handle = _update_lock(root)
     try:
-        return _submit(root, profile, message, ci=ci)
+        return _submit(root, profile, message, ci=ci, mechanical_reference=mechanical_reference)
     finally:
         os.close(handle)
         path.unlink(missing_ok=True)
 
 
-def _submit(root: Path, profile: str, message: str, *, ci: bool = False) -> dict:
+def _submit(
+    root: Path, profile: str, message: str, *, ci: bool = False, mechanical_reference: Path | None = None
+) -> dict:
     """Publish one candidate for review.
 
     The candidate is committed on a review branch: a run from ``feature/<hardware>``
@@ -611,7 +637,7 @@ def _submit(root: Path, profile: str, message: str, *, ci: bool = False) -> dict
     """
 
     check_layout(root)
-    report = assess(root, profile)
+    report = assess(root, profile, mechanical_reference=mechanical_reference)
     if not report["passed"]:
         raise PipelineError(f"Candidate does not qualify: {report['blockers']}")
     if not message.strip():
@@ -641,6 +667,7 @@ def _submit(root: Path, profile: str, message: str, *, ci: bool = False) -> dict
         "profile": profile,
         "branch": branch,
         "state": "pushed",
+        "mechanical_reference_sha256": _mechanical_digest(report),
     }
 
     def with_advisory(value: dict) -> dict:
@@ -657,8 +684,9 @@ def _submit(root: Path, profile: str, message: str, *, ci: bool = False) -> dict
         response["review"] = {"state": "not_created", "error": _error_text(error)}
         response["retry"] = (
             "description model submit --root "
-            f"{root} --profile {profile} --message-file -{' --ci' if ci else ''}"
-            f"  # reuses {branch} and opens the pull request"
+            f"{quote_argument(str(root))} --profile {profile} --message-file -{' --ci' if ci else ''}"
+            + (f" --mechanical-reference {quote_argument(str(mechanical_reference))}" if mechanical_reference else "")
+            + f"  # reuses {branch} and opens the pull request"
         )
         return with_advisory(response)
     response["pull_request"] = pull["html_url"]
@@ -691,10 +719,16 @@ def _submit(root: Path, profile: str, message: str, *, ci: bool = False) -> dict
     return with_advisory(response)
 
 
-def validate_commit(repository: Path, sha: str, profile: str, *, remote: bool = False) -> dict:
+def validate_commit(
+    repository: Path, sha: str, profile: str, *, remote: bool = False, mechanical_reference: Path | None = None
+) -> dict:
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise PipelineError("Validation requires exact 40-character commit SHA")
     _require_checkout(repository)
+    if mechanical_reference is not None:
+        from ..verification.mechanics import reference_path
+
+        mechanical_reference = reference_path(mechanical_reference, repository)
     temporary = Path(tempfile.mkdtemp(prefix="description-validation-"))
     model = temporary / "model"
     try:
@@ -711,7 +745,7 @@ def validate_commit(repository: Path, sha: str, profile: str, *, remote: bool = 
         else:
             git(repository, "worktree", "add", "--detach", str(model), sha)
         check_layout(model)
-        report = assess(model, profile)
+        report = assess(model, profile, mechanical_reference=mechanical_reference)
         return {**report, "model_sha": sha, "delivery_retrieved_from_remote": remote}
     finally:
         if model.exists() and not remote:
@@ -777,7 +811,14 @@ def _accepted_tool_main(repository: Path, tool_sha: str) -> str:
 
 
 def promotion_plan(
-    repository: Path, hardware: str, sha: str, profile: str, tag: str | None = None, *, ci: bool = False
+    repository: Path,
+    hardware: str,
+    sha: str,
+    profile: str,
+    tag: str | None = None,
+    *,
+    ci: bool = False,
+    mechanical_reference: Path | None = None,
 ) -> dict:
     hardware = _hardware(hardware)
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
@@ -798,7 +839,7 @@ def promotion_plan(
         raise PipelineError("Release promotion must fast-forward")
     if tag and git(repository, "ls-remote", "origin", "refs/tags/" + tag).stdout.strip():
         raise PipelineError("Immutable release tag already exists")
-    report = validate_commit(repository, sha, profile, remote=True)
+    report = validate_commit(repository, sha, profile, remote=True, mechanical_reference=mechanical_reference)
     if report.get("hardware_id") != hardware:
         raise PipelineError("Candidate hardware_id does not match the requested release")
     if not report["passed"] or report["source"]["evidence_class"] != "cad" or report["toolchain"].get("development"):
@@ -820,15 +861,22 @@ def promotion_plan(
         "subject": report["subject"],
         "tool_main": tool_main,
         "report": report,
+        "mechanical_reference_sha256": _mechanical_digest(report),
     }
 
 
-def promote(repository: Path, plan: dict) -> dict:
+def promote(repository: Path, plan: dict, *, mechanical_reference: Path | None = None) -> dict:
     fresh = promotion_plan(
-        repository, plan["hardware"], plan["candidate"], plan["profile"], plan.get("tag"), ci=plan.get("ci", False)
+        repository,
+        plan["hardware"],
+        plan["candidate"],
+        plan["profile"],
+        plan.get("tag"),
+        ci=plan.get("ci", False),
+        mechanical_reference=mechanical_reference,
     )
-    for key in ("previous_release", "release_ref", "subject"):
-        if fresh[key] != plan[key]:
+    for key in ("previous_release", "release_ref", "subject", "mechanical_reference_sha256"):
+        if fresh.get(key) != plan.get(key):
             raise PipelineError(f"Stale promotion plan: {key} changed")
     review_run = _review(repository, plan)
     sha = plan["candidate"]

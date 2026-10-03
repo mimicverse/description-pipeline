@@ -63,6 +63,9 @@ replay mode; a replay does not prove that the current CAD interface works. Synth
 replaces real source evidence, and fitted data never doubles as independent physical acceptance
 evidence.
 
+The consumer selects the approved independent reference. A candidate cannot appoint its own
+acceptance authority; reproducible agreement establishes only the scope of that reference.
+
 ## Part 3: how the engineering is organised
 
 The public `description-pipeline` repository distributes the shared tool. A writable model
@@ -221,6 +224,12 @@ saves the record, then rebuilds the same input identity. Simulation runs automat
 `description model accept`; later verification replays the experiments and compares the results.
 Training and hardware need their own independent evidence. A failure keeps the candidate and its
 diagnostics.
+
+For mechanical kinematics acceptance, acquire an approved external reference and pass
+`--mechanical-reference` through update, check and release; see the
+[mechanical acceptance workflow](mechanical-acceptance.en.md). It verifies identity, mounting,
+signed joints and held-out motion against the actual artifacts, without supplying physical or
+control qualification.
 
 ### 6. Submit the candidate in one command and complete the review
 

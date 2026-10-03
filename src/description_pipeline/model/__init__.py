@@ -106,6 +106,27 @@ class Robot:
                 raise PipelineError(f"Unknown actuator joint: {actuator['joint']}")
             if actuator["gear"] == 0 or actuator["control_range"][0] >= actuator["control_range"][1]:
                 raise PipelineError("Actuator requires nonzero gear and an ordered control range")
+        drives = data.get("mechanical_drives")
+        if drives is not None:
+            if set(drives) != moving:
+                raise PipelineError("Mechanical drives require all movable canonical joint names, not source ids")
+            identities = [drive["id"] for drive in drives.values() if drive["kind"] == "active"]
+            if len(identities) != len(set(identities)):
+                raise PipelineError("Duplicate mechanical drive identity")
+            if any(drives[item["joint"]]["kind"] == "passive" for item in data["actuators"]):
+                raise PipelineError("A passive mechanical joint cannot declare a simulated actuator")
+            joints_by_name = {joint["name"]: joint for joint in data["joints"]}
+            for name, drive in drives.items():
+                if drive["kind"] != "active":
+                    continue
+                joint = joints_by_name[name]
+                stator, rotor = set(drive["stator"]), set(drive["rotor"])
+                parent = set(links[joint["parent"]]["provenance"].get("source_entities", []))
+                child = set(links[joint["child"]]["provenance"].get("source_entities", []))
+                if stator & rotor or not stator <= parent or not rotor <= child:
+                    raise PipelineError(
+                        f"Mechanical drive {name}: stator/rotor must belong to parent/child source instances"
+                    )
         for frame in data["frames"]:
             if frame["parent"] not in links:
                 raise PipelineError(f"Unknown frame parent: {frame['parent']}")

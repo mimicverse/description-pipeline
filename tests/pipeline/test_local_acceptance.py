@@ -220,7 +220,7 @@ class LocalAcceptanceTests(unittest.TestCase):
         shutil.rmtree(root / "docs/acceptance")
         subprocess.run(["git", "init", "--quiet", str(root)], check=True)
 
-        def submit_verified(root, profile, message, *, ci=False):
+        def submit_verified(root, profile, message, *, ci=False, mechanical_reference=None):
             self.assertTrue((root / ".git/description-update.lock").exists())
             verdict = assess(root, profile)
             self.assertTrue(verdict["passed"], verdict["blockers"])

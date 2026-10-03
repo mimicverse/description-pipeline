@@ -6,6 +6,7 @@ import hashlib
 import json
 import ntpath
 import os
+import shlex
 import sys
 import tempfile
 from pathlib import Path, PureWindowsPath
@@ -19,6 +20,11 @@ class PipelineError(ValueError):
 
     #: Set when the failure preserved diagnostics the operator should inspect.
     diagnostic_path: str | None = None
+
+
+def quote_argument(value: str) -> str:
+    """Quote a displayed command argument for the platform's usual operator shell."""
+    return "'" + value.replace("'", "''") + "'" if os.name == "nt" else shlex.quote(value)
 
 
 def pin_utf8_streams() -> None:

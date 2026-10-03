@@ -108,6 +108,9 @@ Assert-True ($remote -like "*--root '/srv/description/models/myrobot'*") 'model 
 Assert-True ($remote -like "*--profile 'kinematics'*") 'profile is quoted'
 Assert-True ($remote -like '*--message-file - *') 'the message arrives on stdin'
 Assert-True ($remote -like "*--expect-worker-url 'http://127.0.0.1:8765'*") 'the tunnel url is bound'
+$withReference = Build-RemoteCommand $config $config.model_root $config.profile '/srv/approved refs/mechanism.json'
+Assert-True ($withReference -like "*--mechanical-reference '/srv/approved refs/mechanism.json'*") 'the reference is quoted on the execution host'
+Assert-True (Rejects { Resolve-Plan $config $null $null 'C:\approved\mechanism.json' }) 'remote reference paths belong to the build host'
 
 # --- message defaulting ------------------------------------------------------
 Assert-True ((Get-Message ([pscustomobject]@{ message = 'from config' }) '') -eq 'from config') 'configured message is the default'
@@ -212,6 +215,14 @@ Assert-True ($localLine -eq '-m description_pipeline model update --root C:\mode
 Assert-True ($localLine -notlike '*--expect-worker-url*') 'local mode does not pin a tunnel url'
 Assert-True ($localLine -notlike '*--worker-host*') 'local mode never selects a worker host'
 Assert-True ($localLine -notlike '*--reuse-source*') 'local mode leaves the source mode to the model'
+$referencePath = 'C:\approved refs\mechanism.json'
+$withReference = Build-LocalArguments 'C:\models\myrobot' 'kinematics' $referencePath
+Assert-True ($withReference[-2] -eq '--mechanical-reference' -and $withReference[-1] -eq $referencePath) 'a local reference path stays a single native argument'
+$configuredReference = $local.PSObject.Copy()
+$configuredReference | Add-Member -NotePropertyName mechanical_reference -NotePropertyValue $referencePath
+Assert-True ((Resolve-Plan $configuredReference $null $null).mechanical_reference -eq $referencePath) 'the reference may be selected in the operator host config'
+Assert-True ((Resolve-Plan $configuredReference $null $null 'C:\approved\other.json').mechanical_reference -eq 'C:\approved\other.json') 'an explicit reference flag overrides the operator config'
+Assert-True (Rejects { Resolve-Plan $local $null $null 'relative-reference.json' }) 'local reference paths must be absolute'
 # runtime discovery: explicit override, installed worker venv, and the refusal text
 Assert-True ((Resolve-LocalRuntime ([pscustomobject]@{ python = $python })) -eq $python) 'an explicit python override is used as-is'
 $install = Join-Path $temp 'install'

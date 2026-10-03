@@ -7,6 +7,10 @@
 完成首次建模后，在本目录运行 `description model update` 可一次完成采集、构建和 PR 更新。
 Linux 采集 SolidWorks 时加 `--worker-host SSH_ALIAS`；只改定义或证据时加 `--reuse-source`，校验并复用已有快照。
 
+机械运动学套件还须在 `interfaces.mechanical_drives` 中声明驱动身份与安装关系，并用 `--mechanical-reference`
+选择工作区外的独立批准参考。更新、检查及发布均重放参考；通过不代表物理、训练或实机合格。
+详见[机械验收流程](https://github.com/mimicverse/description-pipeline/blob/main/docs/mechanical-acceptance.md)。
+
 模型入口为 `urdf/robot.urdf`、`mjcf/robot.xml` 和 `mjcf/scene.xml`。使用端固定提交 SHA，并核对报告允许的用途与环境。
 
 初始工作区只有定义，尚无可使用的模型。修正输入或工具后重建，工程决策记录在 `docs/decisions.md`。

@@ -7,7 +7,9 @@ from . import result
 from .attestation import verify_external_record
 
 
-def verify_acceptance(root: Path, subject: str, profile: dict, *, input_hashes=()) -> dict:
+def verify_acceptance(
+    root: Path, subject: str, profile: dict, *, input_hashes=(), mechanical_reference: Path | None = None
+) -> dict:
     required = profile["acceptance_suites"]
     path = root / "docs/acceptance" / (profile["purpose"] + ".json")
     if not required or not path.is_file() or not profile.get("consumer_environment"):
@@ -26,6 +28,10 @@ def verify_acceptance(root: Path, subject: str, profile: dict, *, input_hashes=(
         from .local_acceptance import verify_replay
 
         authority = verify_replay(root, record, subject, profile)
+    elif isinstance(reference, dict) and reference.get("kind") == "mechanical_reference_replay":
+        from .mechanics import verify_replay as verify_mechanics
+
+        authority = verify_mechanics(root, record, subject, profile, mechanical_reference)
     else:
         authority = verify_external_record(record, profile["purpose"])
     checked = []
@@ -58,6 +64,8 @@ def verify_acceptance(root: Path, subject: str, profile: dict, *, input_hashes=(
             permitted = (
                 {"physical_measurement"} if profile["purpose"] == "hardware" else {"simulation", "physical_measurement"}
             )
+            if profile["purpose"] == "kinematics" and authority.get("execution") == "mechanical_reference_replay":
+                permitted.add("reference_replay")
             if (
                 item.get("passed") is True
                 and bound
