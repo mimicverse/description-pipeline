@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.3.25] - 2026-10-03
+
 ### Added
 
 - Operator-selected mechanical kinematics acceptance. `--mechanical-reference` selects an approved
