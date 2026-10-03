@@ -463,7 +463,7 @@ class MechanicalAcceptanceTests(unittest.TestCase):
             lambda r: r.update(profile_digest="0" * 64),
             lambda r: r.update(purpose="hardware"),
             lambda r: r.update(reference_sha256="0" * 64),
-            lambda r: r["tool"].update(development=False),
+            lambda r: r["tool"].update(development=not r["tool"]["development"]),
             lambda r: r["runtime"].update(python="wrong"),
             lambda r: r["qualification"].update(hardware_qualified=True),
             lambda r: r.update(approved=True),
