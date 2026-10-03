@@ -621,6 +621,30 @@
         "additionalProperties": false
       }
     },
+    "mechanical_drives": {
+      "type": "object",
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {"kind": {"const": "passive"}},
+            "required": ["kind"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {"const": "active"},
+              "id": {"type": "string", "minLength": 1},
+              "stator": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1, "uniqueItems": true},
+              "rotor": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1, "uniqueItems": true}
+            },
+            "required": ["kind", "id", "stator", "rotor"],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
     "constraints": {
       "type": "array",
       "items": {

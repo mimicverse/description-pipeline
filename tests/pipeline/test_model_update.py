@@ -89,11 +89,11 @@ class ModelUpdateFixture(unittest.TestCase):
             order.append("freeze")
             return {"snapshot": "sources/snapshots/abc"}
 
-        def build_stub(root, profile):
+        def build_stub(root, profile, *, mechanical_reference=None):
             order.append("build")
             return dict(REPORT)
 
-        def submit_stub(root, profile, message, *, ci=False):
+        def submit_stub(root, profile, message, *, ci=False, mechanical_reference=None):
             order.append("submit")
             if not (root / ".git/description-update.lock").is_file():
                 raise AssertionError("update must hold the workspace lock while submitting")
@@ -268,7 +268,7 @@ class ModelUpdateTests(ModelUpdateFixture):
     def test_update_reports_the_review_branch_that_was_pushed(self):
         order = self._prepare()
 
-        def submit_stub(root, profile, message, *, ci=False):
+        def submit_stub(root, profile, message, *, ci=False, mechanical_reference=None):
             order.append("submit")
             return {
                 "passed": True,
@@ -316,7 +316,11 @@ class ModelUpdateTests(ModelUpdateFixture):
         with (
             patch(
                 "description_pipeline.repository.build",
-                side_effect=lambda root, profile: {**REPORT, "passed": False, "blockers": ["consumer.contacts"]},
+                side_effect=lambda root, profile, **kwargs: {
+                    **REPORT,
+                    "passed": False,
+                    "blockers": ["consumer.contacts"],
+                },
             ),
             self.assertRaises(PipelineError) as raised,
         ):

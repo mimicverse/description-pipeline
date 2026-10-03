@@ -104,7 +104,7 @@ class CliFailureMessageTests(unittest.TestCase):
             self.assertEqual(code, 1)
             hint = next(item for item in payload["next"] if "does not record" in item)
             self.assertIn("hardware", hint)
-            self.assertIn("docs/validation.md", hint)
+            self.assertIn("docs/pipeline.en.md", hint)
             self.assertNotIn("run `description model accept --root", hint)
 
     def test_a_simulation_build_points_at_the_acceptance_as_well(self):

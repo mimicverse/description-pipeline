@@ -300,7 +300,7 @@ class RepositoryTests(unittest.TestCase):
         sha = git(self.repo, "rev-parse", "HEAD").stdout.strip()
         visited = []
 
-        def assess(root, profile):
+        def assess(root, profile, *, mechanical_reference=None):
             visited.append(root)
             self.assertEqual(git(root, "rev-parse", "HEAD").stdout.strip(), sha)
             self.assertEqual(git(root, "branch", "--show-current").stdout.strip(), "")
@@ -317,7 +317,7 @@ class RepositoryTests(unittest.TestCase):
         sha = git(self.repo, "rev-parse", "HEAD").stdout.strip()
         (self.repo / "tool.py").write_text("local uncommitted content")
 
-        def check(root, profile):
+        def check(root, profile, *, mechanical_reference=None):
             self.assertEqual((root / "tool.py").read_text(encoding="utf-8"), "tooling\n")
             self.assertTrue((root / ".git").is_dir())
             return {"passed": True}
@@ -333,7 +333,7 @@ class RepositoryTests(unittest.TestCase):
         sha = git(self.repo, "rev-parse", "HEAD").stdout.strip()
         (self.repo / "tool.py").write_text("uncommitted changes must not qualify")
 
-        def assess_remote(root, profile):
+        def assess_remote(root, profile, *, mechanical_reference=None):
             self.assertEqual((root / "tool.py").read_text(encoding="utf-8"), "tooling\n")
             self.assertNotEqual(root, self.repo)
             return {"passed": True}
@@ -392,7 +392,7 @@ class RepositoryTests(unittest.TestCase):
             promote(self.repo, plan)
         self.assertFalse(plan["ci"])
         self.assertEqual(validated.call_count, 2)
-        validated.assert_called_with(self.repo, sha, "kinematics", remote=True)
+        validated.assert_called_with(self.repo, sha, "kinematics", remote=True, mechanical_reference=None)
         api.assert_called_once()
         self.assertEqual(api.call_args.args[0], f"repos/owner/repo/statuses/{sha}")
         self.assertEqual(api.call_args.args[1]["target_url"], f"https://github.com/owner/repo/commit/{sha}")

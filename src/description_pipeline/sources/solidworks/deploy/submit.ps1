@@ -34,6 +34,7 @@ param(
     [string]$Message,
     [string]$ModelRoot,
     [string]$Profile,
+    [string]$MechanicalReference,
     [switch]$DescribeOnly
 )
 
@@ -162,7 +163,7 @@ function Get-Message($ConfigHost, [string]$Override) {
     return $text
 }
 
-function Resolve-Plan($ConfigHost, [string]$ModelRoot, [string]$Profile) {
+function Resolve-Plan($ConfigHost, [string]$ModelRoot, [string]$Profile, [string]$MechanicalReference) {
     # Command-line overrides are validated exactly like the configuration file.
     $root = if ($ModelRoot) { [string]$ModelRoot } else { [string]$ConfigHost.model_root }
     $name = if ($Profile) { [string]$Profile } else { [string]$ConfigHost.profile }
@@ -172,7 +173,16 @@ function Resolve-Plan($ConfigHost, [string]$ModelRoot, [string]$Profile) {
         Assert-AbsoluteWindowsPath 'model_root' $root | Out-Null
     }
     Assert-ProfileName $name | Out-Null
-    return [pscustomobject]@{ model_root = $root; profile = $name }
+    $reference = if ($MechanicalReference) { $MechanicalReference } else { [string]$ConfigHost.mechanical_reference }
+    if ($reference) {
+        if (Test-RemoteMode $ConfigHost) {
+            Assert-AbsolutePosixPath 'mechanical_reference' $reference | Out-Null
+        } else {
+            $reference = [Environment]::ExpandEnvironmentVariables($reference)
+            Assert-AbsoluteWindowsPath 'mechanical_reference' $reference | Out-Null
+        }
+    }
+    return [pscustomobject]@{ model_root = $root; profile = $name; mechanical_reference = $reference }
 }
 
 function Resolve-LocalRuntime($ConfigHost) {
@@ -252,7 +262,7 @@ function Initialize-LocalTools {
     return [pscustomobject]@{ git = $git; gh = $gh; git_lfs = $probe.stdout.Trim() }
 }
 
-function Build-RemoteCommand($ConfigHost, [string]$ModelRoot, [string]$Profile) {
+function Build-RemoteCommand($ConfigHost, [string]$ModelRoot, [string]$Profile, [string]$MechanicalReference) {
     $parts = @(
         (Quote-PosixArg 'remote_python' ([string]$ConfigHost.remote_python)),
         '-m description_pipeline model update',
@@ -261,14 +271,19 @@ function Build-RemoteCommand($ConfigHost, [string]$ModelRoot, [string]$Profile) 
         '--message-file -',
         '--expect-worker-url', (Quote-PosixArg 'tunnel url' "http://127.0.0.1:$($ConfigHost.remote_port)")
     )
+    if ($MechanicalReference) {
+        $parts += @('--mechanical-reference', (Quote-PosixArg 'mechanical_reference' $MechanicalReference))
+    }
     return ($parts -join ' ')
 }
 
-function Build-LocalArguments([string]$ModelRoot, [string]$Profile) {
+function Build-LocalArguments([string]$ModelRoot, [string]$Profile, [string]$MechanicalReference) {
     # Same public command as the remote path.  The model's own `source` block selects the
     # capture endpoint, so the launcher passes neither --expect-worker-url nor a worker host.
-    return @('-m', 'description_pipeline', 'model', 'update', '--root', $ModelRoot,
+    $parts = @('-m', 'description_pipeline', 'model', 'update', '--root', $ModelRoot,
         '--profile', $Profile, '--message-file', '-')
+    if ($MechanicalReference) { $parts += @('--mechanical-reference', $MechanicalReference) }
+    return $parts
 }
 
 function Invoke-NativeCommand([string]$FilePath, [string[]]$Arguments, [string]$InputText) {
@@ -310,8 +325,8 @@ function Invoke-NativeCommand([string]$FilePath, [string[]]$Arguments, [string]$
     }
 }
 
-function Invoke-LocalUpdate([string]$RuntimePython, [string]$ModelRoot, [string]$Profile, [string]$MessageText) {
-    $arguments = Build-LocalArguments $ModelRoot $Profile
+function Invoke-LocalUpdate([string]$RuntimePython, [string]$ModelRoot, [string]$Profile, [string]$MessageText, [string]$MechanicalReference) {
+    $arguments = Build-LocalArguments $ModelRoot $Profile $MechanicalReference
     return (Invoke-NativeCommand -FilePath $RuntimePython -Arguments $arguments -InputText $MessageText)
 }
 
@@ -406,10 +421,10 @@ function Show-RemoteResult([string]$StdOut, [string]$StdErr, [int]$ExitCode) {
 $configPath = if ($Config) { $Config } else { Join-Path $PSScriptRoot 'submit-host.json' }
 $host_ = Read-HostConfig $configPath
 $remote = Test-RemoteMode $host_
-$plan = Resolve-Plan $host_ $ModelRoot $Profile
+$plan = Resolve-Plan $host_ $ModelRoot $Profile $MechanicalReference
 $messageText = Get-Message $host_ $Message
 $runtimePython = if ($remote) { $null } else { Resolve-LocalRuntime $host_ }
-$remoteCommand = if ($remote) { Build-RemoteCommand $host_ $plan.model_root $plan.profile } else { $null }
+$remoteCommand = if ($remote) { Build-RemoteCommand $host_ $plan.model_root $plan.profile $plan.mechanical_reference } else { $null }
 
 Write-Step 'plan'
 if ($remote) {
@@ -424,6 +439,7 @@ if ($remote) {
     Write-Info "source       : selected by the model's own source block (worker, Onshape or frozen)"
 }
 Write-Info "profile      : $($plan.profile)"
+if ($plan.mechanical_reference) { Write-Info "reference    : $($plan.mechanical_reference)" }
 
 if ($DescribeOnly) {
     if ($remote) {
@@ -456,6 +472,6 @@ if ($remote) {
     Write-Info "gh           : $($tools.gh)"
     Write-Info "git lfs      : $($tools.git_lfs)"
     Write-Step 'submit (local pipeline)'
-    $result = Invoke-LocalUpdate $runtimePython $plan.model_root $plan.profile $messageText
+    $result = Invoke-LocalUpdate $runtimePython $plan.model_root $plan.profile $messageText $plan.mechanical_reference
 }
 Show-RemoteResult -StdOut $result.stdout -StdErr $result.stderr -ExitCode $result.exit_code

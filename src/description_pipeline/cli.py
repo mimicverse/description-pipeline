@@ -14,7 +14,7 @@ from .build import OBJECT_FIELDS, assess, build, freeze, lock_toolchain
 from .build.publication import recover
 from .sources.onshape.errors import OnshapeSourceError
 from .sources.solidworks.errors import BridgeError
-from .io import PipelineError, confined, pin_utf8_streams, read_data, write_json
+from .io import PipelineError, confined, pin_utf8_streams, quote_argument, read_data, write_json
 from .quickstart import DEMO, PROFILE as QUICKSTART_PROFILE, run as run_demo, scaffold
 from .repository import (
     check_layout,
@@ -149,16 +149,7 @@ def _source_mapping(args) -> dict:
 
 
 def _purpose_hints(value: dict, root: Path, profile: str) -> list[str]:
-    """Hints for blockers that need more than "fix the blockers above".
-
-    ``consumer.application`` means the application acceptance suites were never run against this
-    build. The check reports the twenty suite names it is missing and nothing about how to produce
-    them, so a user following the report's own advice (run `check` again) learns nothing new.
-
-    Which way out exists depends on the purpose, and they are not interchangeable: `description model
-    accept` records the *simulation* acceptance (`docs/acceptance/simulation.json`), so pointing a
-    `hardware` build at it would send the user to a command that cannot clear the blocker.
-    """
+    """Name the acceptance workflow for the declared purpose."""
 
     blockers = value.get("blockers") or []
     if "consumer.application" not in blockers:
@@ -169,11 +160,17 @@ def _purpose_hints(value: dict, root: Path, profile: str) -> list[str]:
     except (PipelineError, OSError, ValueError):
         purpose = ""
     purpose = purpose or profile
+    if purpose == "kinematics":
+        return [
+            "select an approved held-out mechanical reference outside the workspace, then run "
+            f"`description model update --root {root} --profile {profile} --reuse-source "
+            "--mechanical-reference <reference.json>`; see `docs/mechanical-acceptance.en.md`"
+        ]
     if purpose != "simulation":
         return [
             f"a {purpose} build needs application evidence this tool does not record: "
-            "`description model accept` writes the `simulation` acceptance only — see the "
-            "qualification boundaries in `docs/validation.md`"
+            "`description model accept` supports simulation and mechanical kinematics replay; see "
+            "the qualification boundaries in `docs/pipeline.en.md`"
         ]
     return [
         "the application acceptance has not been recorded for this build: run "
@@ -268,6 +265,9 @@ def parser() -> argparse.ArgumentParser:
         cmd.add_argument("--root", type=Path, required=True)
         cmd.add_argument("--profile", default="kinematics")
         cmd.add_argument("--report", type=Path)
+        cmd.add_argument(
+            "--mechanical-reference", type=Path, help="Operator-selected held-out reference outside the model"
+        )
         if name == "build":
             cmd.add_argument("--output", type=Path)
     source = commands.add_parser("source").add_subparsers(dest="operation", required=True)
@@ -284,10 +284,13 @@ def parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="print only the JSON report; omit the summary sentence on stderr"
     )
     model = commands.add_parser("model").add_subparsers(dest="operation", required=True)
-    accept = model.add_parser("accept", help="Run declared simulation acceptance on a built candidate")
+    accept = model.add_parser("accept", help="Run simulation acceptance or mechanical kinematics replay")
     accept.add_argument("--root", type=Path, required=True, help="Read-only built candidate")
     accept.add_argument("--profile", default="simulation")
     accept.add_argument("--config", type=Path, default=Path("config/simulation-acceptance.json"))
+    accept.add_argument(
+        "--mechanical-reference", type=Path, help="Required for kinematics; independent external JSON reference"
+    )
     accept.add_argument("--out", type=Path, required=True, help="New output directory outside the candidate")
     init = model.add_parser("init")
     init.add_argument("--root", type=Path, required=True)
@@ -320,6 +323,12 @@ def parser() -> argparse.ArgumentParser:
             "--root", type=Path, required=name != "update", default=Path.cwd() if name == "update" else None
         )
         cmd.add_argument("--profile", default="kinematics")
+        if name in {"submit", "update", "validate", "promote"}:
+            cmd.add_argument(
+                "--mechanical-reference",
+                type=Path,
+                help="Explicitly select the approved external reference for kinematics replay",
+            )
         if name in {"submit", "update"}:
             cmd.add_argument("--message")
             cmd.add_argument("--message-file", type=Path, help="read the commit message from a file; '-' reads stdin")
@@ -368,6 +377,12 @@ def main(argv: list[str] | None = None) -> int:
     pin_utf8_streams()
     args = parser().parse_args(argv)
     report_path = getattr(args, "report", None)
+    mechanical_reference = getattr(args, "mechanical_reference", None)
+    reference_option = (
+        f" --mechanical-reference {quote_argument(str(mechanical_reference))}"
+        if mechanical_reference is not None
+        else ""
+    )
     try:
         root_argument = getattr(args, "root", None)
         if root_argument is not None and root_argument.exists() and not root_argument.is_dir():
@@ -415,20 +430,23 @@ def main(argv: list[str] | None = None) -> int:
                     ],
                 )
         elif args.command == "build":
-            value = build(args.root, args.profile, args.output)
+            value = build(args.root, args.profile, args.output, mechanical_reference=args.mechanical_reference)
             value = _with_next(
                 value,
                 [
-                    f"description check --root {args.root} --profile {args.profile}",
+                    f"description check --root {args.root} --profile {args.profile}{reference_option}",
                     *_purpose_hints(value, args.root, args.profile),
                 ],
             )
         elif args.command == "check":
-            value = assess(args.root.resolve(), args.profile)
+            value = assess(args.root.resolve(), args.profile, mechanical_reference=args.mechanical_reference)
             if value.get("passed"):
                 value = _with_next(
                     value,
-                    [f'description model submit --root {args.root} --profile {args.profile} --message "Update model"'],
+                    [
+                        f"description model submit --root {args.root} --profile {args.profile}{reference_option} "
+                        '--message "Update model"'
+                    ],
                 )
             else:
                 value = _with_next(
@@ -464,9 +482,25 @@ def main(argv: list[str] | None = None) -> int:
                 and (not args.assembly or value.get("cad_collectable", False))
             )
         elif args.operation == "accept":
-            from .verification.simulation import run_acceptance
+            from .build import profile_for
 
-            record = run_acceptance(args.root, args.profile, args.config, args.out)
+            purpose = profile_for(args.root, args.profile)["purpose"]
+            if purpose == "kinematics":
+                from .verification.mechanics import run_acceptance as run_mechanics
+
+                if args.mechanical_reference is None:
+                    raise PipelineError("Kinematics acceptance requires an approved external --mechanical-reference")
+                if args.config != Path("config/simulation-acceptance.json"):
+                    raise PipelineError(
+                        "--config describes simulation tests; use --mechanical-reference for kinematics"
+                    )
+                record = run_mechanics(args.root, args.profile, args.mechanical_reference, args.out)
+            else:
+                from .verification.simulation import run_acceptance
+
+                if args.mechanical_reference is not None:
+                    raise PipelineError("--mechanical-reference supports kinematics only")
+                record = run_acceptance(args.root, args.profile, args.config, args.out)
             value = {
                 "passed": bool(record["results"]) and all(item["passed"] for item in record["results"]),
                 "subject": record["subject"],
@@ -504,7 +538,13 @@ def main(argv: list[str] | None = None) -> int:
         elif args.operation == "layout":
             value = check_layout(args.root, args.role)
         elif args.operation == "submit":
-            value = submit(args.root, args.profile, _commit_message(args), ci=args.ci)
+            value = submit(
+                args.root,
+                args.profile,
+                _commit_message(args),
+                ci=args.ci,
+                mechanical_reference=args.mechanical_reference,
+            )
         elif args.operation == "update":
             value = update(
                 args.root,
@@ -515,18 +555,33 @@ def main(argv: list[str] | None = None) -> int:
                 worker_host=args.worker_host,
                 worker_port=args.worker_port,
                 ci=args.ci,
+                mechanical_reference=args.mechanical_reference,
             )
         elif args.operation == "dispatch":
             value = dispatch(args.root, args.candidate, args.profile)
         elif args.operation == "validate":
-            value = validate_commit(args.root, args.candidate, args.profile, remote=args.remote)
+            value = validate_commit(
+                args.root,
+                args.candidate,
+                args.profile,
+                remote=args.remote,
+                mechanical_reference=args.mechanical_reference,
+            )
         elif args.operation == "pending":
             value = {"dispatched" if args.ci else "pending": pending_candidates(args.root, args.profile, ci=args.ci)}
         else:
-            value = promotion_plan(args.root, args.hardware, args.candidate, args.profile, args.tag, ci=args.ci)
+            value = promotion_plan(
+                args.root,
+                args.hardware,
+                args.candidate,
+                args.profile,
+                args.tag,
+                ci=args.ci,
+                mechanical_reference=args.mechanical_reference,
+            )
             if args.apply:
                 value["review_evidence"] = args.review_evidence
-                value = promote(args.root, value)
+                value = promote(args.root, value, mechanical_reference=args.mechanical_reference)
         if report_path:
             write_json(report_path, value)
         for hint in value.get("next") or []:

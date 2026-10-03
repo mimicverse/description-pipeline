@@ -2,7 +2,18 @@
 
 ## [Unreleased]
 
+## [0.3.25] - 2026-10-03
+
 ### Added
+
+- Operator-selected mechanical kinematics acceptance. `--mechanical-reference` selects an approved
+  held-out JSON outside the model workspace; the pipeline compares rigid ownership, mechanical
+  drive identity, signed joints, limits, couplings and independent poses against the actual URDF
+  and both MuJoCo entries. Update can accept, rebuild and submit in one command; validation and
+  promotion independently select and replay the same reference. Linux and Windows launchers support
+  the flow. This qualifies kinematics against the reference only; no physical, training or hardware
+  claims follow. `interfaces.mechanical_drives` records mechanical identity and mounting without
+  inventing simulation actuator parameters.
 
 - A capture records the assembly's per-component context masses in `raw/mass_closure.json`
   (`component_context`): every component instance's assembly-context mass and its three override

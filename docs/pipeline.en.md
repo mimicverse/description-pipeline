@@ -47,7 +47,7 @@ The top level of `config/robot.yaml` accepts `schema_version`, `hardware_id`, `s
 `interfaces` and `overrides`. `source` captures the data; `robot` holds the source-specific
 mechanical semantics; `overrides` are the shared, explicit author additions. All of these inputs
 participate in the artifact identity, and changing the source configuration requires a new freeze.
-`interfaces` adds frames, actuators, sensors, control and contact exclusions during the build and is
+`interfaces` adds frames, actuators, sensors, control, contact exclusions and mechanical drive mappings during the build and is
 shared by both CAD sources. The same interface may not be given different values in the source
 definition and in `interfaces`, and duplicate or parent/child-overlapping overrides of one field are
 rejected. Duplicate JSON/YAML keys are rejected as well, including fields duplicated after a YAML
@@ -290,6 +290,13 @@ pinned to `config/simulation-acceptance.json`, the input identity, the purpose a
 environment and cannot attest itself with `passed`.
 This route supports simulation only and never grants training or hardware qualification.
 
+Kinematics has a separate [mechanical reference replay](mechanical-acceptance.en.md). Author
+`interfaces.mechanical_drives` once, acquire independent reference observations, and select the
+approved external file with `--mechanical-reference`. Builds, checks, submission and promotion
+replay the actual URDF plus the MuJoCo robot and scene. The candidate cannot choose its reference;
+the operator is responsible for its acquisition and approval. Agreement qualifies kinematics
+against those bytes only, without physical, training or hardware qualification.
+
 The example above is the external attestation format. The pipeline checks the repository, workflow
 and branch registered in the shared `verification/acceptance_trust.json`, confirms a successful run
 titled `accept <subject> (<purpose>)` and downloads the raw material from that run's GitHub
@@ -301,7 +308,7 @@ The public distribution registers no external producer by default. Simulation us
 replayed local experiments; additional external trust requires a reviewed tool release.
 Hardware records accept only `physical_measurement`; fitted data, copies of model inputs and records
 from a mismatched environment are rejected.
-Reports label `local_replay` and `external_attestation` separately. Local simulation replays offline;
+Reports label `local_replay`, `mechanical_reference_replay` and `external_attestation` separately. Local replays run offline;
 a purpose that needs external attestation stays unqualified until the evidence can be checked.
 
 ## Windows SolidWorks
@@ -343,6 +350,10 @@ configuration and snapshot digests and builds without touching CAD; a failed cap
 silently into snapshot reuse. Both modes check the branch, Git/LFS, the GitHub login and the tool
 lock first, and push only after the build passes. The default commit message is
 `Update <hardware> model`; `--message` or `--message-file` override it explicitly.
+For a declared mechanical suite, `--mechanical-reference` lets the same update complete acceptance
+before submission. Re-select the reference during consumer validation and promotion. Windows
+`submit.ps1` accepts `-MechanicalReference` or the operator's `mechanical_reference` host setting;
+Linux `submit.sh` forwards the CLI option.
 
 1. A developer updates with `description model update`, or submits an already built candidate with
    `description model submit`. Candidates only land on a review branch

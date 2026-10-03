@@ -55,6 +55,7 @@ PROFILE = {
 #: The robot's object categories.  The model, its diff and ``summary.robot_objects`` all count
 #: exactly these, so the CLI can name them without carrying a second copy of the list.
 OBJECT_FIELDS = ("links", "joints", "frames", "actuators", "sensors")
+INTERFACE_FIELDS = {"frames", "actuators", "sensors", "control", "contact_excludes", "mechanical_drives"}
 
 
 def profile_for(root: Path, name: str) -> dict:
@@ -144,6 +145,9 @@ def definition(root: Path) -> dict:
         raise PipelineError("Definition requires hardware_id and source")
     if not isinstance(value.get("overrides", []), list):
         raise PipelineError("Overrides must be a list")
+    interfaces = value.get("interfaces", {})
+    if not isinstance(interfaces, dict) or set(interfaces) - INTERFACE_FIELDS:
+        raise PipelineError("Unsupported author interface fields")
     return value
 
 
@@ -374,17 +378,20 @@ def normalize(scene: dict, config: dict, root: Path, snapshot_root: Path | None 
         hook = getattr(adapter, "normalize_scene", None)
         if hook is not None:
             data = hook(data, config, snapshot_root)
-    interfaces = config.get("interfaces", {})
-    if not isinstance(interfaces, dict) or set(interfaces) - {
-        "frames",
-        "actuators",
-        "sensors",
-        "control",
-        "contact_excludes",
-    }:
+    interfaces = copy.deepcopy(config.get("interfaces", {}))
+    if not isinstance(interfaces, dict) or set(interfaces) - INTERFACE_FIELDS:
         raise PipelineError("Unsupported author interface fields")
+    # Part lists are sets; normalise their order before resolving competing definitions.
+    for drives in (data.get("mechanical_drives"), interfaces.get("mechanical_drives")):
+        if not isinstance(drives, dict):
+            continue
+        for drive in drives.values():
+            if isinstance(drive, dict) and drive.get("kind") == "active":
+                for key in ("stator", "rotor"):
+                    if isinstance(drive.get(key), list) and all(isinstance(v, str) for v in drive[key]):
+                        drive[key] = sorted(drive[key])
     for field, value in interfaces.items():
-        if data[field] and data[field] != value:
+        if data.get(field) and data[field] != value:
             raise PipelineError(
                 f"Competing {field} definitions in source/robot and interfaces; choose one author entry"
             )
@@ -498,10 +505,18 @@ def field_changes(before, after, path: str = "") -> list[dict]:
     return [value]
 
 
-def assess(root: Path, profile_name: str, *, verify_manifest: bool = True) -> dict:
+def assess(
+    root: Path, profile_name: str, *, verify_manifest: bool = True, mechanical_reference: Path | None = None
+) -> dict:
     if (root / JOURNAL).exists():
         raise PipelineError("Workspace publication is unfinished; run description recover before checking")
     profile = profile_for(root, profile_name)
+    if mechanical_reference is not None:
+        from ..verification.mechanics import reference_path
+
+        if profile["purpose"] != "kinematics" or not profile["acceptance_suites"]:
+            raise PipelineError("--mechanical-reference requires kinematics with a declared acceptance suite")
+        mechanical_reference = reference_path(mechanical_reference, root)
     config, source_lock, source, source_manifest = inputs(root)
     tool = verify_toolchain(root)
     data = read_data(confined(root, "model/robot.json"))
@@ -613,7 +628,15 @@ def assess(root: Path, profile_name: str, *, verify_manifest: bool = True) -> di
     if profile["acceptance_suites"] or profile["purpose"] != "kinematics":
         from ..verification.acceptance import verify_acceptance
 
-        checks.append(verify_acceptance(root, digest(files), profile, input_hashes=set(files.values())))
+        checks.append(
+            verify_acceptance(
+                root,
+                digest(files),
+                profile,
+                input_hashes=set(files.values()),
+                mechanical_reference=mechanical_reference,
+            )
+        )
     if verify_manifest:
         manifest = _json_object(root, "manifest.json", "run `description build --root .`")
         checks.append(
@@ -692,8 +715,15 @@ def report_advisories(checks: list[dict]) -> list[dict]:
     ]
 
 
-def build(root: Path, profile_name: str, destination: Path | None = None) -> dict:
+def build(
+    root: Path, profile_name: str, destination: Path | None = None, *, mechanical_reference: Path | None = None
+) -> dict:
     root = root.resolve()
+    if mechanical_reference is not None:
+        from ..verification.mechanics import reference_path
+
+        # Validate against the caller's workspace before creating a staging directory.
+        mechanical_reference = reference_path(mechanical_reference, root)
     target = (destination or root).resolve()
     staging = Path(tempfile.mkdtemp(prefix=".description-build-", dir=target.parent))
     try:
@@ -717,7 +747,7 @@ def build(root: Path, profile_name: str, destination: Path | None = None) -> dic
         if not reused:
             generate(Robot.from_dict(canonical), source, staging, profile)
             cache.save(generation_cache, key, staging)
-        report = assess(staging, profile_name, verify_manifest=False)
+        report = assess(staging, profile_name, verify_manifest=False, mechanical_reference=mechanical_reference)
         report["execution"] = {
             "generation": "cache_reuse" if reused else "executed",
             "generation_key": key,

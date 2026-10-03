@@ -43,7 +43,7 @@ main 不承载某台机器的可消费模型；`tests/fixtures` 中的机器人�
 `config/robot.yaml` 的顶层接受 `schema_version`、`hardware_id`、`source`、`robot`、`interfaces`、`overrides`。
 `source` 负责取数；`robot` 是来源特有的机械语义定义；`overrides` 是公共的显式作者补充。
 这些输入均参与产物身份；更改来源配置后必须重新冻结。
-`interfaces` 在构建阶段补充 frames、actuators、sensors、control 和 contact_excludes，两种 CAD 来源共用。
+`interfaces` 在构建阶段补充 frames、actuators、sensors、control、contact_excludes 和 mechanical_drives，两种 CAD 来源共用。
 同一接口不能同时在来源定义和 interfaces 中给出不同值；同一字段的重复或父子重叠 override 会被拒绝。
 JSON/YAML 重复键也会被拒绝，包括 YAML 合并后重复的字段。
 
@@ -219,13 +219,18 @@ profile 的 `acceptance_suites` 明确所需测试名，`consumer_environment` �
 记录固定到 `config/simulation-acceptance.json`、输入身份、用途与实际环境，不能凭 `passed` 自证。
 这种方式只支持仿真，不授予训练或实机资格。
 
+运动学采用独立的[机械参考重放](mechanical-acceptance.md)。作者在 `interfaces.mechanical_drives` 中维护机械驱动映射；
+取得独立观测后，用 `--mechanical-reference` 显式选择工作区外已批准的参考。
+构建、检查、提交及晋级均重放实际 URDF、MuJoCo 机器人和场景。候选不能自行选择参考，采集与批准由操作者负责。
+通过仅表示相对于该参考字节的运动学合格，不授予物理、训练或实机资格。
+
 上例是外部凭证格式。流水线核对公共工具 `verification/acceptance_trust.json` 登记的仓库、workflow 和分支，
 确认成功运行标题为 `accept <subject> (<purpose>)`，并从该运行的 GitHub artifact 下载原始材料。
 artifact 内须含不带 attestation 字段的 `acceptance.json` 及同路径日志，记录和字节均须一致。
 信任方由工具维护者在接入真实应用测试时登记；候选模型不能自行添加。未登记、无法取得或过期的证据不授予资格。
 公共发行版默认不登记外部验收方。仿真采用独立重放的本地实验；新增外部信任源需要经过审查的工具新版本。
 实机记录只接受 physical_measurement；拟合数据、模型输入的副本和环境不符的记录均被拒绝。
-报告分别标记 `local_replay` 或 `external_attestation`。本地仿真可离线重放；需要外部凭证的用途在证据无法核实时保持未获资格。
+报告分别标记 `local_replay`、`mechanical_reference_replay` 或 `external_attestation`。本地重放可离线执行；需要外部凭证的用途在证据无法核实时保持未获资格。
 
 ## Windows SolidWorks
 
@@ -253,6 +258,8 @@ Windows 的 `submit.ps1` 默认调用本机完整运行环境。跨机采集是�
 它重新核对来源配置和快照摘要后构建，不访问 CAD；采集失败不会自动降级为快照复用。
 两种模式均先检查分支、Git/LFS、GitHub 登录和工具锁，构建通过后才推送。
 默认提交信息为 `Update <hardware> model`；`--message` 或 `--message-file` 可显式覆盖。
+声明机械套件时，加 `--mechanical-reference` 可由同一更新流程完成验收；消费端验证及晋级时重新选择参考。
+Windows `submit.ps1` 接受 `-MechanicalReference` 或操作者主机配置中的 `mechanical_reference`；Linux `submit.sh` 转发 CLI 选项。
 
 1. 开发者使用 `description model update` 完成更新，或用 `description model submit` 提交已构建的候选。
    候选只落在审查分支 `work/model/<hardware>/<change>` 上：从 `feature/<hardware>` 运行时先建审查分支再提交，
