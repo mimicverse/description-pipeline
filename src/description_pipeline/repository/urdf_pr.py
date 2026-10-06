@@ -25,7 +25,8 @@ import tempfile
 from pathlib import Path
 
 from ..delivery import subject_digest
-from ..io import read_data
+from ..io import PipelineError, read_data
+from ..sources.solidworks import revision as cad_revision
 
 GOVERNED_PATHS = ("README.md", "input", "evidence", "model", "urdf", "meshes", "reports")
 REPORTS_FILES = ("input.json", "tool.json", "quality.json")
@@ -89,7 +90,7 @@ def _gh(repository: Path, *args: str) -> str:
     return result.stdout
 
 
-def _validate(bundle: Path) -> tuple[str, dict]:
+def _validate(bundle: Path) -> tuple[str, dict, dict]:
     for name in REQUIRED_FILES:
         if not (bundle / name).is_file():
             raise PrError("bundle_incomplete", name)
@@ -109,7 +110,19 @@ def _validate(bundle: Path) -> tuple[str, dict]:
     manifest = read_data(bundle / "input/robot.yaml")
     if not isinstance(manifest, dict) or not manifest.get("hardware_id"):
         raise PrError("robot_yaml_invalid", "hardware_id is required")
-    return _slug_hardware(str(manifest["hardware_id"])), manifest
+    hardware = _slug_hardware(str(manifest["hardware_id"]))
+    try:
+        current = cad_revision.read_revision(bundle / "input", hardware_id=hardware)
+    except PipelineError as error:
+        raise PrError("cad_revision_invalid", str(error)) from error
+    return hardware, manifest, current
+
+
+def _previous_revision(worktree: Path, hardware: str) -> dict | None:
+    try:
+        return cad_revision.read_revision(worktree / "input", hardware_id=hardware)
+    except PipelineError:
+        return None
 
 
 def _validate_ref(repository: Path, name: str, *, branch: bool) -> None:
@@ -275,7 +288,7 @@ def submit_bundle(bundle: Path, repository: Path, *, base: str, branch: str,
     subject = ""
     slug = ""
     try:
-        hardware, _ = _validate(bundle)
+        hardware, _, current_revision = _validate(bundle)
         expected = REVIEW_BRANCH.format(hardware=hardware)
         if branch != expected:
             raise PrError("branch_not_deterministic", {"expected": expected})
@@ -298,6 +311,12 @@ def submit_bundle(bundle: Path, repository: Path, *, base: str, branch: str,
         worktree = staging / "worktree"
         try:
             _prepare_worktree(repository, worktree, base_sha, head_sha)
+            previous = _previous_revision(worktree, hardware)
+            if previous is not None:
+                try:
+                    cad_revision.check_successor(previous, current_revision)
+                except PipelineError as error:
+                    raise PrError("cad_revision_conflict", str(error)) from error
             commit, noop = _stage_commit(bundle, worktree, subject,
                                          message or f"feat({hardware}): publish SolidWorks-to-URDF bundle")
             _reverify(worktree, subject)

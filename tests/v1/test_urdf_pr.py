@@ -12,6 +12,7 @@ from unittest import mock
 
 from description_pipeline.delivery import subject_digest
 from description_pipeline.repository import urdf_pr
+from description_pipeline.sources.solidworks import revision as cad_revision
 
 BRANCH = "work/solidworks/m3.0"
 
@@ -41,6 +42,17 @@ class Fixture:
             run("git", "config", key, value, cwd=self.repo)
         self.bundle = self.tmp / "bundle"
         self.write_bundle("one\n")
+        self.seal("r1", None, cad="part-1\n")
+
+    def seal(self, revision_id: str, parent: str | None, *, cad: str = "part-1\n", fresh: bool = False) -> None:
+        inputs = self.bundle / "input"
+        inputs.mkdir(parents=True, exist_ok=True)
+        (inputs / "M3.0.SLDASM").write_text(cad, encoding="utf-8")
+        if fresh:
+            (inputs / "cad-revision.json").unlink(missing_ok=True)
+        cad_revision.seal_revision(inputs, hardware_id="m3.0", revision=revision_id, owner="t",
+                                   system="handoff", reference="local-handoff", summary="t",
+                                   parent_revision=parent)
 
     def write_bundle(self, evidence: str, extra: dict[str, str] | None = None) -> None:
         files = {
@@ -255,6 +267,44 @@ class PublishTests(unittest.TestCase):
         self.assertIn(result["error"], {"commit_left_dirty", "committed_subject_mismatch",
                                         "reverification_failed", "reverification_binding_mismatch"})
         self.assertEqual(self.fx.remote_head(), "")
+
+    def test_same_cad_revision_allows_definition_changes(self) -> None:
+        first = self.submit()
+        self.fx.write_bundle("two\n")
+        second = self.submit()
+        self.assertEqual(second["state"], "updated")
+        self.assertEqual(self.fx.remote_head(), second["commit"])
+        self.assertTrue(self.fx.is_ancestor(first["commit"], second["commit"]))
+
+    def test_resealed_changed_cad_same_id_rejected(self) -> None:
+        first = self.submit()
+        self.fx.seal("r1", None, cad="part-1-changed\n", fresh=True)
+        self.fx.write_bundle("two\n")
+        result = self.submit()
+        self.assertEqual(result["error"], "cad_revision_conflict")
+        self.assertEqual(self.fx.remote_head(), first["commit"])
+
+    def test_new_revision_with_correct_parent_allowed(self) -> None:
+        first = self.submit()
+        self.fx.seal("r2", "r1", cad="part-2\n", fresh=True)
+        self.fx.write_bundle("two\n")
+        second = self.submit()
+        self.assertEqual(second["state"], "updated")
+        run("git", "fetch", "--quiet", "origin", BRANCH, cwd=self.fx.repo)
+        manifest = json.loads(run("git", "show", "FETCH_HEAD:input/cad-revision.json", cwd=self.fx.repo))
+        self.assertEqual(manifest["revision"], "r2")
+        self.assertEqual(manifest["parent_revision"], "r1")
+        self.assertTrue(self.fx.is_ancestor(first["commit"], second["commit"]))
+
+    def test_missing_or_wrong_parent_rejected(self) -> None:
+        first = self.submit()
+        self.fx.seal("r2", None, cad="part-2-missing\n", fresh=True)
+        self.fx.write_bundle("two\n")
+        self.assertEqual(self.submit()["error"], "cad_revision_conflict")
+        self.assertEqual(self.fx.remote_head(), first["commit"])
+        self.fx.seal("r2", "r0", cad="part-2-wrong\n", fresh=True)
+        self.assertEqual(self.submit()["error"], "cad_revision_conflict")
+        self.assertEqual(self.fx.remote_head(), first["commit"])
 
 
 if __name__ == "__main__":
