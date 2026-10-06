@@ -19,14 +19,13 @@ import json
 import os
 import re
 import shutil
-import stat
 import subprocess
 import tempfile
 import time
 from pathlib import Path
 
 from ..delivery import subject_digest
-from ..io import PipelineError, confined, read_data
+from ..io import PipelineError, acquire_process_lock, confined, read_data
 from ..sources.solidworks import revision as cad_revision
 
 GOVERNED_PATHS = ("README.md", "input", "evidence", "model", "urdf", "meshes", "reports")
@@ -203,10 +202,9 @@ def _lock(repository: Path):
     git_dir = Path(_git(repository, "rev-parse", "--absolute-git-dir").stdout.strip())
     lock = git_dir / "urdf-pr.lock"
     try:
-        handle = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, stat.S_IRUSR | stat.S_IWUSR)
-    except FileExistsError as error:
+        handle = acquire_process_lock(lock)
+    except (OSError, PipelineError) as error:
         raise PrError("repository_locked", str(lock)) from error
-    os.write(handle, str(os.getpid()).encode("ascii"))
     return lock, handle
 
 
@@ -504,6 +502,5 @@ def submit_bundle(
         }
     finally:
         if lock_info is not None:
-            lock, handle = lock_info
+            _, handle = lock_info
             os.close(handle)
-            lock.unlink(missing_ok=True)

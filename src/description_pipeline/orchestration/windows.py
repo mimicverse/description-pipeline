@@ -23,7 +23,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from ..delivery import PIPELINE_ID
-from ..io import PipelineError, artifact_path_parts, confined, file_digest, inventory, read_data, write_json
+from ..io import (
+    PipelineError,
+    acquire_process_lock,
+    artifact_path_parts,
+    confined,
+    file_digest,
+    inventory,
+    read_data,
+    write_json,
+)
 from ..sources.solidworks.revision import package_inventory, read_revision
 from ..repository.urdf_pr import _origin_slug, _slug_hardware
 
@@ -131,6 +140,14 @@ def read_config(path):
     return config
 
 
+def _owner_lock(path):
+    """Process-held ownership survives neither a crash nor an OS restart."""
+    try:
+        return acquire_process_lock(path)
+    except OSError as error:
+        raise PipelineError("Another endpoint owns the state root or its ownership lock is unavailable") from error
+
+
 class Jobs:
     """One persistent queue, one CAD runner, one endpoint process owner."""
 
@@ -143,13 +160,7 @@ class Jobs:
         self.directory.mkdir(parents=True, exist_ok=True)
         inventory(self.directory)
         self.lock_path = config["state_root"] / ".endpoint.lock"
-        try:
-            self.handle = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError as error:
-            raise PipelineError(
-                "Another endpoint owns the state root; inspect the old process before removing its lock"
-            ) from error
-        os.write(self.handle, str(os.getpid()).encode("ascii"))
+        self.handle = _owner_lock(self.lock_path)
         self.mutex = threading.RLock()
         self.queue = queue.Queue()
         self.jobs = {}
@@ -173,7 +184,6 @@ class Jobs:
             self.thread.start()
         except BaseException:
             os.close(self.handle)
-            self.lock_path.unlink(missing_ok=True)
             raise
 
     def _save(self, job):
@@ -324,7 +334,6 @@ class Jobs:
         if self.thread.is_alive():
             raise PipelineError("Native job still runs; endpoint ownership lock retained")
         os.close(self.handle)
-        self.lock_path.unlink(missing_ok=True)
 
 
 def handler(jobs, token):

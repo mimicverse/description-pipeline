@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import copy
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -223,6 +224,26 @@ class EndpointTests(unittest.TestCase):
         self.jobs(lambda *args, **kwargs: {"passed": False})
         with self.assertRaises(PipelineError):
             Jobs(self.config)
+
+    def test_process_exit_releases_ownership_and_fails_interrupted_job(self):
+        request = self.request()
+        # A real child process exits from the running job without Jobs.close().
+        # This exercises kernel lock release, rather than deleting a lock file.
+        script = (
+            "import os,sys;from pathlib import Path;"
+            f"sys.path.insert(0,{str(Path(__file__).resolve().parents[2] / 'src')!r});"
+            "from description_pipeline.orchestration.windows import Jobs,read_config;"
+            "j=Jobs(read_config(Path(sys.argv[1])),runner=lambda *a,**k:os._exit(17));"
+            f"j.create({request!r});j.queue.join()"
+        )
+        stopped = subprocess.run([sys.executable, "-I", "-c", script, str(self.path)], capture_output=True, timeout=10)
+        self.assertEqual(17, stopped.returncode, stopped.stderr.decode())
+        resumed = self.jobs(lambda *a, **k: self.fail("Interrupted CAD job must not restart"))
+        resumed.queue.join()
+        job = resumed.snapshot(request["run_id"])
+        self.assertEqual("failed", job["status"])
+        self.assertIn("Endpoint restarted during native execution", job["error"])
+        self.assertFalse(resumed.create(request)[1])
 
     def test_plaintext_remote_binding_and_overlapping_roots_are_rejected(self):
         for change in ({"host": "0.0.0.0"}, {"output_root": str(self.packages / "output")}):

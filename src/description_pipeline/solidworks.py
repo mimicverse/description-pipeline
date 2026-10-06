@@ -17,7 +17,7 @@ from pathlib import Path
 from . import __version__
 from .backends.urdf import generate_urdf
 from .delivery import BUNDLE_SCHEMA, PIPELINE_ID
-from .io import PipelineError, confined, digest, file_digest, inventory, read_data, write_json
+from .io import PipelineError, acquire_process_lock, confined, digest, file_digest, inventory, read_data, write_json
 from .model import Robot
 from .sources.solidworks.scene import load_scene
 from .sources.solidworks.revision import package_inventory, read_revision
@@ -95,15 +95,13 @@ def output_lock(output: Path):
     output.parent.mkdir(parents=True, exist_ok=True)
     path = output.parent / f".{output.name}.description.lock"
     try:
-        handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
-        raise PipelineError(f"Another run owns {path}; verify that run has stopped before removing its lock") from None
+        handle = acquire_process_lock(path)
+    except OSError as error:
+        raise PipelineError(f"Another run owns {path} or its ownership lock is unavailable") from error
     try:
-        os.write(handle, f"{os.getpid()}\n".encode("ascii"))
         yield output
     finally:
         os.close(handle)
-        path.unlink(missing_ok=True)
 
 
 def _owned_output(path: Path) -> bool:

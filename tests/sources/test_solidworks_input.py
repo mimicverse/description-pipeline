@@ -320,7 +320,7 @@ class InputPackageTests(unittest.TestCase):
 
     def test_worker_and_evidence_class_downgrade_keys_are_rejected(self):
         def mutate(document):
-            document["source"]["worker_url"] = "http://10.0.0.177:8731"
+            document["source"]["worker_url"] = "http://192.0.2.10:8731"
             document["source"]["evidence_class"] = "fixture"
             document["source"]["worker_poll_seconds"] = 1.0
 
