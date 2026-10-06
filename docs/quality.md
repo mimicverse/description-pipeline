@@ -54,6 +54,11 @@ override flags. Per-part readings use part-document axes; whole-assembly
 readings use assembly-document axes. Missing declarations or effective
 mass/COM/inertia overrides block publication.
 
+Native capture rebuilds the collected read-only assembly in its owned session
+before measurements. This refreshes assembly caches, including mass properties;
+it never saves over CAD. The snapshot records the rebuild and verifies both
+original and collected file hashes after capture. A failed rebuild blocks export.
+
 Captured transforms use the native adapter protocol: SI, row-major 4×4
 homogeneous matrices with column-vector multiplication. The adapter converts
 SolidWorks' vendor MathTransform layout at the COM boundary. Verification reads

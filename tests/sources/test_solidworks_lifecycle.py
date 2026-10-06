@@ -12,7 +12,11 @@ from . import _paths  # noqa: F401
 from description_pipeline.sources.solidworks.errors import BridgeError, CadError, EnvironmentError_  # noqa: E402
 from description_pipeline.sources.solidworks.executor import ComExecutor  # noqa: E402
 from description_pipeline.sources.solidworks.isolation import CadSession  # noqa: E402
-from description_pipeline.sources.solidworks.native import SolidWorksBackend, _read_only_document  # noqa: E402
+from description_pipeline.sources.solidworks.native import (  # noqa: E402
+    SolidWorksBackend,
+    _read_only_document,
+    normalize_document_path,
+)
 
 
 class ExecutorTests(unittest.TestCase):
@@ -129,6 +133,37 @@ class ExecutorTests(unittest.TestCase):
 
 
 class SessionTests(unittest.TestCase):
+    def test_capture_rebuild_cannot_touch_the_original_assembly(self):
+        backend = SolidWorksBackend()
+        backend._capture_roots = [normalize_document_path("/snapshot/source")]
+        doc = Mock()
+        with self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(doc, "/handoff/robot.SLDASM")
+        self.assertEqual(caught.exception.code, "cad_rebuild_scope")
+        doc.ForceRebuild3.assert_not_called()
+
+    def test_capture_rebuild_is_in_memory_and_failure_blocks_measurement(self):
+        backend = SolidWorksBackend()
+        backend._capture_roots = [normalize_document_path("/snapshot/source")]
+        doc = SimpleNamespace(
+            ConfigurationManager=SimpleNamespace(ActiveConfiguration=SimpleNamespace(Name="Default")),
+            GetSaveFlag=False,
+            GetPathName="/snapshot/source/robot.SLDASM",
+            IsOpenedReadOnly=True,
+            Save=Mock(),
+            ForceRebuild3=Mock(spec=["__call__"], return_value=True),
+        )
+        result = backend._rebuild_capture_copy(doc, doc.GetPathName)
+        self.assertEqual(result["scope"], "collected_copy_in_memory")
+        self.assertFalse(result["saved_to_disk"])
+        self.assertTrue(result["read_only"])
+        doc.ForceRebuild3.assert_called_once_with(False)
+        doc.Save.assert_not_called()
+        doc.ForceRebuild3.return_value = False
+        with self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(doc, doc.GetPathName)
+        self.assertEqual(caught.exception.code, "cad_rebuild_failed")
+
     def test_loaded_references_must_also_be_read_only(self):
         doc = SimpleNamespace(IsOpenedReadOnly=False, GetPathName="part.SLDPRT")
         calls = []

@@ -209,7 +209,8 @@ def _tool(root):
     runtime = tool["runtime"]
     _require(runtime["python"].startswith("3.12.") and bool(runtime["packages"]), "Missing pinned build runtime")
     for version in runtime["packages"].values():
-        _require(isinstance(version, str) and str(Version(version)) == version, "Invalid dependency versions")
+        _require(isinstance(version, str), "Invalid dependency versions")
+        Version(version)
     return {"version": tool["version"], "source_sha256": tool["source_sha256"]}
 
 

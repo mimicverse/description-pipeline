@@ -1127,15 +1127,40 @@ class SolidWorksBackend(CadBackend):
             },
         }
 
+    def _rebuild_capture_copy(self, doc, path):
+        normalized = normalize_document_path(os.path.abspath(path))
+        if not any(normalized.startswith(root + "\\") for root in self._capture_roots):
+            raise CadError("cad_rebuild_scope", "Only a collected capture copy may be rebuilt")
+        configuration = _active_configuration(doc)
+        before = bool(_member(doc, "GetSaveFlag"))
+        # Reopened assemblies can have resolved solid components but an empty
+        # mass cache. Rebuild the owned read-only copy before ANY measurements,
+        # not just a failed mass reading. Never save the rebuilt document.
+        if not _member(doc, "ForceRebuild3", False):
+            raise CadError("cad_rebuild_failed", "Collected assembly did not rebuild successfully", {"path": path})
+        if _active_configuration(doc) != configuration:
+            raise CadError("cad_configuration_mismatch", "Capture rebuild changed the selected configuration")
+        return {
+            "used_api": "IModelDoc2.ForceRebuild3(False)",
+            "scope": "collected_copy_in_memory",
+            "document": str(_member(doc, "GetPathName")),
+            "configuration": configuration,
+            "read_only": bool(_member(doc, "IsOpenedReadOnly")),
+            "saved_to_disk": False,
+            "save_flag_before": before,
+            "save_flag_after": bool(_member(doc, "GetSaveFlag")),
+        }
+
     def collect_scene(self, doc_path, coordinate_systems, progress=None, require_material=True):
         doc = self._document_by_path(doc_path)
         if _member(doc, "GetType") != 2:
             raise CadError("cad_not_assembly", "export requires a saved SLDASM")
+        preparation = self._rebuild_capture_copy(doc, doc_path)
         self._record_save_flag(doc, doc_path)
         self._doc = doc
         self._components = {}
         self._source_components = {}
-        self.notes = {}
+        self.notes = {"capture_preparation": preparation}
         self.source_files = {doc_path: _hash(doc_path)}
         config = _member(_member(doc, "ConfigurationManager"), "ActiveConfiguration")
         self._source_configuration = str(_member(config, "Name"))
