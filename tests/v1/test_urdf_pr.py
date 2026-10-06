@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -74,9 +75,6 @@ class Fixture:
 class PublishTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fx = Fixture()
-        env = mock.patch.dict("os.environ", {"URDF_PR_REPO_SLUG": "example/m3.0"})
-        env.start()
-        self.addCleanup(env.stop)
         self.gh_calls: list[tuple[str, ...]] = []
         self.gh_mode = "ok"
         self.pr_exists = False
@@ -103,7 +101,8 @@ class PublishTests(unittest.TestCase):
             return report
 
         self.patchers = [mock.patch.object(urdf_pr, "_gh", fake_gh),
-                         mock.patch.object(urdf_pr, "_load_verifier", lambda: verifier)]
+                         mock.patch.object(urdf_pr, "_load_verifier", lambda: verifier),
+                         mock.patch.object(urdf_pr, "_origin_slug", lambda repository: "example/m3.0")]
         for patcher in self.patchers:
             patcher.start()
         self.addCleanup(lambda: [p.stop() for p in self.patchers])
@@ -191,6 +190,71 @@ class PublishTests(unittest.TestCase):
         self.assertNotIn("secret.txt", tree)
         self.assertNotIn("config/extra.json", tree)
         self.assertIn("urdf/robot.urdf", tree)
+
+    def test_local_receipts_ignored_and_do_not_cause_commits(self) -> None:
+        self.fx.write_bundle("one\n", extra={"reports/run.json": '{"run": 1}\n',
+                                            "reports/pr.json": '{"pr": 1}\n'})
+        first = self.submit()
+        tree = self.fx.remote_tree()
+        self.assertIn("reports/quality.json", tree)
+        self.assertNotIn("reports/run.json", tree)
+        self.assertNotIn("reports/pr.json", tree)
+        self.fx.write_bundle("one\n", extra={"reports/run.json": '{"run": 2}\n',
+                                            "reports/pr.json": '{"pr": 2}\n'})
+        second = self.submit()
+        self.assertEqual(second["state"], "noop")
+        self.assertEqual(second["commit"], first["commit"])
+        self.assertEqual(self.fx.remote_head(), first["commit"])
+
+    def test_base_advance_with_identical_bundle_pushes_merge(self) -> None:
+        first = self.submit()
+        (self.fx.seed / "feature.txt").write_text("feature\n", encoding="utf-8")
+        run("git", "add", "-A", cwd=self.fx.seed)
+        run("git", "commit", "-m", "advance base", cwd=self.fx.seed)
+        run("git", "push", "origin", "feature/m3.0", cwd=self.fx.seed)
+        run("git", "fetch", "--quiet", "origin", "feature/m3.0", cwd=self.fx.repo)
+        new_base = run("git", "rev-parse", "FETCH_HEAD", cwd=self.fx.repo).strip()
+        second = self.submit()
+        self.assertEqual(second["state"], "updated")
+        self.assertNotEqual(second["commit"], first["commit"])
+        self.assertEqual(self.fx.remote_head(), second["commit"])
+        self.assertTrue(self.fx.is_ancestor(first["commit"], second["commit"]))
+        self.assertTrue(self.fx.is_ancestor(new_base, second["commit"]))
+
+    def test_invalid_refs_rejected(self) -> None:
+        result = urdf_pr.submit_bundle(self.fx.bundle, self.fx.repo, base="--upload-pack=evil", branch=BRANCH)
+        self.assertEqual(result["error"], "invalid_ref")
+        self.assertEqual(self.fx.remote_head(), "")
+
+    def test_case_duplicate_paths_rejected(self) -> None:
+        (self.fx.bundle / "readme.md").write_text("dup\n", encoding="utf-8")
+        self.assertEqual(self.submit()["error"], "duplicate_path")
+        self.assertEqual(self.fx.remote_head(), "")
+
+    def test_inherited_symlink_not_followed(self) -> None:
+        outside = self.fx.tmp / "outside"
+        outside.mkdir()
+        (outside / "keep.txt").write_text("keep\n", encoding="utf-8")
+        os.symlink(outside, self.fx.seed / "input")
+        run("git", "add", "-A", cwd=self.fx.seed)
+        run("git", "commit", "-m", "symlinked input", cwd=self.fx.seed)
+        run("git", "push", "origin", "feature/m3.0", cwd=self.fx.seed)
+        result = self.submit()
+        self.assertIn(result["state"], {"published", "updated"})
+        self.assertTrue((outside / "keep.txt").is_file())
+        self.assertIn("input/robot.yaml", self.fx.remote_tree())
+
+    def test_commit_hook_tamper_blocks_push(self) -> None:
+        hook = self.fx.repo / ".git" / "hooks" / "pre-commit"
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text('#!/bin/sh\necho tampered >> "$(git rev-parse --show-toplevel)/urdf/robot.urdf"\n',
+                        encoding="utf-8")
+        hook.chmod(0o755)
+        result = self.submit()
+        self.assertEqual(result["state"], "failed")
+        self.assertIn(result["error"], {"commit_left_dirty", "committed_subject_mismatch",
+                                        "reverification_failed", "reverification_binding_mismatch"})
+        self.assertEqual(self.fx.remote_head(), "")
 
 
 if __name__ == "__main__":

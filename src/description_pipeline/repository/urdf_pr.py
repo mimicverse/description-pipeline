@@ -28,6 +28,7 @@ from ..delivery import subject_digest
 from ..io import read_data
 
 GOVERNED_PATHS = ("README.md", "input", "evidence", "model", "urdf", "meshes", "reports")
+REPORTS_FILES = ("input.json", "tool.json", "quality.json")
 REQUIRED_FILES = ("README.md", "input/robot.yaml", "model/robot.json", "urdf/robot.urdf",
                   "reports/input.json", "reports/tool.json")
 REQUIRED_DIRS = ("evidence", "meshes")
@@ -55,9 +56,6 @@ def _slug_hardware(value: str) -> str:
 
 
 def _origin_slug(repository: Path) -> str:
-    override = os.environ.get("URDF_PR_REPO_SLUG")
-    if override:
-        return override
     url = _git(repository, "remote", "get-url", "origin").stdout.strip()
     match = re.fullmatch(r"(?:https://github\.com/|git@github\.com:)([^/]+/[^/]+?)(?:\.git)?", url)
     if not match:
@@ -98,10 +96,28 @@ def _validate(bundle: Path) -> tuple[str, dict]:
     for name in REQUIRED_DIRS:
         if not (bundle / name).is_dir():
             raise PrError("bundle_incomplete", name)
+    seen: dict[str, str] = {}
+    for path in bundle.rglob("*"):
+        if path.is_symlink():
+            raise PrError("bundle_symlink", path.relative_to(bundle).as_posix())
+        if path.is_file():
+            rel = path.relative_to(bundle).as_posix()
+            key = rel.lower()
+            if key in seen and seen[key] != rel:
+                raise PrError("duplicate_path", {"first": seen[key], "second": rel})
+            seen[key] = rel
     manifest = read_data(bundle / "input/robot.yaml")
     if not isinstance(manifest, dict) or not manifest.get("hardware_id"):
         raise PrError("robot_yaml_invalid", "hardware_id is required")
     return _slug_hardware(str(manifest["hardware_id"])), manifest
+
+
+def _validate_ref(repository: Path, name: str, *, branch: bool) -> None:
+    if not name or name.startswith("-") or name.endswith(".lock") or ".." in name:
+        raise PrError("invalid_ref", name)
+    args = ("check-ref-format", "--branch", name) if branch else ("check-ref-format", f"refs/heads/{name}")
+    if _git(repository, *args, check=False).returncode != 0:
+        raise PrError("invalid_ref", name)
 
 
 def _verify(bundle: Path) -> tuple[str, dict]:
@@ -115,9 +131,25 @@ def _verify(bundle: Path) -> tuple[str, dict]:
     on_disk = bundle / "reports/quality.json"
     if not on_disk.is_file():
         raise PrError("missing_quality_report", "reports/quality.json is required")
-    if on_disk.read_text(encoding="utf-8") != _serialize(report):
+    try:
+        saved = json.loads(on_disk.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise PrError("quality_report_invalid", str(error)) from error
+    if saved != report:
         raise PrError("stale_quality_report", "on-disk quality report differs from the recomputed report")
     return subject, report
+
+
+def _reverify(root: Path, subject: str) -> None:
+    report = _load_verifier()(root)
+    if not isinstance(report, dict) or report.get("passed") is not True or report.get("subject_sha256") != subject:
+        raise PrError("reverification_failed", report if isinstance(report, dict) else None)
+    try:
+        saved = json.loads((root / "reports/quality.json").read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise PrError("reverification_missing_quality", None) from error
+    if saved != report:
+        raise PrError("reverification_binding_mismatch", None)
 
 
 def _lock(repository: Path):
@@ -132,9 +164,18 @@ def _lock(repository: Path):
 
 
 def _copy_governed(bundle: Path, worktree: Path) -> None:
+    reports = worktree / "reports"
+    if reports.is_symlink() or reports.is_file():
+        reports.unlink()
+    elif reports.is_dir():
+        shutil.rmtree(reports)
     for name in GOVERNED_PATHS:
+        if name == "reports":
+            continue
         target = worktree / name
-        if target.is_dir():
+        if target.is_symlink():
+            target.unlink()
+        elif target.is_dir():
             shutil.rmtree(target)
         elif target.exists():
             target.unlink()
@@ -144,6 +185,11 @@ def _copy_governed(bundle: Path, worktree: Path) -> None:
         elif source.is_file():
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
+    reports.mkdir(parents=True, exist_ok=True)
+    for name in REPORTS_FILES:
+        source = bundle / "reports" / name
+        if source.is_file():
+            shutil.copyfile(source, reports / name)
 
 
 def _prepare_worktree(repository: Path, worktree: Path, base_sha: str, head_sha: str) -> None:
@@ -158,6 +204,7 @@ def _prepare_worktree(repository: Path, worktree: Path, base_sha: str, head_sha:
 
 def _stage_commit(bundle: Path, worktree: Path, subject: str, message: str) -> tuple[str, bool]:
     _copy_governed(bundle, worktree)
+    _reverify(worktree, subject)
     changed = _git(worktree, "status", "--porcelain").stdout.splitlines()
     for line in changed:
         path = line[3:].strip().strip('"')
@@ -176,6 +223,8 @@ def _stage_commit(bundle: Path, worktree: Path, subject: str, message: str) -> t
     commit = _git(worktree, "rev-parse", "HEAD").stdout.strip()
     if _git(worktree, "status", "--porcelain").stdout.strip():
         raise PrError("commit_left_dirty", "staged worktree is not clean after commit")
+    if _git(worktree, "diff", "--quiet", "HEAD", check=False).returncode != 0:
+        raise PrError("commit_worktree_mismatch", "worktree differs from the committed tree")
     if subject_digest(worktree) != subject:
         raise PrError("committed_subject_mismatch", "committed tree bytes differ from the verified bundle")
     diff = _git(worktree, "diff", "--name-only", "HEAD^", "HEAD").stdout.splitlines()
@@ -230,6 +279,8 @@ def submit_bundle(bundle: Path, repository: Path, *, base: str, branch: str,
         expected = REVIEW_BRANCH.format(hardware=hardware)
         if branch != expected:
             raise PrError("branch_not_deterministic", {"expected": expected})
+        _validate_ref(repository, base, branch=False)
+        _validate_ref(repository, branch, branch=True)
         slug = _origin_slug(repository)
         lock_info = _lock(repository)
         if _git(repository, "status", "--porcelain").stdout.strip():
@@ -249,11 +300,10 @@ def submit_bundle(bundle: Path, repository: Path, *, base: str, branch: str,
             _prepare_worktree(repository, worktree, base_sha, head_sha)
             commit, noop = _stage_commit(bundle, worktree, subject,
                                          message or f"feat({hardware}): publish SolidWorks-to-URDF bundle")
-            if noop:
-                pushed = head_sha
-            else:
+            _reverify(worktree, subject)
+            if not noop or commit != head_sha:
                 _git(worktree, "push", "origin", f"HEAD:refs/heads/{branch}")
-                pushed = commit
+            pushed = commit
         finally:
             _git(repository, "worktree", "remove", "--force", str(worktree), check=False)
             _git(repository, "worktree", "prune", check=False)
@@ -261,7 +311,8 @@ def submit_bundle(bundle: Path, repository: Path, *, base: str, branch: str,
         if _git(repository, "ls-remote", "origin", f"refs/heads/{branch}").stdout.split()[:1] != [pushed]:
             raise PrError("remote_head_mismatch", {"expected": pushed})
         state, url = _pr(repository, slug, base, branch, subject, pushed, report, message)
-        return {"state": "noop" if noop else state, "branch": branch, "base": base,
+        content_noop = noop and pushed == head_sha
+        return {"state": "noop" if content_noop else state, "branch": branch, "base": base,
                 "subject": subject, "commit": pushed, "url": url}
     except PrError as error:
         return {"state": "failed", "error": error.code, "detail": error.detail,
