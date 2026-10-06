@@ -128,16 +128,11 @@ PRODUCT_CONVENTIONS = ("solidworks_positive", "solidworks_standard")
 # with any declared convention, so a reading is never re-interpreted by
 # silently relabelling historical measurements.
 #
-# Measured on an analytic native fixture (2026-10-06, SolidWorks 34.0.0,
-# C:\m30-fixture-20261006): two rotated boxes with known geometry, known COM and
-# non-zero off-diagonals.  The part-document raw matrix equals the analytic
-# STANDARD tensor to 4e-20 / 1e-19 (the positive-product hypothesis is off by
-# 3.5e-5), and a two-instance group equals the analytic standard parallel-axis
-# combination to 6.5e-19 absolute / 2.6e-16 relative (the positive-product
-# hypothesis is off by 2.2e-3 / 0.87).  This build therefore answers in
-# standard notation for every measured scope; the earlier positive-product
-# claim is NOT reproduced and historical readings that declare
-# ``solidworks_positive`` keep their own (negating) interpretation.
+# The native analytic fixture (SolidWorks 34.0.0, 2026-10-06) verifies rotated
+# boxes and a solid cylinder with nonzero cross terms. Part tensors agree with
+# the standard signed tensor within 1.5e-19 kg*m^2; the full assembly agrees
+# within 8.7e-19. Historical positive-product readings retain their own declared
+# interpretation and cannot be relabelled as a measured standard scope.
 SCOPE_CONVENTIONS = {
     "part_document": "solidworks_standard",
     "assembly_component_group": "solidworks_standard",

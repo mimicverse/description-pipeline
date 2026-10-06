@@ -271,8 +271,9 @@ def run(
     """Inspect, capture, generate, independently verify and optionally submit one PR.
 
     ``backend`` is an internal dependency-injection seam for native regressions;
-    the public CLI always uses the native SolidWorks backend. A failed run never
-    submits a PR or replaces a previous passing delivery.
+    the public CLI always uses the native SolidWorks backend. Capture or quality
+    failure preserves a previous delivery. Submission failure keeps the new
+    verified delivery and any publication receipt for retry without CAD.
     """
 
     from .sources.solidworks.freeze import freeze
@@ -296,7 +297,7 @@ def run(
         receipt = {
             "schema_version": BUNDLE_SCHEMA,
             "pipeline_id": PIPELINE_ID,
-            "run_id": run_id or uuid.uuid4().hex,
+            "run_id": run_id or str(uuid.uuid4()),
             "state": "failed",
             "events": [],
         }
@@ -398,7 +399,7 @@ def rebuild(
         receipt = {
             "schema_version": BUNDLE_SCHEMA,
             "pipeline_id": PIPELINE_ID,
-            "run_id": uuid.uuid4().hex,
+            "run_id": str(uuid.uuid4()),
             "state": "failed",
             "passed": False,
             "rebuild_from": previous.get("subject_sha256"),
@@ -408,16 +409,12 @@ def rebuild(
             shutil.copytree(bundle / "evidence", staging / "evidence")
             definition = read_data(bundle / "input/robot.yaml")
             report = _candidate(staging, definition, read_data(bundle / "reports/input.json"))
-            receipt = {
-                "schema_version": BUNDLE_SCHEMA,
-                "pipeline_id": PIPELINE_ID,
-                "run_id": uuid.uuid4().hex,
-                "state": "verified" if report.get("passed") is True else "failed",
-                "passed": report.get("passed") is True,
-                "subject_sha256": report.get("subject_sha256"),
-                "quality": report,
-                "rebuild_from": previous.get("subject_sha256"),
-            }
+            receipt.update(
+                state="verified" if report.get("passed") is True else "failed",
+                passed=report.get("passed") is True,
+                subject_sha256=report.get("subject_sha256"),
+                quality=report,
+            )
             _stamp(staging, receipt)
             if not receipt["passed"]:
                 failed = _keep_diagnostic(staging, output, receipt)

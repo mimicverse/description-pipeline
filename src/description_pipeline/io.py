@@ -61,8 +61,7 @@ def pin_utf8_streams() -> None:
     reader — and the messages contain non-ASCII text.  Windows otherwise encodes redirected streams
     with the active ANSI code page (cp936 on the tested host), so a caller that reads UTF-8 cannot
     decode them and ``subprocess.run(text=True, encoding="utf-8")`` fails outright.  Pinning the
-    streams here keeps every entry point on the same contract; the Windows ``description.cmd`` shim
-    sets the console code page to match.
+    streams here keeps every entry point on the same contract.
     """
 
     for stream in (sys.stdin, sys.stdout, sys.stderr):
