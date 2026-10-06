@@ -24,17 +24,31 @@ the required datums; native capture establishes those facts.
 Install the pinned release in a dedicated Python 3.12 environment. Fresh capture
 requires licensed SolidWorks revision 34 and a logged-in interactive Windows
 desktop. Keep the computer awake during jobs. Git and GitHub CLI are required
-for submission; authenticate once and create a clean dedicated model clone.
+for submission. Configure your Git commit identity, authenticate GitHub once,
+and create a clean dedicated model clone.
 
 ```powershell
 description doctor
 gh auth status
+gh auth setup-git
 git clone https://github.com/mimicverse/description.git C:\description\models
 ```
 
 `doctor` distinguishes runtime availability from native capture availability.
-It does not open CAD or certify a particular package. The model target branch
-must exist; use the branch assigned to that hardware.
+It does not open CAD or certify a particular package. Use the model branch
+assigned to that hardware. If it does not exist, a model owner creates it once
+in this dedicated clean clone:
+
+```powershell
+git -C C:\description\models switch --orphan feature/arm
+Set-Content -Encoding utf8 C:\description\models\README.md "# arm model"
+git -C C:\description\models add README.md
+git -C C:\description\models commit -m "Initialize arm model branch"
+git -C C:\description\models push origin feature/arm
+```
+
+This branch contains model data; its history is separate from tool source.
+Existing hardware branches require no initialization.
 
 ## 3. Execute and submit
 

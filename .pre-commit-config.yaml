@@ -1,5 +1,4 @@
-# 可选的本地钩子：`pip install pre-commit && pre-commit install` 后生效。
-# 完整门禁仍是 `python tools/quality.py all`（CI 与提交前用的是同一套检查）。
+# Optional local hooks; the complete release gate is documented in RELEASING.md.
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.16.8
@@ -11,8 +10,8 @@ repos:
   - repo: local
     hooks:
       - id: quality-tests
-        name: 工具与模型回归（tools/quality.py test）
-        entry: python tools/quality.py test
+        name: Pipeline regression suite
+        entry: python -B -m unittest discover -s tests -t .
         language: system
         pass_filenames: false
         stages: [pre-push]

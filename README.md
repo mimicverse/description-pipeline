@@ -39,8 +39,10 @@ C:\description\.venv\Scripts\description.exe revision C:\handoffs\arm\r1 --hardw
 C:\description\.venv\Scripts\description.exe run C:\handoffs\arm\r1 --output C:\deliveries\arm --repository C:\description\models --base feature/arm
 ```
 
-GitHub authentication is a one-time setup. Use a dedicated clean model clone with the target branch already present. The
-second command performs all five stages and prints the PR URL. A failed check
+GitHub authentication is a one-time setup. Use a dedicated clean model clone;
+the hardware branch must already exist. For a new hardware branch, follow
+[execution setup](docs/operations.md#2-set-up-the-execution-computer).
+The second command performs all five stages and prints the PR URL. A failed check
 keeps diagnostics and does not submit or replace a previous passing delivery.
 
 ## Delivery
