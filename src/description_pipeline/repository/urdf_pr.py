@@ -313,25 +313,25 @@ def _pr(
     if len(matches) > 1:
         raise PrError("pr_ambiguous", [item["url"] for item in matches])
     title = message.splitlines()[0] if message else f"SolidWorks-to-URDF bundle ({commit[:12]})"
-    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as handle:
-        handle.write(_body(subject, commit, report))
+    body = _body(subject, commit, report)
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".json" if matches else ".md", delete=False, encoding="utf-8"
+    ) as handle:
+        handle.write(_serialize({"title": title, "body": body}) if matches else body)
         body_path = handle.name
     url = ""
     try:
         if matches:
+            url = matches[0]["url"]
             _gh(
                 repository,
-                "pr",
-                "edit",
-                str(matches[0]["number"]),
-                "--repo",
-                slug,
-                "--title",
-                title,
-                "--body-file",
+                "api",
+                "--method",
+                "PATCH",
+                f"repos/{slug}/pulls/{matches[0]['number']}",
+                "--input",
                 body_path,
             )
-            url = matches[0]["url"]
             _verify_pr(repository, slug, url, base, branch, commit)
             return "updated", url
         url = _gh(

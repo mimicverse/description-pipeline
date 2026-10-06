@@ -99,6 +99,7 @@ class PublishTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fx = Fixture()
         self.gh_calls: list[tuple[str, ...]] = []
+        self.rest_payloads: list[dict] = []
         self.gh_mode = "ok"
         self.pr_exists = False
 
@@ -123,7 +124,13 @@ class PublishTests(unittest.TestCase):
                 self.pr_exists = True
                 return "https://github.com/example/m3.0/pull/1\n"
             if args[:2] == ("pr", "edit"):
-                return ""
+                raise subprocess.CalledProcessError(1, ["gh", *args], stderr="retired Projects classic GraphQL")
+            if args[0] == "api":
+                self.assertEqual(args[:4], ("api", "--method", "PATCH", "repos/example/m3.0/pulls/1"))
+                self.rest_payloads.append(json.loads(Path(args[args.index("--input") + 1]).read_text(encoding="utf-8")))
+                if self.gh_mode == "fail_update":
+                    raise subprocess.CalledProcessError(1, ["gh", *args], stderr="REST update unavailable")
+                return "{}"
             if args[:2] == ("pr", "view"):
                 if self.gh_mode == "fail_view":
                     raise subprocess.CalledProcessError(1, ["gh", *args], stderr="temporary view failure")
@@ -192,7 +199,26 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(third["commit"], second["commit"])
         self.assertEqual(self.fx.remote_head(), second["commit"])
         self.assertEqual(len([c for c in self.gh_calls if c[:2] == ("pr", "create")]), 1)
-        self.assertGreaterEqual(len([c for c in self.gh_calls if c[:2] == ("pr", "edit")]), 2)
+        self.assertGreaterEqual(len(self.rest_payloads), 2)
+
+    def test_existing_pr_update_survives_legacy_cli_and_preserves_utf8_metadata(self):
+        self.submit()
+        message = 'Update left wrist — 左腕 "$literal" `text`\nDetailed review'
+        result = self.submit(message=message)
+        self.assertEqual(result["state"], "noop")
+        self.assertEqual(set(self.rest_payloads[-1]), {"title", "body"})
+        self.assertEqual(self.rest_payloads[-1]["title"], message.splitlines()[0])
+        self.assertIn(f"verified commit: `{result['commit']}`", self.rest_payloads[-1]["body"])
+        self.assertIn(f"subject: `{result['subject']}`", self.rest_payloads[-1]["body"])
+        self.assertFalse(any(call[:2] == ("pr", "edit") for call in self.gh_calls))
+
+    def test_failed_existing_pr_update_preserves_url_and_pushed_commit(self):
+        first = self.submit()
+        self.gh_mode = "fail_update"
+        result = self.submit()
+        self.assertEqual(result["state"], "gh_failed_after_push")
+        self.assertEqual(result["url"], first["url"])
+        self.assertEqual(result["commit"], self.fx.remote_head())
 
     def test_base_advance_merges_preserving_ancestry(self) -> None:
         first = self.submit()
