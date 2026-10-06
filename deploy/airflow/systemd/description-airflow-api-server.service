@@ -1,0 +1,13 @@
+[Unit]
+Description=Airflow API server (SolidWorks-to-URDF)
+After=network.target
+
+[Service]
+Type=simple
+Environment=AIRFLOW_HOME=@AIRFLOW_HOME@
+ExecStart=@VENV@/bin/airflow api-server --port 8791
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

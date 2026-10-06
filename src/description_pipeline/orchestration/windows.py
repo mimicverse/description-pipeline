@@ -302,6 +302,7 @@ class Jobs:
                         and quality.get("subject_sha256") == subject
                         and submission.get("passed") is True
                         and submission.get("subject_sha256") == subject
+                        and submission.get("repository_slug") == job["repository_slug"]
                         and submission.get("base") == target["base"]
                         and submission.get("branch")
                         == "work/solidworks/" + _slug_hardware(read_revision(package)["hardware_id"])

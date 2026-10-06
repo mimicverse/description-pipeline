@@ -1,7 +1,8 @@
 # Apache Airflow deployment
 
-Linux runs Apache Airflow. A Windows endpoint with licensed SolidWorks runs the
-complete local `description run` workflow and serializes CAD execution.
+Apache Airflow is the single operator interface, through its Web UI or DAG API.
+Linux runs its scheduler. A Windows endpoint with licensed SolidWorks runs the
+complete local workflow and serializes CAD execution.
 
 ```mermaid
 sequenceDiagram
@@ -58,6 +59,22 @@ startup is configured. Do not run native CAD jobs as a Session 0 Windows service
 The endpoint owns only its pipeline jobs and CAD sessions. It does not dismiss
 dialogs in other applications or manipulate their processes.
 
+For automatic startup, register an interactive task under that same execution
+account after verifying the foreground command:
+
+```powershell
+$account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+$action = New-ScheduledTaskAction -Execute C:\description\.venv\Scripts\description.exe -Argument 'serve --config C:\description\endpoint.json'
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $account
+$principal = New-ScheduledTaskPrincipal -UserId $account -LogonType Interactive -RunLevel Limited
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName description-solidworks-endpoint -Action $action -Trigger $trigger -Principal $principal -Settings $settings
+Start-ScheduledTask -TaskName description-solidworks-endpoint
+```
+
+Ensure Git/GitHub authentication and executable paths are available to this
+account. Keep the desktop logged in and the computer awake while processing.
+
 Loopback HTTP must travel through an authenticated SSH tunnel from Linux. For a
 remote bind, configure `tls_cert` and `tls_key`; plaintext remote binding is
 rejected. Keep the bearer token in the Airflow connection, never a DAG, command
@@ -65,25 +82,32 @@ argument, model bundle or committed configuration.
 
 ## Linux scheduler
 
-Use the deployment files under `deploy/airflow/` to install a dedicated Airflow
-environment, its exact tested constraints, connection and DAG. Airflow
-dependencies do not belong in the local pipeline runtime. The connection points
-to the tunneled endpoint and supplies the bearer token.
+Follow the [deployment installation guide](../deploy/airflow/README.md) to set
+up the dedicated Python 3.12 environment, PostgreSQL, authentication,
+connection and services. It includes the exact tested dependency lock and
+token-file connection helper. Airflow dependencies stay in its own environment.
+The connection points to the tunneled endpoint and supplies the bearer token.
 
-Trigger a handoff with:
+After login, open `solidworks_to_urdf`, enable it, and select **Trigger DAG**.
+Submit a handoff with these fields; API submissions use the same DAG:
 
 ```json
 {
   "package": "arm/r2",
   "revision_sha256": "<SHA-256 of the exact cad-revision.json file>",
-  "target": "arm"
+  "target": "arm",
+  "repository_slug": "<owner>/<model-repository>",
+  "base": "feature/arm",
+  "conn_id": "solidworks_windows"
 }
 ```
 
 The DAG validates this request, starts the job, waits for its terminal result,
 and requires a passing quality report plus a successful submission receipt and
-PR URL. Job events expose the five local stages. Reusing a DAG-run identity
-preserves the endpoint UUID across task retries.
+PR URL. The `wait_for_job` task logs native stages and failure diagnostics;
+`confirm_job` returns the events, verified subject, commit and PR URL. Reusing
+a DAG-run identity preserves the endpoint UUID across task retries. A corrected
+handoff starts a new DAG run.
 
 ## Deployment acceptance
 

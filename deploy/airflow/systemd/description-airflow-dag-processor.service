@@ -1,0 +1,13 @@
+[Unit]
+Description=Airflow DAG processor (SolidWorks-to-URDF)
+After=network.target
+
+[Service]
+Type=simple
+Environment=AIRFLOW_HOME=@AIRFLOW_HOME@
+ExecStart=@VENV@/bin/airflow dag-processor
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

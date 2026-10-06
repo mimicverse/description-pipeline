@@ -82,6 +82,7 @@ class EndpointTests(unittest.TestCase):
                 "passed": True,
                 "subject_sha256": subject,
                 "url": "https://github.com/a/b/pull/1",
+                "repository_slug": "a/b",
                 "base": "feature/arm",
                 "branch": "work/solidworks/arm",
                 "state": "published",
@@ -123,6 +124,7 @@ class EndpointTests(unittest.TestCase):
     def test_wrong_repository_base_subject_or_quality_cannot_pass(self):
         responses = []
         for section, key, value in (
+            ("submission", "repository_slug", "a/other"),
             ("submission", "url", "https://github.com/a/other/pull/1"),
             ("submission", "base", "feature/other"),
             ("submission", "branch", "work/solidworks/other"),

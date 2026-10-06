@@ -12,7 +12,7 @@ On Windows, substitute `requirements/windows-py312.lock`. Run:
 
 ```sh
 PYTHONPATH=src python -B -m unittest discover -s tests -t .
-python -m ruff check src tests tools
+python -m ruff check src tests tools deploy/airflow
 ```
 
 Keep author inputs, raw native evidence, generation and independent verification

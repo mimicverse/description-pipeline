@@ -31,9 +31,10 @@ and create a clean dedicated model clone.
 description doctor
 gh auth status
 gh auth setup-git
-git clone https://github.com/mimicverse/description.git C:\description\models
+git clone https://github.com/<owner>/<model-repository>.git C:\description\models
 ```
 
+Replace `<owner>/<model-repository>` with the repository assigned to your models.
 `doctor` distinguishes runtime availability from native capture availability.
 It does not open CAD or certify a particular package. Use the model branch
 assigned to that hardware. If it does not exist, a model owner creates it once
@@ -52,6 +53,18 @@ Existing hardware branches require no initialization.
 
 ## 3. Execute and submit
 
+Use the Airflow UI to trigger `solidworks_to_urdf`, or submit to the same DAG
+through its API. Supply the package path relative to the Windows handoff root,
+the exact `cad-revision.json` digest, and the configured repository target and
+review expectations described in [deployment.md](deployment.md).
+
+The DAG validates the request, queues one Windows job, waits for verification
+and confirms its PR receipt. View the task logs and final result for the run
+UUID, quality decision, commit and PR URL. Airflow is the standard operator
+entry; no Linux-to-Windows command sequence is required for each handoff.
+
+For worker commissioning and diagnosis, execute the same workflow locally:
+
 ```powershell
 description run C:\handoffs\arm\r2 --output C:\deliveries\arm --repository C:\description\models --base feature/arm --message "Update arm wrist travel from mechanical r2"
 ```
@@ -65,10 +78,8 @@ Omit `--repository` to build and verify locally. The output must be separate fro
 the handoff and repository. The pipeline replaces only an output it owns and
 whose inventory is intact. Operator annotations cause replacement to be refused.
 
-Airflow is an alternative trigger for this same Windows execution. Supply a
-configured package path, repository target alias and the exact
-`cad-revision.json` digest. Follow [deployment.md](deployment.md) to install the
-endpoint, connection and DAG.
+Follow [deployment.md](deployment.md) once to install the endpoint, connection
+and scheduler. Subsequent handoffs use the same Airflow interface.
 
 ## 4. Diagnose a failed run
 

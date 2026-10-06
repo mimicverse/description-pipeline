@@ -65,16 +65,17 @@ deploy/airflow/          Linux scheduler deployment
 docs/                    normative specifications and operations
 ```
 
-The Windows endpoint runs the same local workflow. It serializes CAD jobs;
-Airflow manages requests, retry identity and result visibility. Linux does not
-participate in a local Windows run.
+Airflow provides the single operator interface through its UI and DAG API.
+The Windows endpoint serializes CAD jobs and executes the local workflow;
+Airflow manages requests, retry identity and result visibility. The CLI remains
+available for worker commissioning, diagnosis and frozen-delivery replay.
 
 ## 4. How to operate
 
 1. Prepare and review the mechanical assembly, datums and physical authority.
 2. Define rigid bodies, joints, signed axes, limits and acceptance bounds.
 3. Seal the CAD revision and inspect the complete input package.
-4. Execute locally on Windows or trigger the Airflow DAG.
+4. Submit the handoff through the Airflow DAG and track its result.
 5. Resolve failed findings at their source and rerun with corrected inputs.
 6. Review the passing delivery PR, including its source revision and reports.
 7. Freeze the approved model release and recheck copied deliveries before use.

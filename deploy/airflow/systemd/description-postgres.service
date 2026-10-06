@@ -1,0 +1,16 @@
+[Unit]
+Description=Portable PostgreSQL 18 for Airflow (SolidWorks-to-URDF)
+After=network.target
+
+[Service]
+Type=simple
+Environment=POSTGRES_ROOT=@POSTGRES_ROOT@
+Environment=LD_LIBRARY_PATH=@POSTGRES_ROOT@/root/usr/lib/x86_64-linux-gnu
+ExecStartPre=/bin/mkdir -p @POSTGRES_ROOT@/socket
+ExecStartPre=/bin/chmod 700 @POSTGRES_ROOT@/socket
+ExecStart=@POSTGRES_ROOT@/root/usr/lib/postgresql/18/bin/postgres -D @POSTGRES_ROOT@/data -k @POSTGRES_ROOT@/socket -p 5433 -c listen_addresses=
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
