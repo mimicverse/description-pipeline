@@ -695,8 +695,9 @@ class SolidWorksBackend(CadBackend):
 
         The leaf reader above answers "what does this part weigh"; this answers "what does the
         assembly document say the whole thing weighs", with the same settings and the same refusal
-        of mass/COM/inertia overrides.  The capture records both readings; a difference between them
-        is reported by the verification side as an advisory, never as a capture failure.
+        of mass/COM/inertia overrides.  The capture records both readings; the v1 physics closure
+        is a required blocking gate, so a missing or invalid whole-assembly reading fails the
+        product gate instead of degrading to an advisory.
 
         ``CreateMassProperty2`` is tried first.  A session or build where it is unavailable — late
         binding saw it return nothing during the M3.0 review, even though the 2026-09-29 native run
@@ -743,6 +744,7 @@ class SolidWorksBackend(CadBackend):
             "inertia": inertia,
             "reference": {
                 "used_api": "IMassProperty2.GetMomentOfInertia(0)",
+                "scope": "assembly_document",
                 "reference_point": "center_of_mass",
                 "axes": "assembly_document_axes",
                 "use_system_units": True,
@@ -1035,11 +1037,10 @@ class SolidWorksBackend(CadBackend):
     def assembly_group_mass_properties(self, path, names):
         """Mass properties for a selected group of component instances.
 
-        Measured on headM3.0 (2026-10-06): a group selection answers in the
-        *same* positive-product notation as part documents - 3/6/9-member
-        groups match the positive-notation parallel-axis combination of the
-        single-instance readings to <=7e-15 relative, while the mixed-
-        convention hypothesis is off by 0.07..0.33.  The reading is
+        Measured on the analytic fixture (2026-10-06, SolidWorks 34.0.0): a
+        group selection answers in the SAME standard notation the analytic
+        parallel-axis combination predicts (residual 6.5e-19 absolute), so the
+        reading declares ``solidworks_standard``.  The reading is
         scope-qualified (``assembly_component_group``) so no historical part
         measurement is ever relabelled, and any effective instance override is
         refused instead of silently becoming the value.
