@@ -13,13 +13,30 @@ import tempfile
 from pathlib import Path
 
 from packaging.utils import parse_wheel_filename
+from packaging.requirements import Requirement
 
 from description_pipeline import __version__
 from description_pipeline.build.archive import normalize_sdist, normalize_zip, write_zip
 from description_pipeline.delivery import PIPELINE_ID
 from description_pipeline.io import PipelineError, digest, file_digest, inventory, write_json
 
-BUILDERS = {"setuptools": "84.0.0", "wheel": "0.46.3", "build": "1.6.1"}
+BUILD_PACKAGES = {"setuptools", "wheel", "build"}
+
+
+def locked_builders(root):
+    versions = {}
+    for line in (root / "requirements/build-py312.lock").read_text(encoding="utf-8").splitlines():
+        if not line or line.startswith("#"):
+            continue
+        requirement = Requirement(line)
+        if requirement.name in BUILD_PACKAGES:
+            (spec,) = requirement.specifier
+            if spec.operator != "==":
+                raise PipelineError("Release builders must use exact versions")
+            versions[requirement.name] = spec.version
+    if set(versions) != BUILD_PACKAGES:
+        raise PipelineError("Builder lock is incomplete")
+    return versions
 
 
 def git(root, *arguments):
@@ -72,7 +89,8 @@ def build(root, output, *, offline=False):
         raise PipelineError("Release builds require a clean committed checkout")
     if output.exists() and any(output.iterdir()):
         raise PipelineError("Use an empty release output directory")
-    for name, expected in BUILDERS.items():
+    builders = locked_builders(root)
+    for name, expected in builders.items():
         if importlib.metadata.version(name) != expected:
             raise PipelineError(f"Install requirements/build-py312.lock: {name} must be {expected}")
     output.mkdir(parents=True, exist_ok=True)
@@ -94,7 +112,7 @@ def build(root, output, *, offline=False):
             "source_commit": commit,
             "source_sha256": digest(files),
             "package_files": files,
-            "builder": {"python": sys.version.split()[0], **BUILDERS},
+            "builder": {"python": sys.version.split()[0], **builders},
         }
         write_json(package / "tool-release.json", identity)
         subprocess.run(
@@ -115,13 +133,15 @@ def build(root, output, *, offline=False):
         if offline:
             for platform in ("linux", "windows"):
                 offline_bundle(source, output, wheel, platform)
-        write_json(output / "release.json", identity)
-        write_json(output / "SHA256SUMS.json", inventory(output))
+        write_json(output / "release.json", {**identity, "artifacts": inventory(output)})
+        artifacts = inventory(output)
+        write_json(output / "SHA256SUMS.json", artifacts)
     return {
         "passed": True,
         "source_commit": commit,
         "source_sha256": identity["source_sha256"],
-        "artifacts": inventory(output),
+        "artifacts": artifacts,
+        "checksum_manifest_sha256": file_digest(output / "SHA256SUMS.json"),
     }
 
 
