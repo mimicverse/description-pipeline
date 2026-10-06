@@ -667,7 +667,12 @@ class SolidWorksBackend(CadBackend):
                 "reference_point": "center_of_mass",
                 "axes": "part_document_axes",
                 "use_system_units": True,
-                "product_convention": "solidworks_positive",
+                # Measured on the analytic fixture 2026-10-06 (SolidWorks
+                # 34.0.0): GetMomentOfInertia(0) equals the analytic standard
+                # tensor to 4e-20 for a rotated box, so the part document is
+                # read as-is.  Historical readings that declare
+                # solidworks_positive keep their own interpretation.
+                "product_convention": "solidworks_standard",
                 "volume_m3": float(_member(mp, "Volume")),
                 "density_kg_m3": float(_member(mp, "Density")),
                 "overrides": overrides,
@@ -734,7 +739,7 @@ class SolidWorksBackend(CadBackend):
                 "reference_point": "center_of_mass",
                 "axes": "assembly_document_axes",
                 "use_system_units": True,
-                "product_convention": "solidworks_positive",
+                "product_convention": "solidworks_standard",
                 "volume_m3": float(_member(mp, "Volume")),
                 "density_kg_m3": float(_member(mp, "Density")),
                 "overrides": overrides,
@@ -958,7 +963,7 @@ class SolidWorksBackend(CadBackend):
             "reference": {
                 "used_api": "IMassProperty2.GetMomentOfInertia(0)",
                 "scope": "assembly_component_group",
-                "product_convention": "solidworks_positive",
+                "product_convention": "solidworks_standard",
                 "reference_point": "center_of_mass",
                 "axes": "assembly_document_axes",
                 "use_system_units": True,

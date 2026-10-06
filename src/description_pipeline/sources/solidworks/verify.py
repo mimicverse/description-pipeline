@@ -21,12 +21,13 @@ from .jsonio import read_json
 from ...io import PipelineError, confined, file_digest
 
 INERTIA_ORDER = ("ixx", "ixy", "ixz", "iyy", "iyz", "izz")
-# Same API, selection scopes measured on the M3.0 pack: part documents, single
-# instances and component groups all answer in positive-product notation (see
-# scene.SCOPE_CONVENTIONS; kept independent on purpose - this is the oracle).
+# Same API, selection scopes measured on the analytic native fixture
+# (2026-10-06, SolidWorks 34.0.0): part documents and component groups both
+# answer in standard notation (see scene.SCOPE_CONVENTIONS; kept independent on
+# purpose - this is the oracle).
 _SCOPE_CONVENTIONS = {
-    "part_document": "solidworks_positive",
-    "assembly_component_group": "solidworks_positive",
+    "part_document": "solidworks_standard",
+    "assembly_component_group": "solidworks_standard",
 }
 MASS_ATOL = 1e-12
 MASS_RTOL = 1e-9
