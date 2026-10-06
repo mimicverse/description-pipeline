@@ -60,7 +60,9 @@ class GeneratorScopeTests(unittest.TestCase):
         self.assertEqual(tensor, tuple(tuple(row) for row in STANDARD))
 
     def test_explicit_positive_convention_is_still_honoured(self):
-        tensor = tensor_from_raw(POSITIVE_PRODUCT, {"product_convention": "solidworks_positive"}, where="analytic fixture")
+        tensor = tensor_from_raw(
+            POSITIVE_PRODUCT, {"product_convention": "solidworks_positive"}, where="analytic fixture"
+        )
         self.assertEqual(tensor, tuple(tuple(row) for row in STANDARD))
 
     def test_scope_and_convention_must_agree(self):
@@ -68,9 +70,8 @@ class GeneratorScopeTests(unittest.TestCase):
             (STANDARD, {"scope": "part_document", "product_convention": "solidworks_positive"}),
             (STANDARD, {"scope": "assembly_component_group", "product_convention": "solidworks_positive"}),
         ):
-            with self.subTest(reference=reference):
-                with self.assertRaises(ConfigError):
-                    tensor_from_raw(raw, reference, where="analytic fixture")
+            with self.subTest(reference=reference), self.assertRaises(ConfigError):
+                tensor_from_raw(raw, reference, where="analytic fixture")
 
     def test_unknown_scope_is_rejected(self):
         with self.assertRaises(ConfigError):
@@ -104,12 +105,8 @@ class VerifyOracleScopeTests(unittest.TestCase):
         return {"mass": 1.0, "com": [0.0, 0.0, 0.0], "inertia": raw, "reference": reference}
 
     def test_oracle_matches_the_generator_for_both_scopes(self):
-        part = verify_module._raw_tensor(
-            "box", self._payload(STANDARD, {"scope": "part_document"})
-        )
-        group = verify_module._raw_tensor(
-            "group", self._payload(STANDARD, {"scope": "assembly_component_group"})
-        )
+        part = verify_module._raw_tensor("box", self._payload(STANDARD, {"scope": "part_document"}))
+        group = verify_module._raw_tensor("group", self._payload(STANDARD, {"scope": "assembly_component_group"}))
         self.assertTrue(np.allclose(part, np.array(STANDARD)))
         self.assertTrue(np.allclose(group, np.array(STANDARD)))
         positive = verify_module._raw_tensor(

@@ -127,9 +127,7 @@ def _unit_axis(value: Any, report: _Report, code: str, where: str) -> tuple[floa
     return axis
 
 
-def _range2(
-    value: Any, report: _Report, code: str, where: str, *, positive: bool = True
-) -> tuple[float, float] | None:
+def _range2(value: Any, report: _Report, code: str, where: str, *, positive: bool = True) -> tuple[float, float] | None:
     if not isinstance(value, (list, tuple)) or len(value) != 2:
         report.error(code, f"{where} must be a two-element [min, max] range", {"value": value})
         return None
@@ -335,8 +333,13 @@ def _validate_documented_masses(
         item = _as_mapping(payload, report, "input.documented_mass_invalid", f"source.documented_masses.{component}")
         if item is None:
             return {}, None
-        _unknown_keys(item, {"mass_kg", "reason", "evidence"}, report, "input.documented_mass_invalid",
-                      f"source.documented_masses.{component}")
+        _unknown_keys(
+            item,
+            {"mass_kg", "reason", "evidence"},
+            report,
+            "input.documented_mass_invalid",
+            f"source.documented_masses.{component}",
+        )
         mass = item.get("mass_kg")
         if not _is_number(mass) or float(mass) <= 0.0:
             report.error(
@@ -448,36 +451,40 @@ def _validate_source(
                 {"key": forbidden},
             )
     if source.get("provider") != "solidworks":
-        report.error("input.provider_invalid", "source.provider must be exactly 'solidworks'", {
-            "value": source.get("provider")
-        })
+        report.error(
+            "input.provider_invalid", "source.provider must be exactly 'solidworks'", {"value": source.get("provider")}
+        )
     robot_name = source.get("robot_name")
     if not _is_snake(robot_name):
-        report.error("input.robot_name_invalid", "source.robot_name must be an explicit snake_case name", {
-            "value": robot_name
-        })
+        report.error(
+            "input.robot_name_invalid", "source.robot_name must be an explicit snake_case name", {"value": robot_name}
+        )
     assembly = source.get("assembly")
     assembly_path = None
     if not _is_text(assembly):
-        report.error("input.assembly_invalid", "source.assembly must be a non-empty package-relative path", {
-            "value": assembly
-        })
+        report.error(
+            "input.assembly_invalid", "source.assembly must be a non-empty package-relative path", {"value": assembly}
+        )
     else:
         if Path(str(assembly)).suffix.lower() not in FORMAT_SUFFIXES:
-            report.error("input.assembly_invalid", "source.assembly must name a .SLDASM or .SLDPRT document", {
-                "value": assembly
-            })
+            report.error(
+                "input.assembly_invalid", "source.assembly must name a .SLDASM or .SLDPRT document", {"value": assembly}
+            )
         try:
             assembly_path = confined(root, str(assembly))
         except PipelineError as error:
-            report.error("input.assembly_invalid", f"source.assembly is not confined to the package: {error}", {
-                "value": assembly
-            })
+            report.error(
+                "input.assembly_invalid",
+                f"source.assembly is not confined to the package: {error}",
+                {"value": assembly},
+            )
     configuration = source.get("configuration")
     if not _is_text(configuration):
-        report.error("input.configuration_invalid", "source.configuration must be an explicit non-empty string", {
-            "value": configuration
-        })
+        report.error(
+            "input.configuration_invalid",
+            "source.configuration must be an explicit non-empty string",
+            {"value": configuration},
+        )
     bodies = source.get("bodies")
     if not isinstance(bodies, list) or not bodies:
         report.error("input.bodies_invalid", "source.bodies must be a non-empty list", {"value": bodies})
@@ -578,7 +585,9 @@ def _validate_source(
                 {"body": name},
             )
         else:
-            _unknown_keys(frame, {"coordinate_system", "xyz", "rpy"}, report, "input.body_frame_invalid", f"{where}.frame")
+            _unknown_keys(
+                frame, {"coordinate_system", "xyz", "rpy"}, report, "input.body_frame_invalid", f"{where}.frame"
+            )
             reference = frame.get("coordinate_system")
             authored = sorted({"xyz", "rpy"} & set(frame))
             if authored:
@@ -700,7 +709,7 @@ def _validate_source(
                         f"{where}.axis_reference.body_type must be 'solid' or 'sheet'",
                         {"joint": name, "body_type": body_type},
                     )
-        axis = _unit_axis(joint.get("axis"), report, "input.joint_axis_invalid", f"{where}.axis")
+        _unit_axis(joint.get("axis"), report, "input.joint_axis_invalid", f"{where}.axis")
         _structured_evidence(
             joint.get("limit_evidence"),
             root=root,
@@ -783,8 +792,9 @@ def _validate_source(
         frame = _as_mapping(raw_frame, report, "input.frame_invalid", where)
         if frame is None:
             continue
-        _unknown_keys(frame, {"id", "name", "parent", "xyz", "rpy", "coordinate_system"}, report,
-                      "input.frame_invalid", where)
+        _unknown_keys(
+            frame, {"id", "name", "parent", "xyz", "rpy", "coordinate_system"}, report, "input.frame_invalid", where
+        )
         name = frame.get("name")
         if not _is_snake(name):
             report.error("input.frame_invalid", f"{where}.name must be snake_case", {"name": name})
@@ -873,16 +883,12 @@ def _validate_checks(
         "input.checks_invalid",
         "checks",
     )
-    mass_range = _range2(mapping.get("expected_mass_kg"), report, "input.checks_invalid",
-                         "checks.expected_mass_kg")
-    extent_range = _range2(mapping.get("expected_extent_m"), report, "input.checks_invalid",
-                           "checks.expected_extent_m")
+    mass_range = _range2(mapping.get("expected_mass_kg"), report, "input.checks_invalid", "checks.expected_mass_kg")
+    extent_range = _range2(mapping.get("expected_extent_m"), report, "input.checks_invalid", "checks.expected_extent_m")
     exclusions: dict[str, dict[str, Any]] = {}
     raw_exclusions = mapping.get("documented_exclusions") or []
     if not isinstance(raw_exclusions, list):
-        report.error("input.checks_invalid", "checks.documented_exclusions must be a list", {
-            "value": raw_exclusions
-        })
+        report.error("input.checks_invalid", "checks.documented_exclusions must be a list", {"value": raw_exclusions})
         raw_exclusions = []
     for index, raw in enumerate(raw_exclusions):
         where = f"checks.documented_exclusions[{index}]"
@@ -955,9 +961,9 @@ def inspect_package(path: Path) -> dict[str, Any]:
     entries, hashes = _inventory_entries(root, report)
     config_path = root / ROBOT_FILE
     if ROBOT_FILE not in hashes:
-        report.error("input.robot_missing", f"the package must contain exactly one root {ROBOT_FILE}", {
-            "path": str(config_path)
-        })
+        report.error(
+            "input.robot_missing", f"the package must contain exactly one root {ROBOT_FILE}", {"path": str(config_path)}
+        )
         data = None
     else:
         other_configs = sorted(
@@ -1022,7 +1028,9 @@ def inspect_package(path: Path) -> dict[str, Any]:
         "resolved_package_root": str(root),
         "robot_yaml": ROBOT_FILE,
         "robot_yaml_sha256": hashes.get(ROBOT_FILE),
-        "assembly": data.get("source", {}).get("assembly") if isinstance(data, dict) and isinstance(data.get("source"), dict) else None,
+        "assembly": data.get("source", {}).get("assembly")
+        if isinstance(data, dict) and isinstance(data.get("source"), dict)
+        else None,
         "assembly_sha256": assembly_sha,
         "file_count": len(entries),
         "inventory": entries,
@@ -1040,10 +1048,20 @@ def inspect_package(path: Path) -> dict[str, Any]:
             "source": source_mapping,
             "checks": checks,
             "documented_exclusions": exclusions,
-            **{key: resolved.get(key) for key in (
-                "assembly_resolved", "assembly_sha256", "configuration", "coordinate_systems",
-                "owned_components", "body_names", "joint_names", "frame_names", "root_link",
-            )},
+            **{
+                key: resolved.get(key)
+                for key in (
+                    "assembly_resolved",
+                    "assembly_sha256",
+                    "configuration",
+                    "coordinate_systems",
+                    "owned_components",
+                    "body_names",
+                    "joint_names",
+                    "frame_names",
+                    "root_link",
+                )
+            },
         },
         "input_receipt": receipt,
     }

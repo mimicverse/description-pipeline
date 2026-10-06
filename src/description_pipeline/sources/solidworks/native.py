@@ -943,9 +943,7 @@ class SolidWorksBackend(CadBackend):
             "axis_point_m": [float(value) for value in point],
             "axis_direction": [float(value) / norm for value in direction],
             "radius_m": float(radius),
-            "used_api": (
-                "IComponent2.GetBodies2/IBody2.GetFaces/IFace2.GetSurface/ISurface.CylinderParams"
-            ),
+            "used_api": ("IComponent2.GetBodies2/IBody2.GetFaces/IFace2.GetSurface/ISurface.CylinderParams"),
         }
 
     def _component_override_flags(self, doc, component):
@@ -1197,8 +1195,8 @@ class SolidWorksBackend(CadBackend):
         holder = self._components[component]
         doc = _member(holder, "GetModelDoc2")
         document_values = list(map(float, _member(doc, "GetTessTriangles", True) or ()))
-        document_valid = bool(document_values) and len(document_values) % 9 == 0 and all(
-            map(math.isfinite, document_values)
+        document_valid = (
+            bool(document_values) and len(document_values) % 9 == 0 and all(map(math.isfinite, document_values))
         )
         solid_bodies = self._body_list(holder, 0, component)
         sheet_bodies = self._body_list(holder, 1, component)
@@ -1250,12 +1248,8 @@ class SolidWorksBackend(CadBackend):
         api = " + ".join(
             {
                 "part_document": "IPartDoc.GetTessTriangles(True)",
-                "solid_body_faces": (
-                    "IComponent2.GetBodies2(0)/IBody2.GetFaces/IFace2.GetTessTriangles(True)"
-                ),
-                "sheet_body_faces": (
-                    "IComponent2.GetBodies2(1)/IBody2.GetFaces/IFace2.GetTessTriangles(True)"
-                ),
+                "solid_body_faces": ("IComponent2.GetBodies2(0)/IBody2.GetFaces/IFace2.GetTessTriangles(True)"),
+                "sheet_body_faces": ("IComponent2.GetBodies2(1)/IBody2.GetFaces/IFace2.GetTessTriangles(True)"),
             }[source]
             for source in sources
         )

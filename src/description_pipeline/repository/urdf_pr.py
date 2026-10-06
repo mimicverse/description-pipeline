@@ -25,13 +25,19 @@ import tempfile
 from pathlib import Path
 
 from ..delivery import subject_digest
-from ..io import PipelineError, read_data
+from ..io import PipelineError, confined, read_data
 from ..sources.solidworks import revision as cad_revision
 
 GOVERNED_PATHS = ("README.md", "input", "evidence", "model", "urdf", "meshes", "reports")
 REPORTS_FILES = ("input.json", "tool.json", "quality.json")
-REQUIRED_FILES = ("README.md", "input/robot.yaml", "model/robot.json", "urdf/robot.urdf",
-                  "reports/input.json", "reports/tool.json")
+REQUIRED_FILES = (
+    "README.md",
+    "input/robot.yaml",
+    "model/robot.json",
+    "urdf/robot.urdf",
+    "reports/input.json",
+    "reports/tool.json",
+)
 REQUIRED_DIRS = ("evidence", "meshes")
 REVIEW_BRANCH = "work/solidworks/{hardware}"
 PUBLISHER_MARKER = "Urdf-Publisher: description-pipeline"
@@ -45,8 +51,9 @@ class PrError(RuntimeError):
 
 
 def _git(repository: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(repository), *args], check=check,
-                          capture_output=True, text=True, encoding="utf-8")
+    return subprocess.run(
+        ["git", "-C", str(repository), *args], check=check, capture_output=True, text=True, encoding="utf-8"
+    )
 
 
 def _slug_hardware(value: str) -> str:
@@ -85,8 +92,7 @@ def _load_verifier():
 
 
 def _gh(repository: Path, *args: str) -> str:
-    result = subprocess.run(["gh", *args], cwd=repository, check=True,
-                            capture_output=True, text=True, encoding="utf-8")
+    result = subprocess.run(["gh", *args], cwd=repository, check=True, capture_output=True, text=True, encoding="utf-8")
     return result.stdout
 
 
@@ -141,8 +147,7 @@ def _verify(bundle: Path) -> tuple[str, dict]:
     if not isinstance(report, dict) or report.get("passed") is not True:
         raise PrError("verification_failed", report if isinstance(report, dict) else None)
     if report.get("subject_sha256") != subject:
-        raise PrError("verification_subject_mismatch",
-                      {"expected": subject, "reported": report.get("subject_sha256")})
+        raise PrError("verification_subject_mismatch", {"expected": subject, "reported": report.get("subject_sha256")})
     on_disk = bundle / "reports/quality.json"
     if not on_disk.is_file():
         raise PrError("missing_quality_report", "reports/quality.json is required")
@@ -165,6 +170,32 @@ def _reverify(root: Path, subject: str) -> None:
         raise PrError("reverification_missing_quality", None) from error
     if saved != report:
         raise PrError("reverification_binding_mismatch", None)
+
+
+def _verify_committed(repository: Path, commit: str, subject: str) -> None:
+    """Verify Git blob bytes, including changes made by clean filters."""
+    tree = subprocess.run(
+        ["git", "-C", str(repository), "ls-tree", "-rz", commit, "--", *GOVERNED_PATHS], check=True, capture_output=True
+    ).stdout
+    with tempfile.TemporaryDirectory(prefix="urdf-committed-") as directory:
+        root = Path(directory)
+        for entry in tree.split(b"\0"):
+            if not entry:
+                continue
+            metadata, encoded_path = entry.split(b"\t", 1)
+            mode, kind, oid = metadata.split()
+            if mode not in {b"100644", b"100755"} or kind != b"blob":
+                raise PrError("committed_nonregular_file", encoded_path.decode("utf-8"))
+            path = confined(root, encoded_path.decode("utf-8"), exists=False)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("wb") as stream:
+                subprocess.run(
+                    ["git", "-C", str(repository), "cat-file", "blob", oid.decode("ascii")],
+                    check=True,
+                    stdout=stream,
+                    stderr=subprocess.PIPE,
+                )
+        _reverify(root, subject)
 
 
 def _lock(repository: Path):
@@ -251,36 +282,79 @@ def _stage_commit(bundle: Path, worktree: Path, subject: str, message: str) -> t
 
 def _body(subject: str, commit: str, report: dict) -> str:
     checks = report.get("checks") or []
-    return (f"Automatic SolidWorks-to-URDF publication.\n\n"
-            f"- subject: `{subject}`\n- verified commit: `{commit}`\n"
-            f"- verifier: recomputed, passed ({len(checks)} checks)\n")
+    return (
+        f"Automatic SolidWorks-to-URDF publication.\n\n"
+        f"- subject: `{subject}`\n- verified commit: `{commit}`\n"
+        f"- verifier: recomputed, passed ({len(checks)} checks)\n"
+    )
 
 
-def _pr(repository: Path, slug: str, base: str, branch: str, subject: str, commit: str,
-        report: dict, message: str | None) -> tuple[str, str]:
-    listing = json.loads(_gh(repository, "pr", "list", "--repo", slug, "--base", base, "--head", branch,
-                             "--state", "open", "--json", "url,number,baseRefName,headRefName") or "[]")
+def _pr(
+    repository: Path, slug: str, base: str, branch: str, subject: str, commit: str, report: dict, message: str | None
+) -> tuple[str, str]:
+    listing = json.loads(
+        _gh(
+            repository,
+            "pr",
+            "list",
+            "--repo",
+            slug,
+            "--base",
+            base,
+            "--head",
+            branch,
+            "--state",
+            "open",
+            "--json",
+            "url,number,baseRefName,headRefName",
+        )
+        or "[]"
+    )
     matches = [item for item in listing if item.get("baseRefName") == base and item.get("headRefName") == branch]
     if len(matches) > 1:
         raise PrError("pr_ambiguous", [item["url"] for item in matches])
-    title = (message.splitlines()[0] if message else f"SolidWorks-to-URDF bundle ({commit[:12]})")
+    title = message.splitlines()[0] if message else f"SolidWorks-to-URDF bundle ({commit[:12]})"
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as handle:
         handle.write(_body(subject, commit, report))
         body_path = handle.name
     try:
         if matches:
-            _gh(repository, "pr", "edit", str(matches[0]["number"]), "--repo", slug,
-                "--title", title, "--body-file", body_path)
+            _gh(
+                repository,
+                "pr",
+                "edit",
+                str(matches[0]["number"]),
+                "--repo",
+                slug,
+                "--title",
+                title,
+                "--body-file",
+                body_path,
+            )
             return "updated", matches[0]["url"]
-        url = _gh(repository, "pr", "create", "--repo", slug, "--base", base, "--head", branch,
-                  "--title", title, "--body-file", body_path).strip()
+        url = _gh(
+            repository,
+            "pr",
+            "create",
+            "--repo",
+            slug,
+            "--base",
+            base,
+            "--head",
+            branch,
+            "--title",
+            title,
+            "--body-file",
+            body_path,
+        ).strip()
         return "published", url
     finally:
         Path(body_path).unlink(missing_ok=True)
 
 
-def submit_bundle(bundle: Path, repository: Path, *, base: str, branch: str,
-                  message: str | None = None, dry_run: bool = False) -> dict:
+def submit_bundle(
+    bundle: Path, repository: Path, *, base: str, branch: str, message: str | None = None, dry_run: bool = False
+) -> dict:
     """Validate, verify and publish one bundle through a fast-forward review branch and PR."""
     bundle = Path(bundle).resolve()
     repository = Path(repository).resolve()
@@ -307,8 +381,14 @@ def submit_bundle(bundle: Path, repository: Path, *, base: str, branch: str,
         if head_sha and PUBLISHER_MARKER not in head_message:
             raise PrError("branch_foreign", {"branch": branch, "head": head_sha})
         if dry_run:
-            return {"state": "dry_run", "branch": branch, "base": base, "subject": subject,
-                    "commit": head_sha, "url": ""}
+            return {
+                "state": "dry_run",
+                "branch": branch,
+                "base": base,
+                "subject": subject,
+                "commit": head_sha,
+                "url": "",
+            }
         staging = Path(tempfile.mkdtemp(prefix="urdf-pr-"))
         worktree = staging / "worktree"
         try:
@@ -319,9 +399,11 @@ def submit_bundle(bundle: Path, repository: Path, *, base: str, branch: str,
                     cad_revision.check_successor(previous, current_revision)
                 except PipelineError as error:
                     raise PrError("cad_revision_conflict", str(error)) from error
-            commit, noop = _stage_commit(bundle, worktree, subject,
-                                         message or f"feat({hardware}): publish SolidWorks-to-URDF bundle")
+            commit, noop = _stage_commit(
+                bundle, worktree, subject, message or f"feat({hardware}): publish SolidWorks-to-URDF bundle"
+            )
             _reverify(worktree, subject)
+            _verify_committed(worktree, commit, subject)
             if not noop or commit != head_sha:
                 _git(worktree, "push", "origin", f"HEAD:refs/heads/{branch}")
             pushed = commit
@@ -333,21 +415,51 @@ def submit_bundle(bundle: Path, repository: Path, *, base: str, branch: str,
             raise PrError("remote_head_mismatch", {"expected": pushed})
         state, url = _pr(repository, slug, base, branch, subject, pushed, report, message)
         content_noop = noop and pushed == head_sha
-        return {"state": "noop" if content_noop else state, "branch": branch, "base": base,
-                "subject": subject, "commit": pushed, "url": url}
+        return {
+            "state": "noop" if content_noop else state,
+            "branch": branch,
+            "base": base,
+            "subject": subject,
+            "commit": pushed,
+            "url": url,
+        }
     except PrError as error:
-        return {"state": "failed", "error": error.code, "detail": error.detail,
-                "commit": pushed, "branch": branch, "subject": subject}
+        return {
+            "state": "failed",
+            "error": error.code,
+            "detail": error.detail,
+            "commit": pushed,
+            "branch": branch,
+            "subject": subject,
+        }
     except subprocess.CalledProcessError as error:
         if pushed:
-            return {"state": "gh_failed_after_push", "error": "github_failed", "commit": pushed,
-                    "branch": branch, "subject": subject, "base": base,
-                    "retry": {"command": "gh pr list --head " + branch, "stderr": (error.stderr or "")[-300:]}}
-        return {"state": "failed", "error": "git_failed", "detail": (error.stderr or "")[-300:],
-                "commit": pushed, "branch": branch, "subject": subject}
+            return {
+                "state": "gh_failed_after_push",
+                "error": "github_failed",
+                "commit": pushed,
+                "branch": branch,
+                "subject": subject,
+                "base": base,
+                "retry": {"command": "gh pr list --head " + branch, "stderr": (error.stderr or "")[-300:]},
+            }
+        return {
+            "state": "failed",
+            "error": "git_failed",
+            "detail": (error.stderr or "")[-300:],
+            "commit": pushed,
+            "branch": branch,
+            "subject": subject,
+        }
     except Exception as error:  # noqa: BLE001 - receipts must never crash the caller
-        return {"state": "failed", "error": type(error).__name__, "detail": str(error)[:300],
-                "commit": pushed, "branch": branch, "subject": subject}
+        return {
+            "state": "failed",
+            "error": type(error).__name__,
+            "detail": str(error)[:300],
+            "commit": pushed,
+            "branch": branch,
+            "subject": subject,
+        }
     finally:
         if lock_info is not None:
             lock, handle = lock_info

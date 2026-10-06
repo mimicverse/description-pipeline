@@ -50,9 +50,16 @@ class Fixture:
         (inputs / "M3.0.SLDASM").write_text(cad, encoding="utf-8")
         if fresh:
             (inputs / "cad-revision.json").unlink(missing_ok=True)
-        cad_revision.seal_revision(inputs, hardware_id="m3.0", revision=revision_id, owner="t",
-                                   system="handoff", reference="local-handoff", summary="t",
-                                   parent_revision=parent)
+        cad_revision.seal_revision(
+            inputs,
+            hardware_id="m3.0",
+            revision=revision_id,
+            owner="t",
+            system="handoff",
+            reference="local-handoff",
+            summary="t",
+            parent_revision=parent,
+        )
 
     def write_bundle(self, evidence: str, extra: dict[str, str] | None = None) -> None:
         files = {
@@ -80,8 +87,12 @@ class Fixture:
         return run("git", "ls-tree", "-r", "--name-only", "FETCH_HEAD", cwd=self.repo).splitlines()
 
     def is_ancestor(self, older: str, newer: str) -> bool:
-        return subprocess.run(["git", "-C", str(self.repo), "merge-base", "--is-ancestor", older, newer],
-                              capture_output=True).returncode == 0
+        return (
+            subprocess.run(
+                ["git", "-C", str(self.repo), "merge-base", "--is-ancestor", older, newer], capture_output=True
+            ).returncode
+            == 0
+        )
 
 
 class PublishTests(unittest.TestCase):
@@ -97,8 +108,16 @@ class PublishTests(unittest.TestCase):
                 raise subprocess.CalledProcessError(1, ["gh", *args], stderr="gh down")
             if args[:2] == ("pr", "list"):
                 if self.pr_exists:
-                    return json.dumps([{"url": "https://example.test/pr/1", "number": 1,
-                                        "baseRefName": "feature/m3.0", "headRefName": BRANCH}])
+                    return json.dumps(
+                        [
+                            {
+                                "url": "https://example.test/pr/1",
+                                "number": 1,
+                                "baseRefName": "feature/m3.0",
+                                "headRefName": BRANCH,
+                            }
+                        ]
+                    )
                 return "[]"
             if args[:2] == ("pr", "create"):
                 self.pr_exists = True
@@ -108,13 +127,19 @@ class PublishTests(unittest.TestCase):
             raise AssertionError(args)
 
         def verifier(bundle: Path) -> dict:
-            report = {"passed": True, "subject_sha256": subject_digest(bundle), "checks": [{"id": "x", "status": "passed"}]}
+            report = {
+                "passed": True,
+                "subject_sha256": subject_digest(bundle),
+                "checks": [{"id": "x", "status": "passed"}],
+            }
             (bundle / "reports/quality.json").write_text(urdf_pr._serialize(report), encoding="utf-8")
             return report
 
-        self.patchers = [mock.patch.object(urdf_pr, "_gh", fake_gh),
-                         mock.patch.object(urdf_pr, "_load_verifier", lambda: verifier),
-                         mock.patch.object(urdf_pr, "_origin_slug", lambda repository: "example/m3.0")]
+        self.patchers = [
+            mock.patch.object(urdf_pr, "_gh", fake_gh),
+            mock.patch.object(urdf_pr, "_load_verifier", lambda: verifier),
+            mock.patch.object(urdf_pr, "_origin_slug", lambda repository: "example/m3.0"),
+        ]
         for patcher in self.patchers:
             patcher.start()
         self.addCleanup(lambda: [p.stop() for p in self.patchers])
@@ -172,16 +197,17 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(self.fx.remote_head(), foreign)
 
     def test_bad_verification_and_tamper_never_push(self) -> None:
-        with mock.patch.object(urdf_pr, "_load_verifier", lambda: (lambda bundle: {"passed": False})):
+        with mock.patch.object(urdf_pr, "_load_verifier", lambda: lambda bundle: {"passed": False}):
             self.assertEqual(self.submit()["error"], "verification_failed")
         self.assertEqual(self.fx.remote_head(), "")
-        with mock.patch.object(urdf_pr, "_load_verifier",
-                               lambda: (lambda bundle: {"passed": True, "subject_sha256": "0" * 64})):
+        with mock.patch.object(
+            urdf_pr, "_load_verifier", lambda: lambda bundle: {"passed": True, "subject_sha256": "0" * 64}
+        ):
             self.assertEqual(self.submit()["error"], "verification_subject_mismatch")
         self.assertEqual(self.fx.remote_head(), "")
         good = {"passed": True, "subject_sha256": subject_digest(self.fx.bundle)}
         (self.fx.bundle / "reports/quality.json").write_text('{"passed": true}\n', encoding="utf-8")
-        with mock.patch.object(urdf_pr, "_load_verifier", lambda: (lambda bundle: good)):
+        with mock.patch.object(urdf_pr, "_load_verifier", lambda: lambda bundle: good):
             self.assertEqual(self.submit()["error"], "stale_quality_report")
         self.assertEqual(self.fx.remote_head(), "")
 
@@ -204,15 +230,13 @@ class PublishTests(unittest.TestCase):
         self.assertIn("urdf/robot.urdf", tree)
 
     def test_local_receipts_ignored_and_do_not_cause_commits(self) -> None:
-        self.fx.write_bundle("one\n", extra={"reports/run.json": '{"run": 1}\n',
-                                            "reports/pr.json": '{"pr": 1}\n'})
+        self.fx.write_bundle("one\n", extra={"reports/run.json": '{"run": 1}\n', "reports/pr.json": '{"pr": 1}\n'})
         first = self.submit()
         tree = self.fx.remote_tree()
         self.assertIn("reports/quality.json", tree)
         self.assertNotIn("reports/run.json", tree)
         self.assertNotIn("reports/pr.json", tree)
-        self.fx.write_bundle("one\n", extra={"reports/run.json": '{"run": 2}\n',
-                                            "reports/pr.json": '{"pr": 2}\n'})
+        self.fx.write_bundle("one\n", extra={"reports/run.json": '{"run": 2}\n', "reports/pr.json": '{"pr": 2}\n'})
         second = self.submit()
         self.assertEqual(second["state"], "noop")
         self.assertEqual(second["commit"], first["commit"])
@@ -259,13 +283,21 @@ class PublishTests(unittest.TestCase):
     def test_commit_hook_tamper_blocks_push(self) -> None:
         hook = self.fx.repo / ".git" / "hooks" / "pre-commit"
         hook.parent.mkdir(parents=True, exist_ok=True)
-        hook.write_text('#!/bin/sh\necho tampered >> "$(git rev-parse --show-toplevel)/urdf/robot.urdf"\n',
-                        encoding="utf-8")
+        hook.write_text(
+            '#!/bin/sh\necho tampered >> "$(git rev-parse --show-toplevel)/urdf/robot.urdf"\n', encoding="utf-8"
+        )
         hook.chmod(0o755)
         result = self.submit()
         self.assertEqual(result["state"], "failed")
-        self.assertIn(result["error"], {"commit_left_dirty", "committed_subject_mismatch",
-                                        "reverification_failed", "reverification_binding_mismatch"})
+        self.assertIn(
+            result["error"],
+            {
+                "commit_left_dirty",
+                "committed_subject_mismatch",
+                "reverification_failed",
+                "reverification_binding_mismatch",
+            },
+        )
         self.assertEqual(self.fx.remote_head(), "")
 
     def test_same_cad_revision_allows_definition_changes(self) -> None:

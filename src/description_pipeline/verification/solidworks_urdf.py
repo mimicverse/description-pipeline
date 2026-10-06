@@ -62,15 +62,14 @@ def _pose(xyz, rpy):
 
 
 def _cad_pose(values):
-    # SolidWorks MathTransform: three basis columns, translation, scale, padding.
+    # The native adapter converts MathTransform into the protocol's SI,
+    # row-major homogeneous matrix before writing the captured reading.
     values = _vector(values, 16)
-    rotation = values[:9].reshape(3, 3).T
-    _require(abs(values[12] - 1) < 1e-9, "Scaled CAD transforms are unsupported")
+    matrix = values.reshape(4, 4)
+    rotation = matrix[:3, :3]
     _require(np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-8, rtol=0), "CAD basis is not orthonormal")
     _require(abs(float(np.linalg.det(rotation)) - 1) < 1e-8, "CAD basis must be right handed")
-    _require(np.allclose(values[13:], 0, atol=1e-9, rtol=0), "Invalid CAD transform padding")
-    matrix = np.eye(4)
-    matrix[:3, :3], matrix[:3, 3] = rotation, values[9:12]
+    _require(np.allclose(matrix[3], [0, 0, 0, 1], atol=1e-9, rtol=0), "Invalid homogeneous CAD matrix")
     return matrix
 
 
@@ -221,7 +220,7 @@ def _xml(root, definition, model):
     )
     document = ET.fromstring(payload)
     _require(document.tag == "robot" and document.get("name") == definition["hardware_id"], "Wrong URDF robot identity")
-    _require(set(child.tag for child in document) <= {"link", "joint"}, "Unexpected top-level URDF extension")
+    _require({child.tag for child in document} <= {"link", "joint"}, "Unexpected top-level URDF extension")
     links = document.findall("link")
     joints = document.findall("joint")
     link_names = [element.get("name", "") for element in links]
@@ -270,7 +269,7 @@ def _joint(node, authored, canonical, datums, body_datums):
     for key in ("parent", "child"):
         _require(_one(node, key).get("link") == authored[key] == canonical[key], f"Joint {key} changed")
     _require(
-        set(child.tag for child in node) <= {"parent", "child", "origin", "axis", "limit"},
+        {child.tag for child in node} <= {"parent", "child", "origin", "axis", "limit"},
         "Unspecified joint extension",
     )
     expected = np.linalg.inv(body_datums[authored["parent"]]) @ body_datums[authored["child"]]
@@ -466,7 +465,16 @@ def evaluate_bundle(root: Path) -> dict:
         gates.add("source.coverage", lambda: _entities(source, raw, model))
         gates.add("verification.complete", lambda: _verify_model(root, gates, definition, model, raw))
     # Large internal inputs are read by later gates, not copied into the report.
-    internal = {"input.valid", "source.integrity", "model.schema", "source.raw"}
+    internal = {
+        "input.valid",
+        "source.integrity",
+        "model.schema",
+        "source.raw",
+        "frames.native",
+        "frames.components",
+        "frames.references",
+        "urdf.syntax_names",
+    }
     for check in gates.checks:
         if check["passed"] and check["id"] in internal:
             check["details"] = {"validated": True}

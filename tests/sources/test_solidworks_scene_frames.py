@@ -19,7 +19,6 @@ from description_pipeline.sources.solidworks.scene import (  # noqa: E402
     _build_frames,
     _build_joints,
     identity_matrix,
-    map_from_row_major,
 )
 
 

@@ -163,7 +163,7 @@ class Jobs:
                 if job["status"] == "running":
                     job.update(
                         status="failed",
-                        error="Endpoint restarted during native execution; inspect retained diagnostics and request a new run_id",
+                        error="Endpoint restarted during native execution; inspect diagnostics and use a new run_id",
                     )
                     self._save(job)
                 elif job["status"] == "queued":
@@ -264,7 +264,7 @@ class Jobs:
                     repository=target["repository"],
                     base=target["base"],
                     run_id=identifier,
-                    on_event=lambda event: self._event(identifier, event),
+                    on_event=lambda event, identifier=identifier: self._event(identifier, event),
                 )
                 with self.mutex:
                     submission = result.get("submission", {})

@@ -6,7 +6,7 @@ import os
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 from . import _paths  # noqa: F401
 from description_pipeline.sources.solidworks.errors import BridgeError, CadError, EnvironmentError_  # noqa: E402
