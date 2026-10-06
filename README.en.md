@@ -149,6 +149,10 @@ the [first-use guide](docs/solidworks-first-use.en.md) gives the PowerShell form
    writes the template; a missing or stale ledger is refused with `URDF208`). Fix tolerances, contact
    and application acceptance in the purpose profiles. If you change rigid bodies, joints or other
    source configuration, freeze again.
+   Keep the optional `pipeline_id` in `config/robot.yaml`
+   (`solidworks-to-urdf`, `onshape-to-urdf`, `fixture-to-urdf`); `description pipeline list` and
+   `description pipeline show` report the published catalog and a workspace's declared and effective
+   identity.
 5. **Build and review.** Run `description build --root /path/to/model --profile kinematics`. Review
    later changes with `description diff OLD_SHA /path/to/model --repository /path/to/model`: one
    sentence on stderr names the areas and objects that changed and whether the delivery digest

@@ -40,12 +40,25 @@ main 不承载某台机器的可消费模型；`tests/fixtures` 中的机器人�
 
 ## 输入与权威来源
 
-`config/robot.yaml` 的顶层接受 `schema_version`、`hardware_id`、`source`、`robot`、`interfaces`、`overrides`。
+`config/robot.yaml` 的顶层接受 `schema_version`、`hardware_id`、`pipeline_id`、`source`、`robot`、`interfaces`、`overrides`。
 `source` 负责取数；`robot` 是来源特有的机械语义定义；`overrides` 是公共的显式作者补充。
 这些输入均参与产物身份；更改来源配置后必须重新冻结。
 `interfaces` 在构建阶段补充 frames、actuators、sensors、control、contact_excludes 和 mechanical_drives，两种 CAD 来源共用。
 同一接口不能同时在来源定义和 interfaces 中给出不同值；同一字段的重复或父子重叠 override 会被拒绝。
 JSON/YAML 重复键也会被拒绝，包括 YAML 合并后重复的字段。
+
+可选的顶层 `pipeline_id` 命名该定义实现的已发布工作流（`solidworks-to-urdf`、`onshape-to-urdf`、`fixture-to-urdf`）。
+`description pipeline list` 打印目录，`description pipeline show <pipeline_id>` 描述单个定义，
+`description pipeline show --root MODEL` 报告工作区的声明身份与实际生效身份。目录是已发布 id、
+可接受来源类型与实现代码符号的唯一来源。实际生效由冻结来源类型决定；声明的 id 必须与之兼容，
+未知或不匹配的 id 会被拒绝。
+`hardware_id`、工具锁与确定性 subject 摘要是彼此独立的身份。`run_id` 命名一次执行，只出现在 CLI 输出和
+被忽略的 `build/runs/<run_id>.json` 记录中，绝不进入 subject、source lock、manifest、质量报告或快照。
+
+`sources/source.lock.json` 含 `pipeline` 块 `{schema_version, id, declared, resolved_from, source_kind}`。
+在本合同之前写入的锁仅当定义也未声明 `pipeline_id` 时可用（`resolved_from: legacy_lock`）；声明 id 必须重新冻结；
+校验会拒绝删除或更改已声明身份。bundle 的 `manifest.json` 与 `docs/quality.json` 携带同一 `pipeline_id`，
+update、PR、validate、promotion 输出都会比对该身份。
 
 ```yaml
 schema_version: description.definition/v1
@@ -233,6 +246,8 @@ artifact 内须含不带 attestation 字段的 `acceptance.json` 及同路径日
 报告分别标记 `local_replay`、`mechanical_reference_replay` 或 `external_attestation`。本地重放可离线执行；需要外部凭证的用途在证据无法核实时保持未获资格。
 
 ## Windows SolidWorks
+
+面向操作者的单机手册见 [SolidWorks-to-URDF 操作手册](solidworks-first-use.md)；本节说明其背后的工程合同。
 
 SolidWorks COM 运行在装有授权 SolidWorks 的 Windows 机器上。worker 通过交互式用户登录任务运行，
 不安装成 Session 0 服务。所有 COM 访问在同一 STA 线程串行执行；HTTP 请求线程不直接接触 COM。

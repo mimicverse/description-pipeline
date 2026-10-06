@@ -29,6 +29,54 @@
 任何一步不确定就先跑 `description doctor --root <模型目录>`：它逐项报告环境与工作区状态，并给出每条失败的修复命令。
 命令打印的 `next:` 就是下一步该做什么；其余问题见[故障定位](#故障定位)。
 
+## SolidWorks-to-URDF 规范流程
+
+已发布工作流为 `pipeline_id: solidworks-to-urdf`（同族：`onshape-to-urdf`、`fixture-to-urdf`）。
+`description pipeline list` 打印目录；`description pipeline show solidworks-to-urdf --json` 打印本
+工作流各阶段及其 Python 入口与文档；`description pipeline show --root MODEL` 报告工作区的声明身份与
+实际生效身份。身份语义只在[流水线合同](pipeline.md#输入与权威来源)中定义一次；下方阶段表按该语义
+使用，并指向详细命令块。
+
+| # | 阶段（详情） | 命令 | 代码入口 | 输出/报告 |
+|---|---|---|---|---|
+| 1 | 准备并保存 CAD（[第 1 节](#1-保存装配准备工具)） | 在 SolidWorks 保存顶层装配及全部引用 | 操作者/CAD | 已保存文件；未保存修改/保存标志证据 |
+| 2 | 安装并诊断（[第 2 节](#2-安装并检查本机环境)） | `worker.ps1 -Action Setup/Install/Doctor`；`description doctor --root MODEL`；`description worker doctor --target URL` | `description_pipeline.doctor:run`；worker 部署 `sources/solidworks/deploy/worker.ps1` | `worker-host.json`；Doctor 退出码 0，且 `install=True worker=True solidworks=True collectable=True` |
+| 3 | 归属、枢轴与身份（[第 4 节](#4-首次采集补齐机器人定义)） | 编辑 `config/robot.yaml`：`source.bodies`、`source.joints`、`interfaces.mechanical_drives`、可选 `pipeline_id` | `description_pipeline.model:Robot`；`description_pipeline.pipeline:resolve_identity` | `model/robot.json`；`source.pipeline` 检查；`sources/source.lock.json` 的 `pipeline` 块 |
+| 4 | 保存并冻结（[第 4 节](#4-首次采集补齐机器人定义)） | `description source freeze --root MODEL` | `description_pipeline.sources.solidworks:freeze`；`description_pipeline.build:freeze` | `sources/source.lock.json` + `sources/snapshots/<digest>/raw/*` 及几何；失败在 `build/failed-source/` |
+| 5 | 作者语义与证据（[第 4 节](#4-首次采集补齐机器人定义)） | 编辑 `overrides`、documented masses/证据、profiles 与关节台账 | `description_pipeline.build:normalize` | 有证据的规范模型；`docs/quality.*` 提示/阻断 |
+| 6 | 生成（[第 4 节](#4-首次采集补齐机器人定义)） | `description build --root MODEL --profile kinematics` | `description_pipeline.build:build`；`description_pipeline.backends:generate` | `urdf/robot.urdf`、`mjcf/robot.xml`、`mjcf/scene.xml`、`meshes/`、`manifest.json`、`docs/quality.*`；失败在 `build/failed/` |
+| 7 | 独立验收（[第 5 节](#5-配置提交入口日常一键运行)） | `description check --root MODEL --profile kinematics`；`description model accept ...` | `description_pipeline.build:assess`；`description_pipeline.verification.mechanics:run_acceptance`（运动学）或 `description_pipeline.verification.simulation:run_acceptance` | `docs/acceptance/<purpose>.json` + 遥测；`consumer.application`；运动学重放绑定参考摘要 |
+| 8 | 候选 PR（[第 5 节](#5-配置提交入口日常一键运行)） | `description model update` / `submit.ps1`；`description model submit`；`description diff OLD_SHA CANDIDATE --repository REPO` | `description_pipeline.repository:update`；`description_pipeline.repository:_submit` | 审查分支 `work/model/<hardware>/<change>`、PR 链接；输出携带 `pipeline_id` |
+| 9 | 精确提交验收与发布（[发布流程](pipeline.md#提交验收与发布)） | `description model validate ... --remote`；`description model promote ... [--apply]` | `description_pipeline.repository:validate_commit`；`description_pipeline.repository:promotion_plan`；`description_pipeline.repository:promote` | 验证报告；`release/<hardware>` 分支与 `description/release` 状态；可选 tag；全过程比对身份 |
+| 10 | 日常重导出与恢复（[失败处理](pipeline.md#失败处理)） | `submit.ps1` / `description model update`；`description doctor --root MODEL`；`description recover --root MODEL` | `description_pipeline.repository:update`；`description_pipeline.build.publication:recover`；`description_pipeline.runlog:finish` | 新 subject/快照/审查；失败留在 `build/failed-source/` 或 `build/failed/`；运行记录为 `build/runs/<run_id>.json` |
+
+门槛规则（细节见各阶段链接与[流水线合同](pipeline.md)）：
+
+* **归属与枢轴。** 每个纳入的 CAD 实例恰好属于一个刚体（按采集实例名划分，不按文件名）；每个
+  可动关节声明父/子 link、父 link 坐标系下的物理枢轴与关节坐标系下的有符号轴线。必须依据设计与
+  几何确定；绝不从 CAD 配合、最近圆柱或无符号轴线推断枢轴、方向或限位。见
+  [机械验收](mechanical-acceptance.md)。
+* **保存与冻结。** 冻结以磁盘已保存字节为起点；依赖缺失或逃逸、副本验证失败或几何失败都会
+  阻断；`GetSaveFlag` 只是证据，不能替代保存；无法证明输入的中断冻结必须重新采集。
+* **验收。** 生成文件、加载 URDF/MJCF 或两种格式互相一致都不构成验收。仿真运行声明实验；运动学
+  必须由操作者选择外部 `--mechanical-reference`；训练与实机需要各自的独立证据。本地重放是确定
+  性的，不依赖 CI。
+* **发布。** `model promote` 从远端重新取回精确候选到全新 Git/LFS 存储，在锁定工具环境中重跑
+  验收，并拒绝过期计划。PR 不等于发布；验收记录绑定 subject、profile、环境、工具、运行时与
+  参考摘要。
+* **日常重导出与恢复。** 保存 CAD（或只改定义/证据并加 `--reuse-source`）后运行 `submit.ps1`/
+  `model update`；新的采集产生新的 subject 与审查。采集失败留在 `build/failed-source/`，构建或
+  验收失败留在 `build/failed/`；存在 `publication.json` 时运行 `description recover --root MODEL`。
+  worker 重启只恢复排队作业，绝不复用无法证明的中断冻结。
+* **Linux 快照重放。** Linux 上已冻结快照无需 SolidWorks worker 即可构建、检查和验收
+  （`description build`、`description check`、`description model accept`）；工具锁的平台/Python
+  必须匹配，CAD 采集仍仅限 Windows。
+
+**发布门槛。** 0.3.25 尚未发布或打 tag。发布要求候选 bundle 通过一次全新的原生 Windows 复验
+（安装、Doctor、采集与消费端检查），随后通过精确提交验收；当前与历史门槛状态见
+[0.3.25 验证历史](history/validation-0.3.25.md)。诊断改进、保留运行时探测、生成文件或已提交的 PR
+都不能通过该门槛；任何候选只有在精确提交通过声明验收后才算“机械验收通过”。
+
 ## 1. 保存装配，准备工具
 
 在 SolidWorks 中选定配置，保存顶层装配及全部引用文件。确认引用完整，每个纳入的实体有明确的物理材料；外观颜色不算材料。

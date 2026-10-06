@@ -134,7 +134,10 @@ A released kinematics model retains this limited purpose; other purposes need th
 GitHub Actions are not required.
 
 Replay binds the subject, profile, environment, tool, runtime, reference digest and measurement
-artifacts. A missing selection is `not_run`; changed bytes or inconsistent measurements fail.
+artifacts. The source lock, bundle manifest and quality report carry the workflow `pipeline_id`, and
+validation compares it with the definition and frozen source; a unique `run_id` is execution-local
+and never part of the subject, manifest, quality report or acceptance record. A missing selection is
+`not_run`; changed bytes or inconsistent measurements fail.
 A blocked native runtime is unexecuted and grants no qualification. Correct inputs or obtain an
 approved runtime, then rebuild and repeat acceptance. Never alter generated files or relax the
 reference to obtain a pass.

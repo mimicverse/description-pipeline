@@ -113,6 +113,8 @@ description model promote --root REPOSITORY --hardware HARDWARE --candidate FULL
 检查计划后再加 `--apply`。计划绑定参考摘要，发布前再次验证。运动学发布仍只具有该用途资格，
 其他用途必须各自验收；无需 GitHub Actions。
 
-重放绑定输入身份、profile、环境、工具、运行时、参考摘要与观测文件。
+重放绑定输入身份、profile、环境、工具、运行时、参考摘要与观测文件。source lock、bundle manifest
+与质量报告携带工作流 `pipeline_id`，校验会将其与定义和冻结来源比对；单次执行的 `run_id` 只属于执行本身，
+绝不进入 subject、manifest、质量报告或验收记录。
 未选择参考为 `not_run`；字节改变或观测不一致则失败。原生运行时被阻止意味着未执行，不授予资格。
 修正输入或取得获准运行时后，重新构建与验收，不能通过修改生成文件或放宽参考来获取通过。

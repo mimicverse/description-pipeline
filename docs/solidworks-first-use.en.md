@@ -43,6 +43,63 @@ When a step is unclear, run `description doctor --root <model directory>` first:
 environment and the workspace item by item and names the fix for every failure. Every `next:` line a
 command prints is the next step; anything else is in [Troubleshooting](#troubleshooting).
 
+## Canonical SolidWorks-to-URDF pipeline
+
+The published workflow is `pipeline_id: solidworks-to-urdf` (siblings: `onshape-to-urdf`,
+`fixture-to-urdf`). `description pipeline list` prints the catalog;
+`description pipeline show solidworks-to-urdf --json` prints this workflow's stages with their
+Python entry points and documents; `description pipeline show --root MODEL` reports a workspace's
+declared and effective identity. Identity semantics are defined once in the
+[pipeline contract](pipeline.en.md#inputs-and-authoritative-sources); the stage map below uses them
+and points at the detailed command blocks.
+
+| # | Stage (details) | Command | Code entry | Output / report |
+|---|---|---|---|---|
+| 1 | Prepare and save the CAD ([section 1](#1-save-the-assembly-and-prepare-the-tools)) | Save the top assembly and all references in SolidWorks | operator/CAD | Saved files; unsaved-edit/save-flag evidence |
+| 2 | Install and diagnose ([section 2](#2-install-and-check-the-local-environment)) | `worker.ps1 -Action Setup/Install/Doctor`; `description doctor --root MODEL`; `description worker doctor --target URL` | `description_pipeline.doctor:run`; worker deployment `sources/solidworks/deploy/worker.ps1` | `worker-host.json`; Doctor exit 0 with `install=True worker=True solidworks=True collectable=True` |
+| 3 | Ownership, pivots and identity ([section 4](#4-capture-once-and-complete-the-robot-definition)) | Edit `config/robot.yaml`: `source.bodies`, `source.joints`, `interfaces.mechanical_drives`, optional `pipeline_id` | `description_pipeline.model:Robot`; `description_pipeline.pipeline:resolve_identity` | `model/robot.json`; `source.pipeline` check; the `sources/source.lock.json` `pipeline` block |
+| 4 | Save and freeze ([section 4](#4-capture-once-and-complete-the-robot-definition)) | `description source freeze --root MODEL` | `description_pipeline.sources.solidworks:freeze`; `description_pipeline.build:freeze` | `sources/source.lock.json` + `sources/snapshots/<digest>/raw/*` and geometry; failures in `build/failed-source/` |
+| 5 | Author semantics and evidence ([section 4](#4-capture-once-and-complete-the-robot-definition)) | Edit `overrides`, documented masses/evidence, profiles and the joint ledger | `description_pipeline.build:normalize` | Evidence-bound canonical model; advisories/blockers in `docs/quality.*` |
+| 6 | Generate ([section 4](#4-capture-once-and-complete-the-robot-definition)) | `description build --root MODEL --profile kinematics` | `description_pipeline.build:build`; `description_pipeline.backends:generate` | `urdf/robot.urdf`, `mjcf/robot.xml`, `mjcf/scene.xml`, `meshes/`, `manifest.json`, `docs/quality.*`; failures in `build/failed/` |
+| 7 | Independent acceptance ([section 5](#5-configure-the-submission-entry-and-run-it-daily)) | `description check --root MODEL --profile kinematics`; `description model accept ...` | `description_pipeline.build:assess`; `description_pipeline.verification.mechanics:run_acceptance` (kinematics) or `description_pipeline.verification.simulation:run_acceptance` | `docs/acceptance/<purpose>.json` + telemetry; `consumer.application`; the kinematics replay binds the reference digest |
+| 8 | Candidate pull request ([section 5](#5-configure-the-submission-entry-and-run-it-daily)) | `description model update` / `submit.ps1`; `description model submit`; `description diff OLD_SHA CANDIDATE --repository REPO` | `description_pipeline.repository:update`; `description_pipeline.repository:_submit` | Review branch `work/model/<hardware>/<change>`, pull-request URL; outputs carry `pipeline_id` |
+| 9 | Exact-commit acceptance and publication ([release flow](pipeline.en.md#submission-acceptance-and-release)) | `description model validate ... --remote`; `description model promote ... [--apply]` | `description_pipeline.repository:validate_commit`; `description_pipeline.repository:promotion_plan`; `description_pipeline.repository:promote` | Validation report; `release/<hardware>` branch and `description/release` status; optional tag; identity compared throughout |
+| 10 | Daily re-export and recovery ([failure handling](pipeline.en.md#failure-handling)) | `submit.ps1` / `description model update`; `description doctor --root MODEL`; `description recover --root MODEL` | `description_pipeline.repository:update`; `description_pipeline.build.publication:recover`; `description_pipeline.runlog:finish` | New subject/snapshot/review; failures stay in `build/failed-source/` or `build/failed/`; the run record is `build/runs/<run_id>.json` |
+
+Gate rules (details in the linked stages and the [pipeline contract](pipeline.en.md)):
+
+* **Ownership and pivots.** Every included CAD instance belongs to exactly one rigid body (partition
+  by captured instance name, not file name). Every movable joint declares parent/child links, the
+  physical pivot in the parent-link frame and the signed axis in the joint frame. Define these from
+  design and geometry; never infer a pivot, direction or limit from a CAD mate, a nearest cylinder
+  or an unsigned axis. See [mechanical acceptance](mechanical-acceptance.en.md).
+* **Save and freeze.** Freezing starts from saved bytes on disk; a missing or escaping dependency,
+  an unverified copy or a geometry failure blocks the run. `GetSaveFlag` is evidence, not a
+  substitute for saving, and an interrupted freeze that cannot prove its inputs must be re-captured.
+* **Acceptance.** Generating files, loading the URDF/MJCF or agreeing between formats is not
+  acceptance. Simulation runs declared experiments; kinematics requires an operator-selected
+  external `--mechanical-reference`; training and hardware need their own evidence. Local replay is
+  deterministic and needs no CI.
+* **Publication.** `model promote` re-fetches the exact candidate into a fresh Git/LFS store,
+  re-runs acceptance in the pinned tool environment and refuses a stale plan. A pull request is not
+  a release; the acceptance record binds subject, profile, environment, tool, runtime and reference
+  digest.
+* **Daily re-export and recovery.** Save the CAD (or add `--reuse-source` when only the definition
+  or evidence changed) and run `submit.ps1`/`model update`; a new capture creates a new subject and
+  review. Capture failures stay in `build/failed-source/`, build/acceptance failures in
+  `build/failed/`; run `description recover --root MODEL` if `publication.json` exists. A worker
+  restart resumes queued jobs but never reuses an unproven interrupted freeze.
+* **Linux snapshot replay.** On Linux a frozen snapshot can be built, checked and accepted without a
+  SolidWorks worker (`description build`, `description check`, `description model accept`); the
+  tool lock's platform/Python must match, and CAD capture remains Windows-only.
+
+**Release gate.** 0.3.25 is not published or tagged. A release requires a successful fresh native
+Windows rehearsal (installation, Doctor, capture and the consumer checks) on the candidate bundle,
+followed by the exact-commit acceptance; the current and historical gate state is in the
+[0.3.25 validation history](history/validation-0.3.25.md). A diagnostic improvement, a preserved
+runtime probe, generated files or a submitted pull request never pass that gate, and no candidate is
+"mechanically accepted" until its exact commit passes the declared acceptance.
+
 ## 1. Save the assembly and prepare the tools
 
 In SolidWorks pick the configuration and save the top-level assembly together with every referenced

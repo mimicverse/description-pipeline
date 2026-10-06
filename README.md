@@ -109,6 +109,7 @@ git -C /path/to/description push -u origin main
 2. **准备运行环境。** 在所选电脑上准备完整工具、专用模型工作区、Git/LFS 和已登录的 `gh`，并确保可写模型仓库可访问。Onshape 配置访问凭据；SolidWorks 在本机 Windows 安装 worker 并通过 Doctor。来源配置见 [Onshape](docs/sources/onshape.md) 和 [SolidWorks](docs/sources/solidworks.md)。
 3. **冻结来源。** 运行 `description source freeze --root /path/to/model`，核对修订、配置、实例及排除项。
 4. **补充定义。** 在 `config/robot.yaml` 中声明机械语义和有证据的参数，并把每个可动关节登记进 `config/joint_names.yaml`（`model init` 已生成模板；缺失或与 URDF 脱节会被 `URDF208` 拒绝）。在用途配置中确定容差、接触及应用验收要求。若修改了 `source` 中的刚体、关节等来源配置，重新执行 `source freeze`。
+   在 `config/robot.yaml` 中保留可选的 `pipeline_id`（`solidworks-to-urdf`、`onshape-to-urdf`、`fixture-to-urdf`）；`description pipeline list` 与 `description pipeline show` 报告已发布目录及工作区的声明/实际身份。
 5. **构建并审阅。** 运行 `description build --root /path/to/model --profile kinematics`。后续用 `description diff OLD_SHA /path/to/model --repository /path/to/model` 审阅物理语义、输入和用途变化：stderr 先给一行结论（改了哪些区域、多少对象、交付摘要是否变化），完整 JSON 报告在 stdout（重定向到文件即可留档），`--json` 只输出报告。失败诊断保存在 `build/`，修正输入后重建。
 6. **应用验收与提交。** 仿真按[仿真验收流程](docs/simulation.md)执行实验并重建。声明机械运动学套件时，按[机械参考流程](docs/mechanical-acceptance.md)取得独立参考，运行 `description model update --reuse-source --mechanical-reference /approved/mechanism.json`，自动验收、重建并提交；已构建候选用 `description model submit` 并传入同一参考选项。训练与实机仍需各自独立证据。本地重放无需 CI，消费端和发布端须重新选择已批准参考。
 7. **验收并发布。** 候选进入对应 feature 后，使用模型锁定的工具环境运行下列命令查看计划；加 `--apply` 执行。发布会从远端重新取得完整候选，核验实际字节和用途证据，再快进 release。

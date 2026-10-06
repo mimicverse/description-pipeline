@@ -18,6 +18,9 @@ CAD provides geometry, assembly structure and mass properties; the robot definit
 and control semantics; specifications and measurements provide physical and control parameters. When
 sources conflict, the effective source is chosen explicitly, and every override, estimate and
 default records its basis and scope.
+A published workflow is named by a stable `pipeline_id`; the catalog (`description pipeline list` /
+`show`) resolves the published id and its stages. The identity is separate from `hardware_id`, the
+tool lock and the deterministic subject digest.
 
 Capture freezes the CAD and its complete dependencies into a source snapshot, preserving the
 original units, coordinate frames and inertia reference points, recording the CAD and capture-tool
@@ -135,6 +138,8 @@ rebuilds and interrupted-run recovery.
 The steps below use a single hardware model to complete authoring, acceptance, delivery and
 iteration in order. First modelling must fix the mechanical definition and its parameter evidence;
 afterwards, day-to-day updates use the one-command entry.
+The normative step order, entry points and outputs are in the
+[SolidWorks-to-URDF runbook](solidworks-first-use.en.md); this part keeps the design rationale.
 
 ### 1. Choose the target and create the model workspace
 

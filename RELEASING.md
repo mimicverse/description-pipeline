@@ -5,11 +5,21 @@ This is the maintainer checklist for a tool release (a model release lives on it
 this repository, so a release is produced and verified locally, from an exact commit, by the
 maintainer.
 
+**Current status.** 0.3.25 is not published or tagged. Publication happens only after a fresh native
+Windows rehearsal on the candidate bundle (installation, Doctor, capture and the consumer checks)
+and the exact-commit acceptance pass; the current and historical gate state is in the
+[0.3.25 validation history](docs/history/validation-0.3.25.md). A diagnostic improvement, a preserved
+runtime probe, generated files or a submitted pull request do not satisfy the gate, and no model
+candidate is mechanically accepted before its exact commit passes.
+
 ## 0. Decide the version
 
 `description_pipeline.__version__` is the single source of truth. After every release, move `main`
 to the next patch version so two different byte sets never share a version label; the published
 release stays pinned to its own commit.
+The bundle `manifest.json` and `docs/quality.json` carry the workflow `pipeline_id`; validation
+compares it with the definition and `sources/source.lock.json`. A removed, changed or mismatched
+declared id is a release blocker. The per-execution `run_id` is not part of the release identity.
 
 ## 1. Verify the exact commit
 
@@ -105,7 +115,8 @@ environment problem, not a distribution problem.
 Windows App Control must allow MuJoCo's native dependencies. `WinError 4551` means the machine's
 policy rejected loading a file, even if the package is installed. Ask the administrator to review
 that dependency or use an approved runtime. Keep the failed rehearsal as evidence; a successful
-older installation does not establish that a fresh install is allowed.
+older installation does not establish that a fresh install is allowed. Reporting `WinError 4551`
+precisely is a diagnostic improvement, not an acceptance pass.
 
 Rehearse the candidate on the machine that runs SolidWorks. One script installs it into an isolated
 root, proves the bytes, runs the CAD probe and the offline first run, and keeps the evidence:

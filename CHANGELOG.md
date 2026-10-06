@@ -2,8 +2,6 @@
 
 ## [Unreleased]
 
-## [0.3.25] - 2026-10-03
-
 ### Added
 
 - Operator-selected mechanical kinematics acceptance. `--mechanical-reference` selects an approved
@@ -29,6 +27,16 @@
   fallback also keeps the full material-assignment detail the CAD error carried, instead of reducing
   it to a code and a message.
 
+- Published source-to-URDF workflows carry stable `pipeline_id` identities
+  (`solidworks-to-urdf`, `onshape-to-urdf`, `fixture-to-urdf`) with a shared catalog
+  (`description pipeline list` and `description pipeline show`). `config/robot.yaml` may declare `pipeline_id`;
+  `sources/source.lock.json` records the resolved identity
+  `{schema_version, id, declared, resolved_from, source_kind}`, legacy locks stay valid only for
+  undeclared definitions, and declaring or changing an id requires a re-freeze. `manifest.json`,
+  `docs/quality.json` and the update/pull-request/validate/promotion outputs carry and compare the
+  identity. A unique `run_id` is written only to the CLI output and the ignored
+  `build/runs/<run_id>.json`, never to the subject, manifest, quality report or snapshot.
+
 ### Changed
 
 - The mass-closure advisory states the two readings and that no cause is inferred, instead of
@@ -46,7 +54,10 @@
 - A Windows App Control rejection of a MuJoCo DLL (for example Smart App Control blocking the
   unsigned `plugin\elasticity.dll`) is reported as such — with the affected library and the original
   `OSError` — by `description doctor`, the worker's local-pipeline probe and `quickstart`'s error
-  payload, instead of being classified as a missing package or parsed as a MuJoCo version.
+  payload, instead of being classified as a missing package or parsed as a MuJoCo version. This is a
+  diagnostic classification fix only: it does not change the host policy and does not make a blocked
+  native acceptance pass. Version 0.3.25 stays unreleased and untagged until the native rehearsal
+  succeeds in an administrator-approved runtime.
 
 ## [0.3.24] - 2026-09-29
 

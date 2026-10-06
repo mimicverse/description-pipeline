@@ -43,8 +43,8 @@ repository's `origin`. A local release checks the pinned tool commit against its
 
 ## Inputs and authoritative sources
 
-The top level of `config/robot.yaml` accepts `schema_version`, `hardware_id`, `source`, `robot`,
-`interfaces` and `overrides`. `source` captures the data; `robot` holds the source-specific
+The top level of `config/robot.yaml` accepts `schema_version`, `hardware_id`, `pipeline_id`,
+`source`, `robot`, `interfaces` and `overrides`. `source` captures the data; `robot` holds the source-specific
 mechanical semantics; `overrides` are the shared, explicit author additions. All of these inputs
 participate in the artifact identity, and changing the source configuration requires a new freeze.
 `interfaces` adds frames, actuators, sensors, control, contact exclusions and mechanical drive mappings during the build and is
@@ -52,6 +52,25 @@ shared by both CAD sources. The same interface may not be given different values
 definition and in `interfaces`, and duplicate or parent/child-overlapping overrides of one field are
 rejected. Duplicate JSON/YAML keys are rejected as well, including fields duplicated after a YAML
 merge.
+
+The optional top-level `pipeline_id` names the published workflow the definition implements
+(`solidworks-to-urdf`, `onshape-to-urdf`, `fixture-to-urdf`). `description pipeline list` prints the
+catalog, `description pipeline show <pipeline_id>` describes one definition, and
+`description pipeline show --root MODEL` reports a workspace's declared and effective identity. The
+catalog is the single source of truth for the published ids, accepted source kinds and implementing
+code symbols. The frozen
+source kind decides which workflow actually runs, a declared id must be compatible with it, and
+unknown or mismatched ids are refused. `hardware_id`, the tool lock and the deterministic subject
+digest stay separate identities. A `run_id` names one execution and appears only in CLI output and
+the ignored `build/runs/<run_id>.json` record; it never enters the subject, source lock, manifest,
+quality report or snapshot.
+
+`sources/source.lock.json` carries a `pipeline` block
+`{schema_version, id, declared, resolved_from, source_kind}`. A lock written before this contract is
+accepted only while the definition declares no `pipeline_id` (`resolved_from: legacy_lock`);
+declaring an id requires a new freeze, and validation refuses a removed or changed declared
+identity. The bundle `manifest.json` and `docs/quality.json` carry the same `pipeline_id`, and the
+update, pull-request, validation and promotion outputs compare it.
 
 ```yaml
 schema_version: description.definition/v1
@@ -312,6 +331,10 @@ Reports label `local_replay`, `mechanical_reference_replay` and `external_attest
 a purpose that needs external attestation stays unqualified until the evidence can be checked.
 
 ## Windows SolidWorks
+
+The operator-facing one-machine runbook is the
+[SolidWorks-to-URDF runbook](solidworks-first-use.en.md); this section states the engineering
+contract behind it.
 
 SolidWorks COM runs on a Windows machine with a licensed SolidWorks. The worker runs as an
 interactive user logon task and is never installed as a Session 0 service. All COM access executes
