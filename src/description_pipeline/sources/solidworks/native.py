@@ -663,6 +663,7 @@ class SolidWorksBackend(CadBackend):
             "mode": "full",
             "reference": {
                 "used_api": "IMassProperty2.GetMomentOfInertia(0)",
+                "scope": "part_document",
                 "reference_point": "center_of_mass",
                 "axes": "part_document_axes",
                 "use_system_units": True,
@@ -850,6 +851,116 @@ class SolidWorksBackend(CadBackend):
             "reference": {
                 "method": "IMassProperty2 (SelectedItems = component instance)",
                 "override_api": "IMassProperty2.GetOverrideOptions (same selection)",
+                "document": str(_member(doc, "GetPathName")),
+                "configuration": str(_member(configuration, "Name")),
+            },
+        }
+
+    def _component_override_flags(self, doc, component):
+        """Effective override flags for one selected component instance."""
+
+        import pythoncom
+
+        mp = _member(_member(doc, "Extension"), "CreateMassProperty2")
+        if mp is None:
+            raise CadError("cad_empty_mass_property", "CreateMassProperty2 returned null")
+        mp.UseSystemUnits = True
+        mp.IncludeHiddenBodiesOrComponents = True
+        selection = _win32().VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, (component,))
+        mp.SelectedItems = selection
+        _member(mp, "Recalculate")
+        override = _member(mp, "GetOverrideOptions")
+        return {
+            key: bool(_member(override, key))
+            for key in ("OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia")
+        }
+
+    def assembly_group_mass_properties(self, path, names):
+        """Mass properties for a selected group of component instances.
+
+        The same ``GetMomentOfInertia(0)`` call answers in *standard* (as-is)
+        notation when the selection is a group of assembly component instances,
+        unlike the part-document scope which answers in positive-product
+        notation.  The reading is scope-qualified (``assembly_component_group``)
+        so no historical part measurement is ever relabelled, and any effective
+        instance override is refused instead of silently becoming the value.
+
+        Returns ``{"assembly", "configuration", "group", "members", "mass",
+        "com", "inertia", "reference"}``.
+        """
+
+        doc = self._document_by_path(path)
+        if _member(doc, "GetType") != 2:
+            raise CadError("cad_not_assembly", "group mass reader requires a saved SLDASM")
+        configuration = _member(_member(doc, "ConfigurationManager"), "ActiveConfiguration")
+        root = _member(configuration, "GetRootComponent3", True)
+        if root is None:
+            raise CadError("cad_empty_mass_property", "assembly has no root component")
+        wanted = {str(name) for name in names}
+        if not wanted:
+            raise CadError("cad_empty_selection", "group mass reader needs at least one component instance")
+        selection: list[object] = []
+        overrides: dict[str, dict[str, bool]] = {}
+        stack: list[object] = [component for component in reversed(list(_member(root, "GetChildren") or ()))]
+        while stack:
+            component = _dynamic(stack.pop())
+            if _member(component, "IsSuppressed"):
+                continue
+            children = list(_member(component, "GetChildren") or ())
+            stack.extend(reversed(children))
+            name = str(_member(component, "Name2"))
+            if name not in wanted:
+                continue
+            flags = self._component_override_flags(doc, component)
+            if any(flags.values()):
+                raise CadError(
+                    "cad_mass_override",
+                    "pure-CAD export refuses component instance overrides",
+                    {"component": name, "overrides": flags, "scope": "assembly_component_group"},
+                )
+            overrides[name] = flags
+            selection.append(component)
+        missing = sorted(wanted - set(overrides))
+        if missing:
+            raise CadError(
+                "cad_missing_component",
+                "group members are not component instances of this assembly",
+                {"missing": missing, "group": sorted(wanted)},
+            )
+        import pythoncom
+
+        mp = _member(_member(doc, "Extension"), "CreateMassProperty2")
+        if mp is None:
+            raise CadError("cad_empty_mass_property", "CreateMassProperty2 returned null")
+        mp.UseSystemUnits = True
+        mp.IncludeHiddenBodiesOrComponents = True
+        array = _win32().VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, tuple(selection))
+        mp.SelectedItems = array
+        _member(mp, "Recalculate")
+        mass = float(_member(mp, "Mass"))
+        com = tuple(map(float, _member(mp, "CenterOfMass")))
+        values = tuple(map(float, _member(mp, "GetMomentOfInertia", 0)))
+        if len(values) != 9:
+            raise CadError("cad_mass_property_inertia_unsupported", "GetMomentOfInertia(0) must return 9 values")
+        inertia, _ = _inertia_from_raw(values, _member(doc, "GetTitle"))
+        if mass <= 0 or not math.isfinite(mass) or len(com) != 3 or not all(map(math.isfinite, com)):
+            raise CadError("cad_mass_property_invalid", "mass/COM are not finite and positive")
+        return {
+            "assembly": str(_member(doc, "GetPathName")),
+            "configuration": str(_member(configuration, "Name")),
+            "group": sorted(wanted),
+            "members": overrides,
+            "mass": mass,
+            "com": com,
+            "inertia": inertia,
+            "reference": {
+                "used_api": "IMassProperty2.GetMomentOfInertia(0)",
+                "scope": "assembly_component_group",
+                "product_convention": "solidworks_standard",
+                "reference_point": "center_of_mass",
+                "axes": "assembly_document_axes",
+                "use_system_units": True,
+                "overrides": overrides,
                 "document": str(_member(doc, "GetPathName")),
                 "configuration": str(_member(configuration, "Name")),
             },

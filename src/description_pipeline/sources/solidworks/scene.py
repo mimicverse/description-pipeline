@@ -123,7 +123,18 @@ def combine_mass_properties(entries: Sequence[dict[str, Any]]) -> dict[str, Any]
     }
 
 
-PRODUCT_CONVENTIONS = ("solidworks_positive",)
+PRODUCT_CONVENTIONS = ("solidworks_positive", "solidworks_standard")
+# The same ``GetMomentOfInertia(0)`` call answers in different conventions
+# depending on what the mass-property object selected.  Part documents answer in
+# positive-product notation (proven by the analytic box fixture); selections of
+# assembly component instances/groups answer standard tensors (October 6 group
+# audit: 7 of 8 decisive groups).  The scope label is authoritative and must
+# agree with any declared convention, so a reading is never re-interpreted by
+# silently relabelling historical part measurements.
+SCOPE_CONVENTIONS = {
+    "part_document": "solidworks_positive",
+    "assembly_component_group": "solidworks_standard",
+}
 FIXTURE_API_MARKERS = ("fixture",)
 
 
@@ -149,7 +160,8 @@ def tensor_from_raw(raw: Any, reference: Any, *, where: str) -> Matrix3:
         if abs(rows[i][j] - rows[j][i]) > 1e-12 * scale:
             raise ConfigError("raw inertia matrix must be symmetric", {"where": where, "pair": [i, j]})
     convention = (reference or {}).get("product_convention")
-    if convention is None:
+    scope = (reference or {}).get("scope")
+    if convention is None and scope is None:
         used_api = str((reference or {}).get("used_api") or "")
         if used_api not in FIXTURE_API_MARKERS:
             raise ConfigError(
@@ -157,11 +169,26 @@ def tensor_from_raw(raw: Any, reference: Any, *, where: str) -> Matrix3:
                 {"where": where, "used_api": used_api},
             )
         return tuple(tuple(row) for row in rows)  # type: ignore[return-value]
+    if scope is not None:
+        expected = SCOPE_CONVENTIONS.get(str(scope))
+        if expected is None:
+            raise ConfigError(
+                "raw CAD inertia declares an unknown measurement scope",
+                {"where": where, "scope": scope, "supported": sorted(SCOPE_CONVENTIONS)},
+            )
+        if convention is not None and str(convention) != expected:
+            raise ConfigError(
+                "inertia scope and product_convention disagree",
+                {"where": where, "scope": scope, "product_convention": convention, "expected": expected},
+            )
+        convention = expected
     if convention not in PRODUCT_CONVENTIONS:
         raise ConfigError(
             "raw CAD inertia declares an unsupported product_convention",
             {"where": where, "product_convention": convention, "supported": list(PRODUCT_CONVENTIONS)},
         )
+    if convention == "solidworks_standard":
+        return tuple(tuple(row) for row in rows)  # type: ignore[return-value]
     for i, j in ((0, 1), (1, 0), (0, 2), (2, 0), (1, 2), (2, 1)):
         rows[i][j] = -rows[i][j]
     return tuple(tuple(row) for row in rows)  # type: ignore[return-value]
