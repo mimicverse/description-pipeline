@@ -1094,7 +1094,11 @@ def _component_context_record(reading: dict[str, Any], scene: Any, assembly_mass
 
 
 def _component_mass_context(
-    backend: Any, cfg: dict[str, Any], scene: Any, assembly_mass: float | None
+    backend: Any,
+    cfg: dict[str, Any],
+    scene: Any,
+    assembly_mass: float | None,
+    document: str | None = None,
 ) -> dict[str, Any] | None:
     """The assembly context reading when the backend can produce it; best-effort, never fatal."""
 
@@ -1102,7 +1106,9 @@ def _component_mass_context(
     if not callable(reader):
         return None
     try:
-        reading = reader(cfg["assembly"])
+        # The closure must describe the document the capture actually read: the
+        # collected copy, never the author's working tree.
+        reading = reader(str(document or cfg["assembly"]))
     except Exception as error:  # noqa: BLE001 - an optional probe must not fail a valid capture
         return {
             "schema_version": "description-pipeline.solidworks-component-mass-context/v1",
@@ -1128,7 +1134,9 @@ def _component_mass_context(
         }
 
 
-def _mass_closure(backend: Any, cfg: dict[str, Any], scene: Any) -> dict[str, Any] | None:
+def _mass_closure(
+    backend: Any, cfg: dict[str, Any], scene: Any, document: str | None = None
+) -> dict[str, Any] | None:
     """The assembly's own reading next to the recombined leaf readings, as capture evidence.
 
     A backend that cannot read the whole assembly (fixtures, other providers) records nothing; the
@@ -1148,11 +1156,12 @@ def _mass_closure(backend: Any, cfg: dict[str, Any], scene: Any) -> dict[str, An
     context_reader = getattr(backend, "assembly_component_mass_properties", None)
     if not callable(closure_reader) and not callable(context_reader):
         return None
+    measured = str(document or cfg["assembly"])
     top_level: dict[str, Any] | None = None
     failure: dict[str, str] | None = None
     if callable(closure_reader):
         try:
-            top_level = closure_reader(cfg["assembly"])
+            top_level = closure_reader(measured)
         except Exception as error:  # noqa: BLE001 - an optional probe must not fail a valid capture
             failure = {
                 "reason": str(getattr(error, "code", "") or type(error).__name__),
@@ -1176,7 +1185,7 @@ def _mass_closure(backend: Any, cfg: dict[str, Any], scene: Any) -> dict[str, An
         }
     # The override evidence is required for a pure-CAD claim, so it is collected even when the
     # optional assembly reading failed (or the record would earn cad equivalence by omission).
-    component_context = _component_mass_context(backend, cfg, scene, top_mass)
+    component_context = _component_mass_context(backend, cfg, scene, top_mass, measured)
     if top_level is None or top_mass is None:
         unavailable_record: dict[str, Any] = {
             "schema_version": "description-pipeline.solidworks-mass-closure/v1",
@@ -1458,7 +1467,7 @@ def _freeze_local(
         axis_references = _capture_axis_references(backend, cfg)
         if axis_references:
             write_json(staging / "raw" / "axis_references.json", axis_references)
-        mass_closure = _mass_closure(backend, cfg, scene)
+        mass_closure = _mass_closure(backend, cfg, scene, getattr(scene, "document", None))
         if mass_closure is not None:
             write_json(staging / "raw" / "mass_closure.json", mass_closure)
         # Declared author decisions are recorded as declared input, never as CAD
