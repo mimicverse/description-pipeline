@@ -684,7 +684,7 @@ def _validate_source(
             if isinstance(reference, dict):
                 _unknown_keys(
                     reference,
-                    {"component", "face_index", "body_type", "note"},
+                    {"component", "face_index", "feature_name", "body_type", "note"},
                     report,
                     "input.joint_axis_reference_invalid",
                     f"{where}.axis_reference",
@@ -696,11 +696,26 @@ def _validate_source(
                         {"joint": name, "component": reference.get("component")},
                     )
                 face_index = reference.get("face_index")
-                if not isinstance(face_index, int) or isinstance(face_index, bool) or face_index < 0:
+                feature_name = reference.get("feature_name")
+                named = _is_text(feature_name)
+                indexed = isinstance(face_index, int) and not isinstance(face_index, bool) and face_index >= 0
+                if not named and not indexed:
                     report.error(
                         "input.joint_axis_reference_invalid",
-                        f"{where}.axis_reference.face_index must be a non-negative integer",
+                        f"{where}.axis_reference needs a named feature or a non-negative face_index",
+                        {"joint": name, "face_index": face_index, "feature_name": feature_name},
+                    )
+                elif face_index is not None and not indexed:
+                    report.error(
+                        "input.joint_axis_reference_invalid",
+                        f"{where}.axis_reference.face_index must be a non-negative integer when given",
                         {"joint": name, "face_index": face_index},
+                    )
+                if feature_name is not None and not named:
+                    report.error(
+                        "input.joint_axis_reference_invalid",
+                        f"{where}.axis_reference.feature_name must be a non-empty name when given",
+                        {"joint": name, "feature_name": feature_name},
                     )
                 body_type = reference.get("body_type", "solid")
                 if body_type not in ("solid", "sheet"):

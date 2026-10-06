@@ -80,6 +80,10 @@ def _as_list(value):
     return [value]
 
 
+def _is_text_name(value):
+    return isinstance(value, str) and value.strip() != ""
+
+
 def _read_only_document(doc):
     # OpenDoc6's read-only option does not propagate to every loaded reference.
     # Restrict the owned in-memory document without saving or changing its file.
@@ -883,28 +887,38 @@ class SolidWorksBackend(CadBackend):
         component = str(reference.get("component") or "")
         if component not in self._components:
             raise CadError("cad_missing_component", component, {"axis_reference": reference})
+        feature_name = reference.get("feature_name")
         face_index = reference.get("face_index")
-        if not isinstance(face_index, int) or isinstance(face_index, bool) or face_index < 0:
-            raise CadError("cad_axis_reference_invalid", "face_index must be a non-negative integer", reference)
-        body_type = 1 if str(reference.get("body_type") or "solid") == "sheet" else 0
-        holder = self._components[component]
-        bodies = self._body_list(holder, body_type, component)
-        if bodies is None:
-            raise CadError(
-                "cad_axis_reference_unreadable",
-                "component bodies could not be enumerated",
-                {"component": component, "body_type": body_type},
-            )
-        faces = []
-        for body in bodies:
-            faces.extend(_as_list(_member(body, "GetFaces")))
-        if face_index >= len(faces):
+        if not _is_text_name(feature_name) and (
+            not isinstance(face_index, int) or isinstance(face_index, bool) or face_index < 0
+        ):
             raise CadError(
                 "cad_axis_reference_invalid",
-                "face_index is outside the component's faces",
-                {"component": component, "face_index": face_index, "faces": len(faces)},
+                "the selector needs a named feature or a non-negative face_index",
+                reference,
             )
-        face = faces[face_index]
+        body_type = 1 if str(reference.get("body_type") or "solid") == "sheet" else 0
+        holder = self._components[component]
+        if _is_text_name(feature_name):
+            face = self._cylinder_face_by_feature(holder, str(feature_name), component)
+        else:
+            bodies = self._body_list(holder, body_type, component)
+            if bodies is None:
+                raise CadError(
+                    "cad_axis_reference_unreadable",
+                    "component bodies could not be enumerated",
+                    {"component": component, "body_type": body_type},
+                )
+            faces = []
+            for body in bodies:
+                faces.extend(_as_list(_member(body, "GetFaces")))
+            if face_index >= len(faces):
+                raise CadError(
+                    "cad_axis_reference_invalid",
+                    "face_index is outside the component's faces",
+                    {"component": component, "face_index": face_index, "faces": len(faces)},
+                )
+            face = faces[face_index]
         surface = _member(face, "GetSurface")
         params = list(map(float, _member(surface, "CylinderParams") or ()))
         if len(params) != 7 or not all(map(math.isfinite, params)):
@@ -929,10 +943,10 @@ class SolidWorksBackend(CadBackend):
             face_name = str(_member(face, "Name") or "")
         except CadError:
             face_name = ""
-        return {
+        record = {
             "component": component,
             "body_type": "sheet" if body_type == 1 else "solid",
-            "face_index": face_index,
+            "selector": {key: value for key, value in reference.items() if key != "note"},
             "face_name": face_name,
             "surface": "cylinder",
             # IComponent2 bodies answer in component/part-local coordinates and
@@ -945,6 +959,59 @@ class SolidWorksBackend(CadBackend):
             "radius_m": float(radius),
             "used_api": ("IComponent2.GetBodies2/IBody2.GetFaces/IFace2.GetSurface/ISurface.CylinderParams"),
         }
+        if isinstance(face_index, int) and not isinstance(face_index, bool):
+            record["face_index"] = face_index
+        persist = self._persist_reference(face)
+        if persist is not None:
+            record["persist_reference_b64"] = persist
+        return record
+
+    def _cylinder_face_by_feature(self, holder, feature_name, component):
+        """Resolve a named feature's unique cylindrical face; ambiguity fails."""
+
+        document = _member(holder, "GetModelDoc2")
+        feature = _member(document, "FirstFeature")
+        matches = 0
+        found = None
+        while feature is not None:
+            if str(_member(feature, "Name") or "") == feature_name:
+                matches += 1
+                for candidate in _as_list(_member(feature, "GetFaces")):
+                    params = list(map(float, _member(_member(candidate, "GetSurface"), "CylinderParams") or ()))
+                    if len(params) != 7:
+                        continue
+                    direction = params[3:6]
+                    norm = math.sqrt(sum(value * value for value in direction))
+                    if abs(norm - 1.0) <= 1e-6 and params[6] > 0.0:
+                        if found is not None:
+                            raise CadError(
+                                "cad_axis_reference_ambiguous",
+                                "the named feature carries more than one cylindrical face",
+                                {"component": component, "feature_name": feature_name},
+                            )
+                        found = candidate
+            feature = _member(feature, "GetNextFeature")
+        if found is None:
+            raise CadError(
+                "cad_axis_reference_not_cylinder",
+                "no cylindrical face found on the named feature",
+                {"component": component, "feature_name": feature_name, "features_matched": matches},
+            )
+        return found
+
+    def _persist_reference(self, face):
+        """Best-effort CAD persistent reference for the resolved entity."""
+
+        try:
+            import base64
+
+            data = _member(_member(self._doc, "Extension"), "GetPersistReference3", face)
+            if data is None:
+                return None
+            blob = bytes(int(value) & 0xFF for value in data)
+            return base64.b64encode(blob).decode("ascii")
+        except Exception:  # noqa: BLE001 - a missing persistent reference is not fatal
+            return None
 
     def _component_override_flags(self, doc, component):
         """Effective override flags for one selected component instance."""
