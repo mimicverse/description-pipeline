@@ -1,6 +1,14 @@
 {
   "evidence_class": "fixture",
   "manifest_digest": "c198308d213d71d7e0c8e1e69d047ed2f63033a33da7360f5e54e173b9c5f0c7",
+  "pipeline": {
+    "declared": true,
+    "id": "fixture-to-urdf",
+    "resolved_from": "config/robot.yaml",
+    "schema_version": "description.pipeline/v1",
+    "source_kind": "fixture"
+  },
+  "pipeline_id": "fixture-to-urdf",
   "provider": "fixture",
   "schema_version": "description.source-lock/v1",
   "snapshot": "sources/snapshots/c198308d213d71d7e0c8e1e69d047ed2f63033a33da7360f5e54e173b9c5f0c7",

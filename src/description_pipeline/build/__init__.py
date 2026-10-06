@@ -16,6 +16,7 @@ from pathlib import Path
 from packaging.requirements import Requirement
 
 from .. import __version__
+from .. import pipeline
 from ..backends import generate
 from ..io import PipelineError, confined, digest, file_digest, inventory, read_data, write_json
 from ..model import Robot, validate_scene_schema
@@ -134,7 +135,7 @@ def profile_for(root: Path, name: str) -> dict:
 
 def definition(root: Path) -> dict:
     value = read_data(confined(root, "config/robot.yaml"))
-    allowed = {"schema_version", "hardware_id", "source", "overrides", "robot", "interfaces"}
+    allowed = {"schema_version", "hardware_id", "source", "overrides", "robot", "interfaces", "pipeline_id"}
     if (
         not isinstance(value, dict)
         or set(value) - allowed
@@ -148,6 +149,15 @@ def definition(root: Path) -> dict:
     interfaces = value.get("interfaces", {})
     if not isinstance(interfaces, dict) or set(interfaces) - INTERFACE_FIELDS:
         raise PipelineError("Unsupported author interface fields")
+    declared = value.get("pipeline_id")
+    if declared is not None:
+        pipeline.get(declared)  # unknown ids name the published pipeline ids
+        kind = pipeline.effective_source_kind(value.get("source"), value.get("robot"))
+        if kind in pipeline.NATIVE_KINDS:
+            # A native authoring entry point is unambiguous, so reject a mismatch before any capture.
+            # Wrapper entry points (fixture/snapshot/imported) can carry any provider's data, and
+            # freeze re-checks the declaration against the kind the snapshot actually carries.
+            pipeline.resolve_identity(declared, source=value.get("source"), robot=value.get("robot"))
     return value
 
 
@@ -334,7 +344,17 @@ def freeze(root: Path) -> dict:
             "manifest_digest": fingerprint,
             "source_config_digest": digest(config["source"]),
             "evidence_class": manifest["evidence_class"],
+            "pipeline": pipeline.resolve_identity(
+                config.get("pipeline_id"),
+                source=config["source"],
+                robot=config.get("robot"),
+                frozen_kind=manifest["kind"],
+                identity_provider=(
+                    manifest.get("identity", {}).get("provider") if isinstance(manifest.get("identity"), dict) else None
+                ),
+            ),
         }
+        locked["pipeline_id"] = locked["pipeline"]["id"]
         write_json(sources / "source.lock.json", locked)
         return locked
     except Exception as error:
@@ -365,6 +385,7 @@ def inputs(root: Path) -> tuple[dict, dict, Path, dict]:
     manifest = verify_snapshot(path)
     if locked.get("manifest_digest") != digest(manifest):
         raise PipelineError("Source lock does not match snapshot")
+    pipeline.verify_lock(locked, config, manifest)
     return config, locked, path, manifest
 
 
@@ -523,6 +544,19 @@ def assess(
     raw_scene = load_scene(source)
     expected = normalize(raw_scene, config, root, source)
     checks = [_derivation(root, source, expected, data)]
+    pipeline_identity = pipeline.verify_lock(source_lock, config, source_manifest)
+    checks.append(
+        result(
+            "source.pipeline",
+            True,
+            expected=[pipeline_identity["id"]],
+            checked=[pipeline_identity["id"]],
+            details={
+                "pipeline": pipeline_identity,
+                "legacy_lock": pipeline_identity["resolved_from"] == "legacy_lock",
+            },
+        )
+    )
     provider = source_manifest["kind"]
     if provider == "onshape":
         identity = source_manifest["identity"]
@@ -645,7 +679,8 @@ def assess(
                 manifest.get("schema_version") == "description.bundle/v1"
                 and manifest.get("subject") == digest(files)
                 and manifest.get("files") == files
-                and manifest.get("profile") == profile_name,
+                and manifest.get("profile") == profile_name
+                and manifest.get("pipeline_id") == pipeline_identity["id"],
                 details={"expected": manifest.get("subject"), "actual": digest(files)},
             )
         )
@@ -668,6 +703,7 @@ def assess(
                 "bundle.report_binding",
                 committed_report.get("subject") == digest(files)
                 and committed_report.get("profile_digest") == digest(profile)
+                and committed_report.get("pipeline_id") == pipeline_identity["id"]
                 and committed_report.get("passed") is True,
             )
         )
@@ -679,6 +715,8 @@ def assess(
     report = {
         "schema_version": "description.quality/v1",
         "hardware_id": config["hardware_id"],
+        "pipeline_id": pipeline_identity["id"],
+        "pipeline": pipeline_identity,
         "subject": digest(files),
         "files": files,
         "source": source_lock,
@@ -759,6 +797,8 @@ def build(
             "",
             f"Subject: `{report['subject']}`",
             "",
+            f"Pipeline: `{report.get('pipeline_id') or 'unmapped'}`",
+            "",
             f"Passed: {report['passed']}",
             "",
             "| Check | Status | Missing |",
@@ -774,6 +814,7 @@ def build(
                 "schema_version": "description.bundle/v1",
                 "subject": report["subject"],
                 "files": report["files"],
+                "pipeline_id": report.get("pipeline_id"),
                 "reports": {name: file_digest(staging / name) for name in ("docs/quality.json", "docs/quality.md")},
                 "profile": profile_name,
                 "source": _locked,

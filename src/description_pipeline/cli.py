@@ -10,6 +10,7 @@ import subprocess
 from pathlib import Path, PureWindowsPath
 
 from . import __version__
+from . import pipeline, runlog
 from .build import OBJECT_FIELDS, assess, build, freeze, lock_toolchain
 from .build.publication import recover
 from .sources.onshape.errors import OnshapeSourceError
@@ -81,6 +82,27 @@ def _path_advice(error: BaseException) -> str:
 
         return WINDOWS_LONG_PATH_ADVICE + " The workspace was not modified."
     return ""
+
+
+def _app_control_block(error: BaseException) -> dict | None:
+    """Classify an App Control rejection, including one wrapped in an ``ImportError``.
+
+    MuJoCo's native loader can fail while importing ``_callbacks``; on a localized Windows install
+    the OS error may be reachable only through the import error's cause chain.  The classifier
+    itself lives in ``doctor`` (one source of truth with ``description doctor``).
+    """
+
+    from .doctor import app_control_rejection
+
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        block = app_control_rejection(current)
+        if block is not None:
+            return block
+        current = current.__cause__ or current.__context__
+    return None
 
 
 DEFAULT_WORKER_URL = "http://127.0.0.1:8765"
@@ -206,6 +228,46 @@ def _diff_area(area: str, detail) -> str:
     return area
 
 
+def _pipeline_lines(value: dict) -> list[str]:
+    """Human output for `pipeline list` / `pipeline show`; the JSON form carries the same data."""
+
+    if "pipelines" in value:
+        return [
+            f"{entry['id']:22s} {entry['title']} (sources: {', '.join(entry['source_kinds'])})"
+            for entry in value["pipelines"]
+        ]
+    if "pipeline" in value:
+        entry = value["pipeline"]
+        lines = [
+            f"pipeline  : {entry['id']}",
+            f"title     : {entry['title']}",
+            f"source    : {', '.join(entry['source_kinds'])}",
+            "stages:",
+        ]
+        lines += [
+            f"  {number}. {stage['name']:<9s} {stage['summary']}\n"
+            f"     code: {stage['code']}\n"
+            f"     docs: {stage['document']}"
+            for number, stage in enumerate(entry["stages"], 1)
+        ]
+        lines += ["documents:"] + [f"  {document}" for document in entry["documents"]]
+        return lines
+    workspace = value["workspace"]
+    identity = workspace["identity"]
+    lines = [
+        f"root      : {workspace['root']}",
+        f"declared  : {workspace['declared_id'] or 'none (legacy default)'}",
+        f"resolved  : {identity['id'] or 'unmapped'}",
+        f"source    : {identity.get('source_kind')}",
+        f"provenance: {identity['resolved_from']}",
+    ]
+    if identity["id"]:
+        entry = pipeline.describe(identity["id"])
+        lines += ["", f"title     : {entry['title']}", "stages:"]
+        lines += [f"  {number}. {stage['name']:<9s} {stage['code']}" for number, stage in enumerate(entry["stages"], 1)]
+    return lines
+
+
 def _diff_line(value: dict) -> str:
     """The sentence a review starts with, in front of a report that can run to megabytes."""
 
@@ -274,6 +336,14 @@ def parser() -> argparse.ArgumentParser:
     source.add_parser("freeze").add_argument("--root", type=Path, required=True)
     tool = commands.add_parser("tool").add_subparsers(dest="operation", required=True)
     tool.add_parser("lock").add_argument("--root", type=Path, required=True)
+    pipeline_cmd = commands.add_parser("pipeline", help="List or describe the published source-to-URDF pipelines")
+    pipelines = pipeline_cmd.add_subparsers(dest="operation", required=True)
+    listing = pipelines.add_parser("list", help="List every published pipeline id")
+    listing.add_argument("--json", action="store_true", help="print the machine-readable catalog")
+    show = pipelines.add_parser("show", help="Show one published pipeline, or the one a workspace uses")
+    show.add_argument("id", nargs="?", help="published id, for example solidworks-to-urdf")
+    show.add_argument("--root", type=Path, help="model workspace whose pipeline identity to describe")
+    show.add_argument("--json", action="store_true", help="print the machine-readable description")
     diff = commands.add_parser("diff")
     diff.add_argument("before", type=Path)
     diff.add_argument("after", type=Path)
@@ -376,6 +446,7 @@ def main(argv: list[str] | None = None) -> int:
     # Windows redirected streams otherwise use the active ANSI code page.
     pin_utf8_streams()
     args = parser().parse_args(argv)
+    run = runlog.begin(args, list(argv) if argv is not None else sys.argv[1:])
     report_path = getattr(args, "report", None)
     mechanical_reference = getattr(args, "mechanical_reference", None)
     reference_option = (
@@ -467,6 +538,24 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.command == "tool":
             value = lock_toolchain(args.root.resolve())
+        elif args.command == "pipeline":
+            if args.operation == "list":
+                value = {"schema_version": pipeline.SCHEMA, "pipelines": pipeline.catalog()}
+                if not args.json:
+                    for line in _pipeline_lines(value):
+                        print(line)
+                    return 0
+            else:
+                if (args.id is None) == (args.root is None):
+                    raise PipelineError("pipeline show needs a published pipeline id or --root MODEL")
+                if args.id is not None:
+                    value = {"schema_version": pipeline.SCHEMA, "pipeline": pipeline.describe(args.id)}
+                else:
+                    value = {"schema_version": pipeline.SCHEMA, "workspace": pipeline.workspace_identity(args.root)}
+                if not args.json:
+                    for line in _pipeline_lines(value):
+                        print(line)
+                    return 0
         elif args.command == "diff":
             value = compare_models(args.repository, args.before, args.after)
             if not args.json:
@@ -582,6 +671,9 @@ def main(argv: list[str] | None = None) -> int:
             if args.apply:
                 value["review_evidence"] = args.review_evidence
                 value = promote(args.root, value, mechanical_reference=args.mechanical_reference)
+        if run is not None:
+            value["run_id"] = run["run_id"]
+            runlog.note(run, value)
         if report_path:
             write_json(report_path, value)
         for hint in value.get("next") or []:
@@ -602,6 +694,7 @@ def main(argv: list[str] | None = None) -> int:
         subprocess.SubprocessError,
         OnshapeSourceError,
         BridgeError,
+        ImportError,
         KeyboardInterrupt,
     ) as error:
         value = {
@@ -610,12 +703,10 @@ def main(argv: list[str] | None = None) -> int:
             "message": " ".join(part for part in (_failure_message(error), _path_advice(error)) if part)
             or "Operation interrupted",
         }
-        block = None
-        if isinstance(error, OSError):
-            from .doctor import app_control_message, app_control_rejection
-
-            block = app_control_rejection(error)
+        block = _app_control_block(error)
         if block is not None:
+            from .doctor import app_control_message
+
             value["code"] = block["code"]
             value["winerror"] = block["winerror"]
             value["library"] = block.get("library")
@@ -625,6 +716,9 @@ def main(argv: list[str] | None = None) -> int:
             value["diagnostic_path"] = str(vars(error)["diagnostic_path"])
         if isinstance(error, (OnshapeSourceError, BridgeError)):
             value.update(code=error.code, detail=error.detail)
+        if run is not None:
+            value["run_id"] = run["run_id"]
+            runlog.note(run, value, outcome="error")
         if report_path and (
             not report_path.resolve().is_relative_to(args.root.resolve())
             or report_path.resolve().is_relative_to(args.root.resolve() / "build")
@@ -635,6 +729,8 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 130 if isinstance(error, KeyboardInterrupt) else 2
+    finally:
+        runlog.finish(run)
 
 
 if __name__ == "__main__":

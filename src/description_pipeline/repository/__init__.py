@@ -27,6 +27,7 @@ from ..build import (
     semantic_diff,
     verify_toolchain,
 )
+from .. import pipeline
 from ..io import PipelineError, quote_argument, write_json
 from .tunnel import worker_health, worker_tunnel
 
@@ -62,10 +63,20 @@ def init_model(root: Path, hardware: str, source: dict, *, repository: Path | No
         git(root, "rm", "-rf", "--ignore-unmatch", ".")
     else:
         root.mkdir(parents=True)
-    write_json(
-        root / "config/robot.yaml",
-        {"schema_version": "description.definition/v1", "hardware_id": hardware, "source": source, "overrides": []},
-    )
+    definition_record = {
+        "schema_version": "description.definition/v1",
+        "hardware_id": hardware,
+        "source": source,
+        "overrides": [],
+    }
+    robot = source.get("robot") if isinstance(source.get("robot"), dict) else None
+    # Only persist an id that is unambiguous before the first capture.  ``snapshot`` and
+    # ``imported`` wrappers can carry any provider's data, so their workflow is resolved from the
+    # frozen kind at freeze time instead of being guessed here.
+    provider = source.get("provider")
+    if provider in {"solidworks", "onshape", "fixture"}:
+        definition_record["pipeline_id"] = pipeline.resolve_identity(None, source=source, robot=robot)["id"]
+    write_json(root / "config/robot.yaml", definition_record)
     for purpose in ("kinematics", "simulation", "training", "hardware"):
         write_json(
             root / f"config/profiles/{purpose}.json",
@@ -474,6 +485,7 @@ def update(
             "state": submitted.get("state"),
             "root": str(root),
             "profile": profile,
+            "pipeline_id": report.get("pipeline_id"),
             "branch": submitted.get("branch", preflight["branch"]),
             "model_sha": submitted.get("model_sha"),
             "preflight": preflight,
@@ -484,6 +496,7 @@ def update(
                 "passed": report.get("passed"),
                 "subject": report.get("subject"),
                 "profile_digest": report.get("profile_digest"),
+                "pipeline_id": report.get("pipeline_id"),
             },
             "submit": submitted,
             "pull_request": submitted.get("pull_request"),
@@ -570,7 +583,8 @@ def _review_request(
     )
     body = (
         f"Model candidate `{sha}` for `{hardware}`.\n\n"
-        f"Profile: `{profile}`. Local subject: `{report['subject']}`.\n"
+        f"Pipeline: `{report.get('pipeline_id') or 'unmapped'}`. Profile: `{profile}`. "
+        f"Local subject: `{report['subject']}`.\n"
         "Local independent verification passed. Release re-fetches this exact candidate from the remote "
         "and checks its source, artifacts, pinned tool and intended use.\n\n"
         + ("GitHub CI was explicitly requested; its result is pending.\n\n" if ci else "")
@@ -665,6 +679,7 @@ def _submit(
         "repository": repository_slug(root),
         "model_sha": sha,
         "profile": profile,
+        "pipeline_id": report.get("pipeline_id"),
         "branch": branch,
         "state": "pushed",
         "mechanical_reference_sha256": _mechanical_digest(report),
@@ -859,6 +874,7 @@ def promotion_plan(
         "profile": profile,
         "ci": ci,
         "subject": report["subject"],
+        "pipeline_id": report.get("pipeline_id"),
         "tool_main": tool_main,
         "report": report,
         "mechanical_reference_sha256": _mechanical_digest(report),
@@ -875,7 +891,7 @@ def promote(repository: Path, plan: dict, *, mechanical_reference: Path | None =
         ci=plan.get("ci", False),
         mechanical_reference=mechanical_reference,
     )
-    for key in ("previous_release", "release_ref", "subject", "mechanical_reference_sha256"):
+    for key in ("previous_release", "release_ref", "subject", "pipeline_id", "mechanical_reference_sha256"):
         if fresh.get(key) != plan.get(key):
             raise PipelineError(f"Stale promotion plan: {key} changed")
     review_run = _review(repository, plan)
