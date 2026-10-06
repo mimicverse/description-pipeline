@@ -19,10 +19,13 @@ from pathlib import Path
 
 import yaml
 
+from ..delivery import subject_digest
 from . import _hardware, check_layout, git
 
-REQUIRED_FILES = ("input/robot.yaml", "model/robot.json", "urdf/robot.urdf", "reports/input.json")
+REQUIRED_FILES = ("README.md", "input/robot.yaml", "model/robot.json", "urdf/robot.urdf",
+                  "reports/input.json", "reports/tool.json")
 REQUIRED_DIRS = ("evidence", "meshes")
+OWNED_PATHS = ("README.md", "input", "evidence", "model", "urdf", "meshes", "reports")
 REVIEW_BRANCH = "work/solidworks/{hardware}"
 
 
@@ -39,13 +42,7 @@ def _fail(code: str, detail: object | None = None) -> dict:
 
 def subject_hash(bundle: Path) -> str:
     """Deterministic SHA-256 over every bundle file except the quality report itself."""
-    digest = hashlib.sha256()
-    for path in sorted(p for p in bundle.rglob("*") if p.is_file()):
-        rel = path.relative_to(bundle).as_posix()
-        if rel == "reports/quality.json":
-            continue
-        digest.update(rel.encode("utf-8") + b"\0" + hashlib.sha256(path.read_bytes()).digest())
-    return digest.hexdigest()
+    return subject_digest(Path(bundle))
 
 
 def _serialize(report: dict) -> str:
@@ -84,8 +81,9 @@ def _check(bundle: Path) -> tuple[str, dict]:
     report = _load_verifier()(bundle)
     if not isinstance(report, dict) or report.get("passed") is not True:
         raise PrError("verification_failed", report if isinstance(report, dict) else None)
-    if report.get("subject") != subject:
-        raise PrError("verification_subject_mismatch", {"expected": subject, "reported": report.get("subject")})
+    reported = report.get("subject_sha256") or report.get("subject")
+    if reported != subject:
+        raise PrError("verification_subject_mismatch", {"expected": subject, "reported": reported})
     quality = bundle / "reports/quality.json"
     if not quality.is_file():
         raise PrError("missing_quality_report", "reports/quality.json is required")
@@ -106,10 +104,19 @@ def _stage_and_push(repository: Path, bundle: Path, base: str, branch: str, subj
     worktree = staging / "worktree"
     try:
         git(repository, "worktree", "add", "--detach", str(worktree), base_sha)
+        # Replace only the governed delivery paths; inherited config/sources/docs stay untouched.
+        for name in OWNED_PATHS:
+            target = worktree / name
+            if target.is_dir():
+                shutil.rmtree(target)
+            elif target.exists():
+                target.unlink()
         for path in sorted(p for p in bundle.rglob("*") if p.is_file()):
             target = worktree / path.relative_to(bundle)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(path, target)
+        if subject_digest(worktree) != subject:
+            raise PrError("staged_subject_mismatch", "delivered bytes differ from the verified bundle")
         git(worktree, "add", "--all")
         git(worktree, "commit", "-m", message)
         commit = git(worktree, "rev-parse", "HEAD").stdout.strip()

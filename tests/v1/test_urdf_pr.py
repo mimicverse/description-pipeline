@@ -37,12 +37,14 @@ class Fixture:
         run("git", "config", "user.name", "Test", cwd=self.repo)
         self.bundle = self.tmp / "bundle"
         for rel, text in {
+            "README.md": "# m3.0\n",
             "input/robot.yaml": "hardware: m3.0\n",
             "evidence/raw.json": "{}\n",
             "model/robot.json": "{}\n",
             "urdf/robot.urdf": "<robot name='m3.0'/>\n",
             "meshes/part.stl": "solid\n",
             "reports/input.json": "{}\n",
+            "reports/tool.json": "{}\n",
         }.items():
             path = self.bundle / rel
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -69,7 +71,7 @@ class SubmitBundleTests(unittest.TestCase):
             raise AssertionError(args)
 
         def verifier(bundle: Path) -> dict:
-            report = {"passed": True, "subject": urdf_pr.subject_hash(bundle)}
+            report = {"passed": True, "subject_sha256": urdf_pr.subject_hash(bundle)}
             (bundle / "reports/quality.json").write_text(urdf_pr._serialize(report), encoding="utf-8")
             return report
 
@@ -95,15 +97,15 @@ class SubmitBundleTests(unittest.TestCase):
         self.assertEqual(self.fx.remote_branch_sha(), second["commit"])
 
     def test_tampered_subject_never_pushes(self) -> None:
-        with mock.patch.object(urdf_pr, "_load_verifier", lambda: (lambda bundle: {"passed": True, "subject": "0" * 64})):
+        with mock.patch.object(urdf_pr, "_load_verifier", lambda: (lambda bundle: {"passed": True, "subject_sha256": "0" * 64})):
             result = self.submit()
         self.assertEqual(result["state"], "failed")
         self.assertEqual(result["error"], "verification_subject_mismatch")
         self.assertEqual(self.fx.remote_branch_sha(), "")
 
     def test_stale_passed_report_never_pushes(self) -> None:
-        (self.fx.bundle / "reports/quality.json").write_text('{"passed": true, "subject": "old"}\n', encoding="utf-8")
-        no_write = lambda bundle: {"passed": True, "subject": urdf_pr.subject_hash(bundle)}  # noqa: E731
+        (self.fx.bundle / "reports/quality.json").write_text('{"passed": true, "subject_sha256": "old"}\n', encoding="utf-8")
+        no_write = lambda bundle: {"passed": True, "subject_sha256": urdf_pr.subject_hash(bundle)}  # noqa: E731
         with mock.patch.object(urdf_pr, "_load_verifier", lambda: no_write):
             result = self.submit()
         self.assertEqual(result["error"], "stale_quality_report")
