@@ -86,6 +86,18 @@ class GeneratorScopeTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             tensor_from_raw(STANDARD, {"used_api": "IMassProperty2.GetMomentOfInertia(0)"}, where="analytic fixture")
 
+    def test_unvalidated_fallback_arrays_are_never_relabelled(self):
+        # The analytic proof covers GetMomentOfInertia(0) only.  A legacy
+        # GetMassProperties2 array declares no convention and stays unusable.
+        fallback = {
+            "used_api": "IModelDocExtension.GetMassProperties2(1, status, False)",
+            "com": "not_inferred",
+            "inertia": "not_inferred",
+            "product_convention": None,
+        }
+        with self.assertRaises(ConfigError):
+            tensor_from_raw(STANDARD, fallback, where="legacy fallback")
+
 
 class VerifyOracleScopeTests(unittest.TestCase):
     def _payload(self, raw, reference):

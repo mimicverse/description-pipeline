@@ -24,11 +24,21 @@ TRIANGLE = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
 
 
 class FakeFace:
-    def __init__(self, triangles):
+    def __init__(self, triangles, surface=None):
         self._triangles = triangles
+        self._surface = surface
+        self.Name = "Face3"
 
     def GetTessTriangles(self, flag):  # noqa: N802 - SolidWorks API name
         return list(self._triangles)
+
+    def GetSurface(self):  # noqa: N802 - SolidWorks API name
+        return self._surface
+
+
+class FakeSurface:
+    def __init__(self, params):
+        self.CylinderParams = list(params)
 
 
 class FakeBody:
@@ -56,6 +66,13 @@ class FakeComponent:
         return self._document
 
     def GetBodies2(self, body_type, visible_only):  # noqa: N802 - SolidWorks API name
+        return list(self._bodies.get(body_type, ()))
+
+
+class FakeComponentOneArg(FakeComponent):
+    """IComponent2 answers GetBodies2 with the body type only."""
+
+    def GetBodies2(self, body_type):  # noqa: N802 - SolidWorks API name
         return list(self._bodies.get(body_type, ()))
 
 
@@ -125,6 +142,60 @@ class ComponentMeshExportTests(unittest.TestCase):
         with self.assertRaises(CadError) as caught:
             _backend(component).export_component_mesh("missing-1", self.dest)
         self.assertEqual(caught.exception.code, "cad_missing_component")
+
+
+class AxisReferenceTests(unittest.TestCase):
+    def _component_with(self, face):
+        return FakeComponent(FakeDocument([]), {0: [FakeBody([face])], 1: []})
+
+    def test_cylinder_face_resolves_to_a_native_line(self):
+        face = FakeFace(TRIANGLE, FakeSurface([0.01, 0.02, 0.03, 0.0, 0.0, 1.0, 0.005]))
+        record = _backend(self._component_with(face)).capture_axis_reference(
+            {"component": "pcb-1", "face_index": 0}
+        )
+        self.assertEqual(record["surface"], "cylinder")
+        self.assertEqual(record["axis_point_m"], [0.01, 0.02, 0.03])
+        self.assertEqual(record["axis_direction"], [0.0, 0.0, 1.0])
+        self.assertEqual(record["radius_m"], 0.005)
+        self.assertEqual(record["face_name"], "Face3")
+        self.assertEqual(record["component"], "pcb-1")
+        self.assertIn("CylinderParams", record["used_api"])
+
+    def test_non_cylindrical_face_fails(self):
+        face = FakeFace(TRIANGLE, FakeSurface([0.0, 0.0, 0.0, 0.0, 0.0, 1.0]))
+        with self.assertRaises(CadError) as caught:
+            _backend(self._component_with(face)).capture_axis_reference({"component": "pcb-1", "face_index": 0})
+        self.assertEqual(caught.exception.code, "cad_axis_reference_not_cylinder")
+
+    def test_planar_garbage_params_are_not_accepted_as_a_cylinder(self):
+        # SolidWorks answers CylinderParams for planar faces with garbage; the
+        # geometry itself must prove it is a cylinder.
+        face = FakeFace(TRIANGLE, FakeSurface([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 5.6e-315]))
+        with self.assertRaises(CadError) as caught:
+            _backend(self._component_with(face)).capture_axis_reference({"component": "pcb-1", "face_index": 0})
+        self.assertEqual(caught.exception.code, "cad_axis_reference_not_cylinder")
+
+    def test_face_index_out_of_range_fails(self):
+        face = FakeFace(TRIANGLE, FakeSurface([0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.01]))
+        with self.assertRaises(CadError) as caught:
+            _backend(self._component_with(face)).capture_axis_reference({"component": "pcb-1", "face_index": 4})
+        self.assertEqual(caught.exception.code, "cad_axis_reference_invalid")
+
+    def test_missing_component_fails(self):
+        face = FakeFace(TRIANGLE, FakeSurface([0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.01]))
+        with self.assertRaises(CadError) as caught:
+            _backend(self._component_with(face)).capture_axis_reference({"component": "ghost-1", "face_index": 0})
+        self.assertEqual(caught.exception.code, "cad_missing_component")
+
+    def test_component_arity_fallback_is_supported(self):
+        face = FakeFace(TRIANGLE, FakeSurface([0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.006]))
+        component = FakeComponentOneArg(FakeDocument([]), {0: [FakeBody([face])], 1: []})
+        backend = object.__new__(SolidWorksBackend)
+        backend._components = {"arm-1": component}
+        backend.notes = {}
+        record = backend.capture_axis_reference({"component": "arm-1", "face_index": 0})
+        self.assertEqual(record["radius_m"], 0.006)
+        self.assertIn("IComponent2.GetBodies2(type)", backend.notes["bodies_api:arm-1:0"])
 
 
 if __name__ == "__main__":

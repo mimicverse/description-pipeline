@@ -483,8 +483,10 @@ def _validate_source(
         report.error("input.bodies_invalid", "source.bodies must be a non-empty list", {"value": bodies})
         bodies = []
     joints = source.get("joints")
-    if not isinstance(joints, list) or not joints:
-        report.error("input.joints_invalid", "source.joints must be a non-empty list", {"value": joints})
+    if joints is None:
+        joints = []
+    if not isinstance(joints, list):
+        report.error("input.joints_invalid", "source.joints must be a list", {"value": joints})
         joints = []
     frames = source.get("frames") or []
     if not isinstance(frames, list):
@@ -659,12 +661,45 @@ def _validate_source(
                         {"joint": name},
                     )
             continue
-        if not _is_text(joint.get("axis_reference")):
+        reference = joint.get("axis_reference")
+        if not isinstance(reference, dict):
+            # Free text carries no numeric evidence; a moving joint must name
+            # the native component/face that the capture resolves.
             report.error(
                 "input.joint_axis_reference_invalid",
-                f"{where}.axis_reference must name the native component/face that defines the axis",
-                {"joint": name},
+                f"{where}.axis_reference must be a structured native selector "
+                "(component + face_index) for a movable joint",
+                {"joint": name, "axis_reference": reference},
             )
+        else:
+            if isinstance(reference, dict):
+                _unknown_keys(
+                    reference,
+                    {"component", "face_index", "body_type", "note"},
+                    report,
+                    "input.joint_axis_reference_invalid",
+                    f"{where}.axis_reference",
+                )
+                if not _is_text(reference.get("component")):
+                    report.error(
+                        "input.joint_axis_reference_invalid",
+                        f"{where}.axis_reference.component must name a component instance",
+                        {"joint": name, "component": reference.get("component")},
+                    )
+                face_index = reference.get("face_index")
+                if not isinstance(face_index, int) or isinstance(face_index, bool) or face_index < 0:
+                    report.error(
+                        "input.joint_axis_reference_invalid",
+                        f"{where}.axis_reference.face_index must be a non-negative integer",
+                        {"joint": name, "face_index": face_index},
+                    )
+                body_type = reference.get("body_type", "solid")
+                if body_type not in ("solid", "sheet"):
+                    report.error(
+                        "input.joint_axis_reference_invalid",
+                        f"{where}.axis_reference.body_type must be 'solid' or 'sheet'",
+                        {"joint": name, "body_type": body_type},
+                    )
         axis = _unit_axis(joint.get("axis"), report, "input.joint_axis_invalid", f"{where}.axis")
         _structured_evidence(
             joint.get("limit_evidence"),

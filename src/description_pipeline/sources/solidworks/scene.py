@@ -652,7 +652,9 @@ def _build_joints(
         }
         axis_reference = joint.get("axis_reference")
         if axis_reference is not None:
-            entry["provenance"]["axis_reference"] = str(axis_reference)
+            entry["provenance"]["axis_reference"] = (
+                dict(axis_reference) if isinstance(axis_reference, dict) else str(axis_reference)
+            )
         limit_evidence = joint.get("limit_evidence")
         if isinstance(limit_evidence, dict):
             entry["provenance"]["limits_evidence"] = {

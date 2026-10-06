@@ -1332,6 +1332,33 @@ def _verify_originals_unchanged(backend: Any, closure: dict[str, Any]) -> dict[s
     return {"files_checked": len(recorded), "states_checked": checked_states}
 
 
+def _capture_axis_references(backend: Any, cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Resolve every structured joint axis reference to a native line.
+
+    A joint that names a native component/face must yield numeric evidence
+    (point + direction + identity); a backend that cannot resolve it is a
+    capture failure, never a silently skipped record.  Legacy free-text axis
+    references carry no numeric capture and are left to the author.
+    """
+
+    reader = getattr(backend, "capture_axis_reference", None)
+    captured: list[dict[str, Any]] = []
+    for joint in cfg.get("joints") or []:
+        reference = joint.get("axis_reference")
+        if not isinstance(reference, dict):
+            continue
+        joint_name = str(joint.get("name") or joint.get("id") or "")
+        if not callable(reader):
+            raise BridgeError(
+                "cad_axis_reference_unsupported",
+                "this backend cannot resolve a structured joint axis reference",
+                {"joint": joint_name, "axis_reference": reference},
+                exit_code=3,
+            )
+        captured.append({"joint": joint_name, **reader(reference)})
+    return captured
+
+
 def _export_geometry(
     backend: Any, cfg: dict[str, Any], geometry_dir: Path, components: list[str]
 ) -> list[dict[str, Any]]:
@@ -1428,6 +1455,9 @@ def _freeze_local(
         write_json(staging / "raw" / "dependency_closure.json", closure)
         write_json(staging / "raw" / "coordinate_systems.json", raw["coordinate_systems"])
         write_json(staging / "raw" / "mass_properties.json", raw["mass_properties"])
+        axis_references = _capture_axis_references(backend, cfg)
+        if axis_references:
+            write_json(staging / "raw" / "axis_references.json", axis_references)
         mass_closure = _mass_closure(backend, cfg, scene)
         if mass_closure is not None:
             write_json(staging / "raw" / "mass_closure.json", mass_closure)

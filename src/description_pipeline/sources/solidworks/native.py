@@ -664,6 +664,9 @@ class SolidWorksBackend(CadBackend):
             "reference": {
                 "used_api": "IMassProperty2.GetMomentOfInertia(0)",
                 "scope": "part_document",
+                # The convention is proven for this API only (analytic fixture
+                # v2, 2026-10-06); fallback arrays are never relabelled.
+                "convention_basis": "analytic_fixture_v2_20261006",
                 "reference_point": "center_of_mass",
                 "axes": "part_document_axes",
                 "use_system_units": True,
@@ -740,6 +743,7 @@ class SolidWorksBackend(CadBackend):
                 "axes": "assembly_document_axes",
                 "use_system_units": True,
                 "product_convention": "solidworks_standard",
+                "convention_basis": "same_api_selection_family_as_measured_group",
                 "volume_m3": float(_member(mp, "Volume")),
                 "density_kg_m3": float(_member(mp, "Density")),
                 "overrides": overrides,
@@ -762,6 +766,9 @@ class SolidWorksBackend(CadBackend):
             "volume_index": 3,
             "com": "not_inferred",
             "inertia": "not_inferred",
+            # This fallback array is not covered by the analytic convention
+            # proof, so it must never claim a tensor convention.
+            "product_convention": None,
             "document": str(_member(doc, "GetPathName")),
         }
         return reading
@@ -859,6 +866,86 @@ class SolidWorksBackend(CadBackend):
                 "document": str(_member(doc, "GetPathName")),
                 "configuration": str(_member(configuration, "Name")),
             },
+        }
+
+    def capture_axis_reference(self, reference):
+        """Resolve a structured native face reference to its cylindrical axis.
+
+        ``reference`` is the authored joint ``axis_reference``
+        (``{component, face_index, body_type}``).  The returned record carries
+        the identity (component, face index, face name) and the numeric line:
+        a point on the axis, the unit direction and the radius, straight from
+        ``ISurface.CylinderParams``.  Independent verification can then test
+        the authored joint axis for collinearity and origin alignment instead of
+        trusting the datum alone.
+        """
+
+        component = str(reference.get("component") or "")
+        if component not in self._components:
+            raise CadError("cad_missing_component", component, {"axis_reference": reference})
+        face_index = reference.get("face_index")
+        if not isinstance(face_index, int) or isinstance(face_index, bool) or face_index < 0:
+            raise CadError("cad_axis_reference_invalid", "face_index must be a non-negative integer", reference)
+        body_type = 1 if str(reference.get("body_type") or "solid") == "sheet" else 0
+        holder = self._components[component]
+        bodies = self._body_list(holder, body_type, component)
+        if bodies is None:
+            raise CadError(
+                "cad_axis_reference_unreadable",
+                "component bodies could not be enumerated",
+                {"component": component, "body_type": body_type},
+            )
+        faces = []
+        for body in bodies:
+            faces.extend(_as_list(_member(body, "GetFaces")))
+        if face_index >= len(faces):
+            raise CadError(
+                "cad_axis_reference_invalid",
+                "face_index is outside the component's faces",
+                {"component": component, "face_index": face_index, "faces": len(faces)},
+            )
+        face = faces[face_index]
+        surface = _member(face, "GetSurface")
+        params = list(map(float, _member(surface, "CylinderParams") or ()))
+        if len(params) != 7 or not all(map(math.isfinite, params)):
+            raise CadError(
+                "cad_axis_reference_not_cylinder",
+                "the referenced face does not expose cylindrical geometry",
+                {"component": component, "face_index": face_index},
+            )
+        point, direction, radius = params[0:3], params[3:6], params[6]
+        norm = math.sqrt(sum(value * value for value in direction))
+        # Planar faces answer CylinderParams with garbage instead of raising, so
+        # the geometry itself must prove it is a cylinder: unit axis, positive
+        # radius.
+        if abs(norm - 1.0) > 1e-6 or radius <= 0.0:
+            raise CadError(
+                "cad_axis_reference_not_cylinder",
+                "the referenced face is not a cylinder with a unit axis and positive radius",
+                {"component": component, "face_index": face_index, "radius": radius, "axis_norm": norm},
+            )
+        face_name = ""
+        try:
+            face_name = str(_member(face, "Name") or "")
+        except CadError:
+            face_name = ""
+        return {
+            "component": component,
+            "body_type": "sheet" if body_type == 1 else "solid",
+            "face_index": face_index,
+            "face_name": face_name,
+            "surface": "cylinder",
+            # IComponent2 bodies answer in component/part-local coordinates and
+            # the cylinder axis is an undirected line: the authored joint axis
+            # supplies the positive direction.
+            "coordinate_frame": "component_local",
+            "direction_semantics": "undirected_axis_line",
+            "axis_point_m": [float(value) for value in point],
+            "axis_direction": [float(value) / norm for value in direction],
+            "radius_m": float(radius),
+            "used_api": (
+                "IComponent2.GetBodies2/IBody2.GetFaces/IFace2.GetSurface/ISurface.CylinderParams"
+            ),
         }
 
     def _component_override_flags(self, doc, component):
@@ -963,6 +1050,7 @@ class SolidWorksBackend(CadBackend):
             "reference": {
                 "used_api": "IMassProperty2.GetMomentOfInertia(0)",
                 "scope": "assembly_component_group",
+                "convention_basis": "analytic_fixture_v2_20261006",
                 "product_convention": "solidworks_standard",
                 "reference_point": "center_of_mass",
                 "axes": "assembly_document_axes",
@@ -1049,13 +1137,26 @@ class SolidWorksBackend(CadBackend):
         return transform_from_solidworks(_member(tf, "ArrayData"))
 
     def _body_list(self, holder, body_type, component):
-        """Bodies of one swBodyType_e, or ``None`` when the API cannot be read."""
+        """Bodies of one swBodyType_e, or ``None`` when the API cannot be read.
 
-        try:
-            return _as_list(_member(holder, "GetBodies2", body_type, False))
-        except CadError as error:
-            self.notes[f"bodies_unreadable:{component}:{body_type}"] = str(error)
-            return None
+        ``IPartDoc.GetBodies2`` takes ``(bodyType, visibleOnly)`` while
+        ``IComponent2.GetBodies2`` takes ``(bodyType)`` only; the wrong arity
+        raises a COM parameter error, so both signatures are tried and the one
+        that answered is recorded as evidence.
+        """
+
+        for label, arguments in (
+            ("IPartDoc.GetBodies2(type, False)", (body_type, False)),
+            ("IComponent2.GetBodies2(type)", (body_type,)),
+        ):
+            try:
+                bodies = _as_list(_member(holder, "GetBodies2", *arguments))
+            except Exception:  # noqa: BLE001 - the other arity is tried next
+                continue
+            self.notes[f"bodies_api:{component}:{body_type}"] = label
+            return bodies
+        self.notes[f"bodies_unreadable:{component}:{body_type}"] = "no working GetBodies2 signature"
+        return None
 
     def _body_count(self, holder, body_type, component):
         bodies = self._body_list(holder, body_type, component)
@@ -1089,6 +1190,8 @@ class SolidWorksBackend(CadBackend):
         return values
 
     def export_component_mesh(self, component, dest_path, progress=None):
+        """Write one component's display tessellation (solids and sheets)."""
+
         if component not in self._components:
             raise CadError("cad_missing_component", component)
         holder = self._components[component]

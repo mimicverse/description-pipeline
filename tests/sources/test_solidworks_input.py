@@ -76,7 +76,12 @@ def base_document(root: Path) -> dict:
                     "parent": "base_link",
                     "child": "upper_link",
                     "axis": [0.0, 0.0, 1.0],
-                    "axis_reference": "HipYaw.SLDPRT cylindrical face, radius 6 mm",
+                    "axis_reference": {
+                        "component": "upper-1",
+                        "face_index": 3,
+                        "body_type": "solid",
+                        "note": "HipYaw cylindrical face, radius 6 mm",
+                    },
                     "limits": {"lower": -1.5, "upper": 1.5, "effort": 6.0, "velocity": 2.0},
                     "limit_evidence": {
                         "file": "evidence/spec.txt",
@@ -194,7 +199,8 @@ class InputPackageTests(unittest.TestCase):
         joint = source["joints"][0]
         self.assertNotIn("xyz", joint)
         self.assertNotIn("rpy", joint)
-        self.assertIn("cylindrical face", joint["axis_reference"])
+        self.assertEqual(joint["axis_reference"]["face_index"], 3)
+        self.assertEqual(joint["axis_reference"]["body_type"], "solid")
         self.assertEqual(joint["limit_evidence"]["anchor"], "LIMIT-J1")
         self.assertEqual(source["mass_evidence"]["file"], "evidence/spec.txt")
         self.assertEqual(source["mass_evidence"]["sha256"], file_digest(root / "evidence" / "spec.txt"))
@@ -343,14 +349,37 @@ class InputPackageTests(unittest.TestCase):
 
     # ------------------------------------------------------------------- bodies
 
-    def test_bodies_and_joints_must_be_non_empty(self):
+    def test_bodies_must_be_non_empty(self):
         def mutate(document):
             document["source"]["bodies"] = []
             document["source"]["joints"] = []
 
-        codes = self._codes(self._package(mutate))
-        self.assertIn("input.bodies_invalid", codes)
-        self.assertIn("input.joints_invalid", codes)
+        self.assertIn("input.bodies_invalid", self._codes(self._package(mutate)))
+
+    def test_single_rigid_body_may_declare_no_joints(self):
+        def single(document):
+            document["source"]["bodies"] = [document["source"]["bodies"][0]]
+            document["source"]["joints"] = []
+            document["source"]["frames"] = []
+            document["source"]["documented_masses"] = {
+                "base-1": document["source"]["documented_masses"]["base-1"]
+            }
+
+        inspection = inspect_package(self._package(single))
+        self.assertTrue(inspection["passed"], inspection["errors"])
+        self.assertEqual(inspection["resolved"]["root_link"], "base_link")
+
+        def floating(document):
+            document["source"]["joints"] = []
+            document["source"]["frames"] = []
+
+        codes = self._codes(self._package(floating))
+        self.assertIn("input.tree_root_invalid", codes)
+
+        def unknown_key(document):
+            document["source"]["joints"] = "none"
+
+        self.assertIn("input.joints_invalid", self._codes(self._package(unknown_key)))
 
     def test_names_must_be_explicit_snake_case_and_unique(self):
         def not_snake(document):
@@ -459,6 +488,32 @@ class InputPackageTests(unittest.TestCase):
             document["source"]["joints"][0].pop("axis_reference")
 
         self._assert_code(self._package(mutate), "input.joint_axis_reference_invalid")
+
+    def test_structured_axis_reference_is_accepted(self):
+        def mutate(document):
+            document["source"]["joints"][0]["axis_reference"] = {
+                "component": "upper-1",
+                "face_index": 2,
+                "note": "shaft cylindrical face",
+            }
+
+        loaded = load_package(self._package(mutate))
+        reference = loaded["source"]["joints"][0]["axis_reference"]
+        self.assertEqual(reference["component"], "upper-1")
+        self.assertEqual(reference["face_index"], 2)
+
+    def test_malformed_axis_reference_is_rejected(self):
+        for value in (
+            {"component": "upper-1", "face_index": -1},
+            {"component": "", "face_index": 0},
+            {"component": "upper-1", "face_index": 0, "body_type": "wire"},
+            {"component": "upper-1", "face_index": 0, "extra": True},
+        ):
+            with self.subTest(value=value):
+                def mutate(document, value=value):
+                    document["source"]["joints"][0]["axis_reference"] = value
+
+                self._assert_code(self._package(mutate), "input.joint_axis_reference_invalid")
 
     def test_joint_axis_and_limits_are_strict_si(self):
         def axis(document):
