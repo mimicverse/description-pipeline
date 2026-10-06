@@ -198,6 +198,8 @@ def _entities(source, raw, model):
 
 
 def _tool(root):
+    from packaging.version import Version
+
     tool = read_data(confined(root, "reports/tool.json"))
     _require(
         tool["pipeline_id"] == PIPELINE_ID and tool["schema_version"] == "solidworks-to-urdf.tool/v1",
@@ -206,10 +208,8 @@ def _tool(root):
     _require(re.fullmatch(r"[0-9a-f]{64}", tool["source_sha256"]) is not None, "Missing tool code digest")
     runtime = tool["runtime"]
     _require(runtime["python"].startswith("3.12.") and bool(runtime["packages"]), "Missing pinned build runtime")
-    _require(
-        all(re.fullmatch(r"[0-9]+(?:\.[0-9A-Za-z]+)+", version) for version in runtime["packages"].values()),
-        "Invalid dependency versions",
-    )
+    for version in runtime["packages"].values():
+        _require(isinstance(version, str) and str(Version(version)) == version, "Invalid dependency versions")
     return {"version": tool["version"], "source_sha256": tool["source_sha256"]}
 
 

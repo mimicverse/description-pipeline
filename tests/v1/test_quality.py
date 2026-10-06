@@ -213,6 +213,21 @@ class PhysicsTests(unittest.TestCase):
 
 
 class StructuralQualityTests(unittest.TestCase):
+    def test_windows_pywin32_integer_version_is_a_valid_runtime_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_json(
+                root / "reports/tool.json",
+                {
+                    "schema_version": "solidworks-to-urdf.tool/v1",
+                    "pipeline_id": "solidworks-to-urdf",
+                    "source_sha256": "a" * 64,
+                    "version": "1.0.0",
+                    "runtime": {"python": "3.12.10", "packages": {"numpy": "2.5.3", "pywin32": "311"}},
+                },
+            )
+            self.assertEqual("1.0.0", quality._tool(root)["version"])
+
     def test_captured_matrices_are_rowmajor_and_reflections_fail(self):
         transform = np.array([[0, -1, 0, 0.1], [1, 0, 0, 0.2], [0, 0, 1, 0.3], [0, 0, 0, 1]], dtype=float)
         np.testing.assert_array_equal(transform, quality._cad_pose(transform.ravel()))
