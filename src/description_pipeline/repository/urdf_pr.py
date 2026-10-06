@@ -22,6 +22,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 from ..delivery import subject_digest
@@ -317,6 +318,7 @@ def _pr(
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as handle:
         handle.write(_body(subject, commit, report))
         body_path = handle.name
+    url = ""
     try:
         if matches:
             _gh(
@@ -331,7 +333,9 @@ def _pr(
                 "--body-file",
                 body_path,
             )
-            return "updated", matches[0]["url"]
+            url = matches[0]["url"]
+            _verify_pr(repository, slug, url, base, branch, commit)
+            return "updated", url
         url = _gh(
             repository,
             "pr",
@@ -347,9 +351,44 @@ def _pr(
             "--body-file",
             body_path,
         ).strip()
+        _verify_pr(repository, slug, url, base, branch, commit)
         return "published", url
+    except Exception as error:
+        error.pr_url = url
+        raise
     finally:
         Path(body_path).unlink(missing_ok=True)
+
+
+def _verify_pr(repository, slug, url, base, branch, commit):
+    if re.fullmatch(r"https://github\.com/" + re.escape(slug) + r"/pull/[1-9][0-9]*", url) is None:
+        raise PrError("pr_identity_mismatch", "GitHub returned another repository PR URL")
+    observed = None
+    for attempt in range(4):
+        observed = json.loads(
+            _gh(
+                repository,
+                "pr",
+                "view",
+                url,
+                "--repo",
+                slug,
+                "--json",
+                "url,state,baseRefName,headRefName,headRefOid,isCrossRepository",
+            )
+        )
+        if (
+            observed.get("url") == url
+            and observed.get("state") == "OPEN"
+            and observed.get("baseRefName") == base
+            and observed.get("headRefName") == branch
+            and observed.get("headRefOid") == commit
+            and observed.get("isCrossRepository") is False
+        ):
+            return
+        if attempt < 3:
+            time.sleep(2**attempt)
+    raise PrError("pr_identity_mismatch", {"expected_commit": commit, "observed": observed})
 
 
 def submit_bundle(
@@ -422,6 +461,7 @@ def submit_bundle(
             "subject": subject,
             "commit": pushed,
             "url": url,
+            "repository_slug": slug,
         }
     except PrError as error:
         return {
@@ -431,6 +471,7 @@ def submit_bundle(
             "commit": pushed,
             "branch": branch,
             "subject": subject,
+            "url": getattr(error, "pr_url", ""),
         }
     except subprocess.CalledProcessError as error:
         if pushed:
@@ -442,6 +483,7 @@ def submit_bundle(
                 "subject": subject,
                 "base": base,
                 "retry": {"command": "gh pr list --head " + branch, "stderr": (error.stderr or "")[-300:]},
+                "url": getattr(error, "pr_url", ""),
             }
         return {
             "state": "failed",

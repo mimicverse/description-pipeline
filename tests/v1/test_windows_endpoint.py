@@ -82,6 +82,7 @@ class EndpointTests(unittest.TestCase):
                 "subject_sha256": subject,
                 "url": "https://github.com/a/b/pull/1",
                 "base": "feature/arm",
+                "branch": "work/solidworks/arm",
                 "state": "published",
                 "commit": "b" * 40,
             },
@@ -123,6 +124,7 @@ class EndpointTests(unittest.TestCase):
         for section, key, value in (
             ("submission", "url", "https://github.com/a/other/pull/1"),
             ("submission", "base", "feature/other"),
+            ("submission", "branch", "work/solidworks/other"),
             ("submission", "subject_sha256", "c" * 64),
             ("quality", "passed", False),
             ("quality", "subject_sha256", "c" * 64),
@@ -139,6 +141,31 @@ class EndpointTests(unittest.TestCase):
             result = jobs.snapshot(request["run_id"])
             self.assertEqual("failed", result["status"])
             self.assertTrue(result["error"])
+
+    def test_queued_restart_and_incompatible_metadata_fail_once(self):
+        jobs = Jobs(self.config, runner=lambda *args, **kwargs: self.passing_result())
+        request = self.request()
+        jobs.create(request)
+        jobs.queue.join()
+        saved = jobs.snapshot(request["run_id"])
+        jobs.close()
+        saved.update(status="queued", result=None)
+        state = self.config["state_root"] / "jobs" / (request["run_id"] + ".json")
+        write_json(state, saved)
+        resumed = Jobs(self.config, runner=lambda *args, **kwargs: self.passing_result())
+        resumed.queue.join()
+        self.assertEqual("passed", resumed.snapshot(request["run_id"])["status"])
+        resumed.close()
+        saved.pop("repository_slug")
+        write_json(state, saved)
+        broken = Jobs(self.config, runner=lambda *args, **kwargs: self.fail("Incompatible job ran"))
+        broken.queue.join()
+        result = broken.snapshot(request["run_id"])
+        self.assertEqual("failed", result["status"])
+        self.assertIn("Persisted job lacks matching repository metadata", result["error"])
+        broken.close()
+        recovered = self.jobs(lambda *args, **kwargs: self.fail("Failed job reran"))
+        self.assertEqual(result["error"], recovered.snapshot(request["run_id"])["error"])
 
     def test_native_jobs_are_serial(self):
         active, peak = 0, 0

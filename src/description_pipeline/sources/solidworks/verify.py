@@ -760,12 +760,12 @@ def _link_frame(body: dict) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _raw_tensor(component: str, payload: dict) -> np.ndarray:
-    """原始 9 个数 → 标准惯性张量；独立实现，刻意不引用生成侧的转换代码。
+    """Reconstruct a standard tensor independently of the generation code.
 
-    ``solidworks_positive`` 是正惯性积记法：交叉项是 ``∫xy dm`` / ``∫zx dm`` / ``∫yz dm``，
-    标准张量的非对角项是它们的相反数。``solidworks_standard`` 是部件组选择的记法：读数
-    本身就是标准张量（2026-10-06 组审计）。读数带 scope 时以 scope 为准，且必须与显式
-    约定一致；原始读数保持原样，缺约定的原生数据不猜。
+    Qualified native part, group and whole-assembly scopes declare standard
+    signed tensors. Legacy positive-product records invert cross terms only
+    when explicitly declared. The v1 delivery gate separately refuses legacy
+    and unqualified APIs; absent native conventions are never guessed.
     """
 
     matrix = np.array([[float(value) for value in row] for row in payload["inertia"]], dtype=float)

@@ -1139,17 +1139,11 @@ def _mass_closure(
 ) -> dict[str, Any] | None:
     """The assembly's own reading next to the recombined leaf readings, as capture evidence.
 
-    A backend that cannot read the whole assembly (fixtures, other providers) records nothing; the
-    verification side then reports the check as not applicable instead of failing it.  A difference
-    between the two readings is evidence about the CAD tree, so the closure delta is an advisory
-    there; the *capture* never fails because of it.  The component-context section can still make
-    the check fail for a pure-CAD source (recorded instance overrides, or an effective mass that
-    the part documents cannot explain) — that is a source-policy verdict, not a capture failure.
-
-    The assembly read itself is best-effort: builds where ``CreateMassProperty2`` is unavailable, or
-    assemblies that refuse the read, record an explicit ``unavailable`` status.  A capture is never
-    aborted by the optional probe; malformed *standard* readings (the leaf data the combination
-    needs) still fail the freeze through the code below.
+    Capture retains full readings, closure deltas and explicit unavailable/error
+    receipts for diagnosis. The v1 delivery verifier requires full whole-assembly
+    closure and complete component-context evidence; a missing or inconsistent
+    receipt blocks publication. Keeping a failed probe in the snapshot does not
+    qualify the delivery or substitute a mass-only fallback for a full tensor.
     """
 
     closure_reader = getattr(backend, "assembly_mass_properties", None)

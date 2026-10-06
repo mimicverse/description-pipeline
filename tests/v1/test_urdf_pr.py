@@ -111,7 +111,7 @@ class PublishTests(unittest.TestCase):
                     return json.dumps(
                         [
                             {
-                                "url": "https://example.test/pr/1",
+                                "url": "https://github.com/example/m3.0/pull/1",
                                 "number": 1,
                                 "baseRefName": "feature/m3.0",
                                 "headRefName": BRANCH,
@@ -121,9 +121,22 @@ class PublishTests(unittest.TestCase):
                 return "[]"
             if args[:2] == ("pr", "create"):
                 self.pr_exists = True
-                return "https://example.test/pr/1\n"
+                return "https://github.com/example/m3.0/pull/1\n"
             if args[:2] == ("pr", "edit"):
                 return ""
+            if args[:2] == ("pr", "view"):
+                if self.gh_mode == "fail_view":
+                    raise subprocess.CalledProcessError(1, ["gh", *args], stderr="temporary view failure")
+                return json.dumps(
+                    {
+                        "url": "https://github.com/example/m3.0/pull/1",
+                        "state": "OPEN",
+                        "baseRefName": "feature/m3.0",
+                        "headRefName": BRANCH,
+                        "headRefOid": "0" * 40 if self.gh_mode == "stale_head" else self.fx.remote_head(),
+                        "isCrossRepository": False,
+                    }
+                )
             raise AssertionError(args)
 
         def verifier(bundle: Path) -> dict:
@@ -139,10 +152,26 @@ class PublishTests(unittest.TestCase):
             mock.patch.object(urdf_pr, "_gh", fake_gh),
             mock.patch.object(urdf_pr, "_load_verifier", lambda: verifier),
             mock.patch.object(urdf_pr, "_origin_slug", lambda repository: "example/m3.0"),
+            mock.patch.object(urdf_pr.time, "sleep"),
         ]
         for patcher in self.patchers:
             patcher.start()
         self.addCleanup(lambda: [p.stop() for p in self.patchers])
+
+    def test_pr_actual_head_must_equal_verified_pushed_commit(self):
+        self.gh_mode = "stale_head"
+        result = self.submit()
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error"], "pr_identity_mismatch")
+        self.assertEqual(self.fx.remote_head(), result["commit"])
+        self.assertTrue(result["detail"]["observed"]["url"])
+
+    def test_failure_after_pr_creation_preserves_url_and_pushed_commit(self):
+        self.gh_mode = "fail_view"
+        result = self.submit()
+        self.assertEqual(result["state"], "gh_failed_after_push")
+        self.assertEqual(result["url"], "https://github.com/example/m3.0/pull/1")
+        self.assertEqual(result["commit"], self.fx.remote_head())
 
     def submit(self, **kwargs):
         return urdf_pr.submit_bundle(self.fx.bundle, self.fx.repo, base="feature/m3.0", branch=BRANCH, **kwargs)
