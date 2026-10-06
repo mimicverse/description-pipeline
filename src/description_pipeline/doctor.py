@@ -8,6 +8,7 @@ need (Git LFS for model assets, an authenticated ``gh`` for submission, the MuJo
 
 from __future__ import annotations
 
+import ctypes
 import importlib
 import importlib.metadata
 import os
@@ -17,6 +18,7 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Iterable
+from contextlib import suppress
 from pathlib import Path
 
 from . import __version__
@@ -92,22 +94,45 @@ def app_control_rejection(error: BaseException) -> dict | None:
     """Classify a DLL load failure as a Windows App Control rejection, if it is one.
 
     Generic on purpose: the machine's policy id is never captured, only the OS error and the
-    affected library when available. Some loaders omit ``OSError.filename``; recover a path
-    from the message if present, without guessing which file the policy rejected.
+    affected library when available. Python's extension loader can wrap error 4551 in an
+    ``ImportError`` without retaining the numeric code. On Windows only, its exact localized
+    OS message is another usable signal; language-specific substrings are not.
     """
 
-    codes = {getattr(error, "winerror", None), getattr(error, "errno", None)}
-    if APP_CONTROL_WINERROR not in codes:
+    localized = ""
+    if platform.system() == "Windows":
+        formatter = getattr(ctypes, "FormatError", None)
+        if callable(formatter):
+            # The numeric error remains authoritative when formatting is unavailable.
+            with suppress(OSError, ValueError):
+                localized = formatter(APP_CONTROL_WINERROR).strip()
+    chain: list[BaseException] = []
+    current: BaseException | None = error
+    seen: set[int] = set()
+    matched = False
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        codes = {getattr(current, "winerror", None), getattr(current, "errno", None)}
+        message = str(current).strip()
+        if APP_CONTROL_WINERROR in codes or (
+            localized
+            and isinstance(current, (ImportError, OSError))
+            and (message == localized or message.endswith(": " + localized))
+        ):
+            matched = True
+        current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
+    if not matched:
         return None
-    library = getattr(error, "filename", None)
+    library = next((getattr(item, "filename", None) for item in chain if getattr(item, "filename", None)), None)
     if not library:
-        match = re.search(r"[A-Za-z]:\\[^\"'\r\n]*\.(?:dll|pyd)", str(error))
+        match = re.search(r"[A-Za-z]:\\[^\"'\r\n]*\.(?:dll|pyd)", "\n".join(str(item) for item in chain))
         library = match.group(0) if match else None
     return {
         "code": "windows_app_control",
         "winerror": APP_CONTROL_WINERROR,
         "library": str(library) if library else None,
-        "error": f"{type(error).__name__}: {error}",
+        "error": " <- ".join(f"{type(item).__name__}: {item}" for item in chain),
     }
 
 

@@ -396,6 +396,90 @@ class AppControlDiagnosticTests(unittest.TestCase):
         self.assertIn(str(error), message)
         self.assertNotIn("unsigned", message)
 
+    def test_localized_extension_import_errors_without_errno_are_classified_on_windows(self):
+        for localized in (
+            "An application control policy has blocked this file.",
+            "应用程序控制策略已阻止此文件。",
+        ):
+            with (
+                self.subTest(localized=localized),
+                mock.patch.object(doctor.platform, "system", return_value="Windows"),
+                mock.patch.object(
+                    doctor.ctypes, "FormatError", return_value=localized + "\r\n", create=True
+                ) as formatter,
+            ):
+                error = ImportError("DLL load failed while importing _callbacks: " + localized)
+                state = doctor.app_control_rejection(error)
+                assert state is not None
+                self.assertEqual(state["winerror"], 4551)
+                self.assertIsNone(state["library"], "the loader did not identify the rejected DLL")
+                self.assertIn(localized, state["error"])
+                formatter.assert_called_once_with(4551)
+
+    def test_message_match_requires_windows_and_the_exact_os_error(self):
+        localized = "An application control policy has blocked this file."
+        with (
+            mock.patch.object(doctor.platform, "system", return_value="Windows"),
+            mock.patch.object(doctor.ctypes, "FormatError", return_value=localized, create=True),
+        ):
+            for error in (
+                ImportError("DLL load failed: another policy blocked this file"),
+                ImportError("DLL load failed: " + localized + " Additional error."),
+                RuntimeError(localized),
+            ):
+                with self.subTest(error=error):
+                    self.assertIsNone(doctor.app_control_rejection(error))
+        with (
+            mock.patch.object(doctor.platform, "system", return_value="Linux"),
+            mock.patch.object(doctor.ctypes, "FormatError", return_value=localized, create=True) as formatter,
+        ):
+            self.assertIsNone(doctor.app_control_rejection(ImportError("DLL load failed: " + localized)))
+            formatter.assert_not_called()
+
+    def test_numeric_cause_keeps_its_library_and_original_error(self):
+        outer = ImportError("native dependency could not load")
+        outer.__cause__ = self.blocked()
+        state = doctor.app_control_rejection(outer)
+        assert state is not None
+        self.assertEqual(state["library"], r"C:\mujoco\plugin\elasticity.dll")
+        self.assertIn("ImportError: native dependency could not load", state["error"])
+        self.assertIn("OSError", state["error"])
+
+    def test_error_context_cycles_do_not_loop(self):
+        outer = ImportError("not blocked")
+        inner = RuntimeError("unrelated")
+        outer.__context__ = inner
+        inner.__context__ = outer
+        self.assertIsNone(doctor.app_control_rejection(outer))
+
+    def test_formatting_failure_does_not_hide_a_numeric_rejection(self):
+        with (
+            mock.patch.object(doctor.platform, "system", return_value="Windows"),
+            mock.patch.object(doctor.ctypes, "FormatError", side_effect=OSError("unavailable"), create=True),
+        ):
+            self.assertIsNotNone(doctor.app_control_rejection(self.blocked()))
+            self.assertIsNone(doctor.app_control_rejection(ImportError("unrelated")))
+
+    def test_localized_import_failure_is_blocked_in_the_worker_probe(self):
+        localized = "应用程序控制策略已阻止此文件。"
+
+        def failing_import(name, *args, **kwargs):
+            if name == "mujoco":
+                raise ImportError("DLL load failed while importing _callbacks: " + localized)
+            return REAL_IMPORT(name, *args, **kwargs)
+
+        with (
+            mock.patch.object(doctor.platform, "system", return_value="Windows"),
+            mock.patch.object(doctor.ctypes, "FormatError", return_value=localized, create=True),
+            mock.patch.object(doctor.importlib, "import_module", side_effect=failing_import),
+            mock.patch.object(doctor, "_installed_version", return_value="3.13.0"),
+        ):
+            probe = doctor.local_pipeline_probe()
+        self.assertEqual(probe["status"], "blocked")
+        self.assertEqual(probe["code"], "windows_app_control")
+        self.assertEqual(probe["version"], "3.13.0")
+        self.assertIn(localized, probe["error"])
+
     def test_a_blocked_optional_package_is_not_reported_as_missing(self):
         with (
             mock.patch.object(doctor, "_external", return_value="tool 1.0"),
