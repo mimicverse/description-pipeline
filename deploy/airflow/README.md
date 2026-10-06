@@ -57,6 +57,14 @@ deploy/airflow/scripts/install_postgres.sh   # prints the AIRFLOW_DB_URL to expo
 
 ## Services
 
+For loopback Windows execution, configure an SSH host alias with a verified
+host key and key-based authentication, then set `SOLIDWORKS_SSH_HOST`. The
+managed tunnel reconnects after a network break and starts with the user services:
+
+```sh
+export SOLIDWORKS_SSH_HOST=windows-worker
+```
+
 ```sh
 deploy/airflow/services.sh render    # write the description-* unit files only (no systemctl)
 deploy/airflow/services.sh install   # render + systemctl --user daemon-reload
@@ -65,8 +73,9 @@ deploy/airflow/services.sh stop
 deploy/airflow/services.sh status
 ```
 
-Only `description-postgres`, `description-airflow-dag-processor`, `description-airflow-scheduler`
-and `description-airflow-api-server` are ever written; unrelated units in
+The units are `description-postgres`, `description-solidworks-tunnel` when configured,
+`description-airflow-dag-processor`, `description-airflow-scheduler`
+and `description-airflow-api-server`; unrelated units in
 `~/.config/systemd/user` are left alone.
 
 The API server (UI + REST) binds `127.0.0.1:8791` only, and the units run with `UMask=0077` so the
@@ -159,7 +168,8 @@ token_file="$AIRFLOW_HOME/windows-token"        # 0600, holds only the bearer to
 ```
 
 The default connection id is `solidworks_windows`, matching the DAG's `conn_id` parameter.
-The endpoint must stay loopback HTTP behind an SSH tunnel (`ssh -L 18765:127.0.0.1:8765 …`) or TLS;
+The managed tunnel forwards Linux `127.0.0.1:18765` to Windows `127.0.0.1:8765`.
+The endpoint must stay loopback HTTP behind that tunnel or use TLS;
 the client refuses remote `http://` URLs, so a plaintext remote bearer token cannot be configured.
 
 ## Local diagnostics / replay (worker tooling)

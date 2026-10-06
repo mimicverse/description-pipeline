@@ -16,10 +16,18 @@ ACTION="${1:-install}"
 
 UNITS=()
 [ -n "${POSTGRES_ROOT:-}" ] && UNITS+=(description-postgres)
+[ -n "${SOLIDWORKS_SSH_HOST:-}" ] && UNITS+=(description-solidworks-tunnel)
 UNITS+=(description-airflow-dag-processor description-airflow-scheduler description-airflow-api-server)
 
 render_units() {
   mkdir -p "$TARGET"
+  if [ -n "${SOLIDWORKS_SSH_HOST:-}" ]; then
+    [[ "$SOLIDWORKS_SSH_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || {
+      echo 'SOLIDWORKS_SSH_HOST must be a configured SSH host alias' >&2; exit 1;
+    }
+    sed -e "s#@SSH_HOST@#$SOLIDWORKS_SSH_HOST#g" \
+      "$HERE/systemd/description-solidworks-tunnel.service" > "$TARGET/description-solidworks-tunnel.service"
+  fi
   if [ -n "${POSTGRES_ROOT:-}" ]; then
     sed -e "s#@POSTGRES_ROOT@#$POSTGRES_ROOT#g" \
       "$HERE/systemd/description-postgres.service" > "$TARGET/description-postgres.service"

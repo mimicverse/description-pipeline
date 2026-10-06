@@ -161,6 +161,26 @@ class ServicesRenderTest(unittest.TestCase):
             self.assertEqual(len(names), 3)
             self.assertNotIn("description-postgres.service", names)
 
+    def test_tunnel_is_optional_and_rejects_command_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                "XDG_CONFIG_HOME": str(Path(tmp) / "config"),
+                "AIRFLOW_VENV": str(Path(tmp) / "venv"),
+                "AIRFLOW_HOME": str(Path(tmp) / "home"),
+                "SOLIDWORKS_SSH_HOST": "windows-worker",
+            }
+            result = run(["bash", str(DEPLOY / "services.sh"), "render"], env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            unit = Path(tmp) / "config/systemd/user/description-solidworks-tunnel.service"
+            self.assertIn("127.0.0.1:18765:127.0.0.1:8765 windows-worker", unit.read_text())
+            before = unit.read_bytes()
+            result = run(
+                ["bash", str(DEPLOY / "services.sh"), "render"],
+                {**env, "SOLIDWORKS_SSH_HOST": "windows-worker; arbitrary-command"},
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(before, unit.read_bytes())
+
 
 class InstallGuardsTest(unittest.TestCase):
     def _install(self, tmp: str, **env: str) -> subprocess.CompletedProcess:
