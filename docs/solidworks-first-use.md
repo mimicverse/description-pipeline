@@ -40,7 +40,7 @@
 | # | 阶段（详情） | 命令 | 代码入口 | 输出/报告 |
 |---|---|---|---|---|
 | 1 | 准备并保存 CAD（[第 1 节](#1-保存装配准备工具)） | 在 SolidWorks 保存顶层装配及全部引用 | 操作者/CAD | 已保存文件；未保存修改/保存标志证据 |
-| 2 | 安装并诊断（[第 2 节](#2-安装并检查本机环境)） | `worker.ps1 -Action Setup/Install/Doctor`；`description doctor --root MODEL`；`description worker doctor --target URL` | `description_pipeline.doctor:run`；worker 部署 `sources/solidworks/deploy/worker.ps1` | `worker-host.json`；Doctor 退出码 0，且 `install=True worker=True solidworks=True collectable=True` |
+| 2 | 安装并诊断（[第 2 节](#2-安装并检查本机环境)） | `worker.ps1 -Action Setup -Bundle $Bundle -Assembly 'D:\...\robot.SLDASM' -AssemblyConfiguration Default`（一次完成；`-Action Install`、`-Action Doctor` 可分别执行）；`description doctor --root MODEL`；`description worker doctor --target URL` | `description_pipeline.doctor:run`；worker 部署 `sources/solidworks/deploy/worker.ps1` | `worker-host.json`；Doctor 退出码 0，且 `install=True worker=True solidworks=True collectable=True` |
 | 3 | 归属、枢轴与身份（[第 4 节](#4-首次采集补齐机器人定义)） | 编辑 `config/robot.yaml`：`source.bodies`、`source.joints`、`interfaces.mechanical_drives`、可选 `pipeline_id` | `description_pipeline.model:Robot`；`description_pipeline.pipeline:resolve_identity` | `model/robot.json`；`source.pipeline` 检查；`sources/source.lock.json` 的 `pipeline` 块 |
 | 4 | 保存并冻结（[第 4 节](#4-首次采集补齐机器人定义)） | `description source freeze --root MODEL` | `description_pipeline.sources.solidworks:freeze`；`description_pipeline.build:freeze` | `sources/source.lock.json` + `sources/snapshots/<digest>/raw/*` 及几何；失败在 `build/failed-source/` |
 | 5 | 作者语义与证据（[第 4 节](#4-首次采集补齐机器人定义)） | 编辑 `overrides`、documented masses/证据、profiles 与关节台账 | `description_pipeline.build:normalize` | 有证据的规范模型；`docs/quality.*` 提示/阻断 |
@@ -54,13 +54,13 @@
 
 * **归属与枢轴。** 每个纳入的 CAD 实例恰好属于一个刚体（按采集实例名划分，不按文件名）；每个
   可动关节声明父/子 link、父 link 坐标系下的物理枢轴与关节坐标系下的有符号轴线。必须依据设计与
-  几何确定；绝不从 CAD 配合、最近圆柱或无符号轴线推断枢轴、方向或限位。见
-  [机械验收](mechanical-acceptance.md)。
+  几何确定：物理轴线确定枢轴位置，方向符号、解剖约定与限位需要各自的证据；CAD 配合、最近圆柱或
+  无符号轴线不能作为这些证据。见 [机械验收](mechanical-acceptance.md)。
 * **保存与冻结。** 冻结以磁盘已保存字节为起点；依赖缺失或逃逸、副本验证失败或几何失败都会
   阻断；`GetSaveFlag` 只是证据，不能替代保存；无法证明输入的中断冻结必须重新采集。
-* **验收。** 生成文件、加载 URDF/MJCF 或两种格式互相一致都不构成验收。仿真运行声明实验；运动学
-  必须由操作者选择外部 `--mechanical-reference`；训练与实机需要各自的独立证据。本地重放是确定
-  性的，不依赖 CI。
+* **验收。** 生成文件、加载 URDF/MJCF 或两种格式互相一致都不构成验收。仿真运行声明实验；声明
+  机械验收套件的运动学 profile 必须由操作者选择外部 `--mechanical-reference`（未声明套件的
+  profile 没有此前提）；训练与实机需要各自的独立证据。本地重放是确定性的，不依赖 CI。
 * **发布。** `model promote` 从远端重新取回精确候选到全新 Git/LFS 存储，在锁定工具环境中重跑
   验收，并拒绝过期计划。PR 不等于发布；验收记录绑定 subject、profile、环境、工具、运行时与
   参考摘要。

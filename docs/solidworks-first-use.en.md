@@ -56,7 +56,7 @@ and points at the detailed command blocks.
 | # | Stage (details) | Command | Code entry | Output / report |
 |---|---|---|---|---|
 | 1 | Prepare and save the CAD ([section 1](#1-save-the-assembly-and-prepare-the-tools)) | Save the top assembly and all references in SolidWorks | operator/CAD | Saved files; unsaved-edit/save-flag evidence |
-| 2 | Install and diagnose ([section 2](#2-install-and-check-the-local-environment)) | `worker.ps1 -Action Setup/Install/Doctor`; `description doctor --root MODEL`; `description worker doctor --target URL` | `description_pipeline.doctor:run`; worker deployment `sources/solidworks/deploy/worker.ps1` | `worker-host.json`; Doctor exit 0 with `install=True worker=True solidworks=True collectable=True` |
+| 2 | Install and diagnose ([section 2](#2-install-and-check-the-local-environment)) | `worker.ps1 -Action Setup -Bundle $Bundle -Assembly 'D:\...\robot.SLDASM' -AssemblyConfiguration Default` (one-shot; `-Action Install` and `-Action Doctor` run separately); `description doctor --root MODEL`; `description worker doctor --target URL` | `description_pipeline.doctor:run`; worker deployment `sources/solidworks/deploy/worker.ps1` | `worker-host.json`; Doctor exit 0 with `install=True worker=True solidworks=True collectable=True` |
 | 3 | Ownership, pivots and identity ([section 4](#4-capture-once-and-complete-the-robot-definition)) | Edit `config/robot.yaml`: `source.bodies`, `source.joints`, `interfaces.mechanical_drives`, optional `pipeline_id` | `description_pipeline.model:Robot`; `description_pipeline.pipeline:resolve_identity` | `model/robot.json`; `source.pipeline` check; the `sources/source.lock.json` `pipeline` block |
 | 4 | Save and freeze ([section 4](#4-capture-once-and-complete-the-robot-definition)) | `description source freeze --root MODEL` | `description_pipeline.sources.solidworks:freeze`; `description_pipeline.build:freeze` | `sources/source.lock.json` + `sources/snapshots/<digest>/raw/*` and geometry; failures in `build/failed-source/` |
 | 5 | Author semantics and evidence ([section 4](#4-capture-once-and-complete-the-robot-definition)) | Edit `overrides`, documented masses/evidence, profiles and the joint ledger | `description_pipeline.build:normalize` | Evidence-bound canonical model; advisories/blockers in `docs/quality.*` |
@@ -71,14 +71,17 @@ Gate rules (details in the linked stages and the [pipeline contract](pipeline.en
 * **Ownership and pivots.** Every included CAD instance belongs to exactly one rigid body (partition
   by captured instance name, not file name). Every movable joint declares parent/child links, the
   physical pivot in the parent-link frame and the signed axis in the joint frame. Define these from
-  design and geometry; never infer a pivot, direction or limit from a CAD mate, a nearest cylinder
-  or an unsigned axis. See [mechanical acceptance](mechanical-acceptance.en.md).
+  design and geometry: the physical shaft line establishes the pivot locus, while the direction
+  sign, anatomical convention and limits need separate evidence. A CAD mate, a nearest-cylinder
+  match or an unsigned axis is not that evidence. See
+  [mechanical acceptance](mechanical-acceptance.en.md).
 * **Save and freeze.** Freezing starts from saved bytes on disk; a missing or escaping dependency,
   an unverified copy or a geometry failure blocks the run. `GetSaveFlag` is evidence, not a
   substitute for saving, and an interrupted freeze that cannot prove its inputs must be re-captured.
 * **Acceptance.** Generating files, loading the URDF/MJCF or agreeing between formats is not
-  acceptance. Simulation runs declared experiments; kinematics requires an operator-selected
-  external `--mechanical-reference`; training and hardware need their own evidence. Local replay is
+  acceptance. Simulation runs declared experiments; a kinematics profile that declares a mechanical
+  acceptance suite requires an operator-selected external `--mechanical-reference` (a profile with
+  no declared suite does not); training and hardware need their own evidence. Local replay is
   deterministic and needs no CI.
 * **Publication.** `model promote` re-fetches the exact candidate into a fresh Git/LFS store,
   re-runs acceptance in the pinned tool environment and refuses a stale plan. A pull request is not
