@@ -407,6 +407,7 @@ def build_scene(
     check_mass_contract(cfg, included, masses)
 
     links: list[dict[str, Any]] = []
+    link_frames: dict[str, tuple[Matrix3, Vector3, str | None]] = {}
     for body in bodies:
         body_id = str(body.get("id") or body.get("name") or "")
         if not body_id:
@@ -422,6 +423,11 @@ def build_scene(
                 {"body": body_id, "unknown": unknown[:10]},
             )
         link_rotation, link_translation = _link_frame(body, raw_scene.coordinate_systems or {})
+        link_frames[str(name)] = (
+            link_rotation,
+            link_translation,
+            (body.get("frame") or {}).get("coordinate_system"),
+        )
         readings = []
         for component in components:
             payload = masses.get(component)
@@ -487,7 +493,7 @@ def build_scene(
             }
         )
 
-    joint_entries = _build_joints(cfg, {link["name"] for link in links})
+    joint_entries = _build_joints(cfg, {link["name"] for link in links}, link_frames)
     frames = _build_frames(cfg, {link["name"] for link in links}, raw_scene)
     # The root link's frame is where the model's world coordinates start.  The
     # world-frame oracle needs it to evaluate the q=0 chain, so it is written
@@ -534,7 +540,19 @@ def build_scene(
     }
 
 
-def _build_joints(cfg: dict[str, Any], link_names: Iterable[str]) -> list[dict[str, Any]]:
+def _build_joints(
+    cfg: dict[str, Any],
+    link_names: Iterable[str],
+    link_frames: dict[str, tuple[Matrix3, Vector3, str | None]] | None = None,
+) -> list[dict[str, Any]]:
+    """Build canonical joints.
+
+    v1 joints carry no authored origin numbers: the joint frame is the child
+    body's named CAD datum at zero, so the relative origin/RPY is derived from
+    the raw parent and child link frames.  The legacy explicit ``xyz``/``rpy``
+    form stays available for retained sources and is still validated exactly.
+    """
+
     known = set(link_names)
     joints: list[dict[str, Any]] = []
     for joint in cfg.get("joints") or []:
@@ -548,13 +566,42 @@ def _build_joints(cfg: dict[str, Any], link_names: Iterable[str]) -> list[dict[s
         joint_type = str(joint.get("type") or "")
         if joint_type not in ("revolute", "prismatic", "fixed", "continuous"):
             raise ConfigError("joint.type must be revolute, prismatic, continuous or fixed", {"joint": joint_id})
-        for key in ("xyz", "rpy"):
-            value = joint.get(key)
-            if not isinstance(value, (list, tuple)) or len(value) != 3:
+        declared_xyz = joint.get("xyz")
+        declared_rpy = joint.get("rpy")
+        if declared_xyz is None and declared_rpy is None:
+            frames = link_frames or {}
+            if parent not in frames or child not in frames:
                 raise ConfigError(
-                    "joint geometry must be declared explicitly as xyz/rpy in the parent link frame",
-                    {"joint": joint_id, "field": key},
+                    "joint geometry needs either explicit xyz/rpy or CAD-bound body frames",
+                    {"joint": joint_id, "parent": parent, "child": child},
                 )
+            parent_rotation, parent_translation, parent_datum = frames[parent]
+            child_rotation, child_translation, child_datum = frames[child]
+            inverse_parent = _transpose(parent_rotation)
+            relative_rotation = _matmul(inverse_parent, child_rotation)
+            relative_translation = _matvec(
+                inverse_parent,
+                (
+                    child_translation[0] - parent_translation[0],
+                    child_translation[1] - parent_translation[1],
+                    child_translation[2] - parent_translation[2],
+                ),
+            )
+            entry_xyz = [float(value) for value in relative_translation]
+            entry_rpy = [float(value) for value in rpy_from_matrix(relative_rotation)]
+            geometry_source = "cad_body_frames"
+            geometry_detail: dict[str, Any] = {"parent_frame": parent_datum, "child_frame": child_datum}
+        else:
+            for key, value in (("xyz", declared_xyz), ("rpy", declared_rpy)):
+                if not isinstance(value, (list, tuple)) or len(value) != 3:
+                    raise ConfigError(
+                        "joint geometry must be declared explicitly as xyz/rpy in the parent link frame",
+                        {"joint": joint_id, "field": key},
+                    )
+            entry_xyz = [float(value) for value in declared_xyz]
+            entry_rpy = [float(value) for value in declared_rpy]
+            geometry_source = "source.joints"
+            geometry_detail = {}
         movable = joint_type != "fixed"
         axis = joint.get("axis")
         if movable and (not isinstance(axis, (list, tuple)) or len(axis) != 3):
@@ -565,10 +612,18 @@ def _build_joints(cfg: dict[str, Any], link_names: Iterable[str]) -> list[dict[s
             "type": joint_type,
             "parent": parent,
             "child": child,
-            "xyz": [float(value) for value in joint["xyz"]],
-            "rpy": [float(value) for value in joint["rpy"]],
-            "provenance": {"geometry": "source.joints"},
+            "xyz": entry_xyz,
+            "rpy": entry_rpy,
+            "provenance": {"geometry": geometry_source, **geometry_detail},
         }
+        axis_reference = joint.get("axis_reference")
+        if axis_reference is not None:
+            entry["provenance"]["axis_reference"] = str(axis_reference)
+        limit_evidence = joint.get("limit_evidence")
+        if isinstance(limit_evidence, dict):
+            entry["provenance"]["limits_evidence"] = {
+                str(key): str(value) for key, value in limit_evidence.items()
+            }
         if movable:
             entry["axis"] = [float(value) for value in axis]
         limits = joint.get("limits")
@@ -591,14 +646,30 @@ def _build_frames(cfg: dict[str, Any], link_names: Iterable[str], raw_scene: Any
         parent = str(frame.get("parent") or "")
         if not frame_id or parent not in known:
             raise ConfigError("every frame needs an id and a known parent link", {"frame": frame})
+        reference = frame.get("coordinate_system")
+        if reference:
+            matrix = (raw_scene.coordinate_systems or {}).get(str(reference))
+            if matrix is None:
+                raise ConfigError(
+                    "frame references a coordinate system that the capture did not read",
+                    {"frame": frame_id, "coordinate_system": reference},
+                )
+            rotation, translation = map_from_row_major(matrix)
+            xyz = [float(value) for value in translation]
+            rpy = [float(value) for value in rpy_from_matrix(rotation)]
+            geometry = f"cad_coordinate_system:{reference}"
+        else:
+            xyz = [float(value) for value in frame.get("xyz", (0.0, 0.0, 0.0))]
+            rpy = [float(value) for value in frame.get("rpy", (0.0, 0.0, 0.0))]
+            geometry = "source.frames"
         frames.append(
             {
                 "id": frame_id,
                 "name": str(frame.get("name") or frame_id),
                 "parent": parent,
-                "xyz": [float(value) for value in frame.get("xyz", (0.0, 0.0, 0.0))],
-                "rpy": [float(value) for value in frame.get("rpy", (0.0, 0.0, 0.0))],
-                "provenance": {"geometry": "source.frames"},
+                "xyz": xyz,
+                "rpy": rpy,
+                "provenance": {"geometry": geometry},
             }
         )
     return frames

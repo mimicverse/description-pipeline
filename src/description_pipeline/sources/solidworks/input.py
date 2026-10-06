@@ -375,7 +375,6 @@ def _validate_source(
             "robot_name",
             "assembly",
             "configuration",
-            "coordinate_systems",
             "bodies",
             "joints",
             "frames",
@@ -397,6 +396,7 @@ def _validate_source(
         "evidence_class",
         "allowed_roots",
         "document_suffixes",
+        "coordinate_systems",
     ):
         if forbidden in source:
             report.error(
@@ -435,22 +435,6 @@ def _validate_source(
         report.error("input.configuration_invalid", "source.configuration must be an explicit non-empty string", {
             "value": configuration
         })
-    coordinate_systems = source.get("coordinate_systems")
-    if not isinstance(coordinate_systems, list) or not coordinate_systems or not all(
-        _is_text(name) for name in coordinate_systems
-    ):
-        report.error(
-            "input.coordinate_systems_invalid",
-            "source.coordinate_systems must be a non-empty list of explicit names",
-            {"value": coordinate_systems},
-        )
-        coordinate_systems = []
-    else:
-        folded = [str(name).casefold() for name in coordinate_systems]
-        if len(set(folded)) != len(folded):
-            report.error("input.coordinate_systems_ambiguous", "source.coordinate_systems contains case-insensitive duplicates", {
-                "value": coordinate_systems
-            })
     bodies = source.get("bodies")
     if not isinstance(bodies, list) or not bodies:
         report.error("input.bodies_invalid", "source.bodies must be a non-empty list", {"value": bodies})
@@ -463,6 +447,41 @@ def _validate_source(
     if not isinstance(frames, list):
         report.error("input.frames_invalid", "source.frames must be a list when present", {"value": frames})
         frames = []
+
+    # v1 keeps one authority: every body frame names a native CAD coordinate
+    # system, and the datum collection is derived from those frames instead of
+    # being maintained as a second author-owned list.
+    datums: set[str] = set()
+    for raw_body in bodies:
+        if not isinstance(raw_body, dict):
+            continue
+        frame = raw_body.get("frame")
+        if isinstance(frame, dict) and _is_text(frame.get("coordinate_system")):
+            datums.add(str(frame["coordinate_system"]))
+    for raw_frame in frames:
+        if not isinstance(raw_frame, dict):
+            continue
+        if _is_text(raw_frame.get("coordinate_system")):
+            datums.add(str(raw_frame["coordinate_system"]))
+    folded = [name.casefold() for name in datums]
+    if len(set(folded)) != len(folded):
+        report.error(
+            "input.coordinate_systems_ambiguous",
+            "body frames reference case-insensitively duplicate coordinate systems",
+            {"value": sorted(datums)},
+        )
+    coordinate_systems = sorted(datums)
+    if not coordinate_systems:
+        report.error(
+            "input.coordinate_systems_empty",
+            "every body frame must bind a native CAD coordinate_system; none were declared",
+        )
+    else:
+        report.warn(
+            "input.coordinate_systems_unverified",
+            "datum existence is verified against the CAD assembly during the native capture",
+            {"coordinate_systems": coordinate_systems},
+        )
 
     body_names: dict[str, dict[str, Any]] = {}
     body_ids: dict[str, str] = {}
@@ -508,32 +527,32 @@ def _validate_source(
                 owned_components.add(str(component))
         frame = body.get("frame")
         if not isinstance(frame, dict) or not frame:
-            report.error("input.body_frame_missing", f"{where}.frame must be explicit", {"body": name})
+            report.error(
+                "input.body_frame_missing",
+                f"{where}.frame must bind a native CAD coordinate_system",
+                {"body": name},
+            )
         else:
             _unknown_keys(frame, {"coordinate_system", "xyz", "rpy"}, report, "input.body_frame_invalid", f"{where}.frame")
             reference = frame.get("coordinate_system")
-            has_vector = "xyz" in frame or "rpy" in frame
-            if reference is not None and has_vector:
+            authored = sorted({"xyz", "rpy"} & set(frame))
+            if authored:
                 report.error(
-                    "input.body_frame_ambiguous",
-                    f"{where}.frame must use either coordinate_system or xyz+rpy, not both",
+                    "input.body_frame_authored_numbers",
+                    f"{where}.frame must not repeat CAD numbers; v1 derives link frames from the named datum",
+                    {"body": name, "fields": authored},
+                )
+            if reference is None:
+                report.error(
+                    "input.body_frame_missing",
+                    f"{where}.frame must bind a native CAD coordinate_system",
                     {"body": name},
                 )
-            elif reference is not None:
-                if not _is_text(reference) or str(reference) not in {str(item) for item in coordinate_systems}:
-                    report.error(
-                        "input.frame_reference_unknown",
-                        f"{where}.frame.coordinate_system is not listed in source.coordinate_systems",
-                        {"body": name, "coordinate_system": reference},
-                    )
-            elif "xyz" in frame and "rpy" in frame:
-                _vector3(frame.get("xyz"), report, "input.body_frame_invalid", f"{where}.frame.xyz")
-                _vector3(frame.get("rpy"), report, "input.body_frame_invalid", f"{where}.frame.rpy")
-            else:
+            elif not _is_text(reference):
                 report.error(
-                    "input.body_frame_invalid",
-                    f"{where}.frame must declare coordinate_system or both xyz and rpy",
-                    {"body": name},
+                    "input.frame_reference_unknown",
+                    f"{where}.frame.coordinate_system must be a non-empty native datum name",
+                    {"body": name, "coordinate_system": reference},
                 )
 
     joint_names: dict[str, dict[str, Any]] = {}
@@ -546,7 +565,7 @@ def _validate_source(
             continue
         _unknown_keys(
             joint,
-            {"id", "name", "type", "parent", "child", "xyz", "rpy", "axis", "limits"},
+            {"id", "name", "type", "parent", "child", "axis", "limits", "axis_reference", "limit_evidence"},
             report,
             "input.joint_invalid",
             where,
@@ -588,21 +607,36 @@ def _validate_source(
                 )
             child_owner[str(child)] = str(name)
             parent_edges.setdefault(str(parent), set()).add(str(child))
-        _vector3(joint.get("xyz"), report, "input.joint_invalid", f"{where}.xyz")
-        _vector3(joint.get("rpy"), report, "input.joint_invalid", f"{where}.rpy")
         if joint_type == "fixed":
-            if "axis" in joint:
-                report.error("input.joint_invalid", f"{where}.axis is not meaningful for a fixed joint", {"joint": name})
-            if "limits" in joint:
-                report.error("input.joint_invalid", f"{where}.limits is not meaningful for a fixed joint", {"joint": name})
+            for key in ("axis", "limits", "axis_reference", "limit_evidence"):
+                if key in joint:
+                    report.error(
+                        "input.joint_invalid",
+                        f"{where}.{key} is not meaningful for a fixed joint",
+                        {"joint": name},
+                    )
             continue
+        if not _is_text(joint.get("axis_reference")):
+            report.error(
+                "input.joint_axis_reference_invalid",
+                f"{where}.axis_reference must name the native component/face that defines the axis",
+                {"joint": name},
+            )
         axis = _unit_axis(joint.get("axis"), report, "input.joint_axis_invalid", f"{where}.axis")
+        _structured_evidence(
+            joint.get("limit_evidence"),
+            root=root,
+            hashes=hashes,
+            report=report,
+            code="input.limit_evidence_invalid",
+            where=f"{where}.limit_evidence",
+        )
         limits = _as_mapping(joint.get("limits"), report, "input.joint_limits_invalid", f"{where}.limits")
         if limits is None:
             continue
         _unknown_keys(
             limits,
-            {"lower", "upper", "effort", "velocity", "evidence"},
+            {"lower", "upper", "effort", "velocity"},
             report,
             "input.joint_limits_invalid",
             f"{where}.limits",
@@ -616,14 +650,6 @@ def _validate_source(
                     f"{where}.limits.{key} must be finite and positive",
                     {key: value},
                 )
-        _structured_evidence(
-            limits.get("evidence"),
-            root=root,
-            hashes=hashes,
-            report=report,
-            code="input.limit_evidence_invalid",
-            where=f"{where}.limits.evidence",
-        )
         if joint_type in ("revolute", "prismatic"):
             lower, upper = limits.get("lower"), limits.get("upper")
             if not _is_number(lower) or not _is_number(upper):
@@ -686,16 +712,19 @@ def _validate_source(
         if not _is_snake(parent) or str(parent) not in body_names:
             report.error("input.frame_parent_unknown", f"{where}.parent must name a declared body", {"parent": parent})
         reference = frame.get("coordinate_system")
-        if reference is not None:
-            if not _is_text(reference) or str(reference) not in {str(item) for item in coordinate_systems}:
-                report.error(
-                    "input.frame_reference_unknown",
-                    f"{where}.coordinate_system is not listed in source.coordinate_systems",
-                    {"coordinate_system": reference},
-                )
-        else:
-            _vector3(frame.get("xyz"), report, "input.frame_invalid", f"{where}.xyz")
-            _vector3(frame.get("rpy"), report, "input.frame_invalid", f"{where}.rpy")
+        authored = sorted({"xyz", "rpy"} & set(frame))
+        if authored:
+            report.error(
+                "input.frame_authored_numbers",
+                f"{where} must not repeat CAD numbers; v1 derives frames from the named datum",
+                {"frame": name, "fields": authored},
+            )
+        if not _is_text(reference):
+            report.error(
+                "input.frame_reference_unknown",
+                f"{where}.coordinate_system must be a non-empty native datum name",
+                {"frame": name, "coordinate_system": reference},
+            )
 
     documented, mass_evidence = _validate_documented_masses(
         source,

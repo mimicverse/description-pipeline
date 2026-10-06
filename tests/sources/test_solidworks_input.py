@@ -1,9 +1,10 @@
 """Static contract tests for the self-contained SolidWorks-to-URDF v1 package.
 
 The v1 entry point is one directory: exactly one ``robot.yaml`` plus the CAD
-documents it names.  These tests pin the static half of the contract - package
-inventory safety, explicit ownership/frames/joints, evidence bindings and the
-``inspect_package``/``load_package`` surface - without touching SolidWorks.
+documents it names.  Authors declare no CAD numbers twice - every body frame is
+a named native coordinate system, every joint origin is derived from those
+frames at build time, and limits/axes carry structured evidence.  These tests
+pin that static surface without touching SolidWorks.
 """
 
 from __future__ import annotations
@@ -42,7 +43,7 @@ anchor EXCL-upper-2
 
 
 def base_document(root: Path) -> dict:
-    """The smallest package that should load: two links, one joint, one datum."""
+    """The smallest package that should load: two datum-bound links, one joint."""
 
     spec_sha = file_digest(root / "evidence" / "spec.txt")
     return {
@@ -53,7 +54,6 @@ def base_document(root: Path) -> dict:
             "robot_name": "m3_demo",
             "assembly": "cad/robot.SLDASM",
             "configuration": "Default",
-            "coordinate_systems": ["base_datum", "tool_datum"],
             "bodies": [
                 {
                     "id": "base",
@@ -65,7 +65,7 @@ def base_document(root: Path) -> dict:
                     "id": "upper",
                     "name": "upper_link",
                     "components": ["upper-1", "upper-2"],
-                    "frame": {"xyz": [0.0, 0.0, 0.12], "rpy": [0.0, 0.0, 0.0]},
+                    "frame": {"coordinate_system": "tool_datum"},
                 },
             ],
             "joints": [
@@ -75,19 +75,13 @@ def base_document(root: Path) -> dict:
                     "type": "revolute",
                     "parent": "base_link",
                     "child": "upper_link",
-                    "xyz": [0.0, 0.0, 0.05],
-                    "rpy": [0.0, 0.0, 0.0],
                     "axis": [0.0, 0.0, 1.0],
-                    "limits": {
-                        "lower": -1.5,
-                        "upper": 1.5,
-                        "effort": 6.0,
-                        "velocity": 2.0,
-                        "evidence": {
-                            "file": "evidence/spec.txt",
-                            "sha256": spec_sha,
-                            "anchor": "LIMIT-J1",
-                        },
+                    "axis_reference": "HipYaw.SLDPRT cylindrical face, radius 6 mm",
+                    "limits": {"lower": -1.5, "upper": 1.5, "effort": 6.0, "velocity": 2.0},
+                    "limit_evidence": {
+                        "file": "evidence/spec.txt",
+                        "sha256": spec_sha,
+                        "anchor": "LIMIT-J1",
                     },
                 }
             ],
@@ -170,11 +164,14 @@ class InputPackageTests(unittest.TestCase):
         self.assertTrue(inspection["passed"], inspection["errors"])
         self.assertEqual(inspection["errors"], [])
         self.assertEqual(inspection["schema_version"], INSPECTION_SCHEMA)
-        self.assertEqual(inspection["resolved"]["root_link"], "base_link")
-        self.assertEqual(inspection["resolved"]["owned_components"], ["base-1", "upper-1", "upper-2"])
-        self.assertEqual(inspection["resolved"]["joint_names"], ["joint_1"])
-        self.assertEqual(inspection["resolved"]["frame_names"], ["tool_frame"])
-        self.assertEqual(inspection["resolved"]["configuration"], "Default")
+        resolved = inspection["resolved"]
+        self.assertEqual(resolved["root_link"], "base_link")
+        self.assertEqual(resolved["owned_components"], ["base-1", "upper-1", "upper-2"])
+        self.assertEqual(resolved["joint_names"], ["joint_1"])
+        self.assertEqual(resolved["frame_names"], ["tool_frame"])
+        self.assertEqual(resolved["configuration"], "Default")
+        # The datum collection is derived from the frames, never authored twice.
+        self.assertEqual(resolved["coordinate_systems"], ["base_datum", "tool_datum"])
 
         loaded = load_package(root)
         self.assertEqual(loaded["schema_version"], INPUT_SCHEMA)
@@ -191,8 +188,14 @@ class InputPackageTests(unittest.TestCase):
         self.assertEqual(source["geometry"], {"enabled": True, "format": "stl_binary"})
         self.assertIs(source["require_saved"], True)
         self.assertEqual(source["material_source"], "documented_table")
+        self.assertEqual(source["coordinate_systems"], ["base_datum", "tool_datum"])
         for forbidden in ("worker_url", "allow_remote_worker", "job_id", "evidence_class"):
             self.assertNotIn(forbidden, source)
+        joint = source["joints"][0]
+        self.assertNotIn("xyz", joint)
+        self.assertNotIn("rpy", joint)
+        self.assertIn("cylindrical face", joint["axis_reference"])
+        self.assertEqual(joint["limit_evidence"]["anchor"], "LIMIT-J1")
         self.assertEqual(source["mass_evidence"]["file"], "evidence/spec.txt")
         self.assertEqual(source["mass_evidence"]["sha256"], file_digest(root / "evidence" / "spec.txt"))
         self.assertEqual(
@@ -213,18 +216,6 @@ class InputPackageTests(unittest.TestCase):
         before = inventory(root)
         inspect_package(root)
         self.assertEqual(inventory(root), before)
-
-    def test_link_frame_may_assert_xyz_next_to_a_declared_datum(self):
-        # A link frame bound to a CAD datum may also state xyz/rpy: the scene
-        # layer checks that the declared numbers agree with the CAD reading.
-        # Body frames stay strict (datum XOR xyz+rpy) - see the ambiguity test.
-        def add(document):
-            frame = document["source"]["frames"][0]
-            frame["xyz"] = [0.0, 0.0, 0.1]
-            frame["rpy"] = [0.0, 0.0, 0.0]
-
-        inspection = inspect_package(self._package(add))
-        self.assertTrue(inspection["passed"], inspection["errors"])
 
     def test_documented_exclusion_is_physically_accounted(self):
         def add(document):
@@ -385,33 +376,89 @@ class InputPackageTests(unittest.TestCase):
 
         self._assert_code(self._package(empty), "input.body_components_invalid")
 
-    def test_body_frames_are_datum_xor_xyz_rpy(self):
-        def ambiguous(document):
+    # ------------------------------------------------------------ CAD datums
+
+    def test_authored_coordinate_systems_are_rejected(self):
+        def mutate(document):
+            document["source"]["coordinate_systems"] = ["base_datum", "tool_datum"]
+
+        codes = self._codes(self._package(mutate))
+        self.assertIn("input.source_forbidden_key", codes)
+
+    def test_body_frames_bind_named_datums_only(self):
+        def authored_numbers(document):
             document["source"]["bodies"][1]["frame"] = {
                 "coordinate_system": "tool_datum",
                 "xyz": [0.0, 0.0, 0.12],
                 "rpy": [0.0, 0.0, 0.0],
             }
 
-        self._assert_code(self._package(ambiguous), "input.body_frame_ambiguous")
+        self._assert_code(self._package(authored_numbers), "input.body_frame_authored_numbers")
 
         def empty(document):
             document["source"]["bodies"][1]["frame"] = {}
 
         self._assert_code(self._package(empty), "input.body_frame_missing")
 
-    def test_coordinate_systems_are_explicit_and_case_unambiguous(self):
-        def empty(document):
-            document["source"]["coordinate_systems"] = []
+        def blank_datum(document):
+            document["source"]["bodies"][1]["frame"] = {"coordinate_system": ""}
 
-        self._assert_code(self._package(empty), "input.coordinate_systems_invalid")
+        self._assert_code(self._package(blank_datum), "input.frame_reference_unknown")
+
+    def test_datum_collection_is_derived_and_case_unambiguous(self):
+        def no_datums(document):
+            document["source"]["bodies"][0]["frame"] = {"xyz": [0.0, 0.0, 0.0], "rpy": [0.0, 0.0, 0.0]}
+            document["source"]["bodies"][1]["frame"] = {"xyz": [0.0, 0.0, 0.1], "rpy": [0.0, 0.0, 0.0]}
+            document["source"]["frames"] = []
+
+        codes = self._codes(self._package(no_datums))
+        self.assertIn("input.body_frame_authored_numbers", codes)
+        self.assertIn("input.coordinate_systems_empty", codes)
 
         def ambiguous(document):
-            document["source"]["coordinate_systems"] = ["base_datum", "BASE_DATUM"]
+            document["source"]["bodies"][1]["frame"] = {"coordinate_system": "BASE_DATUM"}
 
         self._assert_code(self._package(ambiguous), "input.coordinate_systems_ambiguous")
 
+    def test_link_frames_bind_named_datums_only(self):
+        def blank_reference(document):
+            document["source"]["frames"][0]["coordinate_system"] = ""
+
+        self._assert_code(self._package(blank_reference), "input.frame_reference_unknown")
+
+        def authored_numbers(document):
+            document["source"]["frames"][0] = {
+                "id": "tool",
+                "name": "tool_frame",
+                "parent": "upper_link",
+                "xyz": [0.0, 0.0, 0.1],
+                "rpy": [0.0, 0.0, 0.0],
+            }
+
+        self._assert_code(self._package(authored_numbers), "input.frame_authored_numbers")
+
+        def unknown_parent(document):
+            document["source"]["frames"][0]["parent"] = "ghost_link"
+
+        self._assert_code(self._package(unknown_parent), "input.frame_parent_unknown")
+
     # ------------------------------------------------------------------- joints
+
+    def test_joints_carry_no_authored_origin_numbers(self):
+        def mutate(document):
+            joint = document["source"]["joints"][0]
+            joint["xyz"] = [0.0, 0.0, 0.05]
+            joint["rpy"] = [0.0, 0.0, 0.0]
+
+        inspection = self._assert_code(self._package(mutate), "input.joint_invalid")
+        unknown = inspection["errors"][0]["detail"]["unknown"]
+        self.assertEqual(unknown, ["rpy", "xyz"])
+
+    def test_joints_need_an_axis_reference(self):
+        def mutate(document):
+            document["source"]["joints"][0].pop("axis_reference")
+
+        self._assert_code(self._package(mutate), "input.joint_axis_reference_invalid")
 
     def test_joint_axis_and_limits_are_strict_si(self):
         def axis(document):
@@ -438,6 +485,19 @@ class InputPackageTests(unittest.TestCase):
             document["source"]["joints"][0]["type"] = "continuous"
 
         self._assert_code(self._package(continuous_with_bounds), "input.joint_limits_invalid")
+
+        def evidence_inside_limits(document):
+            joint = document["source"]["joints"][0]
+            joint["limits"]["evidence"] = joint.pop("limit_evidence")
+
+        self._assert_code(self._package(evidence_inside_limits), "input.joint_limits_invalid")
+
+    def test_fixed_joints_reject_axis_and_limit_payloads(self):
+        def mutate(document):
+            document["source"]["joints"][0]["type"] = "fixed"
+
+        codes = self._codes(self._package(mutate))
+        self.assertIn("input.joint_invalid", codes)
 
     def test_joint_endpoints_and_types_are_explicit(self):
         def unknown_type(document):
@@ -467,7 +527,7 @@ class InputPackageTests(unittest.TestCase):
                     "id": "spare",
                     "name": "spare_link",
                     "components": ["spare-1"],
-                    "frame": {"xyz": [0.0, 0.0, 0.0], "rpy": [0.0, 0.0, 0.0]},
+                    "frame": {"coordinate_system": "spare_datum"},
                 }
             )
             document["source"]["documented_masses"]["spare-1"] = {
@@ -491,54 +551,26 @@ class InputPackageTests(unittest.TestCase):
 
         self.assertIn("input.root_missing", self._codes(self._package(renamed_root)))
 
-    def test_joint_carries_no_top_level_evidence_key(self):
-        def mutate(document):
-            document["source"]["joints"][0]["evidence"] = {
-                "file": "evidence/spec.txt",
-                "sha256": document["source"]["mass_evidence"]["sha256"],
-                "anchor": "LIMIT-J1",
-            }
-
-        self._assert_code(self._package(mutate), "input.joint_invalid")
-
-    # ------------------------------------------------------------------- frames
-
-    def test_frames_need_a_declared_parent_and_a_datum_or_xyz_rpy(self):
-        def unknown_reference(document):
-            document["source"]["frames"][0]["coordinate_system"] = "missing_datum"
-
-        self._assert_code(self._package(unknown_reference), "input.frame_reference_unknown")
-
-        def unknown_parent(document):
-            document["source"]["frames"][0]["parent"] = "ghost_link"
-
-        self._assert_code(self._package(unknown_parent), "input.frame_parent_unknown")
-
-        def no_geometry(document):
-            document["source"]["frames"][0].pop("coordinate_system")
-
-        self.assertIn("input.frame_invalid", self._codes(self._package(no_geometry)))
-
     # ----------------------------------------------------------------- evidence
 
     def test_limit_evidence_must_bind_package_bytes_and_anchor(self):
         def missing(document):
-            document["source"]["joints"][0]["limits"].pop("evidence")
+            document["source"]["joints"][0].pop("limit_evidence")
 
         self._assert_code(self._package(missing), "input.limit_evidence_invalid")
 
         def bad_hash(document):
-            document["source"]["joints"][0]["limits"]["evidence"]["sha256"] = "0" * 64
+            document["source"]["joints"][0]["limit_evidence"]["sha256"] = "0" * 64
 
         self._assert_code(self._package(bad_hash), "input.limit_evidence_invalid")
 
         def bad_anchor(document):
-            document["source"]["joints"][0]["limits"]["evidence"]["anchor"] = "LIMIT-J1-MISSING"
+            document["source"]["joints"][0]["limit_evidence"]["anchor"] = "LIMIT-J1-MISSING"
 
         self._assert_code(self._package(bad_anchor), "input.limit_evidence_invalid")
 
         def outside(document):
-            document["source"]["joints"][0]["limits"]["evidence"]["file"] = "../spec.txt"
+            document["source"]["joints"][0]["limit_evidence"]["file"] = "../spec.txt"
 
         self._assert_code(self._package(outside), "input.limit_evidence_invalid")
 
