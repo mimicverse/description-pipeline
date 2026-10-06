@@ -1,32 +1,38 @@
-"""Publish a checked URDF bundle to a dedicated model repository through one review PR.
+"""Publish a verified URDF delivery bundle as one fast-forward review branch and PR.
 
-Public API: ``submit_bundle(bundle, repository, *, base, branch, message=None) -> dict``.
+Public API: ``submit_bundle(bundle, repository, *, base, branch, message=None, dry_run=False)``.
 
-The bundle layout is fixed: ``input/robot.yaml``, ``evidence/`` (frozen capture), ``model/robot.json``,
-``urdf/robot.urdf``, ``meshes/`` and ``reports/input.json``; ``reports/quality.json`` must be the
-*recomputed* verifier report, never a stale passed file. Nothing is pushed unless the verifier
-recomputes a passing report whose subject digest matches the staged bundle bytes.
+Guarantees:
+
+* only governed paths are staged (``README.md`` + ``input, evidence, model, urdf, meshes, reports``);
+* the bundle subject digest is re-bound to the staged bytes *and* the committed tree before any push;
+* a stale or tampered ``reports/quality.json`` can never escape, even if it says ``passed``;
+* the review branch is only ever fast-forwarded on top of its own remote head (no force pushes,
+  no base rewrites, foreign branches are refused);
+* existing PRs are updated with the latest metadata instead of being duplicated;
+* a GitHub failure after a successful push is reported with the pushed commit preserved.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
+import os
+import re
 import shutil
+import stat
 import subprocess
 import tempfile
 from pathlib import Path
 
-import yaml
-
 from ..delivery import subject_digest
-from . import _hardware, check_layout, git
+from ..io import read_data
 
+GOVERNED_PATHS = ("README.md", "input", "evidence", "model", "urdf", "meshes", "reports")
 REQUIRED_FILES = ("README.md", "input/robot.yaml", "model/robot.json", "urdf/robot.urdf",
                   "reports/input.json", "reports/tool.json")
 REQUIRED_DIRS = ("evidence", "meshes")
-OWNED_PATHS = ("README.md", "input", "evidence", "model", "urdf", "meshes", "reports")
 REVIEW_BRANCH = "work/solidworks/{hardware}"
+PUBLISHER_MARKER = "Urdf-Publisher: description-pipeline"
 
 
 class PrError(RuntimeError):
@@ -36,13 +42,37 @@ class PrError(RuntimeError):
         self.detail = detail
 
 
-def _fail(code: str, detail: object | None = None) -> dict:
-    return {"state": "failed", "error": code, "detail": detail}
+def _git(repository: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(repository), *args], check=check,
+                          capture_output=True, text=True, encoding="utf-8")
 
 
-def subject_hash(bundle: Path) -> str:
-    """Deterministic SHA-256 over every bundle file except the quality report itself."""
-    return subject_digest(Path(bundle))
+def _slug_hardware(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9_.-]", "-", value.strip().lower())
+    if not slug or slug.startswith("-"):
+        raise PrError("hardware_id_invalid", value)
+    return slug
+
+
+def _origin_slug(repository: Path) -> str:
+    override = os.environ.get("URDF_PR_REPO_SLUG")
+    if override:
+        return override
+    url = _git(repository, "remote", "get-url", "origin").stdout.strip()
+    match = re.fullmatch(r"(?:https://github\.com/|git@github\.com:)([^/]+/[^/]+?)(?:\.git)?", url)
+    if not match:
+        raise PrError("origin_not_github", url)
+    return match.group(1)
+
+
+def _remote_branch(repository: Path, branch: str) -> tuple[str, str]:
+    listing = _git(repository, "ls-remote", "origin", f"refs/heads/{branch}").stdout.strip()
+    if not listing:
+        return "", ""
+    sha = listing.split()[0]
+    _git(repository, "fetch", "--quiet", "origin", branch)
+    message = _git(repository, "log", "-1", "--format=%B", "FETCH_HEAD").stdout
+    return sha, message
 
 
 def _serialize(report: dict) -> str:
@@ -55,127 +85,199 @@ def _load_verifier():
     return check_bundle
 
 
-def _gh(*args: str) -> str:
-    result = subprocess.run(["gh", *args], check=True, capture_output=True, text=True, encoding="utf-8")
+def _gh(repository: Path, *args: str) -> str:
+    result = subprocess.run(["gh", *args], cwd=repository, check=True,
+                            capture_output=True, text=True, encoding="utf-8")
     return result.stdout
 
 
 def _validate(bundle: Path) -> tuple[str, dict]:
-    if not bundle.is_dir():
-        raise PrError("bundle_missing", str(bundle))
     for name in REQUIRED_FILES:
         if not (bundle / name).is_file():
             raise PrError("bundle_incomplete", name)
     for name in REQUIRED_DIRS:
         if not (bundle / name).is_dir():
             raise PrError("bundle_incomplete", name)
-    manifest = yaml.safe_load((bundle / "input/robot.yaml").read_text(encoding="utf-8"))
-    if not isinstance(manifest, dict) or not manifest.get("hardware"):
-        raise PrError("robot_yaml_invalid", "hardware is required")
-    hardware = _hardware(str(manifest["hardware"]))
-    return hardware, manifest
+    manifest = read_data(bundle / "input/robot.yaml")
+    if not isinstance(manifest, dict) or not manifest.get("hardware_id"):
+        raise PrError("robot_yaml_invalid", "hardware_id is required")
+    return _slug_hardware(str(manifest["hardware_id"])), manifest
 
 
-def _check(bundle: Path) -> tuple[str, dict]:
-    subject = subject_hash(bundle)
+def _verify(bundle: Path) -> tuple[str, dict]:
+    subject = subject_digest(bundle)
     report = _load_verifier()(bundle)
     if not isinstance(report, dict) or report.get("passed") is not True:
         raise PrError("verification_failed", report if isinstance(report, dict) else None)
-    reported = report.get("subject_sha256") or report.get("subject")
-    if reported != subject:
-        raise PrError("verification_subject_mismatch", {"expected": subject, "reported": reported})
-    quality = bundle / "reports/quality.json"
-    if not quality.is_file():
+    if report.get("subject_sha256") != subject:
+        raise PrError("verification_subject_mismatch",
+                      {"expected": subject, "reported": report.get("subject_sha256")})
+    on_disk = bundle / "reports/quality.json"
+    if not on_disk.is_file():
         raise PrError("missing_quality_report", "reports/quality.json is required")
-    if quality.read_text(encoding="utf-8") != _serialize(report):
-        raise PrError("stale_quality_report", "on-disk reports/quality.json differs from the recomputed report")
+    if on_disk.read_text(encoding="utf-8") != _serialize(report):
+        raise PrError("stale_quality_report", "on-disk quality report differs from the recomputed report")
     return subject, report
 
 
-def _remote_head(repository: Path, branch: str) -> str:
-    out = git(repository, "ls-remote", "origin", f"refs/heads/{branch}").stdout.strip()
-    return out.split()[0] if out else ""
-
-
-def _stage_and_push(repository: Path, bundle: Path, base: str, branch: str, subject: str, message: str) -> str:
-    base_sha = git(repository, "rev-parse", f"origin/{base}").stdout.strip()
-    expected = _remote_head(repository, branch)
-    staging = Path(tempfile.mkdtemp(prefix="urdf-pr-"))
-    worktree = staging / "worktree"
+def _lock(repository: Path):
+    git_dir = Path(_git(repository, "rev-parse", "--absolute-git-dir").stdout.strip())
+    lock = git_dir / "urdf-pr.lock"
     try:
-        git(repository, "worktree", "add", "--detach", str(worktree), base_sha)
-        # Replace only the governed delivery paths; inherited config/sources/docs stay untouched.
-        for name in OWNED_PATHS:
-            target = worktree / name
-            if target.is_dir():
-                shutil.rmtree(target)
-            elif target.exists():
-                target.unlink()
-        for path in sorted(p for p in bundle.rglob("*") if p.is_file()):
-            target = worktree / path.relative_to(bundle)
+        handle = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, stat.S_IRUSR | stat.S_IWUSR)
+    except FileExistsError as error:
+        raise PrError("repository_locked", str(lock)) from error
+    os.write(handle, str(os.getpid()).encode("ascii"))
+    return lock, handle
+
+
+def _copy_governed(bundle: Path, worktree: Path) -> None:
+    for name in GOVERNED_PATHS:
+        target = worktree / name
+        if target.is_dir():
+            shutil.rmtree(target)
+        elif target.exists():
+            target.unlink()
+        source = bundle / name
+        if source.is_dir():
+            shutil.copytree(source, target)
+        elif source.is_file():
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(path, target)
-        if subject_digest(worktree) != subject:
-            raise PrError("staged_subject_mismatch", "delivered bytes differ from the verified bundle")
-        git(worktree, "add", "--all")
-        git(worktree, "commit", "-m", message)
-        commit = git(worktree, "rev-parse", "HEAD").stdout.strip()
-        if expected:
-            git(worktree, "push", f"--force-with-lease=refs/heads/{branch}:{expected}", "origin", f"HEAD:refs/heads/{branch}")
-        else:
-            git(worktree, "push", "origin", f"HEAD:refs/heads/{branch}")
-        if _remote_head(repository, branch) != commit:
-            raise PrError("remote_head_mismatch", {"expected": commit})
-        return commit
-    finally:
-        subprocess.run(["git", "-C", str(repository), "worktree", "remove", "--force", str(worktree)],
-                       capture_output=True, text=True)
-        shutil.rmtree(staging, ignore_errors=True)
+            shutil.copyfile(source, target)
 
 
-def _pr(repository: Path, base: str, branch: str, subject: str, commit: str,
+def _prepare_worktree(repository: Path, worktree: Path, base_sha: str, head_sha: str) -> None:
+    start = head_sha or base_sha
+    _git(repository, "worktree", "add", "--detach", str(worktree), start)
+    if head_sha and _git(worktree, "merge-base", "--is-ancestor", base_sha, "HEAD", check=False).returncode != 0:
+        merge = _git(worktree, "merge", "--no-edit", base_sha, check=False)
+        if merge.returncode != 0:
+            _git(worktree, "merge", "--abort", check=False)
+            raise PrError("base_conflict", merge.stderr[-400:])
+
+
+def _stage_commit(bundle: Path, worktree: Path, subject: str, message: str) -> tuple[str, bool]:
+    _copy_governed(bundle, worktree)
+    changed = _git(worktree, "status", "--porcelain").stdout.splitlines()
+    for line in changed:
+        path = line[3:].strip().strip('"')
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        if path and not any(path == name or path.startswith(name + "/") for name in GOVERNED_PATHS):
+            raise PrError("ungoverned_change", path)
+    if subject_digest(worktree) != subject:
+        raise PrError("staged_subject_mismatch", "staged worktree bytes differ from the verified bundle")
+    _git(worktree, "add", "--all")
+    staged = _git(worktree, "diff", "--cached", "--quiet", check=False).returncode
+    if staged == 0:
+        return _git(worktree, "rev-parse", "HEAD").stdout.strip(), True
+    body = f"{message}\n\n{PUBLISHER_MARKER}\nUrdf-Subject: {subject}\n"
+    _git(worktree, "commit", "-m", body)
+    commit = _git(worktree, "rev-parse", "HEAD").stdout.strip()
+    if _git(worktree, "status", "--porcelain").stdout.strip():
+        raise PrError("commit_left_dirty", "staged worktree is not clean after commit")
+    if subject_digest(worktree) != subject:
+        raise PrError("committed_subject_mismatch", "committed tree bytes differ from the verified bundle")
+    diff = _git(worktree, "diff", "--name-only", "HEAD^", "HEAD").stdout.splitlines()
+    for path in diff:
+        if path and not any(path == name or path.startswith(name + "/") for name in GOVERNED_PATHS):
+            raise PrError("commit_touched_ungoverned", path)
+    return commit, False
+
+
+def _body(subject: str, commit: str, report: dict) -> str:
+    checks = report.get("checks") or []
+    return (f"Automatic SolidWorks-to-URDF publication.\n\n"
+            f"- subject: `{subject}`\n- verified commit: `{commit}`\n"
+            f"- verifier: recomputed, passed ({len(checks)} checks)\n")
+
+
+def _pr(repository: Path, slug: str, base: str, branch: str, subject: str, commit: str,
         report: dict, message: str | None) -> tuple[str, str]:
-    existing = json.loads(_gh("pr", "list", "--head", branch, "--state", "open", "--json", "url,number") or "[]")
-    body = (f"Automatic SolidWorks-to-URDF publication.\n\n- bundle subject: `{subject}`\n"
-            f"- commit: `{commit}`\n- verifier: passed (recomputed)\n")
-    if existing:
-        return "reused", existing[0]["url"]
-    title = message.splitlines()[0] if message else "SolidWorks-to-URDF bundle"
+    listing = json.loads(_gh(repository, "pr", "list", "--repo", slug, "--base", base, "--head", branch,
+                             "--state", "open", "--json", "url,number,baseRefName,headRefName") or "[]")
+    matches = [item for item in listing if item.get("baseRefName") == base and item.get("headRefName") == branch]
+    if len(matches) > 1:
+        raise PrError("pr_ambiguous", [item["url"] for item in matches])
+    title = (message.splitlines()[0] if message else f"SolidWorks-to-URDF bundle ({commit[:12]})")
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as handle:
-        handle.write(body)
+        handle.write(_body(subject, commit, report))
         body_path = handle.name
     try:
-        url = _gh("pr", "create", "--base", base, "--head", branch, "--title", title,
-                  "--body-file", body_path).strip()
+        if matches:
+            _gh(repository, "pr", "edit", str(matches[0]["number"]), "--repo", slug,
+                "--title", title, "--body-file", body_path)
+            return "updated", matches[0]["url"]
+        url = _gh(repository, "pr", "create", "--repo", slug, "--base", base, "--head", branch,
+                  "--title", title, "--body-file", body_path).strip()
+        return "published", url
     finally:
         Path(body_path).unlink(missing_ok=True)
-    return "published", url
 
 
 def submit_bundle(bundle: Path, repository: Path, *, base: str, branch: str,
                   message: str | None = None, dry_run: bool = False) -> dict:
-    """Validate, verify and publish one bundle; returns state/commit/url/branch/subject or a receipt."""
+    """Validate, verify and publish one bundle through a fast-forward review branch and PR."""
     bundle = Path(bundle).resolve()
     repository = Path(repository).resolve()
+    lock_info = None
+    staging = None
+    pushed = ""
+    subject = ""
+    slug = ""
     try:
         hardware, _ = _validate(bundle)
-        if branch != REVIEW_BRANCH.format(hardware=hardware):
-            raise PrError("branch_not_deterministic", {"expected": REVIEW_BRANCH.format(hardware=hardware)})
-        if git(repository, "status", "--porcelain").stdout.strip():
+        expected = REVIEW_BRANCH.format(hardware=hardware)
+        if branch != expected:
+            raise PrError("branch_not_deterministic", {"expected": expected})
+        slug = _origin_slug(repository)
+        lock_info = _lock(repository)
+        if _git(repository, "status", "--porcelain").stdout.strip():
             raise PrError("dirty_repository", "commit, stash or remove unrelated changes first")
-        subject, report = _check(bundle)
-        git(repository, "fetch", "origin", base, check=True)
+        subject, report = _verify(bundle)
+        _git(repository, "fetch", "--quiet", "origin", base)
+        base_sha = _git(repository, "rev-parse", "FETCH_HEAD").stdout.strip()
+        head_sha, head_message = _remote_branch(repository, branch)
+        if head_sha and PUBLISHER_MARKER not in head_message:
+            raise PrError("branch_foreign", {"branch": branch, "head": head_sha})
         if dry_run:
             return {"state": "dry_run", "branch": branch, "base": base, "subject": subject,
-                    "commit": "", "url": ""}
-        commit = _stage_and_push(repository, bundle, base, branch, subject,
-                                 message or f"feat({hardware}): publish SolidWorks-to-URDF bundle")
-        state, url = _pr(repository, base, branch, subject, commit, report, message)
-        return {"state": state, "branch": branch, "base": base, "subject": subject,
-                "commit": commit, "url": url}
+                    "commit": head_sha, "url": ""}
+        staging = Path(tempfile.mkdtemp(prefix="urdf-pr-"))
+        worktree = staging / "worktree"
+        try:
+            _prepare_worktree(repository, worktree, base_sha, head_sha)
+            commit, noop = _stage_commit(bundle, worktree, subject,
+                                         message or f"feat({hardware}): publish SolidWorks-to-URDF bundle")
+            if noop:
+                pushed = head_sha
+            else:
+                _git(worktree, "push", "origin", f"HEAD:refs/heads/{branch}")
+                pushed = commit
+        finally:
+            _git(repository, "worktree", "remove", "--force", str(worktree), check=False)
+            _git(repository, "worktree", "prune", check=False)
+            shutil.rmtree(staging, ignore_errors=True)
+        if _git(repository, "ls-remote", "origin", f"refs/heads/{branch}").stdout.split()[:1] != [pushed]:
+            raise PrError("remote_head_mismatch", {"expected": pushed})
+        state, url = _pr(repository, slug, base, branch, subject, pushed, report, message)
+        return {"state": "noop" if noop else state, "branch": branch, "base": base,
+                "subject": subject, "commit": pushed, "url": url}
     except PrError as error:
-        return _fail(error.code, error.detail)
+        return {"state": "failed", "error": error.code, "detail": error.detail,
+                "commit": pushed, "branch": branch, "subject": subject}
     except subprocess.CalledProcessError as error:
-        return _fail("git_or_gh_failed", {"command": error.cmd, "stderr": (error.stderr or "")[-400:]})
+        if pushed:
+            return {"state": "gh_failed_after_push", "error": "github_failed", "commit": pushed,
+                    "branch": branch, "subject": subject, "base": base,
+                    "retry": {"command": "gh pr list --head " + branch, "stderr": (error.stderr or "")[-300:]}}
+        return {"state": "failed", "error": "git_failed", "detail": (error.stderr or "")[-300:],
+                "commit": pushed, "branch": branch, "subject": subject}
     except Exception as error:  # noqa: BLE001 - receipts must never crash the caller
-        return _fail(type(error).__name__, str(error)[:400])
+        return {"state": "failed", "error": type(error).__name__, "detail": str(error)[:300],
+                "commit": pushed, "branch": branch, "subject": subject}
+    finally:
+        if lock_info is not None:
+            lock, handle = lock_info
+            os.close(handle)
+            lock.unlink(missing_ok=True)

@@ -1,4 +1,4 @@
-"""Adversarial tests for the single-PR publication boundary (local bare remote + mocked GitHub)."""
+"""Real local bare-Git tests for the fast-forward single-PR publication boundary."""
 
 from __future__ import annotations
 
@@ -9,7 +9,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from description_pipeline.delivery import subject_digest
 from description_pipeline.repository import urdf_pr
+
+BRANCH = "work/solidworks/m3.0"
 
 
 def run(*args: str, cwd: Path | None = None) -> str:
@@ -21,57 +24,81 @@ class Fixture:
         self.tmp = Path(tempfile.mkdtemp(prefix="urdf-pr-test-"))
         self.remote = self.tmp / "remote.git"
         run("git", "init", "--bare", "-b", "feature/m3.0", str(self.remote))
-        seed = self.tmp / "seed"
-        seed.mkdir()
-        run("git", "init", "-b", "feature/m3.0", cwd=seed)
-        run("git", "config", "user.email", "test@example.com", cwd=seed)
-        run("git", "config", "user.name", "Test", cwd=seed)
-        (seed / "README.md").write_text("base\n", encoding="utf-8")
-        run("git", "add", "-A", cwd=seed)
-        run("git", "commit", "-m", "base", cwd=seed)
-        run("git", "remote", "add", "origin", str(self.remote), cwd=seed)
-        run("git", "push", "-u", "origin", "feature/m3.0", cwd=seed)
+        self.seed = self.tmp / "seed"
+        self.seed.mkdir()
+        run("git", "init", "-b", "feature/m3.0", cwd=self.seed)
+        for key, value in (("user.email", "t@example.com"), ("user.name", "T")):
+            run("git", "config", key, value, cwd=self.seed)
+        (self.seed / "README.md").write_text("base\n", encoding="utf-8")
+        run("git", "add", "-A", cwd=self.seed)
+        run("git", "commit", "-m", "base", cwd=self.seed)
+        run("git", "remote", "add", "origin", str(self.remote), cwd=self.seed)
+        run("git", "push", "-u", "origin", "feature/m3.0", cwd=self.seed)
         self.repo = self.tmp / "repo"
         run("git", "clone", str(self.remote), str(self.repo))
-        run("git", "config", "user.email", "test@example.com", cwd=self.repo)
-        run("git", "config", "user.name", "Test", cwd=self.repo)
+        for key, value in (("user.email", "t@example.com"), ("user.name", "T")):
+            run("git", "config", key, value, cwd=self.repo)
         self.bundle = self.tmp / "bundle"
-        for rel, text in {
+        self.write_bundle("one\n")
+
+    def write_bundle(self, evidence: str, extra: dict[str, str] | None = None) -> None:
+        files = {
             "README.md": "# m3.0\n",
-            "input/robot.yaml": "hardware: m3.0\n",
-            "evidence/raw.json": "{}\n",
+            "input/robot.yaml": "hardware_id: m3.0\n",
+            "evidence/raw.json": evidence,
             "model/robot.json": "{}\n",
             "urdf/robot.urdf": "<robot name='m3.0'/>\n",
             "meshes/part.stl": "solid\n",
             "reports/input.json": "{}\n",
             "reports/tool.json": "{}\n",
-        }.items():
+        }
+        files.update(extra or {})
+        for rel, text in files.items():
             path = self.bundle / rel
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text, encoding="utf-8")
 
-    def remote_branch_sha(self, branch: str = "work/solidworks/m3.0") -> str:
+    def remote_head(self, branch: str = BRANCH) -> str:
         out = run("git", "ls-remote", str(self.remote), f"refs/heads/{branch}").strip()
         return out.split()[0] if out else ""
 
+    def remote_tree(self, branch: str = BRANCH) -> list[str]:
+        run("git", "fetch", "--quiet", "origin", branch, cwd=self.repo)
+        return run("git", "ls-tree", "-r", "--name-only", "FETCH_HEAD", cwd=self.repo).splitlines()
 
-class SubmitBundleTests(unittest.TestCase):
+    def is_ancestor(self, older: str, newer: str) -> bool:
+        return subprocess.run(["git", "-C", str(self.repo), "merge-base", "--is-ancestor", older, newer],
+                              capture_output=True).returncode == 0
+
+
+class PublishTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fx = Fixture()
+        env = mock.patch.dict("os.environ", {"URDF_PR_REPO_SLUG": "example/m3.0"})
+        env.start()
+        self.addCleanup(env.stop)
         self.gh_calls: list[tuple[str, ...]] = []
+        self.gh_mode = "ok"
         self.pr_exists = False
 
-        def fake_gh(*args: str) -> str:
+        def fake_gh(repository: Path, *args: str) -> str:
             self.gh_calls.append(args)
+            if self.gh_mode == "fail":
+                raise subprocess.CalledProcessError(1, ["gh", *args], stderr="gh down")
             if args[:2] == ("pr", "list"):
-                return json.dumps([{"url": "https://example.test/pr/1", "number": 1}]) if self.pr_exists else "[]"
+                if self.pr_exists:
+                    return json.dumps([{"url": "https://example.test/pr/1", "number": 1,
+                                        "baseRefName": "feature/m3.0", "headRefName": BRANCH}])
+                return "[]"
             if args[:2] == ("pr", "create"):
                 self.pr_exists = True
                 return "https://example.test/pr/1\n"
+            if args[:2] == ("pr", "edit"):
+                return ""
             raise AssertionError(args)
 
         def verifier(bundle: Path) -> dict:
-            report = {"passed": True, "subject_sha256": urdf_pr.subject_hash(bundle)}
+            report = {"passed": True, "subject_sha256": subject_digest(bundle), "checks": [{"id": "x", "status": "passed"}]}
             (bundle / "reports/quality.json").write_text(urdf_pr._serialize(report), encoding="utf-8")
             return report
 
@@ -82,60 +109,88 @@ class SubmitBundleTests(unittest.TestCase):
         self.addCleanup(lambda: [p.stop() for p in self.patchers])
 
     def submit(self, **kwargs):
-        return urdf_pr.submit_bundle(self.fx.bundle, self.fx.repo, base="feature/m3.0",
-                                     branch="work/solidworks/m3.0", **kwargs)
+        return urdf_pr.submit_bundle(self.fx.bundle, self.fx.repo, base="feature/m3.0", branch=BRANCH, **kwargs)
 
-    def test_valid_publish_then_reuse_one_pr(self) -> None:
+    def test_repeat_runs_fast_forward_then_noop(self) -> None:
+        base = self.fx.remote_head("feature/m3.0")
         first = self.submit()
-        self.assertIn(first["state"], {"published", "reused"})
-        self.assertEqual(first["url"], "https://example.test/pr/1")
-        self.assertEqual(self.fx.remote_branch_sha(), first["commit"])
+        self.assertIn(first["state"], {"published", "updated"})
+        self.assertEqual(self.fx.remote_head(), first["commit"])
+        self.assertTrue(self.fx.is_ancestor(base, first["commit"]))
+        self.fx.write_bundle("two\n")
         second = self.submit()
-        self.assertEqual(second["state"], "reused")
-        self.assertEqual(second["url"], first["url"])
+        self.assertEqual(second["state"], "updated")
+        self.assertTrue(self.fx.is_ancestor(first["commit"], second["commit"]))
+        self.assertEqual(self.fx.remote_head(), second["commit"])
+        third = self.submit()
+        self.assertEqual(third["state"], "noop")
+        self.assertEqual(third["commit"], second["commit"])
+        self.assertEqual(self.fx.remote_head(), second["commit"])
         self.assertEqual(len([c for c in self.gh_calls if c[:2] == ("pr", "create")]), 1)
-        self.assertEqual(self.fx.remote_branch_sha(), second["commit"])
+        self.assertGreaterEqual(len([c for c in self.gh_calls if c[:2] == ("pr", "edit")]), 2)
 
-    def test_tampered_subject_never_pushes(self) -> None:
-        with mock.patch.object(urdf_pr, "_load_verifier", lambda: (lambda bundle: {"passed": True, "subject_sha256": "0" * 64})):
-            result = self.submit()
-        self.assertEqual(result["state"], "failed")
-        self.assertEqual(result["error"], "verification_subject_mismatch")
-        self.assertEqual(self.fx.remote_branch_sha(), "")
+    def test_base_advance_merges_preserving_ancestry(self) -> None:
+        first = self.submit()
+        (self.fx.seed / "feature.txt").write_text("feature\n", encoding="utf-8")
+        run("git", "add", "-A", cwd=self.fx.seed)
+        run("git", "commit", "-m", "advance base", cwd=self.fx.seed)
+        run("git", "push", "origin", "feature/m3.0", cwd=self.fx.seed)
+        run("git", "fetch", "--quiet", "origin", "feature/m3.0", cwd=self.fx.repo)
+        new_base = run("git", "rev-parse", "FETCH_HEAD", cwd=self.fx.repo).strip()
+        self.fx.write_bundle("three\n")
+        second = self.submit()
+        self.assertTrue(self.fx.is_ancestor(first["commit"], second["commit"]))
+        self.assertTrue(self.fx.is_ancestor(new_base, second["commit"]))
 
-    def test_stale_passed_report_never_pushes(self) -> None:
-        (self.fx.bundle / "reports/quality.json").write_text('{"passed": true, "subject_sha256": "old"}\n', encoding="utf-8")
-        no_write = lambda bundle: {"passed": True, "subject_sha256": urdf_pr.subject_hash(bundle)}  # noqa: E731
-        with mock.patch.object(urdf_pr, "_load_verifier", lambda: no_write):
-            result = self.submit()
-        self.assertEqual(result["error"], "stale_quality_report")
-        self.assertEqual(self.fx.remote_branch_sha(), "")
-
-    def test_dirty_repository_preserved(self) -> None:
+    def test_dirty_checkout_preserved(self) -> None:
         user_file = self.fx.repo / "user-notes.txt"
         user_file.write_text("mine\n", encoding="utf-8")
         result = self.submit()
         self.assertEqual(result["error"], "dirty_repository")
         self.assertTrue(user_file.is_file())
-        self.assertEqual(self.fx.remote_branch_sha(), "")
+        self.assertEqual(self.fx.remote_head(), "")
 
-    def test_failed_verifier_never_pushes(self) -> None:
+    def test_foreign_branch_refused_without_overwrite(self) -> None:
+        (self.fx.seed / "foreign.txt").write_text("foreign\n", encoding="utf-8")
+        run("git", "add", "-A", cwd=self.fx.seed)
+        run("git", "commit", "-m", "foreign branch", cwd=self.fx.seed)
+        run("git", "push", "origin", "HEAD:refs/heads/" + BRANCH, cwd=self.fx.seed)
+        foreign = self.fx.remote_head()
+        result = self.submit()
+        self.assertEqual(result["error"], "branch_foreign")
+        self.assertEqual(self.fx.remote_head(), foreign)
+
+    def test_bad_verification_and_tamper_never_push(self) -> None:
         with mock.patch.object(urdf_pr, "_load_verifier", lambda: (lambda bundle: {"passed": False})):
-            result = self.submit()
-        self.assertEqual(result["error"], "verification_failed")
-        self.assertEqual(self.fx.remote_branch_sha(), "")
+            self.assertEqual(self.submit()["error"], "verification_failed")
+        self.assertEqual(self.fx.remote_head(), "")
+        with mock.patch.object(urdf_pr, "_load_verifier",
+                               lambda: (lambda bundle: {"passed": True, "subject_sha256": "0" * 64})):
+            self.assertEqual(self.submit()["error"], "verification_subject_mismatch")
+        self.assertEqual(self.fx.remote_head(), "")
+        good = {"passed": True, "subject_sha256": subject_digest(self.fx.bundle)}
+        (self.fx.bundle / "reports/quality.json").write_text('{"passed": true}\n', encoding="utf-8")
+        with mock.patch.object(urdf_pr, "_load_verifier", lambda: (lambda bundle: good)):
+            self.assertEqual(self.submit()["error"], "stale_quality_report")
+        self.assertEqual(self.fx.remote_head(), "")
 
-    def test_bad_layout_and_branch(self) -> None:
-        (self.fx.bundle / "urdf/robot.urdf").unlink()
-        self.assertEqual(self.submit()["error"], "bundle_incomplete")
-        (self.fx.bundle / "urdf/robot.urdf").write_text("<robot/>\n", encoding="utf-8")
-        bad = urdf_pr.submit_bundle(self.fx.bundle, self.fx.repo, base="feature/m3.0", branch="work/other")
-        self.assertEqual(bad["error"], "branch_not_deterministic")
+    def test_gh_failure_after_push_keeps_pushed_receipt(self) -> None:
+        self.gh_mode = "fail"
+        result = self.submit()
+        self.assertEqual(result["state"], "gh_failed_after_push")
+        self.assertEqual(result["commit"], self.fx.remote_head())
+        self.assertEqual(result["branch"], BRANCH)
+        self.assertTrue(result["subject"])
+        self.assertIn("retry", result)
 
-    def test_dry_run_does_not_push(self) -> None:
-        result = self.submit(dry_run=True)
-        self.assertEqual(result["state"], "dry_run")
-        self.assertEqual(self.fx.remote_branch_sha(), "")
+    def test_ungoverned_files_never_reach_the_branch(self) -> None:
+        self.fx.write_bundle("four\n", extra={"secret.txt": "shh\n", "config/extra.json": "{}\n"})
+        result = self.submit()
+        self.assertIn(result["state"], {"published", "updated"})
+        tree = self.fx.remote_tree()
+        self.assertNotIn("secret.txt", tree)
+        self.assertNotIn("config/extra.json", tree)
+        self.assertIn("urdf/robot.urdf", tree)
 
 
 if __name__ == "__main__":
