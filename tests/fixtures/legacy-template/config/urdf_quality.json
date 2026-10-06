@@ -1,5 +1,0 @@
-{
-  "comment": "URDF 例外台账：只允许豁免 warning，必须写理由、责任人与日期（见 docs/urdf_standard.md）。",
-  "massless_links": [],
-  "waivers": []
-}

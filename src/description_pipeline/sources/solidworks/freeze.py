@@ -1563,9 +1563,7 @@ def freeze(
     from contextlib import nullcontext
 
     if backend is None and isinstance(config, dict) and config.get("worker_url"):
-        from .remote import freeze_via_worker
-
-        return freeze_via_worker(dict(config), Path(destination))
+        raise ConfigError("Remote capture was removed; run the complete pipeline on the native Windows endpoint")
     if backend is None:
         from .native import SolidWorksBackend
 

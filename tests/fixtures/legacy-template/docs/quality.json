@@ -1,5 +1,0 @@
-{
-  "state": "template",
-  "release_ready": false,
-  "reason": "Repository scaffold only; no hardware model or physical validation."
-}

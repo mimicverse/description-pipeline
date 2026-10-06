@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
-import io
-import json
 import os
 import threading
 import unittest
@@ -16,7 +13,6 @@ from description_pipeline.sources.solidworks.errors import BridgeError, CadError
 from description_pipeline.sources.solidworks.executor import ComExecutor  # noqa: E402
 from description_pipeline.sources.solidworks.isolation import CadSession  # noqa: E402
 from description_pipeline.sources.solidworks.native import SolidWorksBackend, _read_only_document  # noqa: E402
-from description_pipeline.sources.solidworks import cli  # noqa: E402
 
 
 class ExecutorTests(unittest.TestCase):
@@ -204,43 +200,3 @@ class SessionTests(unittest.TestCase):
         for session in sessions:
             session.close.assert_called_once()
         self.assertEqual(backend._sessions, {})
-
-
-class DoctorCliTests(unittest.TestCase):
-    def test_timeout_is_json_and_nonzero(self):
-        with (
-            patch.object(ComExecutor, "run", side_effect=BridgeError("modal_dialog_blocked", "timeout", exit_code=4)),
-            contextlib.redirect_stdout(io.StringIO()) as output,
-        ):
-            self.assertEqual(cli.main(["--doctor", "--assembly", "robot.SLDASM", "--json"]), 4)
-        self.assertEqual(json.loads(output.getvalue())["error"]["code"], "modal_dialog_blocked")
-
-    def test_installation_alone_is_not_collection_success(self):
-        report = {"installed": True, "cad_collectable": False}
-        with patch.object(ComExecutor, "run", return_value=report), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(cli.main(["--doctor", "--assembly", "robot.SLDASM", "--json"]), 1)
-
-    def test_a_save_flag_is_printed_as_a_notice_and_still_collectable(self):
-        # The flag is advisory: the operator has to see it, and the exit status has to
-        # stay successful because a capture from the bytes on disk is still possible.
-        report = {
-            "installed": True,
-            "worker_alive": True,
-            "solidworks_reachable": True,
-            "cad_collectable": True,
-            "advisories": [
-                {
-                    "code": "cad_save_flag_set",
-                    "message": "SolidWorks reports unsaved changes for a document opened read-only",
-                    "documents": ["C:/models/robot.SLDASM"],
-                    "count": 1,
-                }
-            ],
-            "checks": [{"name": "collection", "status": "passed"}],
-        }
-        with patch.object(ComExecutor, "run", return_value=report), contextlib.redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(cli.main(["--doctor", "--assembly", "robot.SLDASM"]), 0)
-        printed = output.getvalue()
-        self.assertIn("[     notice] SolidWorks reports unsaved changes", printed)
-        self.assertIn("C:/models/robot.SLDASM", printed)
-        self.assertIn("collectable=True", printed)

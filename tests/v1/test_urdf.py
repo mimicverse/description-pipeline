@@ -12,9 +12,7 @@ from description_pipeline.model import Robot
 
 class UrdfWriterTests(unittest.TestCase):
     def test_mesh_delivery_is_self_contained_and_deterministic(self):
-        source = Path(__file__).resolve().parents[2] / "examples/mesh-arm/sources/fixture"
-        if not source.exists():
-            source = Path(__file__).resolve().parents[2] / "fixtures/v1/mesh-source"
+        source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
         robot = Robot.from_dict(read_data(source / "scene.json"))
         original = robot.to_dict()
         with tempfile.TemporaryDirectory() as temp:

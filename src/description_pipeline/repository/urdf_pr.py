@@ -112,17 +112,19 @@ def _validate(bundle: Path) -> tuple[str, dict, dict]:
         raise PrError("robot_yaml_invalid", "hardware_id is required")
     hardware = _slug_hardware(str(manifest["hardware_id"]))
     try:
-        current = cad_revision.read_revision(bundle / "input", hardware_id=hardware)
+        current = cad_revision.read_revision(bundle / "input", hardware_id=manifest["hardware_id"])
     except PipelineError as error:
         raise PrError("cad_revision_invalid", str(error)) from error
     return hardware, manifest, current
 
 
 def _previous_revision(worktree: Path, hardware: str) -> dict | None:
-    try:
-        return cad_revision.read_revision(worktree / "input", hardware_id=hardware)
-    except PipelineError:
+    if not (worktree / "input/cad-revision.json").exists():
         return None
+    try:
+        return cad_revision.read_revision(worktree / "input")
+    except PipelineError as error:
+        raise PrError("previous_cad_revision_invalid", str(error)) from error
 
 
 def _validate_ref(repository: Path, name: str, *, branch: bool) -> None:

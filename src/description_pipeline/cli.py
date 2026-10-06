@@ -1,736 +1,148 @@
-"""Public command line: every automation calls the same application functions."""
+"""SolidWorks-to-URDF command-line entry point."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import posixpath
 import sys
-import subprocess
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 
 from . import __version__
-from . import pipeline, runlog
-from .build import OBJECT_FIELDS, assess, build, freeze, lock_toolchain
-from .build.publication import recover
-from .sources.onshape.errors import OnshapeSourceError
-from .sources.solidworks.errors import BridgeError
-from .io import PipelineError, confined, pin_utf8_streams, quote_argument, read_data, write_json
-from .quickstart import DEMO, PROFILE as QUICKSTART_PROFILE, run as run_demo, scaffold
-from .repository import (
-    check_layout,
-    compare_models,
-    dispatch,
-    init_model,
-    pending_candidates,
-    promote,
-    promotion_plan,
-    submit,
-    update,
-    validate_commit,
-)
+from .io import PipelineError, file_digest, pin_utf8_streams, write_json
 
 
-def _commit_message(args) -> str:
-    """The commit message comes from exactly one source; '-' means standard input.
+def _write_report(path: Path, result: dict, source: Path, *, bundle: bool = False) -> None:
+    """Report options must never overwrite author inputs or delivered subject files."""
 
-    Reading it from a file or stdin is what lets the Windows entry pass a message
-    without interpolating it into a shell or ssh command line.
-    """
-
-    if (args.message is not None) == (args.message_file is not None):
-        raise PipelineError("Provide exactly one of --message or --message-file")
-    if args.message_file is not None:
-        text = (
-            sys.stdin.read() if str(args.message_file) == "-" else Path(args.message_file).read_text(encoding="utf-8")
-        )
-    else:
-        text = args.message
-    if not text.strip():
-        raise PipelineError("A commit message is required")
-    return text
-
-
-def _failure_message(error: BaseException) -> str:
-    """Keep what the failing command said, so the caller can show the real cause.
-
-    ``str(CalledProcessError)`` names the command and exit status but drops stderr;
-    without it a wrapper such as the Windows submission entry can only report
-    "returned non-zero exit status 128" and the actual cause has to be reproduced by
-    hand.  Whitespace is collapsed so the value stays a single JSON string.
-    """
-
-    stderr = getattr(error, "stderr", None) or ""
-    if isinstance(stderr, bytes):
-        stderr = stderr.decode(errors="replace")
-    detail = " ".join(str(stderr).split())
-    return f"{error}: {detail[:300]}" if detail else str(error)
-
-
-#: Windows reports "path too long" as one of these codes; the message itself names a staging path
-#: that means nothing to the operator.  Long paths are off by default, so this is common enough to
-#: deserve the fix rather than the symptom.
-WINDOWS_PATH_ERRORS = {3, 206}
-
-
-def _path_advice(error: BaseException) -> str:
-    """The fix for a Windows MAX_PATH failure, or an empty string."""
-
-    if getattr(error, "winerror", None) in WINDOWS_PATH_ERRORS:
-        # One source of truth with `description doctor --root .`, which warns before the failure.
-        from .doctor import WINDOWS_LONG_PATH_ADVICE
-
-        return WINDOWS_LONG_PATH_ADVICE + " The workspace was not modified."
-    return ""
-
-
-def _app_control_block(error: BaseException) -> dict | None:
-    """Classify an App Control rejection, including one wrapped in an ``ImportError``.
-
-    MuJoCo's native loader can fail while importing ``_callbacks``; on a localized Windows install
-    the OS error may be reachable only through the import error's cause chain.  The classifier
-    itself lives in ``doctor`` (one source of truth with ``description doctor``).
-    """
-
-    from .doctor import app_control_rejection
-
-    seen: set[int] = set()
-    current: BaseException | None = error
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        block = app_control_rejection(current)
-        if block is not None:
-            return block
-        current = current.__cause__ or current.__context__
-    return None
-
-
-DEFAULT_WORKER_URL = "http://127.0.0.1:8765"
-
-
-def _absolute_cad_path(value: str) -> bool:
-    """A CAD path is absolute on Windows or on POSIX, whichever machine authored it.
-
-    A model may be prepared on Linux for a Windows workstation (or the other way round), so a
-    ``D:/...`` path has to be accepted on Linux too; ``Path.is_absolute`` only knows the local rules.
-    """
-
-    return posixpath.isabs(value) or bool(PureWindowsPath(value).drive)
-
-
-def _source_mapping(args) -> dict:
-    """Build the ``source`` mapping from command-line options.
-
-    This is the novice path: the first-use guide used to ask for a hand-written YAML file, which is
-    the first place a new user can go wrong.  The options mirror the documented keys exactly, and the
-    SolidWorks mapping is validated with the same function the freeze uses, so a typo fails now
-    rather than after SolidWorks has been opened.
-    """
-
-    if args.provider == "solidworks":
-        if args.assembly is None:
-            raise PipelineError("--provider solidworks needs --assembly D:/robots/myrobot/robot.SLDASM")
-        assembly = str(args.assembly).replace("\\", "/")
-        if not _absolute_cad_path(assembly):
-            raise PipelineError("--assembly must be an absolute path, like D:/robots/myrobot/robot.SLDASM")
-        allowed = args.allowed_roots or [Path(assembly).parent]
-        for root in allowed:
-            if not _absolute_cad_path(str(root).replace("\\", "/")):
-                raise PipelineError(f"--allowed-roots must be absolute directories, got {root}")
-        if not args.configuration.strip():
-            raise PipelineError("--configuration is required; the adapter never guesses the active configuration")
-        mapping = {
-            "provider": "solidworks",
-            "assembly": assembly,
-            "configuration": args.configuration,
-            "allowed_roots": [str(path).replace("\\", "/").rstrip("/") for path in allowed],
-            "worker_url": args.worker_url or DEFAULT_WORKER_URL,
-            "require_saved": True,
-            "geometry": {"enabled": True, "format": "stl_binary"},
-        }
-        from .sources.solidworks.freeze import validate_source_config
-
-        validate_source_config(mapping)
-        return mapping
-
-    if args.url:
-        mapping = {"provider": "onshape", "url": args.url}
-    elif args.document_id and args.element_id and (args.workspace_id or args.version_id):
-        mapping = {"provider": "onshape", "document_id": args.document_id, "element_id": args.element_id}
-        if args.workspace_id:
-            mapping["workspace_id"] = args.workspace_id
-        else:
-            mapping["version_id"] = args.version_id
-    else:
-        raise PipelineError(
-            "--provider onshape needs --url, or --document-id/--element-id together with --workspace-id or --version-id"
-        )
-    if args.configuration.strip():
-        mapping["configuration"] = args.configuration
-    return mapping
-
-
-def _purpose_hints(value: dict, root: Path, profile: str) -> list[str]:
-    """Name the acceptance workflow for the declared purpose."""
-
-    blockers = value.get("blockers") or []
-    if "consumer.application" not in blockers:
-        return []
-    purpose = ""
-    try:
-        purpose = str(read_data(confined(root, f"config/profiles/{profile}.json")).get("purpose") or "")
-    except (PipelineError, OSError, ValueError):
-        purpose = ""
-    purpose = purpose or profile
-    if purpose == "kinematics":
-        return [
-            "select an approved held-out mechanical reference outside the workspace, then run "
-            f"`description model update --root {root} --profile {profile} --reuse-source "
-            "--mechanical-reference <reference.json>`; see `docs/mechanical-acceptance.en.md`"
-        ]
-    if purpose != "simulation":
-        return [
-            f"a {purpose} build needs application evidence this tool does not record: "
-            "`description model accept` supports simulation and mechanical kinematics replay; see "
-            "the qualification boundaries in `docs/pipeline.en.md`"
-        ]
-    return [
-        "the application acceptance has not been recorded for this build: run "
-        f"`description model accept --root {root} --profile {profile} --out <result directory>` "
-        "and keep its record with the delivery"
-    ]
-
-
-def _with_next(value: dict, hints: list[str]) -> dict:
-    """Attach the next commands to a result so the CLI can show a new user the way forward."""
-
-    if isinstance(value, dict) and hints:
-        value.setdefault("next", hints)
-    return value
-
-
-def _diff_reference(identity: dict) -> str:
-    """Name one side of a diff the way the report names it: a commit prefix, or the directory."""
-
-    if identity.get("commit"):
-        return str(identity["commit"])[:12]
-    return str(identity.get("directory", ""))
-
-
-def _diff_area(area: str, detail) -> str:
-    """Describe one changed area in a few words; the JSON report keeps every field of it."""
-
-    if area in OBJECT_FIELDS:
-        counts = [f"{len(detail[kind])} {kind}" for kind in ("added", "removed", "modified") if detail[kind]]
-        return f"{area}: {' + '.join(counts)}"
-    if isinstance(detail, list):
-        return f"{area}: {len(detail)} field{'s' if len(detail) != 1 else ''}"
-    return area
-
-
-def _pipeline_lines(value: dict) -> list[str]:
-    """Human output for `pipeline list` / `pipeline show`; the JSON form carries the same data."""
-
-    if "pipelines" in value:
-        return [
-            f"{entry['id']:22s} {entry['title']} (sources: {', '.join(entry['source_kinds'])})"
-            for entry in value["pipelines"]
-        ]
-    if "pipeline" in value:
-        entry = value["pipeline"]
-        lines = [
-            f"pipeline  : {entry['id']}",
-            f"title     : {entry['title']}",
-            f"source    : {', '.join(entry['source_kinds'])}",
-            "stages:",
-        ]
-        lines += [
-            f"  {number}. {stage['name']:<9s} {stage['summary']}\n"
-            f"     code: {stage['code']}\n"
-            f"     docs: {stage['document']}"
-            for number, stage in enumerate(entry["stages"], 1)
-        ]
-        lines += ["documents:"] + [f"  {document}" for document in entry["documents"]]
-        return lines
-    workspace = value["workspace"]
-    identity = workspace["identity"]
-    lines = [
-        f"root      : {workspace['root']}",
-        f"declared  : {workspace['declared_id'] or 'none (legacy default)'}",
-        f"resolved  : {identity['id'] or 'unmapped'}",
-        f"source    : {identity.get('source_kind')}",
-        f"provenance: {identity['resolved_from']}",
-    ]
-    if identity["id"]:
-        entry = pipeline.describe(identity["id"])
-        lines += ["", f"title     : {entry['title']}", "stages:"]
-        lines += [f"  {number}. {stage['name']:<9s} {stage['code']}" for number, stage in enumerate(entry["stages"], 1)]
-    return lines
-
-
-def _diff_line(value: dict) -> str:
-    """The sentence a review starts with, in front of a report that can run to megabytes."""
-
-    summary = value["summary"]
-    left, right = (_diff_reference(item) for item in value["references"])
-    before, after = str(value["before"])[:12], str(value["after"])[:12]
-    subject = f"subject {before} -> {after}" if summary["subject_changed"] else f"subject {before} unchanged"
-    if not summary["changed"]:
-        if summary["subject_changed"]:
-            return (
-                f"diff: {left} -> {right}: no changes in the compared areas, but the delivery digest moved "
-                f"({before} -> {after}); a delivered file the report does not compare has changed"
-            )
-        return f"diff: {left} -> {right}: no changes; {subject}"
-    changes = value["changes"]
-    areas = [_diff_area(area, changes[area]) for area in summary["changed_areas"]]
-    listed = ", ".join(areas[:5]) + (f", +{len(areas) - 5} more" if len(areas) > 5 else "")
-    return f"diff: {left} -> {right}: {len(areas)} area{'s' if len(areas) != 1 else ''} changed ({listed}); {subject}"
+    destination, source = path.resolve(), source.resolve()
+    if destination.is_relative_to(source):
+        allowed = bundle and destination == source / "reports/quality.json"
+        if not allowed:
+            raise PipelineError("Write reports outside the input; only reports/quality.json may be updated in a bundle")
+    write_json(path, result)
 
 
 def parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    commands = argparse.ArgumentParser(
         prog="description",
-        description=__doc__,
-        epilog=(
-            "common tasks:\n"
-            "  description quickstart --run           create and run the offline demo (no CAD needed)\n"
-            "  description doctor --root .            check this installation and workspace\n"
-            "  description tool lock --root . && description source freeze --root . && description build --root .\n"
-            "  description model update               capture, build, validate and submit a model in one command\n"
-            "  description check --root .             re-derive a delivered model and qualify it\n"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="SolidWorks-to-URDF: inspect the CAD package, generate, verify and submit a PR.",
     )
-    p.add_argument("--version", action="version", version=__version__)
-    commands = p.add_subparsers(dest="command", required=True)
-    quickstart = commands.add_parser(
-        "quickstart",
-        help="create the offline demo workspace and, with --run, build and check it",
-    )
-    quickstart.add_argument(
-        "directory",
-        nargs="?",
-        type=Path,
-        default=Path(DEMO),
-        help=f"directory to write; it must be missing or empty (default: ./{DEMO})",
-    )
-    quickstart.add_argument("--run", action="store_true", help="also run tool lock, source freeze, build and check")
-    doctor = commands.add_parser("doctor", help="check this installation, and a model workspace when given")
-    doctor.add_argument("--root", type=Path, help="model workspace to inspect")
-    doctor.add_argument("--json", action="store_true", help="print the machine-readable report")
-    doctor.add_argument("--github", action="store_true", help="also check that the GitHub CLI is installed")
-    recovery = commands.add_parser("recover")
-    recovery.add_argument("--root", type=Path, required=True)
-    for name in ("build", "check"):
-        cmd = commands.add_parser(name)
-        cmd.add_argument("--root", type=Path, required=True)
-        cmd.add_argument("--profile", default="kinematics")
-        cmd.add_argument("--report", type=Path)
-        cmd.add_argument(
-            "--mechanical-reference", type=Path, help="Operator-selected held-out reference outside the model"
-        )
-        if name == "build":
-            cmd.add_argument("--output", type=Path)
-    source = commands.add_parser("source").add_subparsers(dest="operation", required=True)
-    source.add_parser("freeze").add_argument("--root", type=Path, required=True)
-    tool = commands.add_parser("tool").add_subparsers(dest="operation", required=True)
-    tool.add_parser("lock").add_argument("--root", type=Path, required=True)
-    pipeline_cmd = commands.add_parser("pipeline", help="List or describe the published source-to-URDF pipelines")
-    pipelines = pipeline_cmd.add_subparsers(dest="operation", required=True)
-    listing = pipelines.add_parser("list", help="List every published pipeline id")
-    listing.add_argument("--json", action="store_true", help="print the machine-readable catalog")
-    show = pipelines.add_parser("show", help="Show one published pipeline, or the one a workspace uses")
-    show.add_argument("id", nargs="?", help="published id, for example solidworks-to-urdf")
-    show.add_argument("--root", type=Path, help="model workspace whose pipeline identity to describe")
-    show.add_argument("--json", action="store_true", help="print the machine-readable description")
-    diff = commands.add_parser("diff")
-    diff.add_argument("before", type=Path)
-    diff.add_argument("after", type=Path)
-    diff.add_argument(
-        "--repository", type=Path, default=Path.cwd(), help="Repository used to resolve commit or branch arguments"
-    )
-    diff.add_argument(
-        "--json", action="store_true", help="print only the JSON report; omit the summary sentence on stderr"
-    )
-    model = commands.add_parser("model").add_subparsers(dest="operation", required=True)
-    accept = model.add_parser("accept", help="Run simulation acceptance or mechanical kinematics replay")
-    accept.add_argument("--root", type=Path, required=True, help="Read-only built candidate")
-    accept.add_argument("--profile", default="simulation")
-    accept.add_argument("--config", type=Path, default=Path("config/simulation-acceptance.json"))
-    accept.add_argument(
-        "--mechanical-reference", type=Path, help="Required for kinematics; independent external JSON reference"
-    )
-    accept.add_argument("--out", type=Path, required=True, help="New output directory outside the candidate")
-    init = model.add_parser("init")
-    init.add_argument("--root", type=Path, required=True)
-    init.add_argument("--hardware", required=True)
-    init.add_argument(
-        "--source-config",
-        type=Path,
-        help="source mapping to copy; alternatively describe it with --provider and its options",
-    )
-    init.add_argument("--provider", choices=("solidworks", "onshape"), help="build the source mapping from options")
-    init.add_argument("--assembly", type=Path, help="solidworks: absolute path of the top-level SLDASM")
-    init.add_argument("--configuration", default="", help="CAD configuration to capture (never guessed)")
-    init.add_argument(
-        "--allowed-roots",
-        type=Path,
-        action="append",
-        help="solidworks: directories the dependencies must stay in (repeatable; defaults to the assembly directory)",
-    )
-    init.add_argument("--worker-url", default="", help="solidworks: local worker URL (default http://127.0.0.1:8765)")
-    init.add_argument("--url", help="onshape: document URL (workspace or version)")
-    init.add_argument("--document-id", default="", help="onshape: document id when no URL is given")
-    init.add_argument("--element-id", default="", help="onshape: element id when no URL is given")
-    init.add_argument("--workspace-id", default="", help="onshape: workspace id when no URL is given")
-    init.add_argument("--version-id", default="", help="onshape: version id when no URL is given")
-    init.add_argument("--repository", type=Path)
-    init.add_argument("--base", default="HEAD")
-    for name in ("submit", "update", "dispatch", "validate", "pending", "promote", "layout"):
-        cmd = model.add_parser(name)
-        cmd.add_argument(
-            "--root", type=Path, required=name != "update", default=Path.cwd() if name == "update" else None
-        )
-        cmd.add_argument("--profile", default="kinematics")
-        if name in {"submit", "update", "validate", "promote"}:
-            cmd.add_argument(
-                "--mechanical-reference",
-                type=Path,
-                help="Explicitly select the approved external reference for kinematics replay",
-            )
-        if name in {"submit", "update"}:
-            cmd.add_argument("--message")
-            cmd.add_argument("--message-file", type=Path, help="read the commit message from a file; '-' reads stdin")
-        if name in {"submit", "update", "promote", "pending"}:
-            cmd.add_argument(
-                "--ci", action="store_true", help="Also request or require GitHub CI (disabled by default)"
-            )
-        if name == "update":
-            cmd.add_argument(
-                "--reuse-source",
-                action="store_true",
-                help="Rebuild definition/evidence edits from the verified frozen source; do not contact CAD",
-            )
-            cmd.add_argument(
-                "--worker-host",
-                help="Linux: tunnel to a Windows SSH alias; source.worker_url must use http://127.0.0.1:<port>",
-            )
-            cmd.add_argument("--worker-port", type=int, help="Windows worker port behind --worker-host (default: 8765)")
-            cmd.add_argument(
-                "--expect-worker-url",
-                help="Fail unless source.worker_url already equals this value (guards a stale tunnel port)",
-            )
-        if name in {"dispatch", "validate", "promote"}:
-            cmd.add_argument("--candidate", required=True)
-        if name == "validate":
-            cmd.add_argument("--report", type=Path)
-            cmd.add_argument("--remote", action="store_true", help="Fetch the candidate into a fresh Git/LFS store")
-        if name == "promote":
-            cmd.add_argument("--hardware", required=True)
-            cmd.add_argument("--tag", help="Optional immutable alias; consumers pin the model commit SHA")
-            cmd.add_argument("--review-evidence")
-            cmd.add_argument("--apply", action="store_true")
-        if name == "layout":
-            cmd.add_argument("--role", choices=("model", "tooling"), default="model")
-    worker = commands.add_parser("worker").add_subparsers(dest="operation", required=True)
-    doctor = worker.add_parser("doctor")
-    doctor.add_argument("--target", required=True, help="HTTP worker endpoint, usually a local SSH tunnel")
-    doctor.add_argument("--assembly")
-    doctor.add_argument("--configuration")
-    return p
+    commands.add_argument("--version", action="version", version=f"solidworks-to-urdf {__version__}")
+    operations = commands.add_subparsers(dest="operation", required=True)
+    revision = operations.add_parser("revision", help="seal the mechanical team's immutable CAD handoff")
+    revision.add_argument("input", type=Path)
+    revision.add_argument("--hardware", required=True)
+    revision.add_argument("--id", required=True, dest="revision_id")
+    revision.add_argument("--parent", dest="parent_revision")
+    revision.add_argument("--owner", required=True)
+    revision.add_argument("--control", required=True, choices=("git", "pdm", "handoff"))
+    revision.add_argument("--reference", required=True)
+    revision.add_argument("--summary", required=True)
+    inspect = operations.add_parser("inspect", help="check the author package before opening SolidWorks")
+    inspect.add_argument("input", type=Path, help="self-contained CAD directory containing robot.yaml")
+    inspect.add_argument("--report", type=Path, help="write the input report to this file")
+    run = operations.add_parser("run", help="capture, generate, verify and automatically submit a PR")
+    run.add_argument("input", type=Path)
+    run.add_argument("--output", type=Path, required=True, help="delivery directory outside the input package")
+    run.add_argument("--repository", type=Path, help="dedicated local model clone; omit for local verification")
+    run.add_argument("--base", help="PR target branch; default feature/<hardware_id>")
+    run.add_argument("--message", help="English commit message and PR title")
+    check = operations.add_parser("check", help="independently verify the actual delivered URDF and source evidence")
+    check.add_argument("bundle", type=Path)
+    check.add_argument("--report", type=Path, help="write the recomputed quality report to this file")
+    rebuild = operations.add_parser("rebuild", help="regenerate a verified frozen bundle without SolidWorks")
+    rebuild.add_argument("bundle", type=Path)
+    rebuild.add_argument("--output", type=Path, required=True)
+    rebuild.add_argument("--repository", type=Path)
+    rebuild.add_argument("--base")
+    rebuild.add_argument("--message")
+    submit = operations.add_parser("submit", help="recheck and submit a frozen delivery from Windows or Linux")
+    submit.add_argument("bundle", type=Path)
+    submit.add_argument("--repository", type=Path, required=True)
+    submit.add_argument("--base")
+    submit.add_argument("--message")
+    serve = operations.add_parser("serve", help="run the authenticated Windows endpoint used by Apache Airflow")
+    serve.add_argument("--config", type=Path, required=True)
+    operations.add_parser("doctor", help="check runtime and native capture availability")
+    return commands
 
 
 def main(argv: list[str] | None = None) -> int:
-    # The CLI exchanges JSON and commit messages with launchers on both platforms.
-    # Windows redirected streams otherwise use the active ANSI code page.
     pin_utf8_streams()
-    args = parser().parse_args(argv)
-    run = runlog.begin(args, list(argv) if argv is not None else sys.argv[1:])
-    report_path = getattr(args, "report", None)
-    mechanical_reference = getattr(args, "mechanical_reference", None)
-    reference_option = (
-        f" --mechanical-reference {quote_argument(str(mechanical_reference))}"
-        if mechanical_reference is not None
-        else ""
-    )
+    arguments = parser().parse_args(argv)
     try:
-        root_argument = getattr(args, "root", None)
-        if root_argument is not None and root_argument.exists() and not root_argument.is_dir():
-            raise PipelineError(f"--root must be a directory: {root_argument}")
-        if report_path and getattr(args, "root", None):
-            resolved = report_path.resolve()
-            root = args.root.resolve()
-            if resolved.is_relative_to(root) and not resolved.is_relative_to(root / "build"):
-                raise PipelineError("Write check reports outside the immutable bundle or under build/")
-        if args.command == "recover":
-            value = recover(args.root.resolve())
-        elif args.command == "doctor":
-            from . import doctor as doctor_module
+        if arguments.operation == "serve":
+            from .orchestration.windows import serve
 
-            value = doctor_module.run(args.root, github=args.github)
-            if not args.json:
-                for line in doctor_module.lines(value):
-                    print(line)
-                return 0 if value["passed"] else 1
-        elif args.command == "quickstart":
-            value = scaffold(args.directory)
-            workspace = Path(value["root"])
-            if args.run:
-                value.update(run_demo(workspace))
-                if value["passed"]:
-                    value = _with_next(
-                        value,
-                        [
-                            f"read {workspace / 'docs/quality.md'} to see what was checked",
-                            f"change one joint limit in {workspace / 'urdf/robot.urdf'}, then run the check "
-                            "again to watch the pipeline reject it",
-                        ],
-                    )
-                else:
-                    value = _with_next(value, ["fix the blockers above, then run description check --root . again"])
-            else:
-                value = _with_next(
-                    value,
-                    [
-                        f"cd {workspace}",
-                        "description tool lock --root .",
-                        "description source freeze --root .",
-                        f"description build --root . --profile {QUICKSTART_PROFILE}",
-                        f"description check --root . --profile {QUICKSTART_PROFILE}",
-                    ],
-                )
-        elif args.command == "build":
-            value = build(args.root, args.profile, args.output, mechanical_reference=args.mechanical_reference)
-            value = _with_next(
-                value,
-                [
-                    f"description check --root {args.root} --profile {args.profile}{reference_option}",
-                    *_purpose_hints(value, args.root, args.profile),
-                ],
+            serve(arguments.config)
+            return 0
+        if arguments.operation == "revision":
+            from .sources.solidworks.revision import FILENAME, seal_revision
+
+            revision = seal_revision(
+                arguments.input,
+                hardware_id=arguments.hardware,
+                revision=arguments.revision_id,
+                owner=arguments.owner,
+                system=arguments.control,
+                reference=arguments.reference,
+                summary=arguments.summary,
+                parent_revision=arguments.parent_revision,
             )
-        elif args.command == "check":
-            value = assess(args.root.resolve(), args.profile, mechanical_reference=args.mechanical_reference)
-            if value.get("passed"):
-                value = _with_next(
-                    value,
-                    [
-                        f"description model submit --root {args.root} --profile {args.profile}{reference_option} "
-                        '--message "Update model"'
-                    ],
-                )
-            else:
-                value = _with_next(
-                    value,
-                    [
-                        "fix the blockers above (or the files they name), then run this command again",
-                        *_purpose_hints(value, args.root, args.profile),
-                    ],
-                )
-        elif args.command == "source":
-            value = freeze(args.root.resolve())
-            value = _with_next(
-                value,
-                [
-                    f"description doctor --root {args.root}",
-                    f"description build --root {args.root} --profile kinematics",
-                ],
-            )
-        elif args.command == "tool":
-            value = lock_toolchain(args.root.resolve())
-        elif args.command == "pipeline":
-            if args.operation == "list":
-                value = {"schema_version": pipeline.SCHEMA, "pipelines": pipeline.catalog()}
-                if not args.json:
-                    for line in _pipeline_lines(value):
-                        print(line)
-                    return 0
-            else:
-                if (args.id is None) == (args.root is None):
-                    raise PipelineError("pipeline show needs a published pipeline id or --root MODEL")
-                if args.id is not None:
-                    value = {"schema_version": pipeline.SCHEMA, "pipeline": pipeline.describe(args.id)}
-                else:
-                    value = {"schema_version": pipeline.SCHEMA, "workspace": pipeline.workspace_identity(args.root)}
-                if not args.json:
-                    for line in _pipeline_lines(value):
-                        print(line)
-                    return 0
-        elif args.command == "diff":
-            value = compare_models(args.repository, args.before, args.after)
-            if not args.json:
-                print(_diff_line(value), file=sys.stderr)
-        elif args.command == "worker":
-            from .sources.solidworks.remote import WorkerClient
-
-            value = WorkerClient(args.target).doctor(args.assembly, args.configuration)
-            value["passed"] = (
-                value.get("installed", False)
-                and value.get("worker_alive", False)
-                and value.get("solidworks_reachable", False)
-                and (not args.assembly or value.get("cad_collectable", False))
-            )
-        elif args.operation == "accept":
-            from .build import profile_for
-
-            purpose = profile_for(args.root, args.profile)["purpose"]
-            if purpose == "kinematics":
-                from .verification.mechanics import run_acceptance as run_mechanics
-
-                if args.mechanical_reference is None:
-                    raise PipelineError("Kinematics acceptance requires an approved external --mechanical-reference")
-                if args.config != Path("config/simulation-acceptance.json"):
-                    raise PipelineError(
-                        "--config describes simulation tests; use --mechanical-reference for kinematics"
-                    )
-                record = run_mechanics(args.root, args.profile, args.mechanical_reference, args.out)
-            else:
-                from .verification.simulation import run_acceptance
-
-                if args.mechanical_reference is not None:
-                    raise PipelineError("--mechanical-reference supports kinematics only")
-                record = run_acceptance(args.root, args.profile, args.config, args.out)
-            value = {
-                "passed": bool(record["results"]) and all(item["passed"] for item in record["results"]),
-                "subject": record["subject"],
-                "tests": {item["suite"]: item["passed"] for item in record["results"]},
-                "output": str(args.out.resolve()),
-                "release_qualified": False,
+            result = {
+                "passed": True,
+                "cad_revision": revision,
+                "manifest_sha256": file_digest(arguments.input / FILENAME),
             }
-        elif args.operation == "init":
-            if (args.source_config is None) == (args.provider is None):
-                raise PipelineError(
-                    "Describe the source with --source-config FILE, or with --provider solidworks|onshape "
-                    "and its options"
-                )
-            if args.source_config is not None:
-                if not args.source_config.is_file():
-                    raise PipelineError(f"Source config not found: {args.source_config}")
-                source = read_data(args.source_config)
-            else:
-                source = _source_mapping(args)
-            value = init_model(
-                args.root.resolve(),
-                args.hardware,
-                source,
-                repository=args.repository,
-                base=args.base,
-            )
-            root = args.root.resolve()
-            value = _with_next(
-                value,
-                [
-                    f"edit {root}/config/robot.yaml to declare bodies, joints, frames and limits",
-                    f"description source freeze --root {root}",
-                ],
-            )
-        elif args.operation == "layout":
-            value = check_layout(args.root, args.role)
-        elif args.operation == "submit":
-            value = submit(
-                args.root,
-                args.profile,
-                _commit_message(args),
-                ci=args.ci,
-                mechanical_reference=args.mechanical_reference,
-            )
-        elif args.operation == "update":
-            value = update(
-                args.root,
-                args.profile,
-                None if args.message is None and args.message_file is None else _commit_message(args),
-                expect_worker_url=args.expect_worker_url,
-                reuse_source=args.reuse_source,
-                worker_host=args.worker_host,
-                worker_port=args.worker_port,
-                ci=args.ci,
-                mechanical_reference=args.mechanical_reference,
-            )
-        elif args.operation == "dispatch":
-            value = dispatch(args.root, args.candidate, args.profile)
-        elif args.operation == "validate":
-            value = validate_commit(
-                args.root,
-                args.candidate,
-                args.profile,
-                remote=args.remote,
-                mechanical_reference=args.mechanical_reference,
-            )
-        elif args.operation == "pending":
-            value = {"dispatched" if args.ci else "pending": pending_candidates(args.root, args.profile, ci=args.ci)}
-        else:
-            value = promotion_plan(
-                args.root,
-                args.hardware,
-                args.candidate,
-                args.profile,
-                args.tag,
-                ci=args.ci,
-                mechanical_reference=args.mechanical_reference,
-            )
-            if args.apply:
-                value["review_evidence"] = args.review_evidence
-                value = promote(args.root, value, mechanical_reference=args.mechanical_reference)
-        if run is not None:
-            value["run_id"] = run["run_id"]
-            runlog.note(run, value)
-        if report_path:
-            write_json(report_path, value)
-        for hint in value.get("next") or []:
-            print(f"next: {hint}", file=sys.stderr)
-        for note in value.get("advisories") or []:
-            print(f"note: {note.get('message', note)}", file=sys.stderr)
-            for command in note.get("commands") or []:
-                print(f"      {command}", file=sys.stderr)
-            if note.get("then"):
-                print(f"      {note['then']}", file=sys.stderr)
-        print(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False))
-        return 0 if value.get("passed", value.get("ok", True)) else 1
-    except (
-        PipelineError,
-        OSError,
-        ValueError,
-        KeyError,
-        subprocess.SubprocessError,
-        OnshapeSourceError,
-        BridgeError,
-        ImportError,
-        KeyboardInterrupt,
-    ) as error:
-        value = {
-            "passed": False,
-            "error": type(error).__name__,
-            "message": " ".join(part for part in (_failure_message(error), _path_advice(error)) if part)
-            or "Operation interrupted",
-        }
-        block = _app_control_block(error)
-        if block is not None:
-            from .doctor import app_control_message
+        elif arguments.operation == "inspect":
+            from .solidworks import inspect_input
 
-            value["code"] = block["code"]
-            value["winerror"] = block["winerror"]
-            value["library"] = block.get("library")
-            value["cause"] = block["error"]
-            value["message"] = app_control_message(block)
-        if vars(error).get("diagnostic_path"):
-            value["diagnostic_path"] = str(vars(error)["diagnostic_path"])
-        if isinstance(error, (OnshapeSourceError, BridgeError)):
-            value.update(code=error.code, detail=error.detail)
-        if run is not None:
-            value["run_id"] = run["run_id"]
-            runlog.note(run, value, outcome="error")
-        if report_path and (
-            not report_path.resolve().is_relative_to(args.root.resolve())
-            or report_path.resolve().is_relative_to(args.root.resolve() / "build")
-        ):
-            write_json(report_path, value)
-        print(
-            json.dumps(value, ensure_ascii=False),
-            file=sys.stderr,
-        )
-        return 130 if isinstance(error, KeyboardInterrupt) else 2
-    finally:
-        runlog.finish(run)
+            result = inspect_input(arguments.input)
+            if arguments.report:
+                _write_report(arguments.report, result, arguments.input)
+        elif arguments.operation == "check":
+            from .verification.solidworks_urdf import check_bundle
+
+            result = check_bundle(arguments.bundle)
+            if arguments.report:
+                _write_report(arguments.report, result, arguments.bundle, bundle=True)
+        else:
+            from . import solidworks
+
+            if arguments.operation == "run":
+                if arguments.base and not arguments.repository:
+                    raise PipelineError("--base requires --repository")
+                result = solidworks.run(
+                    arguments.input,
+                    arguments.output,
+                    repository=arguments.repository,
+                    base=arguments.base,
+                    message=arguments.message,
+                )
+            elif arguments.operation == "rebuild":
+                if arguments.base and not arguments.repository:
+                    raise PipelineError("--base requires --repository")
+                result = solidworks.rebuild(
+                    arguments.bundle,
+                    arguments.output,
+                    repository=arguments.repository,
+                    base=arguments.base,
+                    message=arguments.message,
+                )
+            elif arguments.operation == "submit":
+                result = solidworks.submit(
+                    arguments.bundle,
+                    arguments.repository,
+                    base=arguments.base,
+                    message=arguments.message,
+                )
+            else:
+                result = solidworks.doctor()
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0 if result.get("passed") is True else 1
+    except (PipelineError, ValueError, OSError, TypeError, OverflowError) as error:
+        print(json.dumps({"passed": False, "error": str(error)}, ensure_ascii=False), file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

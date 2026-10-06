@@ -1,3 +1,0 @@
-# Structural inspection order only; NOT controller, policy or hardware order.
-structural_joint_names:
-  - shoulder_joint

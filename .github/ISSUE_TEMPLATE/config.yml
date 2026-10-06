@@ -1,8 +1,0 @@
-blank_issues_enabled: false
-contact_links:
-  - name: Read the documentation first
-    url: https://github.com/mimicverse/description-pipeline/tree/main/docs
-    about: Design, runbook, URDF rules, simulation acceptance and first-use guides.
-  - name: Report a security vulnerability
-    url: https://github.com/mimicverse/description-pipeline/security/advisories/new
-    about: Report privately. Do not open a public issue for a vulnerability.
