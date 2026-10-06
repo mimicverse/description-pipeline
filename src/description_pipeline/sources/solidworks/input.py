@@ -33,6 +33,10 @@ _ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
 _SNAKE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+# SolidWorks writes these transient lock files next to the document it has open;
+# they are not part of the authored package and must never poison an inventory
+# or an evidence binding.
+TRANSIENT_PREFIX = "~$"
 
 
 class _Report:
@@ -54,7 +58,14 @@ class _Report:
 
 
 def _is_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        # YAML can carry integers far beyond float range; that is a finding,
+        # never a crash.
+        return False
 
 
 def _is_snake(value: Any) -> bool:
@@ -77,10 +88,25 @@ def _as_mapping(value: Any, report: _Report, code: str, where: str) -> dict[str,
 
 
 def _unknown_keys(value: dict[str, Any], allowed: set[str], report: _Report, code: str, where: str) -> list[str]:
-    unknown = sorted(set(value) - allowed)
+    malformed = [key for key in value if not isinstance(key, str)]
+    if malformed:
+        report.error(
+            code,
+            f"{where} has non-string keys",
+            {"keys": [repr(key) for key in malformed], "allowed": sorted(allowed)},
+        )
+    unknown = sorted(key for key in value if isinstance(key, str) and key not in allowed)
     if unknown:
         report.error(code, f"{where} has unknown keys", {"unknown": unknown, "allowed": sorted(allowed)})
     return unknown
+
+
+def _string_keys(value: dict[str, Any], report: _Report, code: str, where: str) -> None:
+    """Reject mapping keys that are not names, with a finding instead of a crash."""
+
+    malformed = [key for key in value if not isinstance(key, str)]
+    if malformed:
+        report.error(code, f"{where} has non-string keys", {"keys": [repr(key) for key in malformed]})
 
 
 def _vector3(value: Any, report: _Report, code: str, where: str) -> tuple[float, float, float] | None:
@@ -124,11 +150,13 @@ def _range2(
 def _inventory_entries(root: Path, report: _Report) -> tuple[list[dict[str, Any]], dict[str, str]]:
     """Return sorted receipt entries and the hash map; reject symlinks/case collisions."""
 
-    try:
-        hashes = inventory(root)
-    except PipelineError as error:
-        report.error("input.inventory_invalid", str(error))
-        return [], {}
+    hashes, skipped = _package_hashes(root, report)
+    if skipped:
+        report.warn(
+            "input.transient_files_excluded",
+            "transient SolidWorks lock files were excluded from the package inventory",
+            {"files": skipped},
+        )
     entries: list[dict[str, Any]] = []
     for relative in sorted(hashes):
         path = root / relative
@@ -139,6 +167,20 @@ def _inventory_entries(root: Path, report: _Report) -> tuple[list[dict[str, Any]
             continue
         entries.append({"path": relative, "sha256": hashes[relative], "bytes": size})
     return entries, hashes
+
+
+def _package_hashes(root: Path, report: _Report) -> tuple[dict[str, str], list[str]]:
+    """Hash the package, excluding transient ``~$`` lock files."""
+
+    try:
+        hashes = inventory(root)
+    except PipelineError as error:
+        report.error("input.inventory_invalid", str(error))
+        return {}, []
+    transient = sorted(name for name in hashes if Path(name).name.startswith(TRANSIENT_PREFIX))
+    for name in transient:
+        hashes.pop(name)
+    return hashes, transient
 
 
 def _file_text(path: Path) -> str:
@@ -277,6 +319,7 @@ def _validate_documented_masses(
     mapping = _as_mapping(raw, report, "input.documented_masses_invalid", "source.documented_masses")
     if mapping is None:
         return {}, None
+    _string_keys(mapping, report, "input.documented_masses_invalid", "source.documented_masses")
     documented: dict[str, dict[str, Any]] = {}
     shared_binding = None
     if mapping:
@@ -664,6 +707,12 @@ def _validate_source(
                     f"{where}.limits.lower must not exceed .upper",
                     {"lower": lower, "upper": upper},
                 )
+            elif float(lower) == float(upper):
+                report.error(
+                    "input.joint_limits_invalid",
+                    f"{where}.limits.lower must be strictly below .upper",
+                    {"lower": lower, "upper": upper},
+                )
         elif joint_type == "continuous":
             if "lower" in limits or "upper" in limits:
                 report.error(
@@ -980,7 +1029,11 @@ def load_package(path: Path) -> dict[str, Any]:
     # Re-inventory after validation: the freeze must read the same bytes that
     # were statically inspected.  A change invalidates the receipt.
     try:
-        current = inventory(Path(receipt["resolved_package_root"]))
+        current = {
+            name: value
+            for name, value in inventory(Path(receipt["resolved_package_root"])).items()
+            if not Path(name).name.startswith(TRANSIENT_PREFIX)
+        }
     except (KeyError, PipelineError) as error:
         raise PipelineError(f"SolidWorks v1 input package could not be re-inventoried: {error}") from error
     if current != {entry["path"]: entry["sha256"] for entry in receipt.get("inventory", [])}:

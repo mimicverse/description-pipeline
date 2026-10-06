@@ -13,9 +13,10 @@ A part document reports positive-product notation for the same body::
 
     [[1, +1, 0], [+1, 1, 0], [0, 0, 2]]
 
-An assembly component-group selection reports the standard tensor as-is.  The
-scope label therefore decides the conversion, and it must agree with any
-explicit convention - historical part readings are never relabelled.
+An assembly component-group selection was measured (M3.0 head, 2026-10-06) to
+report the *same* positive-product notation.  The scope label therefore decides
+the conversion, and it must agree with any explicit convention - historical
+part readings are never relabelled.
 """
 
 from __future__ import annotations
@@ -47,18 +48,22 @@ class GeneratorScopeTests(unittest.TestCase):
         tensor = tensor_from_raw(POSITIVE_PRODUCT, {"scope": "part_document"}, where="analytic fixture")
         self.assertEqual(tensor, tuple(tuple(row) for row in STANDARD))
 
-    def test_group_scope_keeps_standard_tensors_as_is(self):
+    def test_group_scope_uses_the_measured_positive_convention(self):
         tensor = tensor_from_raw(
-            STANDARD,
-            {"scope": "assembly_component_group", "product_convention": "solidworks_standard"},
+            POSITIVE_PRODUCT,
+            {"scope": "assembly_component_group", "product_convention": "solidworks_positive"},
             where="analytic fixture",
         )
+        self.assertEqual(tensor, tuple(tuple(row) for row in STANDARD))
+
+    def test_explicit_standard_convention_is_honoured(self):
+        tensor = tensor_from_raw(STANDARD, {"product_convention": "solidworks_standard"}, where="analytic fixture")
         self.assertEqual(tensor, tuple(tuple(row) for row in STANDARD))
 
     def test_scope_and_convention_must_agree(self):
         for raw, reference in (
             (POSITIVE_PRODUCT, {"scope": "part_document", "product_convention": "solidworks_standard"}),
-            (STANDARD, {"scope": "assembly_component_group", "product_convention": "solidworks_positive"}),
+            (POSITIVE_PRODUCT, {"scope": "assembly_component_group", "product_convention": "solidworks_standard"}),
         ):
             with self.subTest(reference=reference):
                 with self.assertRaises(ConfigError):
@@ -88,10 +93,14 @@ class VerifyOracleScopeTests(unittest.TestCase):
             "box", self._payload(POSITIVE_PRODUCT, {"scope": "part_document"})
         )
         group = verify_module._raw_tensor(
-            "group", self._payload(STANDARD, {"scope": "assembly_component_group"})
+            "group", self._payload(POSITIVE_PRODUCT, {"scope": "assembly_component_group"})
         )
         self.assertTrue(np.allclose(part, np.array(STANDARD)))
         self.assertTrue(np.allclose(group, np.array(STANDARD)))
+        standard = verify_module._raw_tensor(
+            "explicit", self._payload(STANDARD, {"product_convention": "solidworks_standard"})
+        )
+        self.assertTrue(np.allclose(standard, np.array(STANDARD)))
 
     def test_oracle_rejects_disagreeing_or_unknown_scopes(self):
         with self.assertRaises(ValueError):

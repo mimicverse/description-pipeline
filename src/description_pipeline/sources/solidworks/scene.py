@@ -124,16 +124,23 @@ def combine_mass_properties(entries: Sequence[dict[str, Any]]) -> dict[str, Any]
 
 
 PRODUCT_CONVENTIONS = ("solidworks_positive", "solidworks_standard")
-# The same ``GetMomentOfInertia(0)`` call answers in different conventions
-# depending on what the mass-property object selected.  Part documents answer in
-# positive-product notation (proven by the analytic box fixture); selections of
-# assembly component instances/groups answer standard tensors (October 6 group
-# audit: 7 of 8 decisive groups).  The scope label is authoritative and must
-# agree with any declared convention, so a reading is never re-interpreted by
-# silently relabelling historical part measurements.
+# The scope label names *what was selected*; it is authoritative and must agree
+# with any declared convention, so a reading is never re-interpreted by
+# silently relabelling historical measurements.
+#
+# Measured on the M3.0 pack (2026-10-06, read-only COM audit of headM3.0):
+# part documents, single selected instances and multi-instance groups all
+# answer in positive-product notation.  For the five head parts whose
+# placement is a signed permutation and whose off-diagonals are non-trivial,
+# ``R · raw_part · Rᵀ`` reproduces the single-instance matrix to <=3e-23
+# (the sign-flipped hypothesis is off by 1e-9..1e-7), and 3/6/9-member groups
+# match the positive-notation parallel-axis combination to <=7e-15 relative
+# (the mixed-convention hypothesis is off by 0.07..0.33).  An earlier note
+# that component groups answer standard tensors is NOT supported by this
+# measurement and is retracted.
 SCOPE_CONVENTIONS = {
     "part_document": "solidworks_positive",
-    "assembly_component_group": "solidworks_standard",
+    "assembly_component_group": "solidworks_positive",
 }
 FIXTURE_API_MARKERS = ("fixture",)
 
@@ -521,7 +528,7 @@ def build_scene(
         )
 
     joint_entries = _build_joints(cfg, {link["name"] for link in links}, link_frames)
-    frames = _build_frames(cfg, {link["name"] for link in links}, raw_scene)
+    frames = _build_frames(cfg, {link["name"] for link in links}, raw_scene, link_frames)
     # The root link's frame is where the model's world coordinates start.  The
     # world-frame oracle needs it to evaluate the q=0 chain, so it is written
     # here instead of being reconstructed by whoever reads the snapshot.
@@ -665,7 +672,14 @@ def _build_joints(
     return joints
 
 
-def _build_frames(cfg: dict[str, Any], link_names: Iterable[str], raw_scene: Any) -> list[dict[str, Any]]:
+def _build_frames(
+    cfg: dict[str, Any],
+    link_names: Iterable[str],
+    raw_scene: Any,
+    link_frames: dict[str, tuple[Matrix3, Vector3, str | None]] | None = None,
+) -> list[dict[str, Any]]:
+    """Named frames are native *world* datums; URDF frames are parent-relative."""
+
     known = set(link_names)
     frames: list[dict[str, Any]] = []
     for frame in cfg.get("frames") or []:
@@ -682,6 +696,23 @@ def _build_frames(cfg: dict[str, Any], link_names: Iterable[str], raw_scene: Any
                     {"frame": frame_id, "coordinate_system": reference},
                 )
             rotation, translation = map_from_row_major(matrix)
+            frames_map = link_frames or {}
+            if parent not in frames_map:
+                raise ConfigError(
+                    "frame parent has no captured link frame to be expressed against",
+                    {"frame": frame_id, "parent": parent},
+                )
+            parent_rotation, parent_translation, _parent_datum = frames_map[parent]
+            inverse_parent = _transpose(parent_rotation)
+            rotation = _matmul(inverse_parent, rotation)
+            translation = _matvec(
+                inverse_parent,
+                (
+                    translation[0] - parent_translation[0],
+                    translation[1] - parent_translation[1],
+                    translation[2] - parent_translation[2],
+                ),
+            )
             xyz = [float(value) for value in translation]
             rpy = [float(value) for value in rpy_from_matrix(rotation)]
             geometry = f"cad_coordinate_system:{reference}"

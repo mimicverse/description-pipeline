@@ -97,7 +97,7 @@ class DerivedJointFrameTests(unittest.TestCase):
 
 
 class NamedFrameTests(unittest.TestCase):
-    def test_named_frame_reads_the_captured_datum(self):
+    def test_named_frame_is_expressed_relative_to_its_parent(self):
         raw_scene = SimpleNamespace(
             coordinate_systems={
                 "tool_datum": _array(_rz(math.pi / 2), (0.1, 0.2, 0.3)),
@@ -113,12 +113,35 @@ class NamedFrameTests(unittest.TestCase):
                 }
             ]
         }
-        entry = _build_frames(cfg, {"upper_link"}, raw_scene)[0]
-        self.assertAlmostEqual(entry["xyz"][0], 0.1)
+        link_frames = {"upper_link": (identity_matrix(), (0.1, 0.0, 0.0), "upper_datum")}
+        entry = _build_frames(cfg, {"upper_link"}, raw_scene, link_frames)[0]
+        # The datum is a world pose; URDF wants it in the parent link frame.
+        self.assertAlmostEqual(entry["xyz"][0], 0.0)
         self.assertAlmostEqual(entry["xyz"][1], 0.2)
         self.assertAlmostEqual(entry["xyz"][2], 0.3)
         self.assertAlmostEqual(entry["rpy"][2], math.pi / 2)
         self.assertEqual(entry["provenance"]["geometry"], "cad_coordinate_system:tool_datum")
+
+    def test_parent_rotation_and_translation_are_removed(self):
+        raw_scene = SimpleNamespace(
+            coordinate_systems={"tool_datum": _array(identity_matrix(), (1.0, 1.0, 0.5))}
+        )
+        cfg = {
+            "frames": [
+                {
+                    "id": "tool",
+                    "name": "tool_frame",
+                    "parent": "upper_link",
+                    "coordinate_system": "tool_datum",
+                }
+            ]
+        }
+        link_frames = {"upper_link": (_rz(math.pi / 2), (1.0, 0.0, 0.0), "upper_datum")}
+        entry = _build_frames(cfg, {"upper_link"}, raw_scene, link_frames)[0]
+        self.assertAlmostEqual(entry["xyz"][0], 1.0)
+        self.assertAlmostEqual(entry["xyz"][1], 0.0)
+        self.assertAlmostEqual(entry["xyz"][2], 0.5)
+        self.assertAlmostEqual(entry["rpy"][2], -math.pi / 2)
 
     def test_missing_captured_datum_is_an_error(self):
         raw_scene = SimpleNamespace(coordinate_systems={})
@@ -132,8 +155,9 @@ class NamedFrameTests(unittest.TestCase):
                 }
             ]
         }
+        link_frames = {"upper_link": (identity_matrix(), (0.0, 0.0, 0.0), "upper_datum")}
         with self.assertRaises(ConfigError):
-            _build_frames(cfg, {"upper_link"}, raw_scene)
+            _build_frames(cfg, {"upper_link"}, raw_scene, link_frames)
 
 
 if __name__ == "__main__":

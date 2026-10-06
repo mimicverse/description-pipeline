@@ -656,6 +656,49 @@ class InputPackageTests(unittest.TestCase):
 
         self._assert_code(self._package(unknown), "input.checks_invalid")
 
+    def test_joint_limits_must_be_strictly_ordered(self):
+        def equal_bounds(document):
+            document["source"]["joints"][0]["limits"]["lower"] = 1.5
+
+        self._assert_code(self._package(equal_bounds), "input.joint_limits_invalid")
+
+    def test_malformed_keys_and_overflowing_numbers_are_findings(self):
+        def non_string_key(document):
+            document["source"]["documented_masses"][7] = {
+                "mass_kg": 0.01,
+                "reason": "numeric key",
+                "evidence": "MASS-upper-2",
+            }
+
+        codes = self._codes(self._package(non_string_key))
+        self.assertIn("input.documented_masses_invalid", codes)
+
+        def non_string_source_key(document):
+            document["source"][3] = "typo"
+
+        self.assertIn("input.source_keys", self._codes(self._package(non_string_source_key)))
+
+        def overflowing(document):
+            document["source"]["joints"][0]["limits"]["effort"] = 10**400
+            document["checks"]["expected_mass_kg"] = [10**400, 10**401]
+
+        codes = self._codes(self._package(overflowing))
+        self.assertIn("input.joint_limits_invalid", codes)
+        self.assertIn("input.checks_invalid", codes)
+
+    def test_transient_lock_files_are_excluded_from_the_inventory(self):
+        root = self._package(extra=(("cad/~$robot.SLDASM", b"lock\n"),))
+        inspection = inspect_package(root)
+        self.assertTrue(inspection["passed"], inspection["errors"])
+        self.assertIn(
+            "input.transient_files_excluded",
+            [item["code"] for item in inspection["warnings"]],
+            inspection["warnings"],
+        )
+        receipt = load_package(root)["input_receipt"]
+        self.assertEqual(receipt["file_count"], 3)
+        self.assertNotIn("cad/~$robot.SLDASM", {entry["path"] for entry in receipt["inventory"]})
+
     # --------------------------------------------------------------------- load
 
     def test_load_package_raises_pipeline_error_with_findings(self):
