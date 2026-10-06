@@ -50,7 +50,9 @@ fi
 # no build dependencies, no pip upgrade in the private venv.
 "$AIRFLOW_VENV/bin/python" -m pip install --require-hashes --only-binary=:all: \
   -r "$HERE/requirements.lock"
-"$AIRFLOW_VENV/bin/python" -m pip install --no-deps "$PIPELINE_WHEEL"
+"$AIRFLOW_VENV/bin/python" -m pip install --no-deps --force-reinstall "$PIPELINE_WHEEL"
+# Fail closed if the lock does not cover the wheel's declared runtime dependencies.
+"$AIRFLOW_VENV/bin/python" -m pip check
 
 # Atomic 0600 config; preserves previously generated Fernet/JWT secrets on rerun.
 AIRFLOW_DB_URL="$AIRFLOW_DB_URL" "$AIRFLOW_VENV/bin/python" "$HERE/render_config.py" \

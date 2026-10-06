@@ -28,11 +28,24 @@ distinct — no system interpreter or site-packages tree is touched.
 
 `requirements.lock` is a fully resolved stack, pinned with wheel SHA-256 hashes for Linux CPython
 3.12 (`pip install --require-hashes --only-binary=:all:`): no floating versions, no build
-dependencies, and no pip upgrade in the private venv. `constraints-3.12.txt` is the vendored
-resolve basis (provenance in `constraints-3.12.source`); `scripts/build_requirements_lock.py`
-regenerates the lock from its own `name==version` head. `AIRFLOW_PYTHON` must be a Python 3.12
-with venv support. Rerunning the installer preserves the existing Fernet key and
-`[api_auth] jwt_secret` in the 0600 `airflow.cfg`.
+dependencies, and no pip upgrade in the private venv. It covers the Airflow stack **and** the
+wheel's runtime closure (numpy, mujoco, absl-py, etils, glfw, PyOpenGL, …); the pipeline wheel
+itself is installed separately and never locked. `scripts/build_requirements_lock.py` regenerates
+it in one pip transaction, constrained by the vendored Apache `constraints-3.12.txt`
+(provenance in `constraints-3.12.source`):
+
+```sh
+scripts/build_requirements_lock.py --python "$AIRFLOW_VENV/bin/python" \
+  --requirements deploy/airflow/requirements.txt \
+  --constraints deploy/airflow/constraints-3.12.txt \
+  --constraints deploy/airflow/requirements.lock \
+  --wheel /dist/mimicverse_description-<version>-py3-none-any.whl \
+  --output deploy/airflow/requirements.lock
+```
+
+The installer runs `pip check` after the wheel install, so a lock that misses the wheel's declared
+closure fails the install. `AIRFLOW_PYTHON` must be a Python 3.12 with venv support. Rerunning the
+installer preserves the existing Fernet key and `[api_auth] jwt_secret` in the 0600 `airflow.cfg`.
 
 PostgreSQL is installed separately, sudo-free and socket-only (no TCP listener, no trust reachable
 from the network):

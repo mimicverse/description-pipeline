@@ -1,2 +1,19 @@
+# Direct pins for the orchestration host: the tested Airflow stack, the PostgreSQL driver used by
+# the socket DSN (psycopg2), and the async driver Airflow 3 uses alongside it (asyncpg).
+#
+# requirements.lock is the full Linux CPython 3.12 closure of these pins plus the built
+# mimicverse_description wheel, so the wheel's declared runtime dependencies (numpy, PyYAML,
+# jsonschema, packaging, mujoco) and mujoco's transitive closure (absl-py, etils, glfw, PyOpenGL,
+# …) are pinned and hashed too. Resolution is constrained by the vendored Apache constraints
+# (constraints-3.12.txt) so already-tested Airflow-side versions win over newer transitive ranges.
+#
+# Regenerate (after any wheel or pin change):
+#   scripts/build_requirements_lock.py --python <venv>/bin/python
+#     --requirements requirements.txt --constraints constraints-3.12.txt
+#     --constraints requirements.lock
+#     --wheel <dist>/mimicverse_description-<version>-py3-none-any.whl
+#     --output requirements.lock
 apache-airflow==3.3.2
 apache-airflow-providers-standard==1.19.0
+psycopg2-binary==2.9.13
+asyncpg==0.31.0

@@ -225,10 +225,14 @@ class LockAndScriptsTest(unittest.TestCase):
             "apache-airflow-task-sdk==1.3.2",
             "asyncpg==0.31.0",
             "psycopg2-binary==2.9.13",
+            "mujoco==3.13.0",
+            "numpy==2.5.3",
         ):
             self.assertIn(required, joined)
+        self.assertNotIn("mimicverse-description==", joined)
         installer = (DEPLOY / "install.sh").read_text(encoding="utf-8")
         self.assertIn("--require-hashes --only-binary=:all:", installer)
+        self.assertIn("-m pip check", installer)
         self.assertNotIn("pip install --upgrade", installer)
         self.assertNotIn("sed -e", installer)
 
