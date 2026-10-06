@@ -6,6 +6,7 @@ After=network.target
 Type=simple
 Environment=AIRFLOW_HOME=@AIRFLOW_HOME@
 ExecStart=@VENV@/bin/airflow dag-processor
+UMask=0077
 Restart=on-failure
 RestartSec=10
 

@@ -58,6 +58,7 @@ class RenderConfigTest(unittest.TestCase):
             self.assertIn("# managed-by: description-airflow", text)
             self.assertIn(f"sql_alchemy_conn = {DSN}", text)
             self.assertIn(f"dags_folder = {DEPLOY / 'dags'}", text)
+            self.assertIn("simple_auth_manager_users = operator:admin", text)
             first_keys = re.findall(r"^(?:fernet_key|jwt_secret) = (\S+)$", text, re.M)
             self.assertEqual(len(first_keys), 2)
             # Rerun with a different socket: secrets must survive byte-for-byte.
@@ -134,9 +135,13 @@ class ServicesRenderTest(unittest.TestCase):
             self.assertIn(f"-D {Path(tmp) / 'pg'}/data", postgres)
             self.assertIn("listen_addresses=", postgres)
             self.assertNotIn("127.0.0.1", postgres)
+            self.assertIn("UMask=0077", postgres)
             scheduler = (target / "description-airflow-scheduler.service").read_text(encoding="utf-8")
             self.assertIn(f"Environment=AIRFLOW_HOME={Path(tmp) / 'home'}", scheduler)
+            self.assertIn("UMask=0077", scheduler)
             self.assertNotIn("@", scheduler)
+            api_server = (target / "description-airflow-api-server.service").read_text(encoding="utf-8")
+            self.assertIn("api-server --host 127.0.0.1 --port 8791", api_server)
             untouched = (target / "unrelated.service").read_text(encoding="utf-8")
             self.assertEqual(untouched, "[Unit]\nDescription=keep me\n")
 
@@ -187,8 +192,9 @@ class InstallGuardsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             wheels = Path(tmp) / "wheels"
             wheels.mkdir()
-            (wheels / "description_pipeline-0.3.25-py3-none-any.whl").write_bytes(b"x")
-            result = self._install(tmp)
+            foreign = wheels / "description_pipeline-0.3.25-py3-none-any.whl"
+            foreign.write_bytes(b"x")
+            result = self._install(tmp, PIPELINE_WHEEL=str(foreign))
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("mimicverse_description", result.stderr)
             self.assertFalse(Path(f"{tmp}/home").exists())

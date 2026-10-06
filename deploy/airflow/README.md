@@ -4,6 +4,13 @@ The one-shot DAG `solidworks_to_urdf` submits a configured package to the bearer
 endpoint, polls it with a bounded reschedule sensor and fails closed unless the passing result carries
 quality and PR evidence.
 
+Apache Airflow is the single production operator interface: handoff submission, run status,
+diagnostic events and the PR result all come from the Airflow Web UI and the same DAG REST API
+(`/api/v2`) behind it. The native `mimicverse-description` CLI and `scripts/scheduled_smoke.py` are
+worker/local tooling for diagnostics and replay, not a second required operator path. There is one
+DAG id (`solidworks_to_urdf`), one pipeline id (`solidworks-to-urdf`) and no extra workflow engine or
+custom GUI.
+
 ## Install
 
 ```sh
@@ -49,6 +56,83 @@ Only `description-postgres`, `description-airflow-dag-processor`, `description-a
 and `description-airflow-api-server` are ever written; unrelated units in
 `~/.config/systemd/user` are left alone.
 
+The API server (UI + REST) binds `127.0.0.1:8791` only, and the units run with `UMask=0077` so the
+generated password file is private. Remote operators reach the same UI through an SSH tunnel, or an
+authenticated reverse proxy on the deployment host:
+
+```sh
+ssh -N -L 8788:127.0.0.1:8791 <deployment-host>   # then http://127.0.0.1:8788/
+```
+
+## Operator entry (Web UI / REST API)
+
+Login user `operator` (role `admin`) is configured by `[core] simple_auth_manager_users` in the
+rendered `airflow.cfg`. The Simple Auth Manager prints the generated password once on the first
+`api-server` start (it is also stored, 0600, in
+`$AIRFLOW_HOME/simple_auth_manager_passwords.json.generated`):
+
+```sh
+cat "$AIRFLOW_HOME/simple_auth_manager_passwords.json.generated"
+```
+
+Trigger a handoff from the UI with **Trigger DAG w/ config** and this JSON (identical to the API
+`conf` and to the CLI `--conf`):
+
+```json
+{
+  "package": "handoff/m3.0",
+  "revision_sha256": "<sha256 of the sealed cad-revision.json>",
+  "target": "m3",
+  "repository_slug": "<owner>/<repo>",
+  "base": "feature/<hardware>"
+}
+```
+
+The same operations use the DAG REST API. Save the handoff JSON as
+`handoff.json`. This example authenticates from the private password file and
+submits it without placing credentials in arguments or printing the JWT:
+
+```sh
+"$AIRFLOW_VENV/bin/python" - <<'PY'
+import json, os, uuid
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+base = "http://127.0.0.1:8791"
+passwords = Path(os.environ["AIRFLOW_HOME"]) / "simple_auth_manager_passwords.json.generated"
+credentials = {"username": "operator", "password": json.loads(passwords.read_text())["operator"]}
+auth = Request(base + "/auth/token", data=json.dumps(credentials).encode(),
+               headers={"Content-Type": "application/json"})
+with urlopen(auth, timeout=30) as response:
+    token = json.load(response)["access_token"]
+payload = {"dag_run_id": "handoff-" + uuid.uuid4().hex, "logical_date": None,
+           "conf": json.loads(Path("handoff.json").read_text())}
+request = Request(base + "/api/v2/dags/solidworks_to_urdf/dagRuns",
+                  data=json.dumps(payload).encode(),
+                  headers={"Content-Type": "application/json", "Authorization": "Bearer " + token})
+with urlopen(request, timeout=30) as response:
+    print(json.dumps(json.load(response)))
+PY
+```
+
+| Operator need | Airflow UI | Authenticated REST API |
+| --- | --- | --- |
+| Submit handoff | Trigger DAG w/ config | `POST /api/v2/dags/solidworks_to_urdf/dagRuns` with `{"dag_run_id", "logical_date", "conf"}` |
+| Run status | Grid/Graph view of the run | `GET /api/v2/dags/solidworks_to_urdf/dagRuns/{run_id}` |
+| Task/stage state | Grid task boxes | `GET …/dagRuns/{run_id}/taskInstances` |
+| Diagnostic events | Task log of `wait_for_job` / `confirm_job` | `GET …/taskInstances/{task_id}/logs/{try_number}` |
+| PR result | `confirm_job` XCom (`quality`, `submission`) | `GET …/taskInstances/confirm_job/xcomEntries/return_value` |
+
+`confirm_job` fails the run unless the job echoes the bound request, the job's `repository_slug` /
+`repository_base` match the conf, and the receipt carries a quality pass plus a GitHub pull URL.
+
+Simple Auth Manager keeps a single local admin account; it is appropriate for this private,
+loopback-only deployment (`airflow.cfg` is 0600, the password file is 0600, no shared users). Anyone
+exposing the API server beyond loopback should put a real auth manager in front of it.
+
+Pipeline id is `solidworks-to-urdf`; schema versions carry their own suffixes
+(`solidworks-to-urdf.bundle/v1`, `solidworks-to-urdf.cad-revision/v1`, HTTP `/v1`).
+
 ## Connection
 
 Keep the bearer token in a 0600 file (editor, `umask`-protected write or secret manager — never on a
@@ -65,7 +149,7 @@ The default connection id is `solidworks_windows`, matching the DAG's `conn_id` 
 The endpoint must stay loopback HTTP behind an SSH tunnel (`ssh -L 18765:127.0.0.1:8765 …`) or TLS;
 the client refuses remote `http://` URLs, so a plaintext remote bearer token cannot be configured.
 
-## Run
+## Local diagnostics / replay (worker tooling)
 
 ```sh
 "$AIRFLOW_VENV/bin/airflow" dags test solidworks_to_urdf 2026-01-01 --conf '{
@@ -76,6 +160,10 @@ the client refuses remote `http://` URLs, so a plaintext remote bearer token can
   "base": "feature/<hardware>"
 }'
 ```
+
+`deploy/airflow/scripts/scheduled_smoke.py --root … --venv … --airflow-home …` runs the same DAG
+against a neutral mock endpoint with real dag-processor/scheduler/api-server processes; it is the
+regression harness, not the production submission path.
 
 Start the services first, then unpause the DAG once: the DAG row created by the DAG processor
 starts paused and triggered runs stay queued while it is paused.
@@ -90,9 +178,6 @@ must all run (dedicated port **8791**; `[core] execution_api_server_url` is
 `http://127.0.0.1:8791/execution` and the trailing `/execution` path is required). Airflow reaches
 PostgreSQL only through the private UNIX socket. The installer writes a private Fernet key and
 `[api_auth] jwt_secret` into the 0600 `airflow.cfg`.
-
-Pipeline id is `solidworks-to-urdf`; schema versions carry their own suffixes
-(`solidworks-to-urdf.bundle/v1`, `solidworks-to-urdf.cad-revision/v1`, HTTP `/v1`).
 
 ## Windows endpoint setup
 

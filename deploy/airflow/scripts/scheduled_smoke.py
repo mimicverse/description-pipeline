@@ -21,7 +21,6 @@ from pathlib import Path
 TOKEN = "scheduled-token"
 SUBJECT = "a" * 64
 COMMIT = "b" * 40
-BOUND = ("run_id", "package", "revision_sha256", "target")
 
 
 def _view(job: dict) -> dict:
@@ -66,7 +65,7 @@ def _mock_endpoint() -> tuple[ThreadingHTTPServer, dict]:
                 job["status"] = "passed"
                 job["result"] = {
                     "passed": True, "pipeline_id": "solidworks-to-urdf", "output": "build/out",
-                    "subject_sha256": SUBJECT, "repository_slug": "example/m3.0",
+                    "subject_sha256": SUBJECT,
                     "quality": {"passed": True, "subject_sha256": SUBJECT, "checks": [{"id": "x"}]},
                     "submission": {"passed": True, "subject_sha256": SUBJECT, "base": "feature/m3.0",
                                    "branch": "work/solidworks/m3.0",
@@ -86,17 +85,16 @@ def _mock_endpoint() -> tuple[ThreadingHTTPServer, dict]:
             run_id = payload["run_id"]
             if run_id in state["jobs"]:
                 existing = state["jobs"][run_id]
-                if any(existing[field] != payload.get(field) for field in BOUND):
+                if existing["request"] != payload:
                     self._send(409, {"error": "mismatch"})
                     return
                 self._send(200, _view(existing))
                 return
             job = {"schema_version": "solidworks-to-urdf.job/v1", "pipeline_id": "solidworks-to-urdf",
-                   **{field: payload[field] for field in BOUND},
-                   "repository_slug": "example/m3.0",
+                   "run_id": run_id, "repository_slug": "example/m3.0",
                    "repository_base": "feature/m3.0", "status": "queued",
                    "events": [{"stage": "submit", "state": "queued", "at": "t0"}],
-                   "result": None, "error": None, "pokes": 0}
+                   "result": None, "error": None, "request": dict(payload), "pokes": 0}
             state["jobs"][run_id] = job
             self._send(202, _view(job))
 
@@ -141,11 +139,15 @@ def main() -> int:
     logs = {}
     procs = []
     stack = contextlib.ExitStack()
-    components = (("dag-processor", []), ("scheduler", []), ("api-server", ["--port", "8791"]))
+    components = (
+        ("dag-processor", []),
+        ("scheduler", []),
+        ("api-server", ["--host", "127.0.0.1", "--port", "8791"]),
+    )
     for component, extra in components:
-        # 句柄生命周期由 finally 里的 stack.close() 管理（进程要先拿到日志 fd 才能启动）。
+        # Handles live in an ExitStack closed below in ``finally``; the child process needs the fd first.
         handle = stack.enter_context(
-            open(log_dir / f"{component}.log", "w", encoding="utf-8")  # noqa: SIM115 - ExitStack 统一关闭
+            open(log_dir / f"{component}.log", "w", encoding="utf-8")  # noqa: SIM115 - closed via ExitStack
         )
         logs[component] = handle
         procs.append(subprocess.Popen([str(args.venv / "bin/airflow"), component, *extra], env=env,
