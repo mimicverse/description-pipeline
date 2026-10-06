@@ -45,6 +45,10 @@ class PhysicsTests(unittest.TestCase):
             "used_api": "IMassProperty2.GetMomentOfInertia(0)",
             "product_convention": "solidworks_standard",
             "scope": "part_document",
+            "axes": "part_document_axes",
+            "reference_point": "center_of_mass",
+            "use_system_units": True,
+            "overrides": {"OverrideMass": False, "OverrideCenterOfMass": False, "OverrideMomentsOfInertia": False},
             "material_assignment": material,
         }
         self.masses = {
@@ -123,7 +127,7 @@ class PhysicsTests(unittest.TestCase):
             "mode": "full",
             "top_level": {
                 **world,
-                "reference": {"used_api": reference["used_api"], "product_convention": "solidworks_standard"},
+                "reference": {**reference, "scope": "assembly_document", "axes": "assembly_document_axes"},
             },
             "leaf_total": world,
             "component_context": context,
@@ -158,6 +162,30 @@ class PhysicsTests(unittest.TestCase):
     def test_unqualified_fallback_is_rejected(self):
         self.masses["b"]["reference"]["used_api"] = "GetMassProperties2"
         self.assertIn("physics.reading.b", self.failures())
+
+    def test_missing_or_wrong_reading_context_fails_even_when_values_match(self):
+        for key, value in (
+            ("scope", None),
+            ("scope", "assembly_document"),
+            ("axes", "assembly_document_axes"),
+            ("reference_point", "origin"),
+            ("use_system_units", False),
+            ("overrides", {}),
+        ):
+            with self.subTest(key=key, value=value):
+                original = copy.deepcopy(self.masses["a"]["reference"])
+                self.masses["a"]["reference"][key] = value
+                self.assertIn("physics.reading.a", self.failures())
+                self.masses["a"]["reference"] = original
+
+    def test_wrong_whole_scope_leaf_tensor_and_part_override_are_rejected(self):
+        self.closure["top_level"]["reference"]["scope"] = "part_document"
+        self.assertIn("physics.closure", self.failures())
+        self.closure["top_level"]["reference"]["scope"] = "assembly_document"
+        self.closure["leaf_total"]["inertia"][0][1] += 0.001
+        self.assertIn("physics.closure", self.failures())
+        self.masses["a"]["reference"]["overrides"]["OverrideMass"] = True
+        self.assertIn("physics.reading.a", self.failures())
 
     def test_offdiagonal_sign_mutation_is_rejected(self):
         self.model["links"][0]["inertial"]["inertia"][1] *= -1
@@ -221,7 +249,9 @@ class StructuralQualityTests(unittest.TestCase):
         }
         canonical_joint = {**authored, "xyz": [0, 0, 0], "rpy": [0, 0, 0]}
         node = ET.fromstring(
-            '<joint type="continuous"><parent link="base_link"/><child link="arm_link"/><origin xyz="0 0 0" rpy="0 0 0"/><axis xyz="0 0 1"/><limit effort="1" velocity="2"/></joint>'
+            '<joint type="continuous"><parent link="base_link"/><child link="arm_link"/>'
+            '<origin xyz="0 0 0" rpy="0 0 0"/><axis xyz="0 0 1"/>'
+            '<limit effort="1" velocity="2"/></joint>'
         )
         frames = {"base_link": np.eye(4), "arm_link": np.eye(4)}
         quality._joint(node, authored, canonical_joint, {}, frames)
@@ -237,3 +267,5 @@ class StructuralQualityTests(unittest.TestCase):
             self.assertFalse(report["passed"])
             self.assertIn("report.binding", [check["id"] for check in report["checks"]])
             canonical(report)
+            self.assertEqual(report["subject_status"], "unavailable")
+            self.assertNotIn(str(root).encode(), canonical(report))

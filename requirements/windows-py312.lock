@@ -1,4 +1,4 @@
-# Linux x86_64, CPython 3.12 runtime closure.
+# Windows x86_64, CPython 3.12 runtime closure.
 absl-py==2.5.0
 attrs==26.1.0
 etils==1.14.0
@@ -14,4 +14,5 @@ pyyaml==6.0.3
 referencing==0.37.0
 rpds-py==2026.6.3
 typing-extensions==4.16.0
+pywin32==311
 zipp==4.1.0

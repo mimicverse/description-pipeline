@@ -15,12 +15,14 @@ same workflow through an authenticated Windows endpoint.
 
 ## Start on a SolidWorks computer
 
-Install Python 3.12, Git and GitHub CLI. Install the released tool into a dedicated
-environment and authenticate GitHub once:
+Install Python 3.12, Git and GitHub CLI. Download and extract the release asset
+`description-1.0.0-windows-cp312-x86_64.zip`. From the extracted directory,
+install the tool and its hashed dependencies into a dedicated environment:
 
 ```powershell
 py -3.12 -m venv C:\description\.venv
-C:\description\.venv\Scripts\python.exe -m pip install .\mimicverse_description-1.0.0-py3-none-any.whl
+C:\description\.venv\Scripts\python.exe -m pip install --no-index --require-hashes --find-links wheels -r requirements.lock
+C:\description\.venv\Scripts\description.exe doctor
 gh auth login
 gh auth setup-git
 git clone https://github.com/mimicverse/description.git C:\description\models
@@ -37,7 +39,7 @@ C:\description\.venv\Scripts\description.exe revision C:\handoffs\arm\r1 --hardw
 C:\description\.venv\Scripts\description.exe run C:\handoffs\arm\r1 --output C:\deliveries\arm --repository C:\description\models --base feature/arm
 ```
 
-Use a dedicated clean model clone with the target branch already present. The
+GitHub authentication is a one-time setup. Use a dedicated clean model clone with the target branch already present. The
 second command performs all five stages and prints the PR URL. A failed check
 keeps diagnostics and does not submit or replace a previous passing delivery.
 

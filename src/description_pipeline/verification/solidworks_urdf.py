@@ -113,9 +113,10 @@ class _Gates:
             self.checks.append({"id": identifier, "passed": True, "details": details})
             return details
         except Exception as error:
-            self.checks.append(
-                {"id": identifier, "passed": False, "details": {"error": f"{type(error).__name__}: {error}"}}
-            )
+            details = {"error": f"{type(error).__name__}: {error}"}
+            if isinstance(getattr(error, "details", None), dict):
+                details.update(error.details)
+            self.checks.append({"id": identifier, "passed": False, "details": details})
             return None
 
 
@@ -301,10 +302,18 @@ def _joint(node, authored, canonical, datums, body_datums):
 def _axis(authored, record, components, child_datum):
     reference = authored["axis_reference"]
     _require(isinstance(reference, dict), "Moving joints require a structured native shaft reference")
-    for key in ("component", "face_index"):
-        _require(record[key] == reference[key], "Shaft evidence names another CAD face")
+    _require(record["component"] == reference["component"], "Shaft evidence names another occurrence")
+    if reference.get("feature_name"):
+        _require(
+            record["selector"]["feature_name"] == reference["feature_name"], "Shaft evidence names another CAD feature"
+        )
+    else:
+        _require(record["face_index"] == reference["face_index"], "Shaft evidence names another CAD face")
     _require(record.get("body_type", "solid") == reference.get("body_type", "solid"), "Shaft body type differs")
-    _require(record["surface"] == "cylinder" and float(record["radius_m"]) > 0, "No cylindrical shaft reading")
+    _require(
+        record["surface"] == "cylinder" and math.isfinite(float(record["radius_m"])) and float(record["radius_m"]) > 0,
+        "No cylindrical shaft reading",
+    )
     point, direction = _vector(record["axis_point_m"]), _vector(record["axis_direction"])
     _require(abs(float(np.linalg.norm(direction)) - 1) < 1e-8, "Native shaft direction is not a unit vector")
     if record["coordinate_frame"] in {"component", "component_local"}:
@@ -478,13 +487,28 @@ def evaluate_bundle(root: Path) -> dict:
     for check in gates.checks:
         if check["passed"] and check["id"] in internal:
             check["details"] = {"validated": True}
+        check["details"] = _portable_details(check["details"], root)
     return {
         "schema_version": QUALITY_SCHEMA,
         "pipeline_id": PIPELINE_ID,
         "subject_sha256": subject["sha256"] if subject else None,
+        "subject_status": "bound" if subject else "unavailable",
         "passed": bool(gates.checks) and all(check["passed"] for check in gates.checks),
         "checks": gates.checks,
     }
+
+
+def _portable_details(value, root):
+    """Keep diagnostic text useful without binding it to the replay directory."""
+    if isinstance(value, str):
+        for prefix in {str(root.absolute()), str(root.resolve()), root.resolve().as_posix()}:
+            value = value.replace(prefix, "<bundle>").replace(prefix.replace("/", "\\"), "<bundle>")
+        return value
+    if isinstance(value, dict):
+        return {key: _portable_details(item, root) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_portable_details(item, root) for item in value]
+    return value
 
 
 def _model(root):
@@ -584,7 +608,10 @@ def _verify_model(root, gates, definition, model, raw):
 
 def _physics(root, source, model, verifier):
     checks = verifier(root / "evidence", source, model)
-    _require(bool(checks) and all(check.get("passed") is True for check in checks), str(checks))
+    if not checks or any(check.get("passed") is not True for check in checks):
+        error = PipelineError("Independent physics verification failed")
+        error.details = {"checks": checks}
+        raise error
     return {"checks": checks}
 
 

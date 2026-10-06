@@ -1,9 +1,5 @@
 [build-system]
-# The wheel records its builder version in `WHEEL` (and therefore in `RECORD`), so an isolated build
-# has to fetch exactly the version `requirements/linux-py312.lock` pins; a floating requirement makes
-# the same commit produce different bytes on different days. `tools/build_release.py` checks the
-# installed builder for the same reason. 84.0.0 is also where MANIFEST.in exclusion stops being
-# bypassable through a Unicode normalization collision (CVE-2026-59890).
+# Builder versions affect distribution bytes and are pinned in requirements/build-py312.lock.
 requires = ["setuptools==84.0.0"]
 build-backend = "setuptools.build_meta"
 
@@ -18,7 +14,7 @@ keywords = ["urdf", "solidworks", "cad", "robotics", "airflow"]
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Operating System :: Microsoft :: Windows",
@@ -47,22 +43,6 @@ where = ["src"]
 
 [tool.setuptools.dynamic]
 version = {attr = "description_pipeline.__version__"}
-
-[tool.bandit]
-# `bandit -c pyproject.toml -r src tools` is the static security audit recorded with the release
-# evidence.  Every skipped class is a deliberate, already-guarded pattern:
-#   B101  - the remaining asserts narrow a type immediately after the real `_require`, which stays in
-#           an optimised run.
-#   B107  - the Onshape client takes an empty client-id default, not a secret.
-#   B108  - the SSH control socket needs a short path under /tmp; tempfile creates it mode 0700.
-#   B311  - retry jitter, not a cryptographic choice (tokens use `secrets`).
-#   B314/B405 - ElementTree parses the URDF/MJCF this pipeline also generates.  CPython 3.12's Expat
-#           rejects DTD entity expansion in milliseconds and the CLI reports parse failures as
-#           diagnostics; tests/test_example_mutations.py pins both with an entity bomb and an
-#           external-entity document.
-#   B404/B603/B607 - subprocess runs argument lists (never a shell string) with tools resolved from
-#           PATH on purpose.
-skips = ["B101", "B107", "B108", "B311", "B314", "B404", "B405", "B506", "B603", "B607"]
 
 [tool.setuptools.package-data]
 description_pipeline = [

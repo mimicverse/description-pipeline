@@ -1,6 +1,14 @@
 # Contributing
 
-Use Python 3.12 and the locked development environment. Run:
+Use a dedicated Python 3.12 environment. Install the runtime lock for your OS,
+the builder lock, then the editable package without resolving additional dependencies:
+
+```sh
+python -m pip install -r requirements/linux-py312.lock -r requirements/build-py312.lock
+python -m pip install --no-deps -e .
+```
+
+On Windows, substitute `requirements/windows-py312.lock`. Run:
 
 ```sh
 PYTHONPATH=src python -B -m unittest discover -s tests -t .

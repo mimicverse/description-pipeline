@@ -49,6 +49,11 @@ fallback arrays are rejected. A native analytic fixture verifies nonzero cross
 terms, component rotation and assembly aggregation; diagonal-only examples do
 not establish the convention.
 
+Each reading declares its scope, axes, COM reference, SI-unit setting and
+override flags. Per-part readings use part-document axes; whole-assembly
+readings use assembly-document axes. Missing declarations or effective
+mass/COM/inertia overrides block publication.
+
 Captured transforms use the native adapter protocol: SI, row-major 4×4
 homogeneous matrices with column-vector multiplication. The adapter converts
 SolidWorks' vendor MathTransform layout at the COM boundary. Verification reads

@@ -28,6 +28,7 @@ INERTIA_ORDER = ("ixx", "ixy", "ixz", "iyy", "iyz", "izz")
 _SCOPE_CONVENTIONS = {
     "part_document": "solidworks_standard",
     "assembly_component_group": "solidworks_standard",
+    "assembly_document": "solidworks_standard",
 }
 MASS_ATOL = 1e-12
 MASS_RTOL = 1e-9

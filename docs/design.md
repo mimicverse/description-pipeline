@@ -42,11 +42,13 @@ retry uses the same UUID and request; a corrected handoff starts a new run.
 | Public `description-pipeline/main` | Tool code, specifications and neutral tests |
 | Private `description/feature/<hardware>` | Authored model inputs and reviewed deliveries |
 | Private `description/work/solidworks/<hardware>` | Automatically updated model PR |
+| Private `description/release/<hardware>/<release>` | Approved, frozen model delivery |
 | Mechanical Git, PDM or retained handoff directory | Immutable native CAD revisions |
 
 Tool releases use ordinary version tags such as `v1.0.0`. Models record the tool
 identity they used; tool source is not merged into model branches. A model
-release freezes an approved delivery from its hardware branch.
+release freezes an approved delivery from its hardware branch; its release
+branch is retained without subsequent model edits.
 
 ```text
 src/description_pipeline/

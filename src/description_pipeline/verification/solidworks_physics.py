@@ -25,14 +25,22 @@ def _require(passed, message):
         raise PipelineError(message)
 
 
-def _reading(name, record):
+def _reading(name, record, scope):
     reference = record["reference"]
     _require(reference["used_api"] == "IMassProperty2.GetMomentOfInertia(0)", f"{name}: unqualified inertia API")
     _require(reference["product_convention"] == "solidworks_standard", f"{name}: unqualified inertia convention")
     _require(
-        reference.get("scope") in {"part_document", "assembly_component_group", "assembly_document", None},
-        f"{name}: unknown inertia scope",
+        reference.get("scope") == scope,
+        f"{name}: inertia scope must be {scope}",
     )
+    axes = "part_document_axes" if scope == "part_document" else "assembly_document_axes"
+    _require(reference.get("axes") == axes, f"{name}: undeclared inertia axes")
+    _require(reference.get("reference_point") == "center_of_mass", f"{name}: tensor must be about COM")
+    _require(reference.get("use_system_units") is True, f"{name}: native SI units are required")
+    overrides = reference.get("overrides")
+    flags = {"OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia"}
+    _require(isinstance(overrides, dict) and flags <= set(overrides), f"{name}: missing override evidence")
+    _require(all(value is False for value in overrides.values()), f"{name}: unsupported native override")
     mass = oracle._finite_positive(record["mass"], name + " mass")
     com = oracle._finite_vector(record["com"], name + " COM")
     tensor = oracle._raw_tensor(name, record)
@@ -133,7 +141,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
             payload["status"] == "recorded" and payload["mode"] == "full",
             "Full whole-assembly physics evidence is required",
         )
-        top = _reading("whole assembly", payload["top_level"])
+        top = _reading("whole assembly", payload["top_level"], "assembly_document")
         body = {"id": "assembly", "components": [row["name"] for row in raw["components"]]}
         rebuilt = oracle._raw_world(body, raw, masses, {})
         expected = (rebuilt["mass"], rebuilt["com"], rebuilt["inertia"])
@@ -160,7 +168,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
 
 
 def _reading_summary(name, record):
-    mass, com, tensor = _reading(name, record)
+    mass, com, tensor = _reading(name, record, "part_document")
     return {
         "mass_kg": mass,
         "com_m": com.tolist(),

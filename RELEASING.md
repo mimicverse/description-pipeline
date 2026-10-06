@@ -25,3 +25,20 @@ stays in the private model repository. GitHub CI is not part of the release gate
 
 Completion requires all seven steps. Unit tests, native capture alone, a draft
 PR or a documentation-only deployment do not establish release readiness.
+
+Build from a clean committed checkout with the environment in
+[CONTRIBUTING.md](CONTRIBUTING.md):
+
+```sh
+PYTHONPATH=src python tools/build_release.py --output /path/to/release-a --offline
+PYTHONPATH=src python tools/build_release.py --output /path/to/release-b --offline
+diff /path/to/release-a/SHA256SUMS.json /path/to/release-b/SHA256SUMS.json
+PYTHONPATH=src python tools/verify_distribution.py /path/to/release-a/mimicverse_description-1.0.0-py3-none-any.whl --runtime-lock requirements/linux-py312.lock --bundle /path/to/native-passing-delivery --report /path/to/installed-linux.json
+```
+
+The builder archives the commit into an isolated directory, embeds the complete
+package-file digest, normalizes archive metadata, and emits wheel, source,
+deployment and offline runtime assets. It never publishes. Installed code
+checks its embedded file inventory before use. The offline archives contain
+all target runtime wheels and a hash-locked installation file; exercise the
+Windows archive on the actual CAD computer and the Linux archive independently.

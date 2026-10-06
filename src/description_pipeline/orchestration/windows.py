@@ -25,6 +25,7 @@ from pathlib import Path
 from ..delivery import PIPELINE_ID
 from ..io import PipelineError, artifact_path_parts, confined, file_digest, inventory, read_data, write_json
 from ..sources.solidworks.revision import package_inventory, read_revision
+from ..repository.urdf_pr import _origin_slug
 
 _ALIAS = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _SHA = re.compile(r"^[0-9a-f]{64}$")
@@ -224,6 +225,7 @@ class Jobs:
                 "created_at": datetime.now(UTC).isoformat(),
             }
             job["package_files"] = package_inventory(package)
+            job["repository_slug"] = _origin_slug(self.config["targets"][request["target"]]["repository"])
             self._save(job)
             self.jobs[identifier] = job
             self.queue.put(identifier)
@@ -258,6 +260,10 @@ class Jobs:
                     package_inventory(package) == job["package_files"], "Author inputs changed while the job was queued"
                 )
                 target = self.config["targets"][job["request"]["target"]]
+                _require(
+                    _origin_slug(target["repository"]) == job["repository_slug"],
+                    "Configured repository origin changed while the job was queued",
+                )
                 result = self.runner(
                     package,
                     self.config["output_root"] / identifier,
@@ -267,13 +273,32 @@ class Jobs:
                     on_event=lambda event, identifier=identifier: self._event(identifier, event),
                 )
                 with self.mutex:
+                    job["result"] = result
                     submission = result.get("submission", {})
+                    quality = result.get("quality", {})
+                    subject = result.get("subject_sha256")
                     passed = (
                         result.get("passed") is True
+                        and quality.get("passed") is True
+                        and isinstance(subject, str)
+                        and _SHA.fullmatch(subject) is not None
+                        and quality.get("subject_sha256") == subject
                         and submission.get("passed") is True
-                        and bool(submission.get("url"))
+                        and submission.get("subject_sha256") == subject
+                        and submission.get("base") == target["base"]
+                        and submission.get("state") in {"published", "updated", "noop"}
+                        and re.fullmatch(r"[0-9a-f]{40,64}", str(submission.get("commit", ""))) is not None
+                        and re.fullmatch(
+                            r"https://github\.com/" + re.escape(job["repository_slug"]) + r"/pull/[1-9][0-9]*",
+                            str(submission.get("url", "")),
+                        )
+                        is not None
+                        and _origin_slug(target["repository"]) == job["repository_slug"]
                     )
-                    job.update(result=result, status="passed" if passed else "failed", error=result.get("error"))
+                    job.update(
+                        status="passed" if passed else "failed",
+                        error=None if passed else result.get("error") or "Incomplete or mismatched publication receipt",
+                    )
             except Exception as error:
                 with self.mutex:
                     job.update(status="failed", error=f"{type(error).__name__}: {error}")

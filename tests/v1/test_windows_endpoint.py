@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import copy
+import subprocess
 import tempfile
 import threading
 import time
@@ -38,6 +40,11 @@ class EndpointTests(unittest.TestCase):
             summary="Test queue",
         )
         (self.root / "repository").mkdir()
+        subprocess.run(["git", "init", "-q", str(self.root / "repository")], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.root / "repository"), "remote", "add", "origin", "https://github.com/a/b.git"],
+            check=True,
+        )
         (self.root / "token.txt").write_text("t" * 64)
         self.path = self.root / "config.json"
         self.config_data = {
@@ -64,12 +71,28 @@ class EndpointTests(unittest.TestCase):
         self.addCleanup(jobs.close)
         return jobs
 
+    def passing_result(self):
+        subject = "a" * 64
+        return {
+            "passed": True,
+            "subject_sha256": subject,
+            "quality": {"passed": True, "subject_sha256": subject},
+            "submission": {
+                "passed": True,
+                "subject_sha256": subject,
+                "url": "https://github.com/a/b/pull/1",
+                "base": "feature/arm",
+                "state": "published",
+                "commit": "b" * 40,
+            },
+        }
+
     def test_idempotent_retry_is_bound_to_exact_request_and_survives_restart(self):
         calls = []
 
         def runner(package, output, **kwargs):
             calls.append(kwargs["run_id"])
-            return {"passed": True, "submission": {"passed": True, "url": "https://github.com/a/b/pull/1"}}
+            return self.passing_result()
 
         jobs = Jobs(self.config, runner=runner)
         request = self.request()
@@ -94,6 +117,28 @@ class EndpointTests(unittest.TestCase):
         jobs.create(request)
         jobs.queue.join()
         self.assertEqual("failed", jobs.snapshot(request["run_id"])["status"])
+
+    def test_wrong_repository_base_subject_or_quality_cannot_pass(self):
+        responses = []
+        for section, key, value in (
+            ("submission", "url", "https://github.com/a/other/pull/1"),
+            ("submission", "base", "feature/other"),
+            ("submission", "subject_sha256", "c" * 64),
+            ("quality", "passed", False),
+            ("quality", "subject_sha256", "c" * 64),
+            ("submission", "commit", ""),
+        ):
+            result = copy.deepcopy(self.passing_result())
+            result[section][key] = value
+            responses.append(result)
+        jobs = self.jobs(lambda *args, **kwargs: responses.pop(0))
+        for _ in range(len(responses)):
+            request = self.request()
+            jobs.create(request)
+            jobs.queue.join()
+            result = jobs.snapshot(request["run_id"])
+            self.assertEqual("failed", result["status"])
+            self.assertTrue(result["error"])
 
     def test_native_jobs_are_serial(self):
         active, peak = 0, 0

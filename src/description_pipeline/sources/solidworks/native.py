@@ -1060,7 +1060,7 @@ class SolidWorksBackend(CadBackend):
             raise CadError("cad_empty_selection", "group mass reader needs at least one component instance")
         selection: list[object] = []
         overrides: dict[str, dict[str, bool]] = {}
-        stack: list[object] = [component for component in reversed(list(_member(root, "GetChildren") or ()))]
+        stack: list[object] = list(reversed(list(_member(root, "GetChildren") or ())))
         while stack:
             component = _dynamic(stack.pop())
             if _member(component, "IsSuppressed"):
