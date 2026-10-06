@@ -51,6 +51,9 @@ SOURCE_KEYS = {
     "material_source",
     "documented_masses",
     "mass_evidence",
+    "geometry_exclusions",
+    "expected_mass_kg",
+    "expected_extent_m",
     "evidence_class",
     "worker_url",
     "allow_remote_worker",
@@ -138,6 +141,31 @@ def _require(condition: bool, message: str, detail: object | None = None) -> Non
 
 def _normalise_path(value: str) -> str:
     return os.path.normcase(os.path.abspath(value))
+
+
+def _expected_range(value: Any, where: str) -> list[float] | None:
+    """Validate one explicit design expectation ``[min, max]`` in SI units."""
+
+    if value is None:
+        return None
+    _require(
+        isinstance(value, (list, tuple)) and len(value) == 2,
+        f"{where} must be a two-element [min, max] range",
+        value,
+    )
+    assert isinstance(value, (list, tuple))
+    low, high = value
+    _require(
+        all(
+            isinstance(item, (int, float)) and not isinstance(item, bool) and math.isfinite(float(item))
+            for item in (low, high)
+        ),
+        f"{where} must contain finite numbers",
+        value,
+    )
+    _require(float(low) > 0.0 and float(high) > 0.0, f"{where} must be positive", value)
+    _require(float(low) <= float(high), f"{where} min must not exceed max", value)
+    return [float(low), float(high)]
 
 
 def _prepare_destination(destination: Path) -> bool:
@@ -296,6 +324,61 @@ def validate_source_config(config: object) -> dict[str, Any]:
                     "documented_table requires a mass for every included component",
                     {"missing": missing[:20]},
                 )
+    # 物理上已计入的几何排除项：只允许"组件 + 原因 + 结构化证据"的对象，
+    # 不允许用裸字符串或空原因悄悄跳过几何。
+    raw_exclusions = config.get("geometry_exclusions") or {}
+    _require(
+        isinstance(raw_exclusions, dict),
+        "source.geometry_exclusions must be a mapping of component to exclusion",
+        raw_exclusions,
+    )
+    exclusions: dict[str, dict] = {}
+    for name, value in raw_exclusions.items():
+        _require(
+            isinstance(value, dict),
+            "each geometry exclusion must be an object with reason and evidence",
+            {"component": name, "value": value},
+        )
+        assert isinstance(value, dict)
+        unknown_fields = sorted(set(value) - {"component", "reason", "evidence"})
+        _require(
+            not unknown_fields,
+            "geometry exclusion has unknown fields",
+            {"component": name, "fields": unknown_fields},
+        )
+        reason = value.get("reason")
+        _require(
+            isinstance(reason, str) and reason.strip() != "",
+            "geometry exclusion needs a stated reason",
+            {"component": name},
+        )
+        evidence = value.get("evidence")
+        _require(
+            isinstance(evidence, dict),
+            "geometry exclusion needs a structured evidence binding (file, sha256, anchor)",
+            {"component": name, "evidence": evidence},
+        )
+        assert isinstance(evidence, dict)
+        unknown_evidence = sorted(set(evidence) - {"file", "sha256", "anchor"})
+        _require(
+            not unknown_evidence,
+            "geometry exclusion evidence has unknown fields",
+            {"component": name, "fields": unknown_evidence},
+        )
+        for key in ("file", "sha256", "anchor"):
+            item = evidence.get(key)
+            _require(
+                isinstance(item, str) and item.strip() != "",
+                f"geometry exclusion evidence.{key} must be a non-empty string",
+                {"component": name, "evidence": evidence},
+            )
+        exclusions[str(name)] = {
+            "component": str(value.get("component") or name),
+            "reason": reason,
+            "evidence": {key: str(evidence[key]) for key in ("file", "sha256", "anchor")},
+        }
+    expected_mass = _expected_range(config.get("expected_mass_kg"), "source.expected_mass_kg")
+    expected_extent = _expected_range(config.get("expected_extent_m"), "source.expected_extent_m")
     evidence_class = config.get("evidence_class")
     if evidence_class is not None:
         _require(
@@ -317,6 +400,9 @@ def validate_source_config(config: object) -> dict[str, Any]:
         "material_source": material_source,
         "documented_masses": documented,
         "mass_evidence": mass_evidence,
+        "geometry_exclusions": exclusions,
+        "expected_mass_kg": expected_mass,
+        "expected_extent_m": expected_extent,
         "evidence_class": evidence_class,
         "raw": dict(config),
     }
