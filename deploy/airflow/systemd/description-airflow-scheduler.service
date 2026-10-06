@@ -1,0 +1,14 @@
+[Unit]
+Description=Airflow scheduler (SolidWorks-to-URDF)
+After=network.target
+
+[Service]
+Type=simple
+Environment=AIRFLOW_HOME=@AIRFLOW_HOME@
+ExecStart=@VENV@/bin/airflow scheduler
+UMask=0077
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

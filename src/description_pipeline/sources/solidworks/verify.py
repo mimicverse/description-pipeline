@@ -21,6 +21,15 @@ from .jsonio import read_json
 from ...io import PipelineError, confined, file_digest
 
 INERTIA_ORDER = ("ixx", "ixy", "ixz", "iyy", "iyz", "izz")
+# Same API, selection scopes measured on the analytic native fixture
+# (2026-10-06, SolidWorks 34.0.0): part documents and component groups both
+# answer in standard notation (see scene.SCOPE_CONVENTIONS; kept independent on
+# purpose - this is the oracle).
+_SCOPE_CONVENTIONS = {
+    "part_document": "solidworks_standard",
+    "assembly_component_group": "solidworks_standard",
+    "assembly_document": "solidworks_standard",
+}
 MASS_ATOL = 1e-12
 MASS_RTOL = 1e-9
 COM_ATOL = 1e-9
@@ -751,10 +760,12 @@ def _link_frame(body: dict) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _raw_tensor(component: str, payload: dict) -> np.ndarray:
-    """原始 9 个数 → 标准惯性张量；独立实现，刻意不引用生成侧的转换代码。
+    """Reconstruct a standard tensor independently of the generation code.
 
-    ``solidworks_positive`` 是正惯性积记法：交叉项是 ``∫xy dm`` / ``∫zx dm`` / ``∫yz dm``，
-    标准张量的非对角项是它们的相反数。原始读数保持原样；缺约定的原生数据不猜。
+    Qualified native part, group and whole-assembly scopes declare standard
+    signed tensors. Legacy positive-product records invert cross terms only
+    when explicitly declared. The v1 delivery gate separately refuses legacy
+    and unqualified APIs; absent native conventions are never guessed.
     """
 
     matrix = np.array([[float(value) for value in row] for row in payload["inertia"]], dtype=float)
@@ -765,11 +776,26 @@ def _raw_tensor(component: str, payload: dict) -> np.ndarray:
         raise ValueError(f"component {component} has a non-symmetric inertia matrix")
     reference = payload.get("reference") or {}
     convention = reference.get("product_convention")
+    scope = reference.get("scope")
+    if scope is not None:
+        expected = _SCOPE_CONVENTIONS.get(str(scope))
+        if expected is None:
+            raise ValueError(
+                f"component {component} has an unknown inertia measurement scope: {scope!r}"
+            )
+        if convention is not None and str(convention) != expected:
+            raise ValueError(
+                f"component {component} inertia scope and product_convention disagree: "
+                f"{scope!r} vs {convention!r}"
+            )
+        convention = expected
     if convention == "solidworks_positive":
         tensor = matrix.copy()
         off_diagonal = ~np.eye(3, dtype=bool)
         tensor[off_diagonal] = -matrix[off_diagonal]
         return tensor
+    if convention == "solidworks_standard":
+        return matrix
     if convention is None:
         used_api = str(reference.get("used_api") or "")
         if used_api == "fixture":

@@ -51,6 +51,9 @@ SOURCE_KEYS = {
     "material_source",
     "documented_masses",
     "mass_evidence",
+    "geometry_exclusions",
+    "expected_mass_kg",
+    "expected_extent_m",
     "evidence_class",
     "worker_url",
     "allow_remote_worker",
@@ -138,6 +141,31 @@ def _require(condition: bool, message: str, detail: object | None = None) -> Non
 
 def _normalise_path(value: str) -> str:
     return os.path.normcase(os.path.abspath(value))
+
+
+def _expected_range(value: Any, where: str) -> list[float] | None:
+    """Validate one explicit design expectation ``[min, max]`` in SI units."""
+
+    if value is None:
+        return None
+    _require(
+        isinstance(value, (list, tuple)) and len(value) == 2,
+        f"{where} must be a two-element [min, max] range",
+        value,
+    )
+    assert isinstance(value, (list, tuple))
+    low, high = value
+    _require(
+        all(
+            isinstance(item, (int, float)) and not isinstance(item, bool) and math.isfinite(float(item))
+            for item in (low, high)
+        ),
+        f"{where} must contain finite numbers",
+        value,
+    )
+    _require(float(low) > 0.0 and float(high) > 0.0, f"{where} must be positive", value)
+    _require(float(low) <= float(high), f"{where} min must not exceed max", value)
+    return [float(low), float(high)]
 
 
 def _prepare_destination(destination: Path) -> bool:
@@ -296,6 +324,61 @@ def validate_source_config(config: object) -> dict[str, Any]:
                     "documented_table requires a mass for every included component",
                     {"missing": missing[:20]},
                 )
+    # 物理上已计入的几何排除项：只允许"组件 + 原因 + 结构化证据"的对象，
+    # 不允许用裸字符串或空原因悄悄跳过几何。
+    raw_exclusions = config.get("geometry_exclusions") or {}
+    _require(
+        isinstance(raw_exclusions, dict),
+        "source.geometry_exclusions must be a mapping of component to exclusion",
+        raw_exclusions,
+    )
+    exclusions: dict[str, dict] = {}
+    for name, value in raw_exclusions.items():
+        _require(
+            isinstance(value, dict),
+            "each geometry exclusion must be an object with reason and evidence",
+            {"component": name, "value": value},
+        )
+        assert isinstance(value, dict)
+        unknown_fields = sorted(set(value) - {"component", "reason", "evidence"})
+        _require(
+            not unknown_fields,
+            "geometry exclusion has unknown fields",
+            {"component": name, "fields": unknown_fields},
+        )
+        reason = value.get("reason")
+        _require(
+            isinstance(reason, str) and reason.strip() != "",
+            "geometry exclusion needs a stated reason",
+            {"component": name},
+        )
+        evidence = value.get("evidence")
+        _require(
+            isinstance(evidence, dict),
+            "geometry exclusion needs a structured evidence binding (file, sha256, anchor)",
+            {"component": name, "evidence": evidence},
+        )
+        assert isinstance(evidence, dict)
+        unknown_evidence = sorted(set(evidence) - {"file", "sha256", "anchor"})
+        _require(
+            not unknown_evidence,
+            "geometry exclusion evidence has unknown fields",
+            {"component": name, "fields": unknown_evidence},
+        )
+        for key in ("file", "sha256", "anchor"):
+            item = evidence.get(key)
+            _require(
+                isinstance(item, str) and item.strip() != "",
+                f"geometry exclusion evidence.{key} must be a non-empty string",
+                {"component": name, "evidence": evidence},
+            )
+        exclusions[str(name)] = {
+            "component": str(value.get("component") or name),
+            "reason": reason,
+            "evidence": {key: str(evidence[key]) for key in ("file", "sha256", "anchor")},
+        }
+    expected_mass = _expected_range(config.get("expected_mass_kg"), "source.expected_mass_kg")
+    expected_extent = _expected_range(config.get("expected_extent_m"), "source.expected_extent_m")
     evidence_class = config.get("evidence_class")
     if evidence_class is not None:
         _require(
@@ -317,6 +400,9 @@ def validate_source_config(config: object) -> dict[str, Any]:
         "material_source": material_source,
         "documented_masses": documented,
         "mass_evidence": mass_evidence,
+        "geometry_exclusions": exclusions,
+        "expected_mass_kg": expected_mass,
+        "expected_extent_m": expected_extent,
         "evidence_class": evidence_class,
         "raw": dict(config),
     }
@@ -1008,7 +1094,11 @@ def _component_context_record(reading: dict[str, Any], scene: Any, assembly_mass
 
 
 def _component_mass_context(
-    backend: Any, cfg: dict[str, Any], scene: Any, assembly_mass: float | None
+    backend: Any,
+    cfg: dict[str, Any],
+    scene: Any,
+    assembly_mass: float | None,
+    document: str | None = None,
 ) -> dict[str, Any] | None:
     """The assembly context reading when the backend can produce it; best-effort, never fatal."""
 
@@ -1016,7 +1106,9 @@ def _component_mass_context(
     if not callable(reader):
         return None
     try:
-        reading = reader(cfg["assembly"])
+        # The closure must describe the document the capture actually read: the
+        # collected copy, never the author's working tree.
+        reading = reader(str(document or cfg["assembly"]))
     except Exception as error:  # noqa: BLE001 - an optional probe must not fail a valid capture
         return {
             "schema_version": "description-pipeline.solidworks-component-mass-context/v1",
@@ -1042,31 +1134,28 @@ def _component_mass_context(
         }
 
 
-def _mass_closure(backend: Any, cfg: dict[str, Any], scene: Any) -> dict[str, Any] | None:
+def _mass_closure(
+    backend: Any, cfg: dict[str, Any], scene: Any, document: str | None = None
+) -> dict[str, Any] | None:
     """The assembly's own reading next to the recombined leaf readings, as capture evidence.
 
-    A backend that cannot read the whole assembly (fixtures, other providers) records nothing; the
-    verification side then reports the check as not applicable instead of failing it.  A difference
-    between the two readings is evidence about the CAD tree, so the closure delta is an advisory
-    there; the *capture* never fails because of it.  The component-context section can still make
-    the check fail for a pure-CAD source (recorded instance overrides, or an effective mass that
-    the part documents cannot explain) — that is a source-policy verdict, not a capture failure.
-
-    The assembly read itself is best-effort: builds where ``CreateMassProperty2`` is unavailable, or
-    assemblies that refuse the read, record an explicit ``unavailable`` status.  A capture is never
-    aborted by the optional probe; malformed *standard* readings (the leaf data the combination
-    needs) still fail the freeze through the code below.
+    Capture retains full readings, closure deltas and explicit unavailable/error
+    receipts for diagnosis. The v1 delivery verifier requires full whole-assembly
+    closure and complete component-context evidence; a missing or inconsistent
+    receipt blocks publication. Keeping a failed probe in the snapshot does not
+    qualify the delivery or substitute a mass-only fallback for a full tensor.
     """
 
     closure_reader = getattr(backend, "assembly_mass_properties", None)
     context_reader = getattr(backend, "assembly_component_mass_properties", None)
     if not callable(closure_reader) and not callable(context_reader):
         return None
+    measured = str(document or cfg["assembly"])
     top_level: dict[str, Any] | None = None
     failure: dict[str, str] | None = None
     if callable(closure_reader):
         try:
-            top_level = closure_reader(cfg["assembly"])
+            top_level = closure_reader(measured)
         except Exception as error:  # noqa: BLE001 - an optional probe must not fail a valid capture
             failure = {
                 "reason": str(getattr(error, "code", "") or type(error).__name__),
@@ -1090,7 +1179,7 @@ def _mass_closure(backend: Any, cfg: dict[str, Any], scene: Any) -> dict[str, An
         }
     # The override evidence is required for a pure-CAD claim, so it is collected even when the
     # optional assembly reading failed (or the record would earn cad equivalence by omission).
-    component_context = _component_mass_context(backend, cfg, scene, top_mass)
+    component_context = _component_mass_context(backend, cfg, scene, top_mass, measured)
     if top_level is None or top_mass is None:
         unavailable_record: dict[str, Any] = {
             "schema_version": "description-pipeline.solidworks-mass-closure/v1",
@@ -1246,6 +1335,33 @@ def _verify_originals_unchanged(backend: Any, closure: dict[str, Any]) -> dict[s
     return {"files_checked": len(recorded), "states_checked": checked_states}
 
 
+def _capture_axis_references(backend: Any, cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Resolve every structured joint axis reference to a native line.
+
+    A joint that names a native component/face must yield numeric evidence
+    (point + direction + identity); a backend that cannot resolve it is a
+    capture failure, never a silently skipped record.  Legacy free-text axis
+    references carry no numeric capture and are left to the author.
+    """
+
+    reader = getattr(backend, "capture_axis_reference", None)
+    captured: list[dict[str, Any]] = []
+    for joint in cfg.get("joints") or []:
+        reference = joint.get("axis_reference")
+        if not isinstance(reference, dict):
+            continue
+        joint_name = str(joint.get("name") or joint.get("id") or "")
+        if not callable(reader):
+            raise BridgeError(
+                "cad_axis_reference_unsupported",
+                "this backend cannot resolve a structured joint axis reference",
+                {"joint": joint_name, "axis_reference": reference},
+                exit_code=3,
+            )
+        captured.append({"joint": joint_name, **reader(reference)})
+    return captured
+
+
 def _export_geometry(
     backend: Any, cfg: dict[str, Any], geometry_dir: Path, components: list[str]
 ) -> list[dict[str, Any]]:
@@ -1342,7 +1458,10 @@ def _freeze_local(
         write_json(staging / "raw" / "dependency_closure.json", closure)
         write_json(staging / "raw" / "coordinate_systems.json", raw["coordinate_systems"])
         write_json(staging / "raw" / "mass_properties.json", raw["mass_properties"])
-        mass_closure = _mass_closure(backend, cfg, scene)
+        axis_references = _capture_axis_references(backend, cfg)
+        if axis_references:
+            write_json(staging / "raw" / "axis_references.json", axis_references)
+        mass_closure = _mass_closure(backend, cfg, scene, getattr(scene, "document", None))
         if mass_closure is not None:
             write_json(staging / "raw" / "mass_closure.json", mass_closure)
         # Declared author decisions are recorded as declared input, never as CAD
@@ -1477,9 +1596,7 @@ def freeze(
     from contextlib import nullcontext
 
     if backend is None and isinstance(config, dict) and config.get("worker_url"):
-        from .remote import freeze_via_worker
-
-        return freeze_via_worker(dict(config), Path(destination))
+        raise ConfigError("Remote capture was removed; run the complete pipeline on the native Windows endpoint")
     if backend is None:
         from .native import SolidWorksBackend
 

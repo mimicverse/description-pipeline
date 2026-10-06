@@ -1,9 +1,0 @@
-{
-  "hardware_id": "demo-arm",
-  "overrides": [],
-  "schema_version": "description.definition/v1",
-  "source": {
-    "path": "sources/fixture",
-    "provider": "fixture"
-  }
-}

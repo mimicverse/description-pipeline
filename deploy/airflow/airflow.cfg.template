@@ -1,0 +1,18 @@
+[core]
+dags_folder = @DAGS_FOLDER@
+executor = LocalExecutor
+load_examples = False
+fernet_key = @FERNET_KEY@
+execution_api_server_url = http://127.0.0.1:8791/execution
+# Simple auth manager: the operator entry (Web UI + /api/v2) needs a login. The generated
+# password lands in @AIRFLOW_HOME@/simple_auth_manager_passwords.json.generated (0600).
+simple_auth_manager_users = operator:admin
+[database]
+sql_alchemy_conn = @AIRFLOW_DB_URL@
+[logging]
+base_log_folder = @AIRFLOW_HOME@/logs
+logging_level = INFO
+[api]
+expose_config = False
+[api_auth]
+jwt_secret = @JWT_SECRET@

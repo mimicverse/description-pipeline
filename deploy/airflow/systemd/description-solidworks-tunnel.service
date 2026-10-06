@@ -1,0 +1,15 @@
+[Unit]
+Description=Authenticated tunnel to the SolidWorks execution endpoint
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -N -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -L 127.0.0.1:18765:127.0.0.1:8765 @SSH_HOST@
+Restart=always
+RestartSec=10
+UMask=0077
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=Airflow API server (SolidWorks-to-URDF)
+After=network.target
+
+[Service]
+Type=simple
+Environment=AIRFLOW_HOME=@AIRFLOW_HOME@
+# Loopback only: remote operators reach the UI through an SSH tunnel or reverse proxy.
+ExecStart=@VENV@/bin/airflow api-server --host 127.0.0.1 --port 8791
+UMask=0077
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

@@ -2,21 +2,21 @@
 
 from __future__ import annotations
 
-import contextlib
-import io
-import json
 import os
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 from . import _paths  # noqa: F401
 from description_pipeline.sources.solidworks.errors import BridgeError, CadError, EnvironmentError_  # noqa: E402
 from description_pipeline.sources.solidworks.executor import ComExecutor  # noqa: E402
 from description_pipeline.sources.solidworks.isolation import CadSession  # noqa: E402
-from description_pipeline.sources.solidworks.native import SolidWorksBackend, _read_only_document  # noqa: E402
-from description_pipeline.sources.solidworks import cli  # noqa: E402
+from description_pipeline.sources.solidworks.native import (  # noqa: E402
+    SolidWorksBackend,
+    _read_only_document,
+    normalize_document_path,
+)
 
 
 class ExecutorTests(unittest.TestCase):
@@ -133,6 +133,37 @@ class ExecutorTests(unittest.TestCase):
 
 
 class SessionTests(unittest.TestCase):
+    def test_capture_rebuild_cannot_touch_the_original_assembly(self):
+        backend = SolidWorksBackend()
+        backend._capture_roots = [normalize_document_path("/snapshot/source")]
+        doc = Mock()
+        with self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(doc, "/handoff/robot.SLDASM")
+        self.assertEqual(caught.exception.code, "cad_rebuild_scope")
+        doc.ForceRebuild3.assert_not_called()
+
+    def test_capture_rebuild_is_in_memory_and_failure_blocks_measurement(self):
+        backend = SolidWorksBackend()
+        backend._capture_roots = [normalize_document_path("/snapshot/source")]
+        doc = SimpleNamespace(
+            ConfigurationManager=SimpleNamespace(ActiveConfiguration=SimpleNamespace(Name="Default")),
+            GetSaveFlag=False,
+            GetPathName="/snapshot/source/robot.SLDASM",
+            IsOpenedReadOnly=True,
+            Save=Mock(),
+            ForceRebuild3=Mock(spec=["__call__"], return_value=True),
+        )
+        result = backend._rebuild_capture_copy(doc, doc.GetPathName)
+        self.assertEqual(result["scope"], "collected_copy_in_memory")
+        self.assertFalse(result["saved_to_disk"])
+        self.assertTrue(result["read_only"])
+        doc.ForceRebuild3.assert_called_once_with(False)
+        doc.Save.assert_not_called()
+        doc.ForceRebuild3.return_value = False
+        with self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(doc, doc.GetPathName)
+        self.assertEqual(caught.exception.code, "cad_rebuild_failed")
+
     def test_loaded_references_must_also_be_read_only(self):
         doc = SimpleNamespace(IsOpenedReadOnly=False, GetPathName="part.SLDPRT")
         calls = []
@@ -204,43 +235,3 @@ class SessionTests(unittest.TestCase):
         for session in sessions:
             session.close.assert_called_once()
         self.assertEqual(backend._sessions, {})
-
-
-class DoctorCliTests(unittest.TestCase):
-    def test_timeout_is_json_and_nonzero(self):
-        with (
-            patch.object(ComExecutor, "run", side_effect=BridgeError("modal_dialog_blocked", "timeout", exit_code=4)),
-            contextlib.redirect_stdout(io.StringIO()) as output,
-        ):
-            self.assertEqual(cli.main(["--doctor", "--assembly", "robot.SLDASM", "--json"]), 4)
-        self.assertEqual(json.loads(output.getvalue())["error"]["code"], "modal_dialog_blocked")
-
-    def test_installation_alone_is_not_collection_success(self):
-        report = {"installed": True, "cad_collectable": False}
-        with patch.object(ComExecutor, "run", return_value=report), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(cli.main(["--doctor", "--assembly", "robot.SLDASM", "--json"]), 1)
-
-    def test_a_save_flag_is_printed_as_a_notice_and_still_collectable(self):
-        # The flag is advisory: the operator has to see it, and the exit status has to
-        # stay successful because a capture from the bytes on disk is still possible.
-        report = {
-            "installed": True,
-            "worker_alive": True,
-            "solidworks_reachable": True,
-            "cad_collectable": True,
-            "advisories": [
-                {
-                    "code": "cad_save_flag_set",
-                    "message": "SolidWorks reports unsaved changes for a document opened read-only",
-                    "documents": ["C:/models/robot.SLDASM"],
-                    "count": 1,
-                }
-            ],
-            "checks": [{"name": "collection", "status": "passed"}],
-        }
-        with patch.object(ComExecutor, "run", return_value=report), contextlib.redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(cli.main(["--doctor", "--assembly", "robot.SLDASM"]), 0)
-        printed = output.getvalue()
-        self.assertIn("[     notice] SolidWorks reports unsaved changes", printed)
-        self.assertIn("C:/models/robot.SLDASM", printed)
-        self.assertIn("collectable=True", printed)

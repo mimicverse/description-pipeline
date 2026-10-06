@@ -22,6 +22,33 @@ class PipelineError(ValueError):
     diagnostic_path: str | None = None
 
 
+def acquire_process_lock(path: Path) -> int:
+    """Hold a kernel lock until its descriptor closes, including on process exit.
+
+    Keep the lock file in place: unlinking would let another process lock a
+    different inode while the first owner still runs. Its PID is diagnostic.
+    """
+    if path.is_symlink() or path.is_junction():
+        raise PipelineError("Ownership lock must be a real file")
+    handle = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        owner = str(os.getpid()).encode("ascii")
+        os.write(handle, owner)
+        os.ftruncate(handle, len(owner))
+    except BaseException:
+        os.close(handle)
+        raise
+    return handle
+
+
 def quote_argument(value: str) -> str:
     """Quote a displayed command argument for the platform's usual operator shell."""
     return "'" + value.replace("'", "''") + "'" if os.name == "nt" else shlex.quote(value)
@@ -34,8 +61,7 @@ def pin_utf8_streams() -> None:
     reader — and the messages contain non-ASCII text.  Windows otherwise encodes redirected streams
     with the active ANSI code page (cp936 on the tested host), so a caller that reads UTF-8 cannot
     decode them and ``subprocess.run(text=True, encoding="utf-8")`` fails outright.  Pinning the
-    streams here keeps every entry point on the same contract; the Windows ``description.cmd`` shim
-    sets the console code page to match.
+    streams here keeps every entry point on the same contract.
     """
 
     for stream in (sys.stdin, sys.stdout, sys.stderr):

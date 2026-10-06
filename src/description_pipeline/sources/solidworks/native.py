@@ -80,6 +80,10 @@ def _as_list(value):
     return [value]
 
 
+def _is_text_name(value):
+    return isinstance(value, str) and value.strip() != ""
+
+
 def _read_only_document(doc):
     # OpenDoc6's read-only option does not propagate to every loaded reference.
     # Restrict the owned in-memory document without saving or changing its file.
@@ -663,10 +667,19 @@ class SolidWorksBackend(CadBackend):
             "mode": "full",
             "reference": {
                 "used_api": "IMassProperty2.GetMomentOfInertia(0)",
+                "scope": "part_document",
+                # The convention is proven for this API only (analytic fixture
+                # v2, 2026-10-06); fallback arrays are never relabelled.
+                "convention_basis": "analytic_fixture_v2_20261006",
                 "reference_point": "center_of_mass",
                 "axes": "part_document_axes",
                 "use_system_units": True,
-                "product_convention": "solidworks_positive",
+                # Measured on the analytic fixture 2026-10-06 (SolidWorks
+                # 34.0.0): GetMomentOfInertia(0) equals the analytic standard
+                # tensor to 4e-20 for a rotated box, so the part document is
+                # read as-is.  Historical readings that declare
+                # solidworks_positive keep their own interpretation.
+                "product_convention": "solidworks_standard",
                 "volume_m3": float(_member(mp, "Volume")),
                 "density_kg_m3": float(_member(mp, "Density")),
                 "overrides": overrides,
@@ -682,8 +695,9 @@ class SolidWorksBackend(CadBackend):
 
         The leaf reader above answers "what does this part weigh"; this answers "what does the
         assembly document say the whole thing weighs", with the same settings and the same refusal
-        of mass/COM/inertia overrides.  The capture records both readings; a difference between them
-        is reported by the verification side as an advisory, never as a capture failure.
+        of mass/COM/inertia overrides.  The capture records both readings; the v1 physics closure
+        is a required blocking gate, so a missing or invalid whole-assembly reading fails the
+        product gate instead of degrading to an advisory.
 
         ``CreateMassProperty2`` is tried first.  A session or build where it is unavailable — late
         binding saw it return nothing during the M3.0 review, even though the 2026-09-29 native run
@@ -730,10 +744,12 @@ class SolidWorksBackend(CadBackend):
             "inertia": inertia,
             "reference": {
                 "used_api": "IMassProperty2.GetMomentOfInertia(0)",
+                "scope": "assembly_document",
                 "reference_point": "center_of_mass",
                 "axes": "assembly_document_axes",
                 "use_system_units": True,
-                "product_convention": "solidworks_positive",
+                "product_convention": "solidworks_standard",
+                "convention_basis": "same_api_selection_family_as_measured_group",
                 "volume_m3": float(_member(mp, "Volume")),
                 "density_kg_m3": float(_member(mp, "Density")),
                 "overrides": overrides,
@@ -756,6 +772,9 @@ class SolidWorksBackend(CadBackend):
             "volume_index": 3,
             "com": "not_inferred",
             "inertia": "not_inferred",
+            # This fallback array is not covered by the analytic convention
+            # proof, so it must never claim a tensor convention.
+            "product_convention": None,
             "document": str(_member(doc, "GetPathName")),
         }
         return reading
@@ -855,15 +874,293 @@ class SolidWorksBackend(CadBackend):
             },
         }
 
+    def capture_axis_reference(self, reference):
+        """Resolve a structured native face reference to its cylindrical axis.
+
+        ``reference`` is the authored joint ``axis_reference``
+        (``{component, face_index, body_type}``).  The returned record carries
+        the identity (component, face index, face name) and the numeric line:
+        a point on the axis, the unit direction and the radius, straight from
+        ``ISurface.CylinderParams``.  Independent verification can then test
+        the authored joint axis for collinearity and origin alignment instead of
+        trusting the datum alone.
+        """
+
+        component = str(reference.get("component") or "")
+        if component not in self._components:
+            raise CadError("cad_missing_component", component, {"axis_reference": reference})
+        feature_name = reference.get("feature_name")
+        face_index = reference.get("face_index")
+        if not _is_text_name(feature_name) and (
+            not isinstance(face_index, int) or isinstance(face_index, bool) or face_index < 0
+        ):
+            raise CadError(
+                "cad_axis_reference_invalid",
+                "the selector needs a named feature or a non-negative face_index",
+                reference,
+            )
+        body_type = 1 if str(reference.get("body_type") or "solid") == "sheet" else 0
+        holder = self._components[component]
+        if _is_text_name(feature_name):
+            face = self._cylinder_face_by_feature(holder, str(feature_name), component)
+        else:
+            bodies = self._body_list(holder, body_type, component)
+            if bodies is None:
+                raise CadError(
+                    "cad_axis_reference_unreadable",
+                    "component bodies could not be enumerated",
+                    {"component": component, "body_type": body_type},
+                )
+            faces = []
+            for body in bodies:
+                faces.extend(_as_list(_member(body, "GetFaces")))
+            if face_index >= len(faces):
+                raise CadError(
+                    "cad_axis_reference_invalid",
+                    "face_index is outside the component's faces",
+                    {"component": component, "face_index": face_index, "faces": len(faces)},
+                )
+            face = faces[face_index]
+        surface = _member(face, "GetSurface")
+        params = list(map(float, _member(surface, "CylinderParams") or ()))
+        if len(params) != 7 or not all(map(math.isfinite, params)):
+            raise CadError(
+                "cad_axis_reference_not_cylinder",
+                "the referenced face does not expose cylindrical geometry",
+                {"component": component, "face_index": face_index},
+            )
+        point, direction, radius = params[0:3], params[3:6], params[6]
+        norm = math.sqrt(sum(value * value for value in direction))
+        # Planar faces answer CylinderParams with garbage instead of raising, so
+        # the geometry itself must prove it is a cylinder: unit axis, positive
+        # radius.
+        if abs(norm - 1.0) > 1e-6 or radius <= 0.0:
+            raise CadError(
+                "cad_axis_reference_not_cylinder",
+                "the referenced face is not a cylinder with a unit axis and positive radius",
+                {"component": component, "face_index": face_index, "radius": radius, "axis_norm": norm},
+            )
+        face_name = ""
+        try:
+            face_name = str(_member(face, "Name") or "")
+        except CadError:
+            face_name = ""
+        record = {
+            "component": component,
+            "body_type": "sheet" if body_type == 1 else "solid",
+            "selector": {key: value for key, value in reference.items() if key != "note"},
+            "face_name": face_name,
+            "surface": "cylinder",
+            # IComponent2 bodies answer in component/part-local coordinates and
+            # the cylinder axis is an undirected line: the authored joint axis
+            # supplies the positive direction.
+            "coordinate_frame": "component_local",
+            "direction_semantics": "undirected_axis_line",
+            "axis_point_m": [float(value) for value in point],
+            "axis_direction": [float(value) / norm for value in direction],
+            "radius_m": float(radius),
+            "used_api": ("IComponent2.GetBodies2/IBody2.GetFaces/IFace2.GetSurface/ISurface.CylinderParams"),
+        }
+        if isinstance(face_index, int) and not isinstance(face_index, bool):
+            record["face_index"] = face_index
+        persist = self._persist_reference(face)
+        if persist is not None:
+            record["persist_reference_b64"] = persist
+        return record
+
+    def _cylinder_face_by_feature(self, holder, feature_name, component):
+        """Resolve a named feature's unique cylindrical face; ambiguity fails."""
+
+        document = _member(holder, "GetModelDoc2")
+        feature = _member(document, "FirstFeature")
+        matches = 0
+        found = None
+        while feature is not None:
+            if str(_member(feature, "Name") or "") == feature_name:
+                matches += 1
+                for candidate in _as_list(_member(feature, "GetFaces")):
+                    params = list(map(float, _member(_member(candidate, "GetSurface"), "CylinderParams") or ()))
+                    if len(params) != 7:
+                        continue
+                    direction = params[3:6]
+                    norm = math.sqrt(sum(value * value for value in direction))
+                    if abs(norm - 1.0) <= 1e-6 and params[6] > 0.0:
+                        if found is not None:
+                            raise CadError(
+                                "cad_axis_reference_ambiguous",
+                                "the named feature carries more than one cylindrical face",
+                                {"component": component, "feature_name": feature_name},
+                            )
+                        found = candidate
+            feature = _member(feature, "GetNextFeature")
+        if found is None:
+            raise CadError(
+                "cad_axis_reference_not_cylinder",
+                "no cylindrical face found on the named feature",
+                {"component": component, "feature_name": feature_name, "features_matched": matches},
+            )
+        return found
+
+    def _persist_reference(self, face):
+        """Best-effort CAD persistent reference for the resolved entity."""
+
+        try:
+            import base64
+
+            data = _member(_member(self._doc, "Extension"), "GetPersistReference3", face)
+            if data is None:
+                return None
+            blob = bytes(int(value) & 0xFF for value in data)
+            return base64.b64encode(blob).decode("ascii")
+        except Exception:  # noqa: BLE001 - a missing persistent reference is not fatal
+            return None
+
+    def _component_override_flags(self, doc, component):
+        """Effective override flags for one selected component instance."""
+
+        import pythoncom
+
+        mp = _member(_member(doc, "Extension"), "CreateMassProperty2")
+        if mp is None:
+            raise CadError("cad_empty_mass_property", "CreateMassProperty2 returned null")
+        mp.UseSystemUnits = True
+        mp.IncludeHiddenBodiesOrComponents = True
+        selection = _win32().VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, (component,))
+        mp.SelectedItems = selection
+        _member(mp, "Recalculate")
+        override = _member(mp, "GetOverrideOptions")
+        return {
+            key: bool(_member(override, key))
+            for key in ("OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia")
+        }
+
+    def assembly_group_mass_properties(self, path, names):
+        """Mass properties for a selected group of component instances.
+
+        Measured on the analytic fixture (2026-10-06, SolidWorks 34.0.0): a
+        group selection answers in the SAME standard notation the analytic
+        parallel-axis combination predicts (residual 6.5e-19 absolute), so the
+        reading declares ``solidworks_standard``.  The reading is
+        scope-qualified (``assembly_component_group``) so no historical part
+        measurement is ever relabelled, and any effective instance override is
+        refused instead of silently becoming the value.
+
+        Returns ``{"assembly", "configuration", "group", "members", "mass",
+        "com", "inertia", "reference"}``.
+        """
+
+        doc = self._document_by_path(path)
+        if _member(doc, "GetType") != 2:
+            raise CadError("cad_not_assembly", "group mass reader requires a saved SLDASM")
+        configuration = _member(_member(doc, "ConfigurationManager"), "ActiveConfiguration")
+        root = _member(configuration, "GetRootComponent3", True)
+        if root is None:
+            raise CadError("cad_empty_mass_property", "assembly has no root component")
+        wanted = {str(name) for name in names}
+        if not wanted:
+            raise CadError("cad_empty_selection", "group mass reader needs at least one component instance")
+        selection: list[object] = []
+        overrides: dict[str, dict[str, bool]] = {}
+        stack: list[object] = list(reversed(list(_member(root, "GetChildren") or ())))
+        while stack:
+            component = _dynamic(stack.pop())
+            if _member(component, "IsSuppressed"):
+                continue
+            children = list(_member(component, "GetChildren") or ())
+            stack.extend(reversed(children))
+            name = str(_member(component, "Name2"))
+            if name not in wanted:
+                continue
+            flags = self._component_override_flags(doc, component)
+            if any(flags.values()):
+                raise CadError(
+                    "cad_mass_override",
+                    "pure-CAD export refuses component instance overrides",
+                    {"component": name, "overrides": flags, "scope": "assembly_component_group"},
+                )
+            overrides[name] = flags
+            selection.append(component)
+        missing = sorted(wanted - set(overrides))
+        if missing:
+            raise CadError(
+                "cad_missing_component",
+                "group members are not component instances of this assembly",
+                {"missing": missing, "group": sorted(wanted)},
+            )
+        import pythoncom
+
+        mp = _member(_member(doc, "Extension"), "CreateMassProperty2")
+        if mp is None:
+            raise CadError("cad_empty_mass_property", "CreateMassProperty2 returned null")
+        mp.UseSystemUnits = True
+        mp.IncludeHiddenBodiesOrComponents = True
+        array = _win32().VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, tuple(selection))
+        mp.SelectedItems = array
+        _member(mp, "Recalculate")
+        mass = float(_member(mp, "Mass"))
+        com = tuple(map(float, _member(mp, "CenterOfMass")))
+        values = tuple(map(float, _member(mp, "GetMomentOfInertia", 0)))
+        if len(values) != 9:
+            raise CadError("cad_mass_property_inertia_unsupported", "GetMomentOfInertia(0) must return 9 values")
+        inertia, _ = _inertia_from_raw(values, _member(doc, "GetTitle"))
+        if mass <= 0 or not math.isfinite(mass) or len(com) != 3 or not all(map(math.isfinite, com)):
+            raise CadError("cad_mass_property_invalid", "mass/COM are not finite and positive")
+        return {
+            "assembly": str(_member(doc, "GetPathName")),
+            "configuration": str(_member(configuration, "Name")),
+            "group": sorted(wanted),
+            "members": overrides,
+            "mass": mass,
+            "com": com,
+            "inertia": inertia,
+            "reference": {
+                "used_api": "IMassProperty2.GetMomentOfInertia(0)",
+                "scope": "assembly_component_group",
+                "convention_basis": "analytic_fixture_v2_20261006",
+                "product_convention": "solidworks_standard",
+                "reference_point": "center_of_mass",
+                "axes": "assembly_document_axes",
+                "use_system_units": True,
+                "overrides": overrides,
+                "document": str(_member(doc, "GetPathName")),
+                "configuration": str(_member(configuration, "Name")),
+            },
+        }
+
+    def _rebuild_capture_copy(self, doc, path):
+        normalized = normalize_document_path(os.path.abspath(path))
+        if not any(normalized.startswith(root + "\\") for root in self._capture_roots):
+            raise CadError("cad_rebuild_scope", "Only a collected capture copy may be rebuilt")
+        configuration = _active_configuration(doc)
+        before = bool(_member(doc, "GetSaveFlag"))
+        # Reopened assemblies can have resolved solid components but an empty
+        # mass cache. Rebuild the owned read-only copy before ANY measurements,
+        # not just a failed mass reading. Never save the rebuilt document.
+        if not _member(doc, "ForceRebuild3", False):
+            raise CadError("cad_rebuild_failed", "Collected assembly did not rebuild successfully", {"path": path})
+        if _active_configuration(doc) != configuration:
+            raise CadError("cad_configuration_mismatch", "Capture rebuild changed the selected configuration")
+        return {
+            "used_api": "IModelDoc2.ForceRebuild3(False)",
+            "scope": "collected_copy_in_memory",
+            "document": str(_member(doc, "GetPathName")),
+            "configuration": configuration,
+            "read_only": bool(_member(doc, "IsOpenedReadOnly")),
+            "saved_to_disk": False,
+            "save_flag_before": before,
+            "save_flag_after": bool(_member(doc, "GetSaveFlag")),
+        }
+
     def collect_scene(self, doc_path, coordinate_systems, progress=None, require_material=True):
         doc = self._document_by_path(doc_path)
         if _member(doc, "GetType") != 2:
             raise CadError("cad_not_assembly", "export requires a saved SLDASM")
+        preparation = self._rebuild_capture_copy(doc, doc_path)
         self._record_save_flag(doc, doc_path)
         self._doc = doc
         self._components = {}
         self._source_components = {}
-        self.notes = {}
+        self.notes = {"capture_preparation": preparation}
         self.source_files = {doc_path: _hash(doc_path)}
         config = _member(_member(doc, "ConfigurationManager"), "ActiveConfiguration")
         self._source_configuration = str(_member(config, "Name"))
@@ -906,6 +1203,13 @@ class SolidWorksBackend(CadBackend):
                 raise CadError("cad_empty_subassembly", name)
             components.append(RawComponent(name, path, self._placement(comp), bool(_member(comp, "IsFixed")), "part"))
             self._components[name] = comp
+            # Solids and sheet bodies are different geometry: record which the
+            # part really carries so a sheet-only part is never mistaken for an
+            # empty one.
+            self.notes["bodies:" + name] = {
+                "solid": self._body_count(comp, 0, name),
+                "sheet": self._body_count(comp, 1, name),
+            }
             properties[name] = self._mass_properties_document(part, require_material)
             properties[name]["reference"]["configuration"] = referenced
             self.notes["mass_property:" + name] = properties[name]["reference"]["used_api"]
@@ -923,13 +1227,97 @@ class SolidWorksBackend(CadBackend):
         self.notes["coordinate_system:" + name] = "IModelDocExtension.GetCoordinateSystemTransformByName"
         return transform_from_solidworks(_member(tf, "ArrayData"))
 
+    def _body_list(self, holder, body_type, component):
+        """Bodies of one swBodyType_e, or ``None`` when the API cannot be read.
+
+        ``IPartDoc.GetBodies2`` takes ``(bodyType, visibleOnly)`` while
+        ``IComponent2.GetBodies2`` takes ``(bodyType)`` only; the wrong arity
+        raises a COM parameter error, so both signatures are tried and the one
+        that answered is recorded as evidence.
+        """
+
+        for label, arguments in (
+            ("IPartDoc.GetBodies2(type, False)", (body_type, False)),
+            ("IComponent2.GetBodies2(type)", (body_type,)),
+        ):
+            try:
+                bodies = _as_list(_member(holder, "GetBodies2", *arguments))
+            except Exception:  # noqa: BLE001 - the other arity is tried next
+                continue
+            self.notes[f"bodies_api:{component}:{body_type}"] = label
+            return bodies
+        self.notes[f"bodies_unreadable:{component}:{body_type}"] = "no working GetBodies2 signature"
+        return None
+
+    def _body_count(self, holder, body_type, component):
+        bodies = self._body_list(holder, body_type, component)
+        return None if bodies is None else len(bodies)
+
+    def _body_face_triangles(self, holder, body_type, component):
+        """Component-local display triangles of every face of every requested body."""
+
+        values: list[float] = []
+        bodies = self._body_list(holder, body_type, component)
+        if not bodies:
+            return values
+        for body in bodies:
+            for face in _as_list(_member(body, "GetFaces")):
+                face_values = list(map(float, _member(face, "GetTessTriangles", True) or ()))
+                if len(face_values) % 9 or not all(map(math.isfinite, face_values)):
+                    raise CadError(
+                        "cad_mesh_export_failed",
+                        "invalid face tessellation",
+                        {"component": component, "body_type": body_type},
+                    )
+                values.extend(face_values)
+        if not values:
+            # Bodies exist but produced no display mesh: exporting nothing here
+            # would silently drop real geometry.
+            raise CadError(
+                "cad_mesh_export_failed",
+                "bodies carry no display tessellation",
+                {"component": component, "body_type": body_type, "bodies": len(bodies)},
+            )
+        return values
+
     def export_component_mesh(self, component, dest_path, progress=None):
+        """Write one component's display tessellation (solids and sheets)."""
+
         if component not in self._components:
             raise CadError("cad_missing_component", component)
-        doc = _member(self._components[component], "GetModelDoc2")
-        values = list(map(float, _member(doc, "GetTessTriangles", True) or ()))
-        if not values or len(values) % 9 or not all(map(math.isfinite, values)):
-            raise CadError("cad_mesh_export_failed", "invalid tessellation", {"component": component})
+        holder = self._components[component]
+        doc = _member(holder, "GetModelDoc2")
+        document_values = list(map(float, _member(doc, "GetTessTriangles", True) or ()))
+        document_valid = (
+            bool(document_values) and len(document_values) % 9 == 0 and all(map(math.isfinite, document_values))
+        )
+        solid_bodies = self._body_list(holder, 0, component)
+        sheet_bodies = self._body_list(holder, 1, component)
+        sources: list[str] = []
+        values: list[float] = []
+        if document_valid:
+            # The historical path: one part-document display tessellation.  It
+            # covers solid bodies only, so sheet bodies are appended below.
+            values.extend(document_values)
+            sources.append("part_document")
+        elif solid_bodies:
+            values.extend(self._body_face_triangles(holder, 0, component))
+            sources.append("solid_body_faces")
+        if sheet_bodies:
+            # Sheet bodies (e.g. the PCB) never appear in GetTessTriangles; a
+            # sheet-only part must still export the geometry it really has.
+            values.extend(self._body_face_triangles(holder, 1, component))
+            sources.append("sheet_body_faces")
+        if not values:
+            raise CadError(
+                "cad_mesh_export_failed",
+                "invalid tessellation",
+                {
+                    "component": component,
+                    "solid_bodies": None if solid_bodies is None else len(solid_bodies),
+                    "sheet_bodies": None if sheet_bodies is None else len(sheet_bodies),
+                },
+            )
         # Native display tessellation, in metres, independent of global STL
         # preferences. No claim of machining-grade surface approximation.
         with open(dest_path, "xb") as handle:
@@ -950,7 +1338,14 @@ class SolidWorksBackend(CadBackend):
             # SolidWorks wrote the file; a reader failure here is a CAD export
             # problem and must surface as one instead of a bare traceback.
             raise CadError("cad_mesh_invalid", str(exc), {"component": component}) from exc
-        api = "IPartDoc.GetTessTriangles(True)"
+        api = " + ".join(
+            {
+                "part_document": "IPartDoc.GetTessTriangles(True)",
+                "solid_body_faces": ("IComponent2.GetBodies2(0)/IBody2.GetFaces/IFace2.GetTessTriangles(True)"),
+                "sheet_body_faces": ("IComponent2.GetBodies2(1)/IBody2.GetFaces/IFace2.GetTessTriangles(True)"),
+            }[source]
+            for source in sources
+        )
         self.notes["mesh:" + component] = api
         return {
             "component": component,
@@ -959,6 +1354,11 @@ class SolidWorksBackend(CadBackend):
             "triangles": triangles,
             "units": "m",
             "representation": "CAD_display_tessellation",
+            "tessellation_sources": sources,
+            "bodies": {
+                "solid": None if solid_bodies is None else len(solid_bodies),
+                "sheet": None if sheet_bodies is None else len(sheet_bodies),
+            },
         }
 
     def verify_sources_unchanged(self):
