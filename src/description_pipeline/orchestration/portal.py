@@ -1,0 +1,964 @@
+"""Minimal authenticated operator portal for one SolidWorks engineering folder.
+
+The portal is a dependency-free WSGI application:
+
+* the operator authenticates against the Airflow API; the returned Airflow token is stored in a
+  server-side session and never sent to the browser;
+* the portal triggers the ``solidworks_to_urdf`` DAG with exactly one value, ``handoff_path``, and
+  reports the Airflow stage progress, native findings and the published pull request;
+* the Windows endpoint bearer token also stays server-side; the portal proxies the delivery
+  preview and only serves URDF/mesh artifacts whose bytes match the digest-bound preview;
+* the bundled viewer renders the actual verified URDF with joint and limit controls.
+
+Run ``python -m description_pipeline.orchestration.portal --help`` for the configuration surface.
+"""
+
+from __future__ import annotations
+
+import hmac
+import json
+import logging
+import re
+import secrets
+import threading
+import time
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from http import HTTPStatus
+from pathlib import Path
+from socketserver import ThreadingMixIn
+from typing import Any
+from collections.abc import Callable, Iterable
+from urllib import error as urlerror
+from urllib import parse as urlparse
+from urllib import request as urlrequest
+from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
+
+from .airflow_client import (
+    EndpointConfig,
+    EndpointError,
+    EndpointNotFound,
+    EndpointProtocolError,
+    ResultNotPublishable,
+    WindowsEndpoint,
+    check_result,
+    native_run_id,
+    validate_artifact_name,
+    validate_handoff_path,
+    verified_result,
+)
+
+log = logging.getLogger(__name__)
+
+DEFAULT_DAG_ID = "solidworks_to_urdf"
+DEFAULT_API_ROOT = "/api/v2"
+DEFAULT_SESSION_COOKIE = "solidworks_portal_session"
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_RUN_ID = re.compile(r"[A-Za-z0-9_.:-]{1,250}\Z")
+_LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+_ARTIFACT_TYPES = {
+    ".urdf": "application/xml",
+    ".xml": "application/xml",
+    ".stl": "model/stl",
+    ".obj": "text/plain",
+    ".dae": "model/vnd.collada+xml",
+    ".json": "application/json",
+    ".png": "image/png",
+}
+_STATIC_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".json": "application/json",
+    ".svg": "image/svg+xml",
+    ".txt": "text/plain; charset=utf-8",
+    ".md": "text/plain; charset=utf-8",
+}
+
+
+class PortalError(RuntimeError):
+    """An operator-facing failure with an HTTP status."""
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = int(status)
+        self.message = message
+
+
+class AirflowApiError(RuntimeError):
+    """The Airflow API rejected a request or returned an unexpected shape."""
+
+
+class AirflowAuthError(AirflowApiError):
+    """The Airflow credentials or token were rejected."""
+
+
+def _validate_http_url(url: str) -> str:
+    try:
+        parsed = urlparse.urlsplit(url)
+        _ = parsed.port
+    except ValueError as error:
+        raise AirflowApiError("invalid Airflow address") from error
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise AirflowApiError("Airflow address must be an absolute HTTP or HTTPS URL")
+    if parsed.scheme == "http" and parsed.hostname not in _LOOPBACK:
+        raise AirflowApiError("plaintext HTTP is only allowed for loopback Airflow addresses")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise AirflowApiError("Airflow address cannot embed credentials, a query or a fragment")
+    return url.rstrip("/")
+
+
+@dataclass
+class PortalSession:
+    session_id: str
+    user: str
+    token: str
+    csrf_token: str
+    created_at: float
+    last_seen: float
+
+
+class SessionStore:
+    """Server-side sessions; browsers only ever see an opaque cookie value."""
+
+    def __init__(self, ttl: float) -> None:
+        if ttl <= 0:
+            raise ValueError("session ttl must be positive")
+        self.ttl = float(ttl)
+        self._lock = threading.Lock()
+        self._sessions: dict[str, PortalSession] = {}
+
+    def create(self, user: str, token: str) -> PortalSession:
+        now = time.time()
+        session = PortalSession(
+            session_id=secrets.token_urlsafe(32),
+            user=user,
+            token=token,
+            csrf_token=secrets.token_urlsafe(32),
+            created_at=now,
+            last_seen=now,
+        )
+        with self._lock:
+            self._sessions = {key: value for key, value in self._sessions.items() if self._fresh(value, now)}
+            self._sessions[session.session_id] = session
+        return session
+
+    def get(self, session_id: str | None) -> PortalSession | None:
+        if not session_id:
+            return None
+        now = time.time()
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return None
+            if not self._fresh(session, now):
+                self._sessions.pop(session_id, None)
+                return None
+            session.last_seen = now
+            return session
+
+    def drop(self, session_id: str | None) -> None:
+        if not session_id:
+            return
+        with self._lock:
+            self._sessions.pop(session_id, None)
+
+    def _fresh(self, session: PortalSession, now: float) -> bool:
+        return now - session.last_seen <= self.ttl
+
+
+class LoginThrottle:
+    """Small per-client failure window so the Airflow login cannot be brute-forced trivially."""
+
+    def __init__(self, limit: int, window: float) -> None:
+        self.limit = int(limit)
+        self.window = float(window)
+        self._lock = threading.Lock()
+        self._failures: dict[str, list[float]] = {}
+
+    def allow(self, key: str) -> bool:
+        now = time.time()
+        with self._lock:
+            recent = [stamp for stamp in self._failures.get(key, []) if now - stamp <= self.window]
+            self._failures[key] = recent
+            return len(recent) < self.limit
+
+    def record_failure(self, key: str) -> None:
+        with self._lock:
+            self._failures.setdefault(key, []).append(time.time())
+
+    def reset(self, key: str) -> None:
+        with self._lock:
+            self._failures.pop(key, None)
+
+
+class AirflowApi:
+    """Thin client for the Airflow 3 stable REST API with server-side credentials."""
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        api_root: str = DEFAULT_API_ROOT,
+        timeout: float = 20.0,
+        opener: Callable[..., Any] | None = None,
+    ) -> None:
+        self.base_url = _validate_http_url(base_url)
+        self.api_root = "/" + api_root.strip("/")
+        self.timeout = float(timeout)
+        self._opener = opener or urlrequest.urlopen
+
+    def _request(self, method: str, path: str, payload: dict | None = None, token: str | None = None) -> dict:
+        data = None if payload is None else json.dumps(payload).encode("utf-8")
+        headers = {"Accept": "application/json"}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        request = urlrequest.Request(self.base_url + path, data=data, method=method, headers=headers)
+        try:
+            with self._opener(request, timeout=self.timeout) as response:
+                body = response.read()
+        except urlerror.HTTPError as error:
+            if error.code in {401, 403}:
+                raise AirflowAuthError("Airflow rejected the operator credentials") from error
+            raise AirflowApiError(f"Airflow returned HTTP {error.code}") from error
+        except urlerror.URLError as error:
+            raise AirflowApiError(f"Airflow unreachable: {error.reason}") from error
+        if not body:
+            return {}
+        try:
+            parsed = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise AirflowApiError("Airflow returned invalid JSON") from error
+        if not isinstance(parsed, dict):
+            raise AirflowApiError("Airflow returned a non-object payload")
+        return parsed
+
+    def login(self, username: str, password: str) -> str:
+        payload = self._request("POST", "/auth/token", {"username": username, "password": password})
+        token = payload.get("access_token")
+        if not isinstance(token, str) or not token.strip():
+            raise AirflowApiError("Airflow login returned no access token")
+        return token.strip()
+
+    def dag(self, token: str, dag_id: str) -> dict:
+        return self._request("GET", f"{self.api_root}/dags/{urlparse.quote(dag_id)}", token=token)
+
+    def trigger_dag_run(self, token: str, dag_id: str, dag_run_id: str, conf: dict) -> dict:
+        return self._request(
+            "POST",
+            f"{self.api_root}/dags/{urlparse.quote(dag_id)}/dagRuns",
+            {"dag_run_id": dag_run_id, "conf": conf},
+            token=token,
+        )
+
+    def dag_run(self, token: str, dag_id: str, dag_run_id: str) -> dict:
+        return self._request(
+            "GET",
+            f"{self.api_root}/dags/{urlparse.quote(dag_id)}/dagRuns/{urlparse.quote(dag_run_id)}",
+            token=token,
+        )
+
+    def task_instances(self, token: str, dag_id: str, dag_run_id: str) -> list[dict]:
+        payload = self._request(
+            "GET",
+            f"{self.api_root}/dags/{urlparse.quote(dag_id)}/dagRuns/{urlparse.quote(dag_run_id)}/taskInstances",
+            token=token,
+        )
+        instances = payload.get("task_instances")
+        if instances is None:
+            instances = payload.get("taskInstances")
+        if not isinstance(instances, list):
+            raise AirflowApiError("Airflow returned no task instance list")
+        return [item for item in instances if isinstance(item, dict)]
+
+    def list_dag_runs(self, token: str, dag_id: str, *, limit: int = 20) -> list[dict]:
+        """Recent runs of one DAG, so the operator page survives portal restarts."""
+        payload = self._request(
+            "POST",
+            f"{self.api_root}/dags/~/dagRuns/list",
+            {"dag_ids": [dag_id], "page_limit": int(limit), "order_by": "-start_date"},
+            token=token,
+        )
+        runs = payload.get("dag_runs")
+        if not isinstance(runs, list):
+            raise AirflowApiError("Airflow returned no dag run list")
+        return [item for item in runs if isinstance(item, dict)]
+
+
+@dataclass(frozen=True)
+class PortalConfig:
+    airflow: AirflowApi
+    endpoint: WindowsEndpoint | Callable[[], WindowsEndpoint]
+    dag_id: str = DEFAULT_DAG_ID
+    static_dir: Path = Path(__file__).resolve().parent / "static"
+    host: str = "127.0.0.1"
+    port: int = 8780
+    session_ttl: float = 12 * 3600.0
+    artifact_limit: int = 64 * 1024 * 1024
+    preview_ttl: float = 60.0
+    cookie_secure: bool = False
+    login_limit: int = 10
+    login_window: float = 300.0
+    max_body_bytes: int = 64 * 1024
+
+
+_CONFIG_KEYS = {
+    "airflow": {"url"},
+    "endpoint": {"url", "token_file"},
+    "portal": {"host", "port"},
+}
+
+
+def _read_config(path: Path) -> dict:
+    path = Path(path)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise AirflowApiError(f"cannot read portal config {path}: {error}") from error
+    try:
+        data = json.loads(raw)
+    except ValueError as error:
+        raise AirflowApiError(f"portal config {path} is not valid JSON: {error}") from error
+    if not isinstance(data, dict):
+        raise AirflowApiError("portal config must be one JSON object")
+    return data
+
+
+def _section(data: dict, name: str) -> dict:
+    section = data.get(name) or {}
+    if not isinstance(section, dict):
+        raise AirflowApiError(f"portal config section [{name}] must be a table/object")
+    unknown = set(section) - _CONFIG_KEYS[name]
+    if unknown:
+        raise AirflowApiError(f"portal config section [{name}] has unknown keys: {sorted(unknown)}")
+    return section
+
+
+def _endpoint_from_config(section: dict) -> WindowsEndpoint:
+    token_file = section.get("token_file")
+    url = section.get("url")
+    if not (isinstance(url, str) and url.strip()):
+        raise AirflowApiError("portal config needs endpoint.url")
+    if not (isinstance(token_file, str) and token_file.strip()):
+        raise AirflowApiError("portal config needs endpoint.token_file")
+    try:
+        token = Path(token_file).read_text(encoding="utf-8").strip()
+    except OSError as error:
+        raise AirflowApiError(f"cannot read endpoint token file {token_file}: {error}") from error
+    if not token:
+        raise AirflowApiError(f"endpoint token file {token_file} is empty")
+    return WindowsEndpoint(EndpointConfig(base_url=url.strip(), token=token))
+
+
+def load_portal_config(path: Path) -> PortalConfig:
+    """Load the one JSON config file; see ``portal.example.json`` in this package."""
+    data = _read_config(path)
+    unknown = set(data) - set(_CONFIG_KEYS)
+    if unknown:
+        raise AirflowApiError(f"portal config has unknown sections: {sorted(unknown)}")
+    airflow_section = _section(data, "airflow")
+    portal_section = _section(data, "portal")
+    endpoint_section = _section(data, "endpoint")
+    url = airflow_section.get("url")
+    if not isinstance(url, str) or not url.strip():
+        raise AirflowApiError("portal config needs airflow.url")
+    return PortalConfig(
+        airflow=AirflowApi(url.strip()),
+        endpoint=_endpoint_from_config(endpoint_section),
+        host=str(portal_section.get("host") or "127.0.0.1"),
+        port=int(portal_section.get("port", 8780)),
+    )
+
+
+@dataclass
+class PortalRun:
+    dag_run_id: str
+    handoff_path: str
+    user: str
+    started_at: float
+
+
+def _findings(job: dict | None) -> list[dict]:
+    """Native findings with their object references, tolerant of the transport field names."""
+    findings: list[dict] = []
+    if not isinstance(job, dict):
+        return findings
+    result = job.get("result") if isinstance(job.get("result"), dict) else {}
+    for source in (job.get("findings"), result.get("findings")):
+        if not isinstance(source, list):
+            continue
+        for item in source:
+            if isinstance(item, str):
+                findings.append({"severity": "error", "stage": "", "object": "", "id": "", "message": item})
+                continue
+            if not isinstance(item, dict):
+                continue
+            findings.append(
+                {
+                    "id": str(item.get("id") or item.get("check") or ""),
+                    "severity": str(item.get("severity") or item.get("level") or "error"),
+                    "stage": str(item.get("stage") or ""),
+                    "object": str(
+                        item.get("object") or item.get("component") or item.get("path") or item.get("mate") or ""
+                    ),
+                    "message": str(item.get("message") or item.get("detail") or item.get("error") or "未提供说明"),
+                }
+            )
+    if job.get("error"):
+        findings.append({"id": "", "severity": "error", "stage": "", "object": "", "message": str(job["error"])})
+    quality = result.get("quality")
+    if isinstance(quality, dict):
+        for check in quality.get("checks") or []:
+            if isinstance(check, dict) and check.get("passed") is False:
+                findings.append(
+                    {
+                        "id": str(check.get("id") or ""),
+                        "severity": "error",
+                        "stage": "自动检查",
+                        "object": str(check.get("object") or ""),
+                        "message": str(check.get("details") or check.get("error") or "自动检查未通过"),
+                    }
+                )
+    return findings
+
+
+def _automatic_summary(job: dict | None) -> dict:
+    if not isinstance(job, dict):
+        return {"state": "pending", "job_state": "pending", "checks": []}
+    status = str(job.get("status") or "pending")
+    result = job.get("result") if isinstance(job.get("result"), dict) else {}
+    checks = []
+    quality = result.get("quality")
+    if isinstance(quality, dict):
+        checks = [check for check in quality.get("checks") or [] if isinstance(check, dict)]
+    try:
+        verified_result(result)
+    except ResultNotPublishable as error:
+        message = str(error)
+    else:
+        # A verified model stays previewable even when the PR service failed afterwards.
+        return {"state": "passed", "job_state": status, "checks": checks}
+    if status == "failed":
+        return {"state": "failed", "job_state": status, "checks": checks, "message": message}
+    if status in {"queued", "running"}:
+        return {"state": status, "job_state": status, "checks": checks}
+    return {"state": "unverified", "job_state": status, "checks": checks, "message": message}
+
+
+def _confirmation_summary(job: dict | None) -> dict:
+    """Engineering confirmations stay separate from automatic results and default to pending."""
+    items = []
+    if isinstance(job, dict) and isinstance(job.get("confirmations"), list):
+        for item in job["confirmations"]:
+            if isinstance(item, dict):
+                items.append(
+                    {
+                        "id": str(item.get("id") or ""),
+                        "state": str(item.get("state") or "pending"),
+                        "object": str(item.get("object") or ""),
+                    }
+                )
+    if not items:
+        return {
+            "state": "pending",
+            "items": [],
+            "message": "工程确认由结构负责人在本版本原生工程中完成，当前接口未上报逐项确认。",
+        }
+    return {"state": "reported", "items": items}
+
+
+def _job_repository(job: dict) -> tuple[str, str]:
+    """Repository slug and base as bound by the job (top level or its receipt)."""
+    receipt = job.get("receipt") if isinstance(job.get("receipt"), dict) else {}
+    slug = job.get("repository_slug") or receipt.get("repository_slug")
+    base = job.get("repository_base") or receipt.get("repository_base")
+    return str(slug or ""), str(base or "")
+
+
+class PortalApp:
+    """WSGI application serving the operator page, its API and digest-verified artifacts."""
+
+    def __init__(self, config: PortalConfig) -> None:
+        self.config = config
+        self.sessions = SessionStore(config.session_ttl)
+        self.throttle = LoginThrottle(config.login_limit, config.login_window)
+        self._lock = threading.Lock()
+        self._runs: dict[str, PortalRun] = {}
+        self._previews: dict[str, tuple[float, dict]] = {}
+
+    # ------------------------------------------------------------------ WSGI
+    def __call__(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
+        try:
+            return self._dispatch(environ, start_response)
+        except PortalError as error:
+            return _json_response(start_response, error.status, {"error": error.message}, self.config)
+        except Exception:  # noqa: BLE001 - a portal must fail closed, not leak internals
+            log.exception("portal request failed")
+            return _json_response(start_response, 500, {"error": "internal portal error"}, self.config)
+
+    def _dispatch(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
+        method = str(environ.get("REQUEST_METHOD", "GET")).upper()
+        path = str(environ.get("PATH_INFO") or "/")
+        if path == "/" and method == "GET":
+            return self._static(start_response, "index.html")
+        if path.startswith("/static/") and method == "GET":
+            return self._static(start_response, path[len("/static/") :])
+        if path == "/api/session":
+            if method == "GET":
+                return self._session_info(environ, start_response)
+            if method == "POST":
+                return self._login(environ, start_response)
+            if method == "DELETE":
+                return self._logout(environ, start_response)
+        if path == "/api/runs":
+            if method == "GET":
+                return self._list_runs(environ, start_response)
+            if method == "POST":
+                return self._start_run(environ, start_response)
+        match = re.fullmatch(r"/api/runs/([^/]+)", path)
+        if match and method == "GET":
+            return self._run_status(environ, start_response, match.group(1))
+        match = re.fullmatch(r"/api/runs/([^/]+)/preview", path)
+        if match and method == "GET":
+            return self._preview(environ, start_response, match.group(1))
+        match = re.fullmatch(r"/api/runs/([^/]+)/artifacts/(.+)", path)
+        if match and method == "GET":
+            return self._artifact(environ, start_response, match.group(1), match.group(2))
+        raise PortalError(HTTPStatus.NOT_FOUND, "unknown portal route")
+
+    # ------------------------------------------------------------- sessions
+    def _session(self, environ: dict, *, csrf: bool = False) -> PortalSession:
+        cookies = _parse_cookies(environ.get("HTTP_COOKIE"))
+        session = self.sessions.get(cookies.get(DEFAULT_SESSION_COOKIE))
+        if session is None:
+            raise PortalError(HTTPStatus.UNAUTHORIZED, "需要登录")
+        if csrf:
+            supplied = str(environ.get("HTTP_X_CSRF_TOKEN") or "")
+            if not supplied or not hmac.compare_digest(supplied, session.csrf_token):
+                raise PortalError(HTTPStatus.FORBIDDEN, "请求校验失败，请刷新页面重试")
+        return session
+
+    def _session_info(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
+        session = self._session(environ)
+        return _json_response(
+            start_response,
+            200,
+            {"authenticated": True, "user": session.user, "csrf_token": session.csrf_token},
+            self.config,
+        )
+
+    def _login(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
+        client = str(environ.get("REMOTE_ADDR") or "unknown")
+        if not self.throttle.allow(client):
+            raise PortalError(HTTPStatus.TOO_MANY_REQUESTS, "登录尝试过多，请稍后再试")
+        payload = self._body(environ)
+        username = payload.get("username")
+        password = payload.get("password")
+        if not isinstance(username, str) or not username.strip() or not isinstance(password, str) or not password:
+            raise PortalError(HTTPStatus.BAD_REQUEST, "请输入 Airflow 用户名和密码")
+        try:
+            token = self.config.airflow.login(username.strip(), password)
+            self.config.airflow.dag(token, self.config.dag_id)
+        except AirflowAuthError as error:
+            self.throttle.record_failure(client)
+            raise PortalError(HTTPStatus.UNAUTHORIZED, str(error)) from error
+        except AirflowApiError as error:
+            raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
+        self.throttle.reset(client)
+        session = self.sessions.create(username.strip(), token)
+        headers = [("Set-Cookie", _session_cookie(session.session_id, environ, self.config))]
+        return _json_response(
+            start_response,
+            200,
+            {"authenticated": True, "user": session.user, "csrf_token": session.csrf_token},
+            self.config,
+            headers,
+        )
+
+    def _logout(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
+        session = self._session(environ, csrf=True)
+        self.sessions.drop(session.session_id)
+        headers = [("Set-Cookie", _session_cookie("", environ, self.config, clear=True))]
+        return _json_response(start_response, 200, {"authenticated": False}, self.config, headers)
+
+    # ------------------------------------------------------------------ runs
+    def _list_runs(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
+        session = self._session(environ)
+        with self._lock:
+            local = {run.dag_run_id: run for run in self._runs.values()}
+        try:
+            airflow_runs = self.config.airflow.list_dag_runs(session.token, self.config.dag_id, limit=20)
+        except AirflowAuthError as error:
+            raise PortalError(HTTPStatus.UNAUTHORIZED, str(error)) from error
+        except AirflowApiError:
+            airflow_runs = []
+        runs = []
+        seen = set()
+        for item in airflow_runs:
+            dag_run_id = str(item.get("dag_run_id") or "")
+            if not dag_run_id or dag_run_id in seen:
+                continue
+            seen.add(dag_run_id)
+            record = local.get(dag_run_id)
+            conf = item.get("conf") if isinstance(item.get("conf"), dict) else {}
+            runs.append(
+                {
+                    "dag_run_id": dag_run_id,
+                    "handoff_path": conf.get("handoff_path") or (record.handoff_path if record else None),
+                    "user": record.user if record else None,
+                    "state": item.get("state"),
+                    "started_at": item.get("start_date"),
+                }
+            )
+        for record in sorted(local.values(), key=lambda item: item.started_at, reverse=True):
+            if record.dag_run_id not in seen:
+                runs.append(
+                    {
+                        "dag_run_id": record.dag_run_id,
+                        "handoff_path": record.handoff_path,
+                        "user": record.user,
+                        "state": None,
+                        "started_at": datetime.fromtimestamp(record.started_at, UTC).isoformat(),
+                    }
+                )
+        return _json_response(
+            start_response,
+            200,
+            {"runs": runs[:20]},
+            self.config,
+        )
+
+    def _start_run(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
+        session = self._session(environ, csrf=True)
+        payload = self._body(environ)
+        if set(payload) - {"handoff_path"}:
+            raise PortalError(HTTPStatus.BAD_REQUEST, "只允许提供工程文件夹路径，不接受其他运行参数")
+        try:
+            handoff_path = validate_handoff_path(payload.get("handoff_path"))
+        except EndpointProtocolError as error:
+            raise PortalError(HTTPStatus.BAD_REQUEST, str(error)) from error
+        dag_run_id = f"portal-{datetime.now(UTC):%Y%m%dT%H%M%S}-{secrets.token_hex(4)}"
+        try:
+            self.config.airflow.trigger_dag_run(
+                session.token,
+                self.config.dag_id,
+                dag_run_id,
+                {"handoff_path": handoff_path},
+            )
+        except AirflowAuthError as error:
+            raise PortalError(HTTPStatus.UNAUTHORIZED, str(error)) from error
+        except AirflowApiError as error:
+            raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
+        with self._lock:
+            self._runs[dag_run_id] = PortalRun(
+                dag_run_id=dag_run_id,
+                handoff_path=handoff_path,
+                user=session.user,
+                started_at=time.time(),
+            )
+        log.info("portal started dag_run_id=%s user=%s", dag_run_id, session.user)
+        return _json_response(start_response, 201, {"dag_run_id": dag_run_id}, self.config)
+
+    def _run_status(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
+        session = self._session(environ)
+        if _RUN_ID.fullmatch(dag_run_id) is None:
+            raise PortalError(HTTPStatus.BAD_REQUEST, "运行标识不合法")
+        try:
+            airflow_run = self.config.airflow.dag_run(session.token, self.config.dag_id, dag_run_id)
+            tasks = self.config.airflow.task_instances(session.token, self.config.dag_id, dag_run_id)
+        except AirflowAuthError as error:
+            raise PortalError(HTTPStatus.UNAUTHORIZED, str(error)) from error
+        except AirflowApiError as error:
+            raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
+        endpoint = self._endpoint()
+        run_id = native_run_id(dag_run_id)
+        job: dict | None = None
+        endpoint_error: str | None = None
+        try:
+            job = endpoint.get_job(run_id)
+        except EndpointNotFound:
+            job = None
+        except EndpointError as error:
+            endpoint_error = str(error)
+        conf = airflow_run.get("conf") if isinstance(airflow_run.get("conf"), dict) else {}
+        pr = None
+        if isinstance(job, dict):
+            result = job.get("result") if isinstance(job.get("result"), dict) else {}
+            slug, base = _job_repository(job)
+            try:
+                submission = check_result(
+                    result,
+                    expected_slug=slug,
+                    expected_base=base,
+                )["submission"]
+                pr = {
+                    "url": submission["url"],
+                    "state": submission["state"],
+                    "commit": submission["commit"],
+                    "base": submission["base"],
+                }
+            except ResultNotPublishable:
+                pr = None
+        return _json_response(
+            start_response,
+            200,
+            {
+                "dag_run_id": dag_run_id,
+                "state": airflow_run.get("state"),
+                "handoff_path": conf.get("handoff_path"),
+                "started_at": airflow_run.get("start_date"),
+                "ended_at": airflow_run.get("end_date"),
+                "tasks": [
+                    {
+                        "task_id": str(task.get("task_id") or ""),
+                        "state": task.get("state"),
+                        "start_date": task.get("start_date"),
+                        "end_date": task.get("end_date"),
+                    }
+                    for task in tasks
+                ],
+                "job": None if job is None else {"status": job.get("status"), "error": job.get("error")},
+                "stages": [] if job is None else _stages(job),
+                "findings": _findings(job),
+                "automatic": _automatic_summary(job),
+                "confirmations": _confirmation_summary(job),
+                "pr": pr,
+                "endpoint_error": endpoint_error,
+            },
+            self.config,
+        )
+
+    # --------------------------------------------------------------- preview
+    def _preview_payload(self, session: PortalSession, dag_run_id: str) -> dict:
+        if _RUN_ID.fullmatch(dag_run_id) is None:
+            raise PortalError(HTTPStatus.BAD_REQUEST, "运行标识不合法")
+        run_id = native_run_id(dag_run_id)
+        now = time.time()
+        with self._lock:
+            cached = self._previews.get(run_id)
+        if cached is not None and now - cached[0] <= self.config.preview_ttl:
+            return cached[1]
+        endpoint = self._endpoint()
+        try:
+            job = endpoint.get_job(run_id)
+            if str(job.get("status") or "") in {"queued", "running"}:
+                raise PortalError(HTTPStatus.NOT_FOUND, "该运行还没有可展示的已验证交付")
+            verified_result(job.get("result"))
+            preview = endpoint.get_preview(run_id)
+        except EndpointNotFound as error:
+            raise PortalError(HTTPStatus.NOT_FOUND, "该运行还没有可展示的已验证交付") from error
+        except ResultNotPublishable as error:
+            raise PortalError(HTTPStatus.CONFLICT, f"模型尚未通过独立校验：{error}") from error
+        except EndpointError as error:
+            raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
+        with self._lock:
+            self._previews[run_id] = (now, preview)
+        return preview
+
+    def _preview(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
+        session = self._session(environ)
+        return _json_response(start_response, 200, self._preview_payload(session, dag_run_id), self.config)
+
+    def _artifact(self, environ: dict, start_response: Callable, dag_run_id: str, name: str) -> Iterable[bytes]:
+        session = self._session(environ)
+        try:
+            artifact = validate_artifact_name(name)
+        except EndpointProtocolError as error:
+            raise PortalError(HTTPStatus.BAD_REQUEST, str(error)) from error
+        preview = self._preview_payload(session, dag_run_id)
+        digest = preview["files"].get(artifact)
+        if not isinstance(digest, str):
+            raise PortalError(HTTPStatus.NOT_FOUND, "该文件不在已验证交付清单中")
+        endpoint = self._endpoint()
+        try:
+            data = endpoint.read_artifact(
+                native_run_id(dag_run_id),
+                artifact,
+                sha256=digest,
+                limit=self.config.artifact_limit,
+            )
+        except EndpointNotFound as error:
+            raise PortalError(HTTPStatus.NOT_FOUND, "该文件不在已验证交付清单中") from error
+        except EndpointProtocolError as error:
+            log.warning("artifact verification failed run=%s name=%s: %s", dag_run_id, artifact, error)
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "交付文件摘要校验失败，已拒绝提供") from error
+        except EndpointError as error:
+            raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
+        content_type = _ARTIFACT_TYPES.get(Path(artifact).suffix.lower(), "application/octet-stream")
+        headers = [
+            ("Content-Type", content_type),
+            ("Content-Length", str(len(data))),
+            ("Cache-Control", "private, max-age=300"),
+        ]
+        start_response("200 OK", _common_headers(headers, self.config))
+        return [data]
+
+    # ---------------------------------------------------------------- static
+    def _static(self, start_response: Callable, name: str) -> Iterable[bytes]:
+        relative = Path(name)
+        if relative.is_absolute() or ".." in relative.parts or name.startswith("/"):
+            raise PortalError(HTTPStatus.NOT_FOUND, "unknown static asset")
+        root = self.config.static_dir.resolve()
+        target = (root / relative).resolve()
+        if not target.is_file() or root not in target.parents:
+            raise PortalError(HTTPStatus.NOT_FOUND, "unknown static asset")
+        content_type = _STATIC_TYPES.get(target.suffix.lower())
+        if content_type is None:
+            raise PortalError(HTTPStatus.NOT_FOUND, "unknown static asset")
+        data = target.read_bytes()
+        headers = [
+            ("Content-Type", content_type),
+            ("Content-Length", str(len(data))),
+            ("Cache-Control", "no-cache"),
+        ]
+        start_response("200 OK", _common_headers(headers, self.config))
+        return [data]
+
+    # ---------------------------------------------------------------- helpers
+    def _endpoint(self) -> WindowsEndpoint:
+        endpoint = self.config.endpoint
+        return endpoint() if callable(endpoint) else endpoint
+
+    def _body(self, environ: dict) -> dict:
+        try:
+            length = int(environ.get("CONTENT_LENGTH") or 0)
+        except (TypeError, ValueError) as error:
+            raise PortalError(HTTPStatus.BAD_REQUEST, "请求长度不合法") from error
+        if length < 0 or length > self.config.max_body_bytes:
+            raise PortalError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "请求内容过大")
+        raw = environ["wsgi.input"].read(length)
+        try:
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise PortalError(HTTPStatus.BAD_REQUEST, "请求内容不是合法 JSON") from error
+        if not isinstance(payload, dict):
+            raise PortalError(HTTPStatus.BAD_REQUEST, "请求内容不是 JSON 对象")
+        return payload
+
+
+def _stages(job: dict) -> list[dict]:
+    stages = []
+    for event in job.get("events") or []:
+        if not isinstance(event, dict):
+            continue
+        stages.append(
+            {
+                "stage": str(event.get("stage") or ""),
+                "state": str(event.get("state") or ""),
+                "at": str(event.get("at") or ""),
+            }
+        )
+    return stages
+
+
+def _parse_cookies(header: str | None) -> dict[str, str]:
+    cookies: dict[str, str] = {}
+    for chunk in str(header or "").split(";"):
+        name, _, value = chunk.strip().partition("=")
+        if name:
+            cookies[name] = value
+    return cookies
+
+
+def _request_is_secure(environ: dict) -> bool:
+    if str(environ.get("HTTP_X_FORWARDED_PROTO") or "").lower() == "https":
+        return True
+    if str(environ.get("HTTP_X_FORWARDED_SSL") or "").lower() == "on":
+        return True
+    return str(environ.get("wsgi.url_scheme") or "") == "https"
+
+
+def _is_loopback_request(environ: dict) -> bool:
+    host = str(environ.get("HTTP_HOST") or environ.get("SERVER_NAME") or "")
+    hostname = host.rsplit(":", 1)[0].strip("[]").lower()
+    return hostname in _LOOPBACK
+
+
+def _session_cookie(value: str, environ: dict, config: PortalConfig, *, clear: bool = False) -> str:
+    secure = config.cookie_secure or _request_is_secure(environ)
+    if not secure and not _is_loopback_request(environ):
+        secure = True  # never hand an insecure session cookie to a remote client
+    parts = [
+        f"{DEFAULT_SESSION_COOKIE}={value}",
+        "Path=/",
+        "HttpOnly",
+        "SameSite=Strict",
+    ]
+    if secure:
+        parts.append("Secure")
+    if clear:
+        parts.extend(["Max-Age=0", "Expires=Thu, 01 Jan 1970 00:00:00 GMT"])
+    return "; ".join(parts)
+
+
+def _common_headers(headers: list[tuple[str, str]], config: PortalConfig) -> list[tuple[str, str]]:
+    csp = (
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+        "connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+    )
+    return [
+        ("X-Content-Type-Options", "nosniff"),
+        ("Referrer-Policy", "no-referrer"),
+        ("Content-Security-Policy", csp),
+        *headers,
+    ]
+
+
+def _json_response(
+    start_response: Callable,
+    status: int,
+    payload: dict,
+    config: PortalConfig,
+    headers: list[tuple[str, str]] | None = None,
+) -> list[bytes]:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    response_headers = [
+        ("Content-Type", "application/json; charset=utf-8"),
+        ("Content-Length", str(len(body))),
+        ("Cache-Control", "no-store"),
+        *list(headers or []),
+    ]
+    start_response(f"{int(status)} {HTTPStatus(int(status)).phrase}", _common_headers(response_headers, config))
+    return [body]
+
+
+class _ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class _QuietHandler(WSGIRequestHandler):
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - stdlib signature
+        log.debug("%s - %s", self.address_string(), format % args)
+
+
+def serve(config: PortalConfig, *, host: str | None = None, port: int | None = None) -> None:
+    """Serve the portal until interrupted (deployment owns the reverse proxy and TLS)."""
+    host = host or config.host
+    port = config.port if port is None else port
+    app = PortalApp(config)
+    with make_server(host, port, app, server_class=_ThreadingWSGIServer, handler_class=_QuietHandler) as server:
+        log.info("operator portal listening on http://%s:%s", host, server.server_address[1])
+        server.serve_forever()
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="SolidWorks-to-URDF operator portal")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        help="JSON config with airflow.url, endpoint.url and endpoint.token_file",
+    )
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    serve(load_portal_config(args.config))
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised by deployment
+    raise SystemExit(main())

@@ -1,0 +1,13 @@
+{
+  "airflow": {
+    "url": "http://127.0.0.1:8080"
+  },
+  "endpoint": {
+    "url": "http://127.0.0.1:18765",
+    "token_file": "/etc/solidworks-urdf/endpoint.token"
+  },
+  "portal": {
+    "host": "127.0.0.1",
+    "port": 8788
+  }
+}
