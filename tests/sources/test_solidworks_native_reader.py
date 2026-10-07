@@ -16,8 +16,10 @@ stays owned by the native owner.
 from __future__ import annotations
 
 import os
+import sys
 import types
 import unittest
+from contextlib import contextmanager
 from itertools import pairwise
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -190,7 +192,9 @@ class _Component:
         self.Name2 = name
         self._path = str(path)
         self._children = list(children)
-        self._doc = doc
+        # Unsuppressed components are always property-read, so every mock
+        # component needs a real document; a missing API must be explicit.
+        self._doc = doc if doc is not None else _Doc(self._path)
         self._transform = tuple(transform)
         self.IsSuppressed = suppressed
         self.IsFixed = False
@@ -209,27 +213,69 @@ class _Component:
         return self._doc
 
 
+_AUTO = object()
+
+
 class _PropertyManager:
-    def __init__(self, values):
-        self._values = dict(values)
+    """``ICustomPropertyManager`` with the vendor six-argument ``Get6``.
+
+    ``Get6(Name, ResolvedFlag, ValOut, ResolvedValOut, WasResolved, LinkToProperty)``
+    writes four by-ref outputs and returns ``status2``.  ``Get`` exists only to
+    record that the reader never falls back to the deprecated method.
+    """
+
+    def __init__(self, specs, *, names=_AUTO, get_names_error=None):
+        self._specs = {
+            name: (dict(raw) if isinstance(raw, dict) else {"value": raw, "resolved": raw})
+            for name, raw in specs.items()
+        }
+        self._names = names
+        self._get_names_error = get_names_error
+        self.get6_calls = []
+        self.get_calls = []
 
     def GetNames(self):
-        return list(self._values)
+        if self._get_names_error is not None:
+            raise self._get_names_error
+        if self._names is not _AUTO:
+            return self._names
+        return list(self._specs)
 
-    def Get6(self, name, _configuration, _resolved):
-        return (self._values[name],)
+    def Get6(self, name, resolved_flag, value_out, resolved_out, was_resolved, linked):
+        self.get6_calls.append((name, resolved_flag))
+        spec = self._specs[name]
+        if spec.get("error") is not None:
+            raise spec["error"]
+        value_out.value = spec.get("value", "")
+        resolved_out.value = spec.get("resolved", spec.get("value", ""))
+        was_resolved.value = spec.get("was_resolved", True)
+        linked.value = spec.get("linked", True)
+        return spec.get("status", 2)
+
+    def Get(self, name):
+        self.get_calls.append(name)
+        return self._specs.get(name, {}).get("value", "")
 
 
 class _Extension:
-    def __init__(self, scopes, coordinate_systems=None):
+    def __init__(self, scopes, coordinate_systems=None, manager=_AUTO, scope_managers=None):
         self._scopes = scopes
         self._coordinate_systems = dict(coordinate_systems or {})
+        self._manager = manager
+        self._scope_managers = dict(scope_managers or {})
 
     def CustomPropertyManager(self, scope):
+        if scope in self._scope_managers:
+            return self._scope_managers[scope]
+        if self._manager is not _AUTO:
+            return self._manager
         return _PropertyManager(self._scopes.get(scope, {}))
 
     def GetCoordinateSystemTransformByName(self, name):
-        return types.SimpleNamespace(ArrayData=list(self._coordinate_systems[name]))
+        transform = self._coordinate_systems.get(name)
+        if transform is None:
+            return None
+        return types.SimpleNamespace(ArrayData=list(transform))
 
 
 class _ConfigurationManager:
@@ -258,24 +304,30 @@ class _Doc:
         configuration_properties=None,
         coordinate_systems=None,
         first_feature=None,
+        configuration_features=None,
         children=(),
         configuration_children=None,
         configuration="Default",
+        doc_type=1,
         show_success=True,
         show_effect=True,
+        custom_property_manager=_AUTO,
+        scope_managers=None,
     ):
         self._path = str(path)
         self._children = list(children)
         self._configuration_children = {
             name: list(items) for name, items in (configuration_children or {}).items()
         }
+        self._configuration_features = dict(configuration_features or {})
+        self._doc_type = doc_type
         self.active_configuration = configuration
         self._show_success = show_success
         self._show_effect = show_effect
         scopes = {"": dict(properties or {})}
         for name, values in (configuration_properties or {}).items():
             scopes[name] = dict(values)
-        self.Extension = _Extension(scopes, coordinate_systems)
+        self.Extension = _Extension(scopes, coordinate_systems, custom_property_manager, scope_managers)
         self.ConfigurationManager = _ConfigurationManager(self)
         self._first_feature = first_feature
 
@@ -285,7 +337,8 @@ class _Doc:
     def ShowConfiguration2(self, name):
         """Documented contract: boolean success, never an exception for a bad name."""
 
-        if not self._show_success or name not in self._configuration_children:
+        known = set(self._configuration_children) | set(self._configuration_features)
+        if not self._show_success or (name not in known and name != self.active_configuration):
             return False
         if self._show_effect:
             self.active_configuration = name
@@ -300,8 +353,12 @@ class _Doc:
     def ForceRebuild3(self, _force):
         return True
 
+    def GetType(self):
+        return self._doc_type
+
     def FirstFeature(self):
-        return self._first_feature() if callable(self._first_feature) else self._first_feature
+        feature = self._configuration_features.get(self.active_configuration, self._first_feature)
+        return feature() if callable(feature) else feature
 
     def GetComponents(self, _ignored):
         return list(self._children)
@@ -343,15 +400,67 @@ class _Session:
         return {"reader": "portable-mock"}
 
 
+class _CaptureBackend(SolidWorksBackend):
+    """Real ``collect_scene`` frame loop; only heavy CAD reads are stubbed."""
+
+    def _rebuild_capture_copy(self, doc, path):
+        return {"rebuilt": True, "path": str(path)}
+
+    def _record_save_flag(self, doc, path):
+        self.save_flags[str(path)] = False
+
+    def _body_count(self, holder, body_type, component):
+        return 1
+
+    def _mass_properties_document(self, doc, require_material=True):
+        return {
+            "mass_kg": 1.0,
+            "volume_m3": 0.001,
+            "material": None,
+            "reference": {"used_api": "portable-capture-mock", "configuration": None},
+        }
+
+
 def _write(root: Path, name: str) -> Path:
     path = root / name
     path.write_bytes(f"portable fixture: {name}\n".encode())
     return path
 
 
+@contextmanager
+def _com_stubs():
+    """Minimal pythoncom/win32com surface used by the by-ref property reads."""
+
+    pythoncom = types.ModuleType("pythoncom")
+    pythoncom.VT_BYREF = 0x4000
+    pythoncom.VT_BSTR = 8
+    pythoncom.VT_BOOL = 11
+    pythoncom.VT_I4 = 3
+    pythoncom.COINIT_APARTMENTTHREADED = 2
+    pythoncom.CoInitializeEx = lambda *_args, **_kwargs: None
+    pythoncom.CoUninitialize = lambda: None
+    pythoncom.VARIANT = lambda _vt, value: types.SimpleNamespace(value=value)
+    win32com = types.ModuleType("win32com")
+    client = types.ModuleType("win32com.client")
+    client.VARIANT = pythoncom.VARIANT
+    win32com.client = client
+    added = {"pythoncom": pythoncom, "win32com": win32com, "win32com.client": client}
+    saved = {name: sys.modules.get(name) for name in added}
+    sys.modules.update(added)
+    try:
+        yield
+    finally:
+        for name, previous in saved.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+
+
 def _read(root: Path, app: _App, settings=None) -> dict:
     backend = SolidWorksBackend(session_factory=lambda: _Session(app))
-    return backend.discover_native(root, settings if settings is not None else {})
+    with _com_stubs():
+        return backend.discover_native(root, settings if settings is not None else {})
 
 
 def _mate(name, mate_type, entities, *, lower=0.0, upper=0.0, count=None, suppressed=False, error_code=0):
@@ -679,6 +788,247 @@ class ProducerContextTests(unittest.TestCase):
                 {"sub-a": "sub-a/arm-1", "sub-b": "sub-b/arm-1"},
                 msg="a shared leaf name must resolve through its occurrence path, never by leaf name alone",
             )
+
+
+class CaptureSceneTests(unittest.TestCase):
+    """Requested datums must survive capture from every occurrence/document."""
+
+    def _capture(self, app, assembly, requested):
+        backend = _CaptureBackend(session_factory=lambda: _Session(app))
+        with _com_stubs():
+            return backend.collect_scene(str(assembly), requested)
+
+    def test_component_owned_datum_composes_with_occurrence_placement(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            arm_path = _write(root, "arm.SLDPRT")
+            arm_doc = _Doc(
+                arm_path,
+                coordinate_systems={"CS_tip": _sw_translation(0.1, 0.0, 0.0)},
+                first_feature=_Feature("CS_tip", "CoordSys"),
+            )
+            arm_component = _Component("arm-1", arm_path, doc=arm_doc, transform=_sw_translation(1.0, 2.0, 0.0))
+            assembly = _write(root, "robot.SLDASM")
+            main_doc = _Doc(assembly, doc_type=2, children=[arm_component])
+
+            scene = self._capture(_App({assembly: main_doc}), assembly, ["CS_tip"])
+
+            self.assertEqual([component.name for component in scene.components], ["arm-1"])
+            matrix = scene.coordinate_systems["CS_tip"]
+            self.assertAlmostEqual(matrix[3], 1.1, msg=f"datum not composed with the occurrence: {matrix}")
+            self.assertAlmostEqual(matrix[7], 2.0, msg=f"datum not composed with the occurrence: {matrix}")
+            self.assertAlmostEqual(matrix[11], 0.0, msg=f"datum not composed with the occurrence: {matrix}")
+
+    def test_repeated_reference_uses_each_referenced_configuration(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            arm_path = _write(root, "arm.SLDPRT")
+            arm_doc = _Doc(
+                arm_path,
+                configuration="Left",
+                configuration_children={"Left": [], "Right": []},
+                configuration_features={
+                    "Left": _Feature("CS_left", "CoordSys"),
+                    "Right": _Feature("CS_right", "CoordSys"),
+                },
+                coordinate_systems={
+                    "CS_left": _sw_translation(0.5, 0.0, 0.0),
+                    "CS_right": _sw_translation(0.0, 0.5, 0.0),
+                },
+            )
+            left = _Component(
+                "arm-left", arm_path, doc=arm_doc, configuration="Left", transform=_sw_translation(1.0, 0.0, 0.0)
+            )
+            right = _Component(
+                "arm-right", arm_path, doc=arm_doc, configuration="Right", transform=_sw_translation(0.0, 2.0, 0.0)
+            )
+            assembly = _write(root, "robot.SLDASM")
+            main_doc = _Doc(assembly, doc_type=2, children=[left, right])
+
+            scene = self._capture(_App({assembly: main_doc}), assembly, ["CS_left", "CS_right"])
+
+            left_matrix = scene.coordinate_systems["CS_left"]
+            right_matrix = scene.coordinate_systems["CS_right"]
+            self.assertAlmostEqual(left_matrix[3], 1.5, msg=f"left datum wrong: {left_matrix}")
+            self.assertAlmostEqual(left_matrix[7], 0.0, msg=f"left datum wrong: {left_matrix}")
+            self.assertAlmostEqual(right_matrix[3], 0.0, msg=f"right datum wrong: {right_matrix}")
+            self.assertAlmostEqual(right_matrix[7], 2.5, msg=f"right datum wrong: {right_matrix}")
+
+    def test_missing_and_duplicate_requested_datums_fail(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            arm_path = _write(root, "arm.SLDPRT")
+            arm_doc = _Doc(arm_path)
+            arm_component = _Component("arm-1", arm_path, doc=arm_doc)
+            assembly = _write(root, "robot.SLDASM")
+            main_doc = _Doc(assembly, doc_type=2, children=[arm_component])
+            with self.assertRaises(CadError) as caught:
+                self._capture(_App({assembly: main_doc}), assembly, ["CS_missing"])
+            error = caught.exception
+            self.assertEqual(error.code, "cad_missing_coordinate_system")
+            self.assertIn("CS_missing", f"{error.message} {error.detail}")
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_path = _write(root, "first.SLDPRT")
+            second_path = _write(root, "second.SLDPRT")
+            first_doc = _Doc(
+                first_path,
+                coordinate_systems={"CS_tip": _sw_translation(0.1, 0.0, 0.0)},
+                first_feature=_Feature("CS_tip", "CoordSys"),
+            )
+            second_doc = _Doc(
+                second_path,
+                coordinate_systems={"CS_tip": _sw_translation(0.0, 0.1, 0.0)},
+                first_feature=_Feature("CS_tip", "CoordSys"),
+            )
+            first = _Component("first-1", first_path, doc=first_doc)
+            second = _Component("second-1", second_path, doc=second_doc)
+            assembly = _write(root, "robot.SLDASM")
+            main_doc = _Doc(assembly, doc_type=2, children=[first, second])
+            with self.assertRaises(CadError) as caught:
+                self._capture(_App({assembly: main_doc}), assembly, ["CS_tip"])
+            error = caught.exception
+            self.assertEqual(error.code, "cad_coordinate_system_ambiguous")
+            self.assertEqual(error.detail["datum"], "CS_tip")
+
+
+class PropertyContractTests(unittest.TestCase):
+    """Vendor six-argument Get6 by-ref contract, no deprecated Get fallback."""
+
+    def _identity_record(self, root, **doc_kwargs):
+        assembly = _write(root, "robot.SLDASM")
+        doc = _Doc(assembly, **doc_kwargs)
+        return assembly, _read(root, _App({assembly: doc}))
+
+    def test_get6_byref_records_resolved_value_and_flags(self) -> None:
+        manager = _PropertyManager(
+            {
+                "dp.hardware_id": {"value": "raw-id", "resolved": "m3.0", "was_resolved": True, "linked": True},
+                "dp.revision": {"value": "r1", "resolved": "r1", "linked": False},
+            }
+        )
+        with TemporaryDirectory() as tmp:
+            _assembly, record = self._identity_record(Path(tmp), scope_managers={"": manager})
+
+        # ResolvedValOut is recorded, not ValOut, and both by-ref calls used the
+        # exact six-argument vendor signature with ResolvedFlag False.
+        self.assertEqual(record["identity"]["hardware_id"], "m3.0")
+        self.assertEqual(record["identity"]["revision"], "r1")
+        self.assertEqual(manager.get6_calls, [("dp.hardware_id", False), ("dp.revision", False)])
+        self.assertEqual(manager.get_calls, [])
+
+    def test_get6_status_must_be_actual_two(self) -> None:
+        for status in (True, 1, 3, 1.0, "2"):
+            with self.subTest(status=status), TemporaryDirectory() as tmp:
+                manager = _PropertyManager({"dp.x": {"value": "v", "resolved": "v", "status": status}})
+                with self.assertRaises(CadError) as caught:
+                    self._identity_record(Path(tmp), scope_managers={"": manager})
+                self.assertEqual(caught.exception.code, "cad_property_unreadable")
+
+    def test_get6_requires_resolved_true_and_bool_link(self) -> None:
+        cases = ({"was_resolved": False}, {"was_resolved": 1}, {"linked": 1}, {"linked": None})
+        for extra in cases:
+            spec = {"value": "v", "resolved": "v", **extra}
+            with self.subTest(spec=extra), TemporaryDirectory() as tmp:
+                manager = _PropertyManager({"dp.x": spec})
+                with self.assertRaises(CadError) as caught:
+                    self._identity_record(Path(tmp), scope_managers={"": manager})
+                self.assertEqual(caught.exception.code, "cad_property_unreadable")
+
+    def test_get6_requires_string_values(self) -> None:
+        cases = ({"value": 5}, {"resolved": None}, {"resolved": 3.0})
+        for extra in cases:
+            spec = {"value": "v", "resolved": "v", **extra}
+            with self.subTest(spec=extra), TemporaryDirectory() as tmp:
+                manager = _PropertyManager({"dp.x": spec})
+                with self.assertRaises(CadError) as caught:
+                    self._identity_record(Path(tmp), scope_managers={"": manager})
+                self.assertEqual(caught.exception.code, "cad_property_unreadable")
+
+    def test_empty_namespace_is_valid(self) -> None:
+        for names in ([], None):
+            with self.subTest(names=names), TemporaryDirectory() as tmp:
+                manager = _PropertyManager({}, names=names)
+                _assembly, record = self._identity_record(Path(tmp), scope_managers={"": manager})
+                self.assertIsNone(record["identity"]["hardware_id"])
+                self.assertEqual(manager.get6_calls, [])
+
+    def test_unreadable_property_enumerations_block_with_detail(self) -> None:
+        for index, manager in enumerate(
+            (None, _PropertyManager({}, get_names_error=RuntimeError("no names"))), start=1
+        ):
+            with self.subTest(manager=index), TemporaryDirectory() as tmp:
+                kwargs = {"custom_property_manager": None} if manager is None else {"scope_managers": {"": manager}}
+                with self.assertRaises(CadError) as caught:
+                    self._identity_record(Path(tmp), **kwargs)
+                error = caught.exception
+                self.assertEqual(error.code, "cad_property_unreadable")
+                self.assertEqual(error.detail["configuration"], "")
+                self.assertIn("document", error.detail)
+
+    def test_get6_failure_reports_the_property_and_never_uses_get(self) -> None:
+        manager = _PropertyManager({"dp.x": {"value": "v", "error": RuntimeError("get6 failed")}})
+        with TemporaryDirectory() as tmp, self.assertRaises(CadError) as caught:
+            self._identity_record(Path(tmp), scope_managers={"": manager})
+        error = caught.exception
+        self.assertEqual(error.code, "cad_property_unreadable")
+        self.assertEqual(error.detail["property"], "dp.x")
+        self.assertEqual(error.detail["configuration"], "")
+        self.assertEqual(manager.get_calls, [], "the deprecated Get fallback must never be used")
+
+    def test_suppressed_components_skip_property_reads(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            arm_path = _write(root, "arm.SLDPRT")
+            arm_doc = _Doc(arm_path, scope_managers={"": _PropertyManager({"dp.role": "left"})})
+            arm_component = _Component("arm-1", arm_path, doc=arm_doc)
+            ghost_path = _write(root, "ghost.SLDPRT")
+            ghost_doc = _Doc(ghost_path, custom_property_manager=None)
+            ghost_component = _Component("ghost-1", ghost_path, doc=ghost_doc, suppressed=True)
+            assembly = _write(root, "robot.SLDASM")
+            main_doc = _Doc(assembly, children=[arm_component, ghost_component])
+
+            record = _read(root, _App({assembly: main_doc}))
+
+            properties = record["properties"]["components"]
+            self.assertEqual(properties["arm-1"]["dp.role"], "left")
+            self.assertNotIn("ghost-1", properties)
+
+    def test_configuration_conflict_and_unreadable_scope_block(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            arm_path = _write(root, "arm.SLDPRT")
+            conflict_doc = _Doc(
+                arm_path,
+                properties={"dp.role": "left"},
+                configuration_properties={"Right": {"dp.role": "right"}},
+                configuration_children={"Right": []},
+            )
+            component = _Component("arm-1", arm_path, doc=conflict_doc, configuration="Right")
+            assembly = _write(root, "robot.SLDASM")
+            main_doc = _Doc(assembly, children=[component])
+            with self.assertRaises(CadError) as caught:
+                _read(root, _App({assembly: main_doc}))
+            self.assertEqual(caught.exception.code, "cad_property_conflict")
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            arm_path = _write(root, "arm.SLDPRT")
+            unreadable_doc = _Doc(
+                arm_path,
+                properties={"dp.role": "left"},
+                configuration_children={"Right": []},
+                scope_managers={"Right": _PropertyManager({}, get_names_error=RuntimeError("no scope"))},
+            )
+            component = _Component("arm-1", arm_path, doc=unreadable_doc, configuration="Right")
+            assembly = _write(root, "robot.SLDASM")
+            main_doc = _Doc(assembly, children=[component])
+            with self.assertRaises(CadError) as caught:
+                _read(root, _App({assembly: main_doc}))
+            error = caught.exception
+            self.assertEqual(error.code, "cad_property_unreadable")
+            self.assertEqual(error.detail["configuration"], "Right")
 
 
 class EntityGeometryTests(unittest.TestCase):

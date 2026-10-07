@@ -318,6 +318,66 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(payload["frozen_names"].get("arm-1"), "arm_link")
         self.assertTrue(verify_discovery(output)["passed"])
 
+    def test_rigid_accessory_preserves_the_joint_between_solved_bodies(self):
+        def mutate(payload):
+            accessory = copy.deepcopy(payload["components"][0])
+            accessory.update({"name2": "a_mount-1", "instance_id": "a_mount-1"})
+            payload["components"].append(accessory)
+            payload["mates"].append(
+                {
+                    "name": "base_mount_lock",
+                    "type": "lock",
+                    "suppressed": False,
+                    "error_code": 0,
+                    "limits": None,
+                    "entities": [{"component": "base-1"}, {"component": "a_mount-1"}],
+                }
+            )
+
+        result, _source, output = self._prepare(mutate=mutate)
+        self.assertTrue(result.passed, result.findings)
+        document = yaml.safe_load((output / "robot.yaml").read_text(encoding="utf-8"))
+        base = next(body for body in document["source"]["bodies"] if body["name"] == "base_link")
+        self.assertEqual(base["components"], ["a_mount-1", "base-1"])
+        self.assertEqual(document["source"]["joints"][0]["parent"], "base_link")
+        report = verify_discovery(output)
+        self.assertTrue(report["passed"], report["errors"])
+
+    def test_container_datum_requires_solved_rigidity_and_excludes_container_material(self):
+        for connected in (True, False):
+            def mutate(payload, connected=connected):
+                native = self.tmp / f"native{self.serial}" / "cad/sub.SLDASM"
+                native.write_bytes(b"neutral container fixture\n")
+                container = copy.deepcopy(payload["components"][0])
+                container.update({"name2": "sub-1", "instance_id": "sub-1", "document": "cad/sub.SLDASM"})
+                payload["components"].append(container)
+                payload["datums"][0]["owner"] = "sub-1"
+                if connected:
+                    payload["mates"].append(
+                        {
+                            "name": "base_container_lock",
+                            "type": "lock",
+                            "suppressed": False,
+                            "error_code": 0,
+                            "limits": None,
+                            "entities": [{"component": "base-1"}, {"component": "sub-1"}],
+                        }
+                    )
+
+            with self.subTest(connected=connected):
+                result, _source, output = self._prepare(mutate=mutate)
+                if not connected:
+                    self.assertIn("discovery.root_missing", self._codes(result))
+                    self.assertFalse((output / "robot.yaml").exists())
+                    continue
+                self.assertTrue(result.passed, result.findings)
+                document = yaml.safe_load((output / "robot.yaml").read_text(encoding="utf-8"))
+                base = next(body for body in document["source"]["bodies"] if body["name"] == "base_link")
+                self.assertEqual(base["components"], ["base-1"])
+                self.assertEqual(base["frame"]["coordinate_system"], "CS_base_link")
+                report = verify_discovery(output)
+                self.assertTrue(report["passed"], report["errors"])
+
     # ----------------------------------------------------------------- blocking
 
     def test_missing_identity_blocks_the_package(self):
@@ -383,6 +443,18 @@ class DiscoveryTests(unittest.TestCase):
             mutate=lambda payload: payload["properties"]["document"].pop("dp.design_budget_record")
         )
         self.assertIn("discovery.design_budget_missing", self._codes(result))
+
+    def test_nonfinite_controlled_budget_retains_serializable_blocking_findings(self):
+        def mutate(_payload):
+            (self.tmp / "records/budget.json").write_text(
+                '{"robot":{"expected_mass_kg":[0.28,1e999],"expected_extent_m":[0.35,0.5]}}', encoding="utf-8"
+            )
+
+        result, _source, output = self._prepare(mutate=mutate)
+        self.assertIn("discovery.record_unreadable", self._codes(result))
+        self.assertFalse((output / "robot.yaml").exists())
+        payload = json.loads((output / "discovery/findings.json").read_text(encoding="utf-8"))
+        json.dumps(payload, allow_nan=False)
 
     def test_off_origin_rotated_hinge_reconstructs_the_axis(self):
         """A hinge whose shaft is off-origin and whose child is rotated."""
@@ -683,8 +755,10 @@ class DiscoveryTests(unittest.TestCase):
             values["limits"]["lower"] = float("nan")
             path.write_text(json.dumps(values), encoding="utf-8")
 
-        result, _source, _output = self._prepare(mutate=mutate)
-        self.assertIn("discovery.joint_limits_invalid", self._codes(result))
+        result, _source, output = self._prepare(mutate=mutate)
+        self.assertIn("discovery.record_unreadable", self._codes(result))
+        self.assertFalse((output / "robot.yaml").exists())
+        json.dumps(list(result.findings), allow_nan=False)
 
     def test_frozen_names_do_not_mask_a_native_datum_rename_after_resealing(self):
         settings = DiscoverySettings(record_roots=(self._native()[1],), frozen_names={"arm-1": "arm_link"})

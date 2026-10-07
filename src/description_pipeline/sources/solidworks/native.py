@@ -432,31 +432,43 @@ def _merge_property_scopes(document: dict, configuration: dict) -> dict:
 
 
 def _read_property_scope(doc, scope: str) -> dict:
-    values: dict = {}
+    detail = {"configuration": scope}
     try:
+        detail["document"] = _member(doc, "GetPathName")
         manager = _member(_member(doc, "Extension"), "CustomPropertyManager", scope)
-    except Exception:  # noqa: BLE001 - a missing manager is an empty namespace
-        return values
-    if manager is None:
-        return values
-    try:
-        names = [str(item) for item in (_as_list(_member(manager, "GetNames")) or [])]
-    except Exception:  # noqa: BLE001
-        return values
+        if manager is None:
+            raise ValueError("the custom property manager is unavailable")
+        names = _as_list(_method(manager, "GetNames"))
+        if any(not _is_text_name(name) for name in names):
+            raise ValueError("custom property names are not nonempty strings")
+    except Exception as error:
+        raise CadError(
+            "cad_property_unreadable", "custom properties could not be enumerated", {**detail, "error": str(error)}
+        ) from error
+    values: dict = {}
     for name in names:
-        text_value = None
-        for probe in ("Get6", "Get"):
-            try:
-                raw = _member(manager, probe, name, "", False) if probe == "Get6" else _member(manager, probe, name)
-            except Exception:  # noqa: BLE001
-                raw = None
-            if isinstance(raw, (list, tuple)) and raw:
-                raw = raw[0]
-            if _is_text_name(raw):
-                text_value = str(raw)
-                break
-        if text_value is not None:
-            values.setdefault(name, text_value)
+        try:
+            import pythoncom
+
+            variant = _win32().VARIANT
+            raw = variant(pythoncom.VT_BYREF | pythoncom.VT_BSTR, "")
+            resolved = variant(pythoncom.VT_BYREF | pythoncom.VT_BSTR, "")
+            was_resolved = variant(pythoncom.VT_BYREF | pythoncom.VT_BOOL, False)
+            linked = variant(pythoncom.VT_BYREF | pythoncom.VT_BOOL, False)
+            status = _method(manager, "Get6", name, False, raw, resolved, was_resolved, linked)
+            if type(status) is not int or status != 2:
+                raise ValueError(f"Get6 did not return a resolved value (status {status!r})")
+            if was_resolved.value is not True or type(linked.value) is not bool:
+                raise ValueError("Get6 did not confirm a resolved property and readable link state")
+            if not isinstance(raw.value, str) or not isinstance(resolved.value, str):
+                raise ValueError("Get6 returned a non-string property value")
+            values[name] = resolved.value
+        except Exception as error:
+            raise CadError(
+                "cad_property_unreadable",
+                "a custom property could not be resolved",
+                {**detail, "property": name, "error": str(error)},
+            ) from error
     return values
 
 
@@ -1424,6 +1436,37 @@ class SolidWorksBackend(CadBackend):
         root = _member(config, "GetRootComponent3", True)
         stack = list(_member(root, "GetChildren") or ())
         components, properties = [], {}
+        requested_datums = set(coordinate_systems)
+        transforms, datum_owners = {}, {}
+
+        def record_datums(document, owner, placement):
+            for datum in _coordinate_system_features(document):
+                if datum not in requested_datums:
+                    continue
+                if datum in transforms:
+                    raise CadError(
+                        "cad_coordinate_system_ambiguous",
+                        "the requested coordinate system belongs to several native occurrences",
+                        {"datum": datum, "owners": [datum_owners[datum], owner]},
+                    )
+                local = self._coordinate_system_transform(document, datum)
+                if placement is None:
+                    matrix = local
+                else:
+                    composed = self._multiply_frames(
+                        [placement[0:4], placement[4:8], placement[8:12], placement[12:16]],
+                        [local[0:4], local[4:8], local[8:12], local[12:16]],
+                    )
+                    matrix = tuple(value for row in composed for value in row)
+                transforms[datum] = matrix
+                datum_owners[datum] = owner
+                self.notes["coordinate_system_owner:" + datum] = {
+                    "component": owner,
+                    "configuration": _active_configuration(document),
+                    "document": _member(document, "GetPathName"),
+                }
+
+        record_datums(doc, "", None)
         while stack:
             comp = _dynamic(stack.pop())
             if _member(comp, "IsSuppressed"):
@@ -1440,12 +1483,10 @@ class SolidWorksBackend(CadBackend):
                 # snapshot could not name what it read.
                 raise CadError("cad_component_not_on_disk", name, {"component": name, "path": path})
             self._record_save_flag(part, path)
-            active = _member(_member(part, "ConfigurationManager"), "ActiveConfiguration")
             referenced = _member(comp, "ReferencedConfiguration")
-            if _member(active, "Name") != referenced:
-                raise CadError(
-                    "cad_configuration_mismatch", name, {"referenced": referenced, "active": _member(active, "Name")}
-                )
+            _select_configuration(part, referenced, name)
+            placement = self._placement(comp)
+            record_datums(part, name, placement)
             # Intermediate assemblies own placements/configurations too. Their
             # saved bytes and in-memory state are part of the source closure.
             self._source_components[name] = (comp, str(referenced))
@@ -1458,7 +1499,7 @@ class SolidWorksBackend(CadBackend):
                 continue
             if _member(part, "GetType") != 1:
                 raise CadError("cad_empty_subassembly", name)
-            components.append(RawComponent(name, path, self._placement(comp), bool(_member(comp, "IsFixed")), "part"))
+            components.append(RawComponent(name, path, placement, bool(_member(comp, "IsFixed")), "part"))
             self._components[name] = comp
             # Solids and sheet bodies are different geometry: record which the
             # part really carries so a sheet-only part is never mistaken for an
@@ -1472,7 +1513,11 @@ class SolidWorksBackend(CadBackend):
             self.notes["mass_property:" + name] = properties[name]["reference"]["used_api"]
         if not components:
             raise CadError("cad_empty_model", "assembly has no resolved solid parts")
-        transforms = {name: self._coordinate_system_transform(doc, name) for name in coordinate_systems}
+        missing_datums = sorted(requested_datums - transforms.keys())
+        if missing_datums:
+            raise CadError(
+                "cad_missing_coordinate_system", "requested native coordinate systems were not found", missing_datums
+            )
         if progress:
             progress(f"read {len(components)} leaf components; saved CAD sources hashed")
         return RawScene(doc_path, components, transforms, properties, dict(self.notes))
@@ -2050,7 +2095,11 @@ class SolidWorksBackend(CadBackend):
                     by_document[path_name] = entry["document"]
                     try:
                         mass_property = _member(_member(doc, "Extension"), "CreateMassProperty2")
-                        if mass_property is not None and not entry["suppressed"]:
+                        if (
+                            mass_property is not None
+                            and not entry["suppressed"]
+                            and not entry["document"].lower().endswith(".sldasm")
+                        ):
                             mass_property.UseSystemUnits = True
                             mass_property.IncludeHiddenBodiesOrComponents = True
                             import pythoncom
@@ -2248,10 +2297,10 @@ class SolidWorksBackend(CadBackend):
             property_buckets = {"document": identity_properties, "components": {}, "mates": {}}
             for entry in components:
                 part = by_component.get(entry["name2"])
-                if part is None:
+                if part is None or entry["suppressed"]:
                     continue
                 document = _member(part, "GetModelDoc2")
-                if document is not None and not entry["suppressed"]:
+                if document is not None:
                     _select_configuration(document, entry["configuration"], entry["name2"])
                 values = _custom_properties(document, entry["configuration"] or None)
                 if values:

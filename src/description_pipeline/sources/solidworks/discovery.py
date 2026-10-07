@@ -451,7 +451,13 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
     basis_y = [0.0, 1.0, 0.0]
     basis_z = [0.0, 0.0, 1.0]
     if kind == "lock":
-        point = point_of(first) or [0.0, 0.0, 0.0]
+        first_frame, second_frame = frame_of(first), frame_of(second)
+        if first_frame is None or second_frame is None:
+            return None
+        # A solved lock removes all six relative freedoms. Its constraint
+        # basis can be expressed at the captured occurrence origin without
+        # inventing a face, shaft or mechanical interface point.
+        point = [first_frame[index][3] for index in range(3)]
         rows = [_translation_row(axis, point) for axis in (basis_x, basis_y, basis_z)]
         rows += [_rotation_row(axis) for axis in (basis_x, basis_y, basis_z)]
         return {"rows": rows, "limits": limits, "axis": None, "point": point, "entity": None}
@@ -778,8 +784,19 @@ def _resolve_record(settings: DiscoverySettings, reference: str, findings: list[
             continue
         try:
             data = read_data(path)
+            json.dumps(data, allow_nan=False)
         except PipelineError as error:
             findings.append(_finding("discovery.record_unreadable", obj, str(error), {"file": relative}))
+            return None
+        except (TypeError, ValueError):
+            findings.append(
+                _finding(
+                    "discovery.record_unreadable",
+                    obj,
+                    "controlled evidence contains a nonfinite or non-JSON value",
+                    {"file": relative},
+                )
+            )
             return None
         node: Any = data
         for part in [piece for piece in key.split(".") if piece]:
@@ -1174,7 +1191,7 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                 "index": group["mates"][0],
                 "mates": [str(item.get("name") or "") for item in mates],
                 "type": joint_type,
-                "components": [left, right],
+                "components": [clusters.of[left], clusters.of[right]],
                 "axis": {
                     "point": [float(value) for value in (group["point"] or [0.0, 0.0, 0.0])],
                     "direction": native_direction,
@@ -1213,7 +1230,14 @@ def _body_records(
     datums = [item for item in record.get("datums") or [] if isinstance(item, dict) and _text(item.get("name"))]
     bodies: list[dict] = []
     for root, members in sorted(clusters.members.items()):
-        anchor = members[0]
+        material = [
+            member
+            for member in members
+            if not str(components[member].get("document") or "").lower().endswith(".sldasm")
+        ]
+        if not material:
+            continue
+        anchor = material[0]
         item = components.get(anchor, {})
         identity = str(item.get("instance_id") or f"{item.get('document') or ''}#{anchor}")
         declared = {
@@ -1326,7 +1350,8 @@ def _body_records(
         bodies.append(
             {
                 "root": root,
-                "components": members,
+                "components": material,
+                "owners": members,
                 "name": name,
                 "source": source,
                 "identity": identity,
@@ -1365,9 +1390,9 @@ def _interface_frames(
 
     body_of_component: dict[str, dict] = {}
     for body in bodies:
-        for component in body["components"]:
+        for component in body["owners"]:
             body_of_component[component] = body
-    link_datums = {(owner, str(body.get("datum"))) for body in bodies for owner in body["components"]}
+    link_datums = {(owner, str(body.get("datum"))) for body in bodies for owner in body["owners"]}
     frames: list[dict] = []
     seen: dict[str, str] = {}
     for datum in record.get("datums") or []:
@@ -1459,7 +1484,7 @@ def _jcs_check(record: dict, joints: list[dict], by_name: dict[str, dict], findi
             )
             continue
         child = by_name.get(str(joint["child"]))
-        if child is not None and str(datum.get("owner") or "") not in child["components"]:
+        if child is not None and str(datum.get("owner") or "") not in child["owners"]:
             findings.append(
                 _finding(
                     "discovery.jcs_owner_mismatch",
@@ -1469,7 +1494,7 @@ def _jcs_check(record: dict, joints: list[dict], by_name: dict[str, dict], findi
                 )
             )
             continue
-        child_datum = _datum(record, child["datum"], child["components"]) if child else None
+        child_datum = _datum(record, child["datum"], child["owners"]) if child else None
         alias = [float(value) for value in datum.get("array") or ()]
         reference = [float(value) for value in (child_datum or {}).get("array") or ()]
         if (
@@ -1716,7 +1741,7 @@ def _frame_checks(joints: list[dict], by_name: dict[str, dict], record: dict, fi
         if "child" not in joint or joint["axis"].get("source") != "mate":
             continue
         body = by_name.get(joint["child"])
-        datum = _datum(record, body["datum"], body["components"]) if body else None
+        datum = _datum(record, body["datum"], body["owners"]) if body else None
         if datum is None:
             continue
         try:
@@ -2047,6 +2072,7 @@ def prepare_native_package(
             {
                 "root": "__unresolved__",
                 "components": [],
+                "owners": [],
                 "name": "base_link",
                 "source": "placeholder",
                 "identity": "assembly",
@@ -2235,7 +2261,7 @@ def _robot_document(
         if "parent" not in joint or "name" not in joint:
             continue
         body = by_name[joint["child"]]
-        datum = _datum(record, body["datum"], body["components"])
+        datum = _datum(record, body["datum"], body["owners"])
         axis = _axis_in_child(joint, datum) if datum is not None else None
         if axis is None:
             raise PipelineError(f"joint {joint['name']!r} has no usable child frame")
