@@ -1,25 +1,57 @@
 # Contributing
 
-Use a dedicated Python 3.12 environment. Install the runtime lock for your OS,
-the builder lock, then the editable package without resolving additional dependencies:
+Tool development uses Python 3.12 and the repository's pinned runtime and build
+dependencies. Run the following from the repository root in a dedicated environment.
+
+## Environment
+
+Linux:
 
 ```sh
+python3.12 -m venv .venv
+. .venv/bin/activate
 python -m pip install -r requirements/linux-py312.lock -r requirements/build-py312.lock
-python -m pip install --no-deps -e .
+python -m pip install --no-deps --no-build-isolation -e .
 ```
 
-On Windows, substitute `requirements/windows-py312.lock`. Run:
+Windows PowerShell:
+
+```powershell
+py -3.12 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements/windows-py312.lock -r requirements/build-py312.lock
+.venv\Scripts\python.exe -m pip install --no-deps --no-build-isolation -e .
+```
+
+The source locks pin versions. Release archives additionally hash the downloaded
+wheels; see [RELEASING.md](RELEASING.md). Airflow uses a separate deployment environment.
+
+## Verification
+
+In the activated Linux environment:
 
 ```sh
-PYTHONPATH=src python -B -m unittest discover -s tests -t .
+python -B -m unittest discover -s tests -t .
 python -m ruff check src tests tools deploy/airflow
 ```
 
-Keep author inputs, raw native evidence, generation and independent verification
-separate. A verifier must not call the generator to obtain its expected answer.
-Add analytic or adversarial regressions for semantic changes; retain native
-rehearsal evidence for COM/API behavior that mocks cannot establish.
+On Windows, use `.venv\Scripts\python.exe` in place of `python` for both commands.
+For changes to Airflow deployment, also follow its
+[isolated smoke-test procedure](deploy/airflow/README.md#deployment-maintenance).
 
-Never commit real robot/CAD data, credentials, workstation state or release
-build outputs to this public repository. Neutral unit fixtures are explicitly
-synthetic; passing them cannot grant native or hardware qualification.
+Keep source inputs, raw native evidence, generation and independent verification
+separate. A verifier must not obtain its expected answer from the generator.
+Semantic changes need analytic or adversarial regressions. COM/API changes need
+actual native rehearsal evidence; mocks cannot establish native behavior.
+
+## Documentation and repository boundaries
+
+Keep examples consistent with command help, schemas and measured behavior.
+Describe target features as requirements until they pass release acceptance.
+The [design](docs/design.md) owns architecture, [operations](docs/operations.md)
+owns the end-to-end workflow, [deployment](docs/deployment.md) owns availability
+and configuration, and [quality](docs/quality.md) owns verification claims.
+
+Do not commit real robot/CAD data, credentials, workstation state or build
+outputs to this public repository. Neutral fixtures are synthetic and cannot
+grant hardware qualification. Tool publication follows the
+[release procedure](RELEASING.md).
