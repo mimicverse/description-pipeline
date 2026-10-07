@@ -1000,7 +1000,55 @@ def inspect_package(path: Path) -> dict[str, Any]:
     checks: dict[str, Any] = {}
     source_mapping: dict[str, Any] | None = None
     if isinstance(data, dict):
-        _unknown_keys(data, {"schema_version", "hardware_id", "source", "checks"}, report, "input.top_keys", "input")
+        _unknown_keys(
+            data,
+            {"schema_version", "hardware_id", "source", "checks", "provenance"},
+            report,
+            "input.top_keys",
+            "input",
+        )
+        provenance = data.get("provenance")
+        if provenance is not None:
+            # Optional marker written by native semantic discovery.  Its presence
+            # binds the package to a discovery record; legacy authored packages
+            # omit it and keep their released behaviour.
+            marker = _as_mapping(provenance, report, "input.provenance_invalid", "provenance")
+            if marker is not None:
+                _unknown_keys(
+                    marker,
+                    {
+                        "generator",
+                        "generator_version",
+                        "contract",
+                        "discovery_sha256",
+                        "native_inventory_sha256",
+                        "run_id",
+                    },
+                    report,
+                    "input.provenance_invalid",
+                    "provenance",
+                )
+                if marker.get("generator") != "native-discovery":
+                    report.error(
+                        "input.provenance_invalid",
+                        "provenance.generator must be 'native-discovery' when present",
+                        {"value": marker.get("generator")},
+                    )
+                for key in ("generator_version", "contract", "run_id"):
+                    if not _is_text(marker.get(key)):
+                        report.error(
+                            "input.provenance_invalid",
+                            f"provenance.{key} must be a non-empty string",
+                            {key: marker.get(key)},
+                        )
+                for key in ("discovery_sha256", "native_inventory_sha256"):
+                    value = marker.get(key)
+                    if not isinstance(value, str) or _SHA_RE.match(value) is None:
+                        report.error(
+                            "input.provenance_invalid",
+                            f"provenance.{key} must be a lowercase 64-hex digest",
+                            {key: value},
+                        )
         if data.get("schema_version") != INPUT_SCHEMA:
             report.error(
                 "input.schema_invalid",
@@ -1107,7 +1155,7 @@ def load_package(path: Path) -> dict[str, Any]:
     if current != {entry["path"]: entry["sha256"] for entry in receipt.get("inventory", [])}:
         raise PipelineError("SolidWorks v1 input package changed during static validation")
     resolved = inspection.get("resolved") or {}
-    return {
+    result = {
         "schema_version": INPUT_SCHEMA,
         "hardware_id": inspection["input"]["hardware_id"],
         "source": resolved.get("source"),
@@ -1115,3 +1163,7 @@ def load_package(path: Path) -> dict[str, Any]:
         "resolved": {key: value for key, value in resolved.items() if key not in {"source", "checks"}},
         "input_receipt": {**receipt, "inventory_verified": True},
     }
+    provenance = inspection["input"].get("provenance")
+    if provenance is not None:
+        result["provenance"] = provenance
+    return result

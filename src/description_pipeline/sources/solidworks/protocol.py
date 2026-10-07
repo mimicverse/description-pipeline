@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from collections.abc import Sequence
+from pathlib import Path
 
 Matrix = tuple[
     float,
@@ -109,4 +110,16 @@ class CadBackend:
         raise NotImplementedError
 
     def verify_sources_unchanged(self) -> dict[str, dict]:
+        raise NotImplementedError
+
+    def discover_native(self, frozen_source: Path, settings: dict) -> dict:
+        """Read the raw native primitives used for CAD-only semantic discovery.
+
+        Returns the ``solidworks-to-urdf.native-discovery/v1`` raw record:
+        identity records, the component graph, mate features with their
+        entities, named datums, user-defined properties, cylinder axes and the
+        per-component mass/material readings, each with the file hashes it was
+        read from.  Implementations fail closed; they never invent facts.
+        """
+
         raise NotImplementedError

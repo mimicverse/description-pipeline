@@ -201,24 +201,11 @@ def document_paths_match(active, requested):
     return bool(a and b and (a == b or ("\\" not in b and a.rsplit("\\", 1)[-1] == b)))
 
 
-def _parallel_axis_terms(mass, com):
-    """Rotational moments, in SolidWorks positive-product notation."""
-    x, y, z = map(float, com)
-    return (
-        mass * (y * y + z * z),
-        mass * (x * x + z * z),
-        mass * (x * x + y * y),
-        mass * x * y,
-        mass * x * z,
-        mass * y * z,
-    )
+def _inertia_from_raw(values, component):
+    """Parse the documented nine-value ``GetMomentOfInertia(0)`` full tensor.
 
-
-def _inertia_from_raw(values, component, mass=None, com=None):
-    """Parse full9; explicitly paired legacy six-value groups are checked.
-
-    Live COM uses only GetMomentOfInertia(0)'s documented nine-value result.
-    Array length never determines an unknown API's reference point or axes.
+    Anything else is rejected: an array length never determines an unknown
+    API's reference point, axes or product convention.
     """
     data = list(map(float, values))
     if not all(math.isfinite(v) for v in data):
@@ -230,23 +217,6 @@ def _inertia_from_raw(values, component, mass=None, com=None):
         if any(abs(data[i] - data[j]) > scale * 1e-10 for i, j in ((1, 3), (2, 6), (5, 7))):
             raise CadError("cad_mass_property_inertia_asymmetric", component)
         return tuple(tuple(data[i : i + 3]) for i in (0, 3, 6)), "full9"
-    if len(data) == 12:
-        if mass is None or com is None or mass <= 0 or not math.isfinite(mass):
-            raise CadError("cad_mass_property_inertia_ambiguous", component)
-        shift = _parallel_axis_terms(mass, com)
-        tolerance = 1e-10 * max(max(map(abs, data)), max(map(abs, shift)), 1e-30)
-        first, second = data[:6], data[6:]
-        candidates = [
-            (a, label)
-            for a, b, label in ((first, second, "com_first"), (second, first, "com_second"))
-            if all(abs(o - c - s) <= tolerance for c, o, s in zip(a, b, shift, strict=True))
-        ]
-        if not candidates or (
-            len(candidates) == 2 and any(abs(a - b) > tolerance for a, b in zip(first, second, strict=True))
-        ):
-            raise CadError("cad_mass_property_inertia_ambiguous", component)
-        (xx, yy, zz, xy, xz, yz), label = candidates[0]
-        return ((xx, xy, xz), (xy, yy, yz), (xz, yz, zz)), "six6:validated:" + label
     raise CadError("cad_mass_property_inertia_unsupported", component, {"length": len(data)})
 
 

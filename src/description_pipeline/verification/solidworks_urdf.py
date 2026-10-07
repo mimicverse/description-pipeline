@@ -151,6 +151,36 @@ def _native(root, manifest):
     return {"solidworks_revision": revision, "configuration": manifest["identity"]["configuration"]}
 
 
+def _native_discovery(package):
+    """Mandatory native-discovery gate: an authored or stripped package fails.
+
+    Every current v1 delivery carries the generated provenance block and the
+    bound raw discovery record; deleting either must fail before publication,
+    so this gate has no legacy mode.
+    """
+
+    from .native_discovery import verify_discovery
+
+    report = verify_discovery(Path(package))
+    if report.get("passed") is not True:
+        failures = report.get("errors") or [{"code": "discovery.missing", "message": "no native discovery record"}]
+        summary = "; ".join(f"{item.get('code')}: {item.get('message')}" for item in failures[:5])
+        error = PipelineError(f"native discovery verification failed: {summary}")
+        error.details = {
+            "failures": [
+                {"code": item.get("code"), "message": item.get("message"), "detail": item.get("detail")}
+                for item in failures[:8]
+            ]
+        }
+        raise error
+    return {
+        "contract": report.get("contract"),
+        "discovery_sha256": report.get("discovery_sha256"),
+        "bodies": report.get("bodies"),
+        "joints": report.get("joints"),
+    }
+
+
 def _dependencies(root, definition):
     closure = read_data(confined(root / "evidence", "raw/dependency_closure.json"))
     _require(not closure["declared_unresolved"], "Unresolved CAD references")
@@ -462,6 +492,7 @@ def evaluate_bundle(root: Path) -> dict:
     gates = _Gates()
     subject = gates.add("bundle.subject", lambda: {"sha256": subject_digest(root)})
     definition = gates.add("input.valid", lambda: _input(root))
+    gates.add("source.native_discovery", lambda: _native_discovery(root / "input"))
     gates.add("tool.identity", lambda: _tool(root))
     manifest = gates.add("source.integrity", lambda: verify_snapshot(root / "evidence"))
     if manifest is not None:
