@@ -375,6 +375,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn("connection.password == expected_token", health)
         self.assertIn("2??|3??", health)
         self.assertIn("Airflow api-server serves its login entry", health)
+        self.assertIn("non-JSON response", health)
 
     def test_unconfigured_feishu_is_not_ready(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

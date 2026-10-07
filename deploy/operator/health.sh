@@ -157,10 +157,15 @@ context.verify_mode = ssl.CERT_NONE
 url = f"https://127.0.0.1:{sys.argv[1]}/auth/feishu/health"
 try:
     with urllib.request.urlopen(url, timeout=10, context=context) as response:
-        status, body = response.status, json.load(response)
+        status, raw = response.status, response.read()
 except urllib.error.HTTPError as error:
-    status, body = error.code, json.load(error) if error.headers.get_content_type() == "application/json" else {}
+    status, raw = error.code, error.read()
 except Exception:
+    raise SystemExit(1)
+try:
+    body = json.loads(raw or b"{}")
+except ValueError:
+    print(f"HTTP {status} non-JSON response")
     raise SystemExit(1)
 if status == 200 and body.get("configured") is True:
     raise SystemExit(0)
