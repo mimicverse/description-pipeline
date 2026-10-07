@@ -220,9 +220,9 @@ class PortalTests(unittest.TestCase):
         self.endpoint_server.__enter__()
         self.addCleanup(self.endpoint_server.__exit__, None, None, None)
         self.endpoint = WindowsEndpoint(EndpointConfig(base_url=self.endpoint_server.url, token="test-token"))
-        static_dir = Path(__file__).resolve().parents[2] / "src/description_pipeline/orchestration/static"
+        self.static_dir = Path(__file__).resolve().parents[2] / "src/description_pipeline/orchestration/static"
         config = PortalConfig(
-            airflow=AirflowApi(self.airflow.url), endpoint=lambda: self.endpoint, static_dir=static_dir
+            airflow=AirflowApi(self.airflow.url), endpoint=lambda: self.endpoint, static_dir=self.static_dir
         )
         self.server = make_server(
             "127.0.0.1",
@@ -385,6 +385,13 @@ class PortalTests(unittest.TestCase):
         self.assertGreater(len(body), 100000)
         status, _, _ = client.request("GET", "/static/%2e%2e/portal.py")
         self.assertEqual(status, 404)
+        viewer = (self.static_dir / "viewer.js").read_text(encoding="utf-8")
+        self.assertIn('from "/static/vendor/three.module.min.js"', viewer)
+        self.assertIn('querySelector("limit")', viewer)
+        for name in ("index.html", "app.js", "viewer.js", "style.css"):
+            source = (self.static_dir / name).read_text(encoding="utf-8")
+            self.assertNotIn("http://", source)
+            self.assertNotIn("https://", source)
 
     def test_config_file_drives_the_portal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

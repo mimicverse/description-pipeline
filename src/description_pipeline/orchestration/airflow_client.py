@@ -43,12 +43,11 @@ HANDOFF_SCHEMA = "solidworks-to-urdf.handoff/v1"
 NATIVE_RUN_NAMESPACE = "solidworks_to_urdf"
 EVENT_KEYS = ("stage", "state", "at")
 RUN_STATES = {"queued", "running", "passed", "failed"}
-TERMINAL_STATES = {"passed", "failed"}
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _PULL_URL = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/pull/[1-9]\d*\Z")
 _REVIEW_BRANCH = re.compile(r"work/solidworks/[a-z0-9_.-]+\Z")
-_HARDWARE_ID = re.compile(r"[A-Za-z0-9_.-]{1,200}\Z")
+_HARDWARE_ID = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
 SUBMISSION_STATES = {"published", "updated", "noop"}
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
@@ -511,14 +510,9 @@ def resolved_routing(job: dict) -> dict:
     """
     if not isinstance(job, dict):
         raise EndpointProtocolError("job is not a JSON object")
-    receipt = job.get("receipt")
-    if not isinstance(receipt, dict):
-        receipt = {}
     routing = {}
     for field in ("hardware_id", "revision", "repository_slug", "repository_base"):
         value = job.get(field)
-        if value is None:
-            value = receipt.get(field)
         if not isinstance(value, str) or not value.strip() or _CONTROL.search(value):
             raise EndpointProtocolError(f"native job has not resolved {field}")
         routing[field] = value.strip()

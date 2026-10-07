@@ -305,6 +305,9 @@ export async function loadRobot(viewer, { urdfUrl, files, artifactUrl, controls,
     links.get(parent).group.remove(links.get(child).group);
 
     const limit = node.querySelector("limit");
+    if ((type === "revolute" || type === "prismatic") && !limit) {
+      warnings.push(`关节 ${name} 缺少 limit，未生成控制`);
+    }
     const lower = limit ? parseNumber(limit.getAttribute("lower"), 0) : 0;
     const upper = limit ? parseNumber(limit.getAttribute("upper"), 0) : 0;
     const joint = {
@@ -327,7 +330,7 @@ export async function loadRobot(viewer, { urdfUrl, files, artifactUrl, controls,
         this.set(0);
       },
     };
-    if (type !== "fixed") joints.push(joint);
+    if (type === "continuous" || limit) joints.push(joint);
   }
 
   const rootName = [...links.keys()].find(

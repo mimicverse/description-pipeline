@@ -53,6 +53,7 @@ log = logging.getLogger(__name__)
 DEFAULT_DAG_ID = "solidworks_to_urdf"
 DEFAULT_API_ROOT = "/api/v2"
 DEFAULT_SESSION_COOKIE = "solidworks_portal_session"
+_AIRFLOW_TIMEOUT = 20.0
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _RUN_ID = re.compile(r"[A-Za-z0-9_.:-]{1,250}\Z")
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
@@ -198,14 +199,11 @@ class AirflowApi:
     def __init__(
         self,
         base_url: str,
-        *,
-        api_root: str = DEFAULT_API_ROOT,
-        timeout: float = 20.0,
         opener: Callable[..., Any] | None = None,
     ) -> None:
         self.base_url = _validate_http_url(base_url)
-        self.api_root = "/" + api_root.strip("/")
-        self.timeout = float(timeout)
+        self.api_root = DEFAULT_API_ROOT
+        self.timeout = _AIRFLOW_TIMEOUT
         self._opener = opener or urlrequest.urlopen
 
     def _request(self, method: str, path: str, payload: dict | None = None, token: str | None = None) -> dict:
@@ -298,7 +296,6 @@ class PortalConfig:
     session_ttl: float = 12 * 3600.0
     artifact_limit: int = 64 * 1024 * 1024
     preview_ttl: float = 60.0
-    cookie_secure: bool = False
     login_limit: int = 10
     login_window: float = 300.0
     max_body_bytes: int = 64 * 1024
@@ -467,14 +464,6 @@ def _confirmation_summary(job: dict | None) -> dict:
             "message": "工程确认由结构负责人在本版本原生工程中完成，当前接口未上报逐项确认。",
         }
     return {"state": "reported", "items": items}
-
-
-def _job_repository(job: dict) -> tuple[str, str]:
-    """Repository slug and base as bound by the job (top level or its receipt)."""
-    receipt = job.get("receipt") if isinstance(job.get("receipt"), dict) else {}
-    slug = job.get("repository_slug") or receipt.get("repository_slug")
-    base = job.get("repository_base") or receipt.get("repository_base")
-    return str(slug or ""), str(base or "")
 
 
 class PortalApp:
@@ -686,12 +675,11 @@ class PortalApp:
         pr = None
         if isinstance(job, dict):
             result = job.get("result") if isinstance(job.get("result"), dict) else {}
-            slug, base = _job_repository(job)
             try:
                 submission = check_result(
                     result,
-                    expected_slug=slug,
-                    expected_base=base,
+                    expected_slug=str(job.get("repository_slug") or ""),
+                    expected_base=str(job.get("repository_base") or ""),
                 )["submission"]
                 pr = {
                     "url": submission["url"],
@@ -877,7 +865,7 @@ def _is_loopback_request(environ: dict) -> bool:
 
 
 def _session_cookie(value: str, environ: dict, config: PortalConfig, *, clear: bool = False) -> str:
-    secure = config.cookie_secure or _request_is_secure(environ)
+    secure = _request_is_secure(environ)
     if not secure and not _is_loopback_request(environ):
         secure = True  # never hand an insecure session cookie to a remote client
     parts = [
@@ -934,13 +922,13 @@ class _QuietHandler(WSGIRequestHandler):
         log.debug("%s - %s", self.address_string(), format % args)
 
 
-def serve(config: PortalConfig, *, host: str | None = None, port: int | None = None) -> None:
+def serve(config: PortalConfig) -> None:
     """Serve the portal until interrupted (deployment owns the reverse proxy and TLS)."""
-    host = host or config.host
-    port = config.port if port is None else port
     app = PortalApp(config)
-    with make_server(host, port, app, server_class=_ThreadingWSGIServer, handler_class=_QuietHandler) as server:
-        log.info("operator portal listening on http://%s:%s", host, server.server_address[1])
+    with make_server(
+        config.host, config.port, app, server_class=_ThreadingWSGIServer, handler_class=_QuietHandler
+    ) as server:
+        log.info("operator portal listening on http://%s:%s", config.host, server.server_address[1])
         server.serve_forever()
 
 

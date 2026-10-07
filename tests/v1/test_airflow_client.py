@@ -362,6 +362,14 @@ class ClientTests(unittest.TestCase):
             server.jobs[RUN_ID]["hardware_id"] = "m3.0 左"
             with self.assertRaises(EndpointProtocolError):
                 resolved_routing(server.jobs[RUN_ID])
+            server.jobs[RUN_ID]["hardware_id"] = "9m3"
+            with self.assertRaises(EndpointProtocolError):
+                resolved_routing(server.jobs[RUN_ID])
+            server.jobs[RUN_ID]["hardware_id"] = "A" * 65
+            with self.assertRaises(EndpointProtocolError):
+                resolved_routing(server.jobs[RUN_ID])
+            server.jobs[RUN_ID]["hardware_id"] = "M3.0"
+            self.assertEqual(resolved_routing(server.jobs[RUN_ID])["hardware_id"], "M3.0")
 
     def test_read_artifact_verifies_digest_and_limit(self) -> None:
         urdf = b"<robot name='fixture'/>"
