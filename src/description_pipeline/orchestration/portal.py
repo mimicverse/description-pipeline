@@ -250,10 +250,12 @@ class AirflowApi:
         return self._request("GET", f"{self.api_root}/dags/{urlparse.quote(dag_id)}", token=token)
 
     def trigger_dag_run(self, token: str, dag_id: str, dag_run_id: str, conf: dict) -> dict:
+        # Airflow 3.3.2's TriggerDAGRunPostBody requires ``logical_date`` to be present (nullable);
+        # this workflow is schedule=None, so the run intentionally carries no logical date.
         return self._request(
             "POST",
             f"{self.api_root}/dags/{urlparse.quote(dag_id)}/dagRuns",
-            {"dag_run_id": dag_run_id, "conf": conf},
+            {"dag_run_id": dag_run_id, "logical_date": None, "conf": conf},
             token=token,
         )
 

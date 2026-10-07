@@ -349,7 +349,9 @@ class FeishuAuthManager(BaseAuthManager[FeishuUser]):
             return False
         if method == "GET":
             return True
-        # Triggering the one workflow creates its DagRun; all other writes stay admin-only.
+        # Every read of this one DAG is allowed, and so is the DagAccessEntity.RUN write path the
+        # pinned REST uses for both manual triggers and backfill creation of this DAG; every other
+        # write stays admin-only.
         return method == "POST" and access_entity in (None, DagAccessEntity.RUN)
 
     def is_authorized_configuration(

@@ -47,6 +47,7 @@ class MockAirflow:
     def __init__(self) -> None:
         self.dag_runs: dict[str, dict] = {}
         self.conf: dict | None = None
+        self.trigger_payloads: list[dict] = []
         self.hits = 0
         self.revoked = False
         self.deny_runs = False
@@ -82,6 +83,15 @@ class MockAirflow:
                     return
                 if self.path == "/api/v2/dags/solidworks_to_urdf/dagRuns":
                     payload = json.loads(body or b"{}")
+                    outer.trigger_payloads.append(payload)
+                    if "logical_date" not in payload:
+                        # Airflow 3.3.2 TriggerDAGRunPostBody requires this nullable key; the mock
+                        # mirrors the strict model so a body-only regression cannot pass here.
+                        self._reply(
+                            422,
+                            {"detail": [{"type": "missing", "loc": ["body", "logical_date"], "msg": "Field required"}]},
+                        )
+                        return
                     dag_run_id = payload.get("dag_run_id")
                     outer.conf = payload.get("conf")
                     outer.dag_runs[dag_run_id] = {
@@ -373,6 +383,10 @@ class PortalTests(unittest.TestCase):
         dag_run_id = json.loads(body)["dag_run_id"]
         self.assertTrue(dag_run_id.startswith("portal-"))
         self.assertEqual(self.airflow.conf, {"handoff_path": "/srv/robot-cell"})
+        self.assertEqual(
+            self.airflow.trigger_payloads[-1],
+            {"dag_run_id": dag_run_id, "logical_date": None, "conf": {"handoff_path": "/srv/robot-cell"}},
+        )
         status, _, body = self.client.request("GET", "/api/runs")
         self.assertEqual(status, 200)
         listed = json.loads(body)["runs"][0]
