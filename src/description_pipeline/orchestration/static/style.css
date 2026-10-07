@@ -47,7 +47,7 @@ main { max-width: 1080px; margin: 22px auto 60px; padding: 0 18px; display: grid
 
 label { display: block; font-weight: 600; margin: 10px 0 4px; }
 
-input[type="text"], input[type="password"], input:not([type]) {
+input[type="text"], input:not([type]) {
   width: 100%;
   padding: 9px 10px;
   border: 1px solid var(--line);
