@@ -358,7 +358,9 @@ class Jobs:
     def _event(self, identifier, event):
         with self.mutex:
             job = self.jobs[identifier]
-            job["events"].append(dict(event))
+            entry = dict(event)
+            entry.setdefault("at", datetime.now(UTC).isoformat())
+            job["events"].append(entry)
             self._save(job)
 
     def _prepare_native(self, identifier, frozen):

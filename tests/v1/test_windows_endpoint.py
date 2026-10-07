@@ -11,15 +11,59 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from datetime import datetime
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 from description_pipeline.io import PipelineError, write_json
+from description_pipeline.orchestration.airflow_client import EndpointConfig, HandoffResolution, WindowsEndpoint
 from description_pipeline.orchestration.windows import Jobs, RequestError, handler, read_config
 from .endpoint_support import EndpointFixture
 
 
 class EndpointTests(EndpointFixture, unittest.TestCase):
+    def test_airflow_client_can_poll_native_discovery_and_completed_events(self):
+        preparing, release = threading.Event(), threading.Event()
+        captured = {"stage": "capture", "state": "completed", "at": "2026-01-01T00:00:00+00:00"}
+
+        def prepare(*args, **kwargs):
+            preparing.set()
+            if not release.wait(5):
+                raise RuntimeError("Discovery control was not released")
+            return self.prepare(*args, **kwargs)
+
+        def runner(*args, **kwargs):
+            kwargs["on_event"](captured)
+            return self.passing_result()
+
+        jobs = self.jobs(runner, preparer=prepare)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler(jobs, self.config["token"]))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(release.set)
+        client = WindowsEndpoint(
+            EndpointConfig(f"http://127.0.0.1:{server.server_port}", self.config["token"], timeout=2)
+        )
+        request = self.request()
+        client.start_job(
+            run_id=request["run_id"],
+            resolution=HandoffResolution(request["package"], request["handoff_sha256"]),
+        )
+        self.assertTrue(preparing.wait(2))
+        try:
+            running = client.get_job(request["run_id"])
+            self.assertEqual("running", running["status"])
+            self.assertEqual(("discover", "running"), (running["events"][0]["stage"], running["events"][0]["state"]))
+            self.assertIsNotNone(datetime.fromisoformat(running["events"][0]["at"]).tzinfo)
+        finally:
+            release.set()
+        jobs.queue.join()
+        completed = client.get_job(request["run_id"])
+        self.assertEqual("passed", completed["status"])
+        self.assertIn(captured, completed["events"])
+        self.assertTrue(all(datetime.fromisoformat(event["at"]).tzinfo is not None for event in completed["events"]))
+
     def test_idempotent_retry_is_bound_to_exact_request_and_survives_restart(self):
         calls = []
 
