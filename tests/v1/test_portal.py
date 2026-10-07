@@ -371,7 +371,11 @@ class PortalTests(unittest.TestCase):
             self.assertTrue(any("cad capture failed" in finding["message"] for finding in payload["findings"]))
             self.assertTrue(any(finding["object"] == "mate:elbow-1" for finding in payload["findings"]))
             self.assertTrue(
-                any(finding.get("evidence", {}).get("route") == "native" for finding in payload["findings"])
+                any(
+                    finding.get("evidence", {}).get("detail", {}).get("route") == "native"
+                    and finding["evidence"]["discovery_sha256"] == "d" * 64
+                    for finding in payload["findings"]
+                )
             )
             status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
             self.assertEqual(status, 409)

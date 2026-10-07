@@ -405,24 +405,40 @@ class PortalRun:
     started_at: float
 
 
+def _discovery_evidence(detail: object, digest: str) -> dict:
+    """One finding's diagnostic payload, always bound to the raw discovery record digest."""
+    evidence: dict = {}
+    if detail not in (None, "", [], {}):
+        evidence["detail"] = detail
+    if digest:
+        evidence["discovery_sha256"] = digest
+    return evidence
+
+
 def _findings(job: dict | None) -> list[dict]:
-    """Native findings with object/message/evidence, exactly as the endpoint persists them."""
+    """Native findings with object/message/evidence, exactly as the endpoint persists them.
+
+    The endpoint's ``discovery.findings`` entries are
+    ``{schema_version, code, object, message, detail, blocking}``; ``detail`` is the diagnostic
+    evidence and ``discovery_sha256`` identifies the raw record it came from.
+    """
     findings: list[dict] = []
     if not isinstance(job, dict):
         return findings
     result = job.get("result") if isinstance(job.get("result"), dict) else {}
     discovery = job.get("discovery") if isinstance(job.get("discovery"), dict) else {}
+    digest = str(discovery.get("discovery_sha256") or "")
     for item in discovery.get("findings") or []:
         if not isinstance(item, dict):
             continue
         findings.append(
             {
-                "id": str(item.get("id") or ""),
+                "id": str(item.get("code") or ""),
                 "severity": "error" if item.get("blocking", True) else "warning",
                 "stage": "discover",
                 "object": str(item.get("object") or ""),
                 "message": str(item.get("message") or "native discovery finding"),
-                "evidence": item.get("evidence") if isinstance(item.get("evidence"), dict) else {},
+                "evidence": _discovery_evidence(item.get("detail"), digest),
             }
         )
     if job.get("error"):
@@ -464,13 +480,14 @@ def _automatic_summary(job: dict | None) -> dict:
         # A verified model stays previewable even when the PR service failed afterwards.
         return {"state": "passed", "job_state": status, "checks": checks}
     if discovery.get("passed") is False:
+        digest = str(discovery.get("discovery_sha256") or "")
         discovery_checks = [
             {
-                "id": str(item.get("id") or ""),
+                "id": str(item.get("code") or ""),
                 "passed": False,
                 "object": str(item.get("object") or ""),
                 "message": str(item.get("message") or ""),
-                "evidence": item.get("evidence") if isinstance(item.get("evidence"), dict) else {},
+                "evidence": _discovery_evidence(item.get("detail"), digest),
             }
             for item in discovery.get("findings") or []
             if isinstance(item, dict) and item.get("blocking", True)
@@ -511,7 +528,7 @@ MECHANICAL_CHECKS = (
 )
 UNSUPPORTED_AUTOMATIC = (
     "干涉与间隙：全行程干涉、碰撞及制造公差验算",
-    "命名契约与稳定身份（第 10 节词表、前缀、配合归组、物料号绑定、名称清单与跨版本改名）",
+    "命名契约的剩余人工项（第 2 节术语与物料号身份绑定、跨版本改名对应关系）",
 )
 
 

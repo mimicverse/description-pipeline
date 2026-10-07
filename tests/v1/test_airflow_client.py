@@ -181,10 +181,11 @@ class MockEndpoint:
                             "passed": False,
                             "findings": [
                                 {
-                                    "id": "discovery.axis_unresolved",
+                                    "schema_version": "native-discovery/finding/v1",
+                                    "code": "discovery.axis_unresolved",
                                     "object": "mate:elbow-1",
                                     "message": "elbow axis cannot be resolved",
-                                    "evidence": {"route": "native"},
+                                    "detail": {"route": "native"},
                                     "blocking": True,
                                 }
                             ],

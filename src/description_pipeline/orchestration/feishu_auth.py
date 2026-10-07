@@ -1,282 +1,405 @@
-"""Thin Feishu OAuth2 SSO for pinned Airflow 3.3.2.
+"""Feishu SSO as the auth manager of the pinned Airflow 3.3.2 environment.
 
-Official Feishu web login: authorize at
-``https://accounts.feishu.cn/open-apis/authen/v1/authorize`` and exchange the code at the current
-v3 token endpoint ``https://accounts.feishu.cn/oauth/v3/token`` with an
-``application/x-www-form-urlencoded`` body (``grant_type=authorization_code``, ``client_id``,
-``client_secret``, ``code``, ``redirect_uri`` and ``code_verifier``). Never mix a Basic header
-with body credentials; Feishu rejects that with error 20070. The v3 response is flat JSON
-(``{"code": 0, "access_token": ..., "expires_in": ..., "token_type": "Bearer", "scope": ...}``);
-the deprecated v2 shape is not accepted as a fallback. The signed-in identity is one explicit
-``open_id`` from ``https://open.feishu.cn/open-apis/authen/v1/user_info`` bound to the configured
-App ID and an allowlisted ``tenant_key``; there is no user_id/union_id fallback and no
-cross-tenant provisioning.
+This module is imported only inside the Linux Airflow runtime (``[core] auth_manager``); the
+toolkit runtime never imports Airflow and keeps its OAuth/PKCE core in
+``description_pipeline.orchestration.feishu_oauth``. One enterprise app signs operators in at
+``/auth/feishu/login``; the callback mints the standard Airflow JWT cookie, so every Airflow
+audit record already carries the operator's real Feishu name.
 
-Single-use state and the PKCE verifier live in a database shared by every api-server worker and
-kept across restarts (the Airflow metadata table in production, a SQLite file in tests). No new
-dependencies are required.
-
-Official references (read 2026-10-07):
-
-* authorize (S256): https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/authen-v1/authorize/get
-* token v3: https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/authentication-management/access-token/get-user-access-token-v3
-* user_info v1: https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/authen-v1/user_info/get
-
-Sign-in reads only ``open_id``, ``tenant_key``, ``name``/``en_name`` and the avatar from the v1
-profile; no sensitive field (user_id, email, mobile, employment) is requested, so this enterprise
-app needs no additional contact-directory permission. The authorize request omits ``scope`` and
-``offline_access`` entirely: it is a sign-in-only app, not a generic OIDC client.
+Authorization is deliberately one workflow wide: every allowlisted-tenant user is an operator who
+may read and trigger ``solidworks_to_urdf`` only, and only the explicit
+``FEISHU_ADMIN_OPEN_IDS`` allowlist grants administrative access. An unconfigured installation
+keeps serving: ``init()`` records the configuration problem and ``/auth/feishu/health`` reports
+``configured: false`` instead of aborting the api-server.
 """
 
 from __future__ import annotations
 
-import base64
-import hmac
-import hashlib
-import json
-import os
+import logging
 import secrets
-import sqlite3
-import stat
 import time
-from dataclasses import dataclass, field
-from pathlib import Path
-from urllib import error as urlerror
-from urllib import parse as urlparse
-from urllib import request as urlrequest
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlencode
 
-FEISHU_AUTHORIZE_BASE = "https://accounts.feishu.cn/open-apis/authen/v1/authorize"
-FEISHU_TOKEN_URL = "https://accounts.feishu.cn/oauth/v3/token"
-FEISHU_USERINFO_URL = "https://open.feishu.cn/open-apis/authen/v1/user_info"
-DEFAULT_STATE_TTL = 300.0
-STATE_COOKIE = "feishu_oauth_state"
+from fastapi import APIRouter, FastAPI, HTTPException, Request, status
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from jwt import InvalidTokenError
+from sqlalchemy import text
+
+from airflow.api_fastapi.app import AUTH_MANAGER_FASTAPI_APP_PREFIX, get_cookie_path
+from airflow.api_fastapi.auth.managers.base_auth_manager import COOKIE_NAME_JWT_TOKEN, BaseAuthManager
+from airflow.api_fastapi.auth.managers.models.base_user import BaseUser
+from airflow.api_fastapi.auth.managers.models.resource_details import DagAccessEntity, DagDetails, TeamDetails
+from airflow.api_fastapi.common.types import MenuItem
+from airflow.api_fastapi.core_api.security import is_safe_url
+from airflow.configuration import conf
+
+from description_pipeline.orchestration.feishu_oauth import (
+    STATE_COOKIE,
+    FeishuAuthError,
+    FeishuConfigError,
+    FeishuIdentity,
+    FeishuSettings,
+    build_authorize_url,
+    exchange_code,
+    fetch_identity,
+    pkce_pair,
+    state_cookie_header,
+    state_cookie_matches,
+    state_digest,
+)
+
+if TYPE_CHECKING:
+    from airflow.api_fastapi.auth.managers.base_auth_manager import ResourceMethod
+    from airflow.api_fastapi.auth.managers.models.resource_details import (
+        AccessView,
+        AssetAliasDetails,
+        AssetDetails,
+        ConfigurationDetails,
+        ConnectionDetails,
+        PoolDetails,
+        VariableDetails,
+    )
+
+log = logging.getLogger(__name__)
+
+#: The one workflow operators may read and trigger.
+ALLOWED_DAG_ID = "solidworks_to_urdf"
+ROLE_ADMIN = "ADMIN"
+ROLE_OPERATOR = "OPERATOR"
+#: How long a sign-in attempt may stay pending between /login and /callback.
+STATE_TTL_SECONDS = 300.0
+STATE_COOKIE_PATH = f"{AUTH_MANAGER_FASTAPI_APP_PREFIX}/feishu"
 
 
-class FeishuConfigError(RuntimeError):
-    """The Feishu SSO settings are missing or unsafe; sign-in must fail closed."""
-
-
-class FeishuAuthError(RuntimeError):
-    """The Feishu authorization or token exchange failed."""
-
-
-def _csv(value: str | None) -> frozenset[str]:
-    return frozenset(item.strip() for item in str(value or "").split(",") if item.strip())
+def _login_page(message: str, status_code: int) -> HTMLResponse:
+    """A fixed, escaped-by-construction sign-in failure page; no request data is interpolated."""
+    body = (
+        "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+        "<title>飞书登录</title></head><body>"
+        "<main style=\"font-family:system-ui;max-width:32rem;margin:15vh auto;line-height:1.7\">"
+        f"<h1 style=\"font-size:1.2rem\">飞书登录未完成</h1><p>{message}</p>"
+        "<p><a href=\"/\">返回操作平台</a></p></main></body></html>"
+    )
+    return HTMLResponse(body, status_code=status_code)
 
 
 @dataclass(frozen=True)
-class FeishuIdentity:
+class FeishuUser(BaseUser):
+    """One signed-in Feishu identity; the role is derived from configuration, never from the token."""
+
     open_id: str
     name: str
     avatar_url: str
     tenant_key: str
 
+    def get_id(self) -> str:
+        return self.open_id
 
-@dataclass(frozen=True)
-class FeishuSettings:
-    app_id: str
-    app_secret: str = field(repr=False)
-    tenant_keys: frozenset[str]
-    redirect_uri: str
-    admin_open_ids: frozenset[str]
-    authorize_base: str = FEISHU_AUTHORIZE_BASE
-    token_url: str = FEISHU_TOKEN_URL
-    userinfo_url: str = FEISHU_USERINFO_URL
-    state_ttl: float = DEFAULT_STATE_TTL
-
-    @classmethod
-    def from_environment(cls, environ: dict | None = None) -> FeishuSettings:
-        env = os.environ if environ is None else environ
-        required = ("FEISHU_APP_SECRET_FILE", "FEISHU_TENANT_KEYS", "FEISHU_REDIRECT_URI")
-        missing = [key for key in required if not env.get(key)]
-        if missing:
-            raise FeishuConfigError(f"Feishu SSO is not configured; missing {', '.join(missing)}")
-        raw_path = Path(str(env["FEISHU_APP_SECRET_FILE"]))
-        path = Path(os.path.abspath(raw_path))
-        if not raw_path.is_absolute() or path.is_symlink():
-            raise FeishuConfigError("Feishu secret file must be an absolute regular, non-symlink path")
-        try:
-            mode = stat.S_IMODE(path.stat().st_mode)
-        except OSError as error:
-            raise FeishuConfigError(f"cannot read Feishu secret file: {error}") from error
-        if not path.is_file() or mode != 0o600:
-            raise FeishuConfigError("Feishu secret file must be a regular file with mode 0600")
-        try:
-            secret = json.loads(path.read_text(encoding="utf-8"))
-        except ValueError as error:
-            raise FeishuConfigError("Feishu secret file is not valid JSON") from error
-        if not isinstance(secret, dict) or set(secret) != {"app_id", "app_secret"}:
-            raise FeishuConfigError('Feishu secret file must be {"app_id", "app_secret"} only')
-        app_id = str(secret["app_id"]).strip()
-        app_secret = str(secret["app_secret"]).strip()
-        if not app_id or not app_secret:
-            raise FeishuConfigError('Feishu secret file needs {"app_id", "app_secret"}')
-        tenant_keys = _csv(env["FEISHU_TENANT_KEYS"])
-        if not tenant_keys:
-            raise FeishuConfigError("FEISHU_TENANT_KEYS must list at least one approved tenant_key")
-        redirect_uri = str(env["FEISHU_REDIRECT_URI"]).strip()
-        if not redirect_uri.startswith("https://"):
-            raise FeishuConfigError("FEISHU_REDIRECT_URI must be an absolute https callback URL")
-        return cls(
-            app_id=app_id,
-            app_secret=app_secret,
-            tenant_keys=tenant_keys,
-            redirect_uri=redirect_uri,
-            admin_open_ids=_csv(env.get("FEISHU_ADMIN_OPEN_IDS")),
-        )
+    def get_name(self) -> str:
+        return self.name
 
 
-def state_cookie_header(state: str) -> str:
-    """Browser-bound OAuth state cookie; the callback must require this exact value."""
-    return f"{STATE_COOKIE}={state}; Path=/; HttpOnly; Secure; SameSite=Lax"
+class MetadataStateStore:
+    """Single-use OAuth state and its PKCE verifier in the Airflow metadata database.
 
+    Every api-server worker and every restart uses this one table on the pinned ``airflow_meta``
+    connection. ``CREATE TABLE IF NOT EXISTS`` is idempotent and needs no migration; consuming a
+    state deletes the row, so a replayed callback can never reuse an authorization code.
+    """
 
-def state_cookie_matches(cookie_value: str | None, state: str) -> bool:
-    return bool(cookie_value) and hmac.compare_digest(str(cookie_value), str(state))
+    def __init__(self, session_factory: Any | None = None) -> None:
+        if session_factory is None:
+            from airflow.settings import Session
 
-
-def _pkce_pair() -> tuple[str, str]:
-    verifier = secrets.token_urlsafe(64)
-    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).rstrip(b"=").decode("ascii")
-    return verifier, challenge
-
-
-def build_authorize_url(settings: FeishuSettings, state: str, challenge: str, *, scope: str | None = None) -> str:
-    query = {
-        "client_id": settings.app_id,
-        "redirect_uri": settings.redirect_uri,
-        "response_type": "code",
-        "state": state,
-        "code_challenge": challenge,
-        "code_challenge_method": "S256",
-    }
-    if scope is not None:
-        query["scope"] = scope
-    query = urlparse.urlencode(query)
-    return f"{settings.authorize_base}?{query}"
-
-
-def _post_form(url: str, payload: dict, *, opener=None) -> dict:
-    request = urlrequest.Request(
-        url,
-        data=urlparse.urlencode(payload).encode("ascii"),
-        method="POST",
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-        },
-    )
-    open_url = opener or urlrequest.urlopen
-    try:
-        with open_url(request, timeout=20.0) as response:
-            data = json.loads(response.read().decode("utf-8") or "{}")
-    except (urlerror.URLError, urlerror.HTTPError, ValueError) as error:
-        raise FeishuAuthError(f"Feishu token request failed: {error}") from error
-    if not isinstance(data, dict):
-        raise FeishuAuthError("Feishu token response is not a JSON object")
-    if data.get("code") != 0:
-        raise FeishuAuthError("Feishu token request was rejected")
-    return data
-
-
-def exchange_code(settings: FeishuSettings, code: str, verifier: str, *, opener=None) -> str:
-    """Exchange the authorization code at the current v3 endpoint; exactly one auth style."""
-    payload = _post_form(
-        settings.token_url,
-        {
-            "grant_type": "authorization_code",
-            "client_id": settings.app_id,
-            "client_secret": settings.app_secret,
-            "code": code,
-            "redirect_uri": settings.redirect_uri,
-            "code_verifier": verifier,
-        },
-        opener=opener,
-    )
-    token = str(payload.get("access_token") or "").strip()
-    expires_in = payload.get("expires_in")
-    token_type = str(payload.get("token_type") or "").strip()
-    if (
-        not token
-        or not isinstance(expires_in, int)
-        or isinstance(expires_in, bool)
-        or expires_in <= 0
-        or token_type.lower() != "bearer"
-    ):
-        raise FeishuAuthError("Feishu token response does not match the pinned v3 shape")
-    return token
-
-
-def fetch_identity(settings: FeishuSettings, access_token: str, *, opener=None) -> FeishuIdentity:
-    request = urlrequest.Request(
-        settings.userinfo_url,
-        method="GET",
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Accept": "application/json",
-            "Content-Type": "application/json; charset=utf-8",
-        },
-    )
-    open_url = opener or urlrequest.urlopen
-    try:
-        with open_url(request, timeout=20.0) as response:
-            payload = json.loads(response.read().decode("utf-8") or "{}")
-    except (urlerror.URLError, urlerror.HTTPError, ValueError) as error:
-        raise FeishuAuthError(f"Feishu profile request failed: {error}") from error
-    body = payload.get("data")
-    if payload.get("code") != 0 or not isinstance(body, dict):
-        raise FeishuAuthError("Feishu profile response does not match the pinned v1 user_info shape")
-    open_id = str(body.get("open_id") or "").strip()
-    tenant_key = str(body.get("tenant_key") or "").strip()
-    if not open_id or not tenant_key:
-        raise FeishuAuthError("Feishu profile must carry one explicit open_id and tenant_key")
-    if tenant_key not in settings.tenant_keys:
-        raise FeishuAuthError("Feishu tenant is not approved for this Airflow deployment")
-    name = str(body.get("name") or body.get("en_name") or open_id).strip()
-    avatar = str(body.get("avatar_url") or body.get("avatar_thumb") or "").strip()
-    return FeishuIdentity(open_id=open_id, name=name, avatar_url=avatar, tenant_key=tenant_key)
-
-
-class StateStore:
-    """Single-use state and PKCE verifier shared by all api-server workers and restarts."""
-
-    def __init__(self, path: str | Path) -> None:
-        self.path = str(path)
-        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as connection:
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute(
-                "CREATE TABLE IF NOT EXISTS feishu_auth_state ("
-                "state_hash TEXT PRIMARY KEY, verifier TEXT NOT NULL, expires_at REAL NOT NULL)"
+            session_factory = Session
+        self._session = session_factory
+        with self._session() as session:
+            session.execute(
+                text(
+                    "CREATE TABLE IF NOT EXISTS feishu_auth_state ("
+                    "state_hash VARCHAR(64) PRIMARY KEY, "
+                    "verifier VARCHAR(128) NOT NULL, "
+                    "next_url VARCHAR(2048), "
+                    "expires_at DOUBLE PRECISION NOT NULL)"
+                )
             )
+            session.commit()
 
-    def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.path, timeout=10.0, isolation_level=None)
-
-    def issue(self, ttl: float) -> tuple[str, str]:
+    def issue(self, ttl: float = STATE_TTL_SECONDS, next_url: str | None = None) -> tuple[str, str]:
         state = secrets.token_urlsafe(32)
-        verifier, challenge = _pkce_pair()
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute("DELETE FROM feishu_auth_state WHERE expires_at < ?", (time.time(),))
-            connection.execute(
-                "INSERT INTO feishu_auth_state (state_hash, verifier, expires_at) VALUES (?, ?, ?)",
-                (hashlib.sha256(state.encode("ascii")).hexdigest(), verifier, time.time() + ttl),
+        verifier, challenge = pkce_pair()
+        now = time.time()
+        with self._session() as session:
+            session.execute(text("DELETE FROM feishu_auth_state WHERE expires_at < :now"), {"now": now})
+            session.execute(
+                text(
+                    "INSERT INTO feishu_auth_state (state_hash, verifier, next_url, expires_at) "
+                    "VALUES (:state_hash, :verifier, :next_url, :expires_at)"
+                ),
+                {
+                    "state_hash": state_digest(state),
+                    "verifier": verifier,
+                    "next_url": next_url,
+                    "expires_at": now + ttl,
+                },
             )
-            connection.execute("COMMIT")
+            session.commit()
         return state, challenge
 
-    def consume(self, state: str) -> str | None:
+    def consume(self, state: str) -> tuple[str, str | None] | None:
         if not isinstance(state, str) or not state:
             return None
-        digest = hashlib.sha256(state.encode("ascii", "replace")).hexdigest()
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT verifier, expires_at FROM feishu_auth_state WHERE state_hash = ?", (digest,)
+        with self._session() as session:
+            row = session.execute(
+                text(
+                    "DELETE FROM feishu_auth_state WHERE state_hash = :state_hash "
+                    "RETURNING verifier, next_url, expires_at"
+                ),
+                {"state_hash": state_digest(state)},
             ).fetchone()
-            connection.execute("DELETE FROM feishu_auth_state WHERE state_hash = ?", (digest,))
-            connection.execute("COMMIT")
-        if row is None or float(row[1]) < time.time():
+            session.commit()
+        if row is None or float(row[2]) < time.time():
             return None
-        return str(row[0])
+        return str(row[0]), (str(row[1]) if row[1] else None)
+
+
+class FeishuAuthManager(BaseAuthManager[FeishuUser]):
+    """Feishu enterprise sign-in, mapped onto the single SolidWorks-to-URDF workflow."""
+
+    def __init__(self) -> None:
+        self.settings: FeishuSettings | None = None
+        self.configuration_problem: str | None = None
+        self._state: MetadataStateStore | None = None
+
+    def init(self) -> None:
+        """Prepare sign-in; a missing enterprise app never aborts the api-server."""
+        super().init()
+        try:
+            settings = FeishuSettings.from_environment()
+        except FeishuConfigError as error:
+            self.settings = None
+            self.configuration_problem = str(error)
+            log.error("Feishu SSO is unavailable and stays fail-closed: %s", error)
+            return
+        self._state = MetadataStateStore()
+        self.settings = settings
+        log.info("Feishu SSO ready for approved tenants: %s", ", ".join(sorted(settings.tenant_keys)))
+
+    # -- identity ---------------------------------------------------------
+
+    def serialize_user(self, user: FeishuUser) -> dict[str, Any]:
+        return {
+            "sub": user.open_id,
+            "name": user.name,
+            "avatar_url": user.avatar_url,
+            "tenant_key": user.tenant_key,
+        }
+
+    def deserialize_user(self, token: dict[str, Any]) -> FeishuUser:
+        settings = self.settings
+        if settings is None:
+            raise ValueError("Feishu SSO is not configured")
+        open_id = str(token.get("sub") or "").strip()
+        tenant_key = str(token.get("tenant_key") or "").strip()
+        if not open_id or not tenant_key:
+            raise ValueError("token carries no Feishu identity")
+        if tenant_key not in settings.tenant_keys:
+            raise ValueError("Feishu tenant is no longer approved")
+        return FeishuUser(
+            open_id=open_id,
+            name=str(token.get("name") or open_id).strip(),
+            avatar_url=str(token.get("avatar_url") or "").strip(),
+            tenant_key=tenant_key,
+        )
+
+    def role_of(self, user: FeishuUser) -> str:
+        """Administration is an explicit open_id allowlist; everyone else is an operator."""
+        settings = self.settings
+        if settings is not None and user.open_id in settings.admin_open_ids:
+            return ROLE_ADMIN
+        return ROLE_OPERATOR
+
+    # -- routes -----------------------------------------------------------
+
+    def get_url_login(self, **kwargs: Any) -> str:
+        url = f"{AUTH_MANAGER_FASTAPI_APP_PREFIX}/feishu/login"
+        if next_url := kwargs.get("next_url"):
+            url += f"?{urlencode({'next': next_url})}"
+        return url
+
+    def get_fastapi_app(self) -> FastAPI:
+        app = FastAPI(title="Feishu SSO", docs_url=None, redoc_url=None, openapi_url=None)
+        router = APIRouter()
+
+        @router.get("/feishu/health")
+        def health() -> JSONResponse:
+            if self.settings is None:
+                return JSONResponse(
+                    {
+                        "configured": False,
+                        "reason": "feishu_sso_unconfigured",
+                        "detail": self.configuration_problem,
+                    },
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
+            return JSONResponse({"configured": True})
+
+        @router.get("/feishu/login")
+        def login(request: Request, next: str | None = None) -> RedirectResponse:
+            if self.settings is None or self._state is None:
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="feishu_sso_unconfigured",
+                )
+            target = next if next and is_safe_url(next, request=request) else None
+            state, challenge = self._state.issue(STATE_TTL_SECONDS, target)
+            response = RedirectResponse(
+                build_authorize_url(self.settings, state, challenge),
+                status_code=status.HTTP_302_FOUND,
+            )
+            response.headers["set-cookie"] = state_cookie_header(state, path=STATE_COOKIE_PATH)
+            return response
+
+        @router.get("/feishu/callback")
+        def callback(
+            request: Request,
+            code: str | None = None,
+            state: str | None = None,
+            error: str | None = None,
+        ) -> Response:
+            if self.settings is None or self._state is None:
+                return _login_page("本部署尚未配置飞书企业应用。", status.HTTP_503_SERVICE_UNAVAILABLE)
+            if error:
+                return _login_page("已取消飞书授权，请重新发起登录。", status.HTTP_400_BAD_REQUEST)
+            if not code or not state or not state_cookie_matches(request.cookies.get(STATE_COOKIE), state):
+                return _login_page("登录状态校验失败，请重新发起飞书登录。", status.HTTP_400_BAD_REQUEST)
+            consumed = self._state.consume(state)
+            if consumed is None:
+                return _login_page("登录状态已过期或已使用，请重新登录。", status.HTTP_400_BAD_REQUEST)
+            verifier, next_url = consumed
+            try:
+                token = exchange_code(self.settings, code, verifier)
+                identity = fetch_identity(self.settings, token)
+            except FeishuAuthError as failure:
+                log.warning("Feishu sign-in refused: %s", failure)
+                return _login_page("飞书登录未通过，请联系管理员核对企业应用配置。", status.HTTP_403_FORBIDDEN)
+            user = self._user(identity)
+            target = (
+                next_url
+                if next_url and is_safe_url(next_url, request=request)
+                else conf.get("api", "base_url", fallback="/")
+            )
+            response = RedirectResponse(target, status_code=status.HTTP_303_SEE_OTHER)
+            response.set_cookie(
+                COOKIE_NAME_JWT_TOKEN,
+                self.generate_jwt(user),
+                path=get_cookie_path(),
+                # The Feishu callback URL is https-only by configuration, so the Airflow
+                # session cookie is always a Secure cookie.
+                secure=True,
+                httponly=True,
+                samesite="lax",
+            )
+            response.delete_cookie(STATE_COOKIE, path=STATE_COOKIE_PATH)
+            return response
+
+        @router.get("/feishu/profile")
+        async def profile(request: Request) -> JSONResponse:
+            token = request.cookies.get(COOKIE_NAME_JWT_TOKEN)
+            if not token:
+                raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="not_signed_in")
+            try:
+                user = await self.get_user_from_token(token)
+            except InvalidTokenError as error:
+                raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="invalid_session") from error
+            return JSONResponse(
+                {
+                    "open_id": user.open_id,
+                    "name": user.name,
+                    "avatar_url": user.avatar_url,
+                    "tenant_key": user.tenant_key,
+                    "role": self.role_of(user),
+                }
+            )
+
+        app.include_router(router)
+        return app
+
+    def _user(self, identity: FeishuIdentity) -> FeishuUser:
+        return FeishuUser(
+            open_id=identity.open_id,
+            name=identity.name,
+            avatar_url=identity.avatar_url,
+            tenant_key=identity.tenant_key,
+        )
+
+    # -- authorization ----------------------------------------------------
+
+    def _is_admin(self, user: FeishuUser) -> bool:
+        return self.role_of(user) == ROLE_ADMIN
+
+    def is_authorized_dag(
+        self,
+        *,
+        method: ResourceMethod,
+        user: FeishuUser,
+        access_entity: DagAccessEntity | None = None,
+        details: DagDetails | None = None,
+    ) -> bool:
+        if self._is_admin(user):
+            return True
+        if details is None or details.id != ALLOWED_DAG_ID:
+            return False
+        if method == "GET":
+            return True
+        # Triggering the one workflow creates its DagRun; all other writes stay admin-only.
+        return method == "POST" and access_entity in (None, DagAccessEntity.RUN)
+
+    def is_authorized_configuration(
+        self, *, method: ResourceMethod, user: FeishuUser, details: ConfigurationDetails | None = None
+    ) -> bool:
+        return self._is_admin(user)
+
+    def is_authorized_connection(
+        self, *, method: ResourceMethod, user: FeishuUser, details: ConnectionDetails | None = None
+    ) -> bool:
+        # The Windows endpoint token lives in the solidworks_windows Connection; operators never see it.
+        return self._is_admin(user)
+
+    def is_authorized_asset(
+        self, *, method: ResourceMethod, user: FeishuUser, details: AssetDetails | None = None
+    ) -> bool:
+        return self._is_admin(user)
+
+    def is_authorized_asset_alias(
+        self, *, method: ResourceMethod, user: FeishuUser, details: AssetAliasDetails | None = None
+    ) -> bool:
+        return self._is_admin(user)
+
+    def is_authorized_pool(
+        self, *, method: ResourceMethod, user: FeishuUser, details: PoolDetails | None = None
+    ) -> bool:
+        return self._is_admin(user)
+
+    def is_authorized_variable(
+        self, *, method: ResourceMethod, user: FeishuUser, details: VariableDetails | None = None
+    ) -> bool:
+        return self._is_admin(user)
+
+    def is_authorized_team(
+        self, *, method: ResourceMethod, user: FeishuUser, details: TeamDetails | None = None
+    ) -> bool:
+        return self._is_admin(user)
+
+    def is_authorized_view(self, *, access_view: AccessView, user: FeishuUser) -> bool:
+        return self._is_admin(user)
+
+    def is_authorized_custom_view(self, *, method: ResourceMethod, resource_name: str, user: FeishuUser) -> bool:
+        return self._is_admin(user)
+
+    def filter_authorized_menu_items(self, menu_items: list[MenuItem], *, user: FeishuUser) -> list[MenuItem]:
+        if self._is_admin(user):
+            return menu_items
+        return [item for item in menu_items if item is MenuItem.DAGS]
