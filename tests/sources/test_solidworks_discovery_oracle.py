@@ -236,6 +236,15 @@ class OracleSemanticsTests(unittest.TestCase):
         record_path.write_text(
             json.dumps(payload, sort_keys=True, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
+        OracleSemanticsTests._seal(package, payload)
+        return package
+
+    @staticmethod
+    def _seal(package: Path, payload: dict | None = None) -> None:
+        """Refresh the two digests the oracle checks after any package edit."""
+        record_path = package / RECORD_FILE
+        if payload is None:
+            payload = json.loads(record_path.read_text(encoding="utf-8"))
         robot_path = package / "robot.yaml"
         robot = yaml.safe_load(robot_path.read_text(encoding="utf-8"))
         robot["provenance"]["discovery_sha256"] = hashlib.sha256(record_path.read_bytes()).hexdigest()
@@ -246,7 +255,6 @@ class OracleSemanticsTests(unittest.TestCase):
             ).encode()
         ).hexdigest()
         robot_path.write_text(yaml.safe_dump(robot, sort_keys=False), encoding="utf-8")
-        return package
 
     def check(self, package: Path) -> tuple[bool, list[dict], dict]:
         report = verify_discovery(package)
@@ -515,6 +523,205 @@ class OracleSemanticsTests(unittest.TestCase):
                 self._native(package, mutate)
                 passed, errors, _checks = self.check(package)
                 self.assertFalse(passed, errors)
+
+    # ------------------------------------------------- assemblies as containers
+
+    @staticmethod
+    def _container(name: str = "sub-1", document: str = "cad/sub.SLDASM") -> dict:
+        return {
+            "name2": name,
+            "instance_id": name,
+            "document": document,
+            "configuration": "Default",
+            "fixed": False,
+            "suppressed": False,
+            "transform": copy.deepcopy(IDENTITY),
+        }
+
+    def test_body_must_not_list_an_assembly_container(self) -> None:
+        """A rigid container cannot become material of the body it is attached to."""
+
+        def mutate(raw, payload):
+            raw["components"].append(self._container())
+            raw["mates"].append(
+                {
+                    "name": "base_to_sub_lock",
+                    "type": "lock",
+                    "suppressed": False,
+                    "error_code": 0,
+                    "scope": "",
+                    "limits": None,
+                    "entities": [
+                        {
+                            "component": "base-1",
+                            "feature": "P1",
+                            "plane": {"point": [0.0, 0.0, 0.0], "normal": [0.0, 0.0, 1.0]},
+                        },
+                        {
+                            "component": "sub-1",
+                            "feature": "P2",
+                            "plane": {"point": [0.0, 0.0, 0.0], "normal": [0.0, 0.0, 1.0]},
+                        },
+                    ],
+                }
+            )
+
+        package = self.baseline()
+        self._native(package, mutate)
+        # Let robot.yaml agree with the mutated mate graph so only the container rule can fail.
+        robot_path = package / "robot.yaml"
+        robot = yaml.safe_load(robot_path.read_text(encoding="utf-8"))
+        for body in robot["source"]["bodies"]:
+            if body["name"] == "base_link":
+                body["components"] = ["base-1", "sub-1"]
+        robot_path.write_text(yaml.safe_dump(robot, sort_keys=False), encoding="utf-8")
+        self._seal(package)
+        passed, errors, _checks = self.check(package)
+        self.assertFalse(passed, errors)
+        self.assertTrue(
+            any(
+                error["code"] == "discovery.bodies" and "assembly container as a material member" in error["message"]
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_container_mass_must_not_duplicate_its_parts(self) -> None:
+        def mutate(raw, payload):
+            raw["components"].append(self._container())
+            leaf = copy.deepcopy(raw["components"][1])
+            leaf.update({"name2": "sub-1/arm-1", "instance_id": "sub-1/arm-1"})
+            raw["components"].append(leaf)
+            raw["masses"].append({"component": "sub-1", "mass_kg": 0.2, "material": None})
+            raw["masses"].append({"component": "sub-1/arm-1", "mass_kg": 0.1, "material": None})
+
+        package = self.baseline()
+        self._native(package, mutate)
+        passed, errors, _checks = self.check(package)
+        self.assertFalse(passed, errors)
+        self.assertTrue(
+            any(
+                error["code"] == "discovery.masses"
+                and "assembly container mass duplicates its material parts" in error["message"]
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_container_mass_alone_is_not_a_duplicate(self) -> None:
+        """The container rule is bounded: it forbids double counting, not container readings."""
+
+        def mutate(raw, payload):
+            raw["components"].append(self._container())
+            raw["masses"].append({"component": "sub-1", "mass_kg": 0.2, "material": None})
+
+        package = self.baseline()
+        self._native(package, mutate)
+        _passed, _errors, checks = self.check(package)
+        self.assertTrue(checks["discovery.masses"]["passed"], checks["discovery.masses"])
+
+    def test_hierarchy_and_fixed_flag_do_not_prove_rigidity(self) -> None:
+        from description_pipeline.verification.native_discovery import _independent_clusters
+
+        raw = native_record()
+        raw["components"].append(self._container())
+        child = copy.deepcopy(raw["components"][1])
+        child.update({"name2": "sub-1/arm-2", "instance_id": "sub-1/arm-2", "fixed": True})
+        raw["components"].append(child)
+        members, _pairs = _independent_clusters(raw)
+        for group in members.values():
+            merged = {"sub-1", "sub-1/arm-2"} <= set(group)
+            self.assertFalse(merged, group)
+
+    def test_container_datum_binds_only_through_a_solved_rigid_cluster(self) -> None:
+        """A flexible sub-assembly's container owns no descendant body frame by path alone."""
+
+        def move_frame_to_container(raw, payload):
+            raw["components"].append(self._container())
+            for datum in raw["datums"]:
+                if datum["name"] == "CS_arm_link":
+                    datum["owner"] = "sub-1"
+
+        def lock_container_to_arm(raw, payload):
+            move_frame_to_container(raw, payload)
+            raw["mates"].append(
+                {
+                    "name": "sub_to_arm_lock",
+                    "type": "lock",
+                    "suppressed": False,
+                    "error_code": 0,
+                    "scope": "",
+                    "limits": None,
+                    "entities": [
+                        {
+                            "component": "arm-1",
+                            "feature": "P1",
+                            "plane": {"point": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0]},
+                        },
+                        {
+                            "component": "sub-1",
+                            "feature": "P2",
+                            "plane": {"point": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0]},
+                        },
+                    ],
+                }
+            )
+
+        from description_pipeline.verification.native_discovery import _cluster_bindings
+
+        flexible = native_record()
+        move_frame_to_container(flexible, {})
+        flexible_bindings, _by_component = _cluster_bindings(flexible)
+        # The container is connected by no rank-6 evidence, so it belongs to no material cluster.
+        self.assertNotIn("sub-1", {name for full in flexible_bindings.values() for name in full})
+
+        rigid = native_record()
+        lock_container_to_arm(rigid, {})
+        rigid_bindings, _by_component = _cluster_bindings(rigid)
+        self.assertIn("sub-1", rigid_bindings[frozenset({"arm-1"})])
+
+        # Negative: the arm body's frame moved to the container while the container is flexible.
+        package = self.baseline()
+        self._native(package, move_frame_to_container)
+        passed, errors, _checks = self.check(package)
+        self.assertFalse(passed, errors)
+        self.assertTrue(
+            any(
+                error["code"] == "discovery.bodies" and "no datum owned uniquely by that body" in error["message"]
+                for error in errors
+            ),
+            errors,
+        )
+
+        # Positive: once the container is rigidly locked to the arm, the same datum binds.
+        package = self.baseline()
+        self._native(package, lock_container_to_arm)
+        passed, errors, _checks = self.check(package)
+        self.assertTrue(passed, errors)
+
+    def test_foreign_same_named_link_datum_stays_an_interface(self) -> None:
+        """Only the exact (owner, name) pair a body uses as its frame is excluded.
+
+        With a name-only exclusion this foreign datum was silently dropped and the package
+        passed; the exact-pair rule surfaces it as an interface, which then blocks on the
+        body-name collision instead of vanishing.
+        """
+
+        def mutate(raw, payload):
+            raw["datums"].append({"name": "CS_arm_link", "owner": "base-1", "array": _translated(0.0, 0.0, 0.2)})
+
+        package = self.baseline()
+        self._native(package, mutate)
+        passed, errors, _checks = self.check(package)
+        self.assertFalse(passed, errors)
+        self.assertTrue(
+            any(
+                error["code"] == "discovery.frames"
+                and ("collides with a body name" in error["message"] or "dropped or invented" in error["message"])
+                for error in errors
+            ),
+            errors,
+        )
 
 
 if __name__ == "__main__":

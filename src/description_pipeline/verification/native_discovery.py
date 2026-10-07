@@ -519,6 +519,45 @@ def _owned_datum(record: dict, name, owners) -> dict | None:
     return candidates[0] if len(candidates) == 1 else None
 
 
+def _components_by_name(record: dict) -> dict[str, dict]:
+    return {
+        str(item.get("name2")): item
+        for item in record.get("components") or []
+        if isinstance(item, dict) and isinstance(item.get("name2"), str)
+    }
+
+
+def _is_container(component: dict | None) -> bool:
+    """An assembly-document occurrence is a container, never a physical member."""
+    if not isinstance(component, dict):
+        return False
+    return str(component.get("document") or "").strip().lower().endswith(".sldasm")
+
+
+def _cluster_bindings(
+    record: dict,
+) -> tuple[dict[frozenset[str], frozenset[str]], dict[str, frozenset[str]]]:
+    """Map each material body to its full rigid cluster, and each bound occurrence to it.
+
+    A container joins a cluster only through the same solved rank-6 evidence as any other
+    occurrence, so a datum owned by a flexible sub-assembly's container never becomes a
+    descendant body's frame merely because the path is nested below it.
+    """
+    by_name = _components_by_name(record)
+    members, _pairs = _independent_clusters(record)
+    by_material: dict[frozenset[str], frozenset[str]] = {}
+    by_component: dict[str, frozenset[str]] = {}
+    for group in members.values():
+        material = frozenset(name for name in group if not _is_container(by_name.get(name)))
+        if not material:
+            continue
+        full = frozenset(group)
+        by_material[material] = full
+        for name in full:
+            by_component[name] = full
+    return by_material, by_component
+
+
 def _frame(values) -> list[list[float]] | None:
     try:
         raw = list(values or ())
@@ -973,11 +1012,27 @@ def verify_discovery(package: Path) -> dict:
     def bodies():
         robot = state["robot"]
         raw = state["payload"]["raw"]
-        members, _pairs = _independent_clusters(raw)
+        by_name = _components_by_name(raw)
         source_bodies = (robot.get("source") or {}).get("bodies")
         _require(isinstance(source_bodies, list) and source_bodies, "discovery.bodies", "robot.yaml declares no bodies")
-        expected = {frozenset(value) for value in members.values()}
-        observed = {frozenset(str(item) for item in (body.get("components") or [])) for body in source_bodies}
+        # A body is a set of physical parts.  Assembly-document occurrences stay in the mate
+        # graph as connectors but are never material members, so a rigid sub-assembly cannot
+        # become a body of its own or double the material of its parts.
+        full_by_material, _by_component = _cluster_bindings(raw)
+        expected = set(full_by_material)
+        observed: set[frozenset[str]] = set()
+        for body in source_bodies:
+            listed = [str(item) for item in (body.get("components") or [])]
+            unknown = sorted(name for name in listed if name not in by_name)
+            _require(not unknown, "discovery.bodies", "a body names an unknown component", {"components": unknown})
+            containers = sorted(name for name in listed if _is_container(by_name.get(name)))
+            _require(
+                not containers,
+                "discovery.bodies",
+                "a body lists an assembly container as a material member",
+                {"body": body.get("name"), "containers": containers},
+            )
+            observed.add(frozenset(listed))
         _require(
             observed == expected,
             "discovery.bodies",
@@ -1003,13 +1058,62 @@ def verify_discovery(package: Path) -> dict:
                 {"body": name},
             )
             _require(
-                _owned_datum(raw, frame["coordinate_system"], body.get("components") or []) is not None,
+                _owned_datum(
+                    raw,
+                    frame["coordinate_system"],
+                    full_by_material.get(frozenset(body.get("components") or []), frozenset()),
+                )
+                is not None,
                 "discovery.bodies",
                 "a body frame names no datum owned uniquely by that body",
                 {"body": name, "datum": frame["coordinate_system"]},
             )
         _require("base_link" in seen, "discovery.bodies", "no base_link body")
         return {"bodies": len(source_bodies)}
+
+    def masses():
+        raw = state["payload"]["raw"]
+        by_name = _components_by_name(raw)
+        entries = raw.get("masses") or []
+        _require(isinstance(entries, list), "discovery.masses", "the mass inventory is not a list")
+        seen: set[str] = set()
+        containers: list[str] = []
+        material: set[str] = set()
+        for entry in entries:
+            _require(isinstance(entry, dict), "discovery.masses", "a mass entry is not an object")
+            component = str(entry.get("component") or "")
+            _require(
+                component in by_name,
+                "discovery.masses",
+                "a mass entry names an unknown component",
+                {"component": component},
+            )
+            _require(
+                component not in seen,
+                "discovery.masses",
+                "a component appears twice in the mass inventory",
+                {"component": component},
+            )
+            seen.add(component)
+            _require(
+                _finite_limit(entry.get("mass_kg")) and float(entry["mass_kg"]) > 0,
+                "discovery.masses",
+                "a recorded component mass is not finite and positive",
+                {"component": component},
+            )
+            if _is_container(by_name[component]):
+                containers.append(component)
+            else:
+                material.add(component)
+        for container in containers:
+            duplicated = sorted(name for name in material if name.startswith(container + "/"))
+            _require(
+                not duplicated,
+                "discovery.masses",
+                "an assembly container mass duplicates its material parts",
+                {"container": container, "parts": duplicated[:8]},
+            )
+        return {"components": len(seen), "containers": len(containers)}
 
     def names():
         robot = state["robot"]
@@ -1020,11 +1124,12 @@ def verify_discovery(package: Path) -> dict:
         source = robot.get("source") or {}
         bodies = source.get("bodies") or []
         joints = source.get("joints") or []
-        members, pairs = _independent_clusters(raw)
+        _members, pairs = _independent_clusters(raw)
+        material_clusters, _by_component = _cluster_bindings(raw)
         components = {str(item.get("name2")): item for item in raw.get("components") or [] if isinstance(item, dict)}
         datums = [item for item in raw.get("datums") or [] if isinstance(item, dict)]
         identities: dict[str, str] = {}
-        for group in members.values():
+        for group, full in sorted(material_clusters.items()):
             body = next(
                 (item for item in bodies if {str(value) for value in (item.get("components") or [])} == set(group)),
                 None,
@@ -1033,7 +1138,7 @@ def verify_discovery(package: Path) -> dict:
             name = str(body.get("name"))
             datum_name = str((body.get("frame") or {}).get("coordinate_system"))
             owned = [
-                item for item in datums if str(item.get("owner") or "") in group and str(item.get("name")) == datum_name
+                item for item in datums if str(item.get("owner") or "") in full and str(item.get("name")) == datum_name
             ]
             _require(
                 owned,
@@ -1047,8 +1152,9 @@ def verify_discovery(package: Path) -> dict:
                 "a frozen name must still match its native CS_<link> datum",
                 {"body": name, "datum": datum_name},
             )
-            item = components.get(group[0], {})
-            identity = str(item.get("instance_id") or f"{item.get('document') or ''}#{group[0]}")
+            first = sorted(group)[0]
+            item = components.get(first, {})
+            identity = str(item.get("instance_id") or f"{item.get('document') or ''}#{first}")
             identities[identity] = name
             if identity in frozen:
                 _require(
@@ -1065,10 +1171,10 @@ def verify_discovery(package: Path) -> dict:
                     {"body": name, "datum": datum_name},
                 )
                 components_properties = (raw.get("properties") or {}).get("components") or {}
-                explicit = {(components_properties.get(component) or {}).get("dp.body_datum") for component in group}
+                explicit = {(components_properties.get(component) or {}).get("dp.body_datum") for component in full}
                 if datum_name in explicit:
                     _require(
-                        _owned_datum(raw, datum_name, group) is not None,
+                        _owned_datum(raw, datum_name, full) is not None,
                         "discovery.names",
                         "body_datum names a datum no component of this body owns uniquely",
                         {"body": name, "datum": datum_name},
@@ -1139,10 +1245,21 @@ def verify_discovery(package: Path) -> dict:
             frozenset(str(value) for value in (body.get("components") or [])): body
             for body in source.get("bodies") or []
         }
+        by_material, _by_component = _cluster_bindings(raw)
         component_body: dict[str, str] = {}
-        for components, body in bodies.items():
-            for component in components:
-                component_body[component] = str(body.get("name"))
+        cluster_of_body: dict[str, frozenset[str]] = {}
+        for material, full in by_material.items():
+            body = bodies.get(material)
+            _require(
+                body is not None,
+                "discovery.joints",
+                "a rigid body has no robot.yaml body",
+                {"components": sorted(material)},
+            )
+            name = str(body.get("name"))
+            cluster_of_body[name] = full
+            for component in full:
+                component_body[component] = name
         _members, pairs = _independent_clusters(raw)
         raw_mates = raw.get("mates") or []
         seen: set[frozenset] = set()
@@ -1252,7 +1369,11 @@ def verify_discovery(package: Path) -> dict:
                     {"joint": joint.get("name"), "offset_m": offset},
                 )
             child = next(body for body in source["bodies"] if str(body.get("name")) == str(joint.get("child")))
-            child_datum = _owned_datum(raw, child["frame"]["coordinate_system"], child.get("components") or [])
+            child_datum = _owned_datum(
+                raw,
+                child["frame"]["coordinate_system"],
+                cluster_of_body.get(str(child.get("name")), frozenset()),
+            )
             _require(
                 child_datum is not None,
                 "discovery.joints",
@@ -1457,22 +1578,34 @@ def verify_discovery(package: Path) -> dict:
         raw = payload["raw"]
         source = robot.get("source") or {}
         bodies = source.get("bodies") or []
+        by_material, _by_component = _cluster_bindings(raw)
         component_body: dict[str, str] = {}
-        link_datums: set[str] = set()
+        link_datums: set[tuple[str, str]] = set()
         body_of: dict[str, dict] = {}
+        cluster_of_body: dict[str, frozenset[str]] = {}
         for body in bodies:
-            body_of[str(body.get("name"))] = body
-            link_datums.add(str((body.get("frame") or {}).get("coordinate_system")))
-            for component in body.get("components") or []:
-                component_body[str(component)] = str(body.get("name"))
+            name = str(body.get("name"))
+            body_of[name] = body
+            material = frozenset(str(value) for value in (body.get("components") or []))
+            full = by_material.get(material, material)
+            cluster_of_body[name] = full
+            for component in full:
+                component_body[component] = name
+        for body in bodies:
+            frame_name = str((body.get("frame") or {}).get("coordinate_system") or "")
+            frame_datum = _owned_datum(raw, frame_name, cluster_of_body.get(str(body.get("name")), frozenset()))
+            if frame_datum is not None:
+                link_datums.add((str(frame_datum.get("owner") or ""), str(frame_datum.get("name") or "")))
         expected: dict[str, tuple[str, str]] = {}
         for datum in raw.get("datums") or []:
             if not isinstance(datum, dict):
                 continue
             name = str(datum.get("name") or "")
-            if not name.startswith(INTERFACE_PREFIXES) or name in link_datums:
-                continue
             owner = str(datum.get("owner") or "")
+            # Only the exact (owner, name) pair a body uses as its frame is a link datum: a
+            # foreign datum that merely shares the name stays an interface and cannot vanish.
+            if not name.startswith(INTERFACE_PREFIXES) or (owner, name) in link_datums:
+                continue
             body = component_body.get(owner)
             _require(
                 body is not None,
@@ -1530,15 +1663,18 @@ def verify_discovery(package: Path) -> dict:
             child = body_of.get(str(joint.get("child")))
             _require(child is not None, "discovery.frames", "JCS_ joint has no child body", {"datum": name})
             _require(
-                str(datum.get("owner") or "") in {str(value) for value in child.get("components") or []},
+                str(datum.get("owner") or "")
+                in cluster_of_body.get(
+                    str(child.get("name")), frozenset(str(value) for value in child.get("components") or [])
+                ),
                 "discovery.frames",
-                "JCS_ datum is not owned by the child body's components",
+                "JCS_ datum is not owned by the child body's rigid scope",
                 {"datum": name, "owner": datum.get("owner")},
             )
             reference = _owned_datum(
                 raw,
                 (child.get("frame") or {}).get("coordinate_system"),
-                child.get("components") or [],
+                cluster_of_body.get(str(child.get("name")), frozenset()),
             )
             _require(
                 reference is not None,
@@ -1565,6 +1701,7 @@ def verify_discovery(package: Path) -> dict:
         ("discovery.budgets", budgets),
         ("discovery.graph", graph),
         ("discovery.bodies", bodies),
+        ("discovery.masses", masses),
         ("discovery.names", names),
         ("discovery.joints", joints),
         ("discovery.tree", tree),
