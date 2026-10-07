@@ -109,6 +109,34 @@ def _validate_http_url(url: str) -> str:
     return url.rstrip("/")
 
 
+class _SameOriginRedirect(urlrequest.HTTPRedirectHandler):
+    """Never forward the Airflow bearer token across origins."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        try:
+            old = urlparse.urlsplit(req.full_url)
+            new = urlparse.urlsplit(newurl)
+            same_origin = (old.scheme, old.hostname, old.port) == (new.scheme, new.hostname, new.port)
+        except ValueError:
+            same_origin = False
+        if not same_origin:
+            raise urlerror.HTTPError(newurl, code, "cross-origin redirect refused", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_AIRFLOW_OPENER = urlrequest.build_opener(_SameOriginRedirect())
+
+
+def _client_key(environ: dict) -> str:
+    """Rate-limit key: the proxy's client address when the peer is the loopback proxy."""
+    remote = str(environ.get("REMOTE_ADDR") or "unknown")
+    if remote in _LOOPBACK:
+        forwarded = str(environ.get("HTTP_X_REAL_IP") or "").strip()
+        if forwarded and len(forwarded) <= 64 and _CONTROL.search(forwarded) is None:
+            return forwarded
+    return remote
+
+
 @dataclass
 class PortalSession:
     session_id: str
@@ -204,7 +232,7 @@ class AirflowApi:
         self.base_url = _validate_http_url(base_url)
         self.api_root = DEFAULT_API_ROOT
         self.timeout = _AIRFLOW_TIMEOUT
-        self._opener = opener or urlrequest.urlopen
+        self._opener = opener or _AIRFLOW_OPENER.open
 
     def _request(self, method: str, path: str, payload: dict | None = None, token: str | None = None) -> dict:
         data = None if payload is None else json.dumps(payload).encode("utf-8")
@@ -539,7 +567,7 @@ class PortalApp:
         )
 
     def _login(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
-        client = str(environ.get("REMOTE_ADDR") or "unknown")
+        client = _client_key(environ)
         if not self.throttle.allow(client):
             raise PortalError(HTTPStatus.TOO_MANY_REQUESTS, "登录尝试过多，请稍后再试")
         payload = self._body(environ)

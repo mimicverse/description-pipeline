@@ -301,6 +301,12 @@ async function poll() {
     if (run.automatic && run.automatic.state === "passed") {
       await loadPreview(state.dagRunId);
     }
+    const jobDone = run.job && (run.job.status === "passed" || run.job.status === "failed");
+    const verified = run.automatic && run.automatic.state === "passed";
+    if ((run.state === "success" || run.state === "failed") && jobDone && (!verified || state.previewSubject)) {
+      if (state.timer) window.clearInterval(state.timer);
+      state.timer = null;
+    }
   } catch (error) {
     setError($("run-error"), error.message);
   }

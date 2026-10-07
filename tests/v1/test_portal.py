@@ -47,6 +47,7 @@ class MockAirflow:
         self.dag_runs: dict[str, dict] = {}
         self.conf: dict | None = None
         self.tokens: list[str] = []
+        self.hits = 0
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -68,6 +69,7 @@ class MockAirflow:
                 return True
 
             def do_POST(self) -> None:
+                outer.hits += 1
                 length = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(length)
                 if self.path == "/auth/token":
@@ -103,6 +105,7 @@ class MockAirflow:
                 self._reply(404, {"detail": "not found"})
 
             def do_GET(self) -> None:
+                outer.hits += 1
                 if not self._authorized():
                     return
                 if self.path == "/api/v2/dags/solidworks_to_urdf":
@@ -151,6 +154,42 @@ class MockAirflow:
         self.server.server_close()
 
 
+class RedirectAirflow:
+    """Redirect every request to another origin; used to test token-leak protection."""
+
+    def __init__(self, target: str) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args) -> None:
+                return
+
+            def _redirect(self) -> None:
+                self.send_response(302)
+                self.send_header("Location", target + self.path)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def do_GET(self) -> None:
+                self._redirect()
+
+            def do_POST(self) -> None:
+                self._redirect()
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def __enter__(self) -> RedirectAirflow:
+        self.thread.start()
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
 class _ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -168,8 +207,8 @@ class PortalClient:
         self.csrf: str | None = None
         self.login_response = b""
 
-    def request(self, method: str, path: str, payload: dict | None = None):
-        headers = {"Accept": "application/json"}
+    def request(self, method: str, path: str, payload: dict | None = None, headers: dict | None = None):
+        headers = {"Accept": "application/json", **(headers or {})}
         data = None
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")
@@ -388,6 +427,7 @@ class PortalTests(unittest.TestCase):
         viewer = (self.static_dir / "viewer.js").read_text(encoding="utf-8")
         self.assertIn('from "/static/vendor/three.module.min.js"', viewer)
         self.assertIn('querySelector("limit")', viewer)
+        self.assertIn("<!doctype", viewer.lower())
         for name in ("index.html", "app.js", "viewer.js", "style.css"):
             source = (self.static_dir / name).read_text(encoding="utf-8")
             self.assertNotIn("http://", source)
@@ -425,6 +465,39 @@ class PortalTests(unittest.TestCase):
             )
             with self.assertRaises(AirflowApiError):
                 load_portal_config(missing)
+
+    def test_airflow_redirect_never_forwards_credentials(self) -> None:
+        target = MockAirflow()
+        target.__enter__()
+        self.addCleanup(target.__exit__, None, None, None)
+        with RedirectAirflow(target.url) as redirector:
+            with self.assertRaises(AirflowApiError):
+                AirflowApi(redirector.url).login("operator", AIRFLOW_PASSWORD)
+            self.assertEqual(target.hits, 0)
+
+    def test_login_throttle_is_per_proxied_client(self) -> None:
+        for _ in range(10):
+            status, _, _ = self.client.request(
+                "POST",
+                "/api/session",
+                {"username": "operator", "password": "wrong"},
+                headers={"X-Real-IP": "198.51.100.7"},
+            )
+            self.assertEqual(status, 401)
+        status, _, _ = self.client.request(
+            "POST",
+            "/api/session",
+            {"username": "operator", "password": "wrong"},
+            headers={"X-Real-IP": "198.51.100.7"},
+        )
+        self.assertEqual(status, 429)
+        status, _, _ = self.client.request(
+            "POST",
+            "/api/session",
+            {"username": "operator", "password": "wrong"},
+            headers={"X-Real-IP": "198.51.100.8"},
+        )
+        self.assertEqual(status, 401)
 
     def test_entry_point_boots_from_config(self) -> None:
         with socket.socket() as probe:

@@ -261,6 +261,9 @@ export async function loadRobot(viewer, { urdfUrl, files, artifactUrl, controls,
   const response = await fetch(urdfUrl, { credentials: "same-origin" });
   if (!response.ok) throw new Error(`URDF 加载失败（HTTP ${response.status}）`);
   const xml = await response.text();
+  if (/<!doctype/i.test(xml)) {
+    throw new Error("URDF 不允许包含文档类型声明");
+  }
   const document = new DOMParser().parseFromString(xml, "application/xml");
   if (document.querySelector("parsererror")) throw new Error("URDF XML 解析失败");
   const robot = document.querySelector("robot");
