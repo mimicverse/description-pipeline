@@ -1,12 +1,13 @@
 // Operator page logic. All Airflow and Windows endpoint credentials stay on the server; this
 // module only talks to the portal's own JSON API and the digest-verified artifact routes.
-import { buildJointControls, createViewer, loadRobot } from "/static/viewer.js";
+import { buildJointControls, createViewer, disposeRobot, loadRobot } from "/static/viewer.js";
 
 const state = {
   csrf: null,
   user: null,
   dagRunId: null,
   previewSubject: null,
+  previewRequest: null,
   viewer: null,
   controls: null,
   timer: null,
@@ -42,7 +43,7 @@ const AUTOMATIC_STATES = {
 
 const $ = (id) => document.getElementById(id);
 
-async function api(path, { method = "GET", body } = {}) {
+async function api(path, { method = "GET", body, signal } = {}) {
   const headers = { Accept: "application/json" };
   if (body !== undefined) headers["Content-Type"] = "application/json";
   if (state.csrf && method !== "GET") headers["X-CSRF-Token"] = state.csrf;
@@ -50,6 +51,7 @@ async function api(path, { method = "GET", body } = {}) {
     method,
     headers,
     credentials: "same-origin",
+    signal,
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const text = await response.text();
@@ -96,7 +98,20 @@ function showSession(session) {
   $("account-user").textContent = session.user;
 }
 
+function clearPreview() {
+  if (state.previewRequest) state.previewRequest.abort();
+  state.previewRequest = null;
+  state.previewSubject = null;
+  state.controls = null;
+  if (state.viewer) disposeRobot(state.viewer);
+  $("viewer-card").hidden = true;
+  $("preview-meta").textContent = "";
+  $("viewer-note").hidden = true;
+  $("joint-controls").textContent = "";
+}
+
 function clearSession() {
+  clearPreview();
   state.csrf = null;
   state.user = null;
   state.dagRunId = null;
@@ -274,11 +289,14 @@ function renderRun(run) {
 }
 
 async function loadPreview(dagRunId) {
+  if (state.previewRequest) return;
+  const request = new AbortController();
+  state.previewRequest = request;
   const note = $("viewer-note");
   try {
-    const preview = await api(`/api/runs/${encodeURIComponent(dagRunId)}/preview`);
+    const preview = await api(`/api/runs/${encodeURIComponent(dagRunId)}/preview`, { signal: request.signal });
+    if (request.signal.aborted || state.dagRunId !== dagRunId) return;
     if (state.previewSubject === preview.subject_sha256) return;
-    $("viewer-card").hidden = false;
     $("preview-meta").textContent = `交付摘要 ${String(preview.subject_sha256).slice(0, 12)}… · URDF ${preview.urdf}`;
     note.hidden = true;
     if (!state.viewer) state.viewer = createViewer($("viewer"));
@@ -291,6 +309,7 @@ async function loadPreview(dagRunId) {
       urdfUrl: artifactUrl(preview.urdf),
       files: preview.files,
       artifactUrl,
+      signal: request.signal,
       onWarning: (warnings) => {
         if (warnings.length) {
           note.textContent = warnings.join("；");
@@ -298,9 +317,18 @@ async function loadPreview(dagRunId) {
         }
       },
     });
+    if (request.signal.aborted || state.dagRunId !== dagRunId) return;
     state.controls = buildJointControls($("joint-controls"), loaded.joints, {});
     state.previewSubject = preview.subject_sha256;
+    $("viewer-card").hidden = false;
+    state.viewer.frame();
   } catch (error) {
+    if (request.signal.aborted || state.dagRunId !== dagRunId) return;
+    if (state.viewer) disposeRobot(state.viewer);
+    state.controls = null;
+    state.previewSubject = null;
+    $("joint-controls").textContent = "";
+    $("viewer-card").hidden = false;
     if (error.status === 404 || error.status === 409) {
       note.textContent = `尚未提供已验证交付：${error.message}`;
       note.hidden = false;
@@ -308,17 +336,25 @@ async function loadPreview(dagRunId) {
     }
     note.textContent = `交付预览不可用：${error.message}`;
     note.hidden = false;
+  } finally {
+    if (state.previewRequest === request) state.previewRequest = null;
   }
 }
 
 async function poll() {
-  if (!state.dagRunId) return;
+  const dagRunId = state.dagRunId;
+  if (!dagRunId) return;
   try {
-    const run = await api(`/api/runs/${encodeURIComponent(state.dagRunId)}`);
+    const run = await api(`/api/runs/${encodeURIComponent(dagRunId)}`);
+    if (state.dagRunId !== dagRunId) return;
+    setError($("run-error"), "");
     renderRun(run);
     if (run.automatic && run.automatic.state === "passed") {
-      await loadPreview(state.dagRunId);
+      await loadPreview(dagRunId);
+    } else {
+      clearPreview();
     }
+    if (state.dagRunId !== dagRunId) return;
     const jobDone = run.job && (run.job.status === "passed" || run.job.status === "failed");
     const verified = run.automatic && run.automatic.state === "passed";
     if ((run.state === "success" || run.state === "failed") && jobDone && (!verified || state.previewSubject)) {
@@ -326,20 +362,29 @@ async function poll() {
       state.timer = null;
     }
   } catch (error) {
+    if (state.dagRunId !== dagRunId) return;
+    if (error.status === 401) {
+      clearSession();
+      setError($("login-error"), error.message);
+      return;
+    }
+    if (error.status === 403) clearPreview();
     setError($("run-error"), error.message);
   }
 }
 
 async function selectRun(dagRunId) {
+  if (state.timer) window.clearInterval(state.timer);
+  state.timer = null;
+  clearPreview();
   state.dagRunId = dagRunId;
-  state.previewSubject = null;
   $("detail-card").hidden = false;
   await refreshRuns();
-  await poll();
-  if (state.timer) window.clearInterval(state.timer);
+  if (state.dagRunId !== dagRunId) return;
   state.timer = window.setInterval(() => {
     void poll();
   }, 3000);
+  await poll();
 }
 
 function wire() {

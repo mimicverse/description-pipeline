@@ -245,9 +245,9 @@ function resolveMesh(files, filename) {
   return matches.length ? matches[0] : null;
 }
 
-async function loadMesh(viewer, url, cache) {
+async function loadMesh(viewer, url, cache, signal) {
   if (cache.has(url)) return cache.get(url);
-  const pending = fetch(url, { credentials: "same-origin" })
+  const pending = fetch(url, { credentials: "same-origin", signal })
     .then((response) => {
       if (!response.ok) throw new Error(`网格加载失败（HTTP ${response.status}）`);
       return response.arrayBuffer();
@@ -257,10 +257,11 @@ async function loadMesh(viewer, url, cache) {
   return pending;
 }
 
-export async function loadRobot(viewer, { urdfUrl, files, artifactUrl, controls, onWarning }) {
-  const response = await fetch(urdfUrl, { credentials: "same-origin" });
+export async function loadRobot(viewer, { urdfUrl, files, artifactUrl, onWarning, signal }) {
+  const response = await fetch(urdfUrl, { credentials: "same-origin", signal });
   if (!response.ok) throw new Error(`URDF 加载失败（HTTP ${response.status}）`);
   const xml = await response.text();
+  signal?.throwIfAborted();
   if (/<!doctype/i.test(xml)) {
     throw new Error("URDF 不允许包含文档类型声明");
   }
@@ -362,8 +363,10 @@ export async function loadRobot(viewer, { urdfUrl, files, artifactUrl, controls,
           continue;
         }
         try {
-          geometry = (await loadMesh(viewer, artifactUrl(resolved), meshCache)).clone();
+          geometry = (await loadMesh(viewer, artifactUrl(resolved), meshCache, signal)).clone();
+          signal?.throwIfAborted();
         } catch (error) {
+          if (signal?.aborted) throw error;
           warnings.push(`link ${name} 的网格加载失败：${error.message}`);
           continue;
         }

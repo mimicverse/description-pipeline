@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import posixpath
+import re
 import socket
 import subprocess
 import sys
@@ -555,6 +557,25 @@ class PortalTests(unittest.TestCase):
             source = (self.static_dir / name).read_text(encoding="utf-8")
             self.assertNotIn("http://", source)
             self.assertNotIn("https://", source)
+
+    def test_browser_module_dependencies_are_served_locally(self) -> None:
+        """Follow the module graph, including vendored imports needed to boot the page."""
+        pending = ["/static/app.js"]
+        visited = set()
+        while pending:
+            path = pending.pop()
+            if path in visited:
+                continue
+            visited.add(path)
+            status, headers, body = self.client.request("GET", path)
+            self.assertEqual(status, 200, path)
+            self.assertIn("javascript", headers.get("Content-Type", ""), path)
+            source = body.decode("utf-8")
+            for dependency in re.findall(r"\bfrom\s*[\"']([^\"']+)[\"']", source):
+                self.assertTrue(dependency.startswith(("/static/", "./", "../")), dependency)
+                target = posixpath.normpath(posixpath.join(posixpath.dirname(path), dependency))
+                self.assertTrue(target.startswith("/static/"), target)
+                pending.append(target)
 
     def test_config_file_drives_the_portal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -119,7 +119,7 @@ Complete these configuration groups once:
 
 | Settings | Purpose |
 |---|---|
-| `OPERATOR_HOST`, `OPERATOR_HTTPS_PORT`, TLS certificate/key | One operator address and its trusted HTTPS identity |
+| `OPERATOR_HOST`, `OPERATOR_HTTPS_PORT`, `OPERATOR_TLS_CERT`, `OPERATOR_TLS_KEY` | One operator address and its trusted HTTPS identity |
 | `OPERATOR_STATE`, `AIRFLOW_VENV`, `AIRFLOW_HOME`, `POSTGRES_ROOT` | Separate runtime, database and managed state |
 | `PIPELINE_WHEEL`, `AIRFLOW_DB_URL` | Matching release wheel and dedicated PostgreSQL connection |
 | `SOLIDWORKS_SSH_HOST`, `SOLIDWORKS_ENDPOINT_PORT` | Key-authenticated SSH alias to Windows and its loopback endpoint |
@@ -129,6 +129,13 @@ Complete these configuration groups once:
 | `FEISHU_ADMIN_OPEN_IDS` | Explicit administrator identities; optional, no automatic administrator |
 
 Use comma-separated tenant and administrator lists without spaces.
+
+Set `OPERATOR_TLS_CERT` and `OPERATOR_TLS_KEY` to the absolute paths of the
+approved certificate chain and its private key. The certificate must cover
+`OPERATOR_HOST`; the service user must be able to read both files, and the key
+must have mode `0600`. Reinstall and restart the services after replacing either
+file. Leaving both settings empty generates a self-signed certificate for a LAN
+rehearsal; shared use requires browser trust in the approved certificate.
 
 Store the app credentials in the mode-`0600` JSON file named by
 `FEISHU_APP_SECRET_FILE`:
@@ -179,10 +186,14 @@ allowlist. Operators need no Connection or DAG setup.
 Only `install` writes configuration, secrets or service units. Start and health
 check installed configuration for drift. Reinstall after a configuration change;
 existing signing and encryption keys are preserved. For services to survive a
-Linux user logout, the host administrator enables lingering for the service user.
+Linux user logout, the host administrator runs the following command with the
+actual service account:
 
-A generated self-signed certificate supports a LAN rehearsal. Use an approved,
-browser-trusted certificate for the shared operator address. Credentials missing
+```sh
+sudo loginctl enable-linger <service-user>
+```
+
+Credentials missing
 from an installed app must produce an explicit unavailable login, never a
 password fallback or a readiness pass.
 
