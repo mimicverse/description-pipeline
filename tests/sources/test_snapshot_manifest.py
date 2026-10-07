@@ -1,9 +1,4 @@
-"""The snapshot manifest is the integrity boundary every source provider shares.
-
-`verify_snapshot` is what stops a half-copied or edited frozen source from being treated as evidence,
-and coverage showed none of its rejections were executed.  Each one is written here, next to the
-round trip that has to keep working.
-"""
+"""Snapshot integrity rejects incomplete files, changed bytes and unsupported native sources."""
 
 import json
 import tempfile
@@ -74,7 +69,11 @@ class VerifySnapshotTests(unittest.TestCase):
                 "invalid evidence class": ({**complete, "evidence_class": "guess"}, "evidence class is missing"),
                 "cad with a non-native kind": (
                     {**complete, "evidence_class": "cad", "kind": "fixture"},
-                    "CAD evidence requires a supported native source kind",
+                    "CAD evidence requires the native SolidWorks source kind",
+                ),
+                "cad with an unsupported provider": (
+                    {**complete, "evidence_class": "cad", "kind": "onshape"},
+                    "CAD evidence requires the native SolidWorks source kind",
                 ),
                 "missing identity": ({**complete, "identity": {}}, "source identity is missing"),
                 "no declared files": ({**complete, "files": {}}, "no declared files"),
