@@ -68,7 +68,9 @@ original and collected file hashes after capture. A failed rebuild blocks export
 Each occurrence's datums, mass and mesh are read in its exact referenced
 configuration. Shared documents are restored after each read; final checks
 verify both the restored document state and unchanged occurrence references.
-An unreadable selection or failed restoration blocks capture.
+Suppressed datums are excluded. Unreadable suppression state or an unreadable
+active datum blocks discovery and capture; active frames cannot disappear
+silently. An unreadable selection or failed restoration blocks capture.
 
 Captured transforms use the native adapter protocol: SI, row-major 4×4
 homogeneous matrices with column-vector multiplication. The adapter converts

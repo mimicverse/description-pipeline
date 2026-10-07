@@ -620,6 +620,7 @@ def _optional_bool(obj, *names):
 
 
 def _coordinate_system_features(doc):
+    """Active datums only; suppressed features remain in the native tree."""
     names = []
     try:
         feature = _dynamic(_method(doc, "FirstFeature"))
@@ -636,7 +637,18 @@ def _coordinate_system_features(doc):
                 "cad_geometry_unreadable", "a datum feature could not be classified", {"error": str(error)}
             ) from error
         if type_name in ("CoordSys", "CoordinateSystem") and _is_text_name(name):
-            names.append(str(name))
+            try:
+                suppressed = _method(feature, "IsSuppressed")
+                if type(suppressed) is not bool:
+                    raise ValueError("datum suppression state is not a native boolean")
+            except Exception as error:  # noqa: BLE001
+                raise CadError(
+                    "cad_geometry_unreadable",
+                    "datum suppression state could not be read",
+                    {"datum": str(name), "phase": "suppression", "error": str(error)},
+                ) from error
+            if not suppressed:
+                names.append(str(name))
         try:
             feature = _dynamic(_method(feature, "GetNextFeature"))
         except Exception as error:  # noqa: BLE001
@@ -2278,10 +2290,7 @@ class SolidWorksBackend(CadBackend):
             datums = []
             _select_configuration(doc, configuration, "assembly")
             for name in _coordinate_system_features(doc):
-                try:
-                    matrix = [float(value) for value in self._coordinate_system_transform(doc, name)]
-                except Exception:  # noqa: BLE001
-                    continue
+                matrix = [float(value) for value in self._coordinate_system_transform(doc, name)]
                 datums.append({"name": name, "owner": "", "array": matrix, "configuration": configuration})
             for entry in components:
                 part = by_component.get(entry["name2"])
@@ -2292,12 +2301,7 @@ class SolidWorksBackend(CadBackend):
                     continue
                 _select_configuration(document, entry["configuration"], entry["name2"])
                 for name in _coordinate_system_features(document):
-                    try:
-                        values = [float(value) for value in self._coordinate_system_transform(document, name)]
-                    except Exception:  # noqa: BLE001
-                        continue
-                    if len(values) != 16:
-                        continue
+                    values = [float(value) for value in self._coordinate_system_transform(document, name)]
                     local = [values[0:4], values[4:8], values[8:12], values[12:16]]
                     component_matrix = [
                         entry["transform"][0:4],

@@ -577,6 +577,63 @@ class MateRecordTests(unittest.TestCase):
 
 
 class ProducerContextTests(unittest.TestCase):
+    def test_suppressed_datum_with_a_stored_transform_is_not_discovered(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assembly = _write(root, "robot.SLDASM")
+            inactive = _Feature("CS_inactive", "CoordSys", suppressed=True)
+            active = _Feature("CS_active", "CoordSys", next_feature=inactive)
+            doc = _Doc(
+                assembly,
+                first_feature=active,
+                coordinate_systems={
+                    "CS_active": SW_IDENTITY,
+                    "CS_inactive": _sw_translation(1.0, 0.0, 0.0),
+                },
+            )
+
+            record = _read(root, _App({assembly: doc}))
+
+            self.assertEqual([datum["name"] for datum in record["datums"]], ["CS_active"])
+
+    def test_unreadable_or_non_boolean_datum_suppression_blocks(self) -> None:
+        for state in (None, 1, "false", _raiser(RuntimeError("suppression unavailable"))):
+            with self.subTest(state=state), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                assembly = _write(root, "robot.SLDASM")
+                doc = _Doc(
+                    assembly,
+                    first_feature=_Feature("CS_tip", "CoordSys", suppressed=state),
+                    coordinate_systems={"CS_tip": SW_IDENTITY},
+                )
+
+                with self.assertRaises(CadError) as caught:
+                    _read(root, _App({assembly: doc}))
+
+                self.assertEqual(caught.exception.code, "cad_geometry_unreadable")
+                self.assertEqual(caught.exception.detail["datum"], "CS_tip")
+                self.assertEqual(caught.exception.detail["phase"], "suppression")
+
+    def test_active_datum_without_a_transform_blocks_discovery(self) -> None:
+        for scope in ("assembly", "component"):
+            with self.subTest(scope=scope), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                assembly = _write(root, "robot.SLDASM")
+                datum = _Feature("CS_tip", "CoordSys")
+                if scope == "component":
+                    part = _write(root, "arm.SLDPRT")
+                    part_doc = _Doc(part, first_feature=datum)
+                    component = _Component("arm-1", part, doc=part_doc)
+                    doc = _Doc(assembly, children=[component])
+                else:
+                    doc = _Doc(assembly, first_feature=datum)
+
+                with self.assertRaises(CadError) as caught:
+                    _read(root, _App({assembly: doc}))
+
+                self.assertEqual(caught.exception.code, "cad_missing_coordinate_system")
+                self.assertIn("CS_tip", f"{caught.exception.message} {caught.exception.detail}")
+
     def test_nested_component_datum_composes_every_parent_occurrence_offset(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -910,14 +967,21 @@ class CaptureSceneTests(unittest.TestCase):
                 arm_path,
                 configuration="Left",
                 configuration_children={"Left": [], "Right": []},
-                configuration_features={
-                    "Left": _Feature("CS_left", "CoordSys"),
-                    "Right": _Feature("CS_right", "CoordSys"),
-                },
                 coordinate_systems={
                     "CS_left": _sw_translation(0.5, 0.0, 0.0),
                     "CS_right": _sw_translation(0.0, 0.5, 0.0),
                 },
+            )
+            # SolidWorks retains suppressed features in the tree, and a stored
+            # transform can remain readable. Selection must use suppression.
+            right_datum = _Feature(
+                "CS_right", "CoordSys", suppressed=lambda: arm_doc.active_configuration != "Right"
+            )
+            arm_doc._first_feature = _Feature(
+                "CS_left",
+                "CoordSys",
+                suppressed=lambda: arm_doc.active_configuration != "Left",
+                next_feature=right_datum,
             )
             left = _Component(
                 "arm-left", arm_path, doc=arm_doc, configuration="Left", transform=_sw_translation(1.0, 0.0, 0.0)
