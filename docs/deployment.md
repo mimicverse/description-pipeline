@@ -221,5 +221,8 @@ revision and create a new run after engineering corrections.
 
 After code or deployment changes, run the
 [development checks](../CONTRIBUTING.md#verification), validate shell syntax and
-repeat affected native and deployed acceptance. Install both hosts from the same
-new release; published tags and assets remain immutable.
+repeat affected native and deployed acceptance. For an upgrade, let the current
+native job finish, stop the Windows endpoint and Linux services, install the same
+new release on both hosts, then restart the endpoint and Linux services and run
+health. `install` updates files; it does not restart an already running process.
+Published tags and assets remain immutable.
