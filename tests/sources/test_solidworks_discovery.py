@@ -24,6 +24,7 @@ from description_pipeline.sources.solidworks.discovery import (  # noqa: E402
     CONTRACT,
     DISCOVERY_SCHEMA,
     DiscoverySettings,
+    _unit,
     prepare_native_package,
 )
 from description_pipeline.sources.solidworks.errors import CadError  # noqa: E402
@@ -234,6 +235,24 @@ class DiscoveryTests(unittest.TestCase):
         return [finding["code"] for finding in result.findings]
 
     # ----------------------------------------------------------------- positive
+
+    def test_nonfinite_raw_evidence_is_rejected_with_a_json_safe_field_path(self):
+        for value in (float("inf"), float("-inf"), float("nan")):
+            def nonfinite(payload, value=value):
+                payload["components"][0]["transform"][3] = value
+
+            with self.subTest(value=value), self.assertRaises(CadError) as caught:
+                self._prepare(mutate=nonfinite)
+            error = caught.exception
+            self.assertEqual(error.code, "cad_native_record_invalid")
+            self.assertEqual(error.detail["field"], "raw.components[0].transform[3]")
+            json.dumps(error.to_dict(), allow_nan=False)
+
+    def test_large_finite_axis_normalizes_without_squared_norm_overflow(self):
+        axis = _unit([1e308, 1e308, 0.0])
+        self.assertAlmostEqual(axis[0], 2 ** -0.5)
+        self.assertAlmostEqual(axis[1], 2 ** -0.5)
+        self.assertEqual(axis[2], 0.0)
 
     def test_positive_package_is_generated_and_independently_verified(self):
         result, source, output = self._prepare()
@@ -591,6 +610,22 @@ class DiscoveryTests(unittest.TestCase):
 
         result, _source, _output = self._prepare(mutate=mutate)
         self.assertIn("discovery.body_datum_owner_mismatch", self._codes(result))
+
+    def test_duplicate_occurrence_cannot_overwrite_a_native_identity(self):
+        result, _source, output = self._prepare(
+            mutate=lambda payload: payload["components"].append(copy.deepcopy(payload["components"][0]))
+        )
+        self.assertIn("discovery.component_identity_invalid", self._codes(result))
+        self.assertFalse((output / "robot.yaml").exists())
+
+    def test_duplicate_owned_datum_blocks_even_with_explicit_body_datum(self):
+        def mutate(payload):
+            payload["datums"].append(copy.deepcopy(payload["datums"][1]))
+            payload["properties"]["components"] = {"arm-1": {"dp.body_datum": "CS_arm_link"}}
+
+        result, _source, output = self._prepare(mutate=mutate)
+        self.assertIn("discovery.datum_identity_duplicate", self._codes(result))
+        self.assertFalse((output / "robot.yaml").exists())
 
     def test_interface_suffix_must_already_be_snake_case(self):
         def mutate(payload):

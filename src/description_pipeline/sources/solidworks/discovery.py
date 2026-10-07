@@ -60,6 +60,7 @@ import yaml
 
 from ...io import PipelineError, confined, digest, inventory, read_data
 from .jsonio import write_json
+from .errors import CadError
 from .revision import package_inventory, seal_revision
 
 DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v1"
@@ -192,10 +193,37 @@ def _unit(vector) -> list[float] | None:
         return None
     if len(values) != 3 or not all(math.isfinite(value) for value in values):
         return None
-    norm = math.sqrt(sum(value * value for value in values))
+    norm = math.hypot(*values)
     if norm == 0:
         return None
     return [value / norm for value in values]
+
+
+def _validate_native_record(value: Any, path: str = "raw") -> None:
+    """Reject invalid producer evidence before derivation or serialization."""
+    if value is None or type(value) in (str, bool, int):
+        return
+    if type(value) is float and math.isfinite(value):
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise CadError(
+                    "cad_native_record_invalid",
+                    "a native record key is not a string",
+                    {"field": path, "key": repr(key)},
+                )
+            _validate_native_record(item, f"{path}.{key}")
+        return
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _validate_native_record(item, f"{path}[{index}]")
+        return
+    raise CadError(
+        "cad_native_record_invalid",
+        "native evidence contains a nonfinite or non-JSON value",
+        {"field": path, "value": repr(value)},
+    )
 
 
 def _cross(left: Sequence[float], right: Sequence[float]) -> list[float]:
@@ -643,6 +671,19 @@ class _Clusters:
 
 
 def _clusters(record: dict, findings: list[dict]) -> _Clusters:
+    occurrences: set[str] = set()
+    for item in record.get("components") or []:
+        name = item.get("name2") if isinstance(item, dict) else None
+        if not _text(name) or name in occurrences:
+            findings.append(
+                _finding(
+                    "discovery.component_identity_invalid",
+                    f"component:{name}",
+                    "native occurrence names must be nonempty and unique",
+                )
+            )
+        if _text(name):
+            occurrences.add(name)
     components = {
         str(item.get("name2")): item
         for item in record.get("components") or []
@@ -777,11 +818,15 @@ def _resolve_record(settings: DiscoverySettings, reference: str, findings: list[
     return None
 
 
-def _datum(record: dict, name: str | None) -> dict | None:
-    for datum in record.get("datums") or []:
-        if isinstance(datum, dict) and str(datum.get("name")) == str(name):
-            return datum
-    return None
+def _datum(record: dict, name: str | None, owners: Sequence[str]) -> dict | None:
+    matches = [
+        datum
+        for datum in record.get("datums") or []
+        if isinstance(datum, dict)
+        and str(datum.get("name")) == str(name)
+        and str(datum.get("owner") or "") in owners
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _axis_offset(point: Sequence[float], origin: Sequence[float], direction: Sequence[float]) -> float:
@@ -1171,36 +1216,41 @@ def _body_records(
         anchor = members[0]
         item = components.get(anchor, {})
         identity = str(item.get("instance_id") or f"{item.get('document') or ''}#{anchor}")
-        explicit = None
-        for member in members:
-            value = (properties.get(member) or {}).get(f"{NAMESPACE}.body_datum")
-            if _text(value):
-                explicit = str(value).strip()
-                break
+        declared = {
+            str(value).strip()
+            for member in members
+            if _text(value := (properties.get(member) or {}).get(f"{NAMESPACE}.body_datum"))
+        }
+        if len(declared) > 1:
+            findings.append(
+                _finding(
+                    "discovery.body_datum_conflict",
+                    f"body:{root}",
+                    "one body declares conflicting body datum names",
+                    {"datums": sorted(declared)},
+                )
+            )
+            continue
+        explicit = next(iter(declared), None)
         owned = [
             datum
             for datum in datums
             if str(datum.get("owner") or "") in members and str(datum.get("name")).startswith("CS_")
         ]
         if explicit is not None:
-            candidate = _datum(record, explicit)
+            candidate = _datum(record, explicit, members)
             if candidate is None:
+                foreign = [
+                    datum
+                    for datum in datums
+                    if str(datum.get("name")) == explicit and str(datum.get("owner") or "") not in members
+                ]
                 findings.append(
                     _finding(
-                        "discovery.body_datum_missing",
+                        "discovery.body_datum_owner_mismatch" if foreign else "discovery.body_datum_missing",
                         f"body:{root}",
-                        "body_datum annotation names no recorded coordinate system",
+                        "body_datum does not bind exactly one coordinate system owned by this body",
                         {"datum": explicit},
-                    )
-                )
-                continue
-            if str(candidate.get("owner") or "") not in members:
-                findings.append(
-                    _finding(
-                        "discovery.body_datum_owner_mismatch",
-                        f"body:{root}",
-                        "body_datum names a datum that no component of this body owns",
-                        {"datum": explicit, "owner": candidate.get("owner"), "members": members},
                     )
                 )
                 continue
@@ -1317,7 +1367,7 @@ def _interface_frames(
     for body in bodies:
         for component in body["components"]:
             body_of_component[component] = body
-    link_datums = {str(body.get("datum")) for body in bodies}
+    link_datums = {(owner, str(body.get("datum"))) for body in bodies for owner in body["components"]}
     frames: list[dict] = []
     seen: dict[str, str] = {}
     for datum in record.get("datums") or []:
@@ -1326,9 +1376,9 @@ def _interface_frames(
         name = str(datum.get("name") or "")
         if not name.startswith(INTERFACE_PREFIXES):
             continue
-        if name in link_datums:
-            continue
         owner = str(datum.get("owner") or "")
+        if (owner, name) in link_datums:
+            continue
         body = body_of_component.get(owner)
         if body is None:
             findings.append(
@@ -1419,7 +1469,7 @@ def _jcs_check(record: dict, joints: list[dict], by_name: dict[str, dict], findi
                 )
             )
             continue
-        child_datum = _datum(record, child["datum"]) if child else None
+        child_datum = _datum(record, child["datum"], child["components"]) if child else None
         alias = [float(value) for value in datum.get("array") or ()]
         reference = [float(value) for value in (child_datum or {}).get("array") or ()]
         if (
@@ -1666,7 +1716,7 @@ def _frame_checks(joints: list[dict], by_name: dict[str, dict], record: dict, fi
         if "child" not in joint or joint["axis"].get("source") != "mate":
             continue
         body = by_name.get(joint["child"])
-        datum = _datum(record, body["datum"]) if body else None
+        datum = _datum(record, body["datum"], body["components"]) if body else None
         if datum is None:
             continue
         try:
@@ -1937,7 +1987,23 @@ def prepare_native_package(
     record = backend.discover_native(frozen_source, {"namespace": NAMESPACE, "contract": CONTRACT})
     if not isinstance(record, dict) or record.get("schema_version") != DISCOVERY_SCHEMA:
         raise PipelineError("native discovery backend returned an unexpected record schema")
+    _validate_native_record(record)
     findings: list[dict] = []
+    datum_ids: set[tuple[str, str]] = set()
+    for datum in record.get("datums") or []:
+        if not isinstance(datum, dict):
+            continue
+        key = (str(datum.get("owner") or ""), str(datum.get("name") or ""))
+        if key in datum_ids:
+            findings.append(
+                _finding(
+                    "discovery.datum_identity_duplicate",
+                    f"datum:{key[1]}",
+                    "the same occurrence records one datum name more than once",
+                    {"owner": key[0]},
+                )
+            )
+        datum_ids.add(key)
     record_namespace = record.get("namespace")
     if record_namespace is not None and str(record_namespace) != NAMESPACE:
         findings.append(
@@ -2169,7 +2235,7 @@ def _robot_document(
         if "parent" not in joint or "name" not in joint:
             continue
         body = by_name[joint["child"]]
-        datum = _datum(record, body["datum"])
+        datum = _datum(record, body["datum"], body["components"])
         axis = _axis_in_child(joint, datum) if datum is not None else None
         if axis is None:
             raise PipelineError(f"joint {joint['name']!r} has no usable child frame")
