@@ -17,11 +17,18 @@ stays in the private model repository. GitHub CI is not part of the release gate
    one PR. A bad input or artifact must produce no publication.
 5. Deploy the tested Airflow environment and Windows endpoint. Exercise the
    actual DAG against the native endpoint, including retry and failure cases.
+   A release claiming the single-path interface must also demonstrate folder
+   transfer, hardware routing, operator login and the verified URDF viewer as
+   required by [deployment acceptance](docs/deployment.md#deployment-acceptance).
 6. Audit documentation against command help, schemas, tests and measured
    behavior. Record limitations without implying physical/control qualification.
-7. Push the reviewed implementation to public `main`, tag `v1.0.0`, and publish
-   the distributions, SHA-256 manifest and acceptance evidence. Verify remote
-   commit, tag, release assets and installed version.
+7. Push the reviewed implementation to public `main`, tag the new tool version,
+   and publish the distributions, SHA-256 manifest and acceptance evidence.
+   Verify remote commit, tag, release assets and installed version.
+
+`v1.0.0` is already published. Subsequent releases use a new version and tag;
+do not replace the existing release assets or move its tag. The commands below
+show the v1.0.0 asset names; substitute the version being released.
 
 Completion requires all seven steps. Unit tests, native capture alone, a draft
 PR or a documentation-only deployment do not establish release readiness.

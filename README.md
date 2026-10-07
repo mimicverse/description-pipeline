@@ -13,18 +13,36 @@ Apache Airflow is the operator interface. Linux hosts its UI, API and scheduler;
 an authenticated Windows endpoint executes the complete workflow. Linux can
 also check and rebuild a frozen delivery without CAD.
 
-## Submit through Airflow
+## Operator workflow
 
-Prepare the sealed CAD package and robot definition according to the
-[input specification](docs/input.md). Place the package under the Windows
-endpoint's configured handoff root. In the Airflow UI, trigger
-`solidworks_to_urdf` with the package path, revision digest and configured model
-target. The [deployment guide](docs/deployment.md) defines setup and all trigger
-fields. API submissions use the same DAG.
+Mechanical engineers prepare the delivery directory exactly as the
+[mechanical handoff specification](docs/mechanical-handoff-spec.md) requires.
+The target operator interface is one authenticated URL and one folder field:
+
+1. **Select or paste one compliant handoff-folder path.** Absolute Linux paths,
+   absolute Windows paths and paths relative to the configured `package_root`
+   are all accepted.
+2. **Start the run** and follow validation, native capture, generation,
+   verification and submission.
+3. **Inspect the actual verified URDF** with joint and limit interaction, then
+   read the quality decision and the review PR.
+
+The pipeline freezes the folder, derives its identities and routes it by
+`hardware_id`. Platform configuration supplies the repository, branch and
+Windows connection. Every submission goes through the Airflow DAG. See
+[operations.md](docs/operations.md) for the complete workflow and
+[deployment.md](docs/deployment.md) for platform setup.
+
+**Availability.** The one-folder DAG, embedded viewer and RTX 4080 server
+deployment are not yet released and commissioned. Published v1.0.0 uses the
+existing Airflow form with explicit package, revision and routing fields.
+[Deployment status and the v1.0.0 trigger](docs/deployment.md#release-and-deployment-status)
+describe the working interface. The local workflow below is available in v1.0.0.
 
 Track validation, native execution and publication in the DAG run. A successful
 run returns the verified subject, Git commit and PR URL. A failed run retains
-diagnostics and prevents publication. Task retries reuse the same native job.
+diagnostics; a failed quality gate prevents submission. Task retries reuse the
+same native job.
 
 ## Set up the Windows worker
 
@@ -43,7 +61,7 @@ git clone https://github.com/<owner>/<model-repository>.git C:\description\model
 ```
 
 The structural design must include the CAD datums and robot semantics required
-by the [input specification](docs/input.md). A saved assembly alone cannot
+by the [mechanical handoff specification](docs/mechanical-handoff-spec.md). A saved assembly alone cannot
 establish body grouping, joint direction, limits or physical authority.
 
 Seal each mechanical revision once. The local command below is also available
@@ -58,7 +76,7 @@ Replace `<owner>/<model-repository>` with the team's model repository, separate
 from this tool repository. GitHub authentication is a one-time setup. Use a
 dedicated clean model clone;
 the hardware branch must already exist. For a new hardware branch, follow
-[execution setup](docs/operations.md#2-set-up-the-execution-computer).
+[model repository setup](docs/deployment.md#model-repository-setup).
 The second command performs all five stages and prints the PR URL. A failed check
 keeps diagnostics and does not submit or replace a previous passing delivery.
 
@@ -80,8 +98,8 @@ their own contracts and acceptance.
 | Document | Purpose |
 |---|---|
 | [Design](docs/design.md) | Principles, workflow, organization and operation |
-| [Input specification](docs/input.md) | CAD preparation, robot semantics and revision management |
+| [Mechanical handoff specification](docs/mechanical-handoff-spec.md) | CAD preparation, robot semantics and revision management |
 | [Quality specification](docs/quality.md) | Required gates, tolerances and evidence |
-| [Operations](docs/operations.md) | Complete local workflow, diagnosis and model review |
+| [Operations](docs/operations.md) | Handoff preparation, execution, diagnosis and model review |
 | [Airflow deployment](docs/deployment.md) | Linux orchestration and Windows execution |
 | [Release procedure](RELEASING.md) | Tests, native rehearsal, distribution and release |
