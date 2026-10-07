@@ -86,7 +86,7 @@ src/description_pipeline/
   orchestration/         Airflow, Windows endpoint and result access
   cli.py                 commissioning, diagnostics and frozen replay
 tests/                   neutral, analytic and adversarial fixtures
-deploy/airflow/          Linux orchestration deployment
+deploy/                 Linux service installation and lifecycle
 docs/                    requirements, workflow, quality and deployment
 ```
 

@@ -72,7 +72,7 @@ def offline_bundle(source, output, wheel, platform):
             "# Offline installation\n\nRequires CPython 3.12, x86_64. Create a dedicated virtual environment, "
             "then run its Python from this directory:\n\n"
             "```sh\npython -m pip install --no-index --require-hashes --find-links wheels -r requirements.lock\n"
-            "description doctor\n```\n\nUse the v1 input and operation specifications in the source distribution.\n",
+            "description doctor\n```\n\nFollow docs/deployment.md in the matching deployment archive.\n",
             encoding="utf-8",
         )
         write_json(staging / "files.json", inventory(staging))
