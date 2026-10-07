@@ -106,7 +106,8 @@ class RenderTests(unittest.TestCase):
                 rejected = render(state, SOLIDWORKS_HANDOFF_ROOT=broad)
                 self.assertNotEqual(rejected.returncode, 0, broad)
             for unsupported in ("OPERATOR_BASIC_USER", "OPERATOR_BASIC_PASSWORD",
-                                "OPERATOR_HTPASSWD_FILE", "FEISHU_APP_ID"):
+                                "OPERATOR_HTPASSWD_FILE", "FEISHU_APP_ID", "FEISHU_AUTHORIZE_BASE",
+                                "FEISHU_TOKEN_URL", "FEISHU_USERINFO_URL", "FEISHU_STATE_TTL_SECONDS"):
                 rejected = render(state, **{unsupported: "x"})
                 self.assertNotEqual(rejected.returncode, 0, unsupported)
                 self.assertIn(unsupported, rejected.stderr)
@@ -268,30 +269,6 @@ class RenderTests(unittest.TestCase):
             self.assertEqual(missing.returncode, 1)
             self.assertIn("feishu.env", missing.stdout)
 
-    def test_feishu_optional_overrides_render_and_validate(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            state = Path(tmp) / "state"
-            result = render(state, FEISHU_AUTHORIZE_BASE="https://accounts.example.com/authorize",
-                            FEISHU_TOKEN_URL="https://open.example.com/token",
-                            FEISHU_USERINFO_URL="https://open.example.com/user_info",
-                            FEISHU_STATE_TTL_SECONDS="120")
-            self.assertEqual(result.returncode, 0, result.stderr)
-            text = (state / "feishu.env").read_text(encoding="utf-8")
-            for expected in ("FEISHU_AUTHORIZE_BASE=https://accounts.example.com/authorize",
-                             "FEISHU_TOKEN_URL=https://open.example.com/token",
-                             "FEISHU_USERINFO_URL=https://open.example.com/user_info",
-                             "FEISHU_STATE_TTL_SECONDS=120"):
-                self.assertIn(expected, text)
-            insecure = render(state, FEISHU_AUTHORIZE_BASE="http://accounts.example.com/authorize")
-            self.assertNotEqual(insecure.returncode, 0)
-            self.assertIn("https://", insecure.stderr)
-            bad_ttl = render(state, FEISHU_STATE_TTL_SECONDS="0")
-            self.assertNotEqual(bad_ttl.returncode, 0)
-            self.assertIn("FEISHU_STATE_TTL_SECONDS", bad_ttl.stderr)
-            self.assertEqual(render(state).returncode, 0)
-            self.assertNotIn("FEISHU_AUTHORIZE_BASE", (state / "feishu.env").read_text(encoding="utf-8"))
-
-
 class LifecycleTests(unittest.TestCase):
     def _render_units(self, tmp: Path) -> tuple[Path, Path, Path]:
         state = tmp / "state"
@@ -397,6 +374,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn('if status == 200 and body.get("configured") is True', health)
         self.assertIn("connection.password == expected_token", health)
         self.assertIn("2??|3??", health)
+        self.assertIn("Airflow api-server serves its login entry", health)
 
     def test_unconfigured_feishu_is_not_ready(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

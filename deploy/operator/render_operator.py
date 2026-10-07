@@ -1,9 +1,10 @@
 """Render the operator deployment configuration, TLS material and reverse-proxy config.
 
-The renderer is idempotent: the TLS key pair and the portal config are generated once and preserved
-on reruns, so restarting or re-rendering never invalidates a live operator URL. Everything it writes
-lives under OPERATOR_STATE (0700); nothing is written into Git. Authentication is one Feishu SSO
-(the package-local Airflow auth manager); the proxy only terminates TLS on the single operator URL.
+The renderer is idempotent: the TLS key pair is generated once and preserved on reruns, and every
+other file is re-rendered deterministically from the environment, so restarting or re-rendering
+never invalidates a live operator URL. Everything it writes lives under OPERATOR_STATE (0700);
+nothing is written into Git. Authentication is one Feishu SSO (the package-local Airflow auth
+manager); the proxy only terminates TLS on the single operator URL.
 """
 
 from __future__ import annotations
@@ -36,10 +37,13 @@ UNSUPPORTED_ENV_KEYS = {
     "OPERATOR_BASIC_PASSWORD": "the proxy has no Basic auth; the single human login is Feishu SSO",
     "OPERATOR_HTPASSWD_FILE": "the proxy has no Basic auth; the single human login is Feishu SSO",
     "FEISHU_APP_ID": "the app_id lives in the 0600 secret file; never duplicate it in the environment",
+    "FEISHU_AUTHORIZE_BASE": "the deployment uses the fixed official Feishu endpoints",
+    "FEISHU_TOKEN_URL": "the deployment uses the fixed official Feishu endpoints",
+    "FEISHU_USERINFO_URL": "the deployment uses the fixed official Feishu endpoints",
+    "FEISHU_STATE_TTL_SECONDS": "the deployment uses the module's fixed state lifetime",
 }
 FEISHU_ENV_KEYS = ("FEISHU_APP_SECRET_FILE", "FEISHU_TENANT_KEYS", "FEISHU_REDIRECT_URI",
-                   "FEISHU_ADMIN_OPEN_IDS", "FEISHU_AUTHORIZE_BASE", "FEISHU_TOKEN_URL",
-                   "FEISHU_USERINFO_URL", "FEISHU_STATE_TTL_SECONDS")
+                   "FEISHU_ADMIN_OPEN_IDS")
 
 
 def die(message: str) -> None:
@@ -165,7 +169,6 @@ def ensure_portal_config(state: Path, resolved: dict[str, str]) -> Path:
         ("@AIRFLOW_BASE_URL@", resolved["AIRFLOW_BASE_URL"]),
         ("@OPERATOR_UPSTREAM_HOST@", resolved["PORTAL_HOST"]),
         ("@OPERATOR_UPSTREAM_PORT@", resolved["PORTAL_PORT"]),
-        ("@OPERATOR_HOST@", resolved["OPERATOR_HOST"]),
         ("@ENDPOINT_TOKEN_FILE@", resolved["ENDPOINT_TOKEN_FILE"]),
     ):
         rendered = rendered.replace(token, value)
@@ -256,14 +259,6 @@ def main() -> int:
         require_no_space(tenant_keys, "FEISHU_TENANT_KEYS")
     if admin_open_ids:
         require_no_space(admin_open_ids, "FEISHU_ADMIN_OPEN_IDS")
-    feishu_overrides = {key: values.get(key, "").strip()
-                        for key in ("FEISHU_AUTHORIZE_BASE", "FEISHU_TOKEN_URL", "FEISHU_USERINFO_URL")}
-    for key, value in feishu_overrides.items():
-        if value and not require_no_space(value, key).startswith("https://"):
-            die(f"{key} must be an https:// URL: {value!r}")
-    state_ttl = values.get("FEISHU_STATE_TTL_SECONDS", "").strip()
-    if state_ttl and (not state_ttl.isdigit() or not 1 <= int(state_ttl) <= 86400):
-        die(f"FEISHU_STATE_TTL_SECONDS must be seconds (1-86400), got {state_ttl!r}")
 
     resolved: dict[str, str] = {key: value for key, value in values.items()
                                 if key not in {"PORTAL_COMMAND", "PORTAL_CONFIG"}}
@@ -283,10 +278,6 @@ def main() -> int:
         FEISHU_TENANT_KEYS=tenant_keys,
         FEISHU_ADMIN_OPEN_IDS=admin_open_ids,
         FEISHU_REDIRECT_URI=f"https://{host}:{https_port}/auth/feishu/callback",
-        FEISHU_AUTHORIZE_BASE=feishu_overrides["FEISHU_AUTHORIZE_BASE"],
-        FEISHU_TOKEN_URL=feishu_overrides["FEISHU_TOKEN_URL"],
-        FEISHU_USERINFO_URL=feishu_overrides["FEISHU_USERINFO_URL"],
-        FEISHU_STATE_TTL_SECONDS=state_ttl,
     )
 
     drift: list[str] = []

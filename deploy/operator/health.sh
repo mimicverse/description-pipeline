@@ -23,10 +23,9 @@ source "$OPERATOR_STATE/resolved.env"
 
 [ "$(stat -c '%a' "$OPERATOR_STATE")" = "700" ] && report PASS "state dir is 0700" \
   || report FAIL "state dir is not 0700: $OPERATOR_STATE"
-for secret in "$OPERATOR_TLS_KEY"; do
-  [ -f "$secret" ] && [ "$(stat -c '%a' "$secret")" = "600" ] && report PASS "private: $secret" \
-    || report FAIL "secret missing or not 0600: $secret"
-done
+[ -f "$OPERATOR_TLS_KEY" ] && [ "$(stat -c '%a' "$OPERATOR_TLS_KEY")" = "600" ] \
+  && report PASS "TLS key is 0600: $OPERATOR_TLS_KEY" \
+  || report FAIL "TLS key missing or not 0600: $OPERATOR_TLS_KEY"
 if [ -n "${ENDPOINT_TOKEN_FILE:-}" ] && [ -f "$ENDPOINT_TOKEN_FILE" ] \
    && [ "$(stat -c '%a' "$ENDPOINT_TOKEN_FILE")" = "600" ]; then
   report PASS "endpoint token file is 0600: $ENDPOINT_TOKEN_FILE"
@@ -128,7 +127,10 @@ state="$(systemctl --user is-active description-solidworks-tunnel 2>/dev/null ||
 
 if command -v curl >/dev/null 2>&1; then
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:8791/ || true)"
-  [ "$code" = "200" ] && report PASS "Airflow UI on 127.0.0.1:8791" || report FAIL "Airflow UI HTTP $code"
+  case "$code" in
+    2??|3??) report PASS "Airflow api-server serves its login entry on 127.0.0.1:8791 (HTTP $code)" ;;
+    *) report FAIL "Airflow api-server is not serving its login entry on 127.0.0.1:8791 (HTTP $code)" ;;
+  esac
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:${PORTAL_PORT}/ || true)"
   case "$code" in
     2??|3??) report PASS "portal serves the unauthenticated login entry on 127.0.0.1:${PORTAL_PORT} (HTTP $code)" ;;
