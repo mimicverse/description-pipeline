@@ -194,7 +194,14 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
         self.assertFalse(resumed.create(request)[1])
 
     def test_plaintext_remote_binding_and_overlapping_roots_are_rejected(self):
-        for change in ({"host": "0.0.0.0"}, {"output_root": str(self.packages / "output")}):
+        for change in (
+            {"host": "0.0.0.0"},
+            {"output_root": str(self.packages / "output")},
+            {"handoff_roots": []},
+            {"handoff_roots": [str(self.root.anchor)]},
+            {"handoff_roots": [str(self.packages)]},
+            {"handoff_roots": [str(self.root)]},
+        ):
             write_json(self.path, {**self.config_data, **change})
             with self.assertRaises(PipelineError):
                 read_config(self.path)

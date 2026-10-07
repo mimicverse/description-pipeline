@@ -86,6 +86,7 @@ def read_config(path):
         <= {
             "schema_version",
             "package_root",
+            "handoff_roots",
             "output_root",
             "state_root",
             "targets",
@@ -99,6 +100,9 @@ def read_config(path):
     for key in ("package_root", "output_root", "state_root"):
         config[key] = _root(config[key])
     _require(config["package_root"].is_dir(), "Package root does not exist")
+    from .handoffs import validate_handoff_roots
+
+    config["handoff_roots"] = validate_handoff_roots(config.get("handoff_roots"))
     settings = config.get("discovery", {})
     _require(
         isinstance(settings, dict) and set(settings) <= {"record_roots", "frozen_names_file"},
@@ -135,6 +139,12 @@ def read_config(path):
             _require(
                 not first.is_relative_to(second) and not second.is_relative_to(first),
                 "Endpoint package, output, state and repository roots must be separate",
+            )
+    for source in config["handoff_roots"]:
+        for managed in roots:
+            _require(
+                not source.is_relative_to(managed) and not managed.is_relative_to(source),
+                "Engineering source roots must be separate from managed inputs, state, outputs and repositories",
             )
     token_file = _root(config["token_file"])
     _require(token_file.is_file(), "Missing endpoint token file")
@@ -225,7 +235,15 @@ class Jobs:
         )
         source = Path(path)
         if not source.is_absolute():
-            source = confined(self.config["package_root"], path.rstrip("/") + "/.handoff-folder", exists=False).parent
+            _require(
+                len(self.config["handoff_roots"]) == 1, "Use an absolute engineering path with multiple source roots"
+            )
+            source = confined(
+                self.config["handoff_roots"][0], path.rstrip("/") + "/.handoff-folder", exists=False
+            ).parent
+        from .handoffs import authorize_handoff
+
+        source = authorize_handoff(source, self.config["handoff_roots"])
         package, identity = freeze_handoff(source, self.config["package_root"] / "imports")
         return self._handoff(package, identity)
 

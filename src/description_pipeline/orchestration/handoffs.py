@@ -28,6 +28,42 @@ def _directory(path: Path, *, exists: bool = True) -> Path:
     return path.resolve()
 
 
+def validate_handoff_roots(values) -> tuple[Path, ...]:
+    """Require dedicated source directories, separate from service credentials."""
+    if not isinstance(values, (list, tuple)) or not values:
+        raise PipelineError("Configure at least one dedicated handoff root")
+    roots = []
+    broad = {Path.home(), Path.home().parent}
+    if os.name == "posix":
+        broad.update(
+            Path(value)
+            for value in ("/home", "/root", "/etc", "/usr", "/var", "/tmp", "/opt", "/srv", "/proc", "/sys", "/dev")
+        )
+    for value in values:
+        path = Path(value)
+        if not path.is_absolute():
+            raise PipelineError("Handoff roots must be absolute directories")
+        path = _directory(path)
+        if path == Path(path.anchor) or path in broad:
+            raise PipelineError("Handoff roots must be dedicated engineering directories")
+        if path in roots:
+            raise PipelineError("Duplicate handoff root")
+        roots.append(path)
+    return tuple(roots)
+
+
+def authorize_handoff(source: Path, roots) -> Path:
+    """Check the source boundary before inspecting or archiving any files."""
+    roots = validate_handoff_roots(roots)
+    source = Path(source)
+    if not source.is_absolute():
+        raise PipelineError("Handoff source must be absolute")
+    source = _directory(source)
+    if not any(source.is_relative_to(root) for root in roots):
+        raise PipelineError("Handoff source is outside the configured engineering roots")
+    return source
+
+
 def describe_handoff(source: Path) -> dict:
     """Bind native engineering bytes without requiring generated definitions.
 
@@ -90,7 +126,7 @@ def freeze_handoff(source: Path, store: Path) -> tuple[Path, dict]:
 
 
 def prepare_archive(source: Path, archive: Path) -> dict:
-    """Create a bounded transport ZIP without including lock files or secrets."""
+    """Create a bounded transport ZIP, excluding transient SolidWorks locks."""
     source = _directory(source)
     identity = describe_handoff(source)
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as output:

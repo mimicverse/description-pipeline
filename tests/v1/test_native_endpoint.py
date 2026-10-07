@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from description_pipeline.delivery import subject_inventory
 from description_pipeline.io import digest, write_json
@@ -13,6 +14,24 @@ from .endpoint_support import EndpointFixture
 
 
 class NativeEndpointTests(EndpointFixture, unittest.TestCase):
+    def test_outside_source_root_is_rejected_before_any_file_copy(self):
+        jobs = self.jobs()
+        # This parent contains both CAD and service credentials. Admission must
+        # not sweep it into a delivery merely because an assembly exists below it.
+        with patch("description_pipeline.orchestration.windows.freeze_handoff") as freeze:
+            with self.assertRaisesRegex(ValueError, "outside the configured"):
+                jobs.resolve_handoff({"handoff_path": str(self.root)})
+            freeze.assert_not_called()
+
+    def test_nested_source_uses_the_same_identity_for_absolute_and_relative_paths(self):
+        nested = self.source / "新版结构"
+        nested.mkdir()
+        (nested / "总装.SLDASM").write_bytes(b"Synthetic nested assembly")
+        jobs = self.jobs()
+        absolute = jobs.resolve_handoff({"handoff_path": str(nested)})
+        relative = jobs.resolve_handoff({"handoff_path": "新版结构"})
+        self.assertEqual(absolute, relative)
+
     def test_folder_submission_discovers_routes_and_is_idempotent(self):
         calls = []
 
