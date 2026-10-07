@@ -15,19 +15,23 @@ Follow the [SolidWorks engineering specification](mechanical-handoff-spec.md).
 Confirm assembly organization and dependencies, rigid connections and motion,
 root/body/interface datums, mechanical zero, signed directions, limits,
 materials and the real component identities used for controlled specifications.
+Its responsibility matrix distinguishes automatic consistency checks from the
+engineering facts that the responsible engineers must inspect and confirm.
 
 Complete native engineering properties or platform-provided CAD annotations
 only where standard assembly contents cannot express a necessary fact. Do not
 create `robot.yaml`, revision JSON, pipeline evidence texts or a separate
 manual joint/body mapping file.
 
-For wrists and other multiaxis mechanisms, review actual connection order,
-axis offsets, left/right direction, endpoint poses and tool-frame attachment.
+Review every mechanism's actual connection order, axis relationships, positive
+motion, interface attachment and clearance throughout its working range.
+For coupled mechanisms, preserve and check the actual coupling.
 
 ## 2. Save and collect the delivery
 
-Select the declared export/zero configuration in SolidWorks, force-rebuild,
-resolve errors and save all referenced documents. Collect dependencies with
+Select the declared delivery configuration in SolidWorks. Confirm its zero or
+reference pose and any declared zero offsets, force-rebuild, resolve errors
+and save all referenced documents. Collect dependencies with
 Pack and Go or an equivalent native mechanism. Reopen the collected copy and
 verify that it resolves without the original workstation paths.
 
@@ -66,6 +70,11 @@ or ambiguous identity blocks publication; missing mechanical facts produce
 findings at the corresponding CAD object. Parameters are never invented to
 make a stage pass.
 
+The required check view separates automatic results from engineering
+confirmations. Each item shows its evidence, affected CAD objects and corrective
+guidance. Failed, unexecuted, unsupported and unconfirmed items remain visible;
+automatic success does not complete an outstanding engineering review.
+
 Retries within one Airflow run reuse its frozen input and native UUID. Starting
 a new run creates a new job; changing source contents never silently changes
 an already frozen run.
@@ -94,12 +103,13 @@ require recapturing CAD merely to retry publication.
 ## 5. Review and release the model
 
 Inspect the actual verified URDF on the same operator page. Check root/body
-placement, individual positive motions, left/right differences, ranges and
-endpoint poses, especially the wrists. Compare with the native engineering
+placement, individual positive motions, mirrored-instance differences, ranges,
+endpoint poses and interface motion. Compare with the native engineering
 state and the independent report, not just the overall silhouette.
 
 Confirm the source version, frozen identity, tool identity, quality subject and
-PR commit. The model reviewer approves mechanical meanings and accepted uses;
+PR commit, and that necessary engineering confirmations apply to that version.
+The model reviewer approves mechanical meanings and accepted uses;
 a candidate PR is not automatic model release.
 
 A portable copied delivery can be independently rechecked:

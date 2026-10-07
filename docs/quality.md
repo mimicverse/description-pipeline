@@ -93,6 +93,8 @@ is collision-free, or the model is ready for simulation, training or control.
 Mechanical review owns input meaning and measured authority. v1 exports visual
 meshes and physical properties; collision simplification, contact behavior,
 actuator/control interfaces and dynamic validation require separate acceptance.
+The [mechanical specification](mechanical-handoff-spec.md) assigns each handoff
+check to its automatic coverage and required engineering confirmation.
 Unit tests with mocked CAD cannot grant native qualification. The release review
 must include actual Windows capture and a complete passing delivery.
 

@@ -82,6 +82,10 @@ server hosts that page, Airflow and a private database; one licensed Windows
 worker serializes native CAD execution. Platform configuration owns repository
 routing and credentials.
 
+Each engineering check displays its automatic result, engineering confirmation,
+evidence and affected objects. Missing or unsupported checks remain explicit;
+automatic consistency and design approval are separate conclusions.
+
 The operator provides one folder path. Hardware identity and revisions come
 from native engineering records; inventory hashes, configuration files,
 evidence and run IDs are generated automatically. Ambiguous mechanical facts
@@ -91,7 +95,7 @@ produce actionable CAD findings, never guessed definitions.
 
 1. Complete and review the SolidWorks engineering model under the
    [mechanical specification](mechanical-handoff-spec.md).
-2. Save the export/zero configuration and collect the native dependencies.
+2. Save the declared zero or reference configuration and collect native dependencies.
 3. Select the SolidWorks directory on the operator page and start the run.
 4. The pipeline freezes, reads, derives, builds, verifies and submits.
 5. Resolve findings in CAD or their controlled specification source and rerun.
