@@ -28,6 +28,18 @@ FORBIDDEN = {Path("/"), Path("/usr"), Path("/etc"), Path("/opt"), Path("/var"), 
 BROAD_ROOTS = {Path("/"), Path("/usr"), Path("/etc"), Path("/opt"), Path("/var"), Path("/home"),
                Path("/root"), Path("/tmp"), Path("/srv"), Path("/mnt"), Path("/media"), Path.home()}
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+# Keys that must not appear in the operator env: removed auth modes and credential values that
+# belong in the 0600 secret file. Refusing them keeps a stale/hand-edited file from silently
+# reintroducing a second login or a duplicated credential.
+UNSUPPORTED_ENV_KEYS = {
+    "OPERATOR_BASIC_USER": "the proxy has no Basic auth; the single human login is Feishu SSO",
+    "OPERATOR_BASIC_PASSWORD": "the proxy has no Basic auth; the single human login is Feishu SSO",
+    "OPERATOR_HTPASSWD_FILE": "the proxy has no Basic auth; the single human login is Feishu SSO",
+    "FEISHU_APP_ID": "the app_id lives in the 0600 secret file; never duplicate it in the environment",
+}
+FEISHU_ENV_KEYS = ("FEISHU_APP_SECRET_FILE", "FEISHU_TENANT_KEYS", "FEISHU_REDIRECT_URI",
+                   "FEISHU_ADMIN_OPEN_IDS", "FEISHU_AUTHORIZE_BASE", "FEISHU_TOKEN_URL",
+                   "FEISHU_USERINFO_URL", "FEISHU_STATE_TTL_SECONDS")
 
 
 def die(message: str) -> None:
@@ -53,6 +65,9 @@ def load_env(path: Path | None) -> dict[str, str]:
                      "SOLIDWORKS_SSH_HOST", "SOLIDWORKS_HANDOFF_ROOT"):
         if not values.get(required):
             die(f"{required} is required")
+    for unsupported, reason in UNSUPPORTED_ENV_KEYS.items():
+        if unsupported in values:
+            die(f"{unsupported} is not supported: {reason}; delete it from the env file")
     return values
 
 
@@ -161,10 +176,7 @@ def ensure_portal_config(state: Path, resolved: dict[str, str]) -> Path:
 def ensure_feishu_env(state: Path, resolved: dict[str, str]) -> Path:
     """Render the 0600 FEISHU_* environment file loaded by the Airflow api-server unit."""
     target = state / "feishu.env"
-    lines = [f"{key}={resolved[key]}"
-             for key in ("FEISHU_APP_SECRET_FILE", "FEISHU_TENANT_KEYS",
-                         "FEISHU_REDIRECT_URI", "FEISHU_ADMIN_OPEN_IDS")
-             if resolved.get(key)]
+    lines = [f"{key}={resolved[key]}" for key in FEISHU_ENV_KEYS if resolved.get(key)]
     write_private(target, "\n".join(lines) + "\n")
     return target
 
@@ -244,6 +256,14 @@ def main() -> int:
         require_no_space(tenant_keys, "FEISHU_TENANT_KEYS")
     if admin_open_ids:
         require_no_space(admin_open_ids, "FEISHU_ADMIN_OPEN_IDS")
+    feishu_overrides = {key: values.get(key, "").strip()
+                        for key in ("FEISHU_AUTHORIZE_BASE", "FEISHU_TOKEN_URL", "FEISHU_USERINFO_URL")}
+    for key, value in feishu_overrides.items():
+        if value and not require_no_space(value, key).startswith("https://"):
+            die(f"{key} must be an https:// URL: {value!r}")
+    state_ttl = values.get("FEISHU_STATE_TTL_SECONDS", "").strip()
+    if state_ttl and (not state_ttl.isdigit() or not 1 <= int(state_ttl) <= 86400):
+        die(f"FEISHU_STATE_TTL_SECONDS must be seconds (1-86400), got {state_ttl!r}")
 
     resolved: dict[str, str] = {key: value for key, value in values.items()
                                 if key not in {"PORTAL_COMMAND", "PORTAL_CONFIG"}}
@@ -263,6 +283,10 @@ def main() -> int:
         FEISHU_TENANT_KEYS=tenant_keys,
         FEISHU_ADMIN_OPEN_IDS=admin_open_ids,
         FEISHU_REDIRECT_URI=f"https://{host}:{https_port}/auth/feishu/callback",
+        FEISHU_AUTHORIZE_BASE=feishu_overrides["FEISHU_AUTHORIZE_BASE"],
+        FEISHU_TOKEN_URL=feishu_overrides["FEISHU_TOKEN_URL"],
+        FEISHU_USERINFO_URL=feishu_overrides["FEISHU_USERINFO_URL"],
+        FEISHU_STATE_TTL_SECONDS=state_ttl,
     )
 
     drift: list[str] = []

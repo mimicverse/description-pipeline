@@ -105,6 +105,11 @@ class RenderTests(unittest.TestCase):
             for broad in ("/", "/home", str(Path.home()), str(state)):
                 rejected = render(state, SOLIDWORKS_HANDOFF_ROOT=broad)
                 self.assertNotEqual(rejected.returncode, 0, broad)
+            for unsupported in ("OPERATOR_BASIC_USER", "OPERATOR_BASIC_PASSWORD",
+                                "OPERATOR_HTPASSWD_FILE", "FEISHU_APP_ID"):
+                rejected = render(state, **{unsupported: "x"})
+                self.assertNotEqual(rejected.returncode, 0, unsupported)
+                self.assertIn(unsupported, rejected.stderr)
 
     def test_single_https_listener_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -263,12 +268,39 @@ class RenderTests(unittest.TestCase):
             self.assertEqual(missing.returncode, 1)
             self.assertIn("feishu.env", missing.stdout)
 
+    def test_feishu_optional_overrides_render_and_validate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            result = render(state, FEISHU_AUTHORIZE_BASE="https://accounts.example.com/authorize",
+                            FEISHU_TOKEN_URL="https://open.example.com/token",
+                            FEISHU_USERINFO_URL="https://open.example.com/user_info",
+                            FEISHU_STATE_TTL_SECONDS="120")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            text = (state / "feishu.env").read_text(encoding="utf-8")
+            for expected in ("FEISHU_AUTHORIZE_BASE=https://accounts.example.com/authorize",
+                             "FEISHU_TOKEN_URL=https://open.example.com/token",
+                             "FEISHU_USERINFO_URL=https://open.example.com/user_info",
+                             "FEISHU_STATE_TTL_SECONDS=120"):
+                self.assertIn(expected, text)
+            insecure = render(state, FEISHU_AUTHORIZE_BASE="http://accounts.example.com/authorize")
+            self.assertNotEqual(insecure.returncode, 0)
+            self.assertIn("https://", insecure.stderr)
+            bad_ttl = render(state, FEISHU_STATE_TTL_SECONDS="0")
+            self.assertNotEqual(bad_ttl.returncode, 0)
+            self.assertIn("FEISHU_STATE_TTL_SECONDS", bad_ttl.stderr)
+            self.assertEqual(render(state).returncode, 0)
+            self.assertNotIn("FEISHU_AUTHORIZE_BASE", (state / "feishu.env").read_text(encoding="utf-8"))
+
 
 class LifecycleTests(unittest.TestCase):
     def _render_units(self, tmp: Path) -> tuple[Path, Path, Path]:
         state = tmp / "state"
         env_file = tmp / "operator.env"
-        env = base_env(state, POSTGRES_ROOT=str(tmp / "pg"), SOLIDWORKS_SSH_HOST="windows-m3")
+        secret = tmp / "feishu_app.json"
+        secret.write_text('{"app_id": "cli_test", "app_secret": "s"}\n', encoding="utf-8")
+        secret.chmod(0o600)
+        env = base_env(state, POSTGRES_ROOT=str(tmp / "pg"), SOLIDWORKS_SSH_HOST="windows-m3",
+                       FEISHU_APP_SECRET_FILE=str(secret), FEISHU_TENANT_KEYS="tenant_a")
         env_file.write_text("".join(f"{key}={value}\n" for key, value in env.items()), encoding="utf-8")
         config_home = tmp / "config"
         target = config_home / "systemd" / "user"
@@ -345,6 +377,8 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn("--env-file", example)
         for stale in ("install-base", "install-proxy", "rehearse", "--refresh", "c9", "root provides"):
             self.assertNotIn(stale, example)
+        self.assertIn("integrated release wheel", example)
+        self.assertNotIn("mimicverse_description-1.0.0-py3-none-any.whl", example)
         toolchain = (OPERATOR / "scripts" / "install_toolchain.sh").read_text(encoding="utf-8")
         self.assertIn("UV_VERSION=0.12.23", toolchain)
         self.assertIn("PYTHON_VERSION=3.12.14", toolchain)
@@ -361,6 +395,68 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn("FEISHU_ENV_FILE", health)
         self.assertIn("FEISHU_APP_SECRET_FILE", health)
         self.assertIn('if status == 200 and body.get("configured") is True', health)
+        self.assertIn("connection.password == expected_token", health)
+        self.assertIn("2??|3??", health)
+
+    def test_unconfigured_feishu_is_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            env_file = Path(tmp) / "operator.env"
+            env = base_env(state, POSTGRES_ROOT=str(Path(tmp) / "pg"), SOLIDWORKS_SSH_HOST="windows-m3")
+            env_file.write_text("".join(f"{key}={value}\n" for key, value in env.items()), encoding="utf-8")
+            config_home = Path(tmp) / "config"
+            target = config_home / "systemd" / "user"
+            target.mkdir(parents=True)
+            rendered = run([sys.executable, str(RENDER), "--env-file", str(env_file), "--units-dir", str(target)],
+                           {"XDG_CONFIG_HOME": str(config_home)})
+            self.assertEqual(rendered.returncode, 0, rendered.stderr)
+            airflow = run(["bash", str(OPERATOR.parent / "airflow" / "services.sh"), "render"],
+                          {"XDG_CONFIG_HOME": str(config_home), "AIRFLOW_VENV": env["AIRFLOW_VENV"],
+                           "AIRFLOW_HOME": env["AIRFLOW_HOME"], "POSTGRES_ROOT": env["POSTGRES_ROOT"],
+                           "POSTGRES_MAJOR": "14", "SOLIDWORKS_SSH_HOST": "windows-m3",
+                           "FEISHU_ENV_FILE": str(state / "feishu.env")})
+            self.assertEqual(airflow.returncode, 0, airflow.stderr)
+            health = run(["bash", str(HEALTH), "--static"],
+                         {"OPERATOR_STATE": str(state), "XDG_CONFIG_HOME": str(config_home)})
+            self.assertNotEqual(health.returncode, 0)
+            self.assertIn("preparation state only", health.stdout)
+            self.assertIn("STATIC FAILURES", health.stdout)
+
+    def test_operatorctl_guards_the_integrated_wheel_and_optional_python(self) -> None:
+        control = CONTROL.read_text(encoding="utf-8")
+        self.assertIn('AIRFLOW_PYTHON="${AIRFLOW_PYTHON:-}"', control)
+        self.assertNotIn('AIRFLOW_PYTHON="$AIRFLOW_PYTHON"', control)
+        self.assertIn('PIPELINE_WHEEL="${PIPELINE_WHEEL:?', control)
+        self.assertIn("description_pipeline.orchestration.feishu_auth", control)
+        self.assertIn("description_pipeline.orchestration.portal", control)
+
+    def test_drift_check_reports_missing_and_changed_units(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state, config_home, target = self._render_units(Path(tmp))
+            env_file = Path(tmp) / "operator.env"
+            control_env = {"XDG_CONFIG_HOME": str(config_home), "OPERATOR_STATE": str(state)}
+            portal = target / "description-portal.service"
+            portal.write_text(portal.read_text(encoding="utf-8") + "# drifted\n", encoding="utf-8")
+            changed = run(["bash", str(CONTROL), "status", "--env-file", str(env_file)], control_env)
+            self.assertEqual(changed.returncode, 0, changed.stdout + changed.stderr)
+            self.assertIn("DRIFT unit differs: description-portal.service", changed.stdout)
+            (target / "description-airflow-scheduler.service").unlink()
+            missing = run(["bash", str(CONTROL), "status", "--env-file", str(env_file)], control_env)
+            self.assertIn("DRIFT unit missing: description-airflow-scheduler.service", missing.stdout)
+            self.assertIn("DRIFT unit differs: description-portal.service", missing.stdout)
+
+    def test_drift_check_reports_render_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state, config_home, _ = self._render_units(Path(tmp))
+            env_file = Path(tmp) / "operator.env"
+            env_file.write_text(env_file.read_text(encoding="utf-8")
+                                + f"OPERATOR_TLS_CERT={Path(tmp) / 'missing.crt'}\n"
+                                + f"OPERATOR_TLS_KEY={Path(tmp) / 'missing.key'}\n", encoding="utf-8")
+            failed = run(["bash", str(CONTROL), "status", "--env-file", str(env_file)],
+                         {"XDG_CONFIG_HOME": str(config_home), "OPERATOR_STATE": str(state)})
+            self.assertIn("DRIFT unit missing from render: description-portal.service", failed.stdout)
+            self.assertIn("DRIFT unit missing from render: description-operator-proxy.service", failed.stdout)
+            self.assertIn("provided TLS certificate or key is missing", failed.stderr)
 
     def test_api_server_unit_loads_the_optional_feishu_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -44,7 +44,7 @@ if [ -n "${FEISHU_APP_SECRET_FILE:-}" ]; then
     && report PASS "Feishu app secret file is 0600: $FEISHU_APP_SECRET_FILE" \
     || report FAIL "Feishu app secret file missing or not 0600: $FEISHU_APP_SECRET_FILE"
 else
-  report PASS "Feishu SSO credentials not configured (login fails explicitly; pending enterprise app)"
+  report FAIL "Feishu SSO credentials are not configured (preparation state only; nobody can log in)"
 fi
 [ -f "$OPERATOR_TLS_CERT" ] && report PASS "TLS certificate: $OPERATOR_TLS_CERT" \
   || report FAIL "TLS certificate missing: $OPERATOR_TLS_CERT"
@@ -89,21 +89,28 @@ PY
   fi
 fi
 
-# The installed connection must exist with the same host/port, token and handoff allowlist.
-if [ -x "${AIRFLOW_VENV:-}/bin/python" ]; then
-  if AIRFLOW_HOME="${AIRFLOW_HOME:-}" "$AIRFLOW_VENV/bin/python" - "$SOLIDWORKS_HANDOFF_ROOT" <<'PY'
+# The installed connection must exist with the same host/port, the endpoint token file content and
+# the handoff allowlist. Neither the token nor the connection is ever printed.
+if [ -x "${AIRFLOW_VENV:-}/bin/python" ] && [ -f "${ENDPOINT_TOKEN_FILE:-}" ]; then
+  if AIRFLOW_HOME="${AIRFLOW_HOME:-}" "$AIRFLOW_VENV/bin/python" - \
+      "$SOLIDWORKS_HANDOFF_ROOT" "$ENDPOINT_TOKEN_FILE" <<'PY'
 import sys
+from pathlib import Path
+
 from airflow.models.connection import Connection
 from airflow.settings import Session
-expected = sys.argv[1]
+
+expected_root = sys.argv[1]
+expected_token = Path(sys.argv[2]).read_text(encoding="utf-8").strip()
 with Session() as session:
     connection = session.query(Connection).filter(Connection.conn_id == "solidworks_windows").one_or_none()
-    assert connection and connection.host == "127.0.0.1" and connection.port == 18765, connection
-    assert connection.password, "connection has no token"
-    assert (connection.extra_dejson or {}).get("handoff_roots") == [expected], connection.extra_dejson
+host_ok = bool(connection) and connection.host == "127.0.0.1" and connection.port == 18765
+token_ok = bool(connection) and bool(expected_token) and connection.password == expected_token
+roots_ok = bool(connection) and (connection.extra_dejson or {}).get("handoff_roots") == [expected_root]
+raise SystemExit(0 if host_ok and token_ok and roots_ok else 1)
 PY
   then
-    report PASS "connection solidworks_windows matches host/port/token/handoff_roots"
+    report PASS "connection solidworks_windows matches host/port, the endpoint token file and handoff_roots"
   else
     report FAIL "connection solidworks_windows is missing or differs from the deployment env"
   fi
@@ -123,19 +130,23 @@ if command -v curl >/dev/null 2>&1; then
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:8791/ || true)"
   [ "$code" = "200" ] && report PASS "Airflow UI on 127.0.0.1:8791" || report FAIL "Airflow UI HTTP $code"
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:${PORTAL_PORT}/ || true)"
-  [ -n "$code" ] && [ "$code" != "000" ] && report PASS "portal upstream on 127.0.0.1:${PORTAL_PORT} (HTTP $code)" \
-    || report FAIL "portal upstream unreachable on 127.0.0.1:${PORTAL_PORT}"
+  case "$code" in
+    2??|3??) report PASS "portal serves the unauthenticated login entry on 127.0.0.1:${PORTAL_PORT} (HTTP $code)" ;;
+    *) report FAIL "portal is not serving its login entry on 127.0.0.1:${PORTAL_PORT} (HTTP $code)" ;;
+  esac
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -k "https://127.0.0.1:${OPERATOR_HTTPS_PORT}/operator-healthz" || true)"
   [ "$code" = "200" ] && report PASS "proxy liveness on https://127.0.0.1:${OPERATOR_HTTPS_PORT}/operator-healthz" \
     || report FAIL "proxy liveness HTTP $code"
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -k "https://127.0.0.1:${OPERATOR_HTTPS_PORT}/" || true)"
-  [ -n "$code" ] && [ "$code" != "000" ] && report PASS "operator URL reachable over TLS (HTTP $code)" \
-    || report FAIL "operator URL unreachable over TLS"
+  case "$code" in
+    2??|3??) report PASS "operator URL serves the login entry over TLS (HTTP $code)" ;;
+    *) report FAIL "operator URL is not serving its login entry over TLS (HTTP $code)" ;;
+  esac
 fi
 
-# The Feishu auth manager must answer with its JSON contract: configured, or explicitly
-# unconfigured. A 200 HTML page is not health (that is what a missing auth manager looks like).
-if python3 - "$OPERATOR_HTTPS_PORT" <<'PY'
+# The Feishu auth manager must answer with its JSON contract, and an explicitly unconfigured
+# manager is NOT READY: preparation may run without credentials, commissioning may not.
+if FEISHU_DIAG="$(python3 - "$OPERATOR_HTTPS_PORT" <<'PY'
 import json, ssl, sys, urllib.error, urllib.request
 
 context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -152,17 +163,19 @@ except Exception:
 if status == 200 and body.get("configured") is True:
     raise SystemExit(0)
 if status == 503 and body.get("configured") is False:
+    print("HTTP 503 " + json.dumps(body, sort_keys=True))
     raise SystemExit(2)
+print(f"HTTP {status} " + json.dumps(body, sort_keys=True))
 raise SystemExit(1)
 PY
-then
+)"; then
   report PASS "Feishu SSO health reports configured (200 JSON)"
 else
   FEISHU_RC=$?
   if [ "$FEISHU_RC" = "2" ]; then
-    report PASS "Feishu SSO fails explicitly without credentials (503 JSON; pending enterprise app)"
+    report FAIL "Feishu SSO is not ready for commissioning: ${FEISHU_DIAG:-HTTP 503 configured:false}"
   else
-    report FAIL "Feishu SSO /auth/feishu/health did not answer the auth-manager JSON contract"
+    report FAIL "Feishu SSO /auth/feishu/health did not answer the auth-manager JSON contract: ${FEISHU_DIAG:-no response}"
   fi
 fi
 

@@ -69,19 +69,35 @@ load_installed() {
   TARGET="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 }
 
-# Read-only: render into temporary directories and compare with the installed deployment.
+# Read-only: render the configuration and every managed unit into temporary directories and
+# compare with the installed deployment. Missing installed files, missing renders and render
+# failures count as drift, not as silent passes.
 drift_check() {
-  local rc=0 tmp_xdg drift_log
+  local rc=0 tmp_xdg drift_log tmp_state
   drift_log="$(mktemp)"
-  if ! python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --dry-run > "$drift_log"; then rc=1; fi
-  grep -v '^DRIFT none$' "$drift_log" || true
   tmp_xdg="$(mktemp -d)"
-  XDG_CONFIG_HOME="$tmp_xdg" airflow_render >/dev/null 2>&1 || true
+  if ! python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --dry-run \
+        --units-dir "$tmp_xdg/systemd/user" > "$drift_log"; then rc=1; fi
+  grep -v -e '^DRIFT none$' -e '^OPERATOR_UNITS=' "$drift_log" || true
+  # The operator units carry the temporary render state; normalize it before comparing.
+  tmp_state="$(sed -n 's/^Environment=OPERATOR_STATE=//p' \
+    "$tmp_xdg/systemd/user/description-portal.service" 2>/dev/null | head -1)"
+  if [ -n "$tmp_state" ] && [ "$tmp_state" != "$OPERATOR_STATE" ]; then
+    for unit in "${UNITS[@]}"; do
+      [ -f "$tmp_xdg/systemd/user/$unit.service" ] \
+        && sed -i "s#$tmp_state#$OPERATOR_STATE#g" "$tmp_xdg/systemd/user/$unit.service"
+    done
+  fi
+  if ! XDG_CONFIG_HOME="$tmp_xdg" airflow_render >/dev/null 2>&1; then
+    echo "DRIFT airflow unit render failed"; rc=1
+  fi
   for unit in "${UNITS[@]}"; do
-    if [ -f "$TARGET/$unit.service" ] && [ -f "$tmp_xdg/systemd/user/$unit.service" ]; then
-      if ! diff -q "$tmp_xdg/systemd/user/$unit.service" "$TARGET/$unit.service" >/dev/null; then
-        echo "DRIFT unit differs: $unit.service"; rc=1
-      fi
+    if [ ! -f "$TARGET/$unit.service" ]; then
+      echo "DRIFT unit missing: $unit.service"; rc=1
+    elif [ ! -f "$tmp_xdg/systemd/user/$unit.service" ]; then
+      echo "DRIFT unit missing from render: $unit.service"; rc=1
+    elif ! diff -q "$tmp_xdg/systemd/user/$unit.service" "$TARGET/$unit.service" >/dev/null; then
+      echo "DRIFT unit differs: $unit.service"; rc=1
     fi
   done
   python3 -c "import shutil,sys; shutil.rmtree(sys.argv[1], ignore_errors=True)" "$tmp_xdg"
@@ -109,9 +125,17 @@ case "$ACTION" in
       POSTGRES_ROOT="$POSTGRES_ROOT" POSTGRES_MAJOR="${POSTGRES_MAJOR:-14}" \
         bash "$AIRFLOW_HERE/scripts/install_postgres.sh"
     fi
-    AIRFLOW_VENV="$AIRFLOW_VENV" AIRFLOW_HOME="$AIRFLOW_HOME" AIRFLOW_PYTHON="$AIRFLOW_PYTHON" \
-      PIPELINE_WHEEL="$PIPELINE_WHEEL" AIRFLOW_DB_URL="$AIRFLOW_DB_URL" \
+    AIRFLOW_VENV="$AIRFLOW_VENV" AIRFLOW_HOME="$AIRFLOW_HOME" AIRFLOW_PYTHON="${AIRFLOW_PYTHON:-}" \
+      PIPELINE_WHEEL="${PIPELINE_WHEEL:?PIPELINE_WHEEL is required for install}" \
+      AIRFLOW_DB_URL="$AIRFLOW_DB_URL" \
       bash "$AIRFLOW_HERE/install.sh"
+    # Release 1.0 ships one integrated wheel: the portal and the Feishu auth manager must be
+    # importable before the units start, so a stale artifact without them fails install here.
+    if ! "$AIRFLOW_VENV/bin/python" -c 'import importlib.util, sys; sys.exit(0 if all(
+        importlib.util.find_spec(name) for name in
+        ("description_pipeline.orchestration.portal", "description_pipeline.orchestration.feishu_auth")) else 1)'; then
+      die "PIPELINE_WHEEL is not the integrated release wheel (portal/Feishu modules missing): $PIPELINE_WHEEL"
+    fi
     mkdir -p "$SOLIDWORKS_HANDOFF_ROOT"
     chmod 700 "$SOLIDWORKS_HANDOFF_ROOT"
     [ -f "$ENDPOINT_TOKEN_FILE" ] || die "endpoint token file missing: $ENDPOINT_TOKEN_FILE"
