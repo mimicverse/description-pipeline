@@ -936,6 +936,69 @@ class CaptureSceneTests(unittest.TestCase):
                 self.assertEqual(shared.active_configuration, "Parked")
             backend.verify_sources_unchanged()
 
+    def test_capture_does_not_reuse_occurrence_interfaces_after_configuration_switches(self):
+        class SharedDocument(_Doc):
+            generation = 0
+
+            def ShowConfiguration2(self, name):
+                previous = self.active_configuration
+                selected = super().ShowConfiguration2(name)
+                if selected and previous != self.active_configuration:
+                    self.generation += 1
+                return selected
+
+        class ConfiguredBackend(_CaptureBackend):
+            def _mass_properties_document(self, doc, require_material=True):
+                return {
+                    "mass_kg": {"Short": 2.0, "Long": 3.0}[doc.active_configuration],
+                    "reference": {"used_api": "portable-config-mass", "configuration": doc.active_configuration},
+                }
+
+            def _body_count(self, holder, body_type, component):
+                return len(holder.GetBodies2(body_type))
+
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            path = _write(root, "shared.SLDPRT")
+            assembly = _write(root, "robot.SLDASM")
+            shared = SharedDocument(
+                path, configuration="Parked", configuration_children={"Short": [], "Long": [], "Parked": []},
+            )
+            expired_reads = []
+
+            class BorrowedOccurrence:
+                def __init__(self, inner):
+                    self.inner = inner
+                    self.generation = shared.generation
+
+                def __getattr__(self, name):
+                    if not name.startswith("_") and self.generation != shared.generation:
+                        expired_reads.append(name)
+                        raise RuntimeError("occurrence interface expired after shared configuration selection")
+                    return getattr(self.inner, name)
+
+            main = _Doc(assembly, doc_type=2)
+
+            def current_occurrences(_configuration):
+                result = []
+                for name, configuration, count in (("part-short", "Short", 1), ("part-long", "Long", 2)):
+                    component = _Component(name, path, doc=shared, configuration=configuration)
+                    component.GetBodies2 = lambda body_type, count=count: [object()] * count if body_type == 0 else []
+                    result.append(BorrowedOccurrence(component))
+                return result
+
+            main.children_for = current_occurrences
+            backend = ConfiguredBackend(session_factory=lambda: _Session(_App({assembly: main, path: shared})))
+            scene = backend.collect_scene(str(assembly), [])
+            self.assertEqual(scene.mass_properties["part-short"]["mass_kg"], 2.0)
+            self.assertEqual(scene.mass_properties["part-long"]["mass_kg"], 3.0)
+            self.assertEqual(scene.notes["bodies:part-short"], {"solid": 1, "sheet": 0})
+            self.assertEqual(scene.notes["bodies:part-long"], {"solid": 2, "sheet": 0})
+            self.assertEqual(shared.active_configuration, "Parked")
+            self.assertGreater(shared.generation, 0)
+            self.assertEqual(expired_reads, [])
+            backend.verify_sources_unchanged()
+
     def test_geometry_phase_does_not_release_and_reacquire_parents_between_occurrences(self):
         from contextlib import contextmanager
 

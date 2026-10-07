@@ -1475,10 +1475,13 @@ class SolidWorksBackend(CadBackend):
         self._source_documents = {}
         self.notes = {"capture_preparation": preparation}
         self.source_files = {doc_path: _hash(doc_path)}
-        config = _member(_member(doc, "ConfigurationManager"), "ActiveConfiguration")
+        manager = _member(doc, "ConfigurationManager")
+        config = _member(manager, "ActiveConfiguration")
         self._scene_document_key = self._record_source_document(doc_path, str(_member(config, "Name")))
         root = _member(config, "GetRootComponent3", True)
         stack = list(_member(root, "GetChildren") or ())
+        borrowed_components = []
+        occurrences = []
         components, properties = [], {}
         requested_datums = set(coordinate_systems)
         transforms, datum_owners = {}, {}
@@ -1515,6 +1518,7 @@ class SolidWorksBackend(CadBackend):
             comp = _dynamic(stack.pop())
             if _member(comp, "IsSuppressed"):
                 continue
+            borrowed_components.append(comp)
             name = str(_member(comp, "Name2"))
             part = _member(comp, "GetModelDoc2")
             if part is None:
@@ -1527,32 +1531,42 @@ class SolidWorksBackend(CadBackend):
                 raise CadError("cad_component_not_on_disk", name, {"component": name, "path": path})
             self._record_save_flag(part, path)
             referenced = _member(comp, "ReferencedConfiguration")
-            with _temporary_configuration(
-                lambda document_path=path: self._document_by_path(document_path), referenced, name
-            ) as (part, previous):
-                children = list(_member(comp, "GetChildren") or ())
-                placement = self._placement(comp)
-                record_datums(part, name, placement)
-                # Occurrence references are independent of the one active state
-                # of a shared document; every temporary selection is restored.
-                document_key = self._record_source_document(path, previous)
-                self._source_components[name] = (document_key, str(referenced))
-                if path not in self.source_files:
-                    self.source_files[path] = _hash(path)
-                if children:
-                    if _member(part, "GetType") != 2:
-                        raise CadError("cad_component_type", name)
-                    stack.extend(children)
-                    continue
+            # Configuration changes can invalidate borrowed occurrence interfaces.
+            # Finish the assembly traversal using primitives before any selection.
+            children = list(_member(comp, "GetChildren") or ())
+            placement = self._placement(comp)
+            if children:
+                if _member(part, "GetType") != 2:
+                    raise CadError("cad_component_type", name)
+                document_type, fixed = "assembly", False
+                stack.extend(children)
+            else:
                 if _member(part, "GetType") != 1:
                     raise CadError("cad_empty_subassembly", name)
-                components.append(RawComponent(name, path, placement, bool(_member(comp, "IsFixed")), "part"))
-                self._components.add(name)
-                # Include solids and sheets from this occurrence's configuration.
+                document_type, fixed = "part", bool(_member(comp, "IsFixed"))
                 self.notes["bodies:" + name] = {
                     "solid": self._body_count(comp, 0, name),
                     "sheet": self._body_count(comp, 1, name),
                 }
+            document_key = self._record_source_document(path, _active_configuration(part))
+            self._source_components[name] = (document_key, str(referenced))
+            if path not in self.source_files:
+                self.source_files[path] = _hash(path)
+            occurrences.append((RawComponent(name, path, placement, fixed, document_type), referenced))
+
+        borrowed_components.clear()
+        for occurrence, referenced in occurrences:
+            name, path = occurrence.name, occurrence.path
+            with _temporary_configuration(
+                lambda document_path=path: self._document_by_path(document_path), referenced, name
+            ) as (part, _previous):
+                record_datums(part, name, occurrence.transform)
+                # Occurrence references are independent of the one active state
+                # of a shared document; every temporary selection is restored.
+                if occurrence.document_type == "assembly":
+                    continue
+                components.append(occurrence)
+                self._components.add(name)
                 properties[name] = self._mass_properties_document(part, require_material)
                 properties[name]["reference"]["configuration"] = referenced
                 self.notes["mass_property:" + name] = properties[name]["reference"]["used_api"]
