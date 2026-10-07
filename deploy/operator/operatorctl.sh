@@ -129,12 +129,11 @@ case "$ACTION" in
       PIPELINE_WHEEL="${PIPELINE_WHEEL:?PIPELINE_WHEEL is required for install}" \
       AIRFLOW_DB_URL="$AIRFLOW_DB_URL" \
       bash "$AIRFLOW_HERE/install.sh"
-    # Release 1.0 ships one integrated wheel: the portal and the Feishu auth manager must be
-    # importable before the units start, so a stale artifact without them fails install here.
+    # The wheel must provide the portal and the Feishu auth manager before the units start.
     if ! "$AIRFLOW_VENV/bin/python" -c 'import importlib.util, sys; sys.exit(0 if all(
         importlib.util.find_spec(name) for name in
         ("description_pipeline.orchestration.portal", "description_pipeline.orchestration.feishu_auth")) else 1)'; then
-      die "PIPELINE_WHEEL is not the integrated release wheel (portal/Feishu modules missing): $PIPELINE_WHEEL"
+      die "PIPELINE_WHEEL does not provide the portal and Feishu auth manager modules: $PIPELINE_WHEEL"
     fi
     mkdir -p "$SOLIDWORKS_HANDOFF_ROOT"
     chmod 700 "$SOLIDWORKS_HANDOFF_ROOT"

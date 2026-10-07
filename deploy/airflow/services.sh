@@ -34,7 +34,7 @@ render_units() {
   fi
   if [ -n "${POSTGRES_ROOT:-}" ]; then
     sed -e "s#@POSTGRES_ROOT@#$POSTGRES_ROOT#g" \
-        -e "s#@POSTGRES_MAJOR@#${POSTGRES_MAJOR:-18}#g" \
+        -e "s#@POSTGRES_MAJOR@#${POSTGRES_MAJOR:-14}#g" \
       "$HERE/systemd/description-postgres.service" > "$TARGET/description-postgres.service"
   fi
   for unit in description-airflow-dag-processor description-airflow-scheduler description-airflow-api-server; do
@@ -44,18 +44,9 @@ render_units() {
   done
 }
 
-warn_legacy() {
-  for legacy in solidworks-postgres airflow-scheduler airflow-api-server airflow-dag-processor; do
-    if [ -e "$TARGET/$legacy.service" ]; then
-      echo "warning: legacy unit $TARGET/$legacy.service is not managed here;" >&2
-      echo "         systemctl --user disable --now $legacy && rm $TARGET/$legacy.service" >&2
-    fi
-  done
-}
-
 case "$ACTION" in
   render) render_units ;;
-  install) render_units; warn_legacy; systemctl --user daemon-reload ;;
+  install) render_units; systemctl --user daemon-reload ;;
   start) for u in "${UNITS[@]}"; do systemctl --user enable --now "$u"; done ;;
   stop) for ((i=${#UNITS[@]}-1; i>=0; i--)); do systemctl --user disable --now "${UNITS[$i]}" || true; done ;;
   status) systemctl --user status "${UNITS[@]}" --no-pager ;;

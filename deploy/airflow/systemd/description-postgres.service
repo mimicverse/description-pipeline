@@ -1,5 +1,5 @@
 [Unit]
-Description=Portable PostgreSQL 18 for Airflow (SolidWorks-to-URDF)
+Description=Portable PostgreSQL for Airflow (SolidWorks-to-URDF)
 After=network.target
 
 [Service]

@@ -354,7 +354,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn("--env-file", example)
         for stale in ("install-base", "install-proxy", "rehearse", "--refresh", "c9", "root provides"):
             self.assertNotIn(stale, example)
-        self.assertIn("integrated release wheel", example)
+        self.assertIn("mimicverse_description-1.0.1-py3-none-any.whl", example)
         self.assertNotIn("mimicverse_description-1.0.0-py3-none-any.whl", example)
         toolchain = (OPERATOR / "scripts" / "install_toolchain.sh").read_text(encoding="utf-8")
         self.assertIn("UV_VERSION=0.12.23", toolchain)
@@ -401,7 +401,7 @@ class LifecycleTests(unittest.TestCase):
             self.assertIn("preparation state only", health.stdout)
             self.assertIn("STATIC FAILURES", health.stdout)
 
-    def test_operatorctl_guards_the_integrated_wheel_and_optional_python(self) -> None:
+    def test_operatorctl_guards_required_modules_and_optional_python(self) -> None:
         control = CONTROL.read_text(encoding="utf-8")
         self.assertIn('AIRFLOW_PYTHON="${AIRFLOW_PYTHON:-}"', control)
         self.assertNotIn('AIRFLOW_PYTHON="$AIRFLOW_PYTHON"', control)
