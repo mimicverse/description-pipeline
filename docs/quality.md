@@ -90,3 +90,7 @@ meshes and physical properties; collision simplification, contact behavior,
 actuator/control interfaces and dynamic validation require separate acceptance.
 Unit tests with mocked CAD cannot grant native qualification. The release review
 must include actual Windows capture and a complete passing delivery.
+
+Acceptance on the neutral analytic fixture qualifies the tool behaviors it
+exercises. It does not qualify M3 or another hardware model; each model needs
+its own reviewed inputs, passing delivery and evidence for its intended use.

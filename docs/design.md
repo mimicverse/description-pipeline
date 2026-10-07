@@ -59,23 +59,33 @@ src/description_pipeline/
   repository/urdf_pr.py   governed publication
   orchestration/         Windows endpoint and Airflow client
   solidworks.py          complete local workflow
-  cli.py                 author/operator entry point
+  cli.py                 author, commissioning and replay commands
 tests/                   neutral mathematical, failure and integration tests
 deploy/airflow/          Linux scheduler deployment
 docs/                    normative specifications and operations
 ```
 
-Airflow provides the single operator interface through its UI and DAG API.
-The Windows endpoint serializes CAD jobs and executes the local workflow;
-Airflow manages requests, retry identity and result visibility. The CLI remains
-available for worker commissioning, diagnosis and frozen-delivery replay.
+One operator page submits to the Airflow DAG and displays its progress and
+results. The Linux server hosts that page, Airflow and a private database. The
+Windows endpoint serializes CAD jobs and executes the complete local workflow;
+Airflow manages requests, retry identity and result visibility. The CLI serves
+handoff authoring, worker commissioning, diagnosis and frozen-delivery replay.
+
+The operator contract is one URL, one login and one value: the handoff folder
+path. The pipeline derives the sealed revision, inventory digests and hardware
+route from the frozen package and the deployment configuration, so digests,
+repositories, branches and endpoint connections are never operator inputs. The
+run reports concise stages and ends with the actual verified URDF, joint and
+limit controls, its quality decision and review PR. The viewer reads verified
+URDF and mesh bytes; quality decisions come from the independent report. CAD,
+source evidence and execution-machine paths stay outside the viewer surface.
 
 ## 4. How to operate
 
 1. Prepare and review the mechanical assembly, datums and physical authority.
 2. Define rigid bodies, joints, signed axes, limits and acceptance bounds.
 3. Seal the CAD revision and inspect the complete input package.
-4. Submit the handoff through the Airflow DAG and track its result.
+4. Enter the handoff folder in the Airflow operator page and track its result.
 5. Resolve failed findings at their source and rerun with corrected inputs.
 6. Review the passing delivery PR, including its source revision and reports.
 7. Freeze the approved model release and recheck copied deliveries before use.

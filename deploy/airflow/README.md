@@ -1,5 +1,12 @@
 # Airflow deployment (Linux orchestration, Windows execution)
 
+This guide installs the released v1.0.0 Airflow services and documents their
+configuration and API. The one-folder operator page and embedded viewer are
+the next deployment target, not installed by these commands. See the
+[deployment contract and status](../../docs/deployment.md),
+[operator workflow](../../docs/operations.md), and
+[mechanical handoff specification](../../docs/mechanical-handoff-spec.md).
+
 The one-shot DAG `solidworks_to_urdf` submits a configured package to the bearer-authenticated Windows
 endpoint, polls it with a bounded reschedule sensor and fails closed unless the passing result carries
 quality and PR evidence.
@@ -8,8 +15,9 @@ Apache Airflow is the single production operator interface: handoff submission, 
 diagnostic events and the PR result all come from the Airflow Web UI and the same DAG REST API
 (`/api/v2`) behind it. The native `mimicverse-description` CLI and `scripts/scheduled_smoke.py` are
 worker/local tooling for diagnostics and replay, not a second required operator path. There is one
-DAG id (`solidworks_to_urdf`), one pipeline id (`solidworks-to-urdf`) and no extra workflow engine or
-custom GUI.
+DAG id (`solidworks_to_urdf`) and one pipeline id (`solidworks-to-urdf`). The
+planned operator page uses this same DAG; it does not bypass Airflow or add
+another workflow engine.
 
 ## Install
 
@@ -94,21 +102,31 @@ rendered `airflow.cfg`. The Simple Auth Manager prints the generated password on
 `$AIRFLOW_HOME/simple_auth_manager_passwords.json.generated`):
 
 ```sh
-cat "$AIRFLOW_HOME/simple_auth_manager_passwords.json.generated"
+python3 -c 'import json, os; print(json.load(open(os.path.join(os.environ["AIRFLOW_HOME"], "simple_auth_manager_passwords.json.generated")))["operator"])'
 ```
 
-Trigger a handoff from the UI with **Trigger DAG w/ config** and this JSON (identical to the API
-`conf` and to the CLI `--conf`):
+That prints only the operator's value. The file itself is 0600 and holds every generated account;
+do not print or copy it whole.
+
+For v1.0.0 maintenance, trigger a handoff with **Trigger DAG w/ config** and
+this JSON (identical to the API `conf` and CLI `--conf`):
 
 ```json
 {
-  "package": "handoff/m3.0",
-  "revision_sha256": "<sha256 of the sealed cad-revision.json>",
-  "target": "m3",
-  "repository_slug": "<owner>/<repo>",
-  "base": "feature/<hardware>"
+  "package": "arm/r2",
+  "revision_sha256": "<SHA-256 of the exact cad-revision.json file>",
+  "target": "arm",
+  "repository_slug": "<owner>/<model-repository>",
+  "base": "feature/arm",
+  "conn_id": "solidworks_windows"
 }
 ```
+
+The package must already exist under the Windows `package_root`. The target
+alias selects a configured clone; `repository_slug` and `base` bind its expected
+destination. These are the released DAG's six parameters. The target single-path
+request, transport, hardware routing and server-side preview APIs are specified
+in [deployment.md](../../docs/deployment.md#deployment-contract).
 
 The same operations use the DAG REST API. Save the handoff JSON as
 `handoff.json`. This example authenticates from the private password file and
@@ -167,7 +185,9 @@ token_file="$AIRFLOW_HOME/windows-token"        # 0600, holds only the bearer to
   --token-file "$token_file" --host 127.0.0.1 --port 18765
 ```
 
-The default connection id is `solidworks_windows`, matching the DAG's `conn_id` parameter.
+The v1.0.0 DAG selects the `solidworks_windows` connection through its `conn_id`
+parameter. The target single-path DAG will read `SOLIDWORKS_ENDPOINT_CONN_ID`
+from deployment configuration, defaulting to that same connection ID.
 The managed tunnel forwards Linux `127.0.0.1:18765` to Windows `127.0.0.1:8765`.
 The endpoint must stay loopback HTTP behind that tunnel or use TLS;
 the client refuses remote `http://` URLs, so a plaintext remote bearer token cannot be configured.
@@ -175,13 +195,7 @@ the client refuses remote `http://` URLs, so a plaintext remote bearer token can
 ## Local diagnostics / replay (worker tooling)
 
 ```sh
-"$AIRFLOW_VENV/bin/airflow" dags test solidworks_to_urdf 2026-01-01 --conf '{
-  "package": "handoff/m3.0",
-  "revision_sha256": "<sha256 of the sealed cad-revision.json>",
-  "target": "m3",
-  "repository_slug": "<owner>/<repo>",
-  "base": "feature/<hardware>"
-}'
+"$AIRFLOW_VENV/bin/airflow" dags test solidworks_to_urdf 2026-01-01 --conf "$(cat handoff.json)"
 ```
 
 `deploy/airflow/scripts/scheduled_smoke.py --root … --venv … --airflow-home …` runs the same DAG
