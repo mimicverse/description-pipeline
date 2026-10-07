@@ -499,6 +499,7 @@ def evaluate_bundle(root: Path) -> dict:
         gates.add("source.native", lambda: _native(root, manifest))
     model = gates.add("model.schema", lambda: _model(root))
     raw = gates.add("source.raw", lambda: read_data(confined(root / "evidence", "raw/scene_raw.json")))
+    gates.add("physics.mass_closure_equality", lambda: _mass_closure_equality(root))
     if definition is not None:
         gates.add("source.dependencies", lambda: _dependencies(root, definition))
     if definition is not None and model is not None and raw is not None:
@@ -547,6 +548,12 @@ def _model(root):
     from ..model import Robot
 
     return Robot.from_dict(read_data(confined(root, "model/robot.json"))).to_dict()
+
+
+def _mass_closure_equality(root):
+    from .solidworks_physics import verify_urdf_mass_equality
+
+    return verify_urdf_mass_equality(root)
 
 
 def _verify_model(root, gates, definition, model, raw):

@@ -25,6 +25,7 @@ Implementation paths below are relative to `src/description_pipeline/`.
 | Physical authority | Explicit material coverage or complete documented masses; no implicit density or unknown convention | `verification/solidworks_physics.py` |
 | Mass, COM and tensor | Independently rotate/translate raw part readings, apply the parallel-axis theorem and convert to each CAD link datum | `verification/solidworks_physics.py` |
 | Assembly closure | Independent part sum agrees with full whole-assembly mass/COM/tensor and complete component-context readings | `verification/solidworks_physics.py` |
+| Whole-CAD mass equality | Delivered URDF XML inertial mass sum equals the bound full whole-assembly reading; missing or invalid whole evidence fails; masses are never normalized | `verification/solidworks_physics.py` |
 | Inertia validity | Finite positive mass; positive principal inertia; triangle inequality; XML full tensor agrees with raw-verified model | `verification/solidworks_urdf.py` |
 | Geometry | Native mesh coverage, exact file hashes, SI scale, finite nonempty triangles, CAD placement of actual vertices | `verification/solidworks_urdf.py`, `geometry/stl.py` |
 | Physical plausibility | COM within body bounds; inertia within geometry radius bound; total mass and largest whole-robot extent within declared intervals | `verification/solidworks_urdf.py` |
@@ -41,6 +42,7 @@ Implementation paths below are relative to `src/description_pipeline/`.
 | Signed XML/declared axis | Absolute component difference ≤ 1e-12 |
 | Unit joint axis | Norm error ≤ 1e-9 |
 | Independent mass | Relative 1e-6, absolute 1e-12 kg |
+| Whole-CAD mass equality | Absolute 1e-12 kg, relative 0 |
 | Independent COM | Absolute 0.05 mm per component |
 | Independent full tensor | Max-entry error ≤ 1e-4 of tensor scale + 1e-15 kg·m² |
 | XML/canonical full tensor | Relative 1e-10, absolute 1e-15 kg·m² |
