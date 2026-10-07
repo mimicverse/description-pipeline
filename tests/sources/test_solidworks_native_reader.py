@@ -405,6 +405,7 @@ class _App:
 class _Session:
     def __init__(self, app):
         self.app = app
+        self.process = types.SimpleNamespace(alive=lambda: True)
 
     def connect(self, _cancelled):
         return None
@@ -926,18 +927,74 @@ class CaptureSceneTests(unittest.TestCase):
             backend.verify_sources_unchanged()
 
     def test_repeated_configuration_source_guard_still_rejects_real_drift(self):
-        for drift in ("reference", "active", "file"):
+        for drift in ("reference", "active", "file", "path", "suppression"):
             with self.subTest(drift=drift), TemporaryDirectory() as tmp, _com_stubs():
                 backend, _, shared, short, part = self._configured_occurrences(Path(tmp))
                 if drift == "reference":
                     short.ReferencedConfiguration = "Long"
                 elif drift == "active":
                     self.assertTrue(shared.ShowConfiguration2("Long"))
+                elif drift == "path":
+                    short._path = str(_write(Path(tmp), "foreign.SLDPRT"))
+                elif drift == "suppression":
+                    short.IsSuppressed = True
                 else:
                     part.write_bytes(b"changed native source")
                 with self.assertRaises(CadError) as caught:
                     backend.verify_sources_unchanged()
                 self.assertEqual(caught.exception.code, "cad_source_changed")
+
+    def test_source_guard_reacquires_assembly_instead_of_reading_retained_proxy(self):
+        class Expired:
+            @property
+            def ConfigurationManager(self):
+                raise RuntimeError("retained assembly interface is unavailable")
+
+        with TemporaryDirectory() as tmp, _com_stubs():
+            backend, _, _, _, _ = self._configured_occurrences(Path(tmp))
+            backend._doc = Expired()
+            self.assertIn(str(Path(tmp) / "robot.SLDASM"), backend.verify_sources_unchanged())
+
+    def test_source_guard_reads_owned_document_when_component_document_proxy_is_lost(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            backend, _, shared, short, part = self._configured_occurrences(Path(tmp))
+            app = backend._app_obj()
+            app._docs[os.path.normcase(os.path.abspath(str(part)))] = shared
+            short.GetModelDoc2 = lambda: None
+            self.assertIn(str(part), backend.verify_sources_unchanged())
+
+    def test_source_guard_unreadable_document_keeps_path_and_occurrence_context(self):
+        class Unreadable(_Doc):
+            def __getattribute__(self, name):
+                if name == "ConfigurationManager":
+                    raise RuntimeError("current document configuration interface is unavailable")
+                return super().__getattribute__(name)
+
+        with TemporaryDirectory() as tmp, _com_stubs():
+            backend, _, _, _, part = self._configured_occurrences(Path(tmp))
+            app = backend._app_obj()
+            app._docs[os.path.normcase(os.path.abspath(str(part)))] = Unreadable(part, configuration="Parked")
+            with self.assertRaises(CadError) as caught:
+                backend.verify_sources_unchanged()
+            self.assertEqual(caught.exception.code, "cad_source_state_unreadable")
+            self.assertEqual(caught.exception.detail["path"], str(part))
+            self.assertIn(caught.exception.detail["component"], {"part-short", "part-long"})
+            self.assertEqual(caught.exception.detail["phase"], "verify_sources")
+            self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+
+    def test_source_guard_does_not_start_a_session_when_the_original_is_lost(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            backend, _, _, _, _ = self._configured_occurrences(Path(tmp))
+            backend._sessions.clear()
+
+            def forbidden_factory():
+                raise AssertionError("verification cannot start another CAD application")
+
+            backend._session_factory = forbidden_factory
+            with self.assertRaises(CadError) as caught:
+                backend.verify_sources_unchanged()
+            self.assertEqual(caught.exception.code, "cad_source_state_unreadable")
+            self.assertIn("original owned capture session", caught.exception.detail["error"])
 
     def _expiring_document(self, root, *, foreign_replacement=False):
         part = _write(root, "shared.SLDPRT")

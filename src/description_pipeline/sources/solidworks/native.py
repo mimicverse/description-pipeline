@@ -776,12 +776,12 @@ class SolidWorksBackend(CadBackend):
         self._requested_configurations = {}
         self._components = {}
         self._source_components = {}
+        self._source_documents = {}
         self._doc = None
         self.notes = {}
         self.source_files = {}
         #: ``GetSaveFlag`` per working-tree document, recorded as evidence.
         self.save_flags: dict[str, bool] = {}
-        self._source_configuration = None
 
     def _app_obj(self):
         role = getattr(self._local, "role", "source")
@@ -811,12 +811,13 @@ class SolidWorksBackend(CadBackend):
             raise EnvironmentError_("cad_session_cancelled", "Capture was cancelled")
         return session.app
 
+    def _role_for_path(self, path):
+        normalized = normalize_document_path(os.path.abspath(path))
+        return "copy" if any(normalized.startswith(root + "\\") for root in self._capture_roots) else "source"
+
     def _app_for_path(self, path):
         previous = getattr(self._local, "role", "source")
-        normalized = normalize_document_path(os.path.abspath(path))
-        self._local.role = (
-            "copy" if any(normalized.startswith(root + "\\") for root in self._capture_roots) else "source"
-        )
+        self._local.role = self._role_for_path(path)
         try:
             return self._app_obj()
         finally:
@@ -872,6 +873,7 @@ class SolidWorksBackend(CadBackend):
             raise EnvironmentError_("cad_thread_mismatch", "Release CAD references on their owning STA thread")
         self._components.clear()
         self._source_components.clear()
+        self._source_documents.clear()
         self._doc = None
         self.save_flags.clear()
         with self._sessions_lock:
@@ -1473,10 +1475,11 @@ class SolidWorksBackend(CadBackend):
         self._doc = doc
         self._components = {}
         self._source_components = {}
+        self._source_documents = {}
         self.notes = {"capture_preparation": preparation}
         self.source_files = {doc_path: _hash(doc_path)}
         config = _member(_member(doc, "ConfigurationManager"), "ActiveConfiguration")
-        self._source_configuration = str(_member(config, "Name"))
+        self._record_source_document(doc_path, str(_member(config, "Name")))
         root = _member(config, "GetRootComponent3", True)
         stack = list(_member(root, "GetChildren") or ())
         components, properties = [], {}
@@ -1535,7 +1538,8 @@ class SolidWorksBackend(CadBackend):
                 record_datums(part, name, placement)
                 # Occurrence references are independent of the one active state
                 # of a shared document; every temporary selection is restored.
-                self._source_components[name] = (comp, str(referenced), previous)
+                document_key = self._record_source_document(path, previous)
+                self._source_components[name] = (comp, document_key, str(referenced))
                 if path not in self.source_files:
                     self.source_files[path] = _hash(path)
                 if children:
@@ -1691,34 +1695,70 @@ class SolidWorksBackend(CadBackend):
             },
         }
 
+    def _record_source_document(self, path, configuration):
+        role = self._role_for_path(path)
+        key = (role, normalize_document_path(os.path.abspath(path)))
+        session = self._sessions[role]
+        previous = self._source_documents.setdefault(key, (path, role, configuration, session))
+        if previous[2] != configuration or previous[3] is not session:
+            raise CadError("cad_source_changed", "a shared document's captured state changed", {"path": path})
+        return key
+
     def verify_sources_unchanged(self):
-        active = _member(_member(self._doc, "ConfigurationManager"), "ActiveConfiguration")
-        configuration = _member(active, "Name")
-        if configuration != self._source_configuration:
-            raise CadError(
-                "cad_source_changed",
-                "assembly changed in memory during export",
-                {
-                    "path": _member(self._doc, "GetPathName"),
-                    "before": {"configuration": self._source_configuration},
-                    "after": {"configuration": configuration},
+        def source_read(path, component, read):
+            try:
+                return read()
+            except Exception as error:
+                raise CadError(
+                    "cad_source_state_unreadable",
+                    "native source state could not be rechecked",
+                    {"path": path, "component": component, "phase": "verify_sources", "error": str(error)},
+                ) from error
+
+        if not self._source_documents:
+            raise CadError("cad_source_state_unreadable", "no captured document identities are available")
+        for key, (path, role, expected, session) in self._source_documents.items():
+            def read_configuration(path=path, role=role, session=session):
+                if (
+                    self._owner_thread is not threading.current_thread()
+                    or self._role_for_path(path) != role
+                    or self._sessions.get(role) is not session
+                    or session.app is None
+                    or not session.process.alive()
+                    or self._cancelled.is_set()
+                ):
+                    raise ValueError("the original owned capture session is unavailable")
+                name = _active_configuration(self._document_by_path(path))
+                if not _is_text_name(name):
+                    raise ValueError("the document has no readable active configuration")
+                return name
+
+            component = next((name for name, (_, doc_key, _) in self._source_components.items() if doc_key == key), "")
+            configuration = source_read(path, component, read_configuration)
+            if configuration != expected:
+                raise CadError(
+                    "cad_source_changed",
+                    "document configuration changed during export",
+                    {"path": path, "before": {"configuration": expected}, "after": {"configuration": configuration}},
+                )
+        for name, (comp, document_key, referenced) in self._source_components.items():
+            path = self._source_documents[document_key][0]
+            occurrence = source_read(
+                path,
+                name,
+                lambda comp=comp: {
+                    "path": _member(comp, "GetPathName"),
+                    "referenced_configuration": _member(comp, "ReferencedConfiguration"),
+                    "suppressed": bool(_member(comp, "IsSuppressed")),
                 },
             )
-        for name, (comp, referenced, previous) in self._source_components.items():
-            doc = _member(comp, "GetModelDoc2")
-            if doc is None:
-                raise CadError("cad_source_changed", name)
-            active = _member(_member(doc, "ConfigurationManager"), "ActiveConfiguration")
-            state = {
-                "configuration": _member(active, "Name"),
-                "referenced_configuration": _member(comp, "ReferencedConfiguration"),
-            }
-            expected = {"configuration": previous, "referenced_configuration": referenced}
-            if state != expected:
+            if not document_paths_match(occurrence["path"], path) or occurrence["suppressed"]:
+                raise CadError("cad_source_changed", name, {"path": path, "after": occurrence})
+            if occurrence["referenced_configuration"] != referenced:
                 raise CadError(
                     "cad_source_changed",
                     name,
-                    {"path": _member(doc, "GetPathName"), "before": expected, "after": state},
+                    {"path": path, "before": {"referenced_configuration": referenced}, "after": occurrence},
                 )
         for path, digest in self.source_files.items():
             if _hash(path) != digest:
