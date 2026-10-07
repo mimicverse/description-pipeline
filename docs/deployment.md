@@ -128,6 +128,8 @@ Complete these configuration groups once:
 | `FEISHU_APP_SECRET_FILE`, `FEISHU_TENANT_KEYS` | App credentials and mandatory tenant allowlist |
 | `FEISHU_ADMIN_OPEN_IDS` | Explicit administrator identities; optional, no automatic administrator |
 
+Use comma-separated tenant and administrator lists without spaces.
+
 Store the app credentials in the mode-`0600` JSON file named by
 `FEISHU_APP_SECRET_FILE`:
 
