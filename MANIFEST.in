@@ -1,4 +1,4 @@
-include README.md LICENSE CHANGELOG.md CONTRIBUTING.md RELEASING.md ruff.toml
+include README.md LICENSE CONTRIBUTING.md RELEASING.md ruff.toml
 recursive-include src/description_pipeline/orchestration/static *
 include src/description_pipeline/orchestration/portal.example.json
 recursive-include docs *.md

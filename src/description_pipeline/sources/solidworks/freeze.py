@@ -1304,8 +1304,7 @@ def _capture_axis_references(backend: Any, cfg: dict[str, Any]) -> list[dict[str
 
     A joint that names a native component/face must yield numeric evidence
     (point + direction + identity); a backend that cannot resolve it is a
-    capture failure, never a silently skipped record.  Legacy free-text axis
-    references carry no numeric capture and are left to the author.
+    capture failure, never a silently skipped record.
     """
 
     reader = getattr(backend, "capture_axis_reference", None)

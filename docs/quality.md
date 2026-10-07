@@ -4,18 +4,17 @@ Report: `solidworks-to-urdf.quality/v1`. Pipeline ID: `solidworks-to-urdf`.
 All required gates must pass before automatic publication. Missing required evidence is
 a failure. There is no public bypass or waiver switch.
 
-The table below records the released v1.0.0 prepared-package checks. The
-target mechanical handoff is CAD-only: generated YAML is a derived artifact,
-not a second author input. Additional definition checks below are required
-before that workflow can claim acceptance.
+Native SolidWorks engineering is the input. Generated YAML is an internal
+artifact and must be verified against original native observations.
 
-## Released verification gates
+## Verification gates
 
 Implementation paths below are relative to `src/description_pipeline/`.
 
 | Gate | Evidence and acceptance | Implementation |
 |---|---|---|
-| Input contract | Reinspect archived YAML, evidence anchors, inventories and sealed revision | `sources/solidworks/input.py`, `revision.py` |
+| Derived-input contract | Reinspect generated YAML, native provenance, controlled records, inventories and generated revision | `sources/solidworks/input.py`, `revision.py` |
+| Native definition | Independently reconstruct membership, adjacency, motion, names, frames and limits from native observations; required gate `source.native_discovery` | `verification/native_discovery.py` |
 | Native source | Native SolidWorks evidence, qualified API/build, matching collection identity and environment | `verification/solidworks_urdf.py` |
 | Dependency closure | No unresolved reference; original CAD belongs to the handoff; collected-copy hashes and configuration agree | `verification/solidworks_urdf.py` |
 | Occurrence coverage | Every native occurrence belongs to exactly one body; identity survives normalization | `verification/solidworks_urdf.py` |
@@ -106,17 +105,14 @@ Acceptance on the neutral analytic fixture qualifies the tool behaviors it
 exercises. It does not qualify M3 or another hardware model; each model needs
 its own reviewed inputs, passing delivery and evidence for its intended use.
 
-## CAD-only definition acceptance
-
-These requirements must be implemented and verified before releasing the
-target workflow; they are additional to the v1.0.0 gates above.
+## Native definition verification
 
 The mechanical team supplies only SolidWorks engineering contents under the
-[mechanical specification](mechanical-handoff-spec.md). The pipeline must
-generate its definitions, manifests and evidence and record a source for every
+[mechanical specification](mechanical-handoff-spec.md). The pipeline
+generates definitions, manifests and evidence, and records a source for every
 derived mechanical fact.
 
-Independent verification must check body membership, joint adjacency/type,
+Independent verification checks body membership, joint adjacency/type,
 signed axes, zero configuration, datum placement and limits against original
 native observations and engineering annotations. Merely validating generated
 YAML against a schema or comparing two derivatives does not prove these facts.
@@ -127,11 +123,11 @@ facts block the delivery/use that requires them; no fabricated limits, default
 efforts or guessed directions are acceptable. Source and library revisions,
 original units, transformations and provenance remain bound to the delivery.
 
-The per-item report must distinguish automatic results from engineering
+The per-item report distinguishes automatic results from engineering
 confirmations as specified in [the mechanical standard](mechanical-handoff-spec.md#112-检查报告与-airflow-展示).
 Each confirmation applies to the recorded structural version; missing,
 unsupported or unexecuted checks cannot become implicit passes.
 
-The released v1.0.0 rejects every effective mass/COM/inertia override. A future
-controlled native-parameter channel requires its own demonstrated acceptance;
-the CAD-only contract does not implicitly enable such overrides.
+Effective native mass, COM or inertia overrides are rejected. A controlled
+parameter source must satisfy the complete physical contract; recording a
+source does not waive verification.

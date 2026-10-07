@@ -157,8 +157,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
         raw_masses = {name: float(row["mass"]) for name, row in masses.items()}
         details, error = oracle._component_context_findings(payload, "cad", top[0], raw_masses)
         _require(error is None, "Component context: " + str(error))
-        # v1 refuses effective mass/COM/tensor overrides even when a table is supplied.
-        # A later input contract must explicitly model them before they can qualify.
+        # Effective native mass/COM/tensor overrides cannot qualify.
         for row in context["instances"]:
             _require(not any(row["overrides"].values()), "Unsupported native instance override: " + row["name"])
         return {"assembly_mass_kg": top[0], "independent_mass_kg": expected[0], "component_context": details}

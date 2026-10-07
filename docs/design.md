@@ -1,7 +1,7 @@
 # Design
 
-This document defines the target system. Implementation and deployment status
-are tracked separately in [deployment.md](deployment.md#release-and-deployment-status).
+Release 1.0 uses one workflow: native SolidWorks engineering → Airflow →
+verified URDF and review PR.
 
 ## 1. Core principles
 
@@ -68,13 +68,13 @@ simulation, training or hardware-control qualification remain separate decisions
 | Mechanical PDM, Git LFS or controlled directory | Retrievable SolidWorks revisions and engineering approvals |
 | Controlled component library | Versioned physical and drive specifications |
 
+`main` contains the smallest complete current system. Code, interfaces and
+documentation describe this workflow; intermediate implementations and
+compatibility layers remain in Git history.
+
 Tool releases use ordinary version tags such as `v1.0.0`. Each model records
 the tool identity used to build it. Tool source stays in the tool repository;
 approved model deliveries are frozen from the hardware branch.
-
-The private [model repository](https://github.com/mimicverse/description) also
-retains legacy v0.x tool history. Its historical workflows do not define the
-current SolidWorks contract.
 
 ```text
 src/description_pipeline/
@@ -96,6 +96,10 @@ DAG for submission, progress and results, and previews the actual verified
 URDF with joint controls. It shows each automatic check, engineering
 confirmation, evidence and affected object; unsupported or unexecuted checks
 remain explicit.
+
+Feishu supplies the signed-in identity and profile. The platform restricts
+access to its approved tenant and assigns operator and administrator permissions.
+The same identity is recorded with the Airflow execution.
 
 Platform maintainers configure access, credentials, storage roots and hardware
 routing once. Operators supply one engineering-directory path. Mechanical

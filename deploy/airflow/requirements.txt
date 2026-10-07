@@ -7,7 +7,7 @@
 # …) are pinned and hashed too. Resolution is constrained by the vendored Apache constraints
 # (constraints-3.12.txt) so already-tested Airflow-side versions win over newer transitive ranges.
 #
-# Regeneration commands and acceptance: deploy/airflow/README.md, Deployment maintenance.
+# Regeneration commands and acceptance: docs/deployment.md, Maintenance.
 apache-airflow==3.3.2
 apache-airflow-providers-standard==1.19.0
 psycopg2-binary==2.9.13

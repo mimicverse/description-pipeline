@@ -1009,9 +1009,8 @@ def inspect_package(path: Path) -> dict[str, Any]:
         )
         provenance = data.get("provenance")
         if provenance is not None:
-            # Optional marker written by native semantic discovery.  Its presence
-            # binds the package to a discovery record; legacy authored packages
-            # omit it and keep their released behaviour.
+            # Native semantic discovery binds its generated definition to this
+            # raw evidence. The delivery verifier requires the binding.
             marker = _as_mapping(provenance, report, "input.provenance_invalid", "provenance")
             if marker is not None:
                 _unknown_keys(

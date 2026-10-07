@@ -156,7 +156,7 @@ def _native_discovery(package):
 
     Every current v1 delivery carries the generated provenance block and the
     bound raw discovery record; deleting either must fail before publication,
-    so this gate has no legacy mode.
+    so deleting either blocks publication.
     """
 
     from .native_discovery import verify_discovery
