@@ -4,6 +4,11 @@ Report: `solidworks-to-urdf.quality/v1`. Pipeline ID: `solidworks-to-urdf`.
 All required gates must pass before automatic publication. Missing evidence is
 a failure. There is no public bypass or waiver switch.
 
+The table below records the released v1.0.0 prepared-package checks. The
+target mechanical handoff is CAD-only: generated YAML is a derived artifact,
+not a second author input. Additional definition checks below are required
+before that workflow can claim acceptance.
+
 ## Required checks
 
 | Gate | Evidence and acceptance | Implementation |
@@ -94,3 +99,25 @@ must include actual Windows capture and a complete passing delivery.
 Acceptance on the neutral analytic fixture qualifies the tool behaviors it
 exercises. It does not qualify M3 or another hardware model; each model needs
 its own reviewed inputs, passing delivery and evidence for its intended use.
+
+## CAD-only definition acceptance
+
+The mechanical team supplies only SolidWorks engineering contents under the
+[mechanical specification](mechanical-handoff-spec.md). The pipeline must
+generate its definitions, manifests and evidence and record a source for every
+derived mechanical fact.
+
+Independent verification must check body membership, joint adjacency/type,
+signed axes, zero configuration, datum placement and limits against original
+native observations and engineering annotations. Merely validating generated
+YAML against a schema or comparing two derivatives does not prove these facts.
+
+Drive and physical specifications must resolve to fixed controlled records or
+qualified native engineering properties. Missing, conflicting or ambiguous
+facts block the delivery/use that requires them; no fabricated limits, default
+efforts or guessed directions are acceptable. Source and library revisions,
+original units, transformations and provenance remain bound to the delivery.
+
+The released v1.0.0 rejects every effective mass/COM/inertia override. A future
+controlled native-parameter channel requires its own demonstrated acceptance;
+the CAD-only contract does not implicitly enable such overrides.

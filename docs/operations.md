@@ -1,164 +1,122 @@
 # Operations
 
-## Operator workflow
+The target workflow is **one URL → login → one SolidWorks directory → progress
+→ verified URDF and review PR**. The mechanical team works only in SolidWorks;
+all pipeline definitions, manifests and reports are generated automatically.
 
-The target workflow is **one URL → login → one handoff-folder path → progress →
-verified URDF and review PR**. The mechanical team prepares and reviews the
-folder; the operator selects it; the model reviewer assesses the delivery.
+The CAD-only automatic-definition flow is not yet released. v1.0.0 still uses
+its legacy prepared package and six-field Airflow trigger; it is not the
+mechanical-team interface specified here. Current status and legacy platform
+instructions are in [deployment.md](deployment.md#release-and-deployment-status).
 
-1. **Prepare** the revision directory as
-   [mechanical-handoff-spec.md](mechanical-handoff-spec.md) requires —
-   native dependencies, body datums and stable shaft references, `robot.yaml`,
-   limit and material evidence, and reviewed mass/size bounds. Section 1 below
-   covers preparation: `description revision` seals the CAD files and
-   `description inspect` must pass without errors; review its warnings before
-   opening CAD.
-2. **Select or paste** the sealed folder path on the operator page and start the
-   run. The pipeline reads the identity from `cad-revision.json`.
-3. **Follow progress** through validation, native capture, generation,
-   verification and submission.
-   Routing follows the package's `hardware_id`; the operator does not name an
-   endpoint, repository, branch or digest.
-4. **Inspect the result**: the actual verified URDF with joint and limit
-   interaction, the quality decision and the review PR. A failing run retains
-   its diagnostics. A failed quality gate prevents submission. Retrying the same
-   DAG run reuses its native job; starting a new DAG run creates a new job.
+## 1. Prepare the SolidWorks engineering model
 
-The operator interface is a single path field. Its value may be an absolute
-folder on the Linux orchestration host (transferred as an authenticated ZIP), an
-absolute folder on the Windows worker (copied), or a folder relative to the
-configured `package_root`. The pipeline freezes the received author bytes,
-derives the sealed revision and inventory digests, and routes by `hardware_id`.
+Follow the [SolidWorks engineering specification](mechanical-handoff-spec.md).
+Confirm assembly organization and dependencies, rigid connections and motion,
+root/body/interface datums, mechanical zero, signed directions, limits,
+materials and the real component identities used for controlled specifications.
 
-Incomplete or inconsistent folders and unknown or ambiguous hardware routes
-are rejected before CAD opens. A frozen input changed while queued fails;
-changes to the original folder do not alter an already frozen copy.
-There are no digest, repository, branch or connection fields for the operator to
-fill in.
+Complete native engineering properties or platform-provided CAD annotations
+only where standard assembly contents cannot express a necessary fact. Do not
+create `robot.yaml`, revision JSON, pipeline evidence texts or a separate
+manual joint/body mapping file.
 
-**Availability.** The single-path DAG and embedded viewer are not yet released
-and commissioned. v1.0.0 uses the existing Airflow form; its executable trigger
-is in [deployment status](deployment.md#release-and-deployment-status). Sections
-1 and 3–6 below also document the available local commands. Infrastructure,
-accounts, roots, routing and worker setup belong to [deployment.md](deployment.md).
+For wrists and other multiaxis mechanisms, review actual connection order,
+axis offsets, left/right direction, endpoint poses and tool-frame attachment.
 
-## 1. Prepare the mechanical handoff
+## 2. Save and collect the delivery
 
-Prepare the assembly, body datums and stable shaft references on the SolidWorks
-computer as specified in [mechanical-handoff-spec.md](mechanical-handoff-spec.md).
-Force-rebuild and save the selected configuration, collect its dependencies
-into a revision directory, then reopen the collected copy. Complete `robot.yaml`,
-limits/material evidence, reviewed mass/size bounds and the mechanical review.
+Select the declared export/zero configuration in SolidWorks, force-rebuild,
+resolve errors and save all referenced documents. Collect dependencies with
+Pack and Go or an equivalent native mechanism. Reopen the collected copy and
+verify that it resolves without the original workstation paths.
 
-The directory must be complete before sealing. A new CAD design uses a new
-revision directory; retain the previous published handoff.
+Retain the controlled structural version. Changed engineering contents create
+a new version; the previous input remains available.
 
-```powershell
-description revision C:\handoffs\arm\r2 --hardware arm --id r2 --parent r1 --owner mechanical --control pdm --reference "PDM/arm/r2" --summary "Updated wrist travel"
-description inspect C:\handoffs\arm\r2 --report C:\reviews\arm-r2-input.json
-```
+The directory must be readable by the Linux server or Windows worker. A path
+on a different laptop is not accessible merely because it is pasted into a
+browser. Platform maintainers establish shared/drop locations once; operators
+need no per-run SSH or transfer command sequence.
 
-`inspect` must return `passed: true` with no errors. Review warnings, including
-the notice that CAD datum existence still requires native capture. Static
-inspection does not prove that SolidWorks can resolve dependencies, read the
-datums or confirm their mechanical meaning.
+## 3. Run from the single operator page
 
-## 2. Confirm execution readiness
+Open the published operator URL, log in, select or paste the SolidWorks folder
+and start. No YAML, digest, model repository, branch, connection ID or native
+job ID is an operator field.
 
-The platform maintainer commissions the [Linux server and Windows worker](deployment.md)
-once. Before submitting a handoff, confirm access to the operator URL and that
-its hardware route is configured. The selected folder must be readable by the
-Linux server or Windows worker that receives it; a path on an unrelated laptop
-is not accessible merely because it was pasted into a browser.
+The target interface accepts an absolute Linux folder, an absolute folder on
+the configured Windows worker, or a path relative to its managed handoff root.
+Linux inputs are transported automatically; all inputs become a fixed native
+inventory before execution.
 
-Authoring, sealing and static inspection can run on Linux or Windows. Fresh
-capture requires the commissioned, licensed SolidWorks Windows worker;
-frozen-delivery checks and rebuilds do not require CAD.
+Follow these stages:
 
-## 3. Execute and submit
-
-For released v1.0.0, use the [existing Airflow trigger](deployment.md#linux-scheduler)
-or the local command below. The following single-path instructions describe
-the target deployment.
-
-For the target deployment, enter the folder path on the operator page or
-trigger `solidworks_to_urdf` with the same `handoff_path` field through its API.
-Everything else — validation, revision and inventory digests, hardware routing,
-the Windows endpoint connection and the review expectations — comes from the
-package and the deployment described in [deployment.md](deployment.md).
-
-The DAG freezes and validates the input, queues one Windows job, waits for
-verification and confirms its PR receipt. View the logs and final result for the run
-UUID, quality decision, commit and PR URL. Airflow is the standard operator
-entry; no Linux-to-Windows command sequence is required for each handoff.
-
-For worker commissioning and diagnosis, execute the same workflow locally:
-
-```powershell
-description run C:\handoffs\arm\r2 --output C:\deliveries\arm --repository C:\description\models --base feature/arm --message "Update arm wrist travel from mechanical r2"
-```
-
-The command inspects, captures, generates, verifies and submits. It prints a run
-UUID, quality decision and PR receipt. Only a passing delivery reaches the PR
-stage. Subsequent passing deliveries update the same hardware review branch
-and open PR; the publisher does not force-push or merge it.
-
-Omit `--repository` to build and verify locally. The output must be separate from
-the handoff and repository. The pipeline replaces only an output it owns and
-whose inventory is intact. Operator annotations cause replacement to be refused.
-
-Follow [deployment.md](deployment.md) once to install the endpoint, connection
-and scheduler. Subsequent handoffs use the same Airflow interface.
-
-## 4. Diagnose a failed run
-
-Use the returned `diagnostic_path`. `reports/input.json` records static findings;
-`reports/quality.json` records independent artifact findings when generation
-reached verification. `reports/run.json` identifies the failed stage. Native
-capture failures retain their partial snapshot and `failure.json`.
-
-| Failed stage | Corrective action |
+| Stage | Expected result |
 |---|---|
-| Inspect | Repair YAML, evidence bindings, inventory or mechanical revision |
-| Capture | Repair CAD closure/configuration/datums/shaft selector/materials; inspect native error |
-| Generate | Repair unsupported semantics or physically invalid source values |
-| Verify | Follow each failed gate to its author input, raw reading or generation rule |
-| Submit | Restore repository/authentication/PR service; retain the verified bundle and receipt |
+| Collect and freeze | Main assembly, source version, configuration and native file inventory recorded |
+| Read CAD | Actual instances, mates, datums, materials and engineering annotations captured |
+| Derive definition | Robot semantics and applicable specifications resolved; `robot.yaml` or equivalent model generated |
+| Build | Canonical model, URDF and local meshes generated |
+| Verify | Independent native, physical, XML, mesh and loading gates evaluated |
+| Submit | Passing delivery bound to its Git commit and review PR |
 
-Never repair generated XML or mesh files directly. Correct author inputs or tool
-rules and rebuild. Changed CAD requires a new revision. A failed submission
-preserves the pushed SHA when GitHub fails after the push; retry submission
-without recapturing CAD:
+The platform resolves the hardware destination from native identity. Missing
+or ambiguous identity blocks publication; missing mechanical facts produce
+findings at the corresponding CAD object. Parameters are never invented to
+make a stage pass.
 
-```powershell
-description submit C:\deliveries\arm --repository C:\description\models --base feature/arm
-```
+Retries within one Airflow run reuse its frozen input and native UUID. Starting
+a new run creates a new job; changing source contents never silently changes
+an already frozen run.
 
-Retries within one Airflow run reuse its job UUID and cannot trigger duplicate
-captures.
-An endpoint restart marks an interrupted running job failed. After investigating
-its diagnostics, use a new DAG run for a corrected handoff. A changed request
-cannot reuse the old UUID.
+## 4. Resolve findings
+
+The page reports the failed stage and relevant CAD object, property, mate,
+configuration or specification source. Diagnostic records remain available to
+platform maintainers.
+
+| Finding | Correction |
+|---|---|
+| Missing dependency or wrong configuration | Repair and save the native engineering package |
+| Ambiguous rigid body or joint | Repair hierarchy, mates or the approved native CAD annotation |
+| Missing/incorrect datum, zero or positive direction | Repair reference geometry and the declared CAD state |
+| Limit or drive specification missing | Correct native limit definitions, component identity or the controlled specification record |
+| Material or mass inconsistency | Correct actual material, configuration, physical authority or model simplification |
+| Verification disagreement | Trace the finding to CAD evidence, the resolved specification or a generation rule |
+| Repository/PR failure | Platform maintainer restores publication; retain the verified delivery |
+
+Correct the source and run a new version. Do not hand-edit generated YAML, XML,
+meshes, inertia or reports. A failed quality gate prevents publication. A PR
+service failure after a verified push retains the commit/receipt and does not
+require recapturing CAD merely to retry publication.
 
 ## 5. Review and release the model
 
-Review the PR's native CAD revision, body grouping, datum and axis meanings,
-limits and physical authority. Inspect `reports/quality.json` and verify that
-the delivery's subject matches the PR commit. Preview `urdf/robot.urdf` with
-its adjacent `meshes/` in the team's URDF viewer. Include left/right and limit
-pose review where relevant to the hardware.
+Inspect the actual verified URDF on the same operator page. Check root/body
+placement, individual positive motions, left/right differences, ranges and
+endpoint poses, especially the wrists. Compare with the native engineering
+state and the independent report, not just the overall silhouette.
+
+Confirm the source version, frozen identity, tool identity, quality subject and
+PR commit. The model reviewer approves mechanical meanings and accepted uses;
+a candidate PR is not automatic model release.
+
+A portable copied delivery can be independently rechecked:
 
 ```sh
 description check /path/to/reviewed/delivery
 ```
 
-Approval of the input meanings and independent checks precedes the model
-release. Keep the approved input, evidence and reports together with the URDF.
-Simulation, training and hardware use need their additional acceptance records.
+URDF loading, kinematic consistency, simulation, training and hardware control
+are separate acceptance results. Keep native inputs, generated provenance and
+reports with the approved model.
 
-## 6. Rebuild on Linux or Windows
+## 6. Platform diagnostics and frozen replay
 
-Copy a complete verified frozen delivery. Install the same tool release, then:
+These commands are platform tools, not requirements on the mechanical team.
+Fresh native reading requires the licensed Windows worker. A complete frozen
+delivery can be checked and rebuilt on Linux or Windows without opening CAD:
 
 ```sh
 description check /path/to/frozen-delivery
@@ -166,7 +124,7 @@ description rebuild /path/to/frozen-delivery --output /path/to/rebuilt-delivery
 description submit /path/to/rebuilt-delivery --repository /path/to/model-clone --base feature/arm
 ```
 
-Rebuild uses archived native readings and requires no CAD process. With the same
-code and inputs, the canonical model, URDF and mesh bytes reproduce; the current
-runtime is separately recorded in `reports/tool.json`. A fresh native export on
-Linux requires the deployed Windows endpoint.
+Use the same recorded tool release and dependencies. Rebuild preserves the
+archived native evidence and generated definitions; it does not turn generated
+YAML into a human authoring input. Infrastructure, authentication and worker
+commissioning belong to [deployment.md](deployment.md).

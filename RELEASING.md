@@ -18,8 +18,9 @@ stays in the private model repository. GitHub CI is not part of the release gate
 5. Deploy the tested Airflow environment and Windows endpoint. Exercise the
    actual DAG against the native endpoint, including retry and failure cases.
    A release claiming the single-path interface must also demonstrate folder
-   transfer, hardware routing, operator login and the verified URDF viewer as
-   required by [deployment acceptance](docs/deployment.md#deployment-acceptance).
+   transfer, CAD-only automatic definition, hardware routing, operator login and
+   the verified URDF viewer as required by
+   [deployment acceptance](docs/deployment.md#deployment-acceptance).
 6. Audit documentation against command help, schemas, tests and measured
    behavior. Record limitations without implying physical/control qualification.
 7. Push the reviewed implementation to public `main`, tag the new tool version,
