@@ -504,11 +504,19 @@ def _independent_clusters(record: dict):
     return {root: sorted(value) for root, value in members.items()}, pairs
 
 
-def _datum(record: dict, name) -> dict | None:
-    for datum in record.get("datums") or []:
-        if isinstance(datum, dict) and str(datum.get("name")) == str(name):
-            return datum
-    return None
+def _owned_datum(record: dict, name, owners) -> dict | None:
+    """The single datum of that name owned by one of ``owners``.
+
+    A name that two datums of the same body share is ambiguous, exactly as a name that no
+    component of the body owns is unusable: both answer ``None`` so the caller blocks.
+    """
+    wanted = {str(owner) for owner in owners}
+    candidates = [
+        datum
+        for datum in record.get("datums") or []
+        if isinstance(datum, dict) and str(datum.get("name")) == str(name) and str(datum.get("owner") or "") in wanted
+    ]
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _frame(values) -> list[list[float]] | None:
@@ -813,6 +821,16 @@ def verify_discovery(package: Path) -> dict:
         _require(isinstance(raw, dict), "discovery.graph", "the raw record is missing")
         components = raw.get("components")
         _require(isinstance(components, list) and components, "discovery.graph", "the record lists no components")
+        component_names = [str(item.get("name2") or "") for item in components if isinstance(item, dict)]
+        _require(
+            all(component_names) and len(component_names) == len(set(component_names)),
+            "discovery.graph",
+            "component occurrence names must be unique and non-empty",
+            {
+                "duplicates": sorted({name for name in component_names if component_names.count(name) > 1}),
+                "empty": sum(1 for name in component_names if not name),
+            },
+        )
         names = {str(item.get("name2")) for item in components if isinstance(item, dict)}
         frames = _frames(raw)
         for mate in raw.get("mates") or []:
@@ -985,10 +1003,10 @@ def verify_discovery(package: Path) -> dict:
                 {"body": name},
             )
             _require(
-                _datum(raw, frame["coordinate_system"]) is not None,
+                _owned_datum(raw, frame["coordinate_system"], body.get("components") or []) is not None,
                 "discovery.bodies",
-                "a body frame names no recorded datum",
-                {"body": name},
+                "a body frame names no datum owned uniquely by that body",
+                {"body": name, "datum": frame["coordinate_system"]},
             )
         _require("base_link" in seen, "discovery.bodies", "no base_link body")
         return {"bodies": len(source_bodies)}
@@ -1049,12 +1067,11 @@ def verify_discovery(package: Path) -> dict:
                 components_properties = (raw.get("properties") or {}).get("components") or {}
                 explicit = {(components_properties.get(component) or {}).get("dp.body_datum") for component in group}
                 if datum_name in explicit:
-                    owner = str((_datum(raw, datum_name) or {}).get("owner") or "")
                     _require(
-                        owner in group,
+                        _owned_datum(raw, datum_name, group) is not None,
                         "discovery.names",
-                        "body_datum names a datum no component of this body owns",
-                        {"body": name, "datum": datum_name, "owner": owner},
+                        "body_datum names a datum no component of this body owns uniquely",
+                        {"body": name, "datum": datum_name},
                     )
                 else:
                     _require(
@@ -1235,7 +1252,13 @@ def verify_discovery(package: Path) -> dict:
                     {"joint": joint.get("name"), "offset_m": offset},
                 )
             child = next(body for body in source["bodies"] if str(body.get("name")) == str(joint.get("child")))
-            child_datum = _datum(raw, child["frame"]["coordinate_system"])
+            child_datum = _owned_datum(raw, child["frame"]["coordinate_system"], child.get("components") or [])
+            _require(
+                child_datum is not None,
+                "discovery.joints",
+                "the child body frame names no datum owned uniquely by that body",
+                {"body": child.get("name"), "datum": child["frame"]["coordinate_system"]},
+            )
             frame = _frame(child_datum.get("array"))
             sign_value = properties.get("dp.joint.axis_sign")
             _require(
@@ -1512,7 +1535,17 @@ def verify_discovery(package: Path) -> dict:
                 "JCS_ datum is not owned by the child body's components",
                 {"datum": name, "owner": datum.get("owner")},
             )
-            reference = _datum(raw, (child.get("frame") or {}).get("coordinate_system"))
+            reference = _owned_datum(
+                raw,
+                (child.get("frame") or {}).get("coordinate_system"),
+                child.get("components") or [],
+            )
+            _require(
+                reference is not None,
+                "discovery.frames",
+                "a JCS_ child body has no datum owned uniquely by that body",
+                {"datum": name, "body": child.get("name")},
+            )
             alias = [float(value) for value in datum.get("array") or ()]
             target = [float(value) for value in (reference or {}).get("array") or ()]
             _require(

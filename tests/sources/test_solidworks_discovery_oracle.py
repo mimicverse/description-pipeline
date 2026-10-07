@@ -455,6 +455,67 @@ class OracleSemanticsTests(unittest.TestCase):
         _passed, _errors, checks = self.check(package)
         self.assertTrue(checks["discovery.graph"]["passed"], checks["discovery.graph"])
 
+    # ------------------------------------------------ occurrence and datum ownership
+
+    def test_duplicate_component_occurrence_blocks(self) -> None:
+        def mutate(raw, payload):
+            raw["components"].append(copy.deepcopy(raw["components"][1]))
+
+        self.reject(mutate, "component occurrence names must be unique and non-empty")
+
+    def test_body_frame_datum_must_be_owned_by_that_body(self) -> None:
+        def mutate(raw, payload):
+            raw["datums"][0]["owner"] = "arm-1"
+
+        package = self.baseline()
+        self._native(package, mutate)
+        passed, errors, _checks = self.check(package)
+        self.assertFalse(passed, errors)
+        self.assertTrue(
+            any(
+                error["code"] == "discovery.bodies" and "owned uniquely by that body" in error["message"]
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_ambiguous_same_named_datum_for_one_body_blocks(self) -> None:
+        def mutate(raw, payload):
+            twin = copy.deepcopy(raw["datums"][1])
+            twin["array"] = [1.0, 0.0, 0.0, 9.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+            raw["datums"].append(twin)
+
+        package = self.baseline()
+        self._native(package, mutate)
+        passed, errors, _checks = self.check(package)
+        self.assertFalse(passed, errors)
+        self.assertTrue(
+            any(
+                error["code"] in {"discovery.bodies", "discovery.joints", "discovery.frames"}
+                and "owned uniquely" in error["message"]
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_nested_occurrence_paths_need_a_real_assembly_parent(self) -> None:
+        def orphan(raw, payload):
+            ghost = copy.deepcopy(raw["components"][1])
+            ghost.update({"name2": "ghost-1/arm-2", "instance_id": "ghost-1/arm-2"})
+            raw["components"].append(ghost)
+
+        def under_a_part(raw, payload):
+            ghost = copy.deepcopy(raw["components"][1])
+            ghost.update({"name2": "base-1/arm-2", "instance_id": "base-1/arm-2"})
+            raw["components"].append(ghost)
+
+        for mutate in (orphan, under_a_part):
+            with self.subTest(mutate=mutate.__name__):
+                package = self.baseline()
+                self._native(package, mutate)
+                passed, errors, _checks = self.check(package)
+                self.assertFalse(passed, errors)
+
 
 if __name__ == "__main__":
     unittest.main()
