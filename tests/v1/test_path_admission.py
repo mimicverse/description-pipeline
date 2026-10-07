@@ -46,16 +46,14 @@ class ArtifactPathTests(unittest.TestCase):
             (root / "中文目录" / "零件.SLDPRT").write_bytes(b"fixture")
             self.assertTrue(confined(root, "中文目录/零件.SLDPRT").parent.is_dir())
             for character in FORBIDDEN:
-                with self.subTest(character=character):
-                    with self.assertRaises(PipelineError):
-                        confined(root, f"中文目录/零件{character}2.SLDPRT")
+                with self.subTest(character=character), self.assertRaises(PipelineError):
+                    confined(root, f"中文目录/零件{character}2.SLDPRT")
 
     def test_archive_admission_rejects_forbidden_members(self) -> None:
         safe_members(["docs/机械手规范.md", "meshes/中文零件.STL"])
         for character in FORBIDDEN:
-            with self.subTest(character=character):
-                with self.assertRaises(PipelineError):
-                    safe_members([f"docs/规范{character}.md"])
+            with self.subTest(character=character), self.assertRaises(PipelineError):
+                safe_members([f"docs/规范{character}.md"])
 
 
 if __name__ == "__main__":

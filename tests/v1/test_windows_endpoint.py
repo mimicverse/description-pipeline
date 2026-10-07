@@ -6,90 +6,20 @@ import json
 import copy
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import unittest
 import urllib.error
 import urllib.request
-import uuid
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-from description_pipeline.io import PipelineError, file_digest, write_json
+from description_pipeline.io import PipelineError, write_json
 from description_pipeline.orchestration.windows import Jobs, RequestError, handler, read_config
-from description_pipeline.sources.solidworks.revision import seal_revision
+from .endpoint_support import EndpointFixture
 
 
-class EndpointTests(unittest.TestCase):
-    def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
-        self.packages = self.root / "packages"
-        self.package = self.packages / "arm/r1"
-        self.package.mkdir(parents=True)
-        (self.package / "assembly.SLDASM").write_bytes(b"non-native request control fixture")
-        (self.package / "robot.yaml").write_text("author control fixture")
-        seal_revision(
-            self.package,
-            hardware_id="arm",
-            revision="r1",
-            owner="mechanical",
-            system="handoff",
-            reference="arm/r1",
-            summary="Test queue",
-        )
-        (self.root / "repository").mkdir()
-        subprocess.run(["git", "init", "-q", str(self.root / "repository")], check=True)
-        subprocess.run(
-            ["git", "-C", str(self.root / "repository"), "remote", "add", "origin", "https://github.com/a/b.git"],
-            check=True,
-        )
-        (self.root / "token.txt").write_text("t" * 64)
-        self.path = self.root / "config.json"
-        self.config_data = {
-            "schema_version": "solidworks-to-urdf.endpoint/v1",
-            "package_root": str(self.packages),
-            "output_root": str(self.root / "outputs"),
-            "state_root": str(self.root / "state"),
-            "token_file": str(self.root / "token.txt"),
-            "targets": {"arm": {"repository": str(self.root / "repository"), "base": "feature/arm"}},
-        }
-        write_json(self.path, self.config_data)
-        self.config = read_config(self.path)
-
-    def request(self):
-        return {
-            "run_id": str(uuid.uuid4()),
-            "package": "arm/r1",
-            "target": "arm",
-            "revision_sha256": file_digest(self.package / "cad-revision.json"),
-        }
-
-    def jobs(self, runner):
-        jobs = Jobs(self.config, runner=runner)
-        self.addCleanup(jobs.close)
-        return jobs
-
-    def passing_result(self):
-        subject = "a" * 64
-        return {
-            "passed": True,
-            "subject_sha256": subject,
-            "quality": {"passed": True, "subject_sha256": subject},
-            "submission": {
-                "passed": True,
-                "subject_sha256": subject,
-                "url": "https://github.com/a/b/pull/1",
-                "repository_slug": "a/b",
-                "base": "feature/arm",
-                "branch": "work/solidworks/arm",
-                "state": "published",
-                "commit": "b" * 40,
-            },
-        }
-
+class EndpointTests(EndpointFixture, unittest.TestCase):
     def test_idempotent_retry_is_bound_to_exact_request_and_survives_restart(self):
         calls = []
 
@@ -97,7 +27,7 @@ class EndpointTests(unittest.TestCase):
             calls.append(kwargs["run_id"])
             return self.passing_result()
 
-        jobs = Jobs(self.config, runner=runner)
+        jobs = Jobs(self.config, runner=runner, native_preparer=self.prepare)
         request = self.request()
         jobs.create(request)
         jobs.queue.join()
@@ -106,7 +36,7 @@ class EndpointTests(unittest.TestCase):
         self.assertEqual("passed", result["status"])
         self.assertEqual(1, len(calls))
         with self.assertRaises(RequestError) as error:
-            jobs.create({**request, "target": "another"})
+            jobs.create({**request, "handoff_sha256": "f" * 64})
         self.assertEqual(409, error.exception.status)
         jobs.close()
         resumed = self.jobs(runner)
@@ -145,30 +75,44 @@ class EndpointTests(unittest.TestCase):
             self.assertEqual("failed", result["status"])
             self.assertTrue(result["error"])
 
-    def test_queued_restart_and_incompatible_metadata_fail_once(self):
-        jobs = Jobs(self.config, runner=lambda *args, **kwargs: self.passing_result())
-        request = self.request()
-        jobs.create(request)
-        jobs.queue.join()
-        saved = jobs.snapshot(request["run_id"])
+    def test_queued_restart_rechecks_frozen_native_bytes(self):
+        jobs = Jobs(self.config, runner=lambda *a, **k: self.fail("Unexpected job"), native_preparer=self.prepare)
         jobs.close()
-        saved.update(status="queued", result=None)
-        state = self.config["state_root"] / "jobs" / (request["run_id"] + ".json")
-        write_json(state, saved)
-        resumed = Jobs(self.config, runner=lambda *args, **kwargs: self.passing_result())
-        resumed.queue.join()
-        self.assertEqual("passed", resumed.snapshot(request["run_id"])["status"])
-        resumed.close()
-        saved.pop("repository_slug")
-        write_json(state, saved)
-        broken = Jobs(self.config, runner=lambda *args, **kwargs: self.fail("Incompatible job ran"))
-        broken.queue.join()
-        result = broken.snapshot(request["run_id"])
-        self.assertEqual("failed", result["status"])
-        self.assertIn("Persisted job lacks matching repository metadata", result["error"])
-        broken.close()
-        recovered = self.jobs(lambda *args, **kwargs: self.fail("Failed job reran"))
-        self.assertEqual(result["error"], recovered.snapshot(request["run_id"])["error"])
+        for changed in (False, True):
+            request = self.request()
+            package = self.packages / request["package"]
+            from description_pipeline.sources.solidworks.revision import package_inventory
+
+            saved = {
+                "schema_version": "solidworks-to-urdf.job/v1",
+                "pipeline_id": "solidworks-to-urdf",
+                "run_id": request["run_id"],
+                "request": request,
+                "package_files": package_inventory(package),
+                "status": "queued",
+                "events": [],
+                "result": None,
+                "error": None,
+            }
+            if changed:
+                (package / "总装.SLDASM").write_bytes(b"Changed while offline")
+            state = self.config["state_root"] / "jobs" / (request["run_id"] + ".json")
+            write_json(state, saved)
+            calls = []
+
+            def runner(*a, calls=calls, **k):
+                calls.append(k["run_id"])
+                return self.passing_result()
+
+            resumed = Jobs(self.config, runner=runner, native_preparer=self.prepare)
+            resumed.queue.join()
+            result = resumed.snapshot(request["run_id"])
+            self.assertEqual("failed" if changed else "passed", result["status"])
+            self.assertEqual([] if changed else [request["run_id"]], calls)
+            resumed.close()
+            recovered = Jobs(self.config, runner=lambda *a, **k: self.fail("Completed job reran"))
+            self.assertEqual(result["status"], recovered.snapshot(request["run_id"])["status"])
+            recovered.close()
 
     def test_native_jobs_are_serial(self):
         active, peak = 0, 0
@@ -187,12 +131,12 @@ class EndpointTests(unittest.TestCase):
         jobs.queue.join()
         self.assertEqual(1, peak)
 
-    def test_unknown_target_path_escape_and_revision_changes_are_rejected(self):
+    def test_extra_fields_path_escape_and_changed_handoff_are_rejected(self):
         jobs = self.jobs(lambda *args, **kwargs: self.fail("Unvalidated request ran"))
         for mutation in (
             {"target": "unknown"},
             {"package": "../arm"},
-            {"revision_sha256": "0" * 64},
+            {"handoff_sha256": "0" * 64},
             {"command": "anything"},
         ):
             with self.subTest(mutation=mutation), self.assertRaises(PipelineError):
@@ -234,8 +178,10 @@ class EndpointTests(unittest.TestCase):
         script = (
             "import os,sys;from pathlib import Path;"
             f"sys.path.insert(0,{str(Path(__file__).resolve().parents[2] / 'src')!r});"
+            f"sys.path.insert(0,{str(Path(__file__).resolve().parents[2])!r});"
+            "from tests.v1.endpoint_support import prepare_control;"
             "from description_pipeline.orchestration.windows import Jobs,read_config;"
-            "j=Jobs(read_config(Path(sys.argv[1])),runner=lambda *a,**k:os._exit(17));"
+            "j=Jobs(read_config(Path(sys.argv[1])),native_preparer=prepare_control,runner=lambda *a,**k:os._exit(17));"
             f"j.create({request!r});j.queue.join()"
         )
         stopped = subprocess.run([sys.executable, "-I", "-c", script, str(self.path)], capture_output=True, timeout=10)

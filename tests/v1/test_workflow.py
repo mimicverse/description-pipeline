@@ -124,10 +124,10 @@ class WorkflowTests(unittest.TestCase):
             solidworks.run(self.package, self.package / "output")
         self.assertEqual(before, (self.package / "robot.yaml").read_bytes())
 
-    def test_report_option_cannot_overwrite_author_input(self):
+    def test_report_option_cannot_overwrite_delivery_input(self):
         before = (self.package / "robot.yaml").read_bytes()
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            result = main(["inspect", str(self.package), "--report", str(self.package / "robot.yaml")])
+            result = main(["check", str(self.package), "--report", str(self.package / "robot.yaml")])
         self.assertEqual(1, result)
         self.assertEqual(before, (self.package / "robot.yaml").read_bytes())
 

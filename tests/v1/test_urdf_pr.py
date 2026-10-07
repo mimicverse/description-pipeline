@@ -123,8 +123,6 @@ class PublishTests(unittest.TestCase):
             if args[:2] == ("pr", "create"):
                 self.pr_exists = True
                 return "https://github.com/example/m3.0/pull/1\n"
-            if args[:2] == ("pr", "edit"):
-                raise subprocess.CalledProcessError(1, ["gh", *args], stderr="retired Projects classic GraphQL")
             if args[0] == "api":
                 self.assertEqual(args[:4], ("api", "--method", "PATCH", "repos/example/m3.0/pulls/1"))
                 self.rest_payloads.append(json.loads(Path(args[args.index("--input") + 1]).read_text(encoding="utf-8")))
@@ -201,7 +199,7 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(len([c for c in self.gh_calls if c[:2] == ("pr", "create")]), 1)
         self.assertGreaterEqual(len(self.rest_payloads), 2)
 
-    def test_existing_pr_update_survives_legacy_cli_and_preserves_utf8_metadata(self):
+    def test_existing_pr_update_preserves_utf8_metadata(self):
         self.submit()
         message = 'Update left wrist — 左腕 "$literal" `text`\nDetailed review'
         result = self.submit(message=message)
