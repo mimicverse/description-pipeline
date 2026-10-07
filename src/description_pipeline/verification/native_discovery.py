@@ -146,8 +146,113 @@ def _direction(entity: dict) -> list[float] | None:
     return None
 
 
-def _rows_for(mate: dict) -> dict | None:
-    """The verifier's own constraint reconstruction; ``None`` means unsupported."""
+def _frames(record: dict) -> dict[str, list[list[float]] | None]:
+    frames: dict[str, list[list[float]] | None] = {}
+    for item in record.get("components") or []:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name2")
+        if not isinstance(name, str) or item.get("suppressed"):
+            continue
+        try:
+            numbers = [float(value) for value in item.get("transform") or ()]
+        except (TypeError, ValueError):
+            numbers = []
+        frames[name] = [numbers[0:4], numbers[4:8], numbers[8:12], numbers[12:16]] if len(numbers) == 16 else None
+    return frames
+
+
+def _apply_point(point, frame):
+    x, y, z = (float(value) for value in point)
+    return [
+        frame[0][0] * x + frame[0][1] * y + frame[0][2] * z + frame[0][3],
+        frame[1][0] * x + frame[1][1] * y + frame[1][2] * z + frame[1][3],
+        frame[2][0] * x + frame[2][1] * y + frame[2][2] * z + frame[2][3],
+    ]
+
+
+def _apply_vector(vector, frame):
+    x, y, z = (float(value) for value in vector)
+    return [
+        frame[0][0] * x + frame[0][1] * y + frame[0][2] * z,
+        frame[1][0] * x + frame[1][1] * y + frame[1][2] * z,
+        frame[2][0] * x + frame[2][1] * y + frame[2][2] * z,
+    ]
+
+
+def _plane_basis(axis: list[float]) -> list[list[float]]:
+    """Two orthonormal directions spanning the plane orthogonal to the axis."""
+
+    helper = [1.0, 0.0, 0.0] if abs(axis[0]) <= 0.9 else [0.0, 1.0, 0.0]
+    first = _unit_vector(_cross(axis, helper))
+    second = _unit_vector(_cross(axis, first)) if first is not None else None
+    return [value for value in (first, second) if value is not None]
+
+
+def _translation_row(direction, point):
+    moment = _cross(point, direction)
+    return [direction[0], direction[1], direction[2], moment[0], moment[1], moment[2]]
+
+
+def _rotation_row(direction):
+    return [0.0, 0.0, 0.0, direction[0], direction[1], direction[2]]
+
+
+def _null_space(rows, dim: int = 6) -> list[list[float]]:
+    """The oracle's own elimination: twists the rows leave free."""
+
+    matrix = [[float(value) for value in row] for row in rows]
+    pivot_columns: list[int] = []
+    index = 0
+    for column in range(dim):
+        chosen = None
+        for candidate in range(index, len(matrix)):
+            if abs(matrix[candidate][column]) > TOL:
+                chosen = candidate
+                break
+        if chosen is None:
+            continue
+        matrix[index], matrix[chosen] = matrix[chosen], matrix[index]
+        factor = matrix[index][column]
+        matrix[index] = [value / factor for value in matrix[index]]
+        for other in range(len(matrix)):
+            if other != index and abs(matrix[other][column]) > TOL:
+                weight = matrix[other][column]
+                matrix[other] = [one - weight * two for one, two in zip(matrix[other], matrix[index], strict=True)]
+        pivot_columns.append(column)
+        index += 1
+        if index == len(matrix):
+            break
+    basis: list[list[float]] = []
+    for column in [value for value in range(dim) if value not in pivot_columns]:
+        vector = [0.0] * dim
+        vector[column] = 1.0
+        for row, pivot in enumerate(pivot_columns):
+            vector[pivot] = -matrix[row][column]
+        norm = math.sqrt(sum(value * value for value in vector))
+        basis.append([value / norm for value in vector])
+    return basis
+
+
+def _geometry(entity: dict, frames):
+    frame = frames.get(str(entity.get("component")))
+    if frame is None:
+        return None, None
+    if isinstance(entity.get("cylinder"), dict):
+        direction = _unit_vector(_apply_vector(entity["cylinder"].get("direction") or (), frame))
+        point = _apply_point(entity["cylinder"].get("point") or (), frame)
+        return point, direction
+    if isinstance(entity.get("plane"), dict):
+        direction = _unit_vector(_apply_vector(entity["plane"].get("normal") or (), frame))
+        point = _apply_point(entity["plane"].get("point") or (), frame)
+        return point, direction
+    if isinstance(entity.get("point"), (list, tuple)):
+        return _apply_point(entity["point"], frame), None
+    return None, None
+
+
+def _rows_for(mate: dict, frames) -> dict | None:
+    """The oracle's own constraint reconstruction; ``None`` means unsupported."""
 
     kind = str(mate.get("type") or "").strip().lower()
     if kind not in SUPPORTED_MATES:
@@ -157,99 +262,96 @@ def _rows_for(mate: dict) -> dict | None:
         return None
     first, second = entities[0], entities[1]
     limits = mate.get("limits") if isinstance(mate.get("limits"), dict) else None
+    axes = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
     if kind == "lock":
-        basis = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
-        return {"T": basis, "R": basis, "limits": limits, "axis": None}
+        point, _ = _geometry(first, frames)
+        if point is None:
+            return None
+        rows = [_translation_row(axis, point) for axis in axes] + [_rotation_row(axis) for axis in axes]
+        return {"rows": rows, "limits": limits, "axis": None, "point": point}
     if kind == "concentric":
-        left = _unit_vector((first.get("cylinder") or {}).get("direction"))
-        right = _unit_vector((second.get("cylinder") or {}).get("direction"))
-        if left is None or right is None or abs(abs(_dot(left, right)) - 1.0) > TOL:
+        left_point, left_axis = _geometry(first, frames)
+        right_point, right_axis = _geometry(second, frames)
+        if left_axis is None or right_axis is None or abs(abs(_dot(left_axis, right_axis)) - 1.0) > TOL:
             return None
-        basis = [
-            _unit_vector(_cross(left, [1.0, 0.0, 0.0])),
-            _unit_vector(_cross(left, [0.0, 1.0, 0.0])),
-        ]
-        basis = _span(basis)
-        if len(basis) != 2:
-            return None
-        return {"T": basis, "R": basis, "limits": limits, "axis": left}
-    if kind == "coincident":
-        first_plane = first.get("plane") if isinstance(first.get("plane"), dict) else None
-        second_plane = second.get("plane") if isinstance(second.get("plane"), dict) else None
-        first_point = first.get("point") if isinstance(first.get("point"), (list, tuple)) else None
-        second_point = second.get("point") if isinstance(second.get("point"), (list, tuple)) else None
-        if first_plane is not None and second_plane is not None:
-            left = _unit_vector(first_plane.get("normal"))
-            right = _unit_vector(second_plane.get("normal"))
-            if left is None or right is None or abs(abs(_dot(left, right)) - 1.0) > TOL:
-                return None
-            normal = left if _dot(left, right) >= 0 else [-value for value in left]
-            plane = _span(
-                [_unit_vector(_cross(normal, [1.0, 0.0, 0.0])), _unit_vector(_cross(normal, [0.0, 1.0, 0.0]))]
-            )
-            if len(plane) != 2:
-                return None
-            return {"T": [normal], "R": plane, "limits": limits, "axis": None}
-        if first_point is not None and second_point is not None:
-            return {"T": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], "R": [], "limits": limits, "axis": None}
-        normal = None
-        if first_plane is not None:
-            normal = _unit_vector(first_plane.get("normal"))
-        elif second_plane is not None:
-            normal = _unit_vector(second_plane.get("normal"))
-        if normal is None:
-            return None
-        plane = _span([_unit_vector(_cross(normal, [1.0, 0.0, 0.0])), _unit_vector(_cross(normal, [0.0, 1.0, 0.0]))])
+        plane = _plane_basis(left_axis)
         if len(plane) != 2:
             return None
-        return {"T": [normal], "R": plane, "limits": limits, "axis": None}
+        rows = [_translation_row(direction, left_point) for direction in plane] + [
+            _rotation_row(direction) for direction in plane
+        ]
+        return {"rows": rows, "limits": limits, "axis": left_axis, "point": left_point}
+    if kind == "coincident":
+        left_point, left_axis = _geometry(first, frames)
+        right_point, right_axis = _geometry(second, frames)
+        if (
+            left_axis is not None
+            and right_axis is not None
+            and isinstance(first.get("plane"), dict)
+            and isinstance(second.get("plane"), dict)
+        ):
+            if abs(abs(_dot(left_axis, right_axis)) - 1.0) > TOL:
+                return None
+            normal = left_axis if _dot(left_axis, right_axis) >= 0 else [-value for value in left_axis]
+            plane = _plane_basis(normal)
+            if len(plane) != 2:
+                return None
+            rows = [_translation_row(normal, left_point)] + [_rotation_row(direction) for direction in plane]
+            return {"rows": rows, "limits": limits, "axis": None, "point": left_point}
+        if isinstance(first.get("point"), (list, tuple)) and isinstance(second.get("point"), (list, tuple)):
+            rows = [_translation_row(axis, left_point) for axis in axes]
+            return {"rows": rows, "limits": limits, "axis": None, "point": left_point}
+        normal = left_axis or right_axis
+        point = left_point if left_axis is not None else right_point
+        if normal is None or point is None:
+            return None
+        plane = _plane_basis(normal)
+        if len(plane) != 2:
+            return None
+        rows = [_translation_row(normal, point)] + [_rotation_row(direction) for direction in plane]
+        return {"rows": rows, "limits": limits, "axis": None, "point": point}
     if kind in ("distance", "limitdistance"):
-        direction = None
-        first_point = first.get("point") if isinstance(first.get("point"), (list, tuple)) else None
-        second_point = second.get("point") if isinstance(second.get("point"), (list, tuple)) else None
-        first_plane = first.get("plane") if isinstance(first.get("plane"), dict) else None
-        second_plane = second.get("plane") if isinstance(second.get("plane"), dict) else None
-        if first_point is not None and second_point is not None:
-            direction = _unit_vector([float(second_point[i]) - float(first_point[i]) for i in range(3)])
-        elif first_plane is not None and second_plane is not None:
-            left = _unit_vector(first_plane.get("normal"))
-            right = _unit_vector(second_plane.get("normal"))
-            if left is not None and right is not None and abs(abs(_dot(left, right)) - 1.0) <= TOL:
-                direction = left
-        elif first_point is not None and second_plane is not None:
-            direction = _unit_vector(second_plane.get("normal"))
-        elif first_plane is not None and second_point is not None:
-            direction = _unit_vector(first_plane.get("normal"))
-        if direction is None:
+        left_point, left_axis = _geometry(first, frames)
+        right_point, right_axis = _geometry(second, frames)
+        if isinstance(first.get("point"), (list, tuple)) and isinstance(second.get("point"), (list, tuple)):
+            direction = _unit_vector([right_point[i] - left_point[i] for i in range(3)])
+            point = [(left_point[i] + right_point[i]) / 2.0 for i in range(3)]
+        else:
+            direction = left_axis or right_axis
+            point = left_point if left_axis is not None else right_point
+        if direction is None or point is None:
             return None
-        return {"T": [direction], "R": [], "limits": limits, "axis": None}
+        return {"rows": [_translation_row(direction, point)], "limits": limits, "axis": None, "point": point}
     if kind == "parallel":
-        left = _direction(first)
-        right = _direction(second)
-        if left is None or right is None or abs(abs(_dot(left, right)) - 1.0) > TOL:
+        axis = None
+        for entity in (first, second):
+            _point, direction = _geometry(entity, frames)
+            if isinstance(entity.get("cylinder"), dict) and direction is not None:
+                axis = direction
+                break
+        if axis is None:
+            _first_point, first_axis = _geometry(first, frames)
+            _second_point, second_axis = _geometry(second, frames)
+            if first_axis is None or second_axis is None or abs(abs(_dot(first_axis, second_axis)) - 1.0) > TOL:
+                return None
+            axis = first_axis
+        plane = _plane_basis(axis)
+        if len(plane) != 2:
             return None
-        basis = _span([_unit_vector(_cross(left, [1.0, 0.0, 0.0])), _unit_vector(_cross(left, [0.0, 1.0, 0.0]))])
-        if len(basis) != 2:
-            return None
-        return {"T": [], "R": basis, "limits": limits, "axis": None}
-    left = _direction(first)
-    right = _direction(second)
-    if left is None or right is None:
+        return {
+            "rows": [_rotation_row(direction) for direction in plane],
+            "limits": limits,
+            "axis": None,
+            "point": None,
+        }
+    _first_point, first_axis = _geometry(first, frames)
+    _second_point, second_axis = _geometry(second, frames)
+    if first_axis is None or second_axis is None:
         return None
-    normal = _unit_vector(_cross(left, right))
+    normal = _unit_vector(_cross(first_axis, second_axis))
     if normal is None:
         return None
-    return {"T": [], "R": [normal], "limits": limits, "axis": None}
-
-
-def _free_direction(rows) -> list[float] | None:
-    basis = _span(rows)
-    if not basis:
-        return None
-    if len(basis) >= 2:
-        return _unit_vector(_cross(basis[0], basis[1]))
-    helper = [1.0, 0.0, 0.0] if abs(basis[0][0]) <= 0.9 else [0.0, 1.0, 0.0]
-    return _unit_vector(_cross(basis[0], helper))
+    return {"rows": [_rotation_row(normal)], "limits": limits, "axis": None, "point": None}
 
 
 def _find(nodes: list[str], parent: dict[str, str], node: str) -> str:
@@ -258,17 +360,18 @@ def _find(nodes: list[str], parent: dict[str, str], node: str) -> str:
     return node
 
 
-def _independent_clusters(record: dict) -> tuple[dict[str, list[str]], dict[tuple[str, str], dict]]:
+def _independent_clusters(record: dict):
     components = {
         str(item.get("name2")): item
         for item in record.get("components") or []
         if isinstance(item, dict) and isinstance(item.get("name2"), str) and not item.get("suppressed")
     }
+    frames = _frames(record)
     pairs: dict[tuple[str, str], dict] = {}
     for index, mate in enumerate(record.get("mates") or []):
         if not isinstance(mate, dict) or mate.get("suppressed"):
             continue
-        rows = _rows_for(mate)
+        rows = _rows_for(mate, frames)
         names = _names(mate)
         for left_index in range(len(names)):
             for right_index in range(left_index + 1, len(names)):
@@ -277,22 +380,22 @@ def _independent_clusters(record: dict) -> tuple[dict[str, list[str]], dict[tupl
                     continue
                 key = tuple(sorted((left, right)))
                 group = pairs.setdefault(
-                    key, {"T": [], "R": [], "mates": [], "unresolved": False, "limits": None, "axis": None}
+                    key, {"rows": [], "mates": [], "unresolved": False, "limits": None, "axis": None, "point": None}
                 )
                 group["mates"].append(index)
                 if rows is None:
                     group["unresolved"] = True
                     continue
-                group["T"].extend(rows["T"])
-                group["R"].extend(rows["R"])
+                group["rows"].extend(rows["rows"])
                 if group["limits"] is None and isinstance(rows.get("limits"), dict):
                     group["limits"] = rows["limits"]
                 if group["axis"] is None and isinstance(rows.get("axis"), list):
                     group["axis"] = rows["axis"]
+                    group["point"] = rows.get("point")
     for group in pairs.values():
-        group["rank"] = (len(_span(group["T"])), len(_span(group["R"])))
+        group["rank"] = len(_span(group["rows"]))
     parent = {name: name for name in components}
-    union = [key for key, group in sorted(pairs.items()) if not group["unresolved"] and group["rank"] == (3, 3)]
+    union = [key for key, group in sorted(pairs.items()) if not group["unresolved"] and group["rank"] == 6]
     fixed = [name for name, item in components.items() if item.get("fixed")]
     if fixed:
         union.extend((fixed[0], name) for name in fixed[1:])
@@ -303,8 +406,7 @@ def _independent_clusters(record: dict) -> tuple[dict[str, list[str]], dict[tupl
     markers: dict[str, list[str]] = {}
     properties = (record.get("properties") or {}).get("components") or {}
     for name in components:
-        values = properties.get(name) or {}
-        marker = values.get("dp.body_marker")
+        marker = (properties.get(name) or {}).get("dp.body_marker")
         if isinstance(marker, str) and marker.strip():
             markers.setdefault(marker.strip(), []).append(name)
     for group in markers.values():
@@ -396,6 +498,27 @@ def _primary_name(mates: list[dict]) -> str:
         if any(isinstance(item.get("cylinder"), dict) for item in _entities(mate)):
             return str(mate.get("name") or "")
     return str(mates[0].get("name") or "") if mates else ""
+
+
+def _joint_properties(raw: dict, mates: list[dict]) -> dict:
+    """Mate-level scalars plus document-level ``dp.joint.<name>.<key>`` scalars."""
+
+    merged: dict = {}
+    mate_properties = (raw.get("properties") or {}).get("mates") or {}
+    document = (raw.get("properties") or {}).get("document") or {}
+    names = [str(mate.get("name") or "") for mate in mates]
+    for name in names:
+        for key, value in (mate_properties.get(name) or {}).items():
+            merged.setdefault(key, value)
+    heads = {name.split("__", 1)[0] for name in names if "__" in name}
+    prefixes = [f"dp.joint.{head}." for head in sorted(heads)] + [f"dp.joint.{name}." for name in names if name]
+    for key, value in document.items():
+        if not isinstance(key, str):
+            continue
+        for prefix in prefixes:
+            if key.startswith(prefix):
+                merged.setdefault(f"dp.joint.{key[len(prefix) :]}", value)
+    return merged
 
 
 def verify_discovery(package: Path) -> dict:
@@ -597,12 +720,13 @@ def verify_discovery(package: Path) -> dict:
         components = raw.get("components")
         _require(isinstance(components, list) and components, "discovery.graph", "the record lists no components")
         names = {str(item.get("name2")) for item in components if isinstance(item, dict)}
+        frames = _frames(raw)
         for mate in raw.get("mates") or []:
             _require(isinstance(mate, dict), "discovery.graph", "a mate entry is not an object")
             if mate.get("suppressed"):
                 continue
             _require(
-                _rows_for(mate) is not None,
+                _rows_for(mate, frames) is not None,
                 "discovery.graph",
                 "a mate is outside the supported constraint scope or lacks usable entities",
                 {"type": mate.get("type"), "name": mate.get("name")},
@@ -680,40 +804,85 @@ def verify_discovery(package: Path) -> dict:
         frozen = payload.get("frozen_names") or {}
         _require(isinstance(frozen, dict), "discovery.names", "frozen_names must be an object")
         source = robot.get("source") or {}
-        body_names = {str(body.get("name")) for body in source.get("bodies") or []}
-        joint_names = {str(joint.get("name")) for joint in source.get("joints") or []}
-        members, _pairs = _independent_clusters(raw)
+        bodies = source.get("bodies") or []
+        joints = source.get("joints") or []
+        members, pairs = _independent_clusters(raw)
         components = {str(item.get("name2")): item for item in raw.get("components") or [] if isinstance(item, dict)}
-        for _root, group in sorted(members.items()):
-            documents = sorted({str(components.get(name, {}).get("document") or "") for name in group} - {""})
-            identity = documents[0] if documents else group[0]
-            if identity in frozen:
-                _require(
-                    frozen[identity] in body_names,
-                    "discovery.names",
-                    "a frozen published body name was not preserved",
-                    {"identity": identity, "expected": frozen[identity]},
-                )
-        pair_primary: dict[tuple[str, str], str] = {}
-        raw_mates = raw.get("mates") or []
-        for key, group in sorted(_pairs.items()):
-            mates = [raw_mates[index] for index in group["mates"] if 0 <= index < len(raw_mates)]
-            pair_primary[key] = _primary_name(mates)
-        for key, primary in sorted(pair_primary.items()):
-            identity = primary or f"{key[0]}:{key[1]}"
-            if identity in frozen:
-                _require(
-                    frozen[identity] in joint_names,
-                    "discovery.names",
-                    "a frozen published joint name was not preserved",
-                    {"identity": identity, "expected": frozen[identity]},
-                )
-        for identity, name in sorted(frozen.items()):
+        datums = [item for item in raw.get("datums") or [] if isinstance(item, dict)]
+        identities: dict[str, str] = {}
+        for group in members.values():
+            body = next(
+                (item for item in bodies if {str(value) for value in (item.get("components") or [])} == set(group)),
+                None,
+            )
+            _require(body is not None, "discovery.names", "a rigid body has no robot.yaml body", {"components": group})
+            name = str(body.get("name"))
+            datum_name = str((body.get("frame") or {}).get("coordinate_system"))
+            owned = [
+                item for item in datums if str(item.get("owner") or "") in group and str(item.get("name")) == datum_name
+            ]
             _require(
-                str(name) in body_names or str(name) in joint_names,
+                owned,
                 "discovery.names",
-                "a frozen name was dropped from the package",
-                {"identity": identity, "name": name},
+                "a body frame datum is not owned by its components",
+                {"body": name, "datum": datum_name},
+            )
+            item = components.get(group[0], {})
+            identity = str(item.get("instance_id") or f"{item.get('document') or ''}#{group[0]}")
+            identities[identity] = name
+            if identity in frozen:
+                _require(
+                    str(frozen[identity]) == name,
+                    "discovery.names",
+                    "a frozen published name was not preserved",
+                    {"identity": identity, "expected": frozen[identity], "observed": name},
+                )
+            else:
+                _require(
+                    datum_name == f"CS_{name}",
+                    "discovery.names",
+                    "the body datum must be CS_<link>",
+                    {"body": name, "datum": datum_name},
+                )
+        raw_mates = raw.get("mates") or []
+        joint_identities: dict[str, str] = {}
+        for _key, group in sorted(pairs.items()):
+            if group["unresolved"] or group["rank"] == 6:
+                continue
+            mates = [raw_mates[index] for index in group["mates"] if 0 <= index < len(raw_mates)]
+            heads = []
+            for mate in mates:
+                head, separator, role = str(mate.get("name") or "").partition("__")
+                _require(
+                    bool(separator) and bool(role) and _SNAKE.match(head) is not None,
+                    "discovery.names",
+                    "mate names must form <joint>__<role>",
+                    {"mate": mate.get("name")},
+                )
+                heads.append(head)
+            _require(
+                len(set(heads)) == 1,
+                "discovery.names",
+                "the mates of one pair carry different group names",
+                {"mates": [m.get("name") for m in mates]},
+            )
+            name = heads[0]
+            joint_identities[str(mates[0].get("name") or "")] = name
+            matching = [joint for joint in joints if str(joint.get("name")) == name]
+            _require(matching, "discovery.names", "a named mate group has no joint", {"group": name})
+        for identity, published in sorted(frozen.items()):
+            observed = identities.get(identity) or joint_identities.get(identity)
+            _require(
+                observed is not None,
+                "discovery.names",
+                "a frozen identity matches no body or joint",
+                {"identity": identity},
+            )
+            _require(
+                str(published) == observed,
+                "discovery.names",
+                "a frozen published name was not preserved",
+                {"identity": identity, "expected": published, "observed": observed},
             )
         return {"frozen": len(frozen)}
 
@@ -724,15 +893,16 @@ def verify_discovery(package: Path) -> dict:
         source = robot.get("source") or {}
         source_joints = source.get("joints") or []
         bodies = {
-            frozenset(str(item) for item in (body.get("components") or [])): str(body.get("name"))
+            frozenset(str(value) for value in (body.get("components") or [])): body
             for body in source.get("bodies") or []
         }
         component_body: dict[str, str] = {}
-        for components, name in bodies.items():
+        for components, body in bodies.items():
             for component in components:
-                component_body[component] = name
+                component_body[component] = str(body.get("name"))
         _members, pairs = _independent_clusters(raw)
-        seen: set[tuple[str, str]] = set()
+        raw_mates = raw.get("mates") or []
+        seen: set[frozenset] = set()
         derived = 0
         for key, group in sorted(pairs.items()):
             _require(
@@ -741,7 +911,7 @@ def verify_discovery(package: Path) -> dict:
                 "a mate pair could not be reconstructed",
                 {"components": list(key)},
             )
-            if group["rank"] == (3, 3):
+            if group["rank"] == 6:
                 continue
             derived += 1
             left, right = key
@@ -768,26 +938,37 @@ def verify_discovery(package: Path) -> dict:
             )
             joint = matching[0]
             seen.add(pair)
-            mates = [raw["mates"][index] for index in group["mates"] if 0 <= index < len(raw.get("mates") or [])]
-            properties: dict = {}
-            for mate in mates:
-                values = ((raw.get("properties") or {}).get("mates") or {}).get(str(mate.get("name") or "")) or {}
-                for name, value in values.items():
-                    properties.setdefault(name, value)
+            mates = [raw_mates[index] for index in group["mates"] if 0 <= index < len(raw_mates)]
+            properties = _joint_properties(raw, mates)
             hint = str(properties.get("dp.joint.type") or "").strip().lower()
-            annotation = str(joint.get("type"))
-            rank_t, rank_r = group["rank"]
-            if (rank_t, rank_r) == (3, 2):
-                expected_type = "continuous" if hint == "continuous" else "revolute"
-            elif (rank_t, rank_r) == (2, 3):
+            nullity = 6 - group["rank"]
+            _require(
+                nullity == 1,
+                "discovery.joints",
+                "the mate pair does not leave exactly one motion",
+                {
+                    "rank": group["rank"],
+                    "nullity": nullity,
+                    "components": list(key),
+                },
+            )
+            twist = _null_space(group["rows"], 6)[0]
+            velocity, omega = twist[:3], twist[3:]
+            w = math.sqrt(_dot(omega, omega))
+            v = math.sqrt(_dot(velocity, velocity))
+            if w <= 1e-9:
                 expected_type = "prismatic"
+                direction = [value / v for value in velocity]
+                axis_point = None
             else:
                 _require(
-                    False,
+                    not (v > 1e-9 and abs(_dot(velocity, omega)) > 1e-6 * max(v, w) ** 2),
                     "discovery.joints",
-                    "an unsupported freedom pattern was reduced to a joint",
-                    {"translation_rank": rank_t, "rotation_rank": rank_r, "components": list(key)},
+                    "the reconstructed motion is a screw, not a supported joint",
                 )
+                expected_type = "continuous" if hint == "continuous" else "revolute"
+                direction = [value / w for value in omega]
+                axis_point = [value / (w * w) for value in _cross(omega, velocity)]
             _require(
                 hint in {"", expected_type},
                 "discovery.joints",
@@ -795,49 +976,39 @@ def verify_discovery(package: Path) -> dict:
                 {"annotation": hint, "derived": expected_type},
             )
             _require(
-                annotation == expected_type,
+                str(joint.get("type")) == expected_type,
                 "discovery.joints",
                 "the joint type differs from the reconstructed freedom",
-                {"derived": expected_type, "type": annotation},
+                {"derived": expected_type, "type": joint.get("type")},
             )
-            # Axis: the recorded shaft must follow the reconstructed freedom.
-            free = _free_direction(group["R"] if rank_r == 2 else group["T"])
+            shaft = group["axis"]
             _require(
-                free is not None,
-                "discovery.joints",
-                "the reconstructed freedom has no free axis",
-                {"components": list(key)},
-            )
-            cylinder_mate = next(
-                (mate for mate in mates if any(isinstance(item.get("cylinder"), dict) for item in _entities(mate))),
-                None,
-            )
-            _require(
-                cylinder_mate is not None,
+                shaft is not None,
                 "discovery.joints",
                 "no cylindrical mate entity carries the joint shaft",
                 {"joint": joint.get("name")},
             )
-            cylinders = [
-                item["cylinder"] for item in _entities(cylinder_mate) if isinstance(item.get("cylinder"), dict)
-            ]
-            point = [float(value) for value in cylinders[0].get("point") or ()]
-            direction = _unit_vector(cylinders[0].get("direction"))
-            _require(direction is not None and len(point) == 3, "discovery.joints", "the shaft reading is unusable")
             _require(
-                abs(abs(_dot(direction, free)) - 1.0) <= 1e-4,
+                abs(abs(_dot(shaft, direction)) - 1.0) <= 1e-4,
                 "discovery.joints",
                 "the recorded shaft does not follow the reconstructed freedom",
-                {"joint": joint.get("name"), "shaft": direction, "freedom": free},
+                {"joint": joint.get("name")},
             )
-            axis = {"point": point, "direction": direction}
-            if str(properties.get("dp.joint.axis_sign")) in {"-1"}:
-                axis["direction"] = [-value for value in axis["direction"]]
-            child_name = str(joint.get("child"))
-            child_body = next(body for body in source["bodies"] if str(body.get("name")) == child_name)
-            child_datum = _datum(raw, child_body["frame"]["coordinate_system"])
+            if axis_point is not None and group.get("point") is not None:
+                offset = _offset(group["point"], axis_point, direction)
+                _require(
+                    offset <= AXIS_OFFSET_TOL_M,
+                    "discovery.joints",
+                    "the recorded shaft misses the reconstructed axis",
+                    {"joint": joint.get("name"), "offset_m": offset},
+                )
+            child = next(body for body in source["bodies"] if str(body.get("name")) == str(joint.get("child")))
+            child_datum = _datum(raw, child["frame"]["coordinate_system"])
             frame = _frame(child_datum.get("array"))
-            local = _local_axis(frame, axis["direction"])
+            native = [float(value) for value in shaft]
+            if str(properties.get("dp.joint.axis_sign")) == "-1":
+                native = [-value for value in native]
+            local = _local_axis(frame, native)
             norm = math.sqrt(sum(value * value for value in local))
             _require(norm > 0, "discovery.joints", "the child frame collapses the joint axis")
             local = [value / norm for value in local]
@@ -858,22 +1029,21 @@ def verify_discovery(package: Path) -> dict:
             selector = None
             for mate in mates:
                 for entity in _entities(mate):
-                    if str(entity.get("component")) == str(reference.get("component")) and isinstance(
+                    if str(entity.get("component")) != str(reference.get("component")) or not isinstance(
                         entity.get("cylinder"), dict
                     ):
-                        if reference.get("feature_name"):
-                            if str(entity.get("feature")) == str(reference["feature_name"]):
-                                selector = entity
-                        elif entity.get("face_index") == reference.get("face_index"):
+                        continue
+                    if reference.get("feature_name"):
+                        if str(entity.get("feature")) == str(reference["feature_name"]):
                             selector = entity
+                    elif entity.get("face_index") == reference.get("face_index"):
+                        selector = entity
             _require(
                 selector is not None,
                 "discovery.joints",
                 "the shaft selector does not match a mate entity",
                 {"joint": joint.get("name")},
             )
-            # Limits and drive come from the native mate or the embedded record.
-            native = next((mate.get("limits") for mate in mates if isinstance(mate.get("limits"), dict)), None)
             limits = joint.get("limits")
             _require(
                 isinstance(limits, dict),
@@ -881,28 +1051,30 @@ def verify_discovery(package: Path) -> dict:
                 "a movable joint has no limits",
                 {"joint": joint.get("name")},
             )
-            if annotation == "continuous":
+            if expected_type == "continuous":
                 _require(
                     "lower" not in limits and "upper" not in limits,
                     "discovery.joints",
                     "a continuous joint carries position bounds",
                 )
-                _require(native is None, "discovery.joints", "a continuous joint has native position limits")
-            elif native is not None:
+                _require(group["limits"] is None, "discovery.joints", "a continuous joint has native position limits")
+            elif isinstance(group["limits"], dict):
+                unit = group["limits"].get("unit")
+                _require(
+                    unit == ("m" if expected_type == "prismatic" else "rad"),
+                    "discovery.joints",
+                    "native limits are not in SI units",
+                    {"unit": unit, "type": expected_type},
+                )
                 _require(
                     _close(
-                        [limits.get("lower"), limits.get("upper")], [native.get("lower"), native.get("upper")], 1e-12
+                        [limits.get("lower"), limits.get("upper")],
+                        [group["limits"].get("lower"), group["limits"].get("upper")],
+                        1e-12,
                     ),
                     "discovery.joints",
                     "the joint limits differ from the native mate",
                     {"joint": joint.get("name")},
-                )
-                unit = native.get("unit")
-                _require(
-                    unit == ("m" if annotation == "prismatic" else "rad"),
-                    "discovery.joints",
-                    "native limits are not in SI units",
-                    {"unit": unit, "type": annotation},
                 )
             else:
                 reference_record = properties.get("dp.joint.limits_record")
@@ -937,16 +1109,14 @@ def verify_discovery(package: Path) -> dict:
                 "the joint drive differs from the controlled record",
                 {"joint": joint.get("name")},
             )
-            # The child frame must sit on the shaft.
-            if cylinder_mate is not None:
-                origin = [frame[0][3], frame[1][3], frame[2][3]]
-                offset = _offset(axis["point"], origin, axis["direction"])
-                _require(
-                    offset <= AXIS_OFFSET_TOL_M,
-                    "discovery.joints",
-                    "the child body frame is off the native joint axis",
-                    {"joint": joint.get("name"), "offset_m": offset},
-                )
+            origin = [frame[0][3], frame[1][3], frame[2][3]]
+            offset = _offset(group["point"], origin, native)
+            _require(
+                offset <= AXIS_OFFSET_TOL_M,
+                "discovery.joints",
+                "the child body frame is off the native joint axis",
+                {"joint": joint.get("name"), "offset_m": offset},
+            )
         for joint in source_joints:
             pair = frozenset((str(joint.get("parent")), str(joint.get("child"))))
             _require(

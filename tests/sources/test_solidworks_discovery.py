@@ -90,22 +90,26 @@ def record() -> dict:
         "components": [
             {
                 "name2": "base-1",
+                "instance_id": "base-1",
                 "document": "cad/base.SLDPRT",
                 "configuration": "Default",
                 "fixed": True,
                 "suppressed": False,
+                "transform": copy.deepcopy(IDENTITY),
             },
             {
                 "name2": "arm-1",
+                "instance_id": "arm-1",
                 "document": "cad/arm.SLDPRT",
                 "configuration": "Default",
                 "fixed": False,
                 "suppressed": False,
+                "transform": copy.deepcopy(IDENTITY),
             },
         ],
         "mates": [
             {
-                "name": "Concentric1",
+                "name": "shoulder_pitch__axis",
                 "type": "concentric",
                 "suppressed": False,
                 "limits": None,
@@ -125,7 +129,7 @@ def record() -> dict:
                 ],
             },
             {
-                "name": "Coincident1",
+                "name": "shoulder_pitch__seat",
                 "type": "coincident",
                 "suppressed": False,
                 "limits": None,
@@ -144,8 +148,8 @@ def record() -> dict:
             },
         ],
         "datums": [
-            {"name": "CS_base", "owner": "", "array": copy.deepcopy(IDENTITY)},
-            {"name": "CS_arm", "owner": "", "array": _translated(0.0, 0.0, 0.1)},
+            {"name": "CS_base_link", "owner": "base-1", "array": copy.deepcopy(IDENTITY)},
+            {"name": "CS_arm", "owner": "arm-1", "array": _translated(0.0, 0.0, 0.1)},
         ],
         "masses": [
             {"component": "base-1", "mass_kg": 0.192, "material": "Alloy Steel"},
@@ -157,8 +161,7 @@ def record() -> dict:
             "document": {"dp.design_budget_record": "budget.json#robot"},
             "components": {},
             "mates": {
-                "Concentric1": {
-                    "dp.joint.name": "shoulder_pitch",
+                "shoulder_pitch__axis": {
                     "dp.joint.limits_record": "joints/arm.json#limits",
                     "dp.joint.drive_record": "joints/arm.json#drive",
                 }
@@ -248,7 +251,7 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual([body["name"] for body in source_block["bodies"]], ["arm", "base_link"])
         self.assertEqual(
             {body["name"]: body["frame"]["coordinate_system"] for body in source_block["bodies"]},
-            {"arm": "CS_arm", "base_link": "CS_base"},
+            {"arm": "CS_arm", "base_link": "CS_base_link"},
         )
         joint = source_block["joints"][0]
         self.assertEqual(joint["name"], "shoulder_pitch")
@@ -279,16 +282,14 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(report["joints"], 1)
 
     def test_frozen_published_name_is_preserved(self):
-        settings = DiscoverySettings(
-            record_roots=(self._native()[1],), frozen_names={"cad/arm.SLDPRT": "right_arm_link"}
-        )
+        settings = DiscoverySettings(record_roots=(self._native()[1],), frozen_names={"arm-1": "right_arm_link"})
         result, _source, output = self._prepare(settings=settings)
         self.assertTrue(result.passed, result.findings)
         document = yaml.safe_load((output / "robot.yaml").read_text(encoding="utf-8"))
         names = [body["name"] for body in document["source"]["bodies"]]
         self.assertIn("right_arm_link", names)
         payload = json.loads((output / "discovery/native-discovery.json").read_text(encoding="utf-8"))
-        self.assertEqual(payload["frozen_names"].get("cad/arm.SLDPRT"), "right_arm_link")
+        self.assertEqual(payload["frozen_names"].get("arm-1"), "right_arm_link")
         self.assertTrue(verify_discovery(output)["passed"])
 
     # ----------------------------------------------------------------- blocking
@@ -322,11 +323,11 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_missing_limits_and_drive_block(self):
         result, _source, _output = self._prepare(
-            mutate=lambda payload: payload["properties"]["mates"]["Concentric1"].pop("dp.joint.limits_record")
+            mutate=lambda payload: payload["properties"]["mates"]["shoulder_pitch__axis"].pop("dp.joint.limits_record")
         )
         self.assertIn("discovery.joint_limits_missing", self._codes(result))
         result, _source, _output = self._prepare(
-            mutate=lambda payload: payload["properties"]["mates"]["Concentric1"].pop("dp.joint.drive_record")
+            mutate=lambda payload: payload["properties"]["mates"]["shoulder_pitch__axis"].pop("dp.joint.drive_record")
         )
         self.assertIn("discovery.joint_drive_missing", self._codes(result))
 
@@ -344,6 +345,81 @@ class DiscoveryTests(unittest.TestCase):
             mutate=lambda payload: payload["properties"]["document"].pop("dp.design_budget_record")
         )
         self.assertIn("discovery.design_budget_missing", self._codes(result))
+
+    def test_off_origin_rotated_hinge_reconstructs_the_axis(self):
+        """A hinge whose shaft is off-origin and whose child is rotated."""
+
+        def rotate_x_minus_90(vector):
+            x, y, z = vector
+            return [x, z, -y]
+
+        def mutate(payload):
+            arm = next(item for item in payload["components"] if item["name2"] == "arm-1")
+            arm["transform"] = [
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                -1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+            ]
+            axis_mate, seat = payload["mates"]
+            axis_mate["entities"][0]["cylinder"] = {
+                "point": [0.3, 0.3, 0.5],
+                "direction": [0.0, 1.0, 0.0],
+                "radius": 0.006,
+            }
+            axis_mate["entities"][1]["cylinder"] = {
+                "point": rotate_x_minus_90([0.3, 0.3, 0.5]) if False else [0.3, -0.5, 0.3],
+                "direction": [0.0, 0.0, 1.0],
+                "radius": 0.006,
+            }
+            seat["entities"][0]["plane"] = {"point": [0.3, 0.3, 0.5], "normal": [0.0, 1.0, 0.0]}
+            seat["entities"][1]["plane"] = {"point": [0.3, -0.5, 0.3], "normal": [0.0, 0.0, 1.0]}
+            datum = next(item for item in payload["datums"] if item["name"] == "CS_arm")
+            datum["array"] = _translated(0.3, 0.35, 0.5)
+
+        result, _source, output = self._prepare(mutate=mutate)
+        self.assertTrue(result.passed, result.findings)
+        document = yaml.safe_load((output / "robot.yaml").read_text(encoding="utf-8"))
+        joint = document["source"]["joints"][0]
+        self.assertEqual(joint["type"], "revolute")
+        self.assertEqual(joint["axis"], [0.0, 1.0, 0.0])
+        self.assertEqual(verify_discovery(output)["passed"], True)
+
+    def test_child_frame_off_the_native_axis_blocks(self):
+        def mutate(payload):
+            datum = next(item for item in payload["datums"] if item["name"] == "CS_arm")
+            datum["array"] = _translated(0.4, 0.0, 0.1)
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        self.assertIn("discovery.joint_frame_off_axis", self._codes(result))
+
+    def test_mate_group_naming_is_required(self):
+        def mutate(payload):
+            payload["mates"][0]["name"] = "Concentric1"
+            payload["properties"]["mates"]["Concentric1"] = payload["properties"]["mates"].pop("shoulder_pitch__axis")
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        self.assertIn("discovery.joint_name_missing", self._codes(result))
+
+    def test_link_name_must_be_a_CS_datum_owned_by_the_body(self):
+        def mutate(payload):
+            for datum in payload["datums"]:
+                datum["name"] = datum["name"].replace("CS_", "AX_")
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        self.assertIn("discovery.link_name_missing", self._codes(result))
 
     # ------------------------------------------------------------ verifier gates
 
