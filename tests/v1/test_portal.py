@@ -375,8 +375,8 @@ class PortalTests(unittest.TestCase):
 
     def test_a_forged_or_stale_sso_cookie_is_refused(self) -> None:
         self.client.jar.set_cookie(_airflow_token_cookie("forged"))
-        status, _, _ = self.client.request("GET", "/api/session")
-        self.assertEqual(status, 401)
+        status, _, body = self.client.request("GET", "/api/session")
+        self.assertEqual(status, 401, body)
 
     def test_start_run_carries_one_folder_field(self) -> None:
         self.client.login()

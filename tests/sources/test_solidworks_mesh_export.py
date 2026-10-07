@@ -13,6 +13,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
@@ -52,6 +53,7 @@ class FakeBody:
 class FakeDocument:
     def __init__(self, values):
         self._values = values
+        self.ConfigurationManager = SimpleNamespace(ActiveConfiguration=SimpleNamespace(Name="Default"))
 
     def GetTessTriangles(self, flag):  # noqa: N802 - SolidWorks API name
         return list(self._values)
@@ -61,6 +63,7 @@ class FakeComponent:
     def __init__(self, document, bodies):
         self._document = document
         self._bodies = bodies
+        self.ReferencedConfiguration = "Default"
 
     def GetModelDoc2(self):  # noqa: N802 - SolidWorks API name
         return self._document

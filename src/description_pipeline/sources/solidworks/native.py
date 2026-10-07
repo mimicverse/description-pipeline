@@ -1,4 +1,4 @@
-"""Explicit, fail-closed SolidWorks COM access (ported from tools/solidworks_export).
+"""Explicit, fail-closed SolidWorks COM access.
 
 Each capture owns separate source and copy applications. Documents open read-only
 from saved files; the user's application is never used as a collection server.
@@ -152,6 +152,30 @@ def _select_configuration(doc, configuration, occurrence):
             "the document could not be read in its referenced configuration",
             {**detail, "error": str(error)},
         ) from error
+
+
+@contextmanager
+def _temporary_configuration(doc, configuration, occurrence):
+    """Read one occurrence without leaving its shared document switched."""
+    previous = _active_configuration(doc)
+    if not _is_text_name(previous):
+        raise CadError(
+            "cad_configuration_unreadable",
+            "the document has no readable configuration to restore",
+            {"component": occurrence, "configuration": previous, "phase": "before_read"},
+        )
+    try:
+        _select_configuration(doc, configuration, occurrence)
+        yield previous
+    finally:
+        pending = sys.exception()
+        try:
+            _select_configuration(doc, previous, occurrence)
+        except CadError as error:
+            error.detail["phase"] = "restore"
+            if pending is None:
+                raise
+            pending.add_note(f"Configuration restoration also failed: {error}")
 
 
 def _looks_like_path(value):
@@ -1472,7 +1496,6 @@ class SolidWorksBackend(CadBackend):
             if _member(comp, "IsSuppressed"):
                 continue
             name = str(_member(comp, "Name2"))
-            children = list(_member(comp, "GetChildren") or ())
             part = _member(comp, "GetModelDoc2")
             if part is None:
                 raise CadError("cad_component_unresolved", name)
@@ -1484,33 +1507,32 @@ class SolidWorksBackend(CadBackend):
                 raise CadError("cad_component_not_on_disk", name, {"component": name, "path": path})
             self._record_save_flag(part, path)
             referenced = _member(comp, "ReferencedConfiguration")
-            _select_configuration(part, referenced, name)
-            placement = self._placement(comp)
-            record_datums(part, name, placement)
-            # Intermediate assemblies own placements/configurations too. Their
-            # saved bytes and in-memory state are part of the source closure.
-            self._source_components[name] = (comp, str(referenced))
-            if path not in self.source_files:
-                self.source_files[path] = _hash(path)
-            if children:
-                if _member(part, "GetType") != 2:
-                    raise CadError("cad_component_type", name)
-                stack.extend(children)
-                continue
-            if _member(part, "GetType") != 1:
-                raise CadError("cad_empty_subassembly", name)
-            components.append(RawComponent(name, path, placement, bool(_member(comp, "IsFixed")), "part"))
-            self._components[name] = comp
-            # Solids and sheet bodies are different geometry: record which the
-            # part really carries so a sheet-only part is never mistaken for an
-            # empty one.
-            self.notes["bodies:" + name] = {
-                "solid": self._body_count(comp, 0, name),
-                "sheet": self._body_count(comp, 1, name),
-            }
-            properties[name] = self._mass_properties_document(part, require_material)
-            properties[name]["reference"]["configuration"] = referenced
-            self.notes["mass_property:" + name] = properties[name]["reference"]["used_api"]
+            with _temporary_configuration(part, referenced, name) as previous:
+                children = list(_member(comp, "GetChildren") or ())
+                placement = self._placement(comp)
+                record_datums(part, name, placement)
+                # Occurrence references are independent of the one active state
+                # of a shared document; every temporary selection is restored.
+                self._source_components[name] = (comp, str(referenced), previous)
+                if path not in self.source_files:
+                    self.source_files[path] = _hash(path)
+                if children:
+                    if _member(part, "GetType") != 2:
+                        raise CadError("cad_component_type", name)
+                    stack.extend(children)
+                    continue
+                if _member(part, "GetType") != 1:
+                    raise CadError("cad_empty_subassembly", name)
+                components.append(RawComponent(name, path, placement, bool(_member(comp, "IsFixed")), "part"))
+                self._components[name] = comp
+                # Include solids and sheets from this occurrence's configuration.
+                self.notes["bodies:" + name] = {
+                    "solid": self._body_count(comp, 0, name),
+                    "sheet": self._body_count(comp, 1, name),
+                }
+                properties[name] = self._mass_properties_document(part, require_material)
+                properties[name]["reference"]["configuration"] = referenced
+                self.notes["mass_property:" + name] = properties[name]["reference"]["used_api"]
         if not components:
             raise CadError("cad_empty_model", "assembly has no resolved solid parts")
         missing_datums = sorted(requested_datums - transforms.keys())
@@ -1589,27 +1611,25 @@ class SolidWorksBackend(CadBackend):
             raise CadError("cad_missing_component", component)
         holder = self._components[component]
         doc = _member(holder, "GetModelDoc2")
-        document_values = list(map(float, _member(doc, "GetTessTriangles", True) or ()))
-        document_valid = (
-            bool(document_values) and len(document_values) % 9 == 0 and all(map(math.isfinite, document_values))
-        )
-        solid_bodies = self._body_list(holder, 0, component)
-        sheet_bodies = self._body_list(holder, 1, component)
         sources: list[str] = []
         values: list[float] = []
-        if document_valid:
-            # The historical path: one part-document display tessellation.  It
-            # covers solid bodies only, so sheet bodies are appended below.
-            values.extend(document_values)
-            sources.append("part_document")
-        elif solid_bodies:
-            values.extend(self._body_face_triangles(holder, 0, component))
-            sources.append("solid_body_faces")
-        if sheet_bodies:
-            # Sheet bodies (e.g. the PCB) never appear in GetTessTriangles; a
-            # sheet-only part must still export the geometry it really has.
-            values.extend(self._body_face_triangles(holder, 1, component))
-            sources.append("sheet_body_faces")
+        with _temporary_configuration(doc, _member(holder, "ReferencedConfiguration"), component):
+            document_values = list(map(float, _member(doc, "GetTessTriangles", True) or ()))
+            document_valid = (
+                bool(document_values) and len(document_values) % 9 == 0 and all(map(math.isfinite, document_values))
+            )
+            solid_bodies = self._body_list(holder, 0, component)
+            sheet_bodies = self._body_list(holder, 1, component)
+            if document_valid:
+                # Part-document tessellation covers solids; append sheets below.
+                values.extend(document_values)
+                sources.append("part_document")
+            elif solid_bodies:
+                values.extend(self._body_face_triangles(holder, 0, component))
+                sources.append("solid_body_faces")
+            if sheet_bodies:
+                values.extend(self._body_face_triangles(holder, 1, component))
+                sources.append("sheet_body_faces")
         if not values:
             raise CadError(
                 "cad_mesh_export_failed",
@@ -1676,7 +1696,7 @@ class SolidWorksBackend(CadBackend):
                     "after": {"configuration": configuration},
                 },
             )
-        for name, (comp, referenced) in self._source_components.items():
+        for name, (comp, referenced, previous) in self._source_components.items():
             doc = _member(comp, "GetModelDoc2")
             if doc is None:
                 raise CadError("cad_source_changed", name)
@@ -1685,7 +1705,7 @@ class SolidWorksBackend(CadBackend):
                 "configuration": _member(active, "Name"),
                 "referenced_configuration": _member(comp, "ReferencedConfiguration"),
             }
-            expected = {"configuration": referenced, "referenced_configuration": referenced}
+            expected = {"configuration": previous, "referenced_configuration": referenced}
             if state != expected:
                 raise CadError(
                     "cad_source_changed",

@@ -24,8 +24,9 @@ from itertools import pairwise
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from description_pipeline.geometry.stl import read as read_stl
 from description_pipeline.sources.solidworks.errors import CadError
-from description_pipeline.sources.solidworks.native import SolidWorksBackend
+from description_pipeline.sources.solidworks.native import SolidWorksBackend, _temporary_configuration
 
 #: SolidWorks ``MathTransform.ArrayData`` order for an identity occurrence.
 SW_IDENTITY = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
@@ -797,6 +798,88 @@ class CaptureSceneTests(unittest.TestCase):
         backend = _CaptureBackend(session_factory=lambda: _Session(app))
         with _com_stubs():
             return backend.collect_scene(str(assembly), requested)
+
+    def _configured_occurrences(self, root):
+        class ConfiguredDocument(_Doc):
+            def GetTessTriangles(self, _quality):
+                if self.active_configuration == "Short":
+                    return [0, 0, 0, 1, 0, 0, 0, 1, 0]
+                return [0, 0, 0, 2, 0, 0, 0, 2, 0, 2, 0, 0, 2, 2, 0, 0, 2, 0]
+
+        class ConfiguredBackend(_CaptureBackend):
+            def _mass_properties_document(self, doc, require_material=True):
+                return {
+                    "mass_kg": {"Short": 2.0, "Long": 3.0}[doc.active_configuration],
+                    "reference": {
+                        "configuration": doc.active_configuration,
+                        "used_api": "portable-config-mass",
+                    },
+                }
+
+        part = _write(root, "shared.SLDPRT")
+        shared = ConfiguredDocument(
+            part,
+            configuration="Parked",
+            configuration_children={"Short": [], "Long": [], "Parked": []},
+        )
+        short = _Component("part-short", part, doc=shared, configuration="Short")
+        long = _Component("part-long", part, doc=shared, configuration="Long")
+        assembly = _write(root, "robot.SLDASM")
+        main = _Doc(assembly, doc_type=2, children=[short, long])
+        backend = ConfiguredBackend(session_factory=lambda: _Session(_App({assembly: main})))
+        scene = backend.collect_scene(str(assembly), [])
+        return backend, scene, shared, short, part
+
+    def test_repeated_configurations_keep_their_own_mass_mesh_and_restored_state(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            backend, scene, shared, _, _ = self._configured_occurrences(root)
+            self.assertEqual(scene.mass_properties["part-short"]["mass_kg"], 2.0)
+            self.assertEqual(scene.mass_properties["part-long"]["mass_kg"], 3.0)
+            for name, triangles, extent in (("part-long", 2, 2.0), ("part-short", 1, 1.0)):
+                path = root / f"{name}.stl"
+                result = backend.export_component_mesh(name, path)
+                self.assertEqual(result["triangles"], triangles)
+                self.assertEqual(read_stl(path).high, (extent, extent, 0.0))
+                self.assertEqual(shared.active_configuration, "Parked")
+            backend.verify_sources_unchanged()
+
+    def test_repeated_configuration_source_guard_still_rejects_real_drift(self):
+        for drift in ("reference", "active", "file"):
+            with self.subTest(drift=drift), TemporaryDirectory() as tmp, _com_stubs():
+                backend, _, shared, short, part = self._configured_occurrences(Path(tmp))
+                if drift == "reference":
+                    short.ReferencedConfiguration = "Long"
+                elif drift == "active":
+                    self.assertTrue(shared.ShowConfiguration2("Long"))
+                else:
+                    part.write_bytes(b"changed native source")
+                with self.assertRaises(CadError) as caught:
+                    backend.verify_sources_unchanged()
+                self.assertEqual(caught.exception.code, "cad_source_changed")
+
+    def test_failed_configuration_restore_does_not_mask_a_read_failure(self):
+        class RestoreFailure(_Doc):
+            def ShowConfiguration2(self, name):
+                return False if name == "Parked" else super().ShowConfiguration2(name)
+
+        for fail_read in (False, True):
+            with self.subTest(fail_read=fail_read), _com_stubs():
+                doc = RestoreFailure(
+                    "shared.SLDPRT",
+                    configuration="Parked",
+                    configuration_children={"Short": [], "Parked": []},
+                )
+                read_error = CadError("cad_mesh_export_failed", "original reading failure")
+                with self.assertRaises(CadError) as caught, _temporary_configuration(doc, "Short", "part-short"):
+                    if fail_read:
+                        raise read_error
+                if fail_read:
+                    self.assertIs(caught.exception, read_error)
+                    self.assertIn("restoration also failed", caught.exception.__notes__[0])
+                else:
+                    self.assertEqual(caught.exception.code, "cad_configuration_unreadable")
+                    self.assertEqual(caught.exception.detail["phase"], "restore")
 
     def test_component_owned_datum_composes_with_occurrence_placement(self) -> None:
         with TemporaryDirectory() as tmp:

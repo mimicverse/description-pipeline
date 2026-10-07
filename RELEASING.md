@@ -12,7 +12,9 @@ model repository. Retain local acceptance evidence; GitHub CI is not required.
 2. Capture the neutral moving-joint analytic fixture on licensed Windows
    SolidWorks. Verify native discovery, occurrence transforms, shaft identity,
    off-diagonal inertia and full assembly closure. Retain the native API/build
-   and independent verification report.
+   and independent verification report. Include repeated part occurrences with
+   distinct saved configurations and a nested rigid assembly to verify context,
+   geometry and mass coverage.
 3. Build twice from one clean committed checkout. Compare distribution hashes
    and verify installation outside that checkout on Linux and Windows.
 4. Accept the deployed workflow: HTTPS login → native folder → Airflow run →

@@ -65,6 +65,11 @@ before measurements. This refreshes assembly caches, including mass properties;
 it never saves over CAD. The snapshot records the rebuild and verifies both
 original and collected file hashes after capture. A failed rebuild blocks export.
 
+Each occurrence's datums, mass and mesh are read in its exact referenced
+configuration. Shared documents are restored after each read; final checks
+verify both the restored document state and unchanged occurrence references.
+An unreadable selection or failed restoration blocks capture.
+
 Captured transforms use the native adapter protocol: SI, row-major 4×4
 homogeneous matrices with column-vector multiplication. The adapter converts
 SolidWorks' vendor MathTransform layout at the COM boundary. Verification reads
