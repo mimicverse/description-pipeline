@@ -356,6 +356,7 @@ def _instance_error(name: str, parent: str | None, depth: int, stage: str, error
     }
 
 
+#: SW2026 ``swMateType_e`` values, verified against the installed typelib.
 _SW_MATE_TYPES = {
     0: "coincident",
     1: "concentric",
@@ -364,42 +365,90 @@ _SW_MATE_TYPES = {
     4: "tangent",
     5: "distance",
     6: "angle",
-    7: "lock",
+    7: "unknown",
+    8: "symmetric",
+    9: "camfollower",
+    10: "gear",
+    11: "width",
+    12: "locktosketch",
+    13: "rackpinion",
+    14: "maxmates",
+    15: "path",
+    16: "lock",
+    17: "screw",
+    18: "linearcoupler",
+    19: "universaljoint",
+    20: "coordinate",
+    21: "slot",
+    22: "hinge",
+    23: "slider",
+    24: "profilecenter",
+    25: "magnetic",
 }
 
 
-def _custom_properties(doc, configuration=None):
-    """Document and configuration custom properties, unmodified."""
+def _merge_property_scopes(document: dict, configuration: dict) -> dict:
+    """Merge document/configuration properties; conflicting ``dp.*`` values block.
 
-    values = {}
-    for scope in ("", configuration or ""):
-        if scope and scope == "":
-            continue
-        try:
-            manager = _member(_member(doc, "Extension"), "CustomPropertyManager", scope)
-        except Exception:  # noqa: BLE001 - a missing manager is an empty namespace
-            manager = None
-        if manager is None:
-            continue
-        try:
-            names = [str(item) for item in (_as_list(_member(manager, "GetNames")) or [])]
-        except Exception:  # noqa: BLE001
-            continue
-        for name in names:
-            text_value = None
-            for probe in ("Get6", "Get"):
-                try:
-                    raw = _member(manager, probe, name, "", False) if probe == "Get6" else _member(manager, probe, name)
-                except Exception:  # noqa: BLE001
-                    raw = None
-                if isinstance(raw, (list, tuple)) and raw:
-                    raw = raw[0]
-                if _is_text_name(raw):
-                    text_value = str(raw)
-                    break
-            if text_value is not None:
-                values.setdefault(name, text_value)
+    Ordinary CAD properties keep the usual configuration-overrides-document
+    semantics.  A ``dp.*`` key declared with different non-empty values in the
+    two scopes is ambiguous by contract and raises instead of picking one.
+    """
+
+    merged = dict(document)
+    for key, value in configuration.items():
+        if key.startswith("dp.") and key in document:
+            left = str(document[key]).strip()
+            right = str(value).strip()
+            if left and right and left != right:
+                raise CadError(
+                    "cad_property_conflict",
+                    "a dp.* property differs between the document and configuration scopes",
+                    {"field": key, "document": left, "configuration": right},
+                )
+        merged[key] = value
+    return merged
+
+
+def _read_property_scope(doc, scope: str) -> dict:
+    values: dict = {}
+    try:
+        manager = _member(_member(doc, "Extension"), "CustomPropertyManager", scope)
+    except Exception:  # noqa: BLE001 - a missing manager is an empty namespace
+        return values
+    if manager is None:
+        return values
+    try:
+        names = [str(item) for item in (_as_list(_member(manager, "GetNames")) or [])]
+    except Exception:  # noqa: BLE001
+        return values
+    for name in names:
+        text_value = None
+        for probe in ("Get6", "Get"):
+            try:
+                raw = _member(manager, probe, name, "", False) if probe == "Get6" else _member(manager, probe, name)
+            except Exception:  # noqa: BLE001
+                raw = None
+            if isinstance(raw, (list, tuple)) and raw:
+                raw = raw[0]
+            if _is_text_name(raw):
+                text_value = str(raw)
+                break
+        if text_value is not None:
+            values.setdefault(name, text_value)
     return values
+
+
+def _custom_properties(doc, configuration=None):
+    """Document and configuration custom properties with conflict detection."""
+
+    document = _read_property_scope(doc, "")
+    if not configuration:
+        return document
+    configuration_values = _read_property_scope(doc, str(configuration))
+    if not configuration_values:
+        return document
+    return _merge_property_scopes(document, configuration_values)
 
 
 def _plane_or_cylinder(target):
@@ -414,6 +463,12 @@ def _plane_or_cylinder(target):
             if _member(surface, "IsCylinder"):
                 params = [float(value) for value in (_as_list(_member(surface, "CylinderParams")) or [])]
                 if len(params) == 7:
+                    if not all(math.isfinite(value) for value in params):
+                        raise CadError(
+                            "cad_geometry_nonfinite",
+                            "a recorded cylinder parameter is not finite",
+                            {"feature": _feature_name(target)},
+                        )
                     direction = params[3:6]
                     norm = math.sqrt(sum(value * value for value in direction))
                     if norm > 0 and params[6] > 0:
@@ -430,6 +485,12 @@ def _plane_or_cylinder(target):
             if _member(surface, "IsPlane"):
                 params = [float(value) for value in (_as_list(_member(surface, "PlaneParams")) or [])]
                 if len(params) == 6:
+                    if not all(math.isfinite(value) for value in params):
+                        raise CadError(
+                            "cad_geometry_nonfinite",
+                            "a recorded plane parameter is not finite",
+                            {"feature": _feature_name(target)},
+                        )
                     first = params[0:3]
                     second = params[3:6]
                     first_norm = math.sqrt(sum(value * value for value in first))
@@ -441,8 +502,30 @@ def _plane_or_cylinder(target):
         except Exception:  # noqa: BLE001
             pass
     try:
-        point = [float(value) for value in (_as_list(_member(target, "GetPoint")) or [])]
+        curve = _dynamic(_member(target, "GetCurve"))
+        if curve is not None and _member(curve, "IsCircle"):
+            values = [float(value) for value in (_as_list(_member(curve, "CircleParams")) or [])]
+            if len(values) == 7:
+                normal = values[3:6]
+                center = values[0:3]
+                if not all(math.isfinite(value) for value in (*center, *normal, values[6])):
+                    return {}
+                norm = math.sqrt(sum(value * value for value in normal))
+                if norm > 0 and values[6] > 0:
+                    return {
+                        "circle": {
+                            "center": values[0:3],
+                            "normal": [value / norm for value in normal],
+                            "radius": values[6],
+                        }
+                    }
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        point = [float(value) for value in (_as_list(_method(target, "GetPoint")) or [])]
         if len(point) == 3:
+            if not all(math.isfinite(value) for value in point):
+                raise CadError("cad_geometry_nonfinite", "a recorded vertex is not finite", {})
             return {"point": point}
     except Exception:  # noqa: BLE001
         pass
@@ -472,33 +555,74 @@ def _optional_bool(obj, *names):
 def _coordinate_system_features(doc):
     names = []
     try:
-        feature = _dynamic(_member(doc, "FirstFeature"))
-    except Exception:  # noqa: BLE001
-        return names
+        feature = _dynamic(_method(doc, "FirstFeature"))
+    except Exception as error:  # noqa: BLE001
+        raise CadError(
+            "cad_geometry_unreadable", "the feature tree could not be read for datums", {"error": str(error)}
+        ) from error
     while feature is not None:
         try:
-            type_name = str(_member(feature, "GetTypeName2") or "")
+            type_name = str(_method(feature, "GetTypeName2") or "")
             name = _member(feature, "Name")
-        except Exception:  # noqa: BLE001
-            break
+        except Exception as error:  # noqa: BLE001
+            raise CadError(
+                "cad_geometry_unreadable", "a datum feature could not be classified", {"error": str(error)}
+            ) from error
         if type_name in ("CoordSys", "CoordinateSystem") and _is_text_name(name):
             names.append(str(name))
         try:
-            feature = _dynamic(_member(feature, "GetNextFeature"))
-        except Exception:  # noqa: BLE001
-            break
+            feature = _dynamic(_method(feature, "GetNextFeature"))
+        except Exception as error:  # noqa: BLE001
+            raise CadError("cad_geometry_unreadable", "the datum traversal failed", {"error": str(error)}) from error
     return names
 
 
-def _mate_specific(feature):
-    """Return ``(IMate2, entity_count)`` when a feature really is a mate."""
+def _mate_specific(feature, strict=False):
+    """Return ``(IMate2, entity_count)`` for a mate feature.
+
+    ``GetSpecificFeature2`` and ``GetMateEntityCount`` are parameterless vendor
+    *methods* (SW2026 typelib: ``IMate2.GetMateEntityCount()``).  A recognised
+    mate feature whose interface or entity count cannot be read raises instead
+    of vanishing from the observations: a missed mate could evade the
+    constraint-completeness check.
+    """
 
     try:
-        specific = _dynamic(_member(feature, "GetSpecificFeature2"))
-        count = int(_member(specific, "MateEntityCount"))
-    except Exception:  # noqa: BLE001
+        type_name = str(_method(feature, "GetTypeName2") or "")
+    except Exception as error:  # noqa: BLE001
+        if strict:
+            raise CadError("cad_mate_unreadable", "mate feature type is unreadable", {"error": str(error)}) from error
         return None
-    return specific, count
+    if type_name == "MateGroup":
+        return None
+    if not type_name.startswith("Mate"):
+        if strict:
+            raise CadError(
+                "cad_mate_unreadable",
+                "a feature inside the mate group is not a readable mate",
+                {"feature": str(_member(feature, "Name") or ""), "type": type_name},
+            )
+        return None
+    try:
+        specific = _method(feature, "GetSpecificFeature2")
+        raw_count = _method(specific, "GetMateEntityCount")
+    except Exception as error:  # noqa: BLE001
+        raise CadError(
+            "cad_mate_unreadable",
+            "a recognised mate feature could not be read",
+            {"feature": str(_member(feature, "Name") or ""), "type": type_name, "error": str(error)},
+        ) from error
+    if isinstance(raw_count, bool) or not isinstance(raw_count, (int, float)):
+        raise CadError(
+            "cad_mate_unreadable", "mate entity count is not a number", {"feature": type_name, "value": repr(raw_count)}
+        )
+    if not float(raw_count).is_integer() or int(raw_count) <= 0:
+        raise CadError(
+            "cad_mate_unreadable",
+            "mate entity count is not a positive integer",
+            {"feature": type_name, "value": raw_count},
+        )
+    return specific, int(raw_count)
 
 
 def _mate_features(doc):
@@ -506,24 +630,38 @@ def _mate_features(doc):
 
     features = []
     try:
-        top = _dynamic(_member(doc, "FirstFeature"))
-    except Exception:  # noqa: BLE001
-        return features
+        top = _dynamic(_method(doc, "FirstFeature"))
+    except Exception as error:  # noqa: BLE001
+        raise CadError("cad_mate_unreadable", "the feature tree could not be read", {"error": str(error)}) from error
 
-    def walk(feature, step):
+    def walk(feature, step, inside_group=False):
         while feature is not None:
-            found = _mate_specific(feature)
+            try:
+                type_name = str(_method(feature, "GetTypeName2") or "")
+            except Exception as error:  # noqa: BLE001
+                if inside_group:
+                    raise CadError(
+                        "cad_mate_unreadable", "feature type inside the mate group is unreadable", {"error": str(error)}
+                    ) from error
+                type_name = ""
+            found = _mate_specific(feature, strict=inside_group)
             if found is not None:
                 features.append((feature, found[0], found[1]))
             try:
-                sub = _dynamic(_member(feature, "GetFirstSubFeature"))
-            except Exception:  # noqa: BLE001
+                sub = _dynamic(_method(feature, "GetFirstSubFeature"))
+            except Exception as error:  # noqa: BLE001
+                if inside_group:
+                    raise CadError(
+                        "cad_mate_unreadable", "mate sub-feature walk failed", {"error": str(error)}
+                    ) from error
                 sub = None
             if sub is not None:
-                walk(sub, "GetNextSubFeature")
+                walk(sub, "GetNextSubFeature", inside_group or type_name == "MateGroup")
             try:
-                feature = _dynamic(_member(feature, step))
-            except Exception:  # noqa: BLE001
+                feature = _dynamic(_method(feature, step))
+            except Exception as error:  # noqa: BLE001
+                if inside_group:
+                    raise CadError("cad_mate_unreadable", "mate traversal failed", {"error": str(error)}) from error
                 feature = None
 
     walk(top, "GetNextFeature")
@@ -1808,6 +1946,15 @@ class SolidWorksBackend(CadBackend):
                     {"candidates": [str(item[0]) for item in assemblies]},
                 )
             main_path, doc = main
+            notes: list[str] = []
+            try:
+                rebuilt = bool(_member(doc, "ForceRebuild3", False))
+            except Exception as error:  # noqa: BLE001
+                raise CadError(
+                    "cad_rebuild_failed", "the assembly could not be rebuilt before capture", {"error": str(error)}
+                ) from error
+            if not rebuilt:
+                raise CadError("cad_rebuild_failed", "ForceRebuild3 reported failure; the saved state is stale")
             active = _member(_member(doc, "ConfigurationManager"), "ActiveConfiguration")
             configuration = str(_member(active, "Name") or "")
             identity_properties = _custom_properties(doc, configuration)
@@ -1815,10 +1962,12 @@ class SolidWorksBackend(CadBackend):
             by_component = {}
             by_document: dict[str, str] = {}
             masses = []
-            notes: list[str] = []
-            stack = [(doc, "", None)]
+            mates: list[dict] = []
+            stack = [
+                (doc, "", [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]])
+            ]
             while stack:
-                assembly, prefix, _parent = stack.pop()
+                assembly, prefix, parent_matrix = stack.pop()
                 active_config = _member(_member(assembly, "ConfigurationManager"), "ActiveConfiguration")
                 root = _member(active_config, "GetRootComponent3", True)
                 for raw in list(_member(root, "GetChildren") or []):
@@ -1829,19 +1978,29 @@ class SolidWorksBackend(CadBackend):
                     path_name = f"{prefix}/{name}" if prefix else name
                     document_path = _member(component, "GetPathName")
                     relative = _relative_document(document_path, source_root) if _is_text_name(document_path) else None
-                    transform = []
+                    local_transform = []
                     transform_error = "no transform API answered"
                     for probe in (("GetTotalTransform", False), ("GetTotalTransform", True)):
                         try:
                             holder = _member(component, *probe)
-                            transform = [
+                            local_transform = [
                                 float(value) for value in transform_from_solidworks(_member(holder, "ArrayData"))
                             ]
                             break
                         except Exception as error:  # noqa: BLE001 - an unreadable transform must block, not guess
                             transform_error = f"{probe[0]}({probe[1]}): {error}"
-                    if not transform:
+                    if not local_transform:
                         notes.append(f"transform:{path_name}:{transform_error}")
+                    transform = []
+                    if local_transform:
+                        local_matrix = [
+                            local_transform[0:4],
+                            local_transform[4:8],
+                            local_transform[8:12],
+                            local_transform[12:16],
+                        ]
+                        global_matrix = self._multiply_frames(parent_matrix, local_matrix)
+                        transform = [value for row in global_matrix for value in row]
                     entry = {
                         "name2": path_name,
                         "instance_id": path_name,
@@ -1884,53 +2043,126 @@ class SolidWorksBackend(CadBackend):
                     if children:
                         part = _member(component, "GetModelDoc2")
                         if part is not None:
-                            stack.append((part, path_name, component))
-            mates = []
-            for feature, specific, count in _mate_features(doc):
-                name = str(_member(feature, "Name") or "")
-                try:
-                    raw_type = _member(specific, "Type")
-                    type_index = int(raw_type)
-                except Exception:  # noqa: BLE001
-                    type_index = -1
-                mate_type = _SW_MATE_TYPES.get(type_index, f"unknown-{type_index}")
-                entities = []
-                for index in range(count):
+                            referenced = str(_member(component, "ReferencedConfiguration") or "")
+                            active_config = _member(_member(part, "ConfigurationManager"), "ActiveConfiguration")
+                            if referenced and str(_member(active_config, "Name") or "") != referenced:
+                                try:
+                                    _method(part, "ShowConfiguration2", referenced)
+                                except Exception as error:  # noqa: BLE001
+                                    raise CadError(
+                                        "cad_configuration_unreadable",
+                                        "a sub-assembly could not be shown in its referenced configuration",
+                                        {"component": path_name, "configuration": referenced, "error": str(error)},
+                                    ) from error
+                            stack.append(
+                                (
+                                    part,
+                                    path_name,
+                                    [
+                                        transform[0:4],
+                                        transform[4:8],
+                                        transform[8:12],
+                                        transform[12:16],
+                                    ],
+                                )
+                            )
+                for feature, specific, entity_count in _mate_features(assembly):
+                    name = str(_member(feature, "Name") or "")
                     try:
-                        entity = _dynamic(_member(specific, "MateEntity", index))
-                        reference = _dynamic(_member(entity, "ReferenceComponent"))
-                        reference_name = str(_member(reference, "Name2") or "")
-                        reference_path = _relative_document(_member(reference, "GetPathName"), source_root)
-                        owner = next(
-                            (
-                                key
-                                for key in by_component
-                                if key.split("/")[-1] == reference_name
-                                and (reference_path is None or by_document.get(key) == reference_path)
-                            ),
-                            None,
-                        )
+                        type_index = int(_method(specific, "Type"))
+                    except Exception:  # noqa: BLE001
+                        type_index = -1
+                    mate_type = _SW_MATE_TYPES.get(type_index, f"unknown-{type_index}")
+                    entities = []
+                    for entity_index in range(entity_count):
+                        try:
+                            entity = _dynamic(_method(specific, "MateEntity", entity_index))
+                            reference = _dynamic(_member(entity, "ReferenceComponent"))
+                            reference_name = str(_member(reference, "Name2") or "")
+                            reference_path = _relative_document(_member(reference, "GetPathName"), source_root)
+                        except Exception as error:  # noqa: BLE001
+                            raise CadError(
+                                "cad_mate_unreadable",
+                                "a mate entity could not be read",
+                                {"mate": name, "error": str(error)},
+                            ) from error
+                        scoped = [
+                            key
+                            for key in by_component
+                            if key.split("/")[-1] == reference_name
+                            and (reference_path is None or by_document.get(key) == reference_path)
+                            and (not prefix or key.startswith(prefix + "/"))
+                        ]
+                        if len(scoped) != 1:
+                            raise CadError(
+                                "cad_mate_scope_ambiguous",
+                                "a mate entity does not resolve to exactly one component occurrence",
+                                {"mate": name, "component": reference_name, "candidates": sorted(scoped)[:8]},
+                            )
                         target = _member(entity, "Reference")
-                        geometry = _plane_or_cylinder(target)
                         entities.append(
                             {
-                                "component": owner or reference_name,
+                                "component": scoped[0],
                                 "feature": _feature_name(target),
                                 "face_index": None,
-                                **geometry,
+                                **_plane_or_cylinder(target),
                             }
                         )
-                    except Exception:  # noqa: BLE001 - an unreadable entity blocks via the empty list
-                        continue
-                mates.append(
-                    {
-                        "name": name,
-                        "type": mate_type,
-                        "suppressed": False,
-                        "limits": None,
-                        "entities": entities,
-                    }
-                )
+                    limits = None
+                    try:
+                        lower = float(_method(specific, "MinimumVariation"))
+                        upper = float(_method(specific, "MaximumVariation"))
+                    except Exception as error:  # noqa: BLE001
+                        raise CadError(
+                            "cad_mate_limits_unreadable",
+                            "mate travel variation could not be read",
+                            {"mate": name, "type": mate_type, "error": str(error)},
+                        ) from error
+                    if not (math.isfinite(lower) and math.isfinite(upper)):
+                        raise CadError("cad_mate_limits_invalid", "mate travel variation is not finite", {"mate": name})
+                    if upper < lower:
+                        raise CadError(
+                            "cad_mate_limits_invalid",
+                            "mate travel range is inverted",
+                            {"mate": name, "lower": lower, "upper": upper},
+                        )
+                    if upper > lower + 1e-12:
+                        unit = "m" if type_index == 5 else "rad" if type_index == 6 else None
+                        if unit is None:
+                            raise CadError(
+                                "cad_mate_limits_invalid",
+                                "a bounded range on an unsupported mate type cannot be observed",
+                                {"mate": name, "type": mate_type},
+                            )
+                        limits = {"lower": lower, "upper": upper, "unit": unit}
+                        mate_type = "limitdistance" if type_index == 5 else "limitangle"
+                    try:
+                        suppressed = bool(_method(feature, "IsSuppressed"))
+                    except Exception as error:  # noqa: BLE001
+                        raise CadError(
+                            "cad_mate_unreadable",
+                            "mate suppression state could not be read",
+                            {"mate": name, "error": str(error)},
+                        ) from error
+                    try:
+                        error_code = int(_method(feature, "GetErrorCode"))
+                    except Exception as error:  # noqa: BLE001
+                        raise CadError(
+                            "cad_mate_unreadable",
+                            "mate solve state could not be read; the constraint cannot be trusted",
+                            {"mate": name, "error": str(error)},
+                        ) from error
+                    mates.append(
+                        {
+                            "name": name,
+                            "type": mate_type,
+                            "suppressed": suppressed,
+                            "limits": limits,
+                            "entities": entities,
+                            "error_code": error_code,
+                            "scope": prefix or "",
+                        }
+                    )
             datums = []
             for name in _coordinate_system_features(doc):
                 try:
@@ -1947,9 +2179,12 @@ class SolidWorksBackend(CadBackend):
                     continue
                 for name in _coordinate_system_features(document):
                     try:
-                        local = self._coordinate_system_transform(document, name)
+                        values = [float(value) for value in self._coordinate_system_transform(document, name)]
                     except Exception:  # noqa: BLE001
                         continue
+                    if len(values) != 16:
+                        continue
+                    local = [values[0:4], values[4:8], values[8:12], values[12:16]]
                     component_matrix = [
                         entry["transform"][0:4],
                         entry["transform"][4:8],

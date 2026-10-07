@@ -107,7 +107,7 @@ def _unit_vector(vector) -> list[float] | None:
         values = [float(value) for value in vector or ()]
     except (TypeError, ValueError):
         return None
-    if len(values) != 3:
+    if len(values) != 3 or not all(math.isfinite(value) for value in values):
         return None
     norm = math.sqrt(sum(value * value for value in values))
     if norm == 0:
@@ -143,6 +143,8 @@ def _span(rows) -> list[list[float]]:
 def _direction(entity: dict) -> list[float] | None:
     if isinstance(entity.get("cylinder"), dict):
         return _unit_vector(entity["cylinder"].get("direction"))
+    if isinstance(entity.get("circle"), dict):
+        return _unit_vector(entity["circle"].get("normal"))
     if isinstance(entity.get("plane"), dict):
         return _unit_vector(entity["plane"].get("normal"))
     return None
@@ -244,6 +246,10 @@ def _geometry(entity: dict, frames):
         direction = _unit_vector(_apply_vector(entity["cylinder"].get("direction") or (), frame))
         point = _apply_point(entity["cylinder"].get("point") or (), frame)
         return point, direction
+    if isinstance(entity.get("circle"), dict):
+        direction = _unit_vector(_apply_vector(entity["circle"].get("normal") or (), frame))
+        point = _apply_point(entity["circle"].get("center") or (), frame)
+        return point, direction
     if isinstance(entity.get("plane"), dict):
         direction = _unit_vector(_apply_vector(entity["plane"].get("normal") or (), frame))
         point = _apply_point(entity["plane"].get("point") or (), frame)
@@ -272,6 +278,8 @@ def _rows_for(mate: dict, frames) -> dict | None:
         rows = [_translation_row(axis, point) for axis in axes] + [_rotation_row(axis) for axis in axes]
         return {"rows": rows, "limits": limits, "axis": None, "point": point}
     if kind == "concentric":
+        if not isinstance(first.get("cylinder"), dict) or not isinstance(second.get("cylinder"), dict):
+            return None
         left_point, left_axis = _geometry(first, frames)
         right_point, right_axis = _geometry(second, frames)
         if left_axis is None or right_axis is None or abs(abs(_dot(left_axis, right_axis)) - 1.0) > TOL:
@@ -300,6 +308,18 @@ def _rows_for(mate: dict, frames) -> dict | None:
                 return None
             rows = [_translation_row(normal, left_point)] + [_rotation_row(direction) for direction in plane]
             return {"rows": rows, "limits": limits, "axis": None, "point": left_point}
+        if isinstance(first.get("circle"), dict) and isinstance(second.get("circle"), dict):
+            if left_axis is None or right_axis is None or abs(abs(_dot(left_axis, right_axis)) - 1.0) > TOL:
+                return None
+            separation = math.sqrt(sum((left_point[i] - right_point[i]) ** 2 for i in range(3)))
+            if separation > AXIS_OFFSET_TOL_M:
+                return None
+            return {
+                "rows": [_translation_row(left_axis, left_point)],
+                "limits": limits,
+                "axis": None,
+                "point": left_point,
+            }
         if isinstance(first.get("point"), (list, tuple)) and isinstance(second.get("point"), (list, tuple)):
             rows = [_translation_row(axis, left_point) for axis in axes]
             return {"rows": rows, "limits": limits, "axis": None, "point": left_point}
@@ -440,7 +460,7 @@ def _frame(values) -> list[list[float]] | None:
         numbers = [float(value) for value in values or ()]
     except (TypeError, ValueError):
         return None
-    if len(numbers) != 16:
+    if len(numbers) != 16 or not all(math.isfinite(value) for value in numbers):
         return None
     return [numbers[0:4], numbers[4:8], numbers[8:12], numbers[12:16]]
 
@@ -742,6 +762,12 @@ def verify_discovery(package: Path) -> dict:
             if mate.get("suppressed"):
                 continue
             _require(
+                mate.get("error_code") == 0,
+                "discovery.graph",
+                "the saved mate reports a native error (unsolved or over-defined)",
+                {"mate": mate.get("name"), "error_code": mate.get("error_code")},
+            )
+            _require(
                 _rows_for(mate, frames) is not None,
                 "discovery.graph",
                 "a mate is outside the supported constraint scope or lacks usable entities",
@@ -786,6 +812,20 @@ def verify_discovery(package: Path) -> dict:
                         isinstance(radius, (int, float)) and float(radius) > 0,
                         "discovery.graph",
                         "a cylinder radius is not positive",
+                    )
+                circle = entity.get("circle")
+                if isinstance(circle, dict):
+                    try:
+                        numbers = [
+                            float(value)
+                            for value in (*circle.get("center", ()), *circle.get("normal", ()), circle["radius"])
+                        ]
+                    except (TypeError, ValueError):
+                        numbers = []
+                    _require(
+                        len(numbers) == 7 and all(math.isfinite(value) for value in numbers) and numbers[6] > 0,
+                        "discovery.graph",
+                        "a circle entity is not a finite circle",
                     )
         for datum in raw.get("datums") or []:
             _require(

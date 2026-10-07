@@ -190,7 +190,7 @@ def _unit(vector) -> list[float] | None:
         values = [float(value) for value in vector or ()]
     except (TypeError, ValueError):
         return None
-    if len(values) != 3:
+    if len(values) != 3 or not all(math.isfinite(value) for value in values):
         return None
     norm = math.sqrt(sum(value * value for value in values))
     if norm == 0:
@@ -250,13 +250,13 @@ def _component_frames(record: dict, findings: list[dict]) -> dict[str, list[list
             values = [float(value) for value in item.get("transform") or ()]
         except (TypeError, ValueError):
             values = []
-        if len(values) != 16:
+        if len(values) != 16 or not all(math.isfinite(value) for value in values):
             frames[name] = None
             findings.append(
                 _finding(
                     "discovery.component_transform_missing",
                     f"component:{name}",
-                    "component has no recorded 4x4 assembly transform",
+                    "component has no finite recorded 4x4 assembly transform",
                 )
             )
         else:
@@ -391,9 +391,9 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
         cylinder = entity.get("cylinder")
         if frame is None or not isinstance(cylinder, dict):
             return None
-        direction = _unit(_vector(cylinder.get("direction") or (), frame))
+        direction = _unit(_vector(cylinder.get("direction") or cylinder.get("normal") or (), frame))
         try:
-            point = _point([float(value) for value in cylinder.get("point") or ()], frame)
+            point = _point([float(value) for value in (cylinder.get("point") or cylinder.get("center")) or ()], frame)
         except (TypeError, ValueError):
             point = None
         if direction is None or point is None or len(point) != 3:
@@ -463,6 +463,35 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
             rows = [_translation_row(normal, left_plane[0])]
             rows += [_rotation_row(direction) for direction in _orthogonal_basis(normal)]
             return {"rows": rows, "limits": limits, "axis": None, "point": left_plane[0], "entity": None}
+        if isinstance(first.get("circle"), dict) and isinstance(second.get("circle"), dict):
+            frame_left, frame_right = frame_of(first), frame_of(second)
+            if frame_left is None or frame_right is None:
+                return None
+            left_circle = first["circle"]
+            right_circle = second["circle"]
+            normal = _unit(_vector(left_circle.get("normal") or (), frame_left))
+            other = _unit(_vector(right_circle.get("normal") or (), frame_right))
+            if normal is None or other is None or abs(abs(_dot(normal, other)) - 1.0) > _TOL:
+                return fail("discovery.mate_geometry_mismatch", "solved coincident circles are not parallel")
+            try:
+                center = _point([float(value) for value in left_circle.get("center") or ()], frame_left)
+                other_center = _point([float(value) for value in right_circle.get("center") or ()], frame_right)
+            except (TypeError, ValueError):
+                return fail("discovery.mate_entities_unsupported", "recorded circle centre is not usable")
+            separation = math.sqrt(sum((center[i] - other_center[i]) ** 2 for i in range(3)))
+            if separation > AXIS_OFFSET_TOL_M:
+                return fail(
+                    "discovery.mate_geometry_mismatch",
+                    "solved coincident circles are not co-located",
+                    {"separation_m": separation},
+                )
+            return {
+                "rows": [_translation_row(normal, center)],
+                "limits": limits,
+                "axis": None,
+                "point": center,
+                "entity": None,
+            }
         if left_point is not None and right_point is not None:
             rows = [_translation_row(axis, left_point) for axis in (basis_x, basis_y, basis_z)]
             return {"rows": rows, "limits": limits, "axis": None, "point": left_point, "entity": None}
@@ -626,6 +655,16 @@ def _clusters(record: dict, findings: list[dict]) -> _Clusters:
         if not isinstance(mate, dict) or mate.get("suppressed"):
             continue
         obj = f"mate:{mate.get('name') or index}"
+        if mate.get("error_code") != 0:
+            findings.append(
+                _finding(
+                    "discovery.mate_error_state",
+                    obj,
+                    "the saved mate reports a native error or an unreadable solve state",
+                    {"error_code": mate.get("error_code")},
+                )
+            )
+            continue
         rows = _mate_rows(mate, frames, findings, obj)
         for left, right in _mate_pairs(mate):
             if left not in components or right not in components:
@@ -1144,8 +1183,8 @@ def _body_records(
             if str(datum.get("owner") or "") in members and str(datum.get("name")).startswith("CS_")
         ]
         if explicit is not None:
-            datum = _datum(record, explicit)
-            if datum is None:
+            candidate = _datum(record, explicit)
+            if candidate is None:
                 findings.append(
                     _finding(
                         "discovery.body_datum_missing",
@@ -1155,16 +1194,17 @@ def _body_records(
                     )
                 )
                 continue
-            if str(datum.get("owner") or "") not in members:
+            if str(candidate.get("owner") or "") not in members:
                 findings.append(
                     _finding(
                         "discovery.body_datum_owner_mismatch",
                         f"body:{root}",
                         "body_datum names a datum that no component of this body owns",
-                        {"datum": explicit, "owner": datum.get("owner"), "members": members},
+                        {"datum": explicit, "owner": candidate.get("owner"), "members": members},
                     )
                 )
                 continue
+            datum = candidate
         elif len(owned) == 1:
             datum = owned[0]
         elif not owned:

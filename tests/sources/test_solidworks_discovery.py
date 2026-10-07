@@ -26,6 +26,8 @@ from description_pipeline.sources.solidworks.discovery import (  # noqa: E402
     DiscoverySettings,
     prepare_native_package,
 )
+from description_pipeline.sources.solidworks.errors import CadError  # noqa: E402
+from description_pipeline.sources.solidworks.native import _merge_property_scopes  # noqa: E402
 from description_pipeline.verification.native_discovery import verify_discovery  # noqa: E402
 from description_pipeline.verification.solidworks_urdf import _native_discovery  # noqa: E402
 
@@ -112,6 +114,8 @@ def record() -> dict:
                 "name": "shoulder_pitch_joint__coaxial",
                 "type": "concentric",
                 "suppressed": False,
+                "error_code": 0,
+                "scope": "",
                 "limits": None,
                 "entities": [
                     {
@@ -132,6 +136,8 @@ def record() -> dict:
                 "name": "shoulder_pitch_joint__locate",
                 "type": "coincident",
                 "suppressed": False,
+                "error_code": 0,
+                "scope": "",
                 "limits": None,
                 "entities": [
                     {
@@ -306,7 +312,15 @@ class DiscoveryTests(unittest.TestCase):
     def test_unknown_mate_type_blocks_instead_of_going_rigid(self):
         result, _source, output = self._prepare(
             mutate=lambda payload: payload["mates"].append(
-                {"name": "Tangent1", "type": "tangent", "suppressed": False, "limits": None, "entities": []}
+                {
+                    "name": "Tangent1",
+                    "type": "tangent",
+                    "suppressed": False,
+                    "error_code": 0,
+                    "scope": "",
+                    "limits": None,
+                    "entities": [],
+                }
             )
         )
         codes = self._codes(result)
@@ -655,6 +669,60 @@ class DiscoveryTests(unittest.TestCase):
         report = verify_discovery(output)
         self.assertTrue(next(check for check in report["checks"] if check["id"] == "discovery.binding")["passed"])
         self.assertIn("discovery.names", [item["code"] for item in report["errors"]])
+    def test_circle_edge_coincident_keeps_the_hinge(self):
+        def mutate(payload):
+            seat = payload["mates"][1]
+            seat["entities"][0] = {
+                "component": "base-1",
+                "feature": "Edge1",
+                "circle": {"center": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0], "radius": 0.006},
+            }
+            seat["entities"][1] = {
+                "component": "arm-1",
+                "feature": "Edge2",
+                "circle": {"center": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0], "radius": 0.006},
+            }
+
+        result, _source, output = self._prepare(mutate=mutate)
+        self.assertTrue(result.passed, result.findings)
+        document = yaml.safe_load((output / "robot.yaml").read_text(encoding="utf-8"))
+        joint = document["source"]["joints"][0]
+        self.assertEqual(joint["type"], "revolute")
+        self.assertEqual(joint["axis"], [0.0, 0.0, 1.0])
+        self.assertTrue(verify_discovery(output)["passed"])
+
+    def test_nonparallel_circle_edges_block(self):
+        def mutate(payload):
+            seat = payload["mates"][1]
+            seat["entities"][0] = {
+                "component": "base-1",
+                "feature": "Edge1",
+                "circle": {"center": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0], "radius": 0.006},
+            }
+            seat["entities"][1] = {
+                "component": "arm-1",
+                "feature": "Edge2",
+                "circle": {"center": [0.0, 0.0, 0.1], "normal": [1.0, 0.0, 0.0], "radius": 0.006},
+            }
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        self.assertIn("discovery.mate_geometry_mismatch", self._codes(result))
+
+    def test_missing_or_nonzero_native_error_state_blocks(self):
+        for payload_mutate in (
+            lambda payload: payload["mates"][0].pop("error_code"),
+            lambda payload: payload["mates"][0].update({"error_code": 5}),
+        ):
+            result, _source, _output = self._prepare(mutate=payload_mutate)
+            self.assertIn("discovery.mate_error_state", self._codes(result))
+
+    def test_suppressed_mate_is_ignored(self):
+        def mutate(payload):
+            payload["mates"][1]["suppressed"] = True
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        self.assertFalse(result.passed)
+        self.assertIn("discovery.joint_unsupported_pattern", self._codes(result))
 
     # ------------------------------------------------------------ verifier gates
 
@@ -695,6 +763,93 @@ class DiscoveryTests(unittest.TestCase):
         path.write_text(json.dumps(payload), encoding="utf-8")
         with self.assertRaises(PipelineError):
             _native_discovery(output)
+
+
+class NativePropertyScopeTests(unittest.TestCase):
+    def test_conflicting_dp_values_across_scopes_block(self):
+        with self.assertRaises(CadError) as raised:
+            _merge_property_scopes({"dp.hardware_id": "left"}, {"dp.hardware_id": "right"})
+        self.assertEqual(getattr(raised.exception, "code", ""), "cad_property_conflict")
+
+    def test_equal_dp_values_and_ordinary_overrides_merge(self):
+        merged = _merge_property_scopes(
+            {"dp.hardware_id": "fixture", "Weight": "1"},
+            {"dp.hardware_id": "fixture", "Weight": "2"},
+        )
+        self.assertEqual(merged, {"dp.hardware_id": "fixture", "Weight": "2"})
+
+
+class FakeMateFeature:
+    """Minimal stand-in for a late-bound mate feature."""
+
+    def __init__(self, type_name, count=None, traversable=True):
+        self.type_name = type_name
+        self.count = count
+        self.traversable = traversable
+        self.name = f"mate-{type_name}"
+
+    def _FlagAsMethod(self, name):  # noqa: N802 - mimic the win32com dynamic object
+        return None
+
+    def __getattr__(self, name):
+        if name == "GetTypeName2":
+            return lambda: self.type_name
+        if name == "Name":
+            return self.name
+        if name == "GetSpecificFeature2":
+            if self.count is None:
+
+                def boom():
+                    raise AttributeError("no interface")
+
+                return boom
+            inner = self
+
+            class Specific:
+                def _FlagAsMethod(self, name):  # noqa: N802
+                    return None
+
+                def __getattr__(self, attr):
+                    if attr == "GetMateEntityCount":
+                        return lambda: inner.count
+                    raise AttributeError(attr)
+
+            return lambda: Specific()
+        if self.traversable:
+            return lambda *args: None
+
+        def unreadable(*args):
+            raise AttributeError("no interface")
+
+        return unreadable
+
+
+class MateReaderTests(unittest.TestCase):
+    def test_unreadable_recognised_mate_blocks(self):
+        from description_pipeline.sources.solidworks.native import _mate_specific
+
+        with self.assertRaises(CadError) as raised:
+            _mate_specific(FakeMateFeature("MateConcentric"), strict=True)
+        self.assertEqual(getattr(raised.exception, "code", ""), "cad_mate_unreadable")
+
+    def test_readable_unknown_mate_is_captured_for_rejection(self):
+        from description_pipeline.sources.solidworks.native import _mate_specific
+
+        specific, count = _mate_specific(FakeMateFeature("MateGear", count=2), strict=True)
+        self.assertIsNotNone(specific)
+        self.assertEqual(count, 2)
+
+    def test_invalid_entity_count_blocks(self):
+        from description_pipeline.sources.solidworks.native import _mate_specific
+
+        for value in (0, -1, 2.5, True):
+            with self.assertRaises(CadError):
+                _mate_specific(FakeMateFeature("MateConcentric", count=value), strict=True)
+
+    def test_other_features_are_skipped(self):
+        from description_pipeline.sources.solidworks.native import _mate_specific
+
+        self.assertIsNone(_mate_specific(FakeMateFeature("RefPlane"), strict=False))
 
 
 if __name__ == "__main__":
