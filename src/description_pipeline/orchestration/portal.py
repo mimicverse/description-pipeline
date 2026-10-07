@@ -406,33 +406,29 @@ class PortalRun:
 
 
 def _findings(job: dict | None) -> list[dict]:
-    """Native findings with their object references, tolerant of the transport field names."""
+    """Native findings with object/message/evidence, exactly as the endpoint persists them."""
     findings: list[dict] = []
     if not isinstance(job, dict):
         return findings
     result = job.get("result") if isinstance(job.get("result"), dict) else {}
-    for source in (job.get("findings"), result.get("findings")):
-        if not isinstance(source, list):
+    discovery = job.get("discovery") if isinstance(job.get("discovery"), dict) else {}
+    for item in discovery.get("findings") or []:
+        if not isinstance(item, dict):
             continue
-        for item in source:
-            if isinstance(item, str):
-                findings.append({"severity": "error", "stage": "", "object": "", "id": "", "message": item})
-                continue
-            if not isinstance(item, dict):
-                continue
-            findings.append(
-                {
-                    "id": str(item.get("id") or item.get("check") or ""),
-                    "severity": str(item.get("severity") or item.get("level") or "error"),
-                    "stage": str(item.get("stage") or ""),
-                    "object": str(
-                        item.get("object") or item.get("component") or item.get("path") or item.get("mate") or ""
-                    ),
-                    "message": str(item.get("message") or item.get("detail") or item.get("error") or "未提供说明"),
-                }
-            )
+        findings.append(
+            {
+                "id": str(item.get("id") or ""),
+                "severity": "error" if item.get("blocking", True) else "warning",
+                "stage": "discover",
+                "object": str(item.get("object") or ""),
+                "message": str(item.get("message") or "native discovery finding"),
+                "evidence": item.get("evidence") if isinstance(item.get("evidence"), dict) else {},
+            }
+        )
     if job.get("error"):
-        findings.append({"id": "", "severity": "error", "stage": "", "object": "", "message": str(job["error"])})
+        findings.append(
+            {"id": "", "severity": "error", "stage": "", "object": "", "message": str(job["error"]), "evidence": {}}
+        )
     quality = result.get("quality")
     if isinstance(quality, dict):
         for check in quality.get("checks") or []:
@@ -444,6 +440,7 @@ def _findings(job: dict | None) -> list[dict]:
                         "stage": "自动检查",
                         "object": str(check.get("object") or ""),
                         "message": str(check.get("details") or check.get("error") or "自动检查未通过"),
+                        "evidence": {},
                     }
                 )
     return findings
@@ -454,6 +451,7 @@ def _automatic_summary(job: dict | None) -> dict:
         return {"state": "pending", "job_state": "pending", "checks": []}
     status = str(job.get("status") or "pending")
     result = job.get("result") if isinstance(job.get("result"), dict) else {}
+    discovery = job.get("discovery") if isinstance(job.get("discovery"), dict) else {}
     checks = []
     quality = result.get("quality")
     if isinstance(quality, dict):
@@ -465,6 +463,24 @@ def _automatic_summary(job: dict | None) -> dict:
     else:
         # A verified model stays previewable even when the PR service failed afterwards.
         return {"state": "passed", "job_state": status, "checks": checks}
+    if discovery.get("passed") is False:
+        discovery_checks = [
+            {
+                "id": str(item.get("id") or ""),
+                "passed": False,
+                "object": str(item.get("object") or ""),
+                "message": str(item.get("message") or ""),
+                "evidence": item.get("evidence") if isinstance(item.get("evidence"), dict) else {},
+            }
+            for item in discovery.get("findings") or []
+            if isinstance(item, dict) and item.get("blocking", True)
+        ]
+        return {
+            "state": "failed",
+            "job_state": status,
+            "checks": discovery_checks,
+            "message": "原生 CAD 解析未通过；请按逐项发现修正工程源",
+        }
     if status == "failed":
         return {"state": "failed", "job_state": status, "checks": checks, "message": message}
     if status in {"queued", "running"}:
@@ -472,26 +488,57 @@ def _automatic_summary(job: dict | None) -> dict:
     return {"state": "unverified", "job_state": status, "checks": checks, "message": message}
 
 
-def _confirmation_summary(job: dict | None) -> dict:
-    """Engineering confirmations stay separate from automatic results and default to pending."""
-    items = []
-    if isinstance(job, dict) and isinstance(job.get("confirmations"), list):
-        for item in job["confirmations"]:
-            if isinstance(item, dict):
-                items.append(
-                    {
-                        "id": str(item.get("id") or ""),
-                        "state": str(item.get("state") or "pending"),
-                        "object": str(item.get("object") or ""),
-                    }
-                )
-    if not items:
-        return {
+#: Canonical responsibility rows of docs/mechanical-handoff-spec.md §11.1. The automatic column
+#: below mirrors only the spec's explicit coverage statements; every engineering item stays
+#: pending until the review PR/native controlled records carry the confirmation for this version.
+MECHANICAL_CHECKS = (
+    "范围与身份",
+    "版本留存",
+    "文件依赖",
+    "重建与保存",
+    "配置与实例",
+    "刚体归属",
+    "拓扑与配合",
+    "轴线与基准",
+    "零位与正向",
+    "工作范围",
+    "干涉与间隙",
+    "工具与传感器",
+    "驱动规格",
+    "物理属性",
+    "独立依据",
+    "几何与引用",
+)
+UNSUPPORTED_AUTOMATIC = (
+    "干涉与间隙：全行程干涉、碰撞及制造公差验算",
+    "命名契约与稳定身份（第 10 节词表、前缀、配合归组、物料号绑定、名称清单与跨版本改名）",
+)
+
+
+def _coverage_report(job: dict | None) -> dict:
+    """Per-item canonical check state bound to the native structural identity of this run."""
+    job = job if isinstance(job, dict) else {}
+    result = job.get("result") if isinstance(job.get("result"), dict) else {}
+    discovery = job.get("discovery") if isinstance(job.get("discovery"), dict) else {}
+    return {
+        "structure": {
+            "dag_run_id": str(job.get("dag_run_id") or ""),
+            "hardware_id": str(job.get("hardware_id") or discovery.get("hardware_id") or ""),
+            "revision": str(job.get("revision") or discovery.get("revision") or ""),
+            "subject_sha256": str(result.get("subject_sha256") or ""),
+            "discovery_sha256": str(discovery.get("discovery_sha256") or ""),
+        },
+        "automatic": {
+            "state": "unsupported-present",
+            "unsupported": list(UNSUPPORTED_AUTOMATIC),
+            "message": "其余检查项按已发布的自动校验执行；未覆盖项必须由工程师确认。",
+        },
+        "engineering": {
             "state": "pending",
-            "items": [],
-            "message": "工程确认由结构负责人在本版本原生工程中完成，当前接口未上报逐项确认。",
-        }
-    return {"state": "reported", "items": items}
+            "items": [{"id": name, "state": "pending"} for name in MECHANICAL_CHECKS],
+            "message": "工程确认由结构负责人在本版本原生工程及评审 PR 中完成，本页只显示逐项待确认状态。",
+        },
+    }
 
 
 class PortalApp:
@@ -736,10 +783,18 @@ class PortalApp:
                     for task in tasks
                 ],
                 "job": None if job is None else {"status": job.get("status"), "error": job.get("error")},
+                "discovery": None
+                if not isinstance(job, dict) or not isinstance(job.get("discovery"), dict)
+                else {
+                    "passed": job["discovery"].get("passed"),
+                    "hardware_id": job["discovery"].get("hardware_id"),
+                    "revision": job["discovery"].get("revision"),
+                    "discovery_sha256": job["discovery"].get("discovery_sha256"),
+                },
                 "stages": [] if job is None else _stages(job),
                 "findings": _findings(job),
                 "automatic": _automatic_summary(job),
-                "confirmations": _confirmation_summary(job),
+                "coverage": _coverage_report(job),
                 "pr": pr,
                 "endpoint_error": endpoint_error,
             },

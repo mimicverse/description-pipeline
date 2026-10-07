@@ -337,8 +337,13 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(status, 200, body)
         payload = json.loads(body)
         self.assertEqual(payload["automatic"]["state"], "passed")
-        self.assertEqual(payload["confirmations"]["state"], "pending")
-        self.assertTrue(payload["confirmations"]["message"])
+        coverage = payload["coverage"]
+        self.assertEqual(coverage["engineering"]["state"], "pending")
+        self.assertEqual(len(coverage["engineering"]["items"]), 16)
+        self.assertTrue(all(item["state"] == "pending" for item in coverage["engineering"]["items"]))
+        self.assertEqual(coverage["structure"]["hardware_id"], "m3.0")
+        self.assertEqual(coverage["structure"]["revision"], "r1")
+        self.assertTrue(any("干涉与间隙" in text for text in coverage["automatic"]["unsupported"]))
         self.assertEqual(payload["pr"]["url"], "https://github.com/example/m3.0/pull/1")
         self.assertEqual(
             [task["task_id"] for task in payload["tasks"]],
@@ -359,10 +364,27 @@ class PortalTests(unittest.TestCase):
             self.assertEqual(status, 200, body)
             payload = json.loads(body)
             self.assertEqual(payload["automatic"]["state"], "failed")
+            self.assertTrue(any(check["id"] == "discovery.axis_unresolved" for check in payload["automatic"]["checks"]))
+            self.assertEqual(payload["coverage"]["structure"]["hardware_id"], "m3.0")
+            self.assertFalse(payload["discovery"]["passed"])
             self.assertIsNone(payload["pr"])
             self.assertTrue(any("cad capture failed" in finding["message"] for finding in payload["findings"]))
+            self.assertTrue(any(finding["object"] == "mate:elbow-1" for finding in payload["findings"]))
+            self.assertTrue(
+                any(finding.get("evidence", {}).get("route") == "native" for finding in payload["findings"])
+            )
             status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
             self.assertEqual(status, 409)
+
+    def test_engineer_items_stay_pending_even_if_a_job_claims_confirmations(self) -> None:
+        self.client.login()
+        self._seed_passed_job()
+        run_id = native_run_id(DAG_RUN_ID)
+        self.endpoint_server.jobs[run_id]["confirmations"] = [{"id": "范围与身份", "state": "confirmed"}]
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 200, body)
+        coverage = json.loads(body)["coverage"]
+        self.assertTrue(all(item["state"] == "pending" for item in coverage["engineering"]["items"]))
 
     def test_preview_and_artifacts_are_digest_bound(self) -> None:
         self.client.login()

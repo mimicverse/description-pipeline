@@ -198,19 +198,31 @@ function renderRun(run) {
 
   const confirmations = $("confirmations");
   confirmations.textContent = "";
-  const confirmationState = (run.confirmations && run.confirmations.state) || "pending";
-  confirmations.append(badge(confirmationState === "reported" ? "已上报" : "待确认", confirmationState === "reported" ? "ok" : "pending"));
-  if (run.confirmations && run.confirmations.message) {
-    const note = document.createElement("p");
-    note.className = "muted";
-    note.textContent = run.confirmations.message;
-    confirmations.append(note);
-  }
-  for (const item of (run.confirmations && run.confirmations.items) || []) {
+  const coverage = run.coverage || {};
+  const structure = coverage.structure || {};
+  const identity = document.createElement("p");
+  identity.className = "muted";
+  identity.textContent = `结构身份：${structure.hardware_id || "待解析"} · 版本 ${structure.revision || "—"} · 交付摘要 ${
+    String(structure.subject_sha256 || "").slice(0, 12) || "—"
+  }`;
+  confirmations.append(identity, badge("工程确认：待确认", "pending"));
+  for (const item of (coverage.engineering && coverage.engineering.items) || []) {
     const chip = document.createElement("span");
     chip.className = "chip";
-    chip.textContent = `${item.id || "确认项"}：${item.state || "待确认"}`;
+    chip.textContent = `${item.id}：待确认`;
     confirmations.append(chip);
+  }
+  if (coverage.engineering && coverage.engineering.message) {
+    const note = document.createElement("p");
+    note.className = "muted";
+    note.textContent = coverage.engineering.message;
+    confirmations.append(note);
+  }
+  for (const text of (coverage.automatic && coverage.automatic.unsupported) || []) {
+    const chip = document.createElement("span");
+    chip.className = "chip failed";
+    chip.textContent = `未自动覆盖：${text}`;
+    automatic.append(chip);
   }
 
   const findings = $("findings");
@@ -230,6 +242,12 @@ function renderRun(run) {
     context.className = "object";
     context.textContent = [finding.id, finding.stage, finding.object].filter(Boolean).join(" · ") || "—";
     item.append(message, context);
+    if (finding.evidence && Object.keys(finding.evidence).length) {
+      const evidence = document.createElement("div");
+      evidence.className = "object";
+      evidence.textContent = JSON.stringify(finding.evidence);
+      item.append(evidence);
+    }
     findings.append(item);
   }
 

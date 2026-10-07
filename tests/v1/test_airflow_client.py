@@ -177,6 +177,21 @@ class MockEndpoint:
                         job["status"] = "failed"
                         job["error"] = "cad capture failed"
                         job["result"] = None
+                        job["discovery"] = {
+                            "passed": False,
+                            "findings": [
+                                {
+                                    "id": "discovery.axis_unresolved",
+                                    "object": "mate:elbow-1",
+                                    "message": "elbow axis cannot be resolved",
+                                    "evidence": {"route": "native"},
+                                    "blocking": True,
+                                }
+                            ],
+                            "hardware_id": "m3.0",
+                            "revision": "r1",
+                            "discovery_sha256": "d" * 64,
+                        }
                     elif job["pokes"] >= 2:
                         job["status"] = "passed"
                         result = {

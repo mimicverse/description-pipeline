@@ -1,0 +1,282 @@
+"""Thin Feishu OAuth2 SSO for pinned Airflow 3.3.2.
+
+Official Feishu web login: authorize at
+``https://accounts.feishu.cn/open-apis/authen/v1/authorize`` and exchange the code at the current
+v3 token endpoint ``https://accounts.feishu.cn/oauth/v3/token`` with an
+``application/x-www-form-urlencoded`` body (``grant_type=authorization_code``, ``client_id``,
+``client_secret``, ``code``, ``redirect_uri`` and ``code_verifier``). Never mix a Basic header
+with body credentials; Feishu rejects that with error 20070. The v3 response is flat JSON
+(``{"code": 0, "access_token": ..., "expires_in": ..., "token_type": "Bearer", "scope": ...}``);
+the deprecated v2 shape is not accepted as a fallback. The signed-in identity is one explicit
+``open_id`` from ``https://open.feishu.cn/open-apis/authen/v1/user_info`` bound to the configured
+App ID and an allowlisted ``tenant_key``; there is no user_id/union_id fallback and no
+cross-tenant provisioning.
+
+Single-use state and the PKCE verifier live in a database shared by every api-server worker and
+kept across restarts (the Airflow metadata table in production, a SQLite file in tests). No new
+dependencies are required.
+
+Official references (read 2026-10-07):
+
+* authorize (S256): https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/authen-v1/authorize/get
+* token v3: https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/authentication-management/access-token/get-user-access-token-v3
+* user_info v1: https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/authen-v1/user_info/get
+
+Sign-in reads only ``open_id``, ``tenant_key``, ``name``/``en_name`` and the avatar from the v1
+profile; no sensitive field (user_id, email, mobile, employment) is requested, so this enterprise
+app needs no additional contact-directory permission. The authorize request omits ``scope`` and
+``offline_access`` entirely: it is a sign-in-only app, not a generic OIDC client.
+"""
+
+from __future__ import annotations
+
+import base64
+import hmac
+import hashlib
+import json
+import os
+import secrets
+import sqlite3
+import stat
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from urllib import error as urlerror
+from urllib import parse as urlparse
+from urllib import request as urlrequest
+
+FEISHU_AUTHORIZE_BASE = "https://accounts.feishu.cn/open-apis/authen/v1/authorize"
+FEISHU_TOKEN_URL = "https://accounts.feishu.cn/oauth/v3/token"
+FEISHU_USERINFO_URL = "https://open.feishu.cn/open-apis/authen/v1/user_info"
+DEFAULT_STATE_TTL = 300.0
+STATE_COOKIE = "feishu_oauth_state"
+
+
+class FeishuConfigError(RuntimeError):
+    """The Feishu SSO settings are missing or unsafe; sign-in must fail closed."""
+
+
+class FeishuAuthError(RuntimeError):
+    """The Feishu authorization or token exchange failed."""
+
+
+def _csv(value: str | None) -> frozenset[str]:
+    return frozenset(item.strip() for item in str(value or "").split(",") if item.strip())
+
+
+@dataclass(frozen=True)
+class FeishuIdentity:
+    open_id: str
+    name: str
+    avatar_url: str
+    tenant_key: str
+
+
+@dataclass(frozen=True)
+class FeishuSettings:
+    app_id: str
+    app_secret: str = field(repr=False)
+    tenant_keys: frozenset[str]
+    redirect_uri: str
+    admin_open_ids: frozenset[str]
+    authorize_base: str = FEISHU_AUTHORIZE_BASE
+    token_url: str = FEISHU_TOKEN_URL
+    userinfo_url: str = FEISHU_USERINFO_URL
+    state_ttl: float = DEFAULT_STATE_TTL
+
+    @classmethod
+    def from_environment(cls, environ: dict | None = None) -> FeishuSettings:
+        env = os.environ if environ is None else environ
+        required = ("FEISHU_APP_SECRET_FILE", "FEISHU_TENANT_KEYS", "FEISHU_REDIRECT_URI")
+        missing = [key for key in required if not env.get(key)]
+        if missing:
+            raise FeishuConfigError(f"Feishu SSO is not configured; missing {', '.join(missing)}")
+        raw_path = Path(str(env["FEISHU_APP_SECRET_FILE"]))
+        path = Path(os.path.abspath(raw_path))
+        if not raw_path.is_absolute() or path.is_symlink():
+            raise FeishuConfigError("Feishu secret file must be an absolute regular, non-symlink path")
+        try:
+            mode = stat.S_IMODE(path.stat().st_mode)
+        except OSError as error:
+            raise FeishuConfigError(f"cannot read Feishu secret file: {error}") from error
+        if not path.is_file() or mode != 0o600:
+            raise FeishuConfigError("Feishu secret file must be a regular file with mode 0600")
+        try:
+            secret = json.loads(path.read_text(encoding="utf-8"))
+        except ValueError as error:
+            raise FeishuConfigError("Feishu secret file is not valid JSON") from error
+        if not isinstance(secret, dict) or set(secret) != {"app_id", "app_secret"}:
+            raise FeishuConfigError('Feishu secret file must be {"app_id", "app_secret"} only')
+        app_id = str(secret["app_id"]).strip()
+        app_secret = str(secret["app_secret"]).strip()
+        if not app_id or not app_secret:
+            raise FeishuConfigError('Feishu secret file needs {"app_id", "app_secret"}')
+        tenant_keys = _csv(env["FEISHU_TENANT_KEYS"])
+        if not tenant_keys:
+            raise FeishuConfigError("FEISHU_TENANT_KEYS must list at least one approved tenant_key")
+        redirect_uri = str(env["FEISHU_REDIRECT_URI"]).strip()
+        if not redirect_uri.startswith("https://"):
+            raise FeishuConfigError("FEISHU_REDIRECT_URI must be an absolute https callback URL")
+        return cls(
+            app_id=app_id,
+            app_secret=app_secret,
+            tenant_keys=tenant_keys,
+            redirect_uri=redirect_uri,
+            admin_open_ids=_csv(env.get("FEISHU_ADMIN_OPEN_IDS")),
+        )
+
+
+def state_cookie_header(state: str) -> str:
+    """Browser-bound OAuth state cookie; the callback must require this exact value."""
+    return f"{STATE_COOKIE}={state}; Path=/; HttpOnly; Secure; SameSite=Lax"
+
+
+def state_cookie_matches(cookie_value: str | None, state: str) -> bool:
+    return bool(cookie_value) and hmac.compare_digest(str(cookie_value), str(state))
+
+
+def _pkce_pair() -> tuple[str, str]:
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).rstrip(b"=").decode("ascii")
+    return verifier, challenge
+
+
+def build_authorize_url(settings: FeishuSettings, state: str, challenge: str, *, scope: str | None = None) -> str:
+    query = {
+        "client_id": settings.app_id,
+        "redirect_uri": settings.redirect_uri,
+        "response_type": "code",
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }
+    if scope is not None:
+        query["scope"] = scope
+    query = urlparse.urlencode(query)
+    return f"{settings.authorize_base}?{query}"
+
+
+def _post_form(url: str, payload: dict, *, opener=None) -> dict:
+    request = urlrequest.Request(
+        url,
+        data=urlparse.urlencode(payload).encode("ascii"),
+        method="POST",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+    )
+    open_url = opener or urlrequest.urlopen
+    try:
+        with open_url(request, timeout=20.0) as response:
+            data = json.loads(response.read().decode("utf-8") or "{}")
+    except (urlerror.URLError, urlerror.HTTPError, ValueError) as error:
+        raise FeishuAuthError(f"Feishu token request failed: {error}") from error
+    if not isinstance(data, dict):
+        raise FeishuAuthError("Feishu token response is not a JSON object")
+    if data.get("code") != 0:
+        raise FeishuAuthError("Feishu token request was rejected")
+    return data
+
+
+def exchange_code(settings: FeishuSettings, code: str, verifier: str, *, opener=None) -> str:
+    """Exchange the authorization code at the current v3 endpoint; exactly one auth style."""
+    payload = _post_form(
+        settings.token_url,
+        {
+            "grant_type": "authorization_code",
+            "client_id": settings.app_id,
+            "client_secret": settings.app_secret,
+            "code": code,
+            "redirect_uri": settings.redirect_uri,
+            "code_verifier": verifier,
+        },
+        opener=opener,
+    )
+    token = str(payload.get("access_token") or "").strip()
+    expires_in = payload.get("expires_in")
+    token_type = str(payload.get("token_type") or "").strip()
+    if (
+        not token
+        or not isinstance(expires_in, int)
+        or isinstance(expires_in, bool)
+        or expires_in <= 0
+        or token_type.lower() != "bearer"
+    ):
+        raise FeishuAuthError("Feishu token response does not match the pinned v3 shape")
+    return token
+
+
+def fetch_identity(settings: FeishuSettings, access_token: str, *, opener=None) -> FeishuIdentity:
+    request = urlrequest.Request(
+        settings.userinfo_url,
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+    )
+    open_url = opener or urlrequest.urlopen
+    try:
+        with open_url(request, timeout=20.0) as response:
+            payload = json.loads(response.read().decode("utf-8") or "{}")
+    except (urlerror.URLError, urlerror.HTTPError, ValueError) as error:
+        raise FeishuAuthError(f"Feishu profile request failed: {error}") from error
+    body = payload.get("data")
+    if payload.get("code") != 0 or not isinstance(body, dict):
+        raise FeishuAuthError("Feishu profile response does not match the pinned v1 user_info shape")
+    open_id = str(body.get("open_id") or "").strip()
+    tenant_key = str(body.get("tenant_key") or "").strip()
+    if not open_id or not tenant_key:
+        raise FeishuAuthError("Feishu profile must carry one explicit open_id and tenant_key")
+    if tenant_key not in settings.tenant_keys:
+        raise FeishuAuthError("Feishu tenant is not approved for this Airflow deployment")
+    name = str(body.get("name") or body.get("en_name") or open_id).strip()
+    avatar = str(body.get("avatar_url") or body.get("avatar_thumb") or "").strip()
+    return FeishuIdentity(open_id=open_id, name=name, avatar_url=avatar, tenant_key=tenant_key)
+
+
+class StateStore:
+    """Single-use state and PKCE verifier shared by all api-server workers and restarts."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = str(path)
+        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS feishu_auth_state ("
+                "state_hash TEXT PRIMARY KEY, verifier TEXT NOT NULL, expires_at REAL NOT NULL)"
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.path, timeout=10.0, isolation_level=None)
+
+    def issue(self, ttl: float) -> tuple[str, str]:
+        state = secrets.token_urlsafe(32)
+        verifier, challenge = _pkce_pair()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM feishu_auth_state WHERE expires_at < ?", (time.time(),))
+            connection.execute(
+                "INSERT INTO feishu_auth_state (state_hash, verifier, expires_at) VALUES (?, ?, ?)",
+                (hashlib.sha256(state.encode("ascii")).hexdigest(), verifier, time.time() + ttl),
+            )
+            connection.execute("COMMIT")
+        return state, challenge
+
+    def consume(self, state: str) -> str | None:
+        if not isinstance(state, str) or not state:
+            return None
+        digest = hashlib.sha256(state.encode("ascii", "replace")).hexdigest()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT verifier, expires_at FROM feishu_auth_state WHERE state_hash = ?", (digest,)
+            ).fetchone()
+            connection.execute("DELETE FROM feishu_auth_state WHERE state_hash = ?", (digest,))
+            connection.execute("COMMIT")
+        if row is None or float(row[1]) < time.time():
+            return None
+        return str(row[0])
