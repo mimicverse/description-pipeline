@@ -236,38 +236,6 @@ def _rank(rows: Sequence[Sequence[float]]) -> int:
     return len(basis)
 
 
-def _null_direction(rows: Sequence[Sequence[float]]) -> list[float] | None:
-    """The single direction orthogonal to one or two independent constraint rows."""
-
-    basis: list[list[float]] = []
-    for row in rows:
-        vector = [float(value) for value in row]
-        for other in basis:
-            projection = _dot(vector, other)
-            vector = [one - projection * two for one, two in zip(vector, other, strict=True)]
-        norm = math.sqrt(_dot(vector, vector))
-        if norm > _TOL:
-            basis.append([value / norm for value in vector])
-    if len(basis) == 0:
-        return None
-    if len(basis) >= 2:
-        return _unit(_cross(basis[0], basis[1]))
-    helper = [1.0, 0.0, 0.0]
-    if abs(basis[0][0]) > 0.9:
-        helper = [0.0, 1.0, 0.0]
-    return _unit(_cross(basis[0], helper))
-
-
-def _entity_direction(entity: dict) -> list[float] | None:
-    cylinder = entity.get("cylinder")
-    if isinstance(cylinder, dict):
-        return _unit(cylinder.get("direction"))
-    plane = entity.get("plane")
-    if isinstance(plane, dict):
-        return _unit(plane.get("normal"))
-    return None
-
-
 def _component_frames(record: dict, findings: list[dict]) -> dict[str, list[list[float]] | None]:
     """Every component's 4x4 assembly transform; missing transforms block."""
 
@@ -685,21 +653,18 @@ def _clusters(record: dict, findings: list[dict]) -> _Clusters:
         if not group["unresolved"] and group["rank"] == 6
     ]
     properties = (record.get("properties") or {}).get("components") or {}
-    markers: dict[str, str] = {}
     for name in names:
         value = (properties.get(name) or {}).get(f"{NAMESPACE}.body_marker")
         if _text(value):
-            markers[name] = str(value).strip()
+            findings.append(
+                _finding(
+                    "discovery.body_marker_unsupported",
+                    f"component:{name}",
+                    "authored body markers are not an accepted membership channel; remove them",
+                    {"value": str(value)},
+                )
+            )
     mapping = _union_find(rigid, names)
-    by_marker: dict[str, list[str]] = {}
-    for node, marker in markers.items():
-        by_marker.setdefault(marker, []).append(node)
-    marker_pairs: list[tuple[str, str]] = []
-    for group in by_marker.values():
-        for other in group[1:]:
-            marker_pairs.append((group[0], other))
-    if marker_pairs:
-        mapping = _union_find(rigid + marker_pairs, names)
     members: dict[str, list[str]] = {}
     for node, root in mapping.items():
         members.setdefault(root, []).append(node)
@@ -719,32 +684,6 @@ def _clusters(record: dict, findings: list[dict]) -> _Clusters:
             for key, group in pairs.items()
         },
     )
-    cluster_markers: dict[str, set[str]] = {}
-    for node, marker in markers.items():
-        cluster_markers.setdefault(mapping[node], set()).add(marker)
-    for root, values in sorted(cluster_markers.items()):
-        if len(values) > 1:
-            findings.append(
-                _finding(
-                    "discovery.body_marker_conflict",
-                    f"body:{root}",
-                    "one rigid body carries conflicting scalar body markers",
-                    {"markers": sorted(values), "components": clusters.members[root]},
-                )
-            )
-    for (left, right), group in sorted(pairs.items()):
-        if not group["unresolved"] and group["rank"] == 6:
-            continue
-        if left in mapping and right in mapping and mapping[left] == mapping[right]:
-            mate = (record.get("mates") or [None])[group["mates"][0]] if group["mates"] else None
-            findings.append(
-                _finding(
-                    "discovery.body_marker_conflicts_mate",
-                    f"mate:{(mate or {}).get('name') or group['mates'][0]}",
-                    "a scalar marker merged components that a movable mate keeps apart",
-                    {"components": [left, right], "mate_type": (mate or {}).get("type")},
-                )
-            )
     return clusters
 
 
@@ -1231,14 +1170,13 @@ def _body_records(
             if published != name:
                 findings.append(
                     _finding(
-                        "discovery.link_name_frozen",
+                        "discovery.name_frozen_mismatch",
                         f"body:{root}",
-                        "the published name differs from the current datum name; the published name is kept",
-                        {"identity": identity, "datum": name, "published": published},
-                        blocking=False,
+                        "the frozen name differs from the current native CS_<link>; review the interface",
+                        {"identity": identity, "native": name, "published": published},
                     )
                 )
-            name = published
+                continue
             source = "frozen"
         bodies.append(
             {
@@ -1405,7 +1343,25 @@ def _root_body(
 
     named = [body for body in bodies if str(body.get("datum")) == "CS_base_link"]
     if len(named) == 1:
-        return named[0]
+        root = named[0]
+        properties = (record.get("properties") or {}).get("components") or {}
+        annotated = {
+            clusters.of[name]
+            for name, values in properties.items()
+            if isinstance(values, dict)
+            and str(values.get(f"{namespace}.body_root") or "").strip().lower() in {"1", "true", "yes"}
+            and name in clusters.of
+        }
+        if annotated and annotated != {root["root"]}:
+            findings.append(
+                _finding(
+                    "discovery.body_root_conflict",
+                    "assembly",
+                    "dp.body_root contradicts CS_base_link; remove the redundant annotation",
+                    {"body_root": sorted(annotated), "base": root["root"]},
+                )
+            )
+        return root
     if len(named) > 1:
         findings.append(
             _finding(
@@ -1416,17 +1372,6 @@ def _root_body(
             )
         )
         return None
-    properties = (record.get("properties") or {}).get("components") or {}
-    annotated = {
-        clusters.of[name]
-        for name, values in properties.items()
-        if isinstance(values, dict)
-        and str(values.get(f"{namespace}.body_root") or "").strip().lower() in {"1", "true", "yes"}
-        and name in clusters.of
-    }
-    if len(annotated) == 1:
-        root = next(iter(annotated))
-        return next((body for body in bodies if body["root"] == root), None)
     findings.append(
         _finding(
             "discovery.root_missing",
@@ -1572,14 +1517,13 @@ def _joint_names(
             if published != name:
                 findings.append(
                     _finding(
-                        "discovery.joint_name_frozen",
+                        "discovery.joint_name_frozen_mismatch",
                         f"mate:{identity}",
-                        "the published joint name differs from the mate group; the published name is kept",
-                        {"identity": identity, "group": name, "published": published},
-                        blocking=False,
+                        "the frozen name differs from the named mate group; review the interface change",
+                        {"identity": identity, "native": name, "published": published},
                     )
                 )
-            name = published
+                continue
             assigned[identity] = name
         if name in taken:
             findings.append(

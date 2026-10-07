@@ -282,14 +282,14 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(report["joints"], 1)
 
     def test_frozen_published_name_is_preserved(self):
-        settings = DiscoverySettings(record_roots=(self._native()[1],), frozen_names={"arm-1": "right_arm_link"})
+        settings = DiscoverySettings(record_roots=(self._native()[1],), frozen_names={"arm-1": "arm_link"})
         result, _source, output = self._prepare(settings=settings)
         self.assertTrue(result.passed, result.findings)
         document = yaml.safe_load((output / "robot.yaml").read_text(encoding="utf-8"))
         names = [body["name"] for body in document["source"]["bodies"]]
-        self.assertIn("right_arm_link", names)
+        self.assertIn("arm_link", names)
         payload = json.loads((output / "discovery/native-discovery.json").read_text(encoding="utf-8"))
-        self.assertEqual(payload["frozen_names"].get("arm-1"), "right_arm_link")
+        self.assertEqual(payload["frozen_names"].get("arm-1"), "arm_link")
         self.assertTrue(verify_discovery(output)["passed"])
 
     # ----------------------------------------------------------------- blocking
@@ -556,6 +556,25 @@ class DiscoveryTests(unittest.TestCase):
 
         result, _source, _output = self._prepare(mutate=mismatch)
         self.assertIn("discovery.jcs_mismatch", self._codes(result))
+
+    def test_frozen_name_that_differs_from_native_blocks(self):
+        settings = DiscoverySettings(record_roots=(self._native()[1],), frozen_names={"arm-1": "right_arm_link"})
+        result, _source, _output = self._prepare(settings=settings)
+        self.assertIn("discovery.name_frozen_mismatch", self._codes(result))
+
+    def test_body_marker_is_not_an_accepted_membership_channel(self):
+        def mutate(payload):
+            payload["properties"]["components"] = {"arm-1": {"dp.body_marker": "left"}}
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        self.assertIn("discovery.body_marker_unsupported", self._codes(result))
+
+    def test_contradictory_body_root_blocks(self):
+        def mutate(payload):
+            payload["properties"]["components"] = {"arm-1": {"dp.body_root": "true"}}
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        self.assertIn("discovery.body_root_conflict", self._codes(result))
 
     # ------------------------------------------------------------ verifier gates
 

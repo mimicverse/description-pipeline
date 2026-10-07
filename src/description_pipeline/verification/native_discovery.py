@@ -423,17 +423,6 @@ def _independent_clusters(record: dict):
         root_left, root_right = _find(components, parent, left), _find(components, parent, right)
         if root_left != root_right:
             parent[root_right] = root_left
-    markers: dict[str, list[str]] = {}
-    properties = (record.get("properties") or {}).get("components") or {}
-    for name in components:
-        marker = (properties.get(name) or {}).get("dp.body_marker")
-        if isinstance(marker, str) and marker.strip():
-            markers.setdefault(marker.strip(), []).append(name)
-    for group in markers.values():
-        for other in group[1:]:
-            root_left, root_right = _find(components, parent, group[0]), _find(components, parent, other)
-            if root_left != root_right:
-                parent[root_right] = root_left
     members: dict[str, list[str]] = {}
     for name in components:
         members.setdefault(_find(components, parent, name), []).append(name)
@@ -804,6 +793,15 @@ def verify_discovery(package: Path) -> dict:
                 isinstance(datum, dict) and _frame(datum.get("array")) is not None,
                 "discovery.graph",
                 "a datum transform is not a 4x4 frame",
+            )
+        component_properties = (raw.get("properties") or {}).get("components") or {}
+        for name, values in component_properties.items():
+            marker = values.get("dp.body_marker") if isinstance(values, dict) else None
+            _require(
+                not (isinstance(marker, str) and marker.strip()),
+                "discovery.graph",
+                "authored body markers are not an accepted membership channel",
+                {"component": name},
             )
         return {"components": len(names), "mates": len(raw.get("mates") or []), "datums": len(raw.get("datums") or [])}
 
@@ -1206,28 +1204,31 @@ def verify_discovery(package: Path) -> dict:
         bodies = [str(body.get("name")) for body in source.get("bodies") or []]
         _require("base_link" in bodies, "discovery.tree", "no base_link body")
         raw = state["payload"]["raw"]
-        members, _pairs = _independent_clusters(raw)
-        components = {str(item.get("name2")): item for item in raw.get("components") or [] if isinstance(item, dict)}
-        fixed_roots = {
-            root
-            for root, group in members.items()
-            if any(
-                components.get(name, {}).get("fixed") and not components.get(name, {}).get("suppressed")
-                for name in group
-            )
-        }
-        _require(fixed_roots, "discovery.tree", "no fixed component identifies the base body")
-        _require(len(fixed_roots) == 1, "discovery.tree", "several independent clusters claim the assembly ground")
-        base_components = members[next(iter(fixed_roots))]
-        owners = {
-            str(body.get("name"))
-            for body in source.get("bodies") or []
-            for component in body.get("components") or []
-            if str(component) in base_components
-        }
         _require(
-            owners == {"base_link"}, "discovery.tree", "base_link is not the fixed body", {"owners": sorted(owners)}
+            any(
+                str(body.get("name")) == "base_link"
+                and str((body.get("frame") or {}).get("coordinate_system")) == "CS_base_link"
+                for body in source.get("bodies") or []
+            ),
+            "discovery.tree",
+            "no body owns CS_base_link; a temporary IsFixed flag cannot prove the base",
         )
+        component_properties = (raw.get("properties") or {}).get("components") or {}
+        annotated = {
+            str(name)
+            for name, values in component_properties.items()
+            if isinstance(values, dict)
+            and str(values.get("dp.body_root") or "").strip().lower() in {"1", "true", "yes"}
+        }
+        if annotated:
+            base = next(body for body in source["bodies"] if str(body.get("name")) == "base_link")
+            base_components = {str(value) for value in base.get("components") or []}
+            _require(
+                annotated <= base_components,
+                "discovery.tree",
+                "dp.body_root contradicts CS_base_link",
+                {"components": sorted(annotated - base_components)},
+            )
         incoming: dict[str, str] = {}
         edges: dict[str, list[str]] = {}
         for joint in source.get("joints") or []:
