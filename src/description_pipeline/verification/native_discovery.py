@@ -102,35 +102,59 @@ def _names(mate: dict) -> list[str]:
     return out
 
 
+def _number(value) -> float | None:
+    """A real finite JSON number; booleans, numeric strings and null are not numbers."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
 def _unit_vector(vector) -> list[float] | None:
     try:
-        values = [float(value) for value in vector or ()]
-    except (TypeError, ValueError):
+        raw = list(vector or ())
+    except TypeError:
         return None
-    if len(values) != 3 or not all(math.isfinite(value) for value in values):
+    if len(raw) != 3:
         return None
-    norm = math.sqrt(sum(value * value for value in values))
-    if norm == 0:
+    values = [_number(value) for value in raw]
+    if any(value is None for value in values):
         return None
-    return [value / norm for value in values]
+    numbers = [value for value in values if value is not None]
+    # hypot keeps a large finite magnitude from overflowing the norm, which would otherwise
+    # normalize the vector to zero and silently make an unusable direction look usable.
+    norm = math.hypot(*numbers)
+    if norm == 0.0:
+        return None
+    return [value / norm for value in numbers]
 
 
 def _finite_triple(values) -> list[float] | None:
     """A plain three-number point or vector; non-finite or misshaped data never becomes geometry."""
     if not isinstance(values, (list, tuple)) or len(values) != 3:
         return None
-    try:
-        numbers = [float(value) for value in values]
-    except (TypeError, ValueError):
+    numbers = [_number(value) for value in values]
+    if any(value is None for value in numbers):
         return None
-    if not all(math.isfinite(value) for value in numbers):
-        return None
-    return numbers
+    return [value for value in numbers if value is not None]
 
 
 def _finite_limit(value) -> bool:
     """A real finite number; booleans and strings are not limits."""
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+    return _number(value) is not None
+
+
+def _valid_limits(limits) -> bool:
+    """A bounded range: finite, matching-unit, strictly ordered lower < upper."""
+    if not isinstance(limits, dict):
+        return False
+    lower, upper = limits.get("lower"), limits.get("upper")
+    return (
+        _finite_limit(lower)
+        and _finite_limit(upper)
+        and float(lower) < float(upper)
+        and limits.get("unit") in {"m", "rad"}
+    )
 
 
 def _cross(left, right) -> list[float]:
@@ -164,13 +188,16 @@ def _frames(record: dict) -> dict[str, list[list[float]] | None]:
         if not isinstance(item, dict):
             continue
         name = item.get("name2")
-        if not isinstance(name, str) or item.get("suppressed"):
+        suppressed = item.get("suppressed")
+        if not isinstance(name, str) or not isinstance(suppressed, bool) or suppressed:
             continue
-        try:
-            numbers = [float(value) for value in item.get("transform") or ()]
-        except (TypeError, ValueError):
-            numbers = []
-        frames[name] = [numbers[0:4], numbers[4:8], numbers[8:12], numbers[12:16]] if len(numbers) == 16 else None
+        values = [_number(value) for value in item.get("transform") or ()]
+        numbers = [value for value in values if value is not None]
+        frames[name] = (
+            [numbers[0:4], numbers[4:8], numbers[8:12], numbers[12:16]]
+            if len(values) == 16 and len(numbers) == 16
+            else None
+        )
     return frames
 
 
@@ -486,11 +513,13 @@ def _datum(record: dict, name) -> dict | None:
 
 def _frame(values) -> list[list[float]] | None:
     try:
-        numbers = [float(value) for value in values or ()]
-    except (TypeError, ValueError):
+        raw = list(values or ())
+    except TypeError:
         return None
-    if len(numbers) != 16 or not all(math.isfinite(value) for value in numbers):
+    values_as_numbers = [_number(value) for value in raw]
+    if len(values_as_numbers) != 16 or any(value is None for value in values_as_numbers):
         return None
+    numbers = [value for value in values_as_numbers if value is not None]
     return [numbers[0:4], numbers[4:8], numbers[8:12], numbers[12:16]]
 
 
@@ -804,14 +833,19 @@ def verify_discovery(package: Path) -> dict:
                 "the saved mate reports a native error or an unreadable solve state",
                 {"mate": mate.get("name"), "error_code": error_code},
             )
+            kind = str(mate.get("type") or "").strip().lower()
             limits = mate.get("limits")
-            if limits is not None:
+            if kind in {"limitdistance", "limitangle"}:
+                unit = "m" if kind == "limitdistance" else "rad"
                 _require(
-                    isinstance(limits, dict)
-                    and _finite_limit(limits.get("lower"))
-                    and _finite_limit(limits.get("upper"))
-                    and float(limits["lower"]) <= float(limits["upper"])
-                    and limits.get("unit") in {"m", "rad"},
+                    _valid_limits(limits) and limits.get("unit") == unit,
+                    "discovery.graph",
+                    f"a {kind} mate must carry finite lower < upper bounds in {unit}",
+                    {"mate": mate.get("name"), "limits": limits},
+                )
+            elif limits is not None:
+                _require(
+                    _valid_limits(limits),
                     "discovery.graph",
                     "a bounded mate limit is not a finite ordered range with a unit",
                     {"mate": mate.get("name"), "limits": limits},
@@ -861,17 +895,16 @@ def verify_discovery(package: Path) -> dict:
                     )
                 circle = entity.get("circle")
                 if isinstance(circle, dict):
-                    try:
-                        numbers = [
-                            float(value)
-                            for value in (*circle.get("center", ()), *circle.get("normal", ()), circle["radius"])
-                        ]
-                    except (TypeError, ValueError):
-                        numbers = []
+                    radius = circle.get("radius")
                     _require(
-                        len(numbers) == 7 and all(math.isfinite(value) for value in numbers) and numbers[6] > 0,
+                        _finite_triple(circle.get("center")) is not None
+                        and _finite_triple(circle.get("normal")) is not None
+                        and _unit_vector(circle.get("normal")) is not None
+                        and _finite_limit(radius)
+                        and float(radius) > 0,
                         "discovery.graph",
-                        "a circle entity is not a finite circle",
+                        "a circle entity is not a finite circle with a usable normal",
+                        {"mate": mate.get("name"), "component": entity.get("component")},
                     )
             _require(
                 _rows_for(mate, frames) is not None,

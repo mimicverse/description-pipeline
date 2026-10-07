@@ -321,12 +321,41 @@ class OracleSemanticsTests(unittest.TestCase):
             {"center": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, float("nan")], "radius": 0.006},
             {"center": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0], "radius": float("inf")},
             {"center": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0], "radius": 0.0},
+            # A zero normal is finite but unusable, a boolean radius is not a radius, and a
+            # missing radius must fail semantically rather than as an internal error.
+            {"center": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 0.0], "radius": 0.006},
+            {"center": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0], "radius": True},
+            {"center": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0]},
         ):
             with self.subTest(circle=circle):
                 self.reject(
                     lambda raw, payload, value=circle: raw["mates"][1]["entities"][0].update({"circle": value}),
                     "a circle entity is not a finite circle",
                 )
+
+    def test_numeric_strings_are_not_numbers(self) -> None:
+        def mutate(raw, payload):
+            raw["mates"][1]["entities"][1].clear()
+            raw["mates"][1]["entities"][1].update({"component": "arm-1", "point": ["0", 0.0, 0.1]})
+
+        self.reject(mutate, "a point entity is not a finite point")
+
+        def string_transform(raw, payload):
+            raw["components"][1]["transform"][3] = "0.0"
+
+        self.reject(string_transform, "outside the supported constraint scope")
+
+    def test_large_finite_axis_cannot_overflow_to_a_zero_vector(self) -> None:
+        """hypot normalization keeps a huge finite direction usable instead of collapsing to zero."""
+
+        def mutate(raw, payload):
+            for entity in raw["mates"][0]["entities"]:
+                entity["cylinder"]["direction"] = [1e200, 0.0, 0.0]
+
+        package = self.baseline()
+        self._native(package, mutate)
+        _passed, _errors, checks = self.check(package)
+        self.assertTrue(checks["discovery.graph"]["passed"], checks["discovery.graph"])
 
     # ------------------------------------------------------- solve state flags
 
@@ -353,6 +382,7 @@ class OracleSemanticsTests(unittest.TestCase):
             {"lower": -0.05, "upper": float("inf"), "unit": "m"},
             {"lower": -0.05, "upper": float("nan"), "unit": "m"},
             {"lower": 0.05, "upper": -0.05, "unit": "m"},
+            {"lower": 0.05, "upper": 0.05, "unit": "m"},
             {"lower": -0.05, "upper": 0.05, "unit": "mm"},
             {"lower": "0", "upper": "1", "unit": "m"},
             ["lower", "upper"],
@@ -362,6 +392,32 @@ class OracleSemanticsTests(unittest.TestCase):
                     lambda raw, payload, value=limits: raw["mates"][0].update({"limits": value}),
                     "a bounded mate limit is not a finite ordered range with a unit",
                 )
+
+    def test_typed_bounded_mates_require_matching_bounds(self) -> None:
+        for kind, limits in (
+            ("limitdistance", None),
+            ("limitangle", None),
+            ("limitdistance", {"lower": -0.05, "upper": 0.05, "unit": "rad"}),
+            ("limitangle", {"lower": -0.05, "upper": 0.05, "unit": "m"}),
+            ("limitdistance", {"lower": 0.05, "upper": 0.05, "unit": "m"}),
+        ):
+            unit = "m" if kind == "limitdistance" else "rad"
+            with self.subTest(kind=kind, limits=limits):
+                self.reject(
+                    lambda raw, payload, mate_type=kind, value=limits: raw["mates"][1].update(
+                        {"type": mate_type, "limits": value}
+                    ),
+                    f"a {kind} mate must carry finite lower < upper bounds in {unit}",
+                )
+
+    def test_typed_bounded_mate_with_matching_bounds_keeps_the_graph_valid(self) -> None:
+        def mutate(raw, payload):
+            raw["mates"][1].update({"type": "limitdistance", "limits": {"lower": -0.05, "upper": 0.05, "unit": "m"}})
+
+        package = self.baseline()
+        self._native(package, mutate)
+        _passed, _errors, checks = self.check(package)
+        self.assertTrue(checks["discovery.graph"]["passed"], checks["discovery.graph"])
 
     # -------------------------------------------------- shaft and circle semantics
 
