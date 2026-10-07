@@ -1075,8 +1075,15 @@ def verify_discovery(package: Path) -> dict:
             child = next(body for body in source["bodies"] if str(body.get("name")) == str(joint.get("child")))
             child_datum = _datum(raw, child["frame"]["coordinate_system"])
             frame = _frame(child_datum.get("array"))
+            sign_value = properties.get("dp.joint.axis_sign")
+            _require(
+                sign_value in (1, "+1", "1", -1, "-1"),
+                "discovery.joints",
+                "dp.joint.axis_sign must be exactly +1 or -1",
+                {"value": sign_value},
+            )
             native = [float(value) for value in shaft]
-            if str(properties.get("dp.joint.axis_sign")) == "-1":
+            if sign_value in (-1, "-1"):
                 native = [-value for value in native]
             local = _local_axis(frame, native)
             norm = math.sqrt(sum(value * value for value in local))
@@ -1146,6 +1153,20 @@ def verify_discovery(package: Path) -> dict:
                     "the joint limits differ from the native mate",
                     {"joint": joint.get("name")},
                 )
+                native_record = properties.get("dp.joint.limits_record")
+                if isinstance(native_record, str) and native_record.strip():
+                    entry = _find_record_entry(payload, native_record)
+                    value = _record_value(package, entry["entry"], entry["key"])
+                    _require(
+                        _close(
+                            [limits.get("lower"), limits.get("upper")],
+                            [value.get("lower"), value.get("upper")],
+                            1e-12,
+                        ),
+                        "discovery.joints",
+                        "native mate limits and the controlled record disagree",
+                        {"joint": joint.get("name")},
+                    )
             else:
                 reference_record = properties.get("dp.joint.limits_record")
                 _require(

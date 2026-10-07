@@ -918,9 +918,23 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                     )
                 )
                 continue
-        sign = properties.get(f"{NAMESPACE}.joint.axis_sign")
+        sign_value = properties.get(f"{NAMESPACE}.joint.axis_sign")
+        if sign_value in (1, "+1", "1"):
+            sign = 1
+        elif sign_value in (-1, "-1"):
+            sign = -1
+        else:
+            findings.append(
+                _finding(
+                    "discovery.joint_axis_sign_missing",
+                    obj,
+                    "dp.joint.axis_sign must be exactly +1 or -1; a vendor cylinder direction is not a positive motion",
+                    {"value": sign_value},
+                )
+            )
+            continue
         native_direction = [float(value) for value in shaft]
-        if sign in (-1, "-1"):
+        if sign == -1:
             native_direction = [-value for value in native_direction]
         cylinder_entity = next(
             (
@@ -978,6 +992,34 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                     _finding("discovery.joint_limits_invalid", obj, "native mate limits are not finite numbers")
                 )
                 continue
+            native_record_ref = properties.get(f"{NAMESPACE}.joint.limits_record")
+            if _text(native_record_ref):
+                declared = _resolve_record(settings, str(native_record_ref), findings, obj)
+                if declared is not None:
+                    try:
+                        lower = float(declared["value"]["lower"])
+                        upper = float(declared["value"]["upper"])
+                    except (KeyError, TypeError, ValueError):
+                        findings.append(
+                            _finding(
+                                "discovery.joint_limits_invalid",
+                                obj,
+                                "controlled record lacks finite lower/upper limits",
+                                {"file": declared["file"]},
+                            )
+                        )
+                        continue
+                    if abs(lower - limits["lower"]) > 1e-12 or abs(upper - limits["upper"]) > 1e-12:
+                        findings.append(
+                            _finding(
+                                "discovery.joint_limits_conflict",
+                                obj,
+                                "native mate limits and the controlled record disagree",
+                                {"native": limits, "record": {"lower": lower, "upper": upper}},
+                            )
+                        )
+                        continue
+                    limit_evidence = declared
         else:
             record_ref = properties.get(f"{NAMESPACE}.joint.limits_record")
             if _text(record_ref):

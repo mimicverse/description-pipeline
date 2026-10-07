@@ -162,6 +162,7 @@ def record() -> dict:
             "components": {},
             "mates": {
                 "shoulder_pitch_joint__coaxial": {
+                    "dp.joint.axis_sign": "+1",
                     "dp.joint.limits_record": "joints/arm.json#limits",
                     "dp.joint.drive_record": "joints/arm.json#drive",
                 }
@@ -599,6 +600,21 @@ class DiscoveryTests(unittest.TestCase):
 
         result, _source, _output = self._prepare(mutate=mutate)
         self.assertIn("discovery.link_name_conflict", self._codes(result))
+
+    def test_missing_axis_sign_blocks(self):
+        result, _source, _output = self._prepare(
+            mutate=lambda payload: payload["properties"]["mates"]["shoulder_pitch_joint__coaxial"].pop(
+                "dp.joint.axis_sign"
+            )
+        )
+        self.assertIn("discovery.joint_axis_sign_missing", self._codes(result))
+
+    def test_native_limits_conflicting_with_the_record_block(self):
+        def mutate(payload):
+            payload["mates"][0]["limits"] = {"lower": -2.0, "upper": 2.0, "unit": "rad"}
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        self.assertIn("discovery.joint_limits_conflict", self._codes(result))
 
     # ------------------------------------------------------------ verifier gates
 
