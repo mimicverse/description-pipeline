@@ -1221,73 +1221,74 @@ class SolidWorksBackend(CadBackend):
                 reference,
             )
         body_type = 1 if str(reference.get("body_type") or "solid") == "sheet" else 0
-        holder = self._current_components("axis_reference")[component]
-        if _is_text_name(feature_name):
-            face = self._cylinder_face_by_feature(holder, str(feature_name), component, body_type)
-        else:
+        with self._current_components("axis_reference") as current:
+            holder = current[component]
             bodies = self._body_list(holder, body_type, component)
-            faces = []
-            for body in bodies:
-                faces.extend(_as_list(_member(body, "GetFaces")))
-            if face_index >= len(faces):
+            if _is_text_name(feature_name):
+                face = self._cylinder_face_by_feature(bodies, str(feature_name), component)
+            else:
+                faces = []
+                for body in bodies:
+                    faces.extend(_as_list(_member(body, "GetFaces")))
+                if face_index >= len(faces):
+                    raise CadError(
+                        "cad_axis_reference_invalid",
+                        "face_index is outside the component's faces",
+                        {"component": component, "face_index": face_index, "faces": len(faces)},
+                    )
+                face = faces[face_index]
+            surface = _member(face, "GetSurface")
+            params = list(map(float, _member(surface, "CylinderParams") or ()))
+            if len(params) != 7 or not all(map(math.isfinite, params)):
                 raise CadError(
-                    "cad_axis_reference_invalid",
-                    "face_index is outside the component's faces",
-                    {"component": component, "face_index": face_index, "faces": len(faces)},
+                    "cad_axis_reference_not_cylinder",
+                    "the referenced face does not expose cylindrical geometry",
+                    {"component": component, "face_index": face_index},
                 )
-            face = faces[face_index]
-        surface = _member(face, "GetSurface")
-        params = list(map(float, _member(surface, "CylinderParams") or ()))
-        if len(params) != 7 or not all(map(math.isfinite, params)):
-            raise CadError(
-                "cad_axis_reference_not_cylinder",
-                "the referenced face does not expose cylindrical geometry",
-                {"component": component, "face_index": face_index},
-            )
-        point, direction, radius = params[0:3], params[3:6], params[6]
-        norm = math.sqrt(sum(value * value for value in direction))
-        # Planar faces answer CylinderParams with garbage instead of raising, so
-        # the geometry itself must prove it is a cylinder: unit axis, positive
-        # radius.
-        if abs(norm - 1.0) > 1e-6 or radius <= 0.0:
-            raise CadError(
-                "cad_axis_reference_not_cylinder",
-                "the referenced face is not a cylinder with a unit axis and positive radius",
-                {"component": component, "face_index": face_index, "radius": radius, "axis_norm": norm},
-            )
-        face_name = ""
-        try:
-            face_name = str(_member(face, "Name") or "")
-        except CadError:
+            point, direction, radius = params[0:3], params[3:6], params[6]
+            norm = math.sqrt(sum(value * value for value in direction))
+            # Planar faces answer CylinderParams with garbage instead of raising, so
+            # the geometry itself must prove it is a cylinder: unit axis, positive
+            # radius.
+            if abs(norm - 1.0) > 1e-6 or radius <= 0.0:
+                raise CadError(
+                    "cad_axis_reference_not_cylinder",
+                    "the referenced face is not a cylinder with a unit axis and positive radius",
+                    {"component": component, "face_index": face_index, "radius": radius, "axis_norm": norm},
+                )
             face_name = ""
-        record = {
-            "component": component,
-            "body_type": "sheet" if body_type == 1 else "solid",
-            "selector": {key: value for key, value in reference.items() if key != "note"},
-            "face_name": face_name,
-            "surface": "cylinder",
-            # IComponent2 bodies answer in component/part-local coordinates and
-            # the cylinder axis is an undirected line: the authored joint axis
-            # supplies the positive direction.
-            "coordinate_frame": "component_local",
-            "direction_semantics": "undirected_axis_line",
-            "axis_point_m": [float(value) for value in point],
-            "axis_direction": [float(value) / norm for value in direction],
-            "radius_m": float(radius),
-            "used_api": ("IComponent2.GetBodies2/IBody2.GetFaces/IFace2.GetSurface/ISurface.CylinderParams"),
-        }
-        if isinstance(face_index, int) and not isinstance(face_index, bool):
-            record["face_index"] = face_index
-        persist = self._persist_reference(face)
-        if persist is not None:
-            record["persist_reference_b64"] = persist
-        return record
+            try:
+                face_name = str(_member(face, "Name") or "")
+            except CadError:
+                face_name = ""
+            record = {
+                "component": component,
+                "body_type": "sheet" if body_type == 1 else "solid",
+                "selector": {key: value for key, value in reference.items() if key != "note"},
+                "face_name": face_name,
+                "surface": "cylinder",
+                # IComponent2 bodies answer in component/part-local coordinates and
+                # the cylinder axis is an undirected line: the authored joint axis
+                # supplies the positive direction.
+                "coordinate_frame": "component_local",
+                "direction_semantics": "undirected_axis_line",
+                "axis_point_m": [float(value) for value in point],
+                "axis_direction": [float(value) / norm for value in direction],
+                "radius_m": float(radius),
+                "used_api": ("IComponent2.GetBodies2/IBody2.GetFaces/IFace2.GetSurface/ISurface.CylinderParams"),
+            }
+            if isinstance(face_index, int) and not isinstance(face_index, bool):
+                record["face_index"] = face_index
+            persist = self._persist_reference(face)
+            if persist is not None:
+                record["persist_reference_b64"] = persist
+            return record
 
-    def _cylinder_face_by_feature(self, holder, feature_name, component, body_type):
+    def _cylinder_face_by_feature(self, bodies, feature_name, component):
         """Resolve the named feature among this occurrence's actual body faces."""
 
         found = None
-        for body in self._body_list(holder, body_type, component):
+        for body in bodies:
             for candidate in _as_list(_member(body, "GetFaces")):
                 feature = _member(candidate, "GetFeature")
                 if feature is None or _member(feature, "Name") != feature_name:
@@ -1593,10 +1594,39 @@ class SolidWorksBackend(CadBackend):
         """Component-local display triangles of every face of every requested body."""
 
         values: list[float] = []
+        completed_faces = 0
         for index, body in enumerate(bodies):
             body_values: list[float] = []
-            for face_index, face in enumerate(_as_list(_member(body, "GetFaces"))):
-                face_values = list(map(float, _member(face, "GetTessTriangles", True) or ()))
+            context = {
+                "component": component,
+                "body_type": body_type,
+                "body_index": index,
+                "completed_bodies": index,
+                "completed_faces": completed_faces,
+            }
+            try:
+                faces = _as_list(_member(body, "GetFaces"))
+            except Exception as error:
+                raise CadError(
+                    "cad_body_faces_unreadable",
+                    "the occurrence body's faces could not be read",
+                    {**context, "api": "IBody2.GetFaces", "error": str(error)},
+                ) from error
+            for face_index, face in enumerate(faces):
+                try:
+                    face_values = list(map(float, _member(face, "GetTessTriangles", True) or ()))
+                except Exception as error:
+                    raise CadError(
+                        "cad_face_tessellation_unreadable",
+                        "the occurrence face's display triangles could not be read",
+                        {
+                            **context,
+                            "face_index": face_index,
+                            "completed_faces": completed_faces,
+                            "api": "IFace2.GetTessTriangles(True)",
+                            "error": str(error),
+                        },
+                    ) from error
                 if not face_values or len(face_values) % 9 or not all(map(math.isfinite, face_values)):
                     raise CadError(
                         "cad_mesh_export_failed",
@@ -1609,6 +1639,7 @@ class SolidWorksBackend(CadBackend):
                         },
                     )
                 body_values.extend(face_values)
+                completed_faces += 1
             if not body_values:
                 raise CadError(
                     "cad_mesh_export_failed",
@@ -1627,26 +1658,28 @@ class SolidWorksBackend(CadBackend):
 
         if component not in self._components:
             raise CadError("cad_missing_component", component)
-        holder = self._current_components("geometry")[component]
         sources: list[str] = []
         values: list[float] = []
-        solid_bodies = self._body_list(holder, 0, component)
-        sheet_bodies = self._body_list(holder, 1, component)
-        for bodies, body_type, source in (
-            (solid_bodies, 0, "solid_body_faces"),
-            (sheet_bodies, 1, "sheet_body_faces"),
-        ):
-            if bodies:
-                values.extend(self._body_face_triangles(bodies, body_type, component))
-                sources.append(source)
+        body_counts = {"solid": 0, "sheet": 0}
+        with self._current_components("geometry") as current:
+            holder = current[component]
+            for body_type, kind, source in (
+                (0, "solid", "solid_body_faces"),
+                (1, "sheet", "sheet_body_faces"),
+            ):
+                bodies = self._body_list(holder, body_type, component)
+                body_counts[kind] = len(bodies)
+                if bodies:
+                    values.extend(self._body_face_triangles(bodies, body_type, component))
+                    sources.append(source)
         if not values:
             raise CadError(
                 "cad_mesh_export_failed",
                 "invalid tessellation",
                 {
                     "component": component,
-                    "solid_bodies": len(solid_bodies),
-                    "sheet_bodies": len(sheet_bodies),
+                    "solid_bodies": body_counts["solid"],
+                    "sheet_bodies": body_counts["sheet"],
                 },
             )
         # Native display tessellation, in metres, independent of global STL
@@ -1685,10 +1718,7 @@ class SolidWorksBackend(CadBackend):
             "units": "m",
             "representation": "CAD_display_tessellation",
             "tessellation_sources": sources,
-            "bodies": {
-                "solid": len(solid_bodies),
-                "sheet": len(sheet_bodies),
-            },
+            "bodies": body_counts,
         }
 
     def _record_source_document(self, path, configuration):
@@ -1737,14 +1767,16 @@ class SolidWorksBackend(CadBackend):
             )
         return doc
 
+    @contextmanager
     def _current_components(self, phase):
-        """Read the current assembly tree; never retain occurrence dispatch handles."""
+        """Keep the current parent interfaces alive for one complete occurrence read."""
         doc = self._captured_document(self._scene_document_key, phase=phase)
         path = self._source_documents[self._scene_document_key][0]
         name = ""
         current = {}
         try:
-            config = _member(_member(doc, "ConfigurationManager"), "ActiveConfiguration")
+            manager = _member(doc, "ConfigurationManager")
+            config = _member(manager, "ActiveConfiguration")
             root = _member(config, "GetRootComponent3", True)
             if root is None:
                 raise ValueError("the assembly has no readable root component")
@@ -1798,7 +1830,7 @@ class SolidWorksBackend(CadBackend):
         missing = sorted(self._source_components.keys() - current.keys())
         if missing:
             raise CadError("cad_source_changed", "active occurrences disappeared", {"missing": missing, "path": path})
-        return current
+        yield current
 
     def verify_sources_unchanged(self):
         if not self._source_documents:
@@ -1806,7 +1838,8 @@ class SolidWorksBackend(CadBackend):
         for key in self._source_documents:
             component = next((name for name, (doc_key, _) in self._source_components.items() if doc_key == key), "")
             self._captured_document(key, component)
-        self._current_components("verify_sources")
+        with self._current_components("verify_sources"):
+            pass
         for path, digest in self.source_files.items():
             if _hash(path) != digest:
                 raise CadError("cad_source_changed", path)

@@ -19,6 +19,7 @@ import os
 import sys
 import types
 import unittest
+import weakref
 from contextlib import contextmanager
 from itertools import pairwise
 from pathlib import Path
@@ -976,6 +977,114 @@ class CaptureSceneTests(unittest.TestCase):
             backend.export_component_mesh("part-short", path)
             self.assertEqual(read_stl(path).high, (1.0, 1.0, 0.0))
             backend.verify_sources_unchanged()
+
+    def _borrowed_occurrence_geometry(self, backend, root):
+        """Model vendor geometry that is valid only while its parent interfaces live."""
+        path = str(root / "robot.SLDASM")
+        main = backend._document_by_path(path)
+        lifetimes = []
+
+        class Borrowed:
+            def __init__(self, inner, parents):
+                self.inner = inner
+                self.parents = parents
+
+            def check(self):
+                if not all(parent() is not None for parent in self.parents):
+                    raise RuntimeError("borrowed geometry outlived its native parent interfaces")
+
+            def __getattr__(self, name):
+                self.check()
+                return getattr(self.inner, name)
+
+        class Body(Borrowed):
+            def GetFaces(self):
+                self.check()
+                return [Borrowed(face, self.parents) for face in self.inner.GetFaces()]
+
+        class Component(Borrowed):
+            def GetBodies2(self, body_type):
+                self.check()
+                return [Body(body, self.parents) for body in self.inner.GetBodies2(body_type)]
+
+        class Root:
+            def __init__(self, manager, configuration):
+                self.parents = (manager, weakref.ref(configuration), weakref.ref(self))
+                lifetimes.append(self.parents)
+
+            def GetChildren(self):
+                return [Component(child, self.parents) for child in main._children]
+
+        class Configuration:
+            Name = main.active_configuration
+
+            def __init__(self, manager):
+                self.manager = weakref.ref(manager)
+
+            def GetRootComponent3(self, _resolved):
+                return Root(self.manager, self)
+
+        class Manager:
+            @property
+            def ActiveConfiguration(self):
+                return Configuration(self)
+
+        class Document:
+            @property
+            def ConfigurationManager(self):
+                return Manager()
+
+            def __getattr__(self, name):
+                return getattr(main, name)
+
+        backend._app_obj()._docs[os.path.normcase(os.path.abspath(path))] = Document()
+        return lifetimes
+
+    def test_mesh_keeps_borrowed_parent_interfaces_alive_until_all_faces_are_read(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            backend, _, _, _, _ = self._configured_occurrences(root)
+            lifetimes = self._borrowed_occurrence_geometry(backend, root)
+            path = root / "borrowed.stl"
+            backend.export_component_mesh("part-long", path)
+            self.assertEqual(read_stl(path).triangles, 2)
+            self.assertEqual(read_stl(path).high, (2.0, 2.0, 0.0))
+            self.assertTrue(lifetimes)
+            self.assertTrue(all(parent() is None for parents in lifetimes for parent in parents))
+
+    def test_shaft_keeps_borrowed_parents_alive_through_the_surface_read(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            backend, _, _, short, _ = self._configured_occurrences(root)
+            face = types.SimpleNamespace(
+                GetFeature=lambda: types.SimpleNamespace(Name="shaft"),
+                GetSurface=lambda: _Cylinder((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), 0.02),
+            )
+            short.GetBodies2 = lambda body_type: [types.SimpleNamespace(GetFaces=lambda: [face])]
+            lifetimes = self._borrowed_occurrence_geometry(backend, root)
+            result = backend.capture_axis_reference({"component": "part-short", "feature_name": "shaft"})
+            self.assertEqual(result["axis_direction"], [0.0, 0.0, 1.0])
+            self.assertEqual(result["radius_m"], 0.02)
+            self.assertTrue(all(parent() is None for parents in lifetimes for parent in parents))
+
+    def test_face_read_failure_reports_the_exact_occurrence_and_completed_work(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            backend, _, _, short, _ = self._configured_occurrences(root)
+            good = types.SimpleNamespace(GetTessTriangles=lambda _quality: [0, 0, 0, 1, 0, 0, 0, 1, 0])
+            failed = types.SimpleNamespace(GetTessTriangles=_raiser(RuntimeError("RPC_S_UNKNOWN_IF")))
+            short.GetBodies2 = lambda body_type: (
+                [types.SimpleNamespace(GetFaces=lambda: [good, failed])] if body_type == 0 else []
+            )
+            path = root / "failed.stl"
+            with self.assertRaises(CadError) as caught:
+                backend.export_component_mesh("part-short", path)
+            self.assertEqual(caught.exception.code, "cad_face_tessellation_unreadable")
+            self.assertEqual(caught.exception.detail["component"], "part-short")
+            self.assertEqual(caught.exception.detail["face_index"], 1)
+            self.assertEqual(caught.exception.detail["completed_faces"], 1)
+            self.assertEqual(caught.exception.detail["api"], "IFace2.GetTessTriangles(True)")
+            self.assertFalse(path.exists())
 
     def test_fresh_nested_occurrences_keep_duplicate_leaf_names_distinct(self):
         with TemporaryDirectory() as tmp, _com_stubs():
