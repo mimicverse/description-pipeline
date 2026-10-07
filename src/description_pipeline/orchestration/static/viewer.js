@@ -415,15 +415,14 @@ export function buildJointControls(container, joints, { onInput } = {}) {
     const readout = document.createElement("output");
     const range = document.createElement("input");
     range.type = "range";
+    range.step = "any";
     const angular = joint.type === "revolute" || joint.type === "continuous";
     if (angular) {
       range.min = String((joint.lower * 180) / Math.PI);
       range.max = String((joint.upper * 180) / Math.PI);
-      range.step = "0.5";
     } else {
       range.min = String(joint.lower);
       range.max = String(joint.upper);
-      range.step = String(Math.max((joint.upper - joint.lower) / 500, 1e-4));
     }
     range.value = "0";
     const update = () => {

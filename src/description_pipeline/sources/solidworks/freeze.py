@@ -949,8 +949,9 @@ def _retain_failure(
         "schema_version": "description-pipeline.solidworks-freeze-failure/v1",
         "stage": stage,
         "code": getattr(error, "code", type(error).__name__),
-        "message": str(error),
+        "message": _redact(str(error)),
         "detail": _redact(getattr(error, "detail", None), "detail"),
+        "exceptions": _redact(_exception_trace(error)),
         "exit_code": getattr(error, "exit_code", None),
         "destination": str(destination),
         "request": _redact(request),
@@ -973,6 +974,35 @@ def _retain_failure(
             write_json(candidate / "failure.json", {**payload, "partial": str(moved)})
         return str(candidate)
     return None
+
+
+def _exception_trace(error: BaseException) -> list[dict[str, Any]]:
+    """Retain native call sites without inspecting or calling any COM object."""
+
+    chain: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        frames = []
+        trace = error.__traceback__
+        while trace is not None:
+            frame = trace.tb_frame
+            module = frame.f_globals.get("__name__", "")
+            if isinstance(module, str) and module.startswith("description_pipeline.sources.solidworks."):
+                site = {"module": module, "function": frame.f_code.co_name, "line": trace.tb_lineno}
+                if module.endswith(".native") and frame.f_code.co_name in ("_member", "_method"):
+                    member = frame.f_locals.get("name")
+                    if isinstance(member, str):
+                        site["member"] = member
+                frames.append(site)
+            trace = trace.tb_next
+        record = {"type": type(error).__name__, "message": str(error), "frames": frames}
+        hresult = getattr(error, "hresult", None)
+        if isinstance(hresult, int):
+            record["hresult"] = hresult
+        chain.append(record)
+        error = error.__cause__ or (None if error.__suppress_context__ else error.__context__)
+    return chain
 
 
 def _component_context_record(reading: dict[str, Any], scene: Any, assembly_mass: float | None) -> dict[str, Any]:

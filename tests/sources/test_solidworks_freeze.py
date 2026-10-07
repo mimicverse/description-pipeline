@@ -897,6 +897,67 @@ class FreezeTests(unittest.TestCase):
         self.assertEqual(environment["solidworks"]["sessions"], sessions)
         self.assertFalse(self.destination.exists())
 
+    def test_failed_readings_retain_exact_native_member_and_original_rpc_cause(self) -> None:
+        from description_pipeline.sources.solidworks.errors import CadError
+        from description_pipeline.sources.solidworks.native import _member, _method
+
+        class RpcError(Exception):
+            hresult = -2147023130
+
+        class NoRepresentation:
+            def __repr__(self):
+                raise AssertionError("diagnostics must not inspect COM arguments")
+
+        class Unreadable:
+            def __init__(self):
+                self.attempts = []
+
+            @property
+            def ConfigurationManager(self):
+                self.attempts.append("property")
+                raise RpcError("RPC failed at http://user:secret@192.0.2.10/api?token=abc")
+
+            def ReadValue(self, argument):
+                self.attempts.append("method")
+                raise RpcError("RPC failed at http://user:secret@192.0.2.10/api?token=abc")
+
+        for reader, name, arguments in (
+            (_member, "ConfigurationManager", ()),
+            (_method, "ReadValue", (NoRepresentation(),)),
+        ):
+            with self.subTest(reader=reader.__name__):
+                backend, config = self._two_component_backend()
+                native = Unreadable()
+
+                def fail_reading(*args, reader=reader, native=native, member=name, arguments=arguments, **kwargs):
+                    try:
+                        reader(native, member, *arguments)
+                    except RpcError as cause:
+                        raise CadError("cad_source_state_unreadable", "native source unreadable") from cause
+
+                backend.collect_scene = fail_reading
+                destination = self.tmp / reader.__name__
+                with self.assertRaises(CadError) as caught:
+                    freeze(config, destination, backend=backend)
+
+                self.assertEqual(caught.exception.code, "cad_source_state_unreadable")
+                self.assertEqual(len(native.attempts), 1)
+                failure = destination.with_name(destination.name + ".failed-001")
+                payload = (failure / "failure.json").read_text()
+                record = json.loads(payload)
+                self.assertEqual(record["stage"], "readings")
+                self.assertEqual([item["type"] for item in record["exceptions"]], ["CadError", "RpcError"])
+                rpc = record["exceptions"][1]
+                self.assertEqual(rpc["hresult"], -2147023130)
+                site = next(item for item in rpc["frames"] if item["function"] == reader.__name__)
+                self.assertEqual(site["member"], name)
+                self.assertEqual(site["module"], "description_pipeline.sources.solidworks.native")
+                self.assertGreater(site["line"], 0)
+                self.assertNotIn("secret", payload)
+                self.assertNotIn("token=abc", payload)
+                self.assertTrue((failure / "partial/source" / self.assembly.name).is_file())
+                self.assertFalse(destination.exists())
+
     def test_geometry_batch_cannot_omit_or_substitute_an_occurrence(self) -> None:
         for change in ("omit", "substitute"):
             with self.subTest(change=change):
