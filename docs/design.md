@@ -36,9 +36,12 @@ flowchart LR
 The pipeline freezes the main assembly, delivery configuration and complete
 native dependencies. An owned SolidWorks session reads the saved state and
 derives rigid bodies, joint relationships and frames from assembly structure,
-mates, datums and necessary native engineering annotations. Component identities
-resolve to fixed specifications. Missing or ambiguous facts produce findings
-at their source; the tool does not invent parameters.
+mates, datums and necessary native engineering annotations. The identity step
+binds document part numbers and revisions to occurrence-scoped identifiers and
+model interface names under the
+[mechanical specification](mechanical-handoff-spec.md#2-命名与原生引用).
+Component identities resolve to fixed specifications. Missing or ambiguous facts
+produce findings at their source; the tool does not invent parameters.
 
 The canonical model carries topology, transforms, geometry and complete physical
 semantics. URDF and meshes are derived from it. Original CAD, raw observations
