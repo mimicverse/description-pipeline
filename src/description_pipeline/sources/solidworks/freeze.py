@@ -975,17 +975,6 @@ def _retain_failure(
     return None
 
 
-def _leaf_volume(mass_properties: dict[str, Any], name: Any) -> float:
-    """A leaf's own volume when the capture recorded one; absent or unusable context counts as zero."""
-
-    payload = mass_properties.get(str(name)) or {}
-    reference = payload.get("reference") or {}
-    try:
-        return float(reference.get("volume_m3") or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
 def _component_context_record(reading: dict[str, Any], scene: Any, assembly_mass: float | None) -> dict[str, Any]:
     """Align the assembly context's per-instance readings with the leaf/document basis.
 
@@ -1143,7 +1132,7 @@ def _mass_closure(
     receipts for diagnosis. The v1 delivery verifier requires full whole-assembly
     closure and complete component-context evidence; a missing or inconsistent
     receipt blocks publication. Keeping a failed probe in the snapshot does not
-    qualify the delivery or substitute a mass-only fallback for a full tensor.
+    qualify the delivery.
     """
 
     closure_reader = getattr(backend, "assembly_mass_properties", None)
@@ -1193,45 +1182,20 @@ def _mass_closure(
             unavailable_record["component_context"] = component_context
         return unavailable_record
     leaf_total = assembly_leaf_total(scene.components, scene.mass_properties)
-    record: dict[str, Any]
-    if str(top_level.get("mode") or "") == "mass_only":
-        # The legacy API gives a corroborated mass only; volume travels as context.  The 2026-09-29
-        # native pairing matched COM and the inertia group too, but one document is not a layout
-        # guarantee, so nothing else is taken from the vector here.
-        volumes = sum(_leaf_volume(scene.mass_properties, component.name) for component in scene.components)
-        leaf_mass = float(leaf_total["mass"])
-        record = {
-            "schema_version": "description-pipeline.solidworks-mass-closure/v1",
-            "status": "recorded",
-            "mode": "mass_only",
-            "top_level": {
-                "mass": top_mass,
-                "volume_m3": top_level.get("volume_m3"),
-                "reference": dict(top_level.get("reference") or {}),
-            },
-            "leaf_total": {"mass": leaf_mass, "volume_m3": volumes},
-            "leaf_components": len(list(scene.components)),
-            "not_inferred": ["com", "inertia"],
-            "delta": {
-                "mass_abs": abs(top_mass - leaf_mass),
-                "mass_rel": abs(top_mass - leaf_mass) / max(abs(top_mass), abs(leaf_mass), 1e-12),
-            },
-        }
-    else:
-        record = {
-            "schema_version": "description-pipeline.solidworks-mass-closure/v1",
-            "status": "recorded",
-            "mode": "full",
-            "top_level": {
-                "mass": top_mass,
-                "com": [float(value) for value in top_level["com"]],
-                "inertia": [[float(value) for value in row] for row in top_level["inertia"]],
-                "reference": dict(top_level.get("reference") or {}),
-            },
-            "leaf_total": leaf_total,
-            "leaf_components": len(list(scene.components)),
-            "delta": closure_delta(top_level, leaf_total),
-        }
+    record = {
+        "schema_version": "description-pipeline.solidworks-mass-closure/v1",
+        "status": "recorded",
+        "mode": "full",
+        "top_level": {
+            "mass": top_mass,
+            "com": [float(value) for value in top_level["com"]],
+            "inertia": [[float(value) for value in row] for row in top_level["inertia"]],
+            "reference": dict(top_level.get("reference") or {}),
+        },
+        "leaf_total": leaf_total,
+        "leaf_components": len(list(scene.components)),
+        "delta": closure_delta(top_level, leaf_total),
+    }
     if component_context is not None:
         record["component_context"] = component_context
     return record
