@@ -196,8 +196,8 @@ class OracleSemanticsTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.serial = 0
 
-    def baseline(self) -> Path:
-        """One package produced by the generator from the analytic fixture."""
+    def baseline(self, record: dict | None = None) -> Path:
+        """One package produced by the generator from the analytic fixture (or a variant)."""
         self.serial += 1
         source = self.tmp / f"native{self.serial}"
         for name in ("cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT"):
@@ -219,7 +219,7 @@ class OracleSemanticsTests(unittest.TestCase):
             source,
             output,
             run_id="oracle-run",
-            backend=_ReplayBackend(native_record()),
+            backend=_ReplayBackend(record if record is not None else native_record()),
             settings=DiscoverySettings(record_roots=(records,)),
         )
         self.assertTrue(result.passed, result.findings)
@@ -262,6 +262,9 @@ class OracleSemanticsTests(unittest.TestCase):
         # The reseal itself must be sound: a failure may only come from the semantic rule.
         self.assertTrue(checks["discovery.binding"]["passed"], checks["discovery.binding"])
         self.assertNotIn("discovery.internal", [error["code"] for error in report["errors"]])
+        # Diagnostics must stay JSON-serializable even when the raw payload carried Infinity/NaN,
+        # and computed sets must already be sorted lists.
+        json.dumps(report, allow_nan=False)
         return report["passed"], report["errors"], checks
 
     def reject(self, mutate, expected: str) -> None:
@@ -718,6 +721,70 @@ class OracleSemanticsTests(unittest.TestCase):
             any(
                 error["code"] == "discovery.frames"
                 and ("collides with a body name" in error["message"] or "dropped or invented" in error["message"])
+                for error in errors
+            ),
+            errors,
+        )
+
+    # ------------------------------------------------------------ lock evidence
+
+    @staticmethod
+    def _lock_record(*, with_point: bool) -> dict:
+        """One rigid pair: two parts locked together, with a single body datum."""
+        record = native_record()
+        entities = [
+            {"component": "base-1", "feature": "V1"},
+            {"component": "arm-1", "feature": "V2"},
+        ]
+        if with_point:
+            entities[0]["point"] = [0.0, 0.0, 0.1]
+            entities[1]["point"] = [0.0, 0.0, 0.1]
+        record["mates"] = [
+            {
+                "name": "base_arm_lock",
+                "type": "lock",
+                "suppressed": False,
+                "error_code": 0,
+                "scope": "",
+                "limits": None,
+                "entities": entities,
+            }
+        ]
+        record["properties"]["mates"] = {}
+        record["datums"] = [datum for datum in record["datums"] if datum["name"] == "CS_base_link"]
+        return record
+
+    def test_lock_needs_only_both_occurrence_frames(self) -> None:
+        """A solved lock removes six DOF from the captured frames alone; faces are not evidence."""
+        package = self.baseline(record=self._lock_record(with_point=True))
+
+        def strip_point_geometry(raw, payload):
+            for entity in raw["mates"][0]["entities"]:
+                entity.pop("point", None)
+
+        self._native(package, strip_point_geometry)
+        passed, errors, _checks = self.check(package)
+        self.assertTrue(passed, errors)
+        document = yaml.safe_load((package / "robot.yaml").read_text(encoding="utf-8"))
+        bodies = [(body["name"], sorted(body["components"])) for body in document["source"]["bodies"]]
+        self.assertEqual(bodies, [("base_link", ["arm-1", "base-1"])])
+
+    def test_lock_with_a_missing_occurrence_frame_blocks(self) -> None:
+        package = self.baseline(record=self._lock_record(with_point=True))
+
+        def strip_point_and_arm_frame(raw, payload):
+            for entity in raw["mates"][0]["entities"]:
+                entity.pop("point", None)
+            for component in raw["components"]:
+                if component["name2"] == "arm-1":
+                    component["transform"] = []
+
+        self._native(package, strip_point_and_arm_frame)
+        passed, errors, _checks = self.check(package)
+        self.assertFalse(passed, errors)
+        self.assertTrue(
+            any(
+                error["code"] == "discovery.graph" and "supported constraint scope" in error["message"]
                 for error in errors
             ),
             errors,

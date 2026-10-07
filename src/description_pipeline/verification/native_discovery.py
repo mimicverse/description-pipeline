@@ -157,6 +157,23 @@ def _valid_limits(limits) -> bool:
     )
 
 
+def _report_safe(value):
+    """Diagnostics only: JSON-serializable without non-finite numbers or unordered sets.
+
+    The evidence itself is never rewritten; this shapes what the report carries about it, so a
+    corrupt raw payload (``Infinity`` parsed from JSON, for example) cannot break the report.
+    """
+    if isinstance(value, dict):
+        return {str(key): _report_safe(item) for key, item in value.items()}
+    if isinstance(value, (set, frozenset)):
+        return sorted(str(item) for item in value)
+    if isinstance(value, (list, tuple)):
+        return [_report_safe(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return repr(value)
+    return value
+
+
 def _cross(left, right) -> list[float]:
     return [
         left[1] * right[2] - left[2] * right[1],
@@ -328,9 +345,13 @@ def _rows_for(mate: dict, frames) -> dict | None:
     limits = mate.get("limits") if isinstance(mate.get("limits"), dict) else None
     axes = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
     if kind == "lock":
-        point, _ = _geometry(first, frames)
-        if point is None:
+        first_frame = frames.get(str(first.get("component")))
+        second_frame = frames.get(str(second.get("component")))
+        if first_frame is None or second_frame is None:
             return None
+        # A solved lock removes all six relative freedoms; the constraint basis can be stated at
+        # the first captured occurrence origin, which needs no face, shaft or vertex evidence.
+        point = [first_frame[index][3] for index in range(3)]
         rows = [_translation_row(axis, point) for axis in axes] + [_rotation_row(axis) for axis in axes]
         return {"rows": rows, "limits": limits, "axis": None, "point": point}
     if kind == "concentric":
@@ -672,17 +693,20 @@ def verify_discovery(package: Path) -> dict:
 
     def check(identifier, callback):
         try:
-            details = callback() or {}
+            details = _report_safe(callback() or {})
             checks.append({"id": identifier, "passed": True, "details": details})
         except _Failure as failure:
+            detail = _report_safe(failure.detail)
+            if not isinstance(detail, dict):
+                detail = {"detail": detail}
             checks.append(
                 {
                     "id": identifier,
                     "passed": False,
-                    "details": {"code": failure.code, "error": failure.message, **failure.detail},
+                    "details": {"code": failure.code, "error": failure.message, **detail},
                 }
             )
-            errors.append({"code": failure.code, "message": failure.message, "detail": failure.detail})
+            errors.append({"code": failure.code, "message": failure.message, "detail": detail})
         except Exception as error:  # noqa: BLE001 - a verifier must not crash on hostile input
             checks.append(
                 {
@@ -1134,7 +1158,12 @@ def verify_discovery(package: Path) -> dict:
                 (item for item in bodies if {str(value) for value in (item.get("components") or [])} == set(group)),
                 None,
             )
-            _require(body is not None, "discovery.names", "a rigid body has no robot.yaml body", {"components": group})
+            _require(
+                body is not None,
+                "discovery.names",
+                "a rigid body has no robot.yaml body",
+                {"components": sorted(group)},
+            )
             name = str(body.get("name"))
             datum_name = str((body.get("frame") or {}).get("coordinate_system"))
             owned = [
