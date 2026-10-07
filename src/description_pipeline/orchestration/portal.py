@@ -2,8 +2,9 @@
 
 The portal is a dependency-free WSGI application:
 
-* the operator authenticates against the Airflow API; the returned Airflow token is stored in a
-  server-side session and never sent to the browser;
+* the operator signs in once with Feishu SSO at ``/auth/feishu/login``; the Airflow ``_token``
+  cookie that Airflow issues is validated server-side through ``/auth/feishu/profile`` and its
+  value is kept in a portal session, never echoed to the browser;
 * the portal triggers the ``solidworks_to_urdf`` DAG with exactly one value, ``handoff_path``, and
   reports the Airflow stage progress, native findings and the published pull request;
 * the Windows endpoint bearer token also stays server-side; the portal proxies the delivery
@@ -53,6 +54,8 @@ log = logging.getLogger(__name__)
 DEFAULT_DAG_ID = "solidworks_to_urdf"
 DEFAULT_API_ROOT = "/api/v2"
 DEFAULT_SESSION_COOKIE = "solidworks_portal_session"
+#: The Airflow SSO cookie the portal adopts after server-side validation.
+AIRFLOW_TOKEN_COOKIE = "_token"
 _AIRFLOW_TIMEOUT = 20.0
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _RUN_ID = re.compile(r"[A-Za-z0-9_.:-]{1,250}\Z")
@@ -127,20 +130,12 @@ class _SameOriginRedirect(urlrequest.HTTPRedirectHandler):
 _AIRFLOW_OPENER = urlrequest.build_opener(_SameOriginRedirect())
 
 
-def _client_key(environ: dict) -> str:
-    """Rate-limit key: the proxy's client address when the peer is the loopback proxy."""
-    remote = str(environ.get("REMOTE_ADDR") or "unknown")
-    if remote in _LOOPBACK:
-        forwarded = str(environ.get("HTTP_X_REAL_IP") or "").strip()
-        if forwarded and len(forwarded) <= 64 and _CONTROL.search(forwarded) is None:
-            return forwarded
-    return remote
-
-
 @dataclass
 class PortalSession:
     session_id: str
     user: str
+    avatar_url: str
+    principal: str
     token: str
     csrf_token: str
     created_at: float
@@ -157,11 +152,13 @@ class SessionStore:
         self._lock = threading.Lock()
         self._sessions: dict[str, PortalSession] = {}
 
-    def create(self, user: str, token: str) -> PortalSession:
+    def create(self, user: str, token: str, *, avatar_url: str = "", principal: str = "") -> PortalSession:
         now = time.time()
         session = PortalSession(
             session_id=secrets.token_urlsafe(32),
             user=user,
+            avatar_url=avatar_url,
+            principal=principal,
             token=token,
             csrf_token=secrets.token_urlsafe(32),
             created_at=now,
@@ -196,33 +193,8 @@ class SessionStore:
         return now - session.last_seen <= self.ttl
 
 
-class LoginThrottle:
-    """Small per-client failure window so the Airflow login cannot be brute-forced trivially."""
-
-    def __init__(self, limit: int, window: float) -> None:
-        self.limit = int(limit)
-        self.window = float(window)
-        self._lock = threading.Lock()
-        self._failures: dict[str, list[float]] = {}
-
-    def allow(self, key: str) -> bool:
-        now = time.time()
-        with self._lock:
-            recent = [stamp for stamp in self._failures.get(key, []) if now - stamp <= self.window]
-            self._failures[key] = recent
-            return len(recent) < self.limit
-
-    def record_failure(self, key: str) -> None:
-        with self._lock:
-            self._failures.setdefault(key, []).append(time.time())
-
-    def reset(self, key: str) -> None:
-        with self._lock:
-            self._failures.pop(key, None)
-
-
 class AirflowApi:
-    """Thin client for the Airflow 3 stable REST API with server-side credentials."""
+    """Thin client for the Airflow 3 stable REST API, used only with the operator's SSO token."""
 
     def __init__(
         self,
@@ -234,13 +206,22 @@ class AirflowApi:
         self.timeout = _AIRFLOW_TIMEOUT
         self._opener = opener or _AIRFLOW_OPENER.open
 
-    def _request(self, method: str, path: str, payload: dict | None = None, token: str | None = None) -> dict:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: dict | None = None,
+        token: str | None = None,
+        cookie_token: str | None = None,
+    ) -> dict:
         data = None if payload is None else json.dumps(payload).encode("utf-8")
         headers = {"Accept": "application/json"}
         if data is not None:
             headers["Content-Type"] = "application/json"
         if token:
             headers["Authorization"] = f"Bearer {token}"
+        if cookie_token:
+            headers["Cookie"] = f"{AIRFLOW_TOKEN_COOKIE}={cookie_token}"
         request = urlrequest.Request(self.base_url + path, data=data, method=method, headers=headers)
         try:
             with self._opener(request, timeout=self.timeout) as response:
@@ -261,12 +242,9 @@ class AirflowApi:
             raise AirflowApiError("Airflow returned a non-object payload")
         return parsed
 
-    def login(self, username: str, password: str) -> str:
-        payload = self._request("POST", "/auth/token", {"username": username, "password": password})
-        token = payload.get("access_token")
-        if not isinstance(token, str) or not token.strip():
-            raise AirflowApiError("Airflow login returned no access token")
-        return token.strip()
+    def profile(self, token: str) -> dict:
+        """Validate one browser's Airflow SSO cookie and return its Feishu identity."""
+        return self._request("GET", "/auth/feishu/profile", cookie_token=token)
 
     def dag(self, token: str, dag_id: str) -> dict:
         return self._request("GET", f"{self.api_root}/dags/{urlparse.quote(dag_id)}", token=token)
@@ -293,18 +271,20 @@ class AirflowApi:
             token=token,
         )
         instances = payload.get("task_instances")
-        if instances is None:
-            instances = payload.get("taskInstances")
         if not isinstance(instances, list):
             raise AirflowApiError("Airflow returned no task instance list")
         return [item for item in instances if isinstance(item, dict)]
 
     def list_dag_runs(self, token: str, dag_id: str, *, limit: int = 20) -> list[dict]:
-        """Recent runs of one DAG, so the operator page survives portal restarts."""
+        """Recent runs of one DAG, so the operator page survives portal restarts.
+
+        The per-DAG GET is authorized as a read of that DAG; the POST wildcard list would ask for
+        authorization on ``~`` and is deliberately not used.
+        """
+        query = urlparse.urlencode({"limit": int(limit), "order_by": "-start_date"})
         payload = self._request(
-            "POST",
-            f"{self.api_root}/dags/~/dagRuns/list",
-            {"dag_ids": [dag_id], "page_limit": int(limit), "order_by": "-start_date"},
+            "GET",
+            f"{self.api_root}/dags/{urlparse.quote(dag_id)}/dagRuns?{query}",
             token=token,
         )
         runs = payload.get("dag_runs")
@@ -324,8 +304,6 @@ class PortalConfig:
     session_ttl: float = 12 * 3600.0
     artifact_limit: int = 64 * 1024 * 1024
     preview_ttl: float = 60.0
-    login_limit: int = 10
-    login_window: float = 300.0
     max_body_bytes: int = 64 * 1024
 
 
@@ -402,6 +380,7 @@ class PortalRun:
     dag_run_id: str
     handoff_path: str
     user: str
+    principal: str
     started_at: float
 
 
@@ -564,7 +543,6 @@ class PortalApp:
     def __init__(self, config: PortalConfig) -> None:
         self.config = config
         self.sessions = SessionStore(config.session_ttl)
-        self.throttle = LoginThrottle(config.login_limit, config.login_window)
         self._lock = threading.Lock()
         self._runs: dict[str, PortalRun] = {}
         self._previews: dict[str, tuple[float, dict]] = {}
@@ -590,7 +568,7 @@ class PortalApp:
             if method == "GET":
                 return self._session_info(environ, start_response)
             if method == "POST":
-                return self._login(environ, start_response)
+                raise PortalError(HTTPStatus.METHOD_NOT_ALLOWED, "请求方法不被允许")
             if method == "DELETE":
                 return self._logout(environ, start_response)
         if path == "/api/runs":
@@ -614,46 +592,62 @@ class PortalApp:
         cookies = _parse_cookies(environ.get("HTTP_COOKIE"))
         session = self.sessions.get(cookies.get(DEFAULT_SESSION_COOKIE))
         if session is None:
-            raise PortalError(HTTPStatus.UNAUTHORIZED, "需要登录")
+            raise PortalError(HTTPStatus.UNAUTHORIZED, "请使用飞书登录")
         if csrf:
             supplied = str(environ.get("HTTP_X_CSRF_TOKEN") or "")
             if not supplied or not hmac.compare_digest(supplied, session.csrf_token):
                 raise PortalError(HTTPStatus.FORBIDDEN, "请求校验失败，请刷新页面重试")
         return session
 
-    def _session_info(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
-        session = self._session(environ)
-        return _json_response(
-            start_response,
-            200,
-            {"authenticated": True, "user": session.user, "csrf_token": session.csrf_token},
-            self.config,
-        )
+    def _adopt_airflow_session(self, token: str | None) -> PortalSession | None:
+        """Turn the browser's Airflow SSO cookie into a portal session after Airflow validates it.
 
-    def _login(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
-        client = _client_key(environ)
-        if not self.throttle.allow(client):
-            raise PortalError(HTTPStatus.TOO_MANY_REQUESTS, "登录尝试过多，请稍后再试")
-        payload = self._body(environ)
-        username = payload.get("username")
-        password = payload.get("password")
-        if not isinstance(username, str) or not username.strip() or not isinstance(password, str) or not password:
-            raise PortalError(HTTPStatus.BAD_REQUEST, "请输入 Airflow 用户名和密码")
+        The JWT is never decoded or trusted here: Airflow answers with the Feishu identity only
+        when the signature, expiry and tenant allowlist all pass.
+        """
+        if not token:
+            return None
         try:
-            token = self.config.airflow.login(username.strip(), password)
-            self.config.airflow.dag(token, self.config.dag_id)
+            profile = self.config.airflow.profile(token)
         except AirflowAuthError as error:
-            self.throttle.record_failure(client)
-            raise PortalError(HTTPStatus.UNAUTHORIZED, str(error)) from error
+            raise PortalError(HTTPStatus.UNAUTHORIZED, "飞书登录已过期，请重新登录") from error
         except AirflowApiError as error:
             raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
-        self.throttle.reset(client)
-        session = self.sessions.create(username.strip(), token)
-        headers = [("Set-Cookie", _session_cookie(session.session_id, environ, self.config))]
+        open_id = profile.get("open_id")
+        name = profile.get("name")
+        if not isinstance(open_id, str) or not open_id.strip() or not isinstance(name, str) or not name.strip():
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "Airflow 未返回有效的飞书身份")
+        principal = profile.get("principal")
+        if not isinstance(principal, str) or not principal.strip():
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "Airflow 未返回稳定的飞书身份")
+        avatar = profile.get("avatar_url")
+        return self.sessions.create(
+            name.strip(),
+            token,
+            avatar_url=avatar.strip() if isinstance(avatar, str) else "",
+            principal=principal.strip(),
+        )
+
+    def _session_info(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
+        cookies = _parse_cookies(environ.get("HTTP_COOKIE"))
+        session = self.sessions.get(cookies.get(DEFAULT_SESSION_COOKIE))
+        headers: list[tuple[str, str]] = []
+        if session is None:
+            # First request after the Feishu callback: adopt the Airflow cookie and remember the
+            # session in the browser with the portal's own opaque cookie.
+            session = self._adopt_airflow_session(cookies.get(AIRFLOW_TOKEN_COOKIE))
+            if session is None:
+                raise PortalError(HTTPStatus.UNAUTHORIZED, "请使用飞书登录")
+            headers.append(("Set-Cookie", _session_cookie(session.session_id, environ, self.config)))
         return _json_response(
             start_response,
             200,
-            {"authenticated": True, "user": session.user, "csrf_token": session.csrf_token},
+            {
+                "authenticated": True,
+                "user": session.user,
+                "avatar_url": session.avatar_url,
+                "csrf_token": session.csrf_token,
+            },
             self.config,
             headers,
         )
@@ -661,7 +655,10 @@ class PortalApp:
     def _logout(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
         session = self._session(environ, csrf=True)
         self.sessions.drop(session.session_id)
-        headers = [("Set-Cookie", _session_cookie("", environ, self.config, clear=True))]
+        headers = [
+            ("Set-Cookie", _session_cookie("", environ, self.config, clear=True)),
+            ("Set-Cookie", _airflow_cookie_clear(environ, self.config)),
+        ]
         return _json_response(start_response, 200, {"authenticated": False}, self.config, headers)
 
     # ------------------------------------------------------------------ runs
@@ -689,6 +686,8 @@ class PortalApp:
                     "dag_run_id": dag_run_id,
                     "handoff_path": conf.get("handoff_path") or (record.handoff_path if record else None),
                     "user": record.user if record else None,
+                    # Airflow's own record outlives any portal restart.
+                    "principal": str(item.get("triggering_user_name") or "") or (record.principal if record else None),
                     "state": item.get("state"),
                     "started_at": item.get("start_date"),
                 }
@@ -700,6 +699,7 @@ class PortalApp:
                         "dag_run_id": record.dag_run_id,
                         "handoff_path": record.handoff_path,
                         "user": record.user,
+                        "principal": record.principal,
                         "state": None,
                         "started_at": datetime.fromtimestamp(record.started_at, UTC).isoformat(),
                     }
@@ -737,9 +737,10 @@ class PortalApp:
                 dag_run_id=dag_run_id,
                 handoff_path=handoff_path,
                 user=session.user,
+                principal=session.principal,
                 started_at=time.time(),
             )
-        log.info("portal started dag_run_id=%s user=%s", dag_run_id, session.user)
+        log.info("portal started dag_run_id=%s user=%s principal=%s", dag_run_id, session.user, session.principal)
         return _json_response(start_response, 201, {"dag_run_id": dag_run_id}, self.config)
 
     def _run_status(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
@@ -764,6 +765,8 @@ class PortalApp:
         except EndpointError as error:
             endpoint_error = str(error)
         conf = airflow_run.get("conf") if isinstance(airflow_run.get("conf"), dict) else {}
+        with self._lock:
+            record = self._runs.get(dag_run_id)
         pr = None
         if isinstance(job, dict):
             result = job.get("result") if isinstance(job.get("result"), dict) else {}
@@ -788,6 +791,9 @@ class PortalApp:
                 "dag_run_id": dag_run_id,
                 "state": airflow_run.get("state"),
                 "handoff_path": conf.get("handoff_path"),
+                "operator": record.user if record else None,
+                "principal": str(airflow_run.get("triggering_user_name") or "")
+                or (record.principal if record else None),
                 "started_at": airflow_run.get("start_date"),
                 "ended_at": airflow_run.get("end_date"),
                 "tasks": [
@@ -822,6 +828,15 @@ class PortalApp:
     def _preview_payload(self, session: PortalSession, dag_run_id: str) -> dict:
         if _RUN_ID.fullmatch(dag_run_id) is None:
             raise PortalError(HTTPStatus.BAD_REQUEST, "运行标识不合法")
+        # Every preview and every artifact re-authorizes against Airflow first: an expired or
+        # revoked session, a deleted tenant or a run the operator may not read can never be served
+        # from this cache or from the endpoint.
+        try:
+            self.config.airflow.dag_run(session.token, self.config.dag_id, dag_run_id)
+        except AirflowAuthError as error:
+            raise PortalError(HTTPStatus.UNAUTHORIZED, "飞书登录已失效，请重新登录") from error
+        except AirflowApiError as error:
+            raise PortalError(HTTPStatus.NOT_FOUND, "该运行不存在或无权访问") from error
         run_id = native_run_id(dag_run_id)
         now = time.time()
         with self._lock:
@@ -978,6 +993,24 @@ def _session_cookie(value: str, environ: dict, config: PortalConfig, *, clear: b
         parts.append("Secure")
     if clear:
         parts.extend(["Max-Age=0", "Expires=Thu, 01 Jan 1970 00:00:00 GMT"])
+    return "; ".join(parts)
+
+
+def _airflow_cookie_clear(environ: dict, config: PortalConfig) -> str:
+    """Clear the Airflow ``_token`` cookie on logout; no Airflow route is exposed publicly."""
+    secure = _request_is_secure(environ)
+    if not secure and not _is_loopback_request(environ):
+        secure = True
+    parts = [
+        f"{AIRFLOW_TOKEN_COOKIE}=",
+        "Path=/",
+        "HttpOnly",
+        "SameSite=Lax",
+        "Max-Age=0",
+        "Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+    ]
+    if secure:
+        parts.append("Secure")
     return "; ".join(parts)
 
 

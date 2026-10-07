@@ -107,10 +107,10 @@ class FeishuSettings:
             raise FeishuConfigError("Feishu secret file is not valid JSON") from error
         if not isinstance(secret, dict) or set(secret) != {"app_id", "app_secret"}:
             raise FeishuConfigError('Feishu secret file must be {"app_id", "app_secret"} only')
-        app_id = str(secret["app_id"]).strip()
-        app_secret = str(secret["app_secret"]).strip()
+        app_id = secret["app_id"].strip() if isinstance(secret["app_id"], str) else ""
+        app_secret = secret["app_secret"].strip() if isinstance(secret["app_secret"], str) else ""
         if not app_id or not app_secret:
-            raise FeishuConfigError('Feishu secret file needs {"app_id", "app_secret"}')
+            raise FeishuConfigError('Feishu secret file needs non-empty string "app_id" and "app_secret"')
         tenant_keys = _csv(env["FEISHU_TENANT_KEYS"])
         if not tenant_keys:
             raise FeishuConfigError("FEISHU_TENANT_KEYS must list at least one approved tenant_key")
@@ -214,17 +214,21 @@ def fetch_identity(settings: FeishuSettings, access_token: str, *, opener=None) 
             payload = json.loads(response.read().decode("utf-8") or "{}")
     except (urlerror.URLError, urlerror.HTTPError, ValueError) as error:
         raise FeishuAuthError(f"Feishu profile request failed: {error}") from error
+    if not isinstance(payload, dict):
+        raise FeishuAuthError("Feishu profile response is not a JSON object")
     body = payload.get("data")
     if payload.get("code") != 0 or not isinstance(body, dict):
         raise FeishuAuthError("Feishu profile response does not match the pinned v1 user_info shape")
-    open_id = str(body.get("open_id") or "").strip()
-    tenant_key = str(body.get("tenant_key") or "").strip()
+    open_id = body["open_id"].strip() if isinstance(body.get("open_id"), str) else ""
+    tenant_key = body["tenant_key"].strip() if isinstance(body.get("tenant_key"), str) else ""
     if not open_id or not tenant_key:
         raise FeishuAuthError("Feishu profile must carry one explicit open_id and tenant_key")
     if tenant_key not in settings.tenant_keys:
         raise FeishuAuthError("Feishu tenant is not approved for this Airflow deployment")
-    name = str(body.get("name") or body.get("en_name") or open_id).strip()
-    avatar = str(body.get("avatar_url") or body.get("avatar_thumb") or "").strip()
+    name_field = body.get("name") if isinstance(body.get("name"), str) else body.get("en_name")
+    name = name_field.strip() if isinstance(name_field, str) and name_field.strip() else open_id
+    avatar_field = body.get("avatar_url") if isinstance(body.get("avatar_url"), str) else body.get("avatar_thumb")
+    avatar = avatar_field.strip() if isinstance(avatar_field, str) else ""
     return FeishuIdentity(open_id=open_id, name=name, avatar_url=avatar, tenant_key=tenant_key)
 
 

@@ -11,27 +11,25 @@ import contextlib
 import json
 import os
 import signal
+import socket
 import subprocess
 import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 TOKEN = "scheduled-token"
 SUBJECT = "a" * 64
 COMMIT = "b" * 40
+#: The strict native resolution: the endpoint names only the package and its digest.
 HANDOFF = {
     "schema_version": "solidworks-to-urdf.handoff/v1",
     "pipeline_id": "solidworks-to-urdf",
     "package": "handoff/m3.0",
-    "revision_sha256": SUBJECT,
     "handoff_sha256": "c" * 64,
-    "hardware_id": "m3.0",
-    "revision": "r1",
-    "target": "local",
-    "repository_slug": "example/m3.0",
-    "base": "feature/m3.0",
 }
 
 
@@ -76,14 +74,21 @@ def _mock_endpoint() -> tuple[ThreadingHTTPServer, dict]:
             if job["pokes"] >= 2:
                 job["status"] = "passed"
                 job["result"] = {
-                    "passed": True, "pipeline_id": "solidworks-to-urdf", "output": "build/out",
+                    "passed": True,
+                    "pipeline_id": "solidworks-to-urdf",
+                    "output": "build/out",
                     "subject_sha256": SUBJECT,
                     "quality": {"passed": True, "subject_sha256": SUBJECT, "checks": [{"id": "x"}]},
-                    "submission": {"passed": True, "subject_sha256": SUBJECT, "base": "feature/m3.0",
-                                   "branch": "work/solidworks/m3.0",
-                                   "state": "published", "commit": COMMIT,
-                                   "repository_slug": "example/m3.0",
-                                   "url": "https://github.com/example/m3.0/pull/1"},
+                    "submission": {
+                        "passed": True,
+                        "subject_sha256": SUBJECT,
+                        "base": "feature/m3.0",
+                        "branch": "work/solidworks/m3.0",
+                        "state": "published",
+                        "commit": COMMIT,
+                        "repository_slug": "example/m3.0",
+                        "url": "https://github.com/example/m3.0/pull/1",
+                    },
                 }
             else:
                 job["status"] = "running"
@@ -106,11 +111,22 @@ def _mock_endpoint() -> tuple[ThreadingHTTPServer, dict]:
                     return
                 self._send(200, _view(existing))
                 return
-            job = {"schema_version": "solidworks-to-urdf.job/v1", "pipeline_id": "solidworks-to-urdf",
-                   "run_id": run_id, "repository_slug": "example/m3.0",
-                   "repository_base": "feature/m3.0", "status": "queued",
-                   "events": [{"stage": "submit", "state": "queued", "at": "t0"}],
-                   "result": None, "error": None, "request": dict(payload), "pokes": 0}
+            job = {
+                "schema_version": "solidworks-to-urdf.job/v1",
+                "pipeline_id": "solidworks-to-urdf",
+                "run_id": run_id,
+                # Routing resolved inside the serialized Windows job after CAD discovery.
+                "hardware_id": "m3.0",
+                "revision": "r1",
+                "repository_slug": "example/m3.0",
+                "repository_base": "feature/m3.0",
+                "status": "queued",
+                "events": [{"stage": "submit", "state": "queued", "at": "t0"}],
+                "result": None,
+                "error": None,
+                "request": dict(payload),
+                "pokes": 0,
+            }
             state["jobs"][run_id] = job
             self._send(202, _view(job))
 
@@ -121,8 +137,7 @@ def _mock_endpoint() -> tuple[ThreadingHTTPServer, dict]:
 
 
 def _run(venv: Path, env: dict, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run([str(venv / "bin/airflow"), *args], env=env, capture_output=True,
-                          text=True, timeout=120)
+    return subprocess.run([str(venv / "bin/airflow"), *args], env=env, capture_output=True, text=True, timeout=120)
 
 
 def _json_tail(text: str) -> list:
@@ -137,20 +152,53 @@ def _json_tail(text: str) -> list:
     return []
 
 
+def _free_port() -> int:
+    """A free loopback port, so an isolated smoke never collides with a running deployment."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def _auth_health(port: int) -> dict:
+    """The current auth manager's public health contract, as the deployment probe reads it."""
+    url = f"http://127.0.0.1:{port}/auth/feishu/health"
+    try:
+        with urlrequest.urlopen(url, timeout=10) as response:
+            payload = json.loads(response.read() or b"{}")
+            return {"status": response.status, "configured": payload.get("configured")}
+    except urlerror.HTTPError as error:
+        with contextlib.suppress(ValueError):
+            payload = json.loads(error.read() or b"{}")
+            return {"status": error.code, "configured": payload.get("configured")}
+        return {"status": error.code}
+    except (urlerror.URLError, TimeoutError, OSError) as error:
+        return {"status": None, "error": str(error)}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--venv", type=Path, required=True)
     parser.add_argument("--airflow-home", type=Path, required=True)
+    parser.add_argument("--api-port", type=int, default=0, help="loopback api-server port (0 picks a free one)")
     parser.add_argument("--timeout", type=float, default=180)
     args = parser.parse_args()
+    api_port = args.api_port or _free_port()
     server, state = _mock_endpoint()
     port = server.server_address[1]
     connection = json.dumps({"conn_type": "http", "host": "127.0.0.1", "port": port, "password": TOKEN})
-    env = dict(os.environ, AIRFLOW_HOME=str(args.airflow_home), PYTHONPATH=str(args.root / "src"),
-               AIRFLOW_CONN_SOLIDWORKS_WINDOWS=connection, SOLIDWORKS_SENSOR_MODE="poke",
-               SOLIDWORKS_POLL_INTERVAL="1", SOLIDWORKS_TIMEOUT="120",
-               AIRFLOW__CORE__EXECUTION_API_SERVER_URL="http://127.0.0.1:8791/execution")
+    env = dict(
+        os.environ,
+        AIRFLOW_HOME=str(args.airflow_home),
+        PYTHONPATH=str(args.root / "src"),
+        AIRFLOW_CONN_SOLIDWORKS_WINDOWS=connection,
+        SOLIDWORKS_SENSOR_MODE="poke",
+        SOLIDWORKS_POLL_INTERVAL="1",
+        SOLIDWORKS_TIMEOUT="120",
+        # An isolated home has no airflow.cfg pointing at the repository DAG folder.
+        AIRFLOW__CORE__DAGS_FOLDER=str(args.root / "deploy/airflow/dags"),
+        AIRFLOW__CORE__EXECUTION_API_SERVER_URL=f"http://127.0.0.1:{api_port}/execution",
+    )
     log_dir = args.airflow_home / "logs" / "smoke"
     log_dir.mkdir(parents=True, exist_ok=True)
     logs = {}
@@ -159,7 +207,7 @@ def main() -> int:
     components = (
         ("dag-processor", []),
         ("scheduler", []),
-        ("api-server", ["--host", "127.0.0.1", "--port", "8791"]),
+        ("api-server", ["--host", "127.0.0.1", "--port", str(api_port)]),
     )
     for component, extra in components:
         # Handles live in an ExitStack closed below in ``finally``; the child process needs the fd first.
@@ -167,8 +215,15 @@ def main() -> int:
             open(log_dir / f"{component}.log", "w", encoding="utf-8")  # noqa: SIM115 - closed via ExitStack
         )
         logs[component] = handle
-        procs.append(subprocess.Popen([str(args.venv / "bin/airflow"), component, *extra], env=env,
-                                      stdout=handle, stderr=subprocess.STDOUT, start_new_session=True))
+        procs.append(
+            subprocess.Popen(
+                [str(args.venv / "bin/airflow"), component, *extra],
+                env=env,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        )
     run_id = f"smoke-{uuid.uuid4().hex[:12]}"
     conf = json.dumps({"handoff_path": "handoff/m3.0"})
     try:
@@ -178,6 +233,10 @@ def main() -> int:
                 tail = (log_dir / f"{component}.log").read_text(encoding="utf-8")[-600:]
                 print(json.dumps({"ok": False, "stage": f"{component}_exit", "log": tail}))
                 return 1
+        auth_health = _auth_health(api_port)
+        if auth_health.get("status") is None:
+            print(json.dumps({"ok": False, "stage": "auth_health", "auth_health": auth_health}))
+            return 1
         unpause = _run(args.venv, env, "dags", "unpause", "solidworks_to_urdf")
         if unpause.returncode != 0:
             print(json.dumps({"ok": False, "stage": "unpause", "stderr": unpause.stderr[-500:]}))
@@ -195,11 +254,21 @@ def main() -> int:
                 if match and match[0].get("state") == "success":
                     job = next(iter(state["jobs"].values()), {})
                     request = job.get("request") or {}
-                    print(json.dumps({"ok": job.get("status") == "passed", "run_id": run_id,
-                                      "dag_state": "success", "job_status": job.get("status"),
-                                      "resolved_paths": state["resolved_paths"],
-                                      "handoff_sha256": request.get("handoff_sha256"),
-                                      "submission": (job.get("result") or {}).get("submission")}))
+                    print(
+                        json.dumps(
+                            {
+                                "ok": job.get("status") == "passed",
+                                "run_id": run_id,
+                                "api_port": api_port,
+                                "auth_health": auth_health,
+                                "dag_state": "success",
+                                "job_status": job.get("status"),
+                                "resolved_paths": state["resolved_paths"],
+                                "handoff_sha256": request.get("handoff_sha256"),
+                                "submission": (job.get("result") or {}).get("submission"),
+                            }
+                        )
+                    )
                     return 0 if job.get("status") == "passed" else 1
                 if match and match[0].get("state") == "failed":
                     print(json.dumps({"ok": False, "run_id": run_id, "dag_state": "failed"}))

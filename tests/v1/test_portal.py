@@ -13,7 +13,7 @@ import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from http.cookiejar import CookieJar
+from http.cookiejar import Cookie, CookieJar
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from urllib import error as urlerror
@@ -36,18 +36,20 @@ from description_pipeline.orchestration.portal import (
 from tests.v1.test_airflow_client import RUN_ID, MockEndpoint
 
 AIRFLOW_TOKEN = "airflow-session-token"
-AIRFLOW_PASSWORD = "operator-secret"
+FEISHU_NAME = "崔工"
+FEISHU_PRINCIPAL = "cli_app:tenant-a:ou_worker"
 DAG_RUN_ID = "portal-20261007T000000-abcdef01"
 
 
 class MockAirflow:
-    """Minimal Airflow 3.3.2 surface: /auth/token plus the v2 DAG-run endpoints."""
+    """Minimal Airflow 3.3.2 surface: the Feishu profile bridge plus the v2 DAG-run endpoints."""
 
     def __init__(self) -> None:
         self.dag_runs: dict[str, dict] = {}
         self.conf: dict | None = None
-        self.tokens: list[str] = []
         self.hits = 0
+        self.revoked = False
+        self.deny_runs = False
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -63,7 +65,7 @@ class MockAirflow:
                 self.wfile.write(body)
 
             def _authorized(self) -> bool:
-                if self.headers.get("Authorization") != f"Bearer {AIRFLOW_TOKEN}":
+                if outer.revoked or self.headers.get("Authorization") != f"Bearer {AIRFLOW_TOKEN}":
                     self._reply(401, {"detail": "unauthorized"})
                     return False
                 return True
@@ -72,21 +74,11 @@ class MockAirflow:
                 outer.hits += 1
                 length = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(length)
-                if self.path == "/auth/token":
-                    payload = json.loads(body or b"{}")
-                    if payload.get("username") != "operator" or payload.get("password") != AIRFLOW_PASSWORD:
-                        self._reply(401, {"detail": "bad credentials"})
-                        return
-                    outer.tokens.append(AIRFLOW_TOKEN)
-                    self._reply(201, {"access_token": AIRFLOW_TOKEN})
-                    return
                 if not self._authorized():
                     return
                 if self.path == "/api/v2/dags/~/dagRuns/list":
-                    payload = json.loads(body or b"{}")
-                    dag_ids = set(payload.get("dag_ids") or [])
-                    runs = [run for run in outer.dag_runs.values() if run.get("dag_id") in dag_ids]
-                    self._reply(200, {"dag_runs": runs, "total_entries": len(runs)})
+                    # Operators are not authorized on the wildcard DAG; the client must not use it.
+                    self._reply(403, {"detail": "forbidden on wildcard"})
                     return
                 if self.path == "/api/v2/dags/solidworks_to_urdf/dagRuns":
                     payload = json.loads(body or b"{}")
@@ -97,6 +89,7 @@ class MockAirflow:
                         "dag_id": "solidworks_to_urdf",
                         "state": "running",
                         "conf": payload.get("conf"),
+                        "triggering_user_name": FEISHU_PRINCIPAL,
                         "start_date": "2026-10-07T00:00:00Z",
                         "end_date": None,
                     }
@@ -106,12 +99,36 @@ class MockAirflow:
 
             def do_GET(self) -> None:
                 outer.hits += 1
+                if self.path == "/auth/feishu/profile":
+                    if self.headers.get("Cookie") != f"_token={AIRFLOW_TOKEN}":
+                        self._reply(401, {"detail": "not_signed_in"})
+                        return
+                    self._reply(
+                        200,
+                        {
+                            "open_id": "ou_worker",
+                            "app_id": "cli_app",
+                            "name": FEISHU_NAME,
+                            "avatar_url": "https://avatar/u",
+                            "tenant_key": "tenant-a",
+                            "principal": FEISHU_PRINCIPAL,
+                            "role": "OPERATOR",
+                        },
+                    )
+                    return
                 if not self._authorized():
                     return
                 if self.path == "/api/v2/dags/solidworks_to_urdf":
                     self._reply(200, {"dag_id": "solidworks_to_urdf", "is_paused": False})
                     return
+                if self.path.startswith("/api/v2/dags/solidworks_to_urdf/dagRuns?"):
+                    runs = sorted(outer.dag_runs.values(), key=lambda run: run.get("start_date") or "", reverse=True)
+                    self._reply(200, {"dag_runs": runs, "total_entries": len(runs)})
+                    return
                 prefix = "/api/v2/dags/solidworks_to_urdf/dagRuns/"
+                if outer.deny_runs and self.path.startswith(prefix):
+                    self._reply(403, {"detail": "forbidden"})
+                    return
                 if self.path.startswith(prefix):
                     rest = self.path[len(prefix) :]
                     dag_run_id, _, suffix = rest.partition("/")
@@ -200,12 +217,37 @@ class _QuietHandler(WSGIRequestHandler):
         return
 
 
+def _airflow_token_cookie(value: str) -> Cookie:
+    """The Airflow SSO cookie a signed-in browser would carry back to the same origin."""
+    return Cookie(
+        version=0,
+        name="_token",
+        value=value,
+        port=None,
+        port_specified=False,
+        domain="127.0.0.1",
+        domain_specified=False,
+        domain_initial_dot=False,
+        path="/",
+        path_specified=True,
+        secure=False,
+        expires=None,
+        discard=True,
+        comment=None,
+        comment_url=None,
+        rest={},
+        rfc2109=False,
+    )
+
+
 class PortalClient:
     def __init__(self, base: str) -> None:
         self.base = base
-        self.opener = urlrequest.build_opener(urlrequest.HTTPCookieProcessor(CookieJar()))
+        self.jar = CookieJar()
+        self.opener = urlrequest.build_opener(urlrequest.HTTPCookieProcessor(self.jar))
         self.csrf: str | None = None
         self.login_response = b""
+        self.last_set_cookies: list[str] = []
 
     def request(self, method: str, path: str, payload: dict | None = None, headers: dict | None = None):
         headers = {"Accept": "application/json", **(headers or {})}
@@ -218,12 +260,16 @@ class PortalClient:
         request = urlrequest.Request(self.base + path, data=data, method=method, headers=headers)
         try:
             with self.opener.open(request, timeout=15) as response:
+                self.last_set_cookies = list(response.headers.get_all("Set-Cookie") or [])
                 return response.status, dict(response.headers), response.read()
         except urlerror.HTTPError as error:
+            self.last_set_cookies = list(error.headers.get_all("Set-Cookie") or [])
             return error.code, dict(error.headers), error.read()
 
     def login(self) -> None:
-        status, _, body = self.request("POST", "/api/session", {"username": "operator", "password": AIRFLOW_PASSWORD})
+        """The browser already holds the Feishu SSO cookie; the portal adopts it server-side."""
+        self.jar.set_cookie(_airflow_token_cookie(AIRFLOW_TOKEN))
+        status, _, body = self.request("GET", "/api/session")
         assert status == 200, body
         self.login_response = body
         self.csrf = json.loads(body)["csrf_token"]
@@ -293,6 +339,7 @@ class PortalTests(unittest.TestCase):
             "dag_id": "solidworks_to_urdf",
             "state": state,
             "conf": {"handoff_path": "/srv/robot-cell"},
+            "triggering_user_name": FEISHU_PRINCIPAL,
             "start_date": "2026-10-07T00:00:00Z",
             "end_date": "2026-10-07T00:05:00Z" if state != "running" else None,
         }
@@ -300,16 +347,24 @@ class PortalTests(unittest.TestCase):
     def test_login_is_required_and_tokens_stay_server_side(self) -> None:
         status, _, _ = self.client.request("GET", "/api/session")
         self.assertEqual(status, 401)
-        status, _, body = self.client.request("POST", "/api/session", {"username": "operator", "password": "wrong"})
-        self.assertEqual(status, 401)
+        status, _, _ = self.client.request("POST", "/api/session", {"username": "operator", "password": "x"})
+        self.assertEqual(status, 405)
         self.client.login()
         status, headers, body = self.client.request("GET", "/api/session")
         self.assertEqual(status, 200)
-        self.assertIn("csrf_token", json.loads(body))
-        for secret in (AIRFLOW_TOKEN, AIRFLOW_PASSWORD, "test-token"):
+        payload = json.loads(body)
+        self.assertEqual(payload["user"], FEISHU_NAME)
+        self.assertEqual(payload["avatar_url"], "https://avatar/u")
+        self.assertIn("csrf_token", payload)
+        for secret in (AIRFLOW_TOKEN, "test-token"):
             self.assertNotIn(secret.encode(), body)
             self.assertNotIn(secret.encode(), self.client.login_response)
         self.assertNotIn("Secure", headers.get("Set-Cookie", ""))
+
+    def test_a_forged_or_stale_sso_cookie_is_refused(self) -> None:
+        self.client.jar.set_cookie(_airflow_token_cookie("forged"))
+        status, _, _ = self.client.request("GET", "/api/session")
+        self.assertEqual(status, 401)
 
     def test_start_run_carries_one_folder_field(self) -> None:
         self.client.login()
@@ -324,6 +379,34 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(listed["dag_run_id"], dag_run_id)
         self.assertEqual(listed["handoff_path"], "/srv/robot-cell")
         self.assertEqual(listed["state"], "running")
+        self.assertEqual(listed["user"], FEISHU_NAME)
+        self.assertEqual(listed["principal"], FEISHU_PRINCIPAL)
+
+    def test_run_identity_survives_a_portal_restart(self) -> None:
+        """The operator page reads who triggered a run from Airflow, not from its own memory."""
+        self._seed_airflow_run("portal-20261007T010000-abcdefff")
+        self.client.login()
+        status, _, body = self.client.request("GET", "/api/runs")
+        self.assertEqual(status, 200, body)
+        listed = json.loads(body)["runs"][0]
+        self.assertEqual(listed["dag_run_id"], "portal-20261007T010000-abcdefff")
+        self.assertEqual(listed["principal"], FEISHU_PRINCIPAL)
+
+    def test_preview_and_artifacts_reauthorize_against_airflow(self) -> None:
+        """A revoked session or a denied run must never be served from the preview cache."""
+        self.client.login()
+        self._seed_passed_job()
+        preview = f"/api/runs/{DAG_RUN_ID}/preview"
+        artifact = f"/api/runs/{DAG_RUN_ID}/artifacts/urdf/robot.urdf"
+        self.assertEqual(self.client.request("GET", preview)[0], 200)
+        self.assertEqual(self.client.request("GET", artifact)[0], 200)
+        self.airflow.deny_runs = True
+        self.assertEqual(self.client.request("GET", preview)[0], 401)
+        self.assertEqual(self.client.request("GET", artifact)[0], 401)
+        self.airflow.deny_runs = False
+        self.airflow.revoked = True
+        self.assertEqual(self.client.request("GET", preview)[0], 401)
+        self.assertEqual(self.client.request("GET", artifact)[0], 401)
         status, _, _ = self.client.request("POST", "/api/runs", {"handoff_path": "/srv/robot-cell", "target": "hidden"})
         self.assertEqual(status, 400)
         self.client.csrf = None
@@ -498,32 +581,25 @@ class PortalTests(unittest.TestCase):
         self.addCleanup(target.__exit__, None, None, None)
         with RedirectAirflow(target.url) as redirector:
             with self.assertRaises(AirflowApiError):
-                AirflowApi(redirector.url).login("operator", AIRFLOW_PASSWORD)
+                AirflowApi(redirector.url).profile("airflow-session-token")
             self.assertEqual(target.hits, 0)
 
-    def test_login_throttle_is_per_proxied_client(self) -> None:
-        for _ in range(10):
-            status, _, _ = self.client.request(
-                "POST",
-                "/api/session",
-                {"username": "operator", "password": "wrong"},
-                headers={"X-Real-IP": "198.51.100.7"},
-            )
-            self.assertEqual(status, 401)
-        status, _, _ = self.client.request(
-            "POST",
-            "/api/session",
-            {"username": "operator", "password": "wrong"},
-            headers={"X-Real-IP": "198.51.100.7"},
-        )
-        self.assertEqual(status, 429)
-        status, _, _ = self.client.request(
-            "POST",
-            "/api/session",
-            {"username": "operator", "password": "wrong"},
-            headers={"X-Real-IP": "198.51.100.8"},
-        )
-        self.assertEqual(status, 401)
+    def test_no_password_path_survives(self) -> None:
+        self.assertFalse(hasattr(AirflowApi, "login"))
+        page = (self.static_dir / "index.html").read_text(encoding="utf-8")
+        self.assertNotIn("password", page.lower())
+        self.assertIn("/auth/feishu/login", page)
+        status, _, _ = self.client.request("POST", "/api/session", {"username": "operator", "password": "x"})
+        self.assertEqual(status, 405)
+
+    def test_logout_clears_the_portal_and_airflow_cookies(self) -> None:
+        self.client.login()
+        status, _headers, body = self.client.request("DELETE", "/api/session")
+        self.assertEqual(status, 200, body)
+        cookies = self.client.last_set_cookies
+        self.assertTrue(any(cookie.startswith("solidworks_portal_session=") for cookie in cookies), cookies)
+        self.assertTrue(any(cookie.startswith("_token=") and "Max-Age=0" in cookie for cookie in cookies), cookies)
+        self.assertEqual(self.client.request("GET", "/api/session")[0], 401)
 
     def test_entry_point_boots_from_config(self) -> None:
         with socket.socket() as probe:

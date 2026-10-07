@@ -9,9 +9,39 @@ import sys
 import unittest
 from pathlib import Path
 
+from tests.v1._airflow_env import pinned_airflow_home
+
 ROOT = Path(__file__).resolve().parents[2]
 DAG_DIR = ROOT / "deploy/airflow/dags"
-AIRFLOW_HOME = Path(os.environ.get("AIRFLOW_HOME", ROOT / "deploy/airflow/home"))
+#: Absolute and outside the checkout, fixed before Airflow is imported.
+AIRFLOW_HOME = pinned_airflow_home()
+
+_MIGRATED = False
+
+
+def migrated_airflow_home(venv: Path) -> Path:
+    """Migrate the isolated home once so the pinned Airflow CLI runs for real."""
+    global _MIGRATED
+    if not _MIGRATED:
+        env = dict(
+            os.environ,
+            AIRFLOW_HOME=str(AIRFLOW_HOME),
+            PYTHONPATH=str(ROOT / "src"),
+            AIRFLOW__CORE__LOAD_EXAMPLES="false",
+        )
+        migrated = subprocess.run(
+            [str(venv / "bin/airflow"), "db", "migrate"],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        if migrated.returncode != 0:
+            raise AssertionError("airflow db migrate failed:\n" + (migrated.stdout + migrated.stderr)[-3000:])
+        _MIGRATED = True
+    return AIRFLOW_HOME
+
 
 try:
     from airflow.models import DagBag
@@ -51,7 +81,8 @@ class DagTests(unittest.TestCase):
             )
             env = dict(
                 os.environ,
-                AIRFLOW_HOME=str(AIRFLOW_HOME),
+                AIRFLOW_HOME=str(migrated_airflow_home(venv)),
+                AIRFLOW__CORE__DAGS_FOLDER=str(DAG_DIR),
                 PYTHONPATH=str(ROOT / "src"),
                 AIRFLOW_CONN_SOLIDWORKS_WINDOWS=connection,
                 SOLIDWORKS_SENSOR_MODE="poke",

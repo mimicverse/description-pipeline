@@ -343,26 +343,6 @@ async function selectRun(dagRunId) {
 }
 
 function wire() {
-  $("login-form").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    setError($("login-error"), "");
-    const button = event.target.querySelector("button");
-    button.disabled = true;
-    try {
-      const session = await api("/api/session", {
-        method: "POST",
-        body: { username: $("username").value, password: $("password").value },
-      });
-      $("password").value = "";
-      showSession(session);
-      await refreshRuns();
-    } catch (error) {
-      setError($("login-error"), error.message);
-    } finally {
-      button.disabled = false;
-    }
-  });
-
   $("logout").addEventListener("click", async () => {
     try {
       await api("/api/session", { method: "DELETE" });
@@ -401,8 +381,9 @@ async function boot() {
     const session = await api("/api/session");
     showSession(session);
     await refreshRuns();
-  } catch {
+  } catch (error) {
     clearSession();
+    if (error.status === 401) setError($("login-error"), error.message);
   }
 }
 

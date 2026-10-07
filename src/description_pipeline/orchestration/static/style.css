@@ -67,6 +67,18 @@ button {
   cursor: pointer;
 }
 
+/* The single Feishu sign-in entry is a link, styled as the one primary action. */
+a.button {
+  display: inline-block;
+  margin-top: 12px;
+  padding: 9px 18px;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  text-decoration: none;
+}
+
 button.ghost { background: transparent; color: inherit; border: 1px solid currentColor; padding: 5px 12px; }
 button:disabled { opacity: 0.55; cursor: progress; }
 

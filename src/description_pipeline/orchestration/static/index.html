@@ -18,15 +18,9 @@
   <main>
     <section id="login-card" class="card narrow">
       <h2>登录</h2>
-      <p class="muted">使用 Airflow 账号登录。凭据只用于服务器端调用，不会写入浏览器。</p>
-      <form id="login-form">
-        <label for="username">Airflow 用户名</label>
-        <input id="username" name="username" autocomplete="username" required>
-        <label for="password">密码</label>
-        <input id="password" name="password" type="password" autocomplete="current-password" required>
-        <button type="submit">登录</button>
-        <p id="login-error" class="error" hidden></p>
-      </form>
+      <p class="muted">使用企业飞书账号登录。登录后只能读取和发起本型号的交付任务。</p>
+      <a id="feishu-login" class="button" href="/auth/feishu/login?next=/">使用飞书登录</a>
+      <p id="login-error" class="error" hidden></p>
     </section>
 
     <section id="workspace" hidden>

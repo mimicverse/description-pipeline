@@ -124,6 +124,11 @@ class FeishuCoreTests(unittest.TestCase):
             os.chmod(secret, 0o600)
             with self.assertRaises(FeishuConfigError):
                 FeishuSettings.from_environment({**base, "FEISHU_APP_SECRET_FILE": str(secret)})
+            for coercible in ({"app_id": 5, "app_secret": "b"}, {"app_id": "a", "app_secret": ["x"]}):
+                secret.write_text(json.dumps(coercible), encoding="utf-8")
+                os.chmod(secret, 0o600)
+                with self.subTest(secret=coercible), self.assertRaises(FeishuConfigError):
+                    FeishuSettings.from_environment({**base, "FEISHU_APP_SECRET_FILE": str(secret)})
 
     def test_oauth_state_is_browser_bound(self) -> None:
         header = state_cookie_header("state-1")
