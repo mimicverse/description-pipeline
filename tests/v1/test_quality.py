@@ -352,3 +352,21 @@ class UrdfMassEqualityTests(unittest.TestCase):
         (self.root / "urdf/robot.urdf").write_text('<robot name="unit"><link name="link_0"/></robot>', encoding="utf-8")
         with self.assertRaises(PipelineError):
             verify_urdf_mass_equality(self.root)
+
+    def test_only_actual_link_masses_count_and_fixed_reference_frames_are_allowed(self):
+        path = self.root / "urdf/robot.urdf"
+        xml = path.read_text().replace(
+            "</robot>",
+            '<link name="sensor_frame"/><extension><inertial><mass value="100"/></inertial></extension></robot>',
+        )
+        path.write_text(xml)
+        self.assertEqual(3.0, verify_urdf_mass_equality(self.root)["urdf_mass_kg"])
+
+    def test_malformed_or_ambiguous_link_mass_fails_with_a_pipeline_error(self):
+        path = self.root / "urdf/robot.urdf"
+        original = path.read_text()
+        for replacement in ('<mass value="not-a-number"/>', '<mass value="1.0"/><mass value="2.0"/>'):
+            with self.subTest(replacement=replacement):
+                path.write_text(original.replace('<mass value="1.0"/>', replacement, 1))
+                with self.assertRaises(PipelineError):
+                    verify_urdf_mass_equality(self.root)

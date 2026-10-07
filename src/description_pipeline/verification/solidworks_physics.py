@@ -61,19 +61,26 @@ def verify_urdf_mass_equality(bundle_root: Path) -> dict:
         tree = ET.parse(confined(root, "urdf/robot.urdf")).getroot()
     except (OSError, ET.ParseError) as error:
         raise PipelineError(f"Delivered URDF is unreadable: {error}") from error
-    total = 0.0
-    count = 0
-    for inertial in tree.iter("inertial"):
-        mass = inertial.find("mass")
+    _require(tree.tag == "robot", "Delivered URDF has no robot root")
+    values = []
+    for link in tree.findall("link"):
+        inertials = link.findall("inertial")
+        _require(len(inertials) <= 1, "URDF link carries multiple inertial definitions")
+        if not inertials:  # Fixed reference frames may be massless.
+            continue
+        masses = inertials[0].findall("mass")
         _require(
-            mass is not None and mass.get("value") is not None,
+            len(masses) == 1 and masses[0].get("value") is not None,
             "URDF inertial element is missing its mass value",
         )
-        value = float(mass.get("value"))
+        try:
+            value = float(masses[0].get("value"))
+        except (ValueError, OverflowError) as error:
+            raise PipelineError("URDF inertial mass is not numeric") from error
         _require(math.isfinite(value) and value > 0.0, "URDF inertial mass is not a finite positive value")
-        total += value
-        count += 1
-    _require(count > 0, "Delivered URDF carries no inertial masses")
+        values.append(value)
+    _require(values, "Delivered URDF carries no inertial masses")
+    total = math.fsum(values)
     delta = total - whole
     _require(
         abs(delta) <= MASS_CLOSURE_ATOL,
@@ -85,7 +92,7 @@ def verify_urdf_mass_equality(bundle_root: Path) -> dict:
         "delta_kg": delta,
         "atol_kg": MASS_CLOSURE_ATOL,
         "rtol": 0.0,
-        "inertials": count,
+        "inertials": len(values),
     }
 
 
