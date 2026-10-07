@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,16 +19,20 @@ TRIANGLE = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
 
 
 class FakeFace:
-    def __init__(self, triangles, surface=None):
+    def __init__(self, triangles, surface=None, feature="shaft"):
         self._triangles = triangles
         self._surface = surface
         self.Name = "Face3"
+        self._feature = feature
 
     def GetTessTriangles(self, flag):  # noqa: N802 - SolidWorks API name
         return list(self._triangles)
 
     def GetSurface(self):  # noqa: N802 - SolidWorks API name
         return self._surface
+
+    def GetFeature(self):  # noqa: N802 - SolidWorks API name
+        return SimpleNamespace(Name=self._feature)
 
 
 class FakeSurface:
@@ -57,6 +62,7 @@ class FakeComponent:
         self._document = document
         self._bodies = bodies
         self.ReferencedConfiguration = "Default"
+        self.IsSuppressed = False
         self.body_calls = []
 
     def GetModelDoc2(self):  # noqa: N802 - SolidWorks API name
@@ -71,11 +77,31 @@ class FakeComponent:
             raise TypeError("IComponent2.GetBodies2 takes one body type")
         return list(self._bodies.get(arguments[0], ()))
 
+    def GetChildren(self):  # noqa: N802 - SolidWorks API name
+        return []
 
-def _backend(component) -> SolidWorksBackend:
-    backend = object.__new__(SolidWorksBackend)
-    backend._components = {"pcb-1": component}
-    backend.notes = {}
+
+def _backend(component, name="pcb-1") -> SolidWorksBackend:
+    backend = SolidWorksBackend()
+    component.Name2 = name
+    path = "C:/neutral/robot.SLDASM"
+    doc = SimpleNamespace(
+        ConfigurationManager=SimpleNamespace(ActiveConfiguration=SimpleNamespace(
+            Name="Default",
+            GetRootComponent3=lambda _resolve: SimpleNamespace(GetChildren=lambda: [component]),
+        )),
+        IsOpenedReadOnly=True,
+        GetPathName=lambda: path,
+    )
+    backend._sessions["source"] = SimpleNamespace(
+        app=SimpleNamespace(GetOpenDocumentByName=lambda _path: doc),
+        process=SimpleNamespace(alive=lambda: True),
+    )
+    backend._owner_thread = threading.current_thread()
+    backend._scene_document_key = backend._record_source_document(path, "Default")
+    part_key = backend._record_source_document(component.GetPathName(), "Default")
+    backend._source_components = {name: (part_key, "Default")}
+    backend._components = {name}
     return backend
 
 
@@ -195,6 +221,21 @@ class AxisReferenceTests(unittest.TestCase):
         self.assertEqual(record["component"], "pcb-1")
         self.assertIn("CylinderParams", record["used_api"])
 
+    def test_named_feature_uses_occurrence_faces_without_shared_document_reads(self):
+        face = FakeFace(TRIANGLE, FakeSurface([0.01, 0.02, 0.03, 0.0, 0.0, 1.0, 0.005]))
+        record = _backend(self._component_with(face)).capture_axis_reference(
+            {"component": "pcb-1", "feature_name": "shaft"}
+        )
+        self.assertEqual(record["radius_m"], 0.005)
+        self.assertEqual(record["axis_point_m"], [0.01, 0.02, 0.03])
+
+    def test_named_feature_ambiguous_cylindrical_faces_block(self):
+        face = FakeFace(TRIANGLE, FakeSurface([0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.005]))
+        component = FakeComponent(FakeDocument([]), {0: [FakeBody([face, face])], 1: []})
+        with self.assertRaises(CadError) as caught:
+            _backend(component).capture_axis_reference({"component": "pcb-1", "feature_name": "shaft"})
+        self.assertEqual(caught.exception.code, "cad_axis_reference_ambiguous")
+
     def test_non_cylindrical_face_fails(self):
         face = FakeFace(TRIANGLE, FakeSurface([0.0, 0.0, 0.0, 0.0, 0.0, 1.0]))
         with self.assertRaises(CadError) as caught:
@@ -224,9 +265,7 @@ class AxisReferenceTests(unittest.TestCase):
     def test_component_body_query_uses_its_native_signature_once(self):
         face = FakeFace(TRIANGLE, FakeSurface([0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.006]))
         component = FakeComponent(FakeDocument([]), {0: [FakeBody([face])], 1: []})
-        backend = object.__new__(SolidWorksBackend)
-        backend._components = {"arm-1": component}
-        backend.notes = {}
+        backend = _backend(component, "arm-1")
         record = backend.capture_axis_reference({"component": "arm-1", "face_index": 0})
         self.assertEqual(record["radius_m"], 0.006)
         self.assertIn("IComponent2.GetBodies2(type)", backend.notes["bodies_api:arm-1:0"])

@@ -872,7 +872,7 @@ class CaptureSceneTests(unittest.TestCase):
         with _com_stubs():
             return backend.collect_scene(str(assembly), requested)
 
-    def _configured_occurrences(self, root):
+    def _configured_occurrences(self, root, *, nested=False):
         class ConfiguredDocument(_Doc):
             def GetTessTriangles(self, _quality):
                 raise AssertionError("occurrence geometry must not read the shared document")
@@ -904,10 +904,19 @@ class CaptureSceneTests(unittest.TestCase):
             configuration="Parked",
             configuration_children={"Short": [], "Long": [], "Parked": []},
         )
-        short = ConfiguredComponent("part-short", part, doc=shared, configuration="Short")
-        long = ConfiguredComponent("part-long", part, doc=shared, configuration="Long")
+        short_name = "sub-1/part-1" if nested else "part-short"
+        long_name = "sub-2/part-1" if nested else "part-long"
+        short = ConfiguredComponent(short_name, part, doc=shared, configuration="Short")
+        long = ConfiguredComponent(long_name, part, doc=shared, configuration="Long")
+        children = [short, long]
+        if nested:
+            children = []
+            for index, leaf in enumerate((short, long), 1):
+                sub_path = _write(root, f"sub{index}.SLDASM")
+                sub_doc = _Doc(sub_path, doc_type=2, children=[leaf])
+                children.append(_Component(f"sub-{index}", sub_path, children=[leaf], doc=sub_doc))
         assembly = _write(root, "robot.SLDASM")
-        main = _Doc(assembly, doc_type=2, children=[short, long])
+        main = _Doc(assembly, doc_type=2, children=children)
         backend = ConfiguredBackend(session_factory=lambda: _Session(_App({assembly: main})))
         scene = backend.collect_scene(str(assembly), [])
         return backend, scene, shared, short, part
@@ -927,7 +936,7 @@ class CaptureSceneTests(unittest.TestCase):
             backend.verify_sources_unchanged()
 
     def test_repeated_configuration_source_guard_still_rejects_real_drift(self):
-        for drift in ("reference", "active", "file", "path", "suppression"):
+        for drift in ("reference", "active", "file", "path", "suppression", "added", "removed", "renamed", "duplicate"):
             with self.subTest(drift=drift), TemporaryDirectory() as tmp, _com_stubs():
                 backend, _, shared, short, part = self._configured_occurrences(Path(tmp))
                 if drift == "reference":
@@ -938,21 +947,123 @@ class CaptureSceneTests(unittest.TestCase):
                     short._path = str(_write(Path(tmp), "foreign.SLDPRT"))
                 elif drift == "suppression":
                     short.IsSuppressed = True
+                elif drift in {"added", "removed", "renamed", "duplicate"}:
+                    main = backend._document_by_path(str(Path(tmp) / "robot.SLDASM"))
+                    if drift == "added":
+                        main._children.append(_Component("extra-1", part, doc=shared, configuration="Short"))
+                    elif drift == "removed":
+                        main._children.remove(short)
+                    elif drift == "renamed":
+                        short.Name2 = "renamed-1"
+                    else:
+                        main._children.append(short)
                 else:
                     part.write_bytes(b"changed native source")
                 with self.assertRaises(CadError) as caught:
                     backend.verify_sources_unchanged()
                 self.assertEqual(caught.exception.code, "cad_source_changed")
 
+    def test_mesh_and_guard_use_fresh_occurrence_after_scene_handle_expires(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            backend, _, shared, stale, part = self._configured_occurrences(root)
+            fresh = type(stale)(stale.Name2, part, doc=shared, configuration="Short")
+            main = backend._document_by_path(str(root / "robot.SLDASM"))
+            main._children[main._children.index(stale)] = fresh
+            stale.GetBodies2 = _raiser(RuntimeError("RPC_S_UNKNOWN_IF: expired occurrence"))
+            stale.GetPathName = _raiser(RuntimeError("expired occurrence"))
+            path = root / "fresh.stl"
+            backend.export_component_mesh("part-short", path)
+            self.assertEqual(read_stl(path).high, (1.0, 1.0, 0.0))
+            backend.verify_sources_unchanged()
+
+    def test_fresh_nested_occurrences_keep_duplicate_leaf_names_distinct(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            backend, _, shared, _, _ = self._configured_occurrences(root, nested=True)
+            main = backend._document_by_path(str(root / "robot.SLDASM"))
+            main._children.reverse()
+            for name, count, extent in (("sub-1/part-1", 1, 1.0), ("sub-2/part-1", 2, 2.0)):
+                path = root / f"{count}.stl"
+                backend.export_component_mesh(name, path)
+                self.assertEqual(read_stl(path).triangles, count)
+                self.assertEqual(read_stl(path).high, (extent, extent, 0.0))
+            self.assertEqual(shared.active_configuration, "Parked")
+            backend.verify_sources_unchanged()
+
+    def test_unreadable_fresh_occurrence_blocks_with_context_and_no_cached_fallback(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            backend, _, _, short, _ = self._configured_occurrences(root)
+            short.GetChildren = _raiser(RuntimeError("fresh occurrence tree unavailable"))
+            path = root / "blocked.stl"
+            with self.assertRaises(CadError) as caught:
+                backend.export_component_mesh("part-short", path)
+            self.assertEqual(caught.exception.code, "cad_source_state_unreadable")
+            self.assertEqual(caught.exception.detail["phase"], "geometry")
+            self.assertEqual(caught.exception.detail["component"], "part-short")
+            self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+            self.assertFalse(path.exists())
+
+    def test_geometry_cannot_restart_a_lost_capture_session(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            backend, _, _, _, _ = self._configured_occurrences(root)
+            backend._sessions.clear()
+            backend._session_factory = _raiser(AssertionError("a new CAD application must not be started"))
+            with self.assertRaises(CadError) as caught:
+                backend.export_component_mesh("part-short", root / "blocked.stl")
+            self.assertEqual(caught.exception.code, "cad_source_state_unreadable")
+            self.assertEqual(caught.exception.detail["phase"], "geometry")
+            self.assertIn("original owned capture session", caught.exception.detail["error"])
+
+    def test_unreadable_fresh_occurrence_fields_are_not_reported_as_drift(self):
+        for field in ("Name2", "IsSuppressed", "ReferencedConfiguration"):
+            with self.subTest(field=field), TemporaryDirectory() as tmp, _com_stubs():
+                root = Path(tmp)
+                backend, _, _, short, _ = self._configured_occurrences(root)
+                setattr(short, field, None)
+                with self.assertRaises(CadError) as caught:
+                    backend.export_component_mesh("part-short", root / "blocked.stl")
+                self.assertEqual(caught.exception.code, "cad_source_state_unreadable")
+                self.assertEqual(caught.exception.detail["phase"], "geometry")
+
+    def test_unreadable_name_does_not_report_the_previous_occurrence(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            backend, _, shared, short, part = self._configured_occurrences(root)
+
+            class UnreadableName(type(short)):
+                def __getattribute__(self, name):
+                    if name == "Name2":
+                        raise RuntimeError("current occurrence name unavailable")
+                    return super().__getattribute__(name)
+
+            main = backend._document_by_path(str(root / "robot.SLDASM"))
+            main._children[main._children.index(short)] = UnreadableName(
+                "part-short", part, doc=shared, configuration="Short"
+            )
+            with self.assertRaises(CadError) as caught:
+                backend.export_component_mesh("part-short", root / "blocked.stl")
+            self.assertEqual(caught.exception.code, "cad_source_state_unreadable")
+            self.assertEqual(caught.exception.detail["component"], "")
+            self.assertEqual(caught.exception.detail["phase"], "geometry")
+
     def test_source_guard_reacquires_assembly_instead_of_reading_retained_proxy(self):
         class Expired:
             @property
-            def ConfigurationManager(self):
+            def ActiveConfiguration(self):
                 raise RuntimeError("retained assembly interface is unavailable")
 
         with TemporaryDirectory() as tmp, _com_stubs():
             backend, _, _, _, _ = self._configured_occurrences(Path(tmp))
-            backend._doc = Expired()
+            path = str(Path(tmp) / "robot.SLDASM")
+            app = backend._app_obj()
+            original = backend._document_by_path(path)
+            app._docs[os.path.normcase(os.path.abspath(path))] = _Doc(
+                path, doc_type=2, children=original._children,
+            )
+            original.ConfigurationManager = Expired()
             self.assertIn(str(Path(tmp) / "robot.SLDASM"), backend.verify_sources_unchanged())
 
     def test_source_guard_reads_owned_document_when_component_document_proxy_is_lost(self):
@@ -1029,7 +1140,7 @@ class CaptureSceneTests(unittest.TestCase):
         app._docs[os.path.normcase(os.path.abspath(str(part)))] = original
         component = _Component("part-short", part, doc=original, configuration="Short")
         backend = SolidWorksBackend(session_factory=lambda: _Session(app))
-        backend._components["part-short"] = component
+        backend._components.add("part-short")
         return backend, original, replacement
 
     def test_configuration_window_restores_through_fresh_owned_document_handle(self):

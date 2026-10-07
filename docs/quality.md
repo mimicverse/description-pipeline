@@ -68,10 +68,13 @@ original and collected file hashes after capture. A failed rebuild blocks export
 Datums and mass are read in each occurrence's exact referenced configuration.
 Temporary document selections are restored and verified. Meshes use the
 occurrence's solid and surface bodies in component coordinates, without switching
-the shared part document's configuration. An unreadable body, invalid face
+the shared part document's configuration. Mesh and shaft reads acquire current
+occurrences from the recorded assembly and verify their full names, paths and
+referenced configurations. An unreadable body, invalid face
 triangles or a body with no display mesh blocks capture. Final checks verify
-the document state through each recorded path in the owned session, and reject
-changed occurrence paths, references or suppression. Unreadable state retains
+the document state through each recorded path in the owned session, and compare
+a fresh assembly traversal with the captured active occurrences. Changed
+names, paths, references or suppression block capture. Unreadable state retains
 the affected document and occurrence in diagnostics.
 Suppressed datums are excluded. Unreadable suppression state or an unreadable
 active datum blocks discovery and capture; active frames cannot disappear

@@ -774,10 +774,10 @@ class SolidWorksBackend(CadBackend):
         self._cancelled = threading.Event()
         self._capture_roots = []
         self._requested_configurations = {}
-        self._components = {}
+        self._components = set()
         self._source_components = {}
         self._source_documents = {}
-        self._doc = None
+        self._scene_document_key = None
         self.notes = {}
         self.source_files = {}
         #: ``GetSaveFlag`` per working-tree document, recorded as evidence.
@@ -874,7 +874,7 @@ class SolidWorksBackend(CadBackend):
         self._components.clear()
         self._source_components.clear()
         self._source_documents.clear()
-        self._doc = None
+        self._scene_document_key = None
         self.save_flags.clear()
         with self._sessions_lock:
             sessions = list(self._sessions.values())
@@ -1221,9 +1221,9 @@ class SolidWorksBackend(CadBackend):
                 reference,
             )
         body_type = 1 if str(reference.get("body_type") or "solid") == "sheet" else 0
-        holder = self._components[component]
+        holder = self._current_components("axis_reference")[component]
         if _is_text_name(feature_name):
-            face = self._cylinder_face_by_feature(holder, str(feature_name), component)
+            face = self._cylinder_face_by_feature(holder, str(feature_name), component, body_type)
         else:
             bodies = self._body_list(holder, body_type, component)
             faces = []
@@ -1283,36 +1283,32 @@ class SolidWorksBackend(CadBackend):
             record["persist_reference_b64"] = persist
         return record
 
-    def _cylinder_face_by_feature(self, holder, feature_name, component):
-        """Resolve a named feature's unique cylindrical face; ambiguity fails."""
+    def _cylinder_face_by_feature(self, holder, feature_name, component, body_type):
+        """Resolve the named feature among this occurrence's actual body faces."""
 
-        document = _member(holder, "GetModelDoc2")
-        feature = _member(document, "FirstFeature")
-        matches = 0
         found = None
-        while feature is not None:
-            if str(_member(feature, "Name") or "") == feature_name:
-                matches += 1
-                for candidate in _as_list(_member(feature, "GetFaces")):
-                    params = list(map(float, _member(_member(candidate, "GetSurface"), "CylinderParams") or ()))
-                    if len(params) != 7:
-                        continue
-                    direction = params[3:6]
-                    norm = math.sqrt(sum(value * value for value in direction))
-                    if abs(norm - 1.0) <= 1e-6 and params[6] > 0.0:
-                        if found is not None:
-                            raise CadError(
-                                "cad_axis_reference_ambiguous",
-                                "the named feature carries more than one cylindrical face",
-                                {"component": component, "feature_name": feature_name},
-                            )
-                        found = candidate
-            feature = _member(feature, "GetNextFeature")
+        for body in self._body_list(holder, body_type, component):
+            for candidate in _as_list(_member(body, "GetFaces")):
+                feature = _member(candidate, "GetFeature")
+                if feature is None or _member(feature, "Name") != feature_name:
+                    continue
+                params = list(map(float, _member(_member(candidate, "GetSurface"), "CylinderParams") or ()))
+                if len(params) != 7 or not all(map(math.isfinite, params)):
+                    continue
+                norm = math.sqrt(sum(value * value for value in params[3:6]))
+                if abs(norm - 1.0) <= 1e-6 and params[6] > 0.0:
+                    if found is not None:
+                        raise CadError(
+                            "cad_axis_reference_ambiguous",
+                            "the named feature carries more than one cylindrical face",
+                            {"component": component, "feature_name": feature_name},
+                        )
+                    found = candidate
         if found is None:
             raise CadError(
                 "cad_axis_reference_not_cylinder",
                 "no cylindrical face found on the named feature",
-                {"component": component, "feature_name": feature_name, "features_matched": matches},
+                {"component": component, "feature_name": feature_name},
             )
         return found
 
@@ -1322,7 +1318,8 @@ class SolidWorksBackend(CadBackend):
         try:
             import base64
 
-            data = _member(_member(self._doc, "Extension"), "GetPersistReference3", face)
+            doc = self._captured_document(self._scene_document_key, phase="axis_reference")
+            data = _member(_member(doc, "Extension"), "GetPersistReference3", face)
             if data is None:
                 return None
             blob = bytes(int(value) & 0xFF for value in data)
@@ -1472,14 +1469,13 @@ class SolidWorksBackend(CadBackend):
             raise CadError("cad_not_assembly", "export requires a saved SLDASM")
         preparation = self._rebuild_capture_copy(doc, doc_path)
         self._record_save_flag(doc, doc_path)
-        self._doc = doc
-        self._components = {}
+        self._components = set()
         self._source_components = {}
         self._source_documents = {}
         self.notes = {"capture_preparation": preparation}
         self.source_files = {doc_path: _hash(doc_path)}
         config = _member(_member(doc, "ConfigurationManager"), "ActiveConfiguration")
-        self._record_source_document(doc_path, str(_member(config, "Name")))
+        self._scene_document_key = self._record_source_document(doc_path, str(_member(config, "Name")))
         root = _member(config, "GetRootComponent3", True)
         stack = list(_member(root, "GetChildren") or ())
         components, properties = [], {}
@@ -1539,7 +1535,7 @@ class SolidWorksBackend(CadBackend):
                 # Occurrence references are independent of the one active state
                 # of a shared document; every temporary selection is restored.
                 document_key = self._record_source_document(path, previous)
-                self._source_components[name] = (comp, document_key, str(referenced))
+                self._source_components[name] = (document_key, str(referenced))
                 if path not in self.source_files:
                     self.source_files[path] = _hash(path)
                 if children:
@@ -1550,7 +1546,7 @@ class SolidWorksBackend(CadBackend):
                 if _member(part, "GetType") != 1:
                     raise CadError("cad_empty_subassembly", name)
                 components.append(RawComponent(name, path, placement, bool(_member(comp, "IsFixed")), "part"))
-                self._components[name] = comp
+                self._components.add(name)
                 # Include solids and sheets from this occurrence's configuration.
                 self.notes["bodies:" + name] = {
                     "solid": self._body_count(comp, 0, name),
@@ -1631,7 +1627,7 @@ class SolidWorksBackend(CadBackend):
 
         if component not in self._components:
             raise CadError("cad_missing_component", component)
-        holder = self._components[component]
+        holder = self._current_components("geometry")[component]
         sources: list[str] = []
         values: list[float] = []
         solid_bodies = self._body_list(holder, 0, component)
@@ -1704,62 +1700,113 @@ class SolidWorksBackend(CadBackend):
             raise CadError("cad_source_changed", "a shared document's captured state changed", {"path": path})
         return key
 
-    def verify_sources_unchanged(self):
-        def source_read(path, component, read):
-            try:
-                return read()
-            except Exception as error:
-                raise CadError(
-                    "cad_source_state_unreadable",
-                    "native source state could not be rechecked",
-                    {"path": path, "component": component, "phase": "verify_sources", "error": str(error)},
-                ) from error
+    def _captured_document(self, key, component="", phase="verify_sources"):
+        """Resolve a recorded path in its original live session, without reopening."""
+        if key not in self._source_documents:
+            raise CadError(
+                "cad_source_state_unreadable",
+                "no captured document identity is available",
+                {"component": component, "phase": phase},
+            )
+        path, role, expected, session = self._source_documents[key]
+        try:
+            if (
+                self._owner_thread is not threading.current_thread()
+                or self._role_for_path(path) != role
+                or self._sessions.get(role) is not session
+                or session.app is None
+                or not session.process.alive()
+                or self._cancelled.is_set()
+            ):
+                raise ValueError("the original owned capture session is unavailable")
+            doc = self._document_by_path(path)
+            configuration = _active_configuration(doc)
+            if not _is_text_name(configuration):
+                raise ValueError("the document has no readable active configuration")
+        except Exception as error:
+            raise CadError(
+                "cad_source_state_unreadable",
+                "native source document could not be read",
+                {"path": path, "component": component, "phase": phase, "error": str(error)},
+            ) from error
+        if configuration != expected:
+            raise CadError(
+                "cad_source_changed",
+                "document configuration changed during export",
+                {"path": path, "before": {"configuration": expected}, "after": {"configuration": configuration}},
+            )
+        return doc
 
-        if not self._source_documents:
-            raise CadError("cad_source_state_unreadable", "no captured document identities are available")
-        for key, (path, role, expected, session) in self._source_documents.items():
-            def read_configuration(path=path, role=role, session=session):
-                if (
-                    self._owner_thread is not threading.current_thread()
-                    or self._role_for_path(path) != role
-                    or self._sessions.get(role) is not session
-                    or session.app is None
-                    or not session.process.alive()
-                    or self._cancelled.is_set()
-                ):
-                    raise ValueError("the original owned capture session is unavailable")
-                name = _active_configuration(self._document_by_path(path))
+    def _current_components(self, phase):
+        """Read the current assembly tree; never retain occurrence dispatch handles."""
+        doc = self._captured_document(self._scene_document_key, phase=phase)
+        path = self._source_documents[self._scene_document_key][0]
+        name = ""
+        current = {}
+        try:
+            config = _member(_member(doc, "ConfigurationManager"), "ActiveConfiguration")
+            root = _member(config, "GetRootComponent3", True)
+            if root is None:
+                raise ValueError("the assembly has no readable root component")
+            stack = list(_member(root, "GetChildren") or ())
+            while stack:
+                name = ""
+                comp = _dynamic(stack.pop())
+                name = _member(comp, "Name2")
                 if not _is_text_name(name):
-                    raise ValueError("the document has no readable active configuration")
-                return name
-
-            component = next((name for name, (_, doc_key, _) in self._source_components.items() if doc_key == key), "")
-            configuration = source_read(path, component, read_configuration)
-            if configuration != expected:
-                raise CadError(
-                    "cad_source_changed",
-                    "document configuration changed during export",
-                    {"path": path, "before": {"configuration": expected}, "after": {"configuration": configuration}},
-                )
-        for name, (comp, document_key, referenced) in self._source_components.items():
-            path = self._source_documents[document_key][0]
-            occurrence = source_read(
-                path,
-                name,
-                lambda comp=comp: {
+                    raise ValueError("the occurrence has no readable full name")
+                suppressed = _member(comp, "IsSuppressed")
+                if not isinstance(suppressed, bool):
+                    raise ValueError("the occurrence has no readable suppression state")
+                if suppressed:
+                    continue
+                if name in current or name not in self._source_components:
+                    raise CadError(
+                        "cad_source_changed", "the active occurrence identities changed", {"component": name}
+                    )
+                document_key, referenced = self._source_components[name]
+                expected_path = self._source_documents[document_key][0]
+                occurrence = {
                     "path": _member(comp, "GetPathName"),
                     "referenced_configuration": _member(comp, "ReferencedConfiguration"),
-                    "suppressed": bool(_member(comp, "IsSuppressed")),
-                },
-            )
-            if not document_paths_match(occurrence["path"], path) or occurrence["suppressed"]:
-                raise CadError("cad_source_changed", name, {"path": path, "after": occurrence})
-            if occurrence["referenced_configuration"] != referenced:
-                raise CadError(
-                    "cad_source_changed",
-                    name,
-                    {"path": path, "before": {"referenced_configuration": referenced}, "after": occurrence},
-                )
+                }
+                if not all(_is_text_name(value) for value in occurrence.values()):
+                    raise ValueError("the occurrence path or referenced configuration is unreadable")
+                if (
+                    not document_paths_match(occurrence["path"], expected_path)
+                    or occurrence["referenced_configuration"] != referenced
+                ):
+                    raise CadError(
+                        "cad_source_changed",
+                        name,
+                        {
+                            "path": expected_path,
+                            "before": {"referenced_configuration": referenced},
+                            "after": occurrence,
+                        },
+                    )
+                current[name] = comp
+                stack.extend(_member(comp, "GetChildren") or ())
+        except Exception as error:
+            if isinstance(error, CadError) and error.code == "cad_source_changed":
+                raise
+            raise CadError(
+                "cad_source_state_unreadable",
+                "native occurrence state could not be read",
+                {"path": path, "component": name, "phase": phase, "error": str(error)},
+            ) from error
+        missing = sorted(self._source_components.keys() - current.keys())
+        if missing:
+            raise CadError("cad_source_changed", "active occurrences disappeared", {"missing": missing, "path": path})
+        return current
+
+    def verify_sources_unchanged(self):
+        if not self._source_documents:
+            raise CadError("cad_source_state_unreadable", "no captured document identities are available")
+        for key in self._source_documents:
+            component = next((name for name, (doc_key, _) in self._source_components.items() if doc_key == key), "")
+            self._captured_document(key, component)
+        self._current_components("verify_sources")
         for path, digest in self.source_files.items():
             if _hash(path) != digest:
                 raise CadError("cad_source_changed", path)
