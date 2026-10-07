@@ -10,16 +10,11 @@ The standard inertia tensor has ``Ixy = −∫xy dm``::
 
     [[1, -1, 0], [-1, 1, 0], [0, 0, 2]]
 
-A part document reports positive-product notation for the same body::
-
-    [[1, +1, 0], [+1, 1, 0], [0, 0, 2]]
-
 A native analytic fixture (rotated boxes, SolidWorks 34.0.0, 2026-10-06) showed
 that both the part-document reading and the component-group reading are the
 standard tensor as-is (residuals 4e-20 and 6.5e-19).  The scope label therefore
-names the measured convention, and it must agree with any explicit convention -
-historical readings that declare ``solidworks_positive`` keep their own
-interpretation.
+names the measured convention and must agree with any explicit convention.
+Positive-product and unqualified readings are rejected.
 """
 
 from __future__ import annotations
@@ -59,11 +54,11 @@ class GeneratorScopeTests(unittest.TestCase):
         )
         self.assertEqual(tensor, tuple(tuple(row) for row in STANDARD))
 
-    def test_explicit_positive_convention_is_still_honoured(self):
-        tensor = tensor_from_raw(
-            POSITIVE_PRODUCT, {"product_convention": "solidworks_positive"}, where="analytic fixture"
-        )
-        self.assertEqual(tensor, tuple(tuple(row) for row in STANDARD))
+    def test_explicit_positive_convention_is_rejected(self):
+        with self.assertRaises(ConfigError):
+            tensor_from_raw(
+                POSITIVE_PRODUCT, {"product_convention": "solidworks_positive"}, where="analytic fixture"
+            )
 
     def test_scope_and_convention_must_agree(self):
         for raw, reference in (
@@ -82,10 +77,15 @@ class GeneratorScopeTests(unittest.TestCase):
             )
 
     def test_unqualified_readings_still_fail_closed(self):
-        tensor = tensor_from_raw(STANDARD, {"used_api": "fixture"}, where="analytic fixture")
+        tensor = tensor_from_raw(
+            STANDARD,
+            {"used_api": "fixture", "product_convention": "solidworks_standard"},
+            where="analytic fixture",
+        )
         self.assertEqual(tensor, tuple(tuple(row) for row in STANDARD))
-        with self.assertRaises(ConfigError):
-            tensor_from_raw(STANDARD, {"used_api": "IMassProperty2.GetMomentOfInertia(0)"}, where="analytic fixture")
+        for api in ("fixture", "IMassProperty2.GetMomentOfInertia(0)"):
+            with self.subTest(api=api), self.assertRaises(ConfigError):
+                tensor_from_raw(STANDARD, {"used_api": api}, where="analytic fixture")
 
     def test_unvalidated_fallback_arrays_are_never_relabelled(self):
         # The analytic proof covers GetMomentOfInertia(0) only.  A legacy
@@ -109,10 +109,11 @@ class VerifyOracleScopeTests(unittest.TestCase):
         group = verify_module._raw_tensor("group", self._payload(STANDARD, {"scope": "assembly_component_group"}))
         self.assertTrue(np.allclose(part, np.array(STANDARD)))
         self.assertTrue(np.allclose(group, np.array(STANDARD)))
-        positive = verify_module._raw_tensor(
-            "legacy", self._payload(POSITIVE_PRODUCT, {"product_convention": "solidworks_positive"})
-        )
-        self.assertTrue(np.allclose(positive, np.array(STANDARD)))
+
+    def test_oracle_rejects_positive_and_unqualified_readings(self):
+        for reference in ({"product_convention": "solidworks_positive"}, {"used_api": "fixture"}):
+            with self.subTest(reference=reference), self.assertRaises(ValueError):
+                verify_module._raw_tensor("box", self._payload(POSITIVE_PRODUCT, reference))
 
     def test_oracle_rejects_disagreeing_or_unknown_scopes(self):
         with self.assertRaises(ValueError):

@@ -124,15 +124,10 @@ def combine_mass_properties(entries: Sequence[dict[str, Any]]) -> dict[str, Any]
 
 
 PRODUCT_CONVENTIONS = ("solidworks_standard",)
-# The scope label names *what was selected*; it is authoritative and must agree
-# with any declared convention, so a reading is never re-interpreted by
-# silently relabelling historical measurements.
-#
 # The native analytic fixture (SolidWorks 34.0.0, 2026-10-06) verifies rotated
 # boxes and a solid cylinder with nonzero cross terms. Part tensors agree with
 # the standard signed tensor within 1.5e-19 kg*m^2; the full assembly agrees
-# within 8.7e-19. Historical positive-product readings retain their own declared
-# interpretation and cannot be relabelled as a measured standard scope.
+# within 8.7e-19. Other conventions are rejected.
 SCOPE_CONVENTIONS = {
     "part_document": "solidworks_standard",
     "assembly_component_group": "solidworks_standard",
@@ -190,8 +185,8 @@ class _PartReading:
         self.mass_scale = float(mass.get("scale", 1.0))
         part_com = tuple(float(value) for value in mass["com"])
         reference = mass.get("reference") or {}
-        self.product_convention = str(reference.get("product_convention") or "fixture_tensor")
         part_inertia = tensor_from_raw(mass["inertia"], reference, where=f"component {name}")
+        self.product_convention = "solidworks_standard"
         # part frame -> assembly frame
         assembly_com = _matvec(self.rotation, part_com)  # type: ignore[arg-type]
         self.assembly_com = tuple(assembly_com[i] + self.translation[i] for i in range(3))
@@ -256,7 +251,6 @@ def closure_delta(top_level: dict[str, Any], leaf_total: dict[str, Any]) -> dict
     }
 
 
-FRAME_KEYS = {"xyz", "rpy", "coordinate_system"}
 
 
 def map_from_row_major(values: Sequence[float]) -> tuple[Matrix3, Vector3]:
