@@ -1,4 +1,9 @@
-"""Submit one configured CAD package to the Windows SolidWorks execution endpoint."""
+"""Submit one engineering folder to the Windows SolidWorks execution endpoint.
+
+The DAG carries one operator value, ``handoff_path``. It sends only the resolved native package
+and its digest; hardware, revision and repository routing resolve inside the serialized Windows
+job after CAD discovery and are confirmed here before publication.
+"""
 
 from __future__ import annotations
 
@@ -11,10 +16,12 @@ from airflow.sdk import Param, dag, task
 from airflow.sdk.exceptions import AirflowFailException
 
 from description_pipeline.orchestration.airflow_client import (
+    HandoffResolution,
     WindowsEndpoint,
     check_result,
     config_from_airflow_connection,
     native_run_id,
+    resolved_routing,
 )
 
 DAG_ID = "solidworks_to_urdf"
@@ -31,6 +38,13 @@ def _endpoint(conn_id: str) -> WindowsEndpoint:
 
 def _run_uuid(context) -> str:
     return native_run_id(context["dag_run"].run_id)
+
+
+def _resolution(request: dict) -> HandoffResolution:
+    return HandoffResolution(
+        package=request["package"],
+        handoff_sha256=request["handoff_sha256"],
+    )
 
 
 def _poke(request: dict) -> bool:
@@ -52,10 +66,7 @@ def _poke(request: dict) -> bool:
 
 
 def _same_request(job: dict, request: dict) -> None:
-    keys = ["run_id", "package", "revision_sha256", "target"]
-    if "handoff_sha256" in request:
-        keys.append("handoff_sha256")
-    expected = {key: request[key] for key in keys}
+    expected = {key: request[key] for key in ("run_id", "package", "handoff_sha256")}
     if job.get("request") != expected:
         raise AirflowFailException("Endpoint job differs from the requested mechanical handoff")
 
@@ -71,7 +82,7 @@ def _same_request(job: dict, request: dict) -> None:
         "handoff_path": Param(
             "",
             type="string",
-            title="Handoff folder path",
+            title="Engineering folder path",
             description=(
                 "Folder the Windows endpoint inspects (an absolute Linux folder is archived and "
                 "imported before the run starts)"
@@ -88,24 +99,16 @@ def solidworks_to_urdf():
         resolved = _endpoint(CONN_ID).resolve_handoff(handoff_path)
         run_id = _run_uuid(context)
         log.info(
-            "resolved handoff_path=%s package=%s handoff_sha256=%s hardware_id=%s target=%s endpoint_conn=%s",
+            "resolved handoff_path=%s package=%s handoff_sha256=%s endpoint_conn=%s",
             handoff_path,
             resolved.package,
             resolved.handoff_sha256,
-            resolved.hardware_id,
-            resolved.target,
             CONN_ID,
         )
         return {
             "run_id": run_id,
             "package": resolved.package,
-            "revision_sha256": resolved.revision_sha256,
             "handoff_sha256": resolved.handoff_sha256,
-            "target": resolved.target,
-            "repository_slug": resolved.repository_slug,
-            "base": resolved.base,
-            "hardware_id": resolved.hardware_id,
-            "revision": resolved.revision,
             "conn_id": CONN_ID,
         }
 
@@ -113,10 +116,7 @@ def solidworks_to_urdf():
     def start_job(request: dict) -> dict:
         job = _endpoint(request["conn_id"]).start_job(
             run_id=request["run_id"],
-            package=request["package"],
-            revision_sha256=request["revision_sha256"],
-            target=request["target"],
-            handoff_sha256=request.get("handoff_sha256"),
+            resolution=_resolution(request),
         )
         log.info("started run_id=%s status=%s", job["run_id"], job["status"])
         return {**request, "status": job["status"]}
@@ -127,12 +127,20 @@ def solidworks_to_urdf():
         _same_request(job, request)
         if job["status"] != "passed":
             raise AirflowFailException(f"job {request['run_id']} is {job['status']}, not passed")
-        if job.get("repository_slug") != request["repository_slug"]:
-            raise AirflowFailException("job repository_slug differs from the requested origin")
-        if job.get("repository_base") != request["base"]:
-            raise AirflowFailException("job repository_base differs from the requested base")
+        routing = resolved_routing(job)
+        handoff = {
+            "package": request["package"],
+            "handoff_sha256": request["handoff_sha256"],
+            "hardware_id": routing["hardware_id"],
+            "revision": routing["revision"],
+            "target": routing["target"],
+            "repository_slug": routing["repository_slug"],
+            "base": routing["repository_base"],
+        }
         result = check_result(
-            job.get("result"), expected_slug=request["repository_slug"], expected_base=request["base"]
+            job.get("result"),
+            expected_slug=routing["repository_slug"],
+            expected_base=routing["repository_base"],
         )
         log.info(
             "published run_id=%s quality=%s submission=%s",
@@ -143,16 +151,7 @@ def solidworks_to_urdf():
         return {
             "run_id": request["run_id"],
             "pipeline_id": result["pipeline_id"],
-            "handoff": {
-                "package": request["package"],
-                "revision_sha256": request["revision_sha256"],
-                "handoff_sha256": request["handoff_sha256"],
-                "hardware_id": request["hardware_id"],
-                "revision": request["revision"],
-                "target": request["target"],
-                "repository_slug": request["repository_slug"],
-                "base": request["base"],
-            },
+            "handoff": handoff,
             "events": job["events"],
             "quality": result["quality"],
             "submission": result["submission"],

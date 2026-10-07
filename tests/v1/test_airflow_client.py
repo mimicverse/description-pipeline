@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import io
 import sys
 import tempfile
@@ -21,6 +22,7 @@ from description_pipeline.orchestration.airflow_client import (
     EndpointConflict,
     EndpointError,
     EndpointProtocolError,
+    HandoffResolution,
     HANDOFF_SCHEMA,
     JOB_SCHEMA,
     JobFailed,
@@ -29,27 +31,15 @@ from description_pipeline.orchestration.airflow_client import (
     WindowsEndpoint,
     check_result,
     native_run_id,
+    resolved_routing,
     validate_artifact_name,
     validate_package,
-    validate_revision_sha,
     validate_run_id,
 )
 
 TOKEN = "test-token"
 RUN_ID = "b3f1c2d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
 SHA = "a" * 64
-HANDOFF = {
-    "schema_version": HANDOFF_SCHEMA,
-    "pipeline_id": PIPELINE_ID,
-    "package": "handoff/m3.0",
-    "revision_sha256": SHA,
-    "handoff_sha256": "b" * 64,
-    "hardware_id": "m3.0",
-    "revision": "r1",
-    "target": "m3",
-    "repository_slug": "example/m3.0",
-    "base": "feature/m3.0",
-}
 PREVIEW = {
     "pipeline_id": PIPELINE_ID,
     "run_id": RUN_ID,
@@ -57,6 +47,18 @@ PREVIEW = {
     "urdf": "urdf/robot.urdf",
     "files": {"urdf/robot.urdf": SHA, "meshes/base.stl": "d" * 64},
 }
+NATIVE_HANDOFF = {
+    "schema_version": HANDOFF_SCHEMA,
+    "pipeline_id": PIPELINE_ID,
+    "package": "handoff/m3.0",
+    "handoff_sha256": "b" * 64,
+}
+
+
+def native_resolution(**overrides) -> HandoffResolution:
+    values = {"package": "handoff/m3.0", "handoff_sha256": "b" * 64}
+    values.update(overrides)
+    return HandoffResolution(**values)
 
 
 class MockEndpoint:
@@ -67,8 +69,9 @@ class MockEndpoint:
         *,
         token: str = TOKEN,
         fail_job: bool = False,
-        legacy_events: bool = False,
+        invalid_events: bool = False,
         omit_quality: bool = False,
+        omit_submission: bool = False,
         redirect_to: str | None = None,
         handoff_response: dict | None = None,
         preview_payload: dict | None = None,
@@ -76,8 +79,9 @@ class MockEndpoint:
     ) -> None:
         self.token = token
         self.fail_job = fail_job
-        self.legacy_events = legacy_events
+        self.invalid_events = invalid_events
         self.omit_quality = omit_quality
+        self.omit_submission = omit_submission
         self.redirect_to = redirect_to
         self.handoff_response = handoff_response
         self.preview_payload = preview_payload
@@ -160,6 +164,14 @@ class MockEndpoint:
                     if job is None:
                         self._send(404, {"error": "unknown run_id"})
                         return
+                    if "hardware_id" not in job:
+                        job.update(
+                            hardware_id="m3.0",
+                            revision="r1",
+                            target="m3",
+                            repository_slug="example/m3.0",
+                            repository_base="feature/m3.0",
+                        )
                     job["pokes"] += 1
                     if outer.fail_job:
                         job["status"] = "failed"
@@ -185,12 +197,14 @@ class MockEndpoint:
                         }
                         if not outer.omit_quality:
                             result["quality"] = {"passed": True, "subject_sha256": SHA, "checks": [{"id": "x"}]}
+                        if outer.omit_submission:
+                            result["submission"] = {"passed": False, "subject_sha256": SHA}
                         job["result"] = result
                     else:
                         job["status"] = "running"
                     event = (
                         {"phase": "job", "state": job["status"], "time": "t0"}
-                        if outer.legacy_events
+                        if outer.invalid_events
                         else {"stage": "job", "state": job["status"], "at": "t0"}
                     )
                     job["events"].append(event)
@@ -216,7 +230,7 @@ class MockEndpoint:
                                 "content_length": self.headers.get("Content-Length"),
                             }
                         )
-                    self._send(200, dict(outer.handoff_response or HANDOFF))
+                    self._send(200, dict(outer.handoff_response or NATIVE_HANDOFF))
                     return
                 payload = json.loads(body or b"{}")
                 if self.path != "/v1/jobs":
@@ -233,8 +247,6 @@ class MockEndpoint:
                     "schema_version": JOB_SCHEMA,
                     "pipeline_id": PIPELINE_ID,
                     "run_id": run_id,
-                    "repository_slug": "example/m3.0",
-                    "repository_base": "feature/m3.0",
                     "status": "queued",
                     "events": [{"stage": "submit", "state": "queued", "at": "t0"}],
                     "result": None,
@@ -276,25 +288,40 @@ class ClientTests(unittest.TestCase):
     def test_start_is_idempotent_and_conflicts_on_mismatch(self) -> None:
         with MockEndpoint() as server:
             endpoint = self.endpoint(server)
-            first = endpoint.start_job(run_id=RUN_ID, package="handoff/m3.0", revision_sha256=SHA, target="m3")
-            second = endpoint.start_job(run_id=RUN_ID, package="handoff/m3.0", revision_sha256=SHA, target="m3")
+            first = endpoint.start_job(run_id=RUN_ID, resolution=native_resolution())
+            second = endpoint.start_job(run_id=RUN_ID, resolution=native_resolution())
             self.assertEqual(first["run_id"], second["run_id"])
             self.assertEqual(len(server.jobs), 1)
             with self.assertRaises(EndpointConflict):
-                endpoint.start_job(run_id=RUN_ID, package="handoff/other", revision_sha256=SHA, target="m3")
+                endpoint.start_job(run_id=RUN_ID, resolution=native_resolution(handoff_sha256="c" * 64))
 
-    def test_start_job_binds_optional_handoff_sha256(self) -> None:
+    def test_native_job_binds_only_package_and_digest(self) -> None:
         with MockEndpoint() as server:
             endpoint = self.endpoint(server)
-            job = endpoint.start_job(
-                run_id=RUN_ID, package="handoff/m3.0", revision_sha256=SHA, target="m3", handoff_sha256="b" * 64
-            )
-            self.assertEqual(job["request"]["handoff_sha256"], "b" * 64)
-            self.assertEqual(len(server.jobs), 1)
+            resolved = endpoint.resolve_handoff("handoff/m3.0")
+            self.assertEqual(set(vars(resolved)), {"package", "handoff_sha256"})
+            job = endpoint.start_job(run_id=RUN_ID, resolution=resolved)
+            self.assertEqual(job["request"], {"run_id": RUN_ID, "package": "handoff/m3.0", "handoff_sha256": "b" * 64})
+            self.assertNotIn("repository_slug", job)
+            with self.assertRaises(EndpointProtocolError):
+                resolved_routing(job)
             with self.assertRaises(EndpointConflict):
-                endpoint.start_job(
-                    run_id=RUN_ID, package="handoff/m3.0", revision_sha256=SHA, target="m3", handoff_sha256="c" * 64
-                )
+                endpoint.start_job(run_id=RUN_ID, resolution=native_resolution(handoff_sha256="c" * 64))
+
+    def test_native_job_resolves_routing_after_cad_discovery(self) -> None:
+        with MockEndpoint() as server:
+            endpoint = self.endpoint(server)
+            endpoint.start_job(run_id=RUN_ID, resolution=endpoint.resolve_handoff("handoff/m3.0"))
+            routing = resolved_routing(endpoint.get_job(RUN_ID))
+            self.assertEqual(routing["hardware_id"], "m3.0")
+            self.assertEqual(routing["repository_slug"], "example/m3.0")
+            self.assertEqual(routing["repository_base"], "feature/m3.0")
+            passed = endpoint.wait(RUN_ID, interval=0.05, timeout=5)
+            check_result(
+                passed["result"],
+                expected_slug=routing["repository_slug"],
+                expected_base=routing["repository_base"],
+            )
 
     def test_resolve_handoff_uses_resolver_for_managed_paths(self) -> None:
         with MockEndpoint() as server:
@@ -302,23 +329,19 @@ class ClientTests(unittest.TestCase):
             resolved = endpoint.resolve_handoff("handoff/m3.0")
             self.assertEqual(resolved.package, "handoff/m3.0")
             self.assertEqual(resolved.handoff_sha256, "b" * 64)
-            self.assertEqual(resolved.hardware_id, "m3.0")
-            self.assertEqual(resolved.target, "m3")
-            self.assertEqual(resolved.repository_slug, "example/m3.0")
-            self.assertEqual(resolved.base, "feature/m3.0")
             endpoint.resolve_handoff(r"C:\handoffs\m3.0")
             self.assertEqual(server.resolved_paths, ["handoff/m3.0", r"C:\handoffs\m3.0"])
             self.assertEqual(server.imports, [])
 
-    def test_resolve_handoff_fails_closed_on_bad_payload(self) -> None:
+    def test_native_resolution_fails_closed_on_bad_payload(self) -> None:
         for bad in (
-            {**HANDOFF, "schema_version": "solidworks-to-urdf.handoff/v2"},
-            {**HANDOFF, "pipeline_id": "other-pipeline"},
-            {**HANDOFF, "handoff_sha256": "not-a-digest"},
-            {**HANDOFF, "package": "../escape"},
-            {**HANDOFF, "repository_slug": "no-slash"},
-            {**HANDOFF, "base": "main"},
-            {k: v for k, v in HANDOFF.items() if k != "hardware_id"},
+            {k: v for k, v in NATIVE_HANDOFF.items() if k != "handoff_sha256"},
+            {k: v for k, v in NATIVE_HANDOFF.items() if k != "package"},
+            {**NATIVE_HANDOFF, "schema_version": "solidworks-to-urdf.handoff/v2"},
+            {**NATIVE_HANDOFF, "pipeline_id": "other-pipeline"},
+            {**NATIVE_HANDOFF, "kind": "native"},
+            {**NATIVE_HANDOFF, "package": "../escape"},
+            {**NATIVE_HANDOFF, "handoff_sha256": "nope"},
         ):
             with (
                 self.subTest(bad=bad),
@@ -326,6 +349,47 @@ class ClientTests(unittest.TestCase):
                 self.assertRaises(EndpointProtocolError),
             ):
                 self.endpoint(server).resolve_handoff("handoff/m3.0")
+
+    def test_get_job_accepts_unresolved_routing_but_rejects_empty_values(self) -> None:
+        with MockEndpoint() as server:
+            endpoint = self.endpoint(server)
+            endpoint.start_job(run_id=RUN_ID, resolution=endpoint.resolve_handoff("handoff/m3.0"))
+            self.assertNotIn("repository_slug", server.jobs[RUN_ID])
+            endpoint.get_job(RUN_ID)
+            server.jobs[RUN_ID]["repository_slug"] = " "
+            with self.assertRaises(EndpointProtocolError):
+                endpoint.get_job(RUN_ID)
+
+    def test_read_artifact_verifies_digest_and_limit(self) -> None:
+        urdf = b"<robot name='fixture'/>"
+        stl = b"solid base"
+        preview = {
+            "pipeline_id": PIPELINE_ID,
+            "run_id": RUN_ID,
+            "subject_sha256": SHA,
+            "urdf": "urdf/robot.urdf",
+            "files": {
+                "urdf/robot.urdf": hashlib.sha256(urdf).hexdigest(),
+                "meshes/base.stl": hashlib.sha256(stl).hexdigest(),
+            },
+        }
+        with MockEndpoint(preview_payload=preview) as server:
+            endpoint = self.endpoint(server)
+            endpoint.start_job(run_id=RUN_ID, resolution=native_resolution())
+            endpoint.wait(RUN_ID, interval=0.05, timeout=5)
+            served = endpoint.get_preview(RUN_ID)
+            self.assertEqual(
+                endpoint.read_artifact(RUN_ID, "urdf/robot.urdf", sha256=served["files"]["urdf/robot.urdf"]),
+                urdf,
+            )
+            self.assertEqual(
+                endpoint.read_artifact(RUN_ID, "meshes/base.stl", sha256=served["files"]["meshes/base.stl"]),
+                stl,
+            )
+            with self.assertRaises(EndpointProtocolError):
+                endpoint.read_artifact(RUN_ID, "urdf/robot.urdf", sha256="c" * 64)
+            with self.assertRaises(EndpointProtocolError):
+                endpoint.read_artifact(RUN_ID, "urdf/robot.urdf", sha256=SHA, limit=4)
 
     def _stub_archive(self, digest: str = "b" * 64):
         module = types.ModuleType("description_pipeline.orchestration.handoffs")
@@ -376,7 +440,7 @@ class ClientTests(unittest.TestCase):
             endpoint = self.endpoint(server)
             with self.assertRaises(EndpointError):
                 endpoint.get_preview(RUN_ID)
-            endpoint.start_job(run_id=RUN_ID, package="handoff/m3.0", revision_sha256=SHA, target="m3")
+            endpoint.start_job(run_id=RUN_ID, resolution=native_resolution())
             endpoint.wait(RUN_ID, interval=0.05, timeout=5)
             preview = endpoint.get_preview(RUN_ID)
             self.assertEqual(preview["run_id"], RUN_ID)
@@ -393,7 +457,7 @@ class ClientTests(unittest.TestCase):
         ):
             with self.subTest(bad=bad), MockEndpoint(preview_payload=bad) as server:
                 endpoint = self.endpoint(server)
-                endpoint.start_job(run_id=RUN_ID, package="handoff/m3.0", revision_sha256=SHA, target="m3")
+                endpoint.start_job(run_id=RUN_ID, resolution=native_resolution())
                 endpoint.wait(RUN_ID, interval=0.05, timeout=5)
                 with self.assertRaises(EndpointProtocolError):
                     endpoint.get_preview(RUN_ID)
@@ -401,7 +465,7 @@ class ClientTests(unittest.TestCase):
     def test_open_artifact_streams_verified_bytes(self) -> None:
         with MockEndpoint() as server:
             endpoint = self.endpoint(server)
-            endpoint.start_job(run_id=RUN_ID, package="handoff/m3.0", revision_sha256=SHA, target="m3")
+            endpoint.start_job(run_id=RUN_ID, resolution=native_resolution())
             endpoint.wait(RUN_ID, interval=0.05, timeout=5)
             with endpoint.open_artifact(RUN_ID, "urdf/robot.urdf") as response:
                 self.assertEqual(response.read(), b"<robot name='fixture'/>")
@@ -427,7 +491,7 @@ class ClientTests(unittest.TestCase):
     def test_wait_passes_and_fails_closed_on_result(self) -> None:
         with MockEndpoint() as server:
             endpoint = self.endpoint(server)
-            endpoint.start_job(run_id=RUN_ID, package="handoff/m3.0", revision_sha256=SHA, target="m3")
+            endpoint.start_job(run_id=RUN_ID, resolution=native_resolution())
             job = endpoint.wait(RUN_ID, interval=0.05, timeout=5)
             self.assertEqual(job["status"], "passed")
             self.assertEqual(
@@ -471,7 +535,7 @@ class ClientTests(unittest.TestCase):
                     check_result(bad, expected_slug="example/m3.0", expected_base="feature/m3.0")
         with MockEndpoint(omit_quality=True) as server:
             endpoint = self.endpoint(server)
-            endpoint.start_job(run_id=RUN_ID, package="handoff/m3.0", revision_sha256=SHA, target="m3")
+            endpoint.start_job(run_id=RUN_ID, resolution=native_resolution())
             with self.assertRaises(ResultNotPublishable):
                 check_result(
                     endpoint.wait(RUN_ID, interval=0.05, timeout=5)["result"],
@@ -482,14 +546,14 @@ class ClientTests(unittest.TestCase):
     def test_failed_job_raises(self) -> None:
         with MockEndpoint(fail_job=True) as server:
             endpoint = self.endpoint(server)
-            endpoint.start_job(run_id=RUN_ID, package="handoff/m3.0", revision_sha256=SHA, target="m3")
+            endpoint.start_job(run_id=RUN_ID, resolution=native_resolution())
             with self.assertRaises(JobFailed):
                 endpoint.wait(RUN_ID, interval=0.05, timeout=5)
 
-    def test_event_contract_enforced(self) -> None:
-        with MockEndpoint(legacy_events=True) as server:
+    def test_invalid_event_contract_is_refused(self) -> None:
+        with MockEndpoint(invalid_events=True) as server:
             endpoint = self.endpoint(server)
-            endpoint.start_job(run_id=RUN_ID, package="handoff/m3.0", revision_sha256=SHA, target="m3")
+            endpoint.start_job(run_id=RUN_ID, resolution=native_resolution())
             with self.assertRaises(EndpointProtocolError):
                 endpoint.get_job(RUN_ID)
 
@@ -500,8 +564,6 @@ class ClientTests(unittest.TestCase):
             validate_package("/etc/passwd")
         with self.assertRaises(EndpointProtocolError):
             validate_package("a/../../b")
-        with self.assertRaises(EndpointProtocolError):
-            validate_revision_sha("not-a-sha")
         with self.assertRaises(EndpointProtocolError):
             validate_run_id("not-a-uuid")
         with self.assertRaises(EndpointProtocolError):
@@ -526,14 +588,14 @@ class ClientTests(unittest.TestCase):
         response = {
             "run_id": RUN_ID,
             "status": "queued",
-            "request": {"run_id": RUN_ID, "package": "other/r1", "revision_sha256": SHA, "target": "m3"},
+            "request": {"run_id": RUN_ID, "package": "other/r1", "handoff_sha256": "c" * 64},
         }
         endpoint = WindowsEndpoint(
             EndpointConfig(base_url="http://127.0.0.1", token=TOKEN),
             opener=lambda *_args, **_kwargs: io.BytesIO(json.dumps(response).encode()),
         )
         with self.assertRaisesRegex(EndpointProtocolError, "different mechanical handoff"):
-            endpoint.start_job(run_id=RUN_ID, package="handoff/m3.0", revision_sha256=SHA, target="m3")
+            endpoint.start_job(run_id=RUN_ID, resolution=native_resolution())
 
     def test_invalid_url_timeout_and_redirect_fail_closed(self) -> None:
         for address in ("http://127.0.0.1:invalid", "http://127.0.0.1?token=x", "http://127.0.0.1#fragment"):

@@ -31,7 +31,7 @@ class DagTests(unittest.TestCase):
         self.assertEqual(set(dag.task_ids), {"resolve_handoff", "start_job", "wait_for_job", "confirm_job"})
         self.assertEqual(set(dag.params), {"handoff_path"})
         handoff_param = dict(dag.params.items())["handoff_path"]
-        self.assertEqual(handoff_param.schema["title"], "Handoff folder path")
+        self.assertEqual(handoff_param.schema["title"], "Engineering folder path")
         self.assertEqual(handoff_param.schema["type"], "string")
 
     def test_dag_run_against_mock_endpoint(self) -> None:
@@ -75,9 +75,13 @@ class DagTests(unittest.TestCase):
             self.assertEqual(len(server.jobs), 1)
             job = next(iter(server.jobs.values()))
             self.assertEqual(job["status"], "passed")
-            self.assertEqual(job["request"]["package"], "handoff/m3.0")
-            self.assertEqual(job["request"]["handoff_sha256"], "b" * 64)
-            self.assertEqual(job["request"]["target"], "m3")
+            self.assertEqual(
+                job["request"],
+                {"run_id": job["run_id"], "package": "handoff/m3.0", "handoff_sha256": "b" * 64},
+            )
+            self.assertEqual(job["hardware_id"], "m3.0")
+            self.assertEqual(job["repository_slug"], "example/m3.0")
+            self.assertEqual(job["repository_base"], "feature/m3.0")
             self.assertEqual(server.resolved_paths, ["handoff/m3.0"])
 
 
