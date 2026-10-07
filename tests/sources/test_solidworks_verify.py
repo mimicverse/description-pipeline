@@ -45,12 +45,17 @@ class NormalizationOracleTests(unittest.TestCase):
             "allowed_roots": [str(self.tmp / "cad")],
             "geometry": {"enabled": True},
             "bodies": [
-                {"id": "base", "name": "base_link", "components": ["base-1"]},
+                {
+                    "id": "base",
+                    "name": "base_link",
+                    "components": ["base-1"],
+                    "frame": {"coordinate_system": "base_datum"},
+                },
                 {
                     "id": "arm",
                     "name": "arm_link",
                     "components": ["arm-1"],
-                    "frame": {"xyz": [0.0, 0.0, 0.2], "rpy": [0.0, 0.0, 0.0]},
+                    "frame": {"coordinate_system": "arm_datum"},
                 },
             ],
             "joints": [
@@ -60,8 +65,6 @@ class NormalizationOracleTests(unittest.TestCase):
                     "type": "revolute",
                     "parent": "base_link",
                     "child": "arm_link",
-                    "xyz": [0.0, 0.0, 0.2],
-                    "rpy": [0.0, 0.0, 0.0],
                     "axis": [0.0, 0.0, 1.0],
                     "limits": {"lower": -1.0, "upper": 1.0, "effort": 2.0, "velocity": 3.0},
                 }
@@ -154,13 +157,13 @@ class NormalizationOracleTests(unittest.TestCase):
                     "id": "base",
                     "name": "base_link",
                     "components": ["base-1"],
-                    "frame": {"xyz": [0.1, 0.0, 0.05], "rpy": [0.0, 0.0, 0.0]},
+                    "frame": {"coordinate_system": "base_datum"},
                 },
                 {
                     "id": "arm",
                     "name": "arm_link",
                     "components": ["arm-1"],
-                    "frame": {"xyz": [0.1, 0.0, 0.25], "rpy": [0.0, 0.0, 0.0]},
+                    "frame": {"coordinate_system": "arm_datum"},
                 },
             ],
             joints=[
@@ -170,18 +173,18 @@ class NormalizationOracleTests(unittest.TestCase):
                     "type": "revolute",
                     "parent": "base_link",
                     "child": "arm_link",
-                    "xyz": [0.0, 0.0, 0.2],
-                    "rpy": [0.0, 0.0, 0.0],
                     "axis": [0.0, 0.0, 1.0],
                     "limits": {"lower": -1.0, "upper": 1.0, "effort": 2.0, "velocity": 3.0},
                 }
             ],
         )
+        offset_backend.coordinate_system_matrices["base_datum"] = support.placement((0.1, 0.0, 0.05))
+        offset_backend.coordinate_system_matrices["arm_datum"] = support.placement((0.1, 0.0, 0.25))
         snapshot = self.tmp / "rooted"
         freeze(definition["source"], snapshot, backend=offset_backend)
         raw_scene = support.read_scene(snapshot)
         recorded = raw_scene["provenance"]["world_from_root"]
-        self.assertEqual(recorded["source"], "author_declared")
+        self.assertEqual(recorded["source"], "cad_coordinate_system:base_datum")
         self.assertAlmostEqual(recorded["xyz"][0], 0.1, places=9)
         self.assertAlmostEqual(recorded["xyz"][2], 0.05, places=9)
 
@@ -190,7 +193,7 @@ class NormalizationOracleTests(unittest.TestCase):
 
         world = next(entry for entry in results if entry["id"] == "source.normalization.world")
         self.assertEqual(world["status"], "passed", world["details"]["links"])
-        self.assertEqual(world["details"]["root_pose"]["source"], "author_declared")
+        self.assertEqual(world["details"]["root_pose"]["source"], "cad_coordinate_system:base_datum")
         self.assertAlmostEqual(world["details"]["root_pose"]["xyz"][0], 0.1, places=9)
         self.assertTrue(world["details"]["links"]["arm_link"]["com_ok"])
 

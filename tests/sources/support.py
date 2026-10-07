@@ -113,7 +113,7 @@ def mass_payload(
         "mass": float(mass),
         "com": [float(value) for value in com],
         "inertia": tensor,
-        "reference": {"used_api": "fixture"},
+        "reference": {"used_api": "fixture", "product_convention": "solidworks_standard"},
     }
 
 
@@ -139,8 +139,18 @@ class FixtureCadBackend(CadBackend):
         self.open_documents: list[str] = []
         self.collected: list[str] = []
         self.exported: list[str] = []
+        # Explicit neutral native datums for the shared two-body analytic fixture.
+        datums = (
+            {
+                "base_datum": placement(),
+                "arm_datum": placement((0.0, 0.0, 0.2)),
+                "imu_datum": placement((0.01, 0.0, 0.03)),
+            }
+            if coordinate_systems is None
+            else coordinate_systems
+        )
         self.coordinate_system_matrices: dict[str, Sequence[float]] = {
-            name: list(matrix) for name, matrix in (coordinate_systems or {}).items()
+            name: list(matrix) for name, matrix in datums.items()
         }
         self._dependencies = [Path(path) for path in (dependencies or [])]
         # failure-injection knobs for the closure contract

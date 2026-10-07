@@ -750,23 +750,19 @@ def _raw_inputs(snapshot_root: Path) -> tuple[dict, dict]:
     return scene_raw, masses
 
 
-def _link_frame(body: dict) -> tuple[np.ndarray, np.ndarray]:
-    frame = body.get("frame") or {}
-    if not frame:
-        return np.eye(3), np.zeros(3)
-    xyz = np.array([float(value) for value in frame.get("xyz", (0.0, 0.0, 0.0))], dtype=float)
-    rpy = np.array([float(value) for value in frame.get("rpy", (0.0, 0.0, 0.0))], dtype=float)
-    return _rpy_matrix(rpy), xyz
+def _link_frame(body: dict, raw_scene: dict) -> tuple[np.ndarray, np.ndarray]:
+    frame = body.get("frame")
+    if not isinstance(frame, dict) or set(frame) != {"coordinate_system"}:
+        raise ValueError(f"body {body.get('name')!r} has no native datum binding")
+    datums = raw_scene.get("coordinate_systems") or {}
+    reference = frame["coordinate_system"]
+    if reference not in datums:
+        raise ValueError(f"raw native datum {reference!r} is missing")
+    return _transform(datums[reference])
 
 
 def _raw_tensor(component: str, payload: dict) -> np.ndarray:
-    """Reconstruct a standard tensor independently of the generation code.
-
-    Qualified native part, group and whole-assembly scopes declare standard
-    signed tensors. Legacy positive-product records invert cross terms only
-    when explicitly declared. The v1 delivery gate separately refuses legacy
-    and unqualified APIs; absent native conventions are never guessed.
-    """
+    """Read the signed native tensor independently of the generator."""
 
     matrix = np.array([[float(value) for value in row] for row in payload["inertia"]], dtype=float)
     if matrix.shape != (3, 3):
@@ -780,30 +776,15 @@ def _raw_tensor(component: str, payload: dict) -> np.ndarray:
     if scope is not None:
         expected = _SCOPE_CONVENTIONS.get(str(scope))
         if expected is None:
-            raise ValueError(
-                f"component {component} has an unknown inertia measurement scope: {scope!r}"
-            )
+            raise ValueError(f"component {component} has an unknown inertia measurement scope: {scope!r}")
         if convention is not None and str(convention) != expected:
             raise ValueError(
-                f"component {component} inertia scope and product_convention disagree: "
-                f"{scope!r} vs {convention!r}"
+                f"component {component} inertia scope and product_convention disagree: {scope!r} vs {convention!r}"
             )
         convention = expected
-    if convention == "solidworks_positive":
-        tensor = matrix.copy()
-        off_diagonal = ~np.eye(3, dtype=bool)
-        tensor[off_diagonal] = -matrix[off_diagonal]
-        return tensor
-    if convention == "solidworks_standard":
-        return matrix
-    if convention is None:
-        used_api = str(reference.get("used_api") or "")
-        if used_api == "fixture":
-            return matrix
-        raise ValueError(
-            f"component {component} has no product_convention; refusing to guess the inertia sign convention"
-        )
-    raise ValueError(f"component {component} has an unsupported product_convention: {convention!r}")
+    if convention != "solidworks_standard":
+        raise ValueError(f"component {component} has an unsupported product_convention: {convention!r}")
+    return matrix
 
 
 def _component_mass(
@@ -831,7 +812,7 @@ def _component_mass(
 
 def _recompute_link(body: dict, components: dict[str, dict], raw_scene: dict, masses: dict, declared: dict) -> dict:
     placements = {entry["name"]: entry["transform"] for entry in raw_scene.get("components") or []}
-    rotation_link, translation_link = _link_frame(body)
+    rotation_link, translation_link = _link_frame(body, raw_scene)
     total_mass = 0.0
     weighted = np.zeros(3)
     per_component = []
@@ -928,25 +909,23 @@ def _root_pose(definition: dict, snapshot_root: Path) -> dict | None:
     roots = [body for body in bodies if str(body.get("name") or body.get("id")) not in children]
     if len(roots) != 1:
         return None
-    frame = roots[0].get("frame") or {}
-    reference = frame.get("coordinate_system")
-    if reference:
-        path = Path(snapshot_root) / "raw" / "coordinate_systems.json"
-        if not path.is_file():
-            raise ValueError("snapshot has no raw/coordinate_systems.json for the root frame")
-        payload = read_json(path)
-        matrix = (payload or {}).get(str(reference)) if isinstance(payload, dict) else None
-        if matrix is None:
-            raise ValueError(f"raw coordinate system {reference!r} is missing from the snapshot")
-        rotation, translation = _transform(matrix)
-        return {
-            "xyz": translation,
-            "rpy": np.array(_rpy_to_rpy_list(rotation), dtype=float),
-            "source": f"cad_coordinate_system:{reference}",
-        }
-    xyz = np.array([float(value) for value in frame.get("xyz") or (0.0, 0.0, 0.0)], dtype=float)
-    rpy = np.array([float(value) for value in frame.get("rpy") or (0.0, 0.0, 0.0)], dtype=float)
-    return {"xyz": xyz, "rpy": rpy, "source": "author_declared" if frame else "identity"}
+    frame = roots[0].get("frame")
+    if not isinstance(frame, dict) or set(frame) != {"coordinate_system"}:
+        raise ValueError("the root must be bound to one native CAD datum")
+    reference = frame["coordinate_system"]
+    path = Path(snapshot_root) / "raw" / "coordinate_systems.json"
+    if not path.is_file():
+        raise ValueError("snapshot has no raw/coordinate_systems.json for the root frame")
+    payload = read_json(path)
+    matrix = (payload or {}).get(str(reference)) if isinstance(payload, dict) else None
+    if matrix is None:
+        raise ValueError(f"raw coordinate system {reference!r} is missing from the snapshot")
+    rotation, translation = _transform(matrix)
+    return {
+        "xyz": translation,
+        "rpy": np.array(_rpy_to_rpy_list(rotation), dtype=float),
+        "source": f"cad_coordinate_system:{reference}",
+    }
 
 
 def _rpy_to_rpy_list(rotation: np.ndarray) -> list[float]:

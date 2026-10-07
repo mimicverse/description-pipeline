@@ -123,7 +123,7 @@ def combine_mass_properties(entries: Sequence[dict[str, Any]]) -> dict[str, Any]
     }
 
 
-PRODUCT_CONVENTIONS = ("solidworks_positive", "solidworks_standard")
+PRODUCT_CONVENTIONS = ("solidworks_standard",)
 # The scope label names *what was selected*; it is authoritative and must agree
 # with any declared convention, so a reading is never re-interpreted by
 # silently relabelling historical measurements.
@@ -137,22 +137,10 @@ SCOPE_CONVENTIONS = {
     "part_document": "solidworks_standard",
     "assembly_component_group": "solidworks_standard",
 }
-FIXTURE_API_MARKERS = ("fixture",)
 
 
 def tensor_from_raw(raw: Any, reference: Any, *, where: str) -> Matrix3:
-    """原始 9 个数（3×3）→ 标准惯性张量，按读数里声明的**惯性积约定**转换。
-
-    ``IMassProperty2.GetMomentOfInertia(0)`` 在 ``solidworks_positive`` 记法下返回
-    "正惯性积"：布局是
-
-    ``[[Ixx, Ixy, Izx], [Ixy, Iyy, Iyz], [Izx, Iyz, Izz]]``，其中交叉项是
-    ``∫xy dm / ∫zx dm / ∫yz dm``；标准惯性张量的非对角项正是它们的**相反数**。
-    这里只转换**推导值**，raw 里的原始读数原样保留。
-
-    缺约定时不猜：夹具读数（``used_api == "fixture"``）按其合同本来就可当标准张量；
-    原生 CAD 读数缺 ``product_convention`` 属于无法解释的数据，直接失败。
-    """
+    """Preserve the measured signed 3×3 tensor and reject other conventions."""
 
     rows = [[float(value) for value in row] for row in raw]
     if len(rows) != 3 or any(len(row) != 3 for row in rows):
@@ -163,14 +151,6 @@ def tensor_from_raw(raw: Any, reference: Any, *, where: str) -> Matrix3:
             raise ConfigError("raw inertia matrix must be symmetric", {"where": where, "pair": [i, j]})
     convention = (reference or {}).get("product_convention")
     scope = (reference or {}).get("scope")
-    if convention is None and scope is None:
-        used_api = str((reference or {}).get("used_api") or "")
-        if used_api not in FIXTURE_API_MARKERS:
-            raise ConfigError(
-                "raw CAD inertia has no product_convention; refusing to guess the sign convention",
-                {"where": where, "used_api": used_api},
-            )
-        return tuple(tuple(row) for row in rows)  # type: ignore[return-value]
     if scope is not None:
         expected = SCOPE_CONVENTIONS.get(str(scope))
         if expected is None:
@@ -189,10 +169,6 @@ def tensor_from_raw(raw: Any, reference: Any, *, where: str) -> Matrix3:
             "raw CAD inertia declares an unsupported product_convention",
             {"where": where, "product_convention": convention, "supported": list(PRODUCT_CONVENTIONS)},
         )
-    if convention == "solidworks_standard":
-        return tuple(tuple(row) for row in rows)  # type: ignore[return-value]
-    for i, j in ((0, 1), (1, 0), (0, 2), (2, 0), (1, 2), (2, 1)):
-        rows[i][j] = -rows[i][j]
     return tuple(tuple(row) for row in rows)  # type: ignore[return-value]
 
 
@@ -293,51 +269,21 @@ def map_from_row_major(values: Sequence[float]) -> tuple[Matrix3, Vector3]:
 
 
 def _link_frame(body: dict[str, Any], coordinate_systems: dict[str, Sequence[float]]) -> tuple[Matrix3, Vector3]:
-    """The link frame: declared, or re-derived from a CAD coordinate system.
+    """Read the body frame exclusively from its captured native datum."""
 
-    A frame bound to ``coordinate_system`` is read from the assembly readings, so
-    the pipeline and the independent oracle both work from raw CAD rather than
-    from an author-supplied number.  A declared xyz/rpy next to it must agree.
-    """
-
-    frame = body.get("frame") or {}
-    if not frame:
-        return identity_matrix(), (0.0, 0.0, 0.0)
-    unknown = sorted(set(frame) - FRAME_KEYS)
-    if unknown:
-        raise ConfigError("a body frame has unknown fields", {"body": body.get("name"), "fields": unknown})
-    declared_xyz = frame.get("xyz")
-    declared_rpy = frame.get("rpy")
-    reference = frame.get("coordinate_system")
-    if reference:
-        matrix = coordinate_systems.get(str(reference))
-        if matrix is None:
-            raise ConfigError(
-                "body frame references a coordinate system that the capture did not read",
-                {"body": body.get("name"), "coordinate_system": reference, "available": sorted(coordinate_systems)},
-            )
-        rotation, xyz = map_from_row_major(matrix)
-        rpy = rpy_from_matrix(rotation)
-        if declared_xyz is not None:
-            given = tuple(float(value) for value in declared_xyz)
-            if any(abs(given[i] - xyz[i]) > 1e-9 for i in range(3)):
-                raise ConfigError(
-                    "declared frame xyz disagrees with the CAD coordinate system",
-                    {"body": body.get("name"), "declared": list(given), "cad": list(xyz)},
-                )
-        if declared_rpy is not None:
-            given_rpy = tuple(float(value) for value in declared_rpy)
-            if any(abs(given_rpy[i] - rpy[i]) > 1e-6 for i in range(3)):
-                raise ConfigError(
-                    "declared frame rpy disagrees with the CAD coordinate system",
-                    {"body": body.get("name"), "declared": list(given_rpy), "cad": list(rpy)},
-                )
-        return rotation, xyz
-    xyz_values = tuple(float(value) for value in (declared_xyz or (0.0, 0.0, 0.0)))
-    rpy_values = tuple(float(value) for value in (declared_rpy or (0.0, 0.0, 0.0)))
-    if len(xyz_values) != 3 or len(rpy_values) != 3:
-        raise ConfigError("a body frame needs xyz and rpy", {"body": body.get("name")})
-    return _rotation_from_rpy(rpy_values), xyz_values
+    frame = body.get("frame")
+    if not isinstance(frame, dict) or set(frame) != {"coordinate_system"}:
+        raise ConfigError("every body frame must name one native CAD datum", {"body": body.get("name")})
+    reference = frame["coordinate_system"]
+    if not isinstance(reference, str) or not reference:
+        raise ConfigError("body coordinate_system must be a nonempty name", {"body": body.get("name")})
+    matrix = coordinate_systems.get(reference)
+    if matrix is None:
+        raise ConfigError(
+            "body frame references a coordinate system that the capture did not read",
+            {"body": body.get("name"), "coordinate_system": reference, "available": sorted(coordinate_systems)},
+        )
+    return map_from_row_major(matrix)
 
 
 def _rotation_from_rpy(rpy: Vector3) -> Matrix3:
@@ -422,13 +368,7 @@ def build_scene(
     geometry_by_component = {entry["component"]: entry for entry in geometry_entries}
     bodies = list(cfg.get("bodies") or [])
     if not bodies:
-        bodies = [
-            {"id": component.name, "name": component.name, "components": [component.name]}
-            for component in raw_scene.components
-        ]
-        auto_bodies = True
-    else:
-        auto_bodies = False
+        raise ConfigError("native discovery must define the rigid bodies")
 
     # 质量模式合同用**实际读数**复核（配置层只能查到声明层）：documented_table 必须覆盖
     # 每个被纳入的组件；任何模式都不允许把"未验证材料"的 CAD 质量当作可用读数。
@@ -510,14 +450,8 @@ def build_scene(
                         for reading in readings
                     ],
                     "combination": "parallel_axis_from_part_readings",
-                    "link_frame": (
-                        "assembly"
-                        if _is_identity(link_rotation)
-                        else ("cad_coordinate_system:" + str((body.get("frame") or {}).get("coordinate_system")))
-                        if (body.get("frame") or {}).get("coordinate_system")
-                        else "author_declared"
-                    ),
-                    "kinematics": "not_defined" if auto_bodies else "declared",
+                    "link_frame": "cad_coordinate_system:" + body["frame"]["coordinate_system"],
+                    "kinematics": "native_derived",
                 },
             }
         )
@@ -537,11 +471,7 @@ def build_scene(
             world_from_root = {
                 "xyz": [float(value) for value in translation_root],
                 "rpy": [float(value) for value in rpy_from_matrix(rotation_root)],
-                "source": (
-                    f"cad_coordinate_system:{reference}"
-                    if reference
-                    else ("author_declared" if root_body.get("frame") else "identity")
-                ),
+                "source": f"cad_coordinate_system:{reference}",
             }
     return {
         "schema_version": SCENE_SCHEMA,
@@ -559,7 +489,7 @@ def build_scene(
             "provider": "solidworks",
             "assembly": cfg.get("assembly"),
             "configuration": cfg.get("configuration"),
-            "bodies_source": "auto_from_top_level_components" if auto_bodies else "source.bodies",
+            "bodies_source": "native_derived",
             "coordinate_systems_read": sorted((raw_scene.coordinate_systems or {}).keys()),
             # every native entity that a consumer must account for; the common
             # layer checks that the links below cover exactly this set
@@ -574,13 +504,7 @@ def _build_joints(
     link_names: Iterable[str],
     link_frames: dict[str, tuple[Matrix3, Vector3, str | None]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Build canonical joints.
-
-    v1 joints carry no authored origin numbers: the joint frame is the child
-    body's named CAD datum at zero, so the relative origin/RPY is derived from
-    the raw parent and child link frames.  The legacy explicit ``xyz``/``rpy``
-    form stays available for retained sources and is still validated exactly.
-    """
+    """Derive joint origins from captured parent and child CAD datums."""
 
     known = set(link_names)
     joints: list[dict[str, Any]] = []
@@ -595,42 +519,30 @@ def _build_joints(
         joint_type = str(joint.get("type") or "")
         if joint_type not in ("revolute", "prismatic", "fixed", "continuous"):
             raise ConfigError("joint.type must be revolute, prismatic, continuous or fixed", {"joint": joint_id})
-        declared_xyz = joint.get("xyz")
-        declared_rpy = joint.get("rpy")
-        if declared_xyz is None and declared_rpy is None:
-            frames = link_frames or {}
-            if parent not in frames or child not in frames:
-                raise ConfigError(
-                    "joint geometry needs either explicit xyz/rpy or CAD-bound body frames",
-                    {"joint": joint_id, "parent": parent, "child": child},
-                )
-            parent_rotation, parent_translation, parent_datum = frames[parent]
-            child_rotation, child_translation, child_datum = frames[child]
-            inverse_parent = _transpose(parent_rotation)
-            relative_rotation = _matmul(inverse_parent, child_rotation)
-            relative_translation = _matvec(
-                inverse_parent,
-                (
-                    child_translation[0] - parent_translation[0],
-                    child_translation[1] - parent_translation[1],
-                    child_translation[2] - parent_translation[2],
-                ),
+        if "xyz" in joint or "rpy" in joint:
+            raise ConfigError("joint origins must be derived from CAD datums", {"joint": joint_id})
+        frames = link_frames or {}
+        if parent not in frames or child not in frames:
+            raise ConfigError(
+                "joint geometry requires captured parent and child CAD datums",
+                {"joint": joint_id, "parent": parent, "child": child},
             )
-            entry_xyz = [float(value) for value in relative_translation]
-            entry_rpy = [float(value) for value in rpy_from_matrix(relative_rotation)]
-            geometry_source = "cad_body_frames"
-            geometry_detail: dict[str, Any] = {"parent_frame": parent_datum, "child_frame": child_datum}
-        else:
-            for key, value in (("xyz", declared_xyz), ("rpy", declared_rpy)):
-                if not isinstance(value, (list, tuple)) or len(value) != 3:
-                    raise ConfigError(
-                        "joint geometry must be declared explicitly as xyz/rpy in the parent link frame",
-                        {"joint": joint_id, "field": key},
-                    )
-            entry_xyz = [float(value) for value in declared_xyz]
-            entry_rpy = [float(value) for value in declared_rpy]
-            geometry_source = "source.joints"
-            geometry_detail = {}
+        parent_rotation, parent_translation, parent_datum = frames[parent]
+        child_rotation, child_translation, child_datum = frames[child]
+        inverse_parent = _transpose(parent_rotation)
+        relative_rotation = _matmul(inverse_parent, child_rotation)
+        relative_translation = _matvec(
+            inverse_parent,
+            (
+                child_translation[0] - parent_translation[0],
+                child_translation[1] - parent_translation[1],
+                child_translation[2] - parent_translation[2],
+            ),
+        )
+        entry_xyz = [float(value) for value in relative_translation]
+        entry_rpy = [float(value) for value in rpy_from_matrix(relative_rotation)]
+        geometry_source = "cad_body_frames"
+        geometry_detail = {"parent_frame": parent_datum, "child_frame": child_datum}
         movable = joint_type != "fixed"
         axis = joint.get("axis")
         if movable and (not isinstance(axis, (list, tuple)) or len(axis) != 3):
@@ -652,9 +564,7 @@ def _build_joints(
             )
         limit_evidence = joint.get("limit_evidence")
         if isinstance(limit_evidence, dict):
-            entry["provenance"]["limits_evidence"] = {
-                str(key): str(value) for key, value in limit_evidence.items()
-            }
+            entry["provenance"]["limits_evidence"] = {str(key): str(value) for key, value in limit_evidence.items()}
         if movable:
             entry["axis"] = [float(value) for value in axis]
         limits = joint.get("limits")
@@ -685,38 +595,35 @@ def _build_frames(
         if not frame_id or parent not in known:
             raise ConfigError("every frame needs an id and a known parent link", {"frame": frame})
         reference = frame.get("coordinate_system")
-        if reference:
-            matrix = (raw_scene.coordinate_systems or {}).get(str(reference))
-            if matrix is None:
-                raise ConfigError(
-                    "frame references a coordinate system that the capture did not read",
-                    {"frame": frame_id, "coordinate_system": reference},
-                )
-            rotation, translation = map_from_row_major(matrix)
-            frames_map = link_frames or {}
-            if parent not in frames_map:
-                raise ConfigError(
-                    "frame parent has no captured link frame to be expressed against",
-                    {"frame": frame_id, "parent": parent},
-                )
-            parent_rotation, parent_translation, _parent_datum = frames_map[parent]
-            inverse_parent = _transpose(parent_rotation)
-            rotation = _matmul(inverse_parent, rotation)
-            translation = _matvec(
-                inverse_parent,
-                (
-                    translation[0] - parent_translation[0],
-                    translation[1] - parent_translation[1],
-                    translation[2] - parent_translation[2],
-                ),
+        if not reference or "xyz" in frame or "rpy" in frame:
+            raise ConfigError("every interface frame must name one native CAD datum", {"frame": frame_id})
+        matrix = (raw_scene.coordinate_systems or {}).get(str(reference))
+        if matrix is None:
+            raise ConfigError(
+                "frame references a coordinate system that the capture did not read",
+                {"frame": frame_id, "coordinate_system": reference},
             )
-            xyz = [float(value) for value in translation]
-            rpy = [float(value) for value in rpy_from_matrix(rotation)]
-            geometry = f"cad_coordinate_system:{reference}"
-        else:
-            xyz = [float(value) for value in frame.get("xyz", (0.0, 0.0, 0.0))]
-            rpy = [float(value) for value in frame.get("rpy", (0.0, 0.0, 0.0))]
-            geometry = "source.frames"
+        rotation, translation = map_from_row_major(matrix)
+        frames_map = link_frames or {}
+        if parent not in frames_map:
+            raise ConfigError(
+                "frame parent has no captured link frame to be expressed against",
+                {"frame": frame_id, "parent": parent},
+            )
+        parent_rotation, parent_translation, _parent_datum = frames_map[parent]
+        inverse_parent = _transpose(parent_rotation)
+        rotation = _matmul(inverse_parent, rotation)
+        translation = _matvec(
+            inverse_parent,
+            (
+                translation[0] - parent_translation[0],
+                translation[1] - parent_translation[1],
+                translation[2] - parent_translation[2],
+            ),
+        )
+        xyz = [float(value) for value in translation]
+        rpy = [float(value) for value in rpy_from_matrix(rotation)]
+        geometry = f"cad_coordinate_system:{reference}"
         frames.append(
             {
                 "id": frame_id,

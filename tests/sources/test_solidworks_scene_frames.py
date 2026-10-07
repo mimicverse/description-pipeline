@@ -2,8 +2,7 @@
 
 The scene layer derives each joint origin/RPY from the raw parent and child
 link frames (which come from named CAD coordinate systems) and reads named
-frames straight from the same capture.  The legacy explicit form stays
-available and is still validated exactly.
+frames straight from the same capture. Authored origin numbers are rejected.
 """
 
 from __future__ import annotations
@@ -29,10 +28,22 @@ def _rz(angle: float) -> tuple[tuple[float, float, float], ...]:
 
 def _array(rotation, translation) -> list[float]:
     return [
-        rotation[0][0], rotation[0][1], rotation[0][2], translation[0],
-        rotation[1][0], rotation[1][1], rotation[1][2], translation[1],
-        rotation[2][0], rotation[2][1], rotation[2][2], translation[2],
-        0.0, 0.0, 0.0, 1.0,
+        rotation[0][0],
+        rotation[0][1],
+        rotation[0][2],
+        translation[0],
+        rotation[1][0],
+        rotation[1][1],
+        rotation[1][2],
+        translation[1],
+        rotation[2][0],
+        rotation[2][1],
+        rotation[2][2],
+        translation[2],
+        0.0,
+        0.0,
+        0.0,
+        1.0,
     ]
 
 
@@ -79,17 +90,16 @@ class DerivedJointFrameTests(unittest.TestCase):
         self.assertAlmostEqual(entry["xyz"][2], 0.5)
         self.assertAlmostEqual(entry["rpy"][2], -math.pi / 2)
 
-    def test_legacy_explicit_numbers_still_build(self):
+    def test_authored_joint_origins_are_rejected(self):
         joint = _joint(xyz=[0.0, 0.0, 0.25], rpy=[0.0, 0.0, 0.0])
-        entry = _build_joints({"joints": [joint]}, {"base_link", "upper_link"}, {})[0]
-        self.assertEqual(entry["xyz"], [0.0, 0.0, 0.25])
-        self.assertEqual(entry["provenance"]["geometry"], "source.joints")
+        with self.assertRaises(ConfigError):
+            _build_joints({"joints": [joint]}, {"base_link", "upper_link"}, {})
 
     def test_joint_without_numbers_or_frames_is_rejected(self):
         with self.assertRaises(ConfigError):
             _build_joints({"joints": [_joint()]}, {"base_link", "upper_link"}, {})
 
-    def test_half_declared_legacy_numbers_are_rejected(self):
+    def test_incomplete_authored_origins_are_rejected(self):
         joint = _joint(xyz=[0.0, 0.0, 0.25])
         with self.assertRaises(ConfigError):
             _build_joints({"joints": [joint]}, {"base_link", "upper_link"}, {})
@@ -122,9 +132,7 @@ class NamedFrameTests(unittest.TestCase):
         self.assertEqual(entry["provenance"]["geometry"], "cad_coordinate_system:tool_datum")
 
     def test_parent_rotation_and_translation_are_removed(self):
-        raw_scene = SimpleNamespace(
-            coordinate_systems={"tool_datum": _array(identity_matrix(), (1.0, 1.0, 0.5))}
-        )
+        raw_scene = SimpleNamespace(coordinate_systems={"tool_datum": _array(identity_matrix(), (1.0, 1.0, 0.5))})
         cfg = {
             "frames": [
                 {

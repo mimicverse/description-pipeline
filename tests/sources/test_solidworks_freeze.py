@@ -48,14 +48,19 @@ class FreezeTests(unittest.TestCase):
             "configuration": "Default",
             "allowed_roots": [str(self.tmp / "cad")],
             "geometry": {"enabled": True, "format": "stl_binary"},
-            "coordinate_systems": ["CS_arm"],
+            "coordinate_systems": ["base_datum", "arm_datum", "imu_datum"],
             "bodies": [
-                {"id": "base", "name": "base_link", "components": ["base-1"]},
+                {
+                    "id": "base",
+                    "name": "base_link",
+                    "components": ["base-1"],
+                    "frame": {"coordinate_system": "base_datum"},
+                },
                 {
                     "id": "arm",
                     "name": "arm_link",
                     "components": ["arm-1"],
-                    "frame": {"xyz": [0.0, 0.0, 0.2], "rpy": [0.0, 0.0, 0.0]},
+                    "frame": {"coordinate_system": "arm_datum"},
                 },
             ],
             "joints": [
@@ -65,13 +70,11 @@ class FreezeTests(unittest.TestCase):
                     "type": "revolute",
                     "parent": "base_link",
                     "child": "arm_link",
-                    "xyz": [0.0, 0.0, 0.2],
-                    "rpy": [0.0, 0.0, 0.0],
                     "axis": [0.0, 0.0, 1.0],
                     "limits": {"lower": -1.0, "upper": 1.0, "effort": 2.0, "velocity": 3.0},
                 }
             ],
-            "frames": [{"id": "imu", "parent": "base_link", "xyz": [0.01, 0.0, 0.03]}],
+            "frames": [{"id": "imu", "parent": "base_link", "coordinate_system": "imu_datum"}],
         }
         self.destination = self.tmp / "snapshot"
 
@@ -128,7 +131,7 @@ class FreezeTests(unittest.TestCase):
         config = json.loads(json.dumps(self.config))
         # rotate the arm link frame 90 degrees about Z: the COM rotates with it,
         # and the inertia tensor has to be re-expressed in the rotated axes
-        config["bodies"][1]["frame"] = {"xyz": [-0.2, 0.0, 0.0], "rpy": [0.0, 0.0, 1.5707963267948966]}
+        config["bodies"][1]["frame"] = {"coordinate_system": "arm_datum"}
         backend = support.FixtureCadBackend(
             self.assembly,
             [
@@ -146,6 +149,9 @@ class FreezeTests(unittest.TestCase):
                 },
             ],
             dependencies=self.parts,
+        )
+        backend.coordinate_system_matrices["arm_datum"] = support.placement(
+            (-0.2, 0.0, 0.0), (0.0, 0.0, 1.5707963267948966)
         )
         freeze(config, self.destination, backend=backend)
         scene = load_scene(self.destination)
@@ -214,8 +220,8 @@ class FreezeTests(unittest.TestCase):
         backend.pack_drop_files = {self.parts[1].name}
         config = json.loads(json.dumps(self.config))
         config["bodies"] = [
-            {"id": "base", "name": "base_link", "components": ["base-1"]},
-            {"id": "arm", "name": "arm_link", "components": ["arm-1"]},
+            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "base_datum"}},
+            {"id": "arm", "name": "arm_link", "components": ["arm-1"], "frame": {"coordinate_system": "arm_datum"}},
         ]
 
         with self.assertRaises(BridgeError) as raised:
@@ -239,7 +245,9 @@ class FreezeTests(unittest.TestCase):
         )
         backend.resolve_returns_empty = True
         config = json.loads(json.dumps(self.config))
-        config["bodies"] = [{"id": "base", "name": "base_link", "components": ["base-1"]}]
+        config["bodies"] = [
+            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "base_datum"}}
+        ]
         config["joints"] = []
         config.pop("frames", None)
 
@@ -263,7 +271,9 @@ class FreezeTests(unittest.TestCase):
         )
         backend.copy_extra_components = 1
         config = json.loads(json.dumps(self.config))
-        config["bodies"] = [{"id": "base", "name": "base_link", "components": ["base-1"]}]
+        config["bodies"] = [
+            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "base_datum"}}
+        ]
         config["joints"] = []
         config.pop("frames", None)
 
@@ -293,7 +303,9 @@ class FreezeTests(unittest.TestCase):
 
         backend.collect_dependencies = broken_pack  # type: ignore[method-assign]
         config = json.loads(json.dumps(self.config))
-        config["bodies"] = [{"id": "base", "name": "base_link", "components": ["base-1"]}]
+        config["bodies"] = [
+            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "base_datum"}}
+        ]
         config["joints"] = []
         config.pop("frames", None)
 
@@ -343,9 +355,9 @@ class FreezeTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "cad_configuration_missing")
 
-    def test_joint_without_explicit_geometry_is_refused(self) -> None:
+    def test_joint_with_authored_origin_is_refused(self) -> None:
         config = json.loads(json.dumps(self.config))
-        config["joints"][0].pop("xyz")
+        config["joints"][0]["xyz"] = [0.0, 0.0, 0.2]
 
         with self.assertRaises(ConfigError) as raised:
             freeze(config, self.destination, backend=self.backend)
@@ -392,8 +404,8 @@ class FreezeTests(unittest.TestCase):
         )
         config = json.loads(json.dumps(self.config))
         config["bodies"] = [
-            {"id": "base", "name": "base_link", "components": ["base-1"]},
-            {"id": "arm", "name": "arm_link", "components": ["arm-1"]},
+            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "base_datum"}},
+            {"id": "arm", "name": "arm_link", "components": ["arm-1"], "frame": {"coordinate_system": "arm_datum"}},
         ]
         return backend, config
 
@@ -718,8 +730,8 @@ class FreezeTests(unittest.TestCase):
         # switching the user's document is not this adapter's job
         config["configuration"] = "Other"
         config["bodies"] = [
-            {"id": "base", "name": "base_link", "components": ["base-1"]},
-            {"id": "arm", "name": "arm_link", "components": ["arm-1"]},
+            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "base_datum"}},
+            {"id": "arm", "name": "arm_link", "components": ["arm-1"], "frame": {"coordinate_system": "arm_datum"}},
         ]
 
         with self.assertRaises(BridgeError) as raised:
@@ -809,7 +821,9 @@ class FreezeTests(unittest.TestCase):
             dependencies=self.parts,
         )
         config = json.loads(json.dumps(self.config))
-        config["bodies"] = [{"id": "base", "name": "base_link", "components": ["base-1"]}]
+        config["bodies"] = [
+            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "base_datum"}}
+        ]
         config["joints"] = []
         config.pop("frames", None)
 
@@ -969,8 +983,13 @@ class SharedModelContractTests(unittest.TestCase):
             "robot_name": "robot",
             "geometry": {"enabled": True},
             "bodies": [
-                {"id": "base", "name": "base_link", "components": ["base-1"]},
-                {"id": "arm", "name": "arm_link", "components": ["arm-1"]},
+                {
+                    "id": "base",
+                    "name": "base_link",
+                    "components": ["base-1"],
+                    "frame": {"coordinate_system": "base_datum"},
+                },
+                {"id": "arm", "name": "arm_link", "components": ["arm-1"], "frame": {"coordinate_system": "arm_datum"}},
             ],
             "joints": [
                 {
@@ -979,8 +998,6 @@ class SharedModelContractTests(unittest.TestCase):
                     "type": "revolute",
                     "parent": "base_link",
                     "child": "arm_link",
-                    "xyz": [0.0, 0.0, 0.2],
-                    "rpy": [0.0, 0.0, 0.0],
                     "axis": [0.0, 0.0, 1.0],
                     "limits": {"lower": -1.0, "upper": 1.0, "effort": 2.0, "velocity": 3.0},
                 }
@@ -1045,7 +1062,14 @@ class DocumentedMassTests(unittest.TestCase):
                 "file": "docs/provenance/drawing-12-3.json",
                 "sha256": "0" * 64,
             },
-            "bodies": [{"id": "base", "name": "base_link", "components": ["base-1"]}],
+            "bodies": [
+                {
+                    "id": "base",
+                    "name": "base_link",
+                    "components": ["base-1"],
+                    "frame": {"coordinate_system": "base_datum"},
+                }
+            ],
             "joints": [],
         }
 
