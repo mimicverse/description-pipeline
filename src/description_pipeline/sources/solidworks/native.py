@@ -495,6 +495,17 @@ def _feature_name(target):
         return None
 
 
+def _optional_bool(obj, *names):
+    """A bool member that may not exist on every SolidWorks build."""
+
+    for name in names:
+        try:
+            return bool(_member(obj, name))
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
 def _coordinate_system_features(doc):
     names = []
     try:
@@ -516,23 +527,43 @@ def _coordinate_system_features(doc):
     return names
 
 
+def _mate_specific(feature):
+    """Return ``(IMate2, entity_count)`` when a feature really is a mate."""
+
+    try:
+        specific = _dynamic(_member(feature, "GetSpecificFeature2"))
+        count = int(_member(specific, "MateEntityCount"))
+    except Exception:  # noqa: BLE001
+        return None
+    return specific, count
+
+
 def _mate_features(doc):
+    """Mate features, including the ones nested under the mate group feature."""
+
     features = []
     try:
-        feature = _dynamic(_member(doc, "FirstFeature"))
+        top = _dynamic(_member(doc, "FirstFeature"))
     except Exception:  # noqa: BLE001
         return features
-    while feature is not None:
-        try:
-            type_name = str(_member(feature, "GetTypeName2") or "")
-        except Exception:  # noqa: BLE001
-            break
-        if type_name == "Mate":
-            features.append(feature)
-        try:
-            feature = _dynamic(_member(feature, "GetNextFeature"))
-        except Exception:  # noqa: BLE001
-            break
+
+    def walk(feature, step):
+        while feature is not None:
+            found = _mate_specific(feature)
+            if found is not None:
+                features.append((feature, found[0], found[1]))
+            try:
+                sub = _dynamic(_member(feature, "GetFirstSubFeature"))
+            except Exception:  # noqa: BLE001
+                sub = None
+            if sub is not None:
+                walk(sub, "GetNextSubFeature")
+            try:
+                feature = _dynamic(_member(feature, step))
+            except Exception:  # noqa: BLE001
+                feature = None
+
+    walk(top, "GetNextFeature")
     return features
 
 
@@ -801,8 +832,8 @@ class SolidWorksBackend(CadBackend):
                 # Measured on the analytic fixture 2026-10-06 (SolidWorks
                 # 34.0.0): GetMomentOfInertia(0) equals the analytic standard
                 # tensor to 4e-20 for a rotated box, so the part document is
-                # read as-is.  Historical readings that declare
-                # solidworks_positive keep their own interpretation.
+                # read as-is; solidworks_standard is the only supported
+                # product convention.
                 "product_convention": "solidworks_standard",
                 "volume_m3": float(_member(mp, "Volume")),
                 "density_kg_m3": float(_member(mp, "Density")),
@@ -1812,7 +1843,7 @@ class SolidWorksBackend(CadBackend):
         with self.session():
             assemblies = []
             for candidate in candidates:
-                doc = self.open_document(str(candidate))
+                doc = self._ensure_document(str(candidate))
                 assemblies.append((candidate, doc))
             main = None
             if len(assemblies) == 1:
@@ -1841,6 +1872,7 @@ class SolidWorksBackend(CadBackend):
             by_component = {}
             by_document: dict[str, str] = {}
             masses = []
+            notes: list[str] = []
             stack = [(doc, "", None)]
             while stack:
                 assembly, prefix, _parent = stack.pop()
@@ -1854,12 +1886,20 @@ class SolidWorksBackend(CadBackend):
                     path_name = f"{prefix}/{name}" if prefix else name
                     document_path = _member(component, "GetPathName")
                     relative = _relative_document(document_path, source_root) if _is_text_name(document_path) else None
-                    try:
-                        transform = [
-                            float(value) for value in transform_from_solidworks(_member(component, "GetTotalTransform"))
-                        ]
-                    except Exception:  # noqa: BLE001 - an unreadable transform must block, not guess
-                        transform = []
+                    transform = []
+                    transform_error = "no transform API answered"
+                    for probe in (("GetTotalTransform", False), ("GetTotalTransform", True)):
+                        try:
+                            holder = _member(component, *probe)
+                            transform = [
+                                float(value)
+                                for value in transform_from_solidworks(_member(holder, "ArrayData"))
+                            ]
+                            break
+                        except Exception as error:  # noqa: BLE001 - an unreadable transform must block, not guess
+                            transform_error = f"{probe[0]}({probe[1]}): {error}"
+                    if not transform:
+                        notes.append(f"transform:{path_name}:{transform_error}")
                     entry = {
                         "name2": path_name,
                         "instance_id": path_name,
@@ -1868,7 +1908,7 @@ class SolidWorksBackend(CadBackend):
                         "configuration": str(_member(component, "ReferencedConfiguration") or ""),
                         "fixed": bool(_member(component, "IsFixed")),
                         "suppressed": bool(_member(component, "IsSuppressed")),
-                        "lightweight": bool(_member(component, "IsLightweight")),
+                        "lightweight": _optional_bool(component, "IsLightweight", "IsLightWeight"),
                         "transform": transform,
                     }
                     components.append(entry)
@@ -1896,22 +1936,16 @@ class SolidWorksBackend(CadBackend):
                                         "material": None,
                                     }
                                 )
-                    except Exception:  # noqa: BLE001 - masses are informational here
-                        pass
+                    except Exception as error:  # noqa: BLE001 - masses are informational here
+                        notes.append(f"mass:{path_name}:{error}")
                     children = list(_member(component, "GetChildren") or [])
                     if children:
                         part = _member(component, "GetModelDoc2")
                         if part is not None:
                             stack.append((part, path_name, component))
             mates = []
-            for feature in _mate_features(doc):
+            for feature, specific, count in _mate_features(doc):
                 name = str(_member(feature, "Name") or "")
-                specific = _dynamic(_member(feature, "GetSpecificFeature2"))
-                if specific is None:
-                    mates.append(
-                        {"name": name, "type": "unknown-specific", "suppressed": False, "limits": None, "entities": []}
-                    )
-                    continue
                 try:
                     raw_type = _member(specific, "Type")
                     type_index = int(raw_type)
@@ -1919,10 +1953,6 @@ class SolidWorksBackend(CadBackend):
                     type_index = -1
                 mate_type = _SW_MATE_TYPES.get(type_index, f"unknown-{type_index}")
                 entities = []
-                try:
-                    count = int(_member(specific, "MateEntityCount") or 0)
-                except Exception:  # noqa: BLE001
-                    count = 0
                 for index in range(count):
                     try:
                         entity = _dynamic(_member(specific, "MateEntity", index))
@@ -2027,6 +2057,7 @@ class SolidWorksBackend(CadBackend):
                 "masses": masses,
                 "properties": property_buckets,
                 "files": files,
+                "notes": notes,
             }
 
     @staticmethod

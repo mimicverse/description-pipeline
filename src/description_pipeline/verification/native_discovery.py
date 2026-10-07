@@ -305,12 +305,32 @@ def _rows_for(mate: dict, frames) -> dict | None:
         point = left_point if left_axis is not None else right_point
         if normal is None or point is None:
             return None
-        plane = _plane_basis(normal)
-        if len(plane) != 2:
-            return None
-        rows = [_translation_row(normal, point)] + [_rotation_row(direction) for direction in plane]
-        return {"rows": rows, "limits": limits, "axis": None, "point": point}
-    if kind in ("distance", "limitdistance"):
+        # A vertex on a face removes one translation only.
+        return {"rows": [_translation_row(normal, point)], "limits": limits, "axis": None, "point": point}
+    if kind == "limitangle":
+        return {"rows": [], "limits": limits, "axis": None, "point": None}
+    if kind == "limitdistance":
+        _first_point, first_axis = _geometry(first, frames)
+        _second_point, second_axis = _geometry(second, frames)
+        if (
+            isinstance(first.get("plane"), dict)
+            and isinstance(second.get("plane"), dict)
+            and first_axis is not None
+            and second_axis is not None
+            and abs(abs(_dot(first_axis, second_axis)) - 1.0) <= TOL
+        ):
+            normal = first_axis if _dot(first_axis, second_axis) >= 0 else [-value for value in first_axis]
+            plane = _plane_basis(normal)
+            if len(plane) != 2:
+                return None
+            return {
+                "rows": [_rotation_row(direction) for direction in plane],
+                "limits": limits,
+                "axis": None,
+                "point": None,
+            }
+        return {"rows": [], "limits": limits, "axis": None, "point": None}
+    if kind == "distance":
         left_point, left_axis = _geometry(first, frames)
         right_point, right_axis = _geometry(second, frames)
         if isinstance(first.get("point"), (list, tuple)) and isinstance(second.get("point"), (list, tuple)):
@@ -396,9 +416,6 @@ def _independent_clusters(record: dict):
         group["rank"] = len(_span(group["rows"]))
     parent = {name: name for name in components}
     union = [key for key, group in sorted(pairs.items()) if not group["unresolved"] and group["rank"] == 6]
-    fixed = [name for name, item in components.items() if item.get("fixed")]
-    if fixed:
-        union.extend((fixed[0], name) for name in fixed[1:])
     for left, right in union:
         root_left, root_right = _find(components, parent, left), _find(components, parent, right)
         if root_left != root_right:
@@ -500,16 +517,16 @@ def _primary_name(mates: list[dict]) -> str:
     return str(mates[0].get("name") or "") if mates else ""
 
 
-def _joint_properties(raw: dict, mates: list[dict]) -> dict:
-    """Mate-level scalars plus document-level ``dp.joint.<name>.<key>`` scalars."""
+def _joint_properties(raw: dict, mates: list[dict]) -> tuple[dict, dict]:
+    """Merged scalars plus every key two native sources declare differently."""
 
-    merged: dict = {}
+    candidates: dict[str, list[tuple[str, object]]] = {}
     mate_properties = (raw.get("properties") or {}).get("mates") or {}
     document = (raw.get("properties") or {}).get("document") or {}
     names = [str(mate.get("name") or "") for mate in mates]
     for name in names:
         for key, value in (mate_properties.get(name) or {}).items():
-            merged.setdefault(key, value)
+            candidates.setdefault(key, []).append((f"mate:{name}", value))
     heads = {name.split("__", 1)[0] for name in names if "__" in name}
     prefixes = [f"dp.joint.{head}." for head in sorted(heads)] + [f"dp.joint.{name}." for name in names if name]
     for key, value in document.items():
@@ -517,8 +534,16 @@ def _joint_properties(raw: dict, mates: list[dict]) -> dict:
             continue
         for prefix in prefixes:
             if key.startswith(prefix):
-                merged.setdefault(f"dp.joint.{key[len(prefix) :]}", value)
-    return merged
+                candidates.setdefault(f"dp.joint.{key[len(prefix) :]}", []).append((f"document:{key}", value))
+    merged: dict = {}
+    conflicts: dict = {}
+    for key, values in candidates.items():
+        texts = {str(value) for _, value in values}
+        if len(texts) > 1:
+            conflicts[key] = {"sources": [source for source, _ in values], "values": sorted(texts)}
+            continue
+        merged[key] = values[0][1]
+    return merged, conflicts
 
 
 def verify_discovery(package: Path) -> dict:
@@ -850,6 +875,13 @@ def verify_discovery(package: Path) -> dict:
             if group["unresolved"] or group["rank"] == 6:
                 continue
             mates = [raw_mates[index] for index in group["mates"] if 0 <= index < len(raw_mates)]
+            _properties, conflicts = _joint_properties(raw, mates)
+            _require(
+                not conflicts,
+                "discovery.names",
+                "two native sources declare the same joint scalar differently",
+                {"conflicts": conflicts},
+            )
             heads = []
             for mate in mates:
                 head, separator, role = str(mate.get("name") or "").partition("__")
@@ -939,7 +971,13 @@ def verify_discovery(package: Path) -> dict:
             joint = matching[0]
             seen.add(pair)
             mates = [raw_mates[index] for index in group["mates"] if 0 <= index < len(raw_mates)]
-            properties = _joint_properties(raw, mates)
+            properties, conflicts = _joint_properties(raw, mates)
+            _require(
+                not conflicts,
+                "discovery.joints",
+                "two native sources declare the same joint scalar differently",
+                {"conflicts": conflicts},
+            )
             hint = str(properties.get("dp.joint.type") or "").strip().lower()
             nullity = 6 - group["rank"]
             _require(

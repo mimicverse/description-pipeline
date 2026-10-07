@@ -490,10 +490,36 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
             return fail(
                 "discovery.mate_entities_unsupported", "coincident mate entities carry no plane or point geometry"
             )
-        rows = [_translation_row(normal, point)]
-        rows += [_rotation_row(direction) for direction in _orthogonal_basis(normal)]
-        return {"rows": rows, "limits": limits, "axis": None, "point": point, "entity": None}
-    if kind in ("distance", "limitdistance"):
+        # A vertex on a face removes exactly one translation; it does not
+        # constrain the relative orientation.
+        return {
+            "rows": [_translation_row(normal, point)],
+            "limits": limits,
+            "axis": None,
+            "point": point,
+            "entity": None,
+        }
+    if kind == "limitangle":
+        # A bounded angle travels inside its range: no bilateral constraint.
+        return {"rows": [], "limits": limits, "axis": None, "point": None, "entity": None}
+    if kind == "limitdistance":
+        # A bounded distance keeps its travel; parallel planes still keep
+        # their normal alignment.
+        left_plane = plane_of(first) if isinstance(first.get("plane"), dict) else None
+        right_plane = plane_of(second) if isinstance(second.get("plane"), dict) else None
+        if left_plane is not None and right_plane is not None:
+            if abs(abs(_dot(left_plane[1], right_plane[1])) - 1.0) > _TOL:
+                return fail("discovery.mate_geometry_mismatch", "limit distance planes are not parallel")
+            normal = left_plane[1] if _dot(left_plane[1], right_plane[1]) >= 0 else [-value for value in left_plane[1]]
+            return {
+                "rows": [_rotation_row(direction) for direction in _orthogonal_basis(normal)],
+                "limits": limits,
+                "axis": None,
+                "point": left_plane[0],
+                "entity": None,
+            }
+        return {"rows": [], "limits": limits, "axis": None, "point": None, "entity": None}
+    if kind == "distance":
         left_point = point_of(first) if first.get("point") is not None else None
         right_point = point_of(second) if second.get("point") is not None else None
         left_plane = plane_of(first) if left_point is None else None
@@ -640,10 +666,6 @@ def _clusters(record: dict, findings: list[dict]) -> _Clusters:
         for (left, right), group in sorted(pairs.items())
         if not group["unresolved"] and group["rank"] == 6
     ]
-    fixed = [name for name, item in components.items() if item.get("fixed")]
-    if fixed:
-        ground = fixed[0]
-        rigid.extend((ground, name) for name in fixed[1:])
     properties = (record.get("properties") or {}).get("components") or {}
     markers: dict[str, str] = {}
     for name in names:
@@ -786,15 +808,24 @@ def _primary_mate(mates: list[dict], properties: dict) -> dict:
 
 
 def _merged_joint_properties(
-    mate_properties: dict, document_properties: dict, mates: list[dict], namespace: str
+    mate_properties: dict,
+    document_properties: dict,
+    mates: list[dict],
+    namespace: str,
+    findings: list[dict],
+    obj: str,
 ) -> dict:
-    """Mate-level scalars plus document-level ``dp.joint.<name>.<key>`` scalars."""
+    """Merge mate-level and document-level scalars; conflicts block.
 
-    merged: dict = {}
+    No source wins by order: when two native sources declare the same key with
+    different values the package is blocked with an object-specific finding.
+    """
+
+    candidates: dict[str, list[tuple[str, object]]] = {}
     names = [str(item.get("name") or "") for item in mates]
     for name in names:
         for key, value in (mate_properties.get(name) or {}).items():
-            merged.setdefault(key, value)
+            candidates.setdefault(key, []).append((f"mate:{name}", value))
     heads = {name.split("__", 1)[0] for name in names if "__" in name}
     prefixes = [f"{namespace}.joint.{head}." for head in sorted(heads)]
     prefixes += [f"{namespace}.joint.{name}." for name in names if name]
@@ -803,7 +834,21 @@ def _merged_joint_properties(
             continue
         for prefix in prefixes:
             if key.startswith(prefix):
-                merged.setdefault(f"{namespace}.joint.{key[len(prefix) :]}", value)
+                candidates.setdefault(f"{namespace}.joint.{key[len(prefix) :]}", []).append((f"document:{key}", value))
+    merged: dict = {}
+    for key, values in candidates.items():
+        texts = {str(value) for _, value in values}
+        if len(texts) > 1:
+            findings.append(
+                _finding(
+                    "discovery.joint_property_conflict",
+                    obj,
+                    "two native sources declare the same joint scalar with different values",
+                    {"key": key, "sources": [source for source, _ in values], "values": sorted(texts)},
+                )
+            )
+            continue
+        merged[key] = values[0][1]
     return merged
 
 
@@ -824,10 +869,10 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
         mates = [raw_mates[index] for index in group["mates"] if 0 <= index < len(raw_mates)]
         if not mates:
             continue
-        properties = _merged_joint_properties(mate_properties, document_properties, mates, NAMESPACE)
+        obj = f"mate:{mates[0].get('name') or group['mates'][0]}"
+        properties = _merged_joint_properties(mate_properties, document_properties, mates, NAMESPACE, findings, obj)
         mate = _primary_mate(mates, properties)
         name = str(mate.get("name") or "")
-        obj = f"mate:{name or group['mates'][0]}"
         hint = str(properties.get(f"{NAMESPACE}.joint.type") or "").strip().lower()
         nullity = 6 - rank
         if nullity != 1:
@@ -1205,17 +1250,24 @@ def _body_records(
 def _root_body(
     record: dict, clusters: _Clusters, bodies: list[dict], namespace: str, findings: list[dict]
 ) -> dict | None:
-    fixed_roots = {
-        clusters.of[str(item.get("name2"))]
-        for item in record.get("components") or []
-        if isinstance(item, dict)
-        and item.get("fixed")
-        and not item.get("suppressed")
-        and str(item.get("name2")) in clusters.of
-    }
-    if len(fixed_roots) == 1:
-        root = next(iter(fixed_roots))
-        return next((body for body in bodies if body["root"] == root), None)
+    """The base body is the one the CAD itself names: CS_base_link.
+
+    A temporary ``IsFixed`` flag never proves a root or a rigid connection.
+    """
+
+    named = [body for body in bodies if str(body.get("datum")) == "CS_base_link"]
+    if len(named) == 1:
+        return named[0]
+    if len(named) > 1:
+        findings.append(
+            _finding(
+                "discovery.root_conflict",
+                "assembly",
+                "several bodies own a CS_base_link coordinate system",
+                {"bodies": [body["name"] for body in named]},
+            )
+        )
+        return None
     properties = (record.get("properties") or {}).get("components") or {}
     annotated = {
         clusters.of[name]
@@ -1229,10 +1281,9 @@ def _root_body(
         return next((body for body in bodies if body["root"] == root), None)
     findings.append(
         _finding(
-            "discovery.root_ambiguous",
+            "discovery.root_missing",
             "assembly",
-            "no fixed component or dp.body_root annotation identifies the base body",
-            {"fixed_clusters": sorted(fixed_roots)},
+            "no body owns CS_base_link; a temporary IsFixed flag cannot prove the base",
         )
     )
     return None

@@ -421,6 +421,58 @@ class DiscoveryTests(unittest.TestCase):
         result, _source, _output = self._prepare(mutate=mutate)
         self.assertIn("discovery.link_name_missing", self._codes(result))
 
+    def test_point_plane_coincident_does_not_rigidify(self):
+        """A vertex-on-face mate removes one translation, never orientation."""
+
+        def mutate(payload):
+            seat = payload["mates"][1]
+            seat["entities"][0]["plane"] = {"point": [0.0, 0.0, 0.1], "normal": [1.0, 0.0, 0.0]}
+            seat["entities"][1].pop("plane", None)
+            seat["entities"][1]["point"] = [0.0, 0.0, 0.1]
+
+        result, _source, output = self._prepare(mutate=mutate)
+        codes = self._codes(result)
+        self.assertIn("discovery.joint_unsupported_pattern", codes)
+        payload = json.loads((output / "discovery" / "native-discovery.json").read_text(encoding="utf-8"))
+        for body in payload["derived"]["bodies"]:
+            self.assertNotEqual(set(body["components"]), {"base-1", "arm-1"})
+
+    def test_bounded_travel_mates_keep_their_freedom(self):
+        """limitdistance keeps the bounded translation free instead of rigid."""
+
+        for mate_type in ("limitdistance", "limitangle"):
+            result, _source, output = self._prepare(
+                mutate=lambda payload, kind=mate_type: payload["mates"][1].update({"type": kind})
+            )
+            codes = self._codes(result)
+            self.assertIn("discovery.joint_unsupported_pattern", codes, (mate_type, codes))
+            payload = json.loads((output / "discovery" / "native-discovery.json").read_text(encoding="utf-8"))
+            for body in payload["derived"]["bodies"]:
+                self.assertNotEqual(set(body["components"]), {"base-1", "arm-1"}, mate_type)
+
+    def test_conflicting_joint_scalar_sources_block(self):
+        def mutate(payload):
+            payload["properties"]["document"]["dp.joint.shoulder_pitch.drive_record"] = "other.json#drive"
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        self.assertIn("discovery.joint_property_conflict", self._codes(result))
+
+    def test_root_comes_from_cs_base_link_not_a_fixed_flag(self):
+        def unfixed(payload):
+            for component in payload["components"]:
+                component["fixed"] = False
+
+        result, _source, _output = self._prepare(mutate=unfixed)
+        self.assertTrue(result.passed, result.findings)
+
+        def renamed(payload):
+            for datum in payload["datums"]:
+                if datum["name"] == "CS_base_link":
+                    datum["name"] = "CS_frame"
+
+        result, _source, _output = self._prepare(mutate=renamed)
+        self.assertIn("discovery.root_missing", self._codes(result))
+
     # ------------------------------------------------------------ verifier gates
 
     def test_verifier_rejects_deleted_or_stripped_metadata(self):
