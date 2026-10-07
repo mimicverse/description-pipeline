@@ -4,9 +4,16 @@ from __future__ import annotations
 
 import json
 import io
+import sys
+import tempfile
 import threading
+import types
+import uuid
 import unittest
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
+from urllib import parse as urlparse
 
 from description_pipeline.orchestration.airflow_client import (
     EndpointAuthError,
@@ -14,12 +21,15 @@ from description_pipeline.orchestration.airflow_client import (
     EndpointConflict,
     EndpointError,
     EndpointProtocolError,
+    HANDOFF_SCHEMA,
     JOB_SCHEMA,
     JobFailed,
     PIPELINE_ID,
     ResultNotPublishable,
     WindowsEndpoint,
     check_result,
+    native_run_id,
+    validate_artifact_name,
     validate_package,
     validate_revision_sha,
     validate_run_id,
@@ -28,6 +38,25 @@ from description_pipeline.orchestration.airflow_client import (
 TOKEN = "test-token"
 RUN_ID = "b3f1c2d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
 SHA = "a" * 64
+HANDOFF = {
+    "schema_version": HANDOFF_SCHEMA,
+    "pipeline_id": PIPELINE_ID,
+    "package": "handoff/m3.0",
+    "revision_sha256": SHA,
+    "handoff_sha256": "b" * 64,
+    "hardware_id": "m3.0",
+    "revision": "r1",
+    "target": "m3",
+    "repository_slug": "example/m3.0",
+    "base": "feature/m3.0",
+}
+PREVIEW = {
+    "pipeline_id": PIPELINE_ID,
+    "run_id": RUN_ID,
+    "subject_sha256": SHA,
+    "urdf": "urdf/robot.urdf",
+    "files": {"urdf/robot.urdf": SHA, "meshes/base.stl": "d" * 64},
+}
 
 
 class MockEndpoint:
@@ -41,14 +70,28 @@ class MockEndpoint:
         legacy_events: bool = False,
         omit_quality: bool = False,
         redirect_to: str | None = None,
+        handoff_response: dict | None = None,
+        preview_payload: dict | None = None,
+        artifact_redirect_to: str | None = None,
     ) -> None:
         self.token = token
         self.fail_job = fail_job
         self.legacy_events = legacy_events
         self.omit_quality = omit_quality
         self.redirect_to = redirect_to
+        self.handoff_response = handoff_response
+        self.preview_payload = preview_payload
+        self.artifact_redirect_to = artifact_redirect_to
         self.hits = 0
         self.jobs: dict[str, dict] = {}
+        self.resolved_paths: list[str] = []
+        self.imports: list[dict] = []
+        self.artifact_paths: list[str] = []
+        self.artifacts = {
+            "urdf/robot.urdf": b"<robot name='fixture'/>",
+            "meshes/base.stl": b"solid base",
+            "meshes/a b.stl": b"solid spaced",
+        }
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -83,7 +126,36 @@ class MockEndpoint:
                     self._send(200, {"pipeline_id": PIPELINE_ID, "ready": True})
                     return
                 if self.path.startswith("/v1/jobs/"):
-                    run_id = self.path.rsplit("/", 1)[-1]
+                    parts = self.path.split("/")
+                    run_id = parts[3] if len(parts) > 3 else ""
+                    if len(parts) >= 5 and parts[4] == "preview":
+                        job = outer.jobs.get(run_id)
+                        if job is None or job.get("status") != "passed":
+                            self._send(404, {"error": "no passed delivery"})
+                            return
+                        payload = dict(outer.preview_payload or PREVIEW)
+                        payload["run_id"] = run_id
+                        self._send(200, payload)
+                        return
+                    if len(parts) >= 6 and parts[4] == "artifacts":
+                        if outer.artifact_redirect_to:
+                            self.send_response(302)
+                            self.send_header("Location", outer.artifact_redirect_to)
+                            self.send_header("Content-Length", "0")
+                            self.end_headers()
+                            return
+                        name = urlparse.unquote("/".join(parts[5:]))
+                        outer.artifact_paths.append(self.path)
+                        data = outer.artifacts.get(name)
+                        if data is None:
+                            self._send(404, {"error": "unknown artifact"})
+                            return
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/octet-stream")
+                        self.send_header("Content-Length", str(len(data)))
+                        self.end_headers()
+                        self.wfile.write(data)
+                        return
                     job = outer.jobs.get(run_id)
                     if job is None:
                         self._send(404, {"error": "unknown run_id"})
@@ -131,7 +203,22 @@ class MockEndpoint:
                 if not self._authorized():
                     return
                 length = int(self.headers.get("Content-Length") or 0)
-                payload = json.loads(self.rfile.read(length) or b"{}")
+                body = self.rfile.read(length)
+                if self.path in {"/v1/handoffs/resolve", "/v1/handoffs/import"}:
+                    if self.path == "/v1/handoffs/resolve":
+                        outer.resolved_paths.append(json.loads(body or b"{}").get("handoff_path"))
+                    else:
+                        outer.imports.append(
+                            {
+                                "size": len(body),
+                                "bytes": body,
+                                "content_type": self.headers.get("Content-Type"),
+                                "content_length": self.headers.get("Content-Length"),
+                            }
+                        )
+                    self._send(200, dict(outer.handoff_response or HANDOFF))
+                    return
+                payload = json.loads(body or b"{}")
                 if self.path != "/v1/jobs":
                     self._send(404, {"error": "not found"})
                     return
@@ -195,6 +282,147 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(len(server.jobs), 1)
             with self.assertRaises(EndpointConflict):
                 endpoint.start_job(run_id=RUN_ID, package="handoff/other", revision_sha256=SHA, target="m3")
+
+    def test_start_job_binds_optional_handoff_sha256(self) -> None:
+        with MockEndpoint() as server:
+            endpoint = self.endpoint(server)
+            job = endpoint.start_job(
+                run_id=RUN_ID, package="handoff/m3.0", revision_sha256=SHA, target="m3", handoff_sha256="b" * 64
+            )
+            self.assertEqual(job["request"]["handoff_sha256"], "b" * 64)
+            self.assertEqual(len(server.jobs), 1)
+            with self.assertRaises(EndpointConflict):
+                endpoint.start_job(
+                    run_id=RUN_ID, package="handoff/m3.0", revision_sha256=SHA, target="m3", handoff_sha256="c" * 64
+                )
+
+    def test_resolve_handoff_uses_resolver_for_managed_paths(self) -> None:
+        with MockEndpoint() as server:
+            endpoint = self.endpoint(server)
+            resolved = endpoint.resolve_handoff("handoff/m3.0")
+            self.assertEqual(resolved.package, "handoff/m3.0")
+            self.assertEqual(resolved.handoff_sha256, "b" * 64)
+            self.assertEqual(resolved.hardware_id, "m3.0")
+            self.assertEqual(resolved.target, "m3")
+            self.assertEqual(resolved.repository_slug, "example/m3.0")
+            self.assertEqual(resolved.base, "feature/m3.0")
+            endpoint.resolve_handoff(r"C:\handoffs\m3.0")
+            self.assertEqual(server.resolved_paths, ["handoff/m3.0", r"C:\handoffs\m3.0"])
+            self.assertEqual(server.imports, [])
+
+    def test_resolve_handoff_fails_closed_on_bad_payload(self) -> None:
+        for bad in (
+            {**HANDOFF, "schema_version": "solidworks-to-urdf.handoff/v2"},
+            {**HANDOFF, "pipeline_id": "other-pipeline"},
+            {**HANDOFF, "handoff_sha256": "not-a-digest"},
+            {**HANDOFF, "package": "../escape"},
+            {**HANDOFF, "repository_slug": "no-slash"},
+            {**HANDOFF, "base": "main"},
+            {k: v for k, v in HANDOFF.items() if k != "hardware_id"},
+        ):
+            with (
+                self.subTest(bad=bad),
+                MockEndpoint(handoff_response=bad) as server,
+                self.assertRaises(EndpointProtocolError),
+            ):
+                self.endpoint(server).resolve_handoff("handoff/m3.0")
+
+    def _stub_archive(self, digest: str = "b" * 64):
+        module = types.ModuleType("description_pipeline.orchestration.handoffs")
+
+        def prepare_archive(source: Path, archive: Path) -> dict:
+            self.assertTrue(Path(source).is_dir(), source)
+            Path(archive).write_bytes(b"PK\x03\x04stub-archive")
+            return {"handoff_sha256": digest, "files": {"cad-revision.json": "x"}}
+
+        module.prepare_archive = prepare_archive
+        return mock.patch.dict(sys.modules, {"description_pipeline.orchestration.handoffs": module})
+
+    def test_absolute_posix_path_is_zipped_and_imported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "handoff"
+            source.mkdir()
+            (source / "cad-revision.json").write_text("{}", encoding="utf-8")
+            with MockEndpoint() as server, self._stub_archive():
+                resolved = self.endpoint(server).resolve_handoff(str(source))
+            self.assertEqual(resolved.handoff_sha256, "b" * 64)
+            self.assertEqual(server.resolved_paths, [])
+            self.assertEqual(len(server.imports), 1)
+            upload = server.imports[0]
+            self.assertEqual(upload["bytes"], b"PK\x03\x04stub-archive")
+            self.assertEqual(upload["content_type"], "application/zip")
+            self.assertEqual(upload["content_length"], str(upload["size"]))
+
+    def test_import_digest_mismatch_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "handoff"
+            source.mkdir()
+            with (
+                MockEndpoint() as server,
+                self._stub_archive(digest="c" * 64),
+                self.assertRaises(EndpointProtocolError),
+            ):
+                self.endpoint(server).resolve_handoff(str(source))
+
+    def test_native_run_id_is_canonical_and_stable(self) -> None:
+        expected = str(uuid.uuid5(uuid.NAMESPACE_URL, f"solidworks_to_urdf:{RUN_ID}"))
+        self.assertEqual(native_run_id(RUN_ID), expected)
+        self.assertEqual(native_run_id(RUN_ID), native_run_id(RUN_ID))
+        with self.assertRaises(EndpointProtocolError):
+            native_run_id("")
+
+    def test_preview_requires_a_passed_delivery(self) -> None:
+        with MockEndpoint() as server:
+            endpoint = self.endpoint(server)
+            with self.assertRaises(EndpointError):
+                endpoint.get_preview(RUN_ID)
+            endpoint.start_job(run_id=RUN_ID, package="handoff/m3.0", revision_sha256=SHA, target="m3")
+            endpoint.wait(RUN_ID, interval=0.05, timeout=5)
+            preview = endpoint.get_preview(RUN_ID)
+            self.assertEqual(preview["run_id"], RUN_ID)
+            self.assertEqual(preview["urdf"], "urdf/robot.urdf")
+            self.assertIn(preview["urdf"], preview["files"])
+
+    def test_preview_fails_closed_on_bad_payload(self) -> None:
+        for bad in (
+            {**PREVIEW, "pipeline_id": "other"},
+            {**PREVIEW, "subject_sha256": "nope"},
+            {**PREVIEW, "urdf": "../escape.urdf"},
+            {**PREVIEW, "files": {"urdf/robot.urdf": "nope"}},
+            {**PREVIEW, "files": {"meshes/base.stl": "d" * 64}},
+        ):
+            with self.subTest(bad=bad), MockEndpoint(preview_payload=bad) as server:
+                endpoint = self.endpoint(server)
+                endpoint.start_job(run_id=RUN_ID, package="handoff/m3.0", revision_sha256=SHA, target="m3")
+                endpoint.wait(RUN_ID, interval=0.05, timeout=5)
+                with self.assertRaises(EndpointProtocolError):
+                    endpoint.get_preview(RUN_ID)
+
+    def test_open_artifact_streams_verified_bytes(self) -> None:
+        with MockEndpoint() as server:
+            endpoint = self.endpoint(server)
+            endpoint.start_job(run_id=RUN_ID, package="handoff/m3.0", revision_sha256=SHA, target="m3")
+            endpoint.wait(RUN_ID, interval=0.05, timeout=5)
+            with endpoint.open_artifact(RUN_ID, "urdf/robot.urdf") as response:
+                self.assertEqual(response.read(), b"<robot name='fixture'/>")
+            with endpoint.open_artifact(RUN_ID, "meshes/a b.stl") as response:
+                self.assertEqual(response.read(), b"solid spaced")
+            self.assertEqual(
+                server.artifact_paths,
+                [f"/v1/jobs/{RUN_ID}/artifacts/urdf/robot.urdf", f"/v1/jobs/{RUN_ID}/artifacts/meshes/a%20b.stl"],
+            )
+            with self.assertRaises(EndpointError):
+                endpoint.open_artifact(RUN_ID, "meshes/missing.stl")
+            for bad in ("../escape", "/etc/passwd", "a\\b", "", "."):
+                with self.subTest(bad=bad), self.assertRaises(EndpointProtocolError):
+                    endpoint.open_artifact(RUN_ID, bad)
+            self.assertEqual(len(server.artifact_paths), 3)
+
+    def test_open_artifact_refuses_cross_host_redirect(self) -> None:
+        with MockEndpoint(artifact_redirect_to="http://127.0.0.1:1/urdf/robot.urdf") as server:
+            endpoint = self.endpoint(server)
+            with self.assertRaises(EndpointError):
+                endpoint.open_artifact(RUN_ID, "urdf/robot.urdf")
 
     def test_wait_passes_and_fails_closed_on_result(self) -> None:
         with MockEndpoint() as server:
@@ -283,6 +511,9 @@ class ClientTests(unittest.TestCase):
                 validate_package(bad)
         self.assertEqual(validate_package("手臂 r1/cad"), "手臂 r1/cad")
         self.assertEqual(validate_package(".hidden/x"), ".hidden/x")
+        self.assertEqual(validate_artifact_name("urdf/robot.urdf"), "urdf/robot.urdf")
+        with self.assertRaises(EndpointProtocolError):
+            validate_artifact_name("../escape.urdf")
 
     def test_cross_host_redirect_never_forwards_token(self) -> None:
         with MockEndpoint() as target, MockEndpoint(redirect_to=target.url) as redirector:

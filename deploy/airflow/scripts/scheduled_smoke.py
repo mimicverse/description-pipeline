@@ -21,6 +21,18 @@ from pathlib import Path
 TOKEN = "scheduled-token"
 SUBJECT = "a" * 64
 COMMIT = "b" * 40
+HANDOFF = {
+    "schema_version": "solidworks-to-urdf.handoff/v1",
+    "pipeline_id": "solidworks-to-urdf",
+    "package": "handoff/m3.0",
+    "revision_sha256": SUBJECT,
+    "handoff_sha256": "c" * 64,
+    "hardware_id": "m3.0",
+    "revision": "r1",
+    "target": "local",
+    "repository_slug": "example/m3.0",
+    "base": "feature/m3.0",
+}
 
 
 def _view(job: dict) -> dict:
@@ -82,6 +94,10 @@ def _mock_endpoint() -> tuple[ThreadingHTTPServer, dict]:
             if not self._auth():
                 return
             payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+            if self.path == "/v1/handoffs/resolve":
+                state["resolved_paths"].append(payload.get("handoff_path"))
+                self._send(200, HANDOFF)
+                return
             run_id = payload["run_id"]
             if run_id in state["jobs"]:
                 existing = state["jobs"][run_id]
@@ -98,6 +114,7 @@ def _mock_endpoint() -> tuple[ThreadingHTTPServer, dict]:
             state["jobs"][run_id] = job
             self._send(202, _view(job))
 
+    state["resolved_paths"] = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, state
@@ -153,8 +170,7 @@ def main() -> int:
         procs.append(subprocess.Popen([str(args.venv / "bin/airflow"), component, *extra], env=env,
                                       stdout=handle, stderr=subprocess.STDOUT, start_new_session=True))
     run_id = f"smoke-{uuid.uuid4().hex[:12]}"
-    conf = json.dumps({"package": "handoff/m3.0", "revision_sha256": SUBJECT, "target": "local",
-                       "repository_slug": "example/m3.0", "base": "feature/m3.0"})
+    conf = json.dumps({"handoff_path": "handoff/m3.0"})
     try:
         time.sleep(15)
         for (component, _), proc in zip(components, procs, strict=True):
@@ -178,8 +194,11 @@ def main() -> int:
                 match = [r for r in runs if r.get("run_id") == run_id]
                 if match and match[0].get("state") == "success":
                     job = next(iter(state["jobs"].values()), {})
+                    request = job.get("request") or {}
                     print(json.dumps({"ok": job.get("status") == "passed", "run_id": run_id,
                                       "dag_state": "success", "job_status": job.get("status"),
+                                      "resolved_paths": state["resolved_paths"],
+                                      "handoff_sha256": request.get("handoff_sha256"),
                                       "submission": (job.get("result") or {}).get("submission")}))
                     return 0 if job.get("status") == "passed" else 1
                 if match and match[0].get("state") == "failed":

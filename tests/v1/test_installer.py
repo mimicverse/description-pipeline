@@ -281,7 +281,9 @@ class LockAndScriptsTest(unittest.TestCase):
                         defaults[node.args[0].value] = ast.literal_eval(keyword.value)
         self.assertEqual(defaults.get("--conn-id"), "solidworks_windows")
         dag = (DEPLOY / "dags" / "solidworks_to_urdf.py").read_text(encoding="utf-8")
-        self.assertIn('"conn_id": Param("solidworks_windows"', dag)
+        self.assertIn('CONN_ID = os.environ.get("SOLIDWORKS_ENDPOINT_CONN_ID", "solidworks_windows")', dag)
+        self.assertNotIn('"conn_id": Param(', dag)
+        self.assertIn("native_run_id(", dag)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import os
-import uuid
 from datetime import datetime, timedelta
 
 from airflow.providers.standard.sensors.python import PythonSensor
@@ -15,11 +14,11 @@ from description_pipeline.orchestration.airflow_client import (
     WindowsEndpoint,
     check_result,
     config_from_airflow_connection,
-    validate_package,
-    validate_revision_sha,
+    native_run_id,
 )
 
 DAG_ID = "solidworks_to_urdf"
+CONN_ID = os.environ.get("SOLIDWORKS_ENDPOINT_CONN_ID", "solidworks_windows")
 SENSOR_MODE = os.environ.get("SOLIDWORKS_SENSOR_MODE", "reschedule")
 POLL_INTERVAL = float(os.environ.get("SOLIDWORKS_POLL_INTERVAL", "10"))
 POLL_TIMEOUT = float(os.environ.get("SOLIDWORKS_TIMEOUT", "3600"))
@@ -31,7 +30,7 @@ def _endpoint(conn_id: str) -> WindowsEndpoint:
 
 
 def _run_uuid(context) -> str:
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{DAG_ID}:{context['dag_run'].run_id}"))
+    return native_run_id(context["dag_run"].run_id)
 
 
 def _poke(request: dict) -> bool:
@@ -53,7 +52,10 @@ def _poke(request: dict) -> bool:
 
 
 def _same_request(job: dict, request: dict) -> None:
-    expected = {key: request[key] for key in ("run_id", "package", "revision_sha256", "target")}
+    keys = ["run_id", "package", "revision_sha256", "target"]
+    if "handoff_sha256" in request:
+        keys.append("handoff_sha256")
+    expected = {key: request[key] for key in keys}
     if job.get("request") != expected:
         raise AirflowFailException("Endpoint job differs from the requested mechanical handoff")
 
@@ -66,37 +68,45 @@ def _same_request(job: dict, request: dict) -> None:
     tags=["solidworks", "urdf", "windows"],
     default_args={"retries": 2, "retry_delay": timedelta(seconds=15)},
     params={
-        "package": Param("", type="string", description="POSIX relative package path"),
-        "revision_sha256": Param("", type="string", description="sealed cad-revision.json digest"),
-        "target": Param("", type="string", description="configured repository alias"),
-        "repository_slug": Param("", type="string", description="expected origin owner/repo"),
-        "base": Param("", type="string", description="expected base branch feature/<hardware>"),
-        "conn_id": Param("solidworks_windows", type="string", description="Airflow connection"),
+        "handoff_path": Param(
+            "",
+            type="string",
+            title="Handoff folder path",
+            description=(
+                "Folder the Windows endpoint inspects (an absolute Linux folder is archived and "
+                "imported before the run starts)"
+            ),
+        ),
     },
 )
 def solidworks_to_urdf():
     @task
-    def validate_request(**context) -> dict:
-        params = context["params"]
-        package = validate_package(params["package"])
-        revision_sha256 = validate_revision_sha(params["revision_sha256"])
-        target = str(params["target"]).strip()
-        if not target:
-            raise AirflowFailException("target repository alias is required")
-        repository_slug = str(params["repository_slug"]).strip()
-        base = str(params["base"]).strip()
-        if not repository_slug or "/" not in repository_slug or not base.startswith("feature/"):
-            raise AirflowFailException("repository_slug and feature/<hardware> base are required")
+    def resolve_handoff(**context) -> dict:
+        handoff_path = str(context["params"]["handoff_path"]).strip()
+        if not handoff_path:
+            raise AirflowFailException("handoff_path is required")
+        resolved = _endpoint(CONN_ID).resolve_handoff(handoff_path)
         run_id = _run_uuid(context)
-        log.info("queue run_id=%s package=%s target=%s endpoint_conn=%s", run_id, package, target, params["conn_id"])
+        log.info(
+            "resolved handoff_path=%s package=%s handoff_sha256=%s hardware_id=%s target=%s endpoint_conn=%s",
+            handoff_path,
+            resolved.package,
+            resolved.handoff_sha256,
+            resolved.hardware_id,
+            resolved.target,
+            CONN_ID,
+        )
         return {
             "run_id": run_id,
-            "package": package,
-            "revision_sha256": revision_sha256,
-            "target": target,
-            "repository_slug": repository_slug,
-            "base": base,
-            "conn_id": params["conn_id"],
+            "package": resolved.package,
+            "revision_sha256": resolved.revision_sha256,
+            "handoff_sha256": resolved.handoff_sha256,
+            "target": resolved.target,
+            "repository_slug": resolved.repository_slug,
+            "base": resolved.base,
+            "hardware_id": resolved.hardware_id,
+            "revision": resolved.revision,
+            "conn_id": CONN_ID,
         }
 
     @task
@@ -106,6 +116,7 @@ def solidworks_to_urdf():
             package=request["package"],
             revision_sha256=request["revision_sha256"],
             target=request["target"],
+            handoff_sha256=request.get("handoff_sha256"),
         )
         log.info("started run_id=%s status=%s", job["run_id"], job["status"])
         return {**request, "status": job["status"]}
@@ -132,12 +143,22 @@ def solidworks_to_urdf():
         return {
             "run_id": request["run_id"],
             "pipeline_id": result["pipeline_id"],
+            "handoff": {
+                "package": request["package"],
+                "revision_sha256": request["revision_sha256"],
+                "handoff_sha256": request["handoff_sha256"],
+                "hardware_id": request["hardware_id"],
+                "revision": request["revision"],
+                "target": request["target"],
+                "repository_slug": request["repository_slug"],
+                "base": request["base"],
+            },
             "events": job["events"],
             "quality": result["quality"],
             "submission": result["submission"],
         }
 
-    request = validate_request()
+    request = resolve_handoff()
     started = start_job(request)
     wait_for_job = PythonSensor(
         task_id="wait_for_job",

@@ -6,6 +6,10 @@ The endpoint contract is fixed and carries no shell or local paths:
   a different payload for the same run_id is HTTP 409);
 * ``GET /v1/jobs/<uuid>`` returns status/events/result/error;
 * ``GET /health`` exposes only ``pipeline_id`` and readiness.
+* ``POST /v1/handoffs/resolve`` with ``{handoff_path}`` resolves one operator-supplied folder to the
+  managed package, sealed revision digest, complete-package digest, hardware id and repository
+  target/slug/base; an absolute POSIX path is archived locally and sent to
+  ``POST /v1/handoffs/import`` (``application/zip``) instead.
 
 Plaintext HTTP is allowed only for loopback hosts; anything remote requires TLS.
 """
@@ -14,12 +18,14 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
 from collections.abc import Callable
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib import error as urlerror
 from urllib import parse as urlparse
@@ -29,6 +35,8 @@ from ..delivery import PIPELINE_ID
 from ..io import PipelineError, artifact_path_parts
 
 JOB_SCHEMA = "solidworks-to-urdf.job/v1"
+HANDOFF_SCHEMA = "solidworks-to-urdf.handoff/v1"
+NATIVE_RUN_NAMESPACE = "solidworks_to_urdf"
 EVENT_KEYS = ("stage", "state", "at")
 RUN_STATES = {"queued", "running", "passed", "failed"}
 TERMINAL_STATES = {"passed", "failed"}
@@ -38,6 +46,7 @@ _PULL_URL = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/pull/[1-9]\d*\Z")
 _REVIEW_BRANCH = re.compile(r"work/solidworks/[a-z0-9_.-]+\Z")
 SUBMISSION_STATES = {"published", "updated", "noop"}
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 
 class EndpointError(RuntimeError):
@@ -79,23 +88,59 @@ def validate_run_id(value: str) -> str:
     return canonical
 
 
-def validate_package(value: str) -> str:
+def native_run_id(dag_run_id: str) -> str:
+    """The canonical native job UUID for one Airflow DAG run id (stable across retries)."""
+    if not isinstance(dag_run_id, str) or not dag_run_id.strip():
+        raise EndpointProtocolError("dag_run_id must be a non-empty string")
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{NATIVE_RUN_NAMESPACE}:{dag_run_id}"))
+
+
+def _validate_relative_path(value: str, field: str) -> str:
     if not isinstance(value, str) or not value or "\\" in value:
-        raise EndpointProtocolError("package must be a POSIX relative path")
+        raise EndpointProtocolError(f"{field} must be a POSIX relative path")
     try:
         artifact_path_parts(value)
     except PipelineError as error:
-        raise EndpointProtocolError("package must be a portable relative path") from error
+        raise EndpointProtocolError(f"{field} must be a portable relative path") from error
     path = PurePosixPath(value)
     if path.is_absolute() or any(segment in {"", ".", ".."} for segment in value.split("/")):
-        raise EndpointProtocolError(f"package must stay inside the configured root: {value!r}")
+        raise EndpointProtocolError(f"{field} must stay inside the delivery: {value!r}")
     return path.as_posix()
+
+
+def validate_package(value: str) -> str:
+    return _validate_relative_path(value, "package")
+
+
+def validate_artifact_name(value: str) -> str:
+    return _validate_relative_path(value, "artifact name")
 
 
 def validate_revision_sha(value: str) -> str:
     if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
         raise EndpointProtocolError("revision_sha256 must be a lowercase SHA-256 digest")
     return value
+
+
+def validate_handoff_sha(value: str) -> str:
+    if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+        raise EndpointProtocolError("handoff_sha256 must be a lowercase SHA-256 digest")
+    return value
+
+
+def validate_handoff_path(value: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise EndpointProtocolError("handoff_path must be a non-empty path")
+    path = value.strip()
+    if _CONTROL.search(path):
+        raise EndpointProtocolError("handoff_path must not contain control characters")
+    return path
+
+
+def validate_hardware_id(value: str) -> str:
+    if not isinstance(value, str) or not value.strip() or _CONTROL.search(value):
+        raise EndpointProtocolError("hardware_id must be non-empty text")
+    return value.strip()
 
 
 def _validate_base_url(url: str) -> str:
@@ -146,6 +191,50 @@ def config_from_airflow_connection(conn_id: str, *, timeout: float = 30.0) -> En
     return EndpointConfig(base_url=host, token=connection.password or "", timeout=float(extra.get("timeout", timeout)))
 
 
+@dataclass(frozen=True)
+class HandoffResolution:
+    """One operator path resolved to the exact mechanical handoff the endpoint will run."""
+
+    package: str
+    revision_sha256: str
+    handoff_sha256: str
+    hardware_id: str
+    revision: str
+    target: str
+    repository_slug: str
+    base: str
+
+    @classmethod
+    def from_payload(cls, payload: dict) -> HandoffResolution:
+        if not isinstance(payload, dict):
+            raise EndpointProtocolError("handoff resolution is not a JSON object")
+        if payload.get("schema_version") != HANDOFF_SCHEMA:
+            raise EndpointProtocolError(f"unexpected handoff schema: {payload.get('schema_version')!r}")
+        if payload.get("pipeline_id") != PIPELINE_ID:
+            raise EndpointProtocolError(f"unexpected pipeline_id: {payload.get('pipeline_id')!r}")
+        target = _resolution_text(payload.get("target"), "target")
+        repository_slug = _resolution_text(payload.get("repository_slug"), "repository_slug")
+        base = _resolution_text(payload.get("base"), "base")
+        if "/" not in repository_slug or not base.startswith("feature/"):
+            raise EndpointProtocolError("handoff resolution must carry repository_slug and a feature/<hardware> base")
+        return cls(
+            package=validate_package(payload.get("package")),
+            revision_sha256=validate_revision_sha(payload.get("revision_sha256")),
+            handoff_sha256=validate_handoff_sha(payload.get("handoff_sha256")),
+            hardware_id=validate_hardware_id(payload.get("hardware_id")),
+            revision=_resolution_text(payload.get("revision"), "revision"),
+            target=target,
+            repository_slug=repository_slug,
+            base=base,
+        )
+
+
+def _resolution_text(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value.strip() or _CONTROL.search(value):
+        raise EndpointProtocolError(f"handoff resolution field {field!r} must be non-empty text")
+    return value.strip()
+
+
 class WindowsEndpoint:
     """Small JSON client; injectable opener keeps it testable without network."""
 
@@ -162,18 +251,7 @@ class WindowsEndpoint:
         self._sleep = sleeper
         self._clock = clock
 
-    def _request(self, method: str, path: str, payload: dict | None = None) -> dict:
-        body = None if payload is None else json.dumps(payload).encode("utf-8")
-        request = urlrequest.Request(
-            self.config.base_url + path,
-            data=body,
-            method=method,
-            headers={
-                "Authorization": f"Bearer {self.config.token}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-        )
+    def _exchange(self, request: urlrequest.Request) -> dict:
         try:
             with self._opener(request, timeout=self.config.timeout) as response:
                 data = json.loads(response.read().decode("utf-8") or "{}")
@@ -191,6 +269,63 @@ class WindowsEndpoint:
             raise EndpointProtocolError("endpoint response is not a JSON object")
         return data
 
+    def _request(self, method: str, path: str, payload: dict | None = None) -> dict:
+        body = None if payload is None else json.dumps(payload).encode("utf-8")
+        return self._exchange(
+            urlrequest.Request(
+                self.config.base_url + path,
+                data=body,
+                method=method,
+                headers={
+                    "Authorization": f"Bearer {self.config.token}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+            )
+        )
+
+    def _request_stream(self, method: str, path: str, source: Any, *, size: int) -> dict:
+        """Stream one file body with a fixed Content-Length (no chunked upload)."""
+        return self._exchange(
+            urlrequest.Request(
+                self.config.base_url + path,
+                data=source,
+                method=method,
+                headers={
+                    "Authorization": f"Bearer {self.config.token}",
+                    "Content-Type": "application/zip",
+                    "Accept": "application/json",
+                    "Content-Length": str(size),
+                },
+            )
+        )
+
+    def resolve_handoff(self, handoff_path: str) -> HandoffResolution:
+        """Resolve one operator path; an absolute POSIX folder is ZIP-imported first."""
+        path = validate_handoff_path(handoff_path)
+        if os.name == "posix" and PurePosixPath(path).is_absolute():
+            return self._import_handoff(Path(path))
+        return HandoffResolution.from_payload(self._request("POST", "/v1/handoffs/resolve", {"handoff_path": path}))
+
+    def _import_handoff(self, source: Path) -> HandoffResolution:
+        from .handoffs import prepare_archive
+
+        if not source.is_dir():
+            raise EndpointProtocolError(f"handoff_path is not a directory: {source}")
+        with tempfile.TemporaryDirectory(prefix="handoff-import-") as tmp:
+            archive = Path(tmp) / "handoff.zip"
+            identity = prepare_archive(source, archive)
+            size = archive.stat().st_size
+            if size <= 0:
+                raise EndpointProtocolError("prepared handoff archive is empty")
+            with archive.open("rb") as handle:
+                payload = self._request_stream("POST", "/v1/handoffs/import", handle, size=size)
+        resolved = HandoffResolution.from_payload(payload)
+        expected = str((identity or {}).get("handoff_sha256") or "")
+        if resolved.handoff_sha256 != expected:
+            raise EndpointProtocolError("endpoint stored a different handoff digest than the uploaded archive")
+        return resolved
+
     def health(self) -> dict:
         payload = self._request("GET", "/health")
         if payload.get("pipeline_id") != PIPELINE_ID:
@@ -199,7 +334,9 @@ class WindowsEndpoint:
             raise EndpointProtocolError("health response must include readiness")
         return payload
 
-    def start_job(self, *, run_id: str, package: str, revision_sha256: str, target: str) -> dict:
+    def start_job(
+        self, *, run_id: str, package: str, revision_sha256: str, target: str, handoff_sha256: str | None = None
+    ) -> dict:
         payload = {
             "run_id": validate_run_id(run_id),
             "package": validate_package(package),
@@ -208,6 +345,8 @@ class WindowsEndpoint:
         }
         if not payload["target"]:
             raise EndpointProtocolError("target must be a configured repository alias")
+        if handoff_sha256 is not None:
+            payload["handoff_sha256"] = validate_handoff_sha(handoff_sha256)
         response = self._request("POST", "/v1/jobs", payload)
         if response.get("run_id") != payload["run_id"]:
             raise EndpointProtocolError("endpoint returned a different run_id")
@@ -237,6 +376,50 @@ class WindowsEndpoint:
             if not isinstance(event, dict) or any(key not in event for key in EVENT_KEYS):
                 raise EndpointProtocolError("Events must carry stage, state and timestamp")
         return job
+
+    def get_preview(self, run_id: str) -> dict:
+        """Preview metadata of one passed, bound delivery (operator portal entry point)."""
+        canonical = validate_run_id(run_id)
+        preview = self._request("GET", f"/v1/jobs/{canonical}/preview")
+        if preview.get("pipeline_id") != PIPELINE_ID:
+            raise EndpointProtocolError(f"unexpected pipeline_id: {preview.get('pipeline_id')!r}")
+        if preview.get("run_id") != canonical:
+            raise EndpointProtocolError("preview returned a different run_id")
+        subject = preview.get("subject_sha256")
+        if not isinstance(subject, str) or _SHA256.fullmatch(subject) is None:
+            raise EndpointProtocolError("preview must carry the subject_sha256 digest")
+        urdf = validate_artifact_name(preview.get("urdf"))
+        files = preview.get("files")
+        if not isinstance(files, dict) or not files:
+            raise EndpointProtocolError("preview must list the delivered files")
+        for name, digest in files.items():
+            validate_artifact_name(name)
+            if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
+                raise EndpointProtocolError("preview file digests must be lowercase SHA-256")
+        if urdf not in files:
+            raise EndpointProtocolError("preview urdf must be one of the delivered files")
+        return preview
+
+    def open_artifact(self, run_id: str, name: str) -> Any:
+        """Open one verified delivery artifact for streaming; the caller closes the response."""
+        canonical = validate_run_id(run_id)
+        artifact = validate_artifact_name(name)
+        encoded = urlparse.quote(artifact, safe="/")
+        request = urlrequest.Request(
+            f"{self.config.base_url}/v1/jobs/{canonical}/artifacts/{encoded}",
+            method="GET",
+            headers={"Authorization": f"Bearer {self.config.token}", "Accept": "*/*"},
+        )
+        try:
+            return self._opener(request, timeout=self.config.timeout)
+        except urlerror.HTTPError as error:
+            if error.code in {401, 403}:
+                raise EndpointAuthError(f"endpoint rejected the bearer token ({error.code})") from error
+            if error.code == 404:
+                raise EndpointError(f"artifact {artifact!r} is not part of run {canonical}") from error
+            raise EndpointError(f"endpoint returned HTTP {error.code}") from error
+        except urlerror.URLError as error:
+            raise EndpointError(f"endpoint unreachable: {error.reason}") from error
 
     def wait(self, run_id: str, *, interval: float = 2.0, timeout: float = 600.0) -> dict:
         """Bounded polling; returns the job dict only for the terminal passed state."""

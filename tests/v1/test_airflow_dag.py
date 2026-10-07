@@ -28,7 +28,11 @@ class DagTests(unittest.TestCase):
         self.assertEqual(bag.import_errors, {})
         dag = bag.dags["solidworks_to_urdf"]
         self.assertIsNone(dag.schedule)
-        self.assertEqual(set(dag.task_ids), {"validate_request", "start_job", "wait_for_job", "confirm_job"})
+        self.assertEqual(set(dag.task_ids), {"resolve_handoff", "start_job", "wait_for_job", "confirm_job"})
+        self.assertEqual(set(dag.params), {"handoff_path"})
+        handoff_param = dict(dag.params.items())["handoff_path"]
+        self.assertEqual(handoff_param.schema["title"], "Handoff folder path")
+        self.assertEqual(handoff_param.schema["type"], "string")
 
     def test_dag_run_against_mock_endpoint(self) -> None:
         from tests.v1.test_airflow_client import MockEndpoint
@@ -56,11 +60,7 @@ class DagTests(unittest.TestCase):
             )
             conf = json.dumps(
                 {
-                    "package": "handoff/m3.0",
-                    "revision_sha256": "a" * 64,
-                    "target": "local",
-                    "repository_slug": "example/m3.0",
-                    "base": "feature/m3.0",
+                    "handoff_path": "handoff/m3.0",
                 }
             )
             result = subprocess.run(
@@ -76,6 +76,9 @@ class DagTests(unittest.TestCase):
             job = next(iter(server.jobs.values()))
             self.assertEqual(job["status"], "passed")
             self.assertEqual(job["request"]["package"], "handoff/m3.0")
+            self.assertEqual(job["request"]["handoff_sha256"], "b" * 64)
+            self.assertEqual(job["request"]["target"], "m3")
+            self.assertEqual(server.resolved_paths, ["handoff/m3.0"])
 
 
 if __name__ == "__main__":
