@@ -84,6 +84,14 @@ AXIS_OFFSET_TOL_M = 5e-5
 CONTROL_SYSTEMS = ("git", "pdm", "handoff")
 
 _SNAKE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+#: Datum name spaces the spec recognises: link frames, tool/sensor interfaces
+#: and joint frames.  A ``CS_*`` datum whose suffix is an interface qualifier
+#: (``..._mount``, ``..._frame``, ...) is a mount interface, never the link
+#: frame itself.
+INTERFACE_PREFIXES = ("CS_", "TCP_", "SCS_")
+INTERFACE_SUFFIXES = ("_mount", "_frame", "_datum", "_tcp", "_scs", "_sensor", "_tool")
+JCS_PREFIX = "JCS_"
 _TOL = 1e-6
 
 #: Mate types whose constraint rows this module can reconstruct from recorded
@@ -1147,7 +1155,9 @@ def _body_records(
         owned = [
             datum
             for datum in datums
-            if str(datum.get("owner") or "") in members and str(datum.get("name")).startswith("CS_")
+            if str(datum.get("owner") or "") in members
+            and str(datum.get("name")).startswith("CS_")
+            and not _is_interface_suffix(str(datum.get("name")))
         ]
         if explicit is not None:
             datum = _datum(record, explicit)
@@ -1255,6 +1265,134 @@ def _body_records(
         else:
             seen[body["name"]] = body["root"]
     return bodies, by_root
+
+
+def _is_interface_suffix(name: str) -> bool:
+    return any(str(name).endswith(suffix) for suffix in INTERFACE_SUFFIXES)
+
+
+def _interface_frames(
+    record: dict,
+    clusters: _Clusters,
+    bodies: list[dict],
+    findings: list[dict],
+) -> list[dict]:
+    """Every recognised named native interface becomes a source frame.
+
+    A recognised datum is never dropped silently: an interface that cannot be
+    attributed to a body, or whose derived name is not an exact snake_case
+    name, blocks the package.
+    """
+
+    body_of_component: dict[str, dict] = {}
+    for body in bodies:
+        for component in body["components"]:
+            body_of_component[component] = body
+    link_datums = {str(body.get("datum")) for body in bodies}
+    frames: list[dict] = []
+    seen: dict[str, str] = {}
+    for datum in record.get("datums") or []:
+        if not isinstance(datum, dict):
+            continue
+        name = str(datum.get("name") or "")
+        if not name.startswith(INTERFACE_PREFIXES):
+            continue
+        if name in link_datums:
+            continue
+        owner = str(datum.get("owner") or "")
+        body = body_of_component.get(owner)
+        if body is None:
+            findings.append(
+                _finding(
+                    "discovery.interface_unowned",
+                    f"datum:{name}",
+                    "recognised interface datum is not owned by any body",
+                    {"owner": owner},
+                )
+            )
+            continue
+        frame_name = name.lower()
+        if _SNAKE.fullmatch(frame_name) is None:
+            findings.append(
+                _finding(
+                    "discovery.interface_name_invalid",
+                    f"datum:{name}",
+                    "interface datum must be <PREFIX>_<snake_case>",
+                )
+            )
+            continue
+        if frame_name in seen:
+            findings.append(
+                _finding(
+                    "discovery.interface_name_duplicate",
+                    f"datum:{name}",
+                    "two interface datums derive the same frame name",
+                    {"other": seen[frame_name]},
+                )
+            )
+            continue
+        seen[frame_name] = name
+        frames.append(
+            {
+                "id": frame_name,
+                "name": frame_name,
+                "parent": body["name"],
+                "coordinate_system": name,
+            }
+        )
+    return frames
+
+
+def _jcs_check(record: dict, joints: list[dict], by_name: dict[str, dict], findings: list[dict]) -> None:
+    """``JCS_<joint>`` must alias the child body datum the compiler uses.
+
+    The current compiler places the joint frame at the child body's datum; a
+    JCS that disagrees would be silently ignored, so it blocks instead.
+    """
+
+    named = {str(joint.get("name")): joint for joint in joints if joint.get("name")}
+    for datum in record.get("datums") or []:
+        if not isinstance(datum, dict):
+            continue
+        name = str(datum.get("name") or "")
+        if not name.startswith(JCS_PREFIX):
+            continue
+        joint_name = name[len(JCS_PREFIX) :]
+        joint = named.get(joint_name)
+        if joint is None or "child" not in joint:
+            findings.append(
+                _finding(
+                    "discovery.jcs_unmatched",
+                    f"datum:{name}",
+                    "JCS_<joint> names no discovered joint",
+                )
+            )
+            continue
+        child = by_name.get(str(joint["child"]))
+        child_datum = _datum(record, child["datum"]) if child else None
+        alias = [float(value) for value in datum.get("array") or ()]
+        reference = [float(value) for value in (child_datum or {}).get("array") or ()]
+        if (
+            len(alias) != 16
+            or len(reference) != 16
+            or any(abs(one - two) > 1e-6 for one, two in zip(alias, reference, strict=True))
+        ):
+            findings.append(
+                _finding(
+                    "discovery.jcs_mismatch",
+                    f"datum:{name}",
+                    "JCS_ frame differs from the child body datum the compiler places the joint at",
+                )
+            )
+        else:
+            findings.append(
+                _finding(
+                    "discovery.jcs_alias",
+                    f"datum:{name}",
+                    "JCS_ frame aliases the child body datum",
+                    blocking=False,
+                )
+            )
 
 
 def _root_body(
@@ -1832,6 +1970,8 @@ def prepare_native_package(
             seen_names[body["name"]] = body["root"]
     by_name = {body["name"]: body for body in bodies}
     _frame_checks(joints, by_name, record, findings)
+    frames = _interface_frames(record, clusters, bodies, findings)
+    _jcs_check(record, joints, by_name, findings)
     blocking = [item for item in findings if item["blocking"]]
     output.mkdir(parents=True, exist_ok=True)
     discovery_path = output / DISCOVERY_FILE
@@ -1853,6 +1993,7 @@ def prepare_native_package(
             }
             for joint in joints
         ],
+        "frames": frames,
     }
     payload = {
         "schema_version": DISCOVERY_SCHEMA,
@@ -1911,7 +2052,7 @@ def prepare_native_package(
         write_json(discovery_path, payload)
         discovery_sha256 = hashlib.sha256(discovery_path.read_bytes()).hexdigest()
     document = _robot_document(
-        identity, bodies, joints, record, settings, records, checks, run_id, discovery_sha256, handoff_sha256
+        identity, bodies, joints, record, settings, records, checks, frames, run_id, discovery_sha256, handoff_sha256
     )
     _write_yaml(output / ROBOT_FILE, document)
     seal_revision(
@@ -1952,6 +2093,7 @@ def _robot_document(
     settings: DiscoverySettings,
     records: list[dict],
     checks: dict | None,
+    frames: list[dict],
     run_id: str,
     discovery_sha256: str,
     handoff_sha256: str,
@@ -1975,6 +2117,16 @@ def _robot_document(
         "joints": [],
         "material_source": "cad",
     }
+    if frames:
+        source["frames"] = [
+            {
+                "id": frame["id"],
+                "name": frame["name"],
+                "parent": frame["parent"],
+                "coordinate_system": frame["coordinate_system"],
+            }
+            for frame in sorted(frames, key=lambda item: item["name"])
+        ]
     for joint in sorted(joints, key=lambda item: item.get("name") or ""):
         if "parent" not in joint or "name" not in joint:
             continue

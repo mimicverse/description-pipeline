@@ -109,7 +109,7 @@ def record() -> dict:
         ],
         "mates": [
             {
-                "name": "shoulder_pitch__axis",
+                "name": "shoulder_pitch_joint__coaxial",
                 "type": "concentric",
                 "suppressed": False,
                 "limits": None,
@@ -129,7 +129,7 @@ def record() -> dict:
                 ],
             },
             {
-                "name": "shoulder_pitch__seat",
+                "name": "shoulder_pitch_joint__locate",
                 "type": "coincident",
                 "suppressed": False,
                 "limits": None,
@@ -149,7 +149,7 @@ def record() -> dict:
         ],
         "datums": [
             {"name": "CS_base_link", "owner": "base-1", "array": copy.deepcopy(IDENTITY)},
-            {"name": "CS_arm", "owner": "arm-1", "array": _translated(0.0, 0.0, 0.1)},
+            {"name": "CS_arm_link", "owner": "arm-1", "array": _translated(0.0, 0.0, 0.1)},
         ],
         "masses": [
             {"component": "base-1", "mass_kg": 0.192, "material": "Alloy Steel"},
@@ -161,7 +161,7 @@ def record() -> dict:
             "document": {"dp.design_budget_record": "budget.json#robot"},
             "components": {},
             "mates": {
-                "shoulder_pitch__axis": {
+                "shoulder_pitch_joint__coaxial": {
                     "dp.joint.limits_record": "joints/arm.json#limits",
                     "dp.joint.drive_record": "joints/arm.json#drive",
                 }
@@ -248,15 +248,15 @@ class DiscoveryTests(unittest.TestCase):
         for name in ("cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT"):
             self.assertEqual((output / name).read_bytes(), (source / name).read_bytes())
         source_block = document["source"]
-        self.assertEqual([body["name"] for body in source_block["bodies"]], ["arm", "base_link"])
+        self.assertEqual([body["name"] for body in source_block["bodies"]], ["arm_link", "base_link"])
         self.assertEqual(
             {body["name"]: body["frame"]["coordinate_system"] for body in source_block["bodies"]},
-            {"arm": "CS_arm", "base_link": "CS_base_link"},
+            {"arm_link": "CS_arm_link", "base_link": "CS_base_link"},
         )
         joint = source_block["joints"][0]
-        self.assertEqual(joint["name"], "shoulder_pitch")
+        self.assertEqual(joint["name"], "shoulder_pitch_joint")
         self.assertEqual(joint["type"], "revolute")
-        self.assertEqual((joint["parent"], joint["child"]), ("base_link", "arm"))
+        self.assertEqual((joint["parent"], joint["child"]), ("base_link", "arm_link"))
         self.assertEqual(joint["axis"], [0.0, 0.0, 1.0])
         self.assertEqual(joint["limits"], {"lower": -1.5, "upper": 1.5, "effort": 6.0, "velocity": 2.0})
         self.assertEqual(joint["axis_reference"]["component"], "base-1")
@@ -323,11 +323,15 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_missing_limits_and_drive_block(self):
         result, _source, _output = self._prepare(
-            mutate=lambda payload: payload["properties"]["mates"]["shoulder_pitch__axis"].pop("dp.joint.limits_record")
+            mutate=lambda payload: payload["properties"]["mates"]["shoulder_pitch_joint__coaxial"].pop(
+                "dp.joint.limits_record"
+            )
         )
         self.assertIn("discovery.joint_limits_missing", self._codes(result))
         result, _source, _output = self._prepare(
-            mutate=lambda payload: payload["properties"]["mates"]["shoulder_pitch__axis"].pop("dp.joint.drive_record")
+            mutate=lambda payload: payload["properties"]["mates"]["shoulder_pitch_joint__coaxial"].pop(
+                "dp.joint.drive_record"
+            )
         )
         self.assertIn("discovery.joint_drive_missing", self._codes(result))
 
@@ -386,7 +390,7 @@ class DiscoveryTests(unittest.TestCase):
             }
             seat["entities"][0]["plane"] = {"point": [0.3, 0.3, 0.5], "normal": [0.0, 1.0, 0.0]}
             seat["entities"][1]["plane"] = {"point": [0.3, -0.5, 0.3], "normal": [0.0, 0.0, 1.0]}
-            datum = next(item for item in payload["datums"] if item["name"] == "CS_arm")
+            datum = next(item for item in payload["datums"] if item["name"] == "CS_arm_link")
             datum["array"] = _translated(0.3, 0.35, 0.5)
 
         result, _source, output = self._prepare(mutate=mutate)
@@ -399,7 +403,7 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_child_frame_off_the_native_axis_blocks(self):
         def mutate(payload):
-            datum = next(item for item in payload["datums"] if item["name"] == "CS_arm")
+            datum = next(item for item in payload["datums"] if item["name"] == "CS_arm_link")
             datum["array"] = _translated(0.4, 0.0, 0.1)
 
         result, _source, _output = self._prepare(mutate=mutate)
@@ -408,7 +412,9 @@ class DiscoveryTests(unittest.TestCase):
     def test_mate_group_naming_is_required(self):
         def mutate(payload):
             payload["mates"][0]["name"] = "Concentric1"
-            payload["properties"]["mates"]["Concentric1"] = payload["properties"]["mates"].pop("shoulder_pitch__axis")
+            payload["properties"]["mates"]["Concentric1"] = payload["properties"]["mates"].pop(
+                "shoulder_pitch_joint__coaxial"
+            )
 
         result, _source, _output = self._prepare(mutate=mutate)
         self.assertIn("discovery.joint_name_missing", self._codes(result))
@@ -452,7 +458,7 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_conflicting_joint_scalar_sources_block(self):
         def mutate(payload):
-            payload["properties"]["document"]["dp.joint.shoulder_pitch.drive_record"] = "other.json#drive"
+            payload["properties"]["document"]["dp.joint.shoulder_pitch_joint.drive_record"] = "other.json#drive"
 
         result, _source, _output = self._prepare(mutate=mutate)
         self.assertIn("discovery.joint_property_conflict", self._codes(result))
@@ -479,6 +485,77 @@ class DiscoveryTests(unittest.TestCase):
 
         result, _source, _output = self._prepare(mutate=mutate)
         self.assertIn("discovery.joint_axis_misaligned", self._codes(result))
+
+    def test_interface_datums_become_frames_and_never_bind_links(self):
+        def mutate(payload):
+            payload["datums"].append(
+                {"name": "CS_arm_link_mount", "owner": "arm-1", "array": _translated(0.0, 0.0, 0.2)}
+            )
+            payload["datums"].append({"name": "TCP_pinch", "owner": "arm-1", "array": _translated(0.0, 0.0, 0.3)})
+
+        result, _source, output = self._prepare(mutate=mutate)
+        self.assertTrue(result.passed, result.findings)
+        document = yaml.safe_load((output / "robot.yaml").read_text(encoding="utf-8"))
+        frames = document["source"]["frames"]
+        self.assertEqual(
+            {frame["name"]: (frame["parent"], frame["coordinate_system"]) for frame in frames},
+            {
+                "cs_arm_link_mount": ("arm_link", "CS_arm_link_mount"),
+                "tcp_pinch": ("arm_link", "TCP_pinch"),
+            },
+        )
+        names = [body["name"] for body in document["source"]["bodies"]]
+        self.assertEqual(names, ["arm_link", "base_link"])
+        self.assertTrue(verify_discovery(output)["passed"])
+
+    def test_unowned_interface_datum_blocks(self):
+        result, _source, _output = self._prepare(
+            mutate=lambda payload: payload["datums"].append(
+                {"name": "TCP_loose", "owner": "ghost-1", "array": _translated(0.0, 0.0, 0.4)}
+            )
+        )
+        self.assertIn("discovery.interface_unowned", self._codes(result))
+
+    def test_dropped_frame_is_rejected_by_the_oracle(self):
+        def mutate(payload):
+            payload["datums"].append({"name": "TCP_pinch", "owner": "arm-1", "array": _translated(0.0, 0.0, 0.3)})
+
+        result, _source, output = self._prepare(mutate=mutate)
+        self.assertTrue(result.passed, result.findings)
+        destination = self.tmp / "no-frame"
+        shutil.copytree(output, destination)
+        document = yaml.safe_load((destination / "robot.yaml").read_text(encoding="utf-8"))
+        document["source"].pop("frames")
+        (destination / "robot.yaml").write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+        report = verify_discovery(destination)
+        self.assertFalse(report["passed"])
+        self.assertIn("discovery.frames", [item["code"] for item in report["errors"]])
+
+    def test_jcs_must_alias_the_child_datum(self):
+        def alias(payload):
+            child = next(datum for datum in payload["datums"] if datum["name"] == "CS_arm_link")
+            payload["datums"].append(
+                {"name": "JCS_shoulder_pitch_joint", "owner": "arm-1", "array": list(child["array"])}
+            )
+
+        result, _source, output = self._prepare(mutate=alias)
+        self.assertTrue(result.passed, result.findings)
+        self.assertIn("discovery.jcs_alias", [finding["code"] for finding in result.findings])
+        self.assertTrue(verify_discovery(output)["passed"])
+
+        def mismatch(payload):
+            child = next(datum for datum in payload["datums"] if datum["name"] == "CS_arm_link")
+            payload["datums"].append(
+                {
+                    "name": "JCS_shoulder_pitch_joint",
+                    "owner": "arm-1",
+                    "array": _translated(0.05, 0.0, 0.1),
+                }
+            )
+            del child
+
+        result, _source, _output = self._prepare(mutate=mismatch)
+        self.assertIn("discovery.jcs_mismatch", self._codes(result))
 
     # ------------------------------------------------------------ verifier gates
 

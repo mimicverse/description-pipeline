@@ -46,6 +46,9 @@ AXIS_OFFSET_TOL_M = 5e-5
 TOL = 1e-6
 
 _SNAKE = re.compile(r"^[a-z][a-z0-9_]*$")
+INTERFACE_PREFIXES = ("CS_", "TCP_", "SCS_")
+INTERFACE_SUFFIXES = ("_mount", "_frame", "_datum", "_tcp", "_scs", "_sensor", "_tool")
+JCS_PREFIX = "JCS_"
 _ID = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
 _HEX = re.compile(r"^[0-9a-f]{64}$")
 
@@ -892,6 +895,15 @@ def verify_discovery(package: Path) -> dict:
                     "the body datum must be CS_<link>",
                     {"body": name, "datum": datum_name},
                 )
+                components_properties = (raw.get("properties") or {}).get("components") or {}
+                explicit = {(components_properties.get(component) or {}).get("dp.body_datum") for component in group}
+                if datum_name not in explicit:
+                    _require(
+                        not any(str(datum_name).endswith(suffix) for suffix in INTERFACE_SUFFIXES),
+                        "discovery.names",
+                        "a suffix-qualified interface datum cannot be the link frame",
+                        {"body": name, "datum": datum_name},
+                    )
         raw_mates = raw.get("mates") or []
         joint_identities: dict[str, str] = {}
         for _key, group in sorted(pairs.items()):
@@ -1254,24 +1266,84 @@ def verify_discovery(package: Path) -> dict:
         payload = state["payload"]
         raw = payload["raw"]
         source = robot.get("source") or {}
-        checked = 0
-        for joint in source.get("joints") or []:
-            if str(joint.get("type")) == "fixed":
+        bodies = source.get("bodies") or []
+        component_body: dict[str, str] = {}
+        link_datums: set[str] = set()
+        body_of: dict[str, dict] = {}
+        for body in bodies:
+            body_of[str(body.get("name"))] = body
+            link_datums.add(str((body.get("frame") or {}).get("coordinate_system")))
+            for component in body.get("components") or []:
+                component_body[str(component)] = str(body.get("name"))
+        expected: dict[str, tuple[str, str]] = {}
+        for datum in raw.get("datums") or []:
+            if not isinstance(datum, dict):
                 continue
-            children = [body for body in source["bodies"] if str(body.get("name")) == str(joint.get("child"))]
-            _require(children, "discovery.frames", "a joint names no child body")
-            child = children[0]
-            datum = _datum(raw, child["frame"]["coordinate_system"])
-            frame = _frame(datum.get("array"))
-            authored = joint.get("axis")
-            axis = _local_axis(frame, authored)
-            norm = math.sqrt(sum(value * value for value in axis))
-            _require(norm > 0, "discovery.frames", "a child frame collapses its joint axis")
-            checked += 1
+            name = str(datum.get("name") or "")
+            if not name.startswith(INTERFACE_PREFIXES) or name in link_datums:
+                continue
+            owner = str(datum.get("owner") or "")
+            body = component_body.get(owner)
+            _require(
+                body is not None,
+                "discovery.frames",
+                "a recognised interface datum is not owned by any body",
+                {"datum": name, "owner": owner},
+            )
+            frame_name = name.lower()
+            _require(
+                _SNAKE.match(frame_name) is not None,
+                "discovery.frames",
+                "an interface datum does not derive an exact snake_case frame name",
+                {"datum": name},
+            )
+            _require(
+                frame_name not in expected,
+                "discovery.frames",
+                "two interface datums derive the same frame name",
+                {"datum": name},
+            )
+            expected[frame_name] = (body, name)
+        observed: dict[str, tuple[str, str]] = {}
+        for frame in source.get("frames") or []:
+            name = str(frame.get("name"))
+            _require(name not in observed, "discovery.frames", "a frame name repeats", {"frame": name})
+            observed[name] = (str(frame.get("parent")), str(frame.get("coordinate_system")))
         _require(
-            checked == len(source.get("joints") or []), "discovery.frames", "some joints carry no recomputed frame"
+            observed == expected,
+            "discovery.frames",
+            "named native interfaces were dropped or invented",
+            {
+                "missing": sorted(set(expected) - set(observed)),
+                "extra": sorted(set(observed) - set(expected)),
+                "wrong": sorted(name for name in set(observed) & set(expected) if observed[name] != expected[name]),
+            },
         )
-        return {"moving_joints": checked}
+        joints = {str(joint.get("name")): joint for joint in source.get("joints") or []}
+        jcs_seen = 0
+        for datum in raw.get("datums") or []:
+            if not isinstance(datum, dict):
+                continue
+            name = str(datum.get("name") or "")
+            if not name.startswith(JCS_PREFIX):
+                continue
+            jcs_seen += 1
+            joint = joints.get(name[len(JCS_PREFIX) :])
+            _require(joint is not None, "discovery.frames", "JCS_ names no discovered joint", {"datum": name})
+            child = body_of.get(str(joint.get("child")))
+            _require(child is not None, "discovery.frames", "JCS_ joint has no child body", {"datum": name})
+            reference = _datum(raw, (child.get("frame") or {}).get("coordinate_system"))
+            alias = [float(value) for value in datum.get("array") or ()]
+            target = [float(value) for value in (reference or {}).get("array") or ()]
+            _require(
+                len(alias) == 16
+                and len(target) == 16
+                and all(abs(one - two) <= 1e-6 for one, two in zip(alias, target, strict=True)),
+                "discovery.frames",
+                "JCS_ frame differs from the child body datum the compiler places the joint at",
+                {"datum": name},
+            )
+        return {"frames": len(expected), "jcs_aliases": jcs_seen}
 
     bound = check("discovery.binding", binding)
     dependent = (
