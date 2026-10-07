@@ -47,7 +47,6 @@ TOL = 1e-6
 
 _SNAKE = re.compile(r"^[a-z][a-z0-9_]*$")
 INTERFACE_PREFIXES = ("CS_", "TCP_", "SCS_")
-INTERFACE_SUFFIXES = ("_mount", "_frame", "_datum", "_tcp", "_scs", "_sensor", "_tool")
 JCS_PREFIX = "JCS_"
 _ID = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
 _HEX = re.compile(r"^[0-9a-f]{64}$")
@@ -897,9 +896,9 @@ def verify_discovery(package: Path) -> dict:
                 explicit = {(components_properties.get(component) or {}).get("dp.body_datum") for component in group}
                 if datum_name not in explicit:
                     _require(
-                        not any(str(datum_name).endswith(suffix) for suffix in INTERFACE_SUFFIXES),
+                        str(datum_name) == f"CS_{name}",
                         "discovery.names",
-                        "a suffix-qualified interface datum cannot be the link frame",
+                        "the body datum must be CS_<link>",
                         {"body": name, "datum": datum_name},
                     )
         raw_mates = raw.get("mates") or []
@@ -1291,18 +1290,25 @@ def verify_discovery(package: Path) -> dict:
                 "a recognised interface datum is not owned by any body",
                 {"datum": name, "owner": owner},
             )
-            frame_name = name.lower()
+            _prefix, _, suffix = name.partition("_")
             _require(
-                _SNAKE.match(frame_name) is not None,
+                _SNAKE.fullmatch(suffix) is not None,
                 "discovery.frames",
-                "an interface datum does not derive an exact snake_case frame name",
+                "an interface datum suffix is not exact snake_case",
                 {"datum": name},
             )
+            frame_name = suffix
             _require(
                 frame_name not in expected,
                 "discovery.frames",
                 "two interface datums derive the same frame name",
                 {"datum": name},
+            )
+            _require(
+                frame_name not in {str(item.get("name")) for item in source.get("bodies") or []},
+                "discovery.frames",
+                "an interface frame collides with a body name",
+                {"datum": name, "name": frame_name},
             )
             expected[frame_name] = (body, name)
         observed: dict[str, tuple[str, str]] = {}
@@ -1333,6 +1339,12 @@ def verify_discovery(package: Path) -> dict:
             _require(joint is not None, "discovery.frames", "JCS_ names no discovered joint", {"datum": name})
             child = body_of.get(str(joint.get("child")))
             _require(child is not None, "discovery.frames", "JCS_ joint has no child body", {"datum": name})
+            _require(
+                str(datum.get("owner") or "") in {str(value) for value in child.get("components") or []},
+                "discovery.frames",
+                "JCS_ datum is not owned by the child body's components",
+                {"datum": name, "owner": datum.get("owner")},
+            )
             reference = _datum(raw, (child.get("frame") or {}).get("coordinate_system"))
             alias = [float(value) for value in datum.get("array") or ()]
             target = [float(value) for value in (reference or {}).get("array") or ()]

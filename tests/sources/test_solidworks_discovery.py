@@ -492,6 +492,7 @@ class DiscoveryTests(unittest.TestCase):
                 {"name": "CS_arm_link_mount", "owner": "arm-1", "array": _translated(0.0, 0.0, 0.2)}
             )
             payload["datums"].append({"name": "TCP_pinch", "owner": "arm-1", "array": _translated(0.0, 0.0, 0.3)})
+            payload["properties"]["components"] = {"arm-1": {"dp.body_datum": "CS_arm_link"}}
 
         result, _source, output = self._prepare(mutate=mutate)
         self.assertTrue(result.passed, result.findings)
@@ -500,8 +501,8 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(
             {frame["name"]: (frame["parent"], frame["coordinate_system"]) for frame in frames},
             {
-                "cs_arm_link_mount": ("arm_link", "CS_arm_link_mount"),
-                "tcp_pinch": ("arm_link", "TCP_pinch"),
+                "arm_link_mount": ("arm_link", "CS_arm_link_mount"),
+                "pinch": ("arm_link", "TCP_pinch"),
             },
         )
         names = [body["name"] for body in document["source"]["bodies"]]
@@ -575,6 +576,29 @@ class DiscoveryTests(unittest.TestCase):
 
         result, _source, _output = self._prepare(mutate=mutate)
         self.assertIn("discovery.body_root_conflict", self._codes(result))
+
+    def test_interface_suffix_must_already_be_snake_case(self):
+        def mutate(payload):
+            payload["datums"].append({"name": "TCP_Tool", "owner": "arm-1", "array": _translated(0.0, 0.0, 0.3)})
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        self.assertIn("discovery.interface_name_invalid", self._codes(result))
+
+    def test_interface_frame_colliding_with_a_body_name_blocks(self):
+        def mutate(payload):
+            payload["datums"].append({"name": "TCP_base_link", "owner": "base-1", "array": _translated(0.0, 0.0, 0.3)})
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        self.assertIn("discovery.interface_name_duplicate", self._codes(result))
+
+    def test_two_owned_link_datums_need_an_explicit_body_datum(self):
+        def mutate(payload):
+            payload["datums"].append(
+                {"name": "CS_arm_link_backup", "owner": "arm-1", "array": _translated(0.0, 0.0, 0.2)}
+            )
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        self.assertIn("discovery.link_name_conflict", self._codes(result))
 
     # ------------------------------------------------------------ verifier gates
 

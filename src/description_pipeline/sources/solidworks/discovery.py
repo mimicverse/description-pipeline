@@ -86,11 +86,11 @@ CONTROL_SYSTEMS = ("git", "pdm", "handoff")
 _SNAKE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 #: Datum name spaces the spec recognises: link frames, tool/sensor interfaces
-#: and joint frames.  A ``CS_*`` datum whose suffix is an interface qualifier
-#: (``..._mount``, ``..._frame``, ...) is a mount interface, never the link
-#: frame itself.
+#: and joint frames.  A datum is ``<PREFIX>_<snake_case>``: the suffix must be
+#: exact snake_case before any transformation, so ``TCP_Tool`` blocks instead
+#: of silently becoming ``tcp_tool``.  Any owned ``CS_*`` datum that is not the
+#: body's link datum is a named interface frame.
 INTERFACE_PREFIXES = ("CS_", "TCP_", "SCS_")
-INTERFACE_SUFFIXES = ("_mount", "_frame", "_datum", "_tcp", "_scs", "_sensor", "_tool")
 JCS_PREFIX = "JCS_"
 _TOL = 1e-6
 
@@ -1094,9 +1094,7 @@ def _body_records(
         owned = [
             datum
             for datum in datums
-            if str(datum.get("owner") or "") in members
-            and str(datum.get("name")).startswith("CS_")
-            and not _is_interface_suffix(str(datum.get("name")))
+            if str(datum.get("owner") or "") in members and str(datum.get("name")).startswith("CS_")
         ]
         if explicit is not None:
             datum = _datum(record, explicit)
@@ -1205,10 +1203,6 @@ def _body_records(
     return bodies, by_root
 
 
-def _is_interface_suffix(name: str) -> bool:
-    return any(str(name).endswith(suffix) for suffix in INTERFACE_SUFFIXES)
-
-
 def _interface_frames(
     record: dict,
     clusters: _Clusters,
@@ -1249,16 +1243,17 @@ def _interface_frames(
                 )
             )
             continue
-        frame_name = name.lower()
-        if _SNAKE.fullmatch(frame_name) is None:
+        _prefix, _, suffix = name.partition("_")
+        if _SNAKE.fullmatch(suffix) is None:
             findings.append(
                 _finding(
                     "discovery.interface_name_invalid",
                     f"datum:{name}",
-                    "interface datum must be <PREFIX>_<snake_case>",
+                    "interface datum suffix must already be exact snake_case",
                 )
             )
             continue
+        frame_name = suffix
         if frame_name in seen:
             findings.append(
                 _finding(
@@ -1266,6 +1261,16 @@ def _interface_frames(
                     f"datum:{name}",
                     "two interface datums derive the same frame name",
                     {"other": seen[frame_name]},
+                )
+            )
+            continue
+        if frame_name in {str(body.get("name")) for body in bodies}:
+            findings.append(
+                _finding(
+                    "discovery.interface_name_duplicate",
+                    f"datum:{name}",
+                    "an interface frame collides with a body name under the shared name contract",
+                    {"name": frame_name},
                 )
             )
             continue
@@ -1307,6 +1312,16 @@ def _jcs_check(record: dict, joints: list[dict], by_name: dict[str, dict], findi
             )
             continue
         child = by_name.get(str(joint["child"]))
+        if child is not None and str(datum.get("owner") or "") not in child["components"]:
+            findings.append(
+                _finding(
+                    "discovery.jcs_owner_mismatch",
+                    f"datum:{name}",
+                    "JCS_ datum is not owned by the child body's components",
+                    {"owner": datum.get("owner"), "child": joint["child"]},
+                )
+            )
+            continue
         child_datum = _datum(record, child["datum"]) if child else None
         alias = [float(value) for value in datum.get("array") or ()]
         reference = [float(value) for value in (child_datum or {}).get("array") or ()]
