@@ -4,8 +4,9 @@
 self-contained URDF delivery and submits it as a pull request.
 
 ```text
-CAD package + robot.yaml + cad-revision.json
-  → inspect → native capture → URDF → independent verification → PR
+SolidWorks assembly and native engineering contents
+  → collect and freeze → read CAD → derive robot definition
+  → URDF → independent verification → PR
 ```
 
 Fresh capture runs on Windows with licensed SolidWorks 2026 (revision 34).
@@ -15,8 +16,10 @@ also check and rebuild a frozen delivery without CAD.
 
 ## Operator workflow
 
-Mechanical engineers prepare the delivery directory exactly as the
-[mechanical handoff specification](docs/mechanical-handoff-spec.md) requires.
+Mechanical engineers provide only the saved SolidWorks engineering directory
+under the [mechanical specification](docs/mechanical-handoff-spec.md).
+The pipeline generates `robot.yaml`, revision manifests, evidence and reports;
+none is a mechanical-team input.
 The target operator interface is one authenticated URL and one folder field:
 
 1. **Select or paste one compliant handoff-folder path.** Absolute Linux paths,
@@ -27,17 +30,18 @@ The target operator interface is one authenticated URL and one folder field:
 3. **Inspect the actual verified URDF** with joint and limit interaction, then
    read the quality decision and the review PR.
 
-The pipeline freezes the folder, derives its identities and routes it by
-`hardware_id`. Platform configuration supplies the repository, branch and
+The pipeline freezes the native files, reads engineering identity and routes
+the hardware. Platform configuration supplies the repository, branch and
 Windows connection. Every submission goes through the Airflow DAG. See
 [operations.md](docs/operations.md) for the complete workflow and
 [deployment.md](docs/deployment.md) for platform setup.
 
-**Availability.** The one-folder DAG, embedded viewer and RTX 4080 server
-deployment are not yet released and commissioned. Published v1.0.0 uses the
-existing Airflow form with explicit package, revision and routing fields.
+**Availability.** CAD-only automatic definition, the one-folder interface,
+embedded viewer and RTX 4080 deployment are not yet released and commissioned.
+Published v1.0.0 requires its legacy prepared package and explicit Airflow
+package, revision and routing fields. It does not implement this CAD-only contract.
 [Deployment status and the v1.0.0 trigger](docs/deployment.md#release-and-deployment-status)
-describe the working interface. The local workflow below is available in v1.0.0.
+describe the released interface and platform tooling.
 
 Track validation, native execution and publication in the DAG run. A successful
 run returns the verified subject, Git commit and PR URL. A failed run retains
@@ -60,25 +64,11 @@ gh auth setup-git
 git clone https://github.com/<owner>/<model-repository>.git C:\description\models
 ```
 
-The structural design must include the CAD datums and robot semantics required
-by the [mechanical handoff specification](docs/mechanical-handoff-spec.md). A saved assembly alone cannot
-establish body grouping, joint direction, limits or physical authority.
-
-Seal each mechanical revision once. The local command below is also available
-for commissioning and diagnosis; Airflow invokes this same workflow:
-
-```powershell
-C:\description\.venv\Scripts\description.exe revision C:\handoffs\arm\r1 --hardware arm --id r1 --owner mechanical --control handoff --reference arm/r1 --summary "Initial mechanical handoff"
-C:\description\.venv\Scripts\description.exe run C:\handoffs\arm\r1 --output C:\deliveries\arm --repository C:\description\models --base feature/arm
-```
-
 Replace `<owner>/<model-repository>` with the team's model repository, separate
 from this tool repository. GitHub authentication is a one-time setup. Use a
 dedicated clean model clone;
 the hardware branch must already exist. For a new hardware branch, follow
 [model repository setup](docs/deployment.md#model-repository-setup).
-The second command performs all five stages and prints the PR URL. A failed check
-keeps diagnostics and does not submit or replace a previous passing delivery.
 
 ## Delivery
 

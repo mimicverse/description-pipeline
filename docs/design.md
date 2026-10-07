@@ -6,90 +6,98 @@
 - Automatic derivation.
 - Verified publication.
 
-CAD owns geometry, assembly placement and datums. `robot.yaml` owns robot
-semantics and the explicit selection of physical authority. The pipeline owns
-every derived file. Corrections return to their owning input or generation rule.
+SolidWorks owns the mechanical assembly, geometry, datums, zero pose and
+engineering semantics. Controlled component records supply physical and drive
+specifications identified by the CAD model. Every pipeline configuration,
+manifest, model and report is derived; `robot.yaml` is an internal generated
+artifact, never a mechanical-team input.
 
 ## 2. How the system works
 
 ```mermaid
 flowchart LR
-  I[Versioned CAD and robot definition] --> C[Inspect and capture]
-  C --> M[Canonical model]
+  C[SolidWorks engineering directory] --> F[Collect and freeze native inputs]
+  F --> R[Read assembly, mates, datums and properties]
+  L[Controlled component library] --> R
+  R --> D[Generate robot definition]
+  D --> M[Canonical model]
   M --> U[URDF and meshes]
-  I --> V[Independent verification]
-  C --> V
+  F --> V[Independent verification]
+  R --> V
   U --> V
-  V -->|pass| P[Model PR]
-  V -->|fail| D[Retained diagnostics]
+  V -->|pass| P[Review PR and verified preview]
+  V -->|fail| E[CAD findings and retained diagnostics]
 ```
 
-Capture reads saved files in an owned SolidWorks session, collects the complete
-dependency closure and records numeric evidence. Generation derives joint
-frames from CAD datums and combines physical properties in their declared
-frames. Verification rereads inputs, raw readings, meshes and XML, then loads
-the URDF with an independent consumer. Publication verifies the copied bundle
-and actual Git blobs before pushing.
+The pipeline identifies the main assembly and export configuration, records a
+fixed native inventory and reads the actual saved engineering state in an
+owned SolidWorks session. It derives rigid-body membership and joint relations
+from assembly structure, mates, datums and any required native engineering
+annotations. It resolves declared component specifications without inventing
+missing limits or capabilities.
 
-The pipeline ID is `solidworks-to-urdf`. Each execution has a UUID. CAD revision,
-source files, tool code, runtime and delivery are bound by SHA-256. An Airflow
-retry uses the same UUID and request; a corrected handoff starts a new run.
+Generated definitions remain separate from original CAD and raw observations.
+Verification rederives their mechanical facts from independent native evidence,
+then checks the canonical model, actual XML, meshes and consumer loading.
+Publication verifies the complete copied delivery and actual Git blobs.
+
+The pipeline ID is `solidworks-to-urdf`. Each execution has a UUID. CAD bytes,
+source revisions, component-library revisions, tool code, runtime and delivery
+are bound by SHA-256. A retry preserves the same frozen inputs and native UUID;
+a corrected handoff starts a new run. A generated configuration cannot become
+an alternate source of mechanical truth.
 
 ## 3. How engineering is organized
 
 | Location | Responsibility |
 |---|---|
 | Public `description-pipeline/main` | Tool code, specifications and neutral tests |
-| Private `description/feature/<hardware>` | Authored model inputs and reviewed deliveries |
+| Private `description/feature/<hardware>` | Reviewed native inputs and model deliveries |
 | Private `description/work/solidworks/<hardware>` | Automatically updated model PR |
 | Private `description/release/<hardware>/<release>` | Approved, frozen model delivery |
-| Mechanical Git, PDM or retained handoff directory | Immutable native CAD revisions |
+| Mechanical PDM, Git or retained directory | Controlled SolidWorks revisions |
+| Controlled component library | Versioned physical and drive specifications |
 
-Tool releases use ordinary version tags such as `v1.0.0`. Models record the tool
-identity they used; tool source is not merged into model branches. A model
-release freezes an approved delivery from its hardware branch; its release
-branch is retained without subsequent model edits.
+Tool releases use ordinary tags such as `v1.0.0`; models record the tool identity
+used. Tool source is not merged into model branches. Approved model deliveries
+are frozen from their hardware branch.
 
 ```text
 src/description_pipeline/
-  sources/solidworks/     CAD contract, native capture and normalization
+  sources/solidworks/     native collection, reading and automatic definition
   model/                 canonical semantics
-  backends/urdf.py        URDF and local mesh projection
-  verification/          independent physical and artifact gates
-  repository/urdf_pr.py   governed publication
-  orchestration/         Windows endpoint and Airflow client
-  solidworks.py          complete local workflow
-  cli.py                 author, commissioning and replay commands
-tests/                   neutral mathematical, failure and integration tests
-deploy/airflow/          Linux scheduler deployment
-docs/                    normative specifications and operations
+  backends/               generated URDF and consumer artifacts
+  verification/          independent native, physical and artifact checks
+  repository/            governed publication
+  orchestration/         Airflow, Windows endpoint and operator result access
+  cli.py                 platform commissioning, diagnosis and replay
+tests/                   neutral, analytic and adversarial regressions
+deploy/airflow/          Linux orchestration deployment
+docs/                    engineering requirements, workflow and deployment
 ```
 
-One operator page submits to the Airflow DAG and displays its progress and
-results. The Linux server hosts that page, Airflow and a private database. The
-Windows endpoint serializes CAD jobs and executes the complete local workflow;
-Airflow manages requests, retry identity and result visibility. The CLI serves
-handoff authoring, worker commissioning, diagnosis and frozen-delivery replay.
+One operator page submits to the Airflow DAG and displays progress, quality,
+PR results and the actual verified URDF with joint/limit controls. The Linux
+server hosts that page, Airflow and a private database; one licensed Windows
+worker serializes native CAD execution. Platform configuration owns repository
+routing and credentials.
 
-The operator contract is one URL, one login and one value: the handoff folder
-path. The pipeline derives the sealed revision, inventory digests and hardware
-route from the frozen package and the deployment configuration, so digests,
-repositories, branches and endpoint connections are never operator inputs. The
-run reports concise stages and ends with the actual verified URDF, joint and
-limit controls, its quality decision and review PR. The viewer reads verified
-URDF and mesh bytes; quality decisions come from the independent report. CAD,
-source evidence and execution-machine paths stay outside the viewer surface.
+The operator provides one folder path. Hardware identity and revisions come
+from native engineering records; inventory hashes, configuration files,
+evidence and run IDs are generated automatically. Ambiguous mechanical facts
+produce actionable CAD findings, never guessed definitions.
 
 ## 4. How to operate
 
-1. Prepare and review the mechanical assembly, datums and physical authority.
-2. Define rigid bodies, joints, signed axes, limits and acceptance bounds.
-3. Seal the CAD revision and inspect the complete input package.
-4. Enter the handoff folder in the Airflow operator page and track its result.
-5. Resolve failed findings at their source and rerun with corrected inputs.
-6. Review the passing delivery PR, including its source revision and reports.
-7. Freeze the approved model release and recheck copied deliveries before use.
+1. Complete and review the SolidWorks engineering model under the
+   [mechanical specification](mechanical-handoff-spec.md).
+2. Save the export/zero configuration and collect the native dependencies.
+3. Select the SolidWorks directory on the operator page and start the run.
+4. The pipeline freezes, reads, derives, builds, verifies and submits.
+5. Resolve findings in CAD or their controlled specification source and rerun.
+6. Review the verified URDF, joint motion, source evidence and delivery PR.
+7. Approve and freeze the model release for the accepted uses.
 
-The [operations guide](operations.md) ties these steps to commands and expected
-results. The [quality specification](quality.md) defines exactly what a passing
-delivery establishes.
+The [operations guide](operations.md) describes the complete process.
+[Quality](quality.md) defines acceptance, and [deployment](deployment.md)
+separates the target contract from released capabilities.

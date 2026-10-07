@@ -1,11 +1,16 @@
 # Airflow deployment (Linux orchestration, Windows execution)
 
 This guide installs the released v1.0.0 Airflow services and documents their
-configuration and API. The one-folder operator page and embedded viewer are
+configuration and API. The CAD-only one-folder operator page and embedded viewer are
 the next deployment target, not installed by these commands. See the
 [deployment contract and status](../../docs/deployment.md),
 [operator workflow](../../docs/operations.md), and
 [mechanical handoff specification](../../docs/mechanical-handoff-spec.md).
+
+v1.0.0 still requires a legacy prepared package with `robot.yaml` and a revision
+manifest. These are not requirements on the mechanical team; the target
+workflow generates them from SolidWorks contents. Prepared-package transport
+alone must not be described as the completed CAD-only interface.
 
 The one-shot DAG `solidworks_to_urdf` submits a configured package to the bearer-authenticated Windows
 endpoint, polls it with a bounded reschedule sensor and fails closed unless the passing result carries

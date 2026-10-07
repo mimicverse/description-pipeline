@@ -32,6 +32,9 @@ The target DAG accepts one field:
 A folder on an operator's separate computer must first reach one of these
 locations. The browser does not grant server access to arbitrary local files.
 Transport changes the location, not the package contents or its relative paths.
+The selected folder contains SolidWorks engineering files, not an authored
+`robot.yaml` or revision manifest. The platform generates these artifacts after
+native reading and records their provenance.
 
 ```mermaid
 sequenceDiagram
@@ -44,21 +47,28 @@ sequenceDiagram
     A->>W: Authenticated archive plus inventory identity
   end
   A->>W: Resolve and freeze handoff
-  W->>W: Verify sealed revision and full inventory; resolve hardware route
-  W-->>A: Frozen identity, repository and base
+  W->>W: Freeze native file inventory
+  W-->>A: Frozen input identity
   A->>W: Authenticated job request with stable UUID
-  W->>W: Inspect, capture, generate, independently verify
+  W->>W: Read CAD identity, assembly, mates, datums and properties
+  W->>W: Resolve hardware route and controlled specifications
+  W->>W: Generate robot definition, build, independently verify
   W->>G: Push verified bundle and create/update PR
   A->>W: Poll persistent job result
   W-->>A: Quality, verified URDF assets, commit and PR URL
   A-->>M: Progress, interactive URDF and review result
 ```
 
-The pipeline freezes the received author files, derives the sealed revision and
-full inventory digests, and binds them to the job request. The worker resolves
-`hardware_id` against `targets`: each target may declare its hardware ID, with
+The pipeline freezes the received native files, computes their inventory
+digest, and binds it to the job request. Hardware and structural identity are
+read from CAD engineering records; manifests and robot definitions are
+generated outputs. The worker resolves the hardware identity against `targets`:
+each target may declare its hardware ID, with
 the target key as the default. Exactly one match is required. Unknown or
-ambiguous hardware fails before CAD opens; the operator never chooses a route.
+ambiguous hardware blocks publication; the operator never chooses a route.
+Mechanical identity may require native reading, so this check is not claimed
+to happen before opening CAD. Unsafe paths and malformed transport are rejected
+before native execution.
 
 The Airflow connection is configured by `SOLIDWORKS_ENDPOINT_CONN_ID`, default
 `solidworks_windows`. Repository clones and `feature/<hardware>` bases belong
@@ -86,13 +96,17 @@ correlation rule, not an operator input.
 | Capability | Status |
 |---|---|
 | Published v1.0.0 | Native capture, verified URDF, governed PR submission, frozen replay and the existing Airflow DAG are released |
-| One-folder resolution, transfer and routing | Under development; not part of the v1.0.0 assets |
+| CAD-only input and automatic robot definition | Required target; native semantic discovery and generated-input verification are not yet released |
+| One-folder resolution, transfer and routing | Under development; prepared-package transport alone does not establish CAD-only operation |
 | Operator page and embedded URDF viewer | Planned; not commissioned |
 | RTX 4080 server and shared operator URL | Not commissioned; no live address is asserted here |
 
 The instructions below apply to the released v1.0.0 deployment. They provide
 the working Airflow/Windows foundation; they do not install the planned page
-or the single-path DAG. Existing v1.0.0 assets and their tag remain unchanged.
+or CAD-only workflow. This release still requires its legacy prepared package,
+including `robot.yaml` and `cad-revision.json`; that is an existing platform
+limitation, not a delivery requirement on the mechanical team. Existing
+v1.0.0 assets and their tag remain unchanged.
 
 ## Windows endpoint
 
@@ -196,7 +210,11 @@ publication, and restart recovery. Verify the actual Airflow DAG imports and
 runs in its isolated deployment environment. For the target interface, also
 exercise all three folder locations, inventory verification after transfer,
 unknown/ambiguous hardware rejection, single-page login and submission, and
-actual URDF joint/limit interaction. Confirm that failed or changed assets and
+actual URDF joint/limit interaction. Begin with native SolidWorks files only
+and demonstrate automatic identity, rigid-body/joint recognition, parameter
+resolution and generated definitions. Independently verify each derived fact
+against native evidence; reject ambiguity and missing sources without
+inventing parameters. Confirm that failed or changed assets and
 non-viewer files cannot be served. A mocked endpoint tests DAG control behavior;
 it does not replace the native end-to-end rehearsal.
 
