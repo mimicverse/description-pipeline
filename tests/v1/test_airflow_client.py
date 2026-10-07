@@ -404,7 +404,8 @@ class ClientTests(unittest.TestCase):
                 endpoint.read_artifact(RUN_ID, "urdf/robot.urdf", sha256=SHA, limit=4)
 
     def _stub_archive(self, digest: str = "b" * 64):
-        module = types.ModuleType("description_pipeline.orchestration.handoffs")
+        from description_pipeline.orchestration import handoffs as handoffs_module
+
         self.archived_sources: list[Path] = []
 
         def prepare_archive(source: Path, archive: Path) -> dict:
@@ -413,8 +414,7 @@ class ClientTests(unittest.TestCase):
             Path(archive).write_bytes(b"PK\x03\x04stub-archive")
             return {"handoff_sha256": digest, "files": {"cad-revision.json": "x"}}
 
-        module.prepare_archive = prepare_archive
-        return mock.patch.dict(sys.modules, {"description_pipeline.orchestration.handoffs": module})
+        return mock.patch.object(handoffs_module, "prepare_archive", prepare_archive)
 
     def test_absolute_posix_path_is_zipped_and_imported(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -183,37 +183,16 @@ class EndpointConfig:
         object.__setattr__(self, "handoff_roots", _handoff_roots(self.handoff_roots))
 
 
-def _reject_links(path: Path, label: str) -> None:
-    for candidate in (path, *path.parents):
-        if candidate.is_symlink() or candidate.is_junction():
-            raise EndpointProtocolError(f"{label} must not contain links: {candidate}")
-
-
 def _handoff_roots(values) -> tuple[Path, ...]:
-    """Validate the platform allowlist that authorizes absolute Linux handoff folders."""
+    """Validate the platform allowlist with the shared handoff boundary rules."""
     if values is None or values == () or values == "":
         return ()
-    if isinstance(values, (str, Path)):
-        values = (values,)
-    if not isinstance(values, (list, tuple)):
-        raise EndpointProtocolError("handoff_roots must be a list of absolute directory paths")
-    roots: list[Path] = []
-    for value in values:
-        text = str(value).strip() if isinstance(value, (str, Path)) else ""
-        if not text or not PurePosixPath(text).is_absolute():
-            raise EndpointProtocolError("handoff_roots entries must be absolute POSIX directory paths")
-        path = Path(text)
-        if path.resolve(strict=False) == Path(path.anchor):
-            raise EndpointProtocolError("the filesystem root cannot be a handoff root")
-        _reject_links(path, "handoff root")
-        try:
-            resolved = path.resolve(strict=True)
-        except OSError as error:
-            raise EndpointProtocolError(f"handoff root is unavailable: {path}") from error
-        if not resolved.is_dir():
-            raise EndpointProtocolError(f"handoff root is not a directory: {path}")
-        roots.append(resolved)
-    return tuple(roots)
+    try:
+        from .handoffs import validate_handoff_roots
+
+        return validate_handoff_roots(values)
+    except (ImportError, PipelineError, TypeError, ValueError, OSError) as error:
+        raise EndpointProtocolError(str(error)) from error
 
 
 def config_from_airflow_connection(conn_id: str, *, timeout: float = 30.0) -> EndpointConfig:
@@ -337,19 +316,12 @@ class WindowsEndpoint:
             raise EndpointProtocolError(
                 "absolute Linux handoff folders require handoff_roots in the Airflow endpoint connection"
             )
-        candidate = Path(path)
-        _reject_links(candidate, "handoff folder")
         try:
-            resolved = candidate.resolve(strict=True)
-        except OSError as error:
-            raise EndpointProtocolError(f"handoff folder is unavailable: {candidate}") from error
-        if not resolved.is_dir():
-            raise EndpointProtocolError(f"handoff folder is not a directory: {candidate}")
-        if not any(resolved.is_relative_to(root) for root in self.config.handoff_roots):
-            raise EndpointProtocolError(
-                "handoff folder is outside the configured handoff_roots; place it under an approved root"
-            )
-        return resolved
+            from .handoffs import authorize_handoff
+
+            return authorize_handoff(Path(path), self.config.handoff_roots)
+        except (ImportError, PipelineError, TypeError, ValueError, OSError) as error:
+            raise EndpointProtocolError(str(error)) from error
 
     def resolve_handoff(self, handoff_path: str) -> HandoffResolution:
         """Resolve one operator path; an authorized absolute POSIX folder is ZIP-imported first."""
