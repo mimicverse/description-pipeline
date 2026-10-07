@@ -31,6 +31,21 @@ const TASK_STATES = {
   skipped: "跳过",
   deferred: "等待",
   none: "待执行",
+  completed: "完成",
+};
+const STAGES = {
+  resolve_handoff: "冻结素材",
+  validate_request: "检查素材",
+  start_job: "开始执行",
+  wait_for_job: "等待结果",
+  confirm_job: "确认结果",
+  discover: "读取工程定义",
+  inspect: "检查输入",
+  capture: "采集 CAD",
+  build: "生成模型",
+  generate: "生成模型",
+  verify: "独立验证",
+  submit: "提交 PR",
 };
 const AUTOMATIC_STATES = {
   passed: "自动校验通过",
@@ -81,6 +96,15 @@ function badge(text, kind) {
   span.className = `badge ${kind || ""}`.trim();
   span.textContent = text;
   return span;
+}
+
+function expandable(parent, title) {
+  const details = document.createElement("details");
+  const summary = document.createElement("summary");
+  summary.textContent = title;
+  details.append(summary);
+  parent.append(details);
+  return details;
 }
 
 function formatTime(value) {
@@ -141,7 +165,9 @@ async function refreshRuns() {
       if (run.dag_run_id === state.dagRunId) item.className = "selected";
       const button = document.createElement("button");
       button.type = "button";
-      button.textContent = `${run.dag_run_id} · ${run.handoff_path}`;
+      const folder = String(run.handoff_path || "工程交付").replace(/[\\/]+$/, "").split(/[\\/]/).pop();
+      button.textContent = `${folder} · ${RUN_STATES[run.state] || run.state || "待执行"}`;
+      button.title = `${run.handoff_path || ""}\n${run.dag_run_id}`;
       button.addEventListener("click", () => selectRun(run.dag_run_id));
       item.append(button);
       list.append(item);
@@ -157,7 +183,7 @@ function renderRun(run) {
   const rows = [
     ["运行标识", run.dag_run_id],
     ["工程文件夹", run.handoff_path || "—"],
-    ["Airflow 状态", RUN_STATES[run.state] || run.state || "—"],
+    ["状态", RUN_STATES[run.state] || run.state || "—"],
     ["开始时间", formatTime(run.started_at)],
     ["结束时间", formatTime(run.ended_at)],
   ];
@@ -174,7 +200,7 @@ function renderRun(run) {
   for (const task of run.tasks || []) {
     const chip = document.createElement("span");
     chip.className = `chip ${task.state || ""}`.trim();
-    chip.textContent = `${task.task_id}：${TASK_STATES[task.state] || task.state || "—"}`;
+    chip.textContent = `${STAGES[task.task_id] || task.task_id}：${TASK_STATES[task.state] || task.state || "—"}`;
     progress.append(chip);
   }
 
@@ -189,7 +215,7 @@ function renderRun(run) {
   }
   for (const stage of stageRows) {
     const item = document.createElement("li");
-    item.textContent = `${stage.stage || "阶段"} · ${stage.state || ""} · ${formatTime(stage.at)}`;
+    item.textContent = `${STAGES[stage.stage] || stage.stage || "阶段"} · ${TASK_STATES[stage.state] || stage.state || ""} · ${formatTime(stage.at)}`;
     stages.append(item);
   }
 
@@ -204,11 +230,13 @@ function renderRun(run) {
     note.textContent = run.automatic.message;
     automatic.append(note);
   }
-  for (const check of (run.automatic && run.automatic.checks) || []) {
+  const checks = (run.automatic && run.automatic.checks) || [];
+  const allChecks = checks.length ? expandable(automatic, `查看全部 ${checks.length} 项检查`) : automatic;
+  for (const check of checks) {
     const chip = document.createElement("span");
     chip.className = `chip ${check.passed === false ? "failed" : check.passed === true ? "success" : ""}`.trim();
     chip.textContent = `${check.id || "检查"}：${check.passed === false ? "未通过" : check.passed === true ? "通过" : "未报告"}`;
-    automatic.append(chip);
+    allChecks.append(chip);
   }
 
   const confirmations = $("confirmations");
@@ -221,11 +249,13 @@ function renderRun(run) {
     String(structure.subject_sha256 || "").slice(0, 12) || "—"
   }`;
   confirmations.append(identity, badge("工程确认：待确认", "pending"));
-  for (const item of (coverage.engineering && coverage.engineering.items) || []) {
+  const items = (coverage.engineering && coverage.engineering.items) || [];
+  const allConfirmations = items.length ? expandable(confirmations, `查看 ${items.length} 项工程确认`) : confirmations;
+  for (const item of items) {
     const chip = document.createElement("span");
     chip.className = "chip";
     chip.textContent = `${item.id}：待确认`;
-    confirmations.append(chip);
+    allConfirmations.append(chip);
   }
   if (coverage.engineering && coverage.engineering.message) {
     const note = document.createElement("p");
@@ -258,10 +288,10 @@ function renderRun(run) {
     context.textContent = [finding.id, finding.stage, finding.object].filter(Boolean).join(" · ") || "—";
     item.append(message, context);
     if (finding.evidence && Object.keys(finding.evidence).length) {
-      const evidence = document.createElement("div");
+      const evidence = document.createElement("pre");
       evidence.className = "object";
-      evidence.textContent = JSON.stringify(finding.evidence);
-      item.append(evidence);
+      evidence.textContent = JSON.stringify(finding.evidence, null, 2);
+      expandable(item, "查看证据").append(evidence);
     }
     findings.append(item);
   }

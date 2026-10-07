@@ -18,9 +18,9 @@ and maintenance; [operations](operations.md) owns the engineering workflow.
 | Feishu | Enterprise app, approved tenant keys, registered OAuth callback and access to basic user identity/profile |
 | Storage | Dedicated CAD intake directories; separate frozen inputs, outputs, state, secrets and model clones |
 
-The commissioning server uses `https://10.0.0.235:8443/`. Register
-`https://10.0.0.235:8443/auth/feishu/callback` as the app callback. For another
-host, register the callback derived from its `OPERATOR_HOST` and HTTPS port.
+Choose one operator address through `OPERATOR_HOST` and the HTTPS port, for
+example `https://operator.example.com:8443/`. Register that address followed by
+`/auth/feishu/callback` as the app callback.
 The browser must trust the server certificate and be able to reach this address.
 
 Operators use their existing enterprise Feishu accounts; the platform has no

@@ -9,6 +9,8 @@ Windows SolidWorks worker.
 
 ## Use
 
+Open the single HTTPS address provided by the platform maintainer.
+
 1. Prepare saved native engineering under the
    [mechanical specification](docs/mechanical-handoff-spec.md).
 2. Sign in with Feishu, select its accessible engineering-folder path,
@@ -19,6 +21,10 @@ Windows SolidWorks worker.
 Mechanical engineers provide SolidWorks files and engineering facts. Robot
 YAML, version manifests, model artifacts and reports are generated. Corrections
 return to CAD or controlled specifications, followed by a new run.
+
+If a check fails, use the affected object and correction report to repair the
+engineering source, then submit a new version. Platform or PR failures retain
+diagnostics for the maintainer to recover the same frozen delivery.
 
 See [operations](docs/operations.md) for the full design-to-release workflow
 and [deployment](docs/deployment.md) for installing the Linux server and

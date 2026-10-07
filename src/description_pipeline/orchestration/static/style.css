@@ -112,6 +112,10 @@ button:disabled { opacity: 0.55; cursor: progress; }
 .findings li { border-left: 3px solid var(--bad); padding: 6px 10px; background: #fff6f5; border-radius: 0 8px 8px 0; }
 .findings li.warn { border-color: var(--warn); background: #fffaf0; }
 .findings .object { color: var(--muted); font-size: 12.5px; }
+details { margin-top: 10px; }
+summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+details .chip { display: inline-block; margin: 6px 4px 0 0; }
+details pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 
 .badge { display: inline-block; border-radius: 999px; padding: 3px 10px; font-size: 12.5px; border: 1px solid var(--line); }
 .badge.ok { border-color: var(--ok); color: var(--ok); }

@@ -29,7 +29,7 @@
         <form id="run-form">
           <label for="handoff-path">工程文件夹</label>
           <input id="handoff-path" name="handoff_path" placeholder="/共享目录/机器人工程 或 D:\\CAD\\机器人工程" required>
-          <p class="muted">只填写一个文件夹。硬件、目标仓库与结构版本由流水线在 CAD 读取后解析。</p>
+          <p class="muted">填写平台可访问的 SolidWorks 工程文件夹，其余信息自动读取。</p>
           <button type="submit" id="start-button">开始</button>
           <p id="run-error" class="error" hidden></p>
         </form>
@@ -44,8 +44,10 @@
         <h2>运行状态</h2>
         <dl class="meta" id="run-meta"></dl>
         <div id="task-progress" class="progress"></div>
-        <h3>阶段</h3>
-        <ol id="stages" class="stages"></ol>
+        <details>
+          <summary>执行记录</summary>
+          <ol id="stages" class="stages"></ol>
+        </details>
         <h3>自动检查</h3>
         <div id="automatic" class="automatic"></div>
         <h3>工程确认</h3>
