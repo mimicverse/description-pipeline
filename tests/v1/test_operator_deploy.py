@@ -1,4 +1,4 @@
-"""Operator deployment renderer/lifecycle tests (stdlib only; no services are started)."""
+"""Operator deployment renderer/lifecycle tests (stdlib only; external services are mocked)."""
 
 from __future__ import annotations
 
@@ -53,6 +53,11 @@ def render(state: Path, **overrides: str) -> subprocess.CompletedProcess:
 
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def write_stub(path: Path, body: str) -> None:
+    path.write_text(body, encoding="utf-8")
+    path.chmod(0o755)
 
 
 class RenderTests(unittest.TestCase):
@@ -470,6 +475,258 @@ class LifecycleTests(unittest.TestCase):
             result = run(["bash", "-n", str(script)], {})
             self.assertEqual(result.returncode, 0, f"{script}: {result.stderr}")
         compile(RENDER.read_text(encoding="utf-8"), str(RENDER), "exec")
+
+
+class InstallOrderingTests(unittest.TestCase):
+    """Install must start the managed postgres unit and wait for readiness before migration."""
+
+    def _prepare(self, tmp: Path, *, fresh: bool, ready_after: int, db_exists: bool = False,
+                 psql_query_rc: int = 0, createdb_rc: int = 0,
+                 start_rc: int = 0) -> tuple[Path, Path, dict[str, str], Path]:
+        release = tmp / "release"
+        (release / "operator" / "scripts").mkdir(parents=True)
+        (release / "airflow" / "scripts").mkdir(parents=True)
+        (release / "operator" / "operatorctl.sh").write_bytes(CONTROL.read_bytes())
+        (release / "operator" / "render_operator.py").write_bytes(RENDER.read_bytes())
+        for template in ("nginx.conf.template", "portal.json.template"):
+            (release / "operator" / template).write_bytes((OPERATOR / template).read_bytes())
+        (release / "operator" / "systemd").mkdir()
+        for unit in (OPERATOR / "systemd").glob("*.service"):
+            (release / "operator" / "systemd" / unit.name).write_bytes(unit.read_bytes())
+        write_stub(release / "operator" / "scripts" / "install_toolchain.sh",
+                   '#!/usr/bin/env bash\necho "AIRFLOW_PYTHON=/usr/bin/python3"\n')
+        write_stub(release / "operator" / "scripts" / "install_proxy.sh", "#!/usr/bin/env bash\nexit 0\n")
+        write_stub(release / "airflow" / "services.sh",
+                   '#!/usr/bin/env bash\necho "services_render" >> "$ORDER_LOG"\nexit 0\n')
+        write_stub(release / "airflow" / "install.sh",
+                   '#!/usr/bin/env bash\necho "airflow_install" >> "$ORDER_LOG"\nexit 0\n')
+        write_stub(release / "airflow" / "scripts" / "install_postgres.sh",
+                   '#!/usr/bin/env bash\necho "install_postgres" >> "$ORDER_LOG"\n'
+                   'mkdir -p "$POSTGRES_ROOT/data"\n: > "$POSTGRES_ROOT/data/PG_VERSION"\nexit 0\n')
+        (release / "airflow" / "scripts" / "add_connection.py").write_text("# stub\n", encoding="utf-8")
+
+        (tmp / "venv" / "bin").mkdir(parents=True)
+        write_stub(tmp / "venv" / "bin" / "python", "#!/usr/bin/env bash\nexit 0\n")
+        (tmp / "token").write_text("test-token\n", encoding="utf-8")
+        (tmp / "token").chmod(0o600)
+        if not fresh:
+            (tmp / "pg" / "data").mkdir(parents=True)
+            (tmp / "pg" / "data" / "PG_VERSION").write_text("14\n", encoding="utf-8")
+
+        bindir = tmp / "bin"
+        bindir.mkdir()
+        write_stub(bindir / "systemctl",
+                   '#!/usr/bin/env bash\necho "systemctl $*" >> "$ORDER_LOG"\n'
+                   'case "$*" in\n'
+                   '  "--user daemon-reload") exit 0 ;;\n'
+                   '  "--user start description-postgres.service") exit "${START_RC:-0}" ;;\n'
+                   '  *) echo "unexpected systemctl call: $*" >&2; exit 1 ;;\n'
+                   "esac\n")
+        pgbin = tmp / "pg" / "root" / "usr" / "lib" / "postgresql" / "14" / "bin"
+        pgbin.mkdir(parents=True)
+        client_libraries = ('[ "${LD_LIBRARY_PATH%%:*}" = "$PG_CLIENT_LIB" ] || '
+                            '{ echo "missing private PostgreSQL client libraries" >&2; exit 90; }\n')
+        write_stub(pgbin / "pg_isready",
+                   '#!/usr/bin/env bash\n' + client_libraries +
+                   'n=$(cat "$PG_READY_COUNT" 2>/dev/null || echo 0)\n'
+                   'n=$((n + 1))\n'
+                   'echo "$n" > "$PG_READY_COUNT"\n'
+                   'echo "pg_isready $n" >> "$ORDER_LOG"\n'
+                   '[ "${PG_READY_AFTER:-1}" = "0" ] && exit 1\n'
+                   '[ "$n" -ge "${PG_READY_AFTER:-1}" ]\n')
+        write_stub(pgbin / "psql",
+                   '#!/usr/bin/env bash\n' + client_libraries +
+                   'echo "psql_db_query" >> "$ORDER_LOG"\n'
+                   'rc="${PSQL_QUERY_RC:-0}"\n'
+                   '[ "$rc" != "0" ] && exit "$rc"\n'
+                   'echo "${DB_EXISTS:-}"\n'
+                   'exit 0\n')
+        write_stub(pgbin / "createdb",
+                   '#!/usr/bin/env bash\n' + client_libraries +
+                   'echo "createdb" >> "$ORDER_LOG"\nexit "${CREATEDB_RC:-0}"\n')
+        write_stub(bindir / "sleep", '#!/usr/bin/env bash\necho "sleep" >> "$ORDER_LOG"\nexit 0\n')
+
+        state = tmp / "state"
+        env = base_env(state, POSTGRES_ROOT=str(tmp / "pg"), PIPELINE_WHEEL=str(tmp / "wheel.whl"),
+                       ENDPOINT_TOKEN_FILE=str(tmp / "token"), SOLIDWORKS_HANDOFF_ROOT=str(tmp / "handoffs"))
+        env_file = tmp / "operator.env"
+        env_file.write_text("".join(f"{key}={value}\n" for key, value in env.items()), encoding="utf-8")
+        order = tmp / "order.log"
+        control_env = {
+            "PATH": f"{bindir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+            "XDG_CONFIG_HOME": str(tmp / "config"),
+            "ORDER_LOG": str(order),
+            "PG_READY_COUNT": str(tmp / "ready-count"),
+            "PG_READY_AFTER": str(ready_after),
+            "DB_EXISTS": "1" if db_exists else "",
+            "PSQL_QUERY_RC": str(psql_query_rc),
+            "CREATEDB_RC": str(createdb_rc),
+            "START_RC": str(start_rc),
+            "PG_CLIENT_LIB": str(tmp / "pg" / "root" / "usr" / "lib" / "x86_64-linux-gnu"),
+            "LD_LIBRARY_PATH": "/unrelated/vendor",
+        }
+        return release, env_file, control_env, order
+
+    def _install(self, release: Path, env_file: Path, control_env: dict[str, str]):
+        return run(["bash", str(release / "operator" / "operatorctl.sh"), "install",
+                    "--env-file", str(env_file)], control_env)
+
+    def test_fresh_install_creates_then_uses_the_managed_unit_before_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release, env_file, control_env, order = self._prepare(Path(tmp), fresh=True, ready_after=2)
+            result = self._install(release, env_file, control_env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            lines = order.read_text(encoding="utf-8").splitlines()
+            self.assertLess(lines.index("install_postgres"),
+                            lines.index("systemctl --user start description-postgres.service"))
+            self.assertLess(lines.index("systemctl --user start description-postgres.service"),
+                            lines.index("pg_isready 1"))
+            self.assertLess(lines.index("pg_isready 2"), lines.index("airflow_install"))
+            self.assertLess(lines.index("pg_isready 2"), lines.index("psql_db_query"))
+            self.assertLess(lines.index("psql_db_query"), lines.index("createdb"))
+            self.assertLess(lines.index("createdb"), lines.index("airflow_install"))
+            self.assertEqual([line for line in lines if line.startswith("pg_isready ")],
+                             ["pg_isready 1", "pg_isready 2"])
+            systemctl_lines = [line for line in lines if line.startswith("systemctl ")]
+            self.assertIn("systemctl --user start description-postgres.service", systemctl_lines)
+            self.assertFalse(
+                [line for line in systemctl_lines
+                 if "enable" in line or ("description-postgres" not in line and "daemon-reload" not in line)],
+                systemctl_lines,
+            )
+
+    def test_stopped_reinstall_starts_the_managed_unit_before_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release, env_file, control_env, order = self._prepare(Path(tmp), fresh=False, ready_after=1,
+                                                                   db_exists=True)
+            result = self._install(release, env_file, control_env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            lines = order.read_text(encoding="utf-8").splitlines()
+            self.assertNotIn("install_postgres", lines)
+            self.assertNotIn("createdb", lines)
+            self.assertLess(lines.index("systemctl --user start description-postgres.service"),
+                            lines.index("pg_isready 1"))
+            self.assertLess(lines.index("psql_db_query"), lines.index("airflow_install"))
+
+    def test_not_ready_postgres_fails_before_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release, env_file, control_env, order = self._prepare(Path(tmp), fresh=True, ready_after=0)
+            result = self._install(release, env_file, control_env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("PostgreSQL did not become ready", result.stderr)
+            lines = order.read_text(encoding="utf-8").splitlines()
+            self.assertNotIn("airflow_install", lines)
+            self.assertNotIn("psql_db_query", lines)
+            self.assertNotIn("createdb", lines)
+            attempts = [line for line in lines if line.startswith("pg_isready ")]
+            self.assertEqual(len(attempts), 20, lines)
+
+    def test_database_service_failure_exits_before_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release, env_file, control_env, order = self._prepare(Path(tmp), fresh=False, ready_after=1,
+                                                                 start_rc=1)
+            result = self._install(release, env_file, control_env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("description-postgres.service failed to start", result.stderr)
+            lines = order.read_text(encoding="utf-8").splitlines()
+            self.assertNotIn("pg_isready 1", lines)
+            self.assertNotIn("psql_db_query", lines)
+            self.assertNotIn("createdb", lines)
+            self.assertNotIn("airflow_install", lines)
+
+    def test_database_query_failure_exits_before_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release, env_file, control_env, order = self._prepare(Path(tmp), fresh=False, ready_after=1,
+                                                                   psql_query_rc=1)
+            result = self._install(release, env_file, control_env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("could not query pg_database", result.stderr)
+            lines = order.read_text(encoding="utf-8").splitlines()
+            self.assertNotIn("createdb", lines)
+            self.assertNotIn("airflow_install", lines)
+
+    def test_database_creation_failure_exits_before_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release, env_file, control_env, order = self._prepare(Path(tmp), fresh=True, ready_after=1,
+                                                                   db_exists=False, createdb_rc=1)
+            result = self._install(release, env_file, control_env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("could not create the airflow_meta database", result.stderr)
+            lines = order.read_text(encoding="utf-8").splitlines()
+            self.assertIn("createdb", lines)
+            self.assertNotIn("airflow_install", lines)
+
+
+class InstallPostgresBehaviorTests(unittest.TestCase):
+    """install_postgres.sh provisions only: no server lifecycle and no database creation."""
+
+    def _fixture(self, tmp: Path, *, preexisting: bool) -> tuple[Path, dict[str, str], Path]:
+        pgroot = tmp / "pg"
+        bindir = pgroot / "root" / "usr" / "lib" / "postgresql" / "14" / "bin"
+        bindir.mkdir(parents=True)
+        write_stub(bindir / "postgres",
+                   '#!/usr/bin/env bash\n[ "${1:-}" = "--version" ] && echo "postgres (PostgreSQL) 14.0"\nexit 0\n')
+        write_stub(bindir / "initdb",
+                   '#!/usr/bin/env bash\n'
+                   'data=""\n'
+                   'while [ $# -gt 0 ]; do case "$1" in -D) data="$2"; shift 2 ;; *) shift ;; esac; done\n'
+                   'mkdir -p "$data"\n: > "$data/PG_VERSION"\n: > "$data/postgresql.conf"\n: > "$data/pg_hba.conf"\n'
+                   'echo "initdb" >> "$ORDER_LOG"\n')
+        for command in ("pg_ctl", "createdb", "psql"):
+            write_stub(bindir / command, f'#!/usr/bin/env bash\necho "{command}" >> "$ORDER_LOG"\nexit 0\n')
+        if preexisting:
+            data = pgroot / "data"
+            data.mkdir(parents=True)
+            (data / "PG_VERSION").write_text("14\n", encoding="utf-8")
+            (data / "postgresql.conf").write_text("", encoding="utf-8")
+            (data / "pg_hba.conf").write_text("", encoding="utf-8")
+        pathbin = tmp / "pathbin"
+        pathbin.mkdir()
+        write_stub(pathbin / "apt-get", '#!/usr/bin/env bash\n: > dummy.deb\nexit 0\n')
+        write_stub(pathbin / "dpkg-deb", "#!/usr/bin/env bash\nexit 0\n")
+        write_stub(pathbin / "ldd", "#!/usr/bin/env bash\nexit 0\n")
+        order = tmp / "order.log"
+        env = {
+            "PATH": f"{pathbin}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+            "POSTGRES_ROOT": str(pgroot),
+            "POSTGRES_MAJOR": "14",
+            "ORDER_LOG": str(order),
+        }
+        return order, env, pgroot
+
+    def _run(self, env: dict[str, str]):
+        script = ROOT / "deploy" / "airflow" / "scripts" / "install_postgres.sh"
+        return run(["bash", str(script)], env)
+
+    def _assert_provisioned_only(self, order: Path) -> list[str]:
+        lines = order.read_text(encoding="utf-8").splitlines() if order.is_file() else []
+        self.assertFalse([line for line in lines if line.startswith(("pg_ctl", "createdb", "psql"))], lines)
+        return lines
+
+    def test_fresh_provision_writes_cluster_and_hardening_without_a_server(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            order, env, pgroot = self._fixture(Path(tmp), preexisting=False)
+            result = self._run(env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            lines = self._assert_provisioned_only(order)
+            self.assertIn("initdb", lines)
+            self.assertTrue((pgroot / "data" / "PG_VERSION").is_file())
+            conf = (pgroot / "data" / "postgresql.conf").read_text(encoding="utf-8")
+            self.assertIn("# >>> description-postgres", conf)
+            self.assertIn("reject", (pgroot / "data" / "pg_hba.conf").read_text(encoding="utf-8"))
+            self.assertIn("AIRFLOW_DB_URL=postgresql+psycopg2://solidworks@/airflow_meta", result.stdout)
+            self.assertFalse((pgroot / "data" / ".running").exists())
+
+    def test_existing_cluster_is_rehardened_without_server_or_database_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            order, env, pgroot = self._fixture(Path(tmp), preexisting=True)
+            result = self._run(env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            lines = self._assert_provisioned_only(order)
+            self.assertNotIn("initdb", lines)
+            conf = (pgroot / "data" / "postgresql.conf").read_text(encoding="utf-8")
+            self.assertIn("# >>> description-postgres", conf)
+            self.assertFalse((pgroot / "data" / ".running").exists())
 
 
 if __name__ == "__main__":

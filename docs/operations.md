@@ -31,8 +31,10 @@ must remain retrievable and unchanged. Engineering corrections create a new
 structural version.
 
 Make the folder accessible to the platform. The path may name a directory on
-the Linux server or the configured Windows worker. A browser cannot read an
-arbitrary folder on another computer merely from its path.
+the Linux server or the configured Windows worker. Linux folders must be within
+`SOLIDWORKS_HANDOFF_ROOT`; Windows folders must be within the endpoint's
+`handoff_roots`. A browser cannot read an arbitrary folder on another computer
+merely from its path.
 
 ## 3. Start and inspect the run
 

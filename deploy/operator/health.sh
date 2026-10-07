@@ -146,6 +146,42 @@ if command -v curl >/dev/null 2>&1; then
   esac
 fi
 
+# Check the complete current browser module bundle against installed bytes. A
+# working login page alone does not establish that the URDF viewer can start.
+if [ -x "${AIRFLOW_VENV:-}/bin/python" ]; then
+  if ASSET_DIAG="$("$AIRFLOW_VENV/bin/python" - "$PORTAL_PORT" <<'ASSETS'
+import hashlib
+from pathlib import Path
+import sys
+from urllib.request import urlopen
+
+import description_pipeline
+
+root = Path(description_pipeline.__file__).resolve().parent / "orchestration" / "static"
+try:
+    for name in ("app.js", "viewer.js", "vendor/three.module.min.js", "vendor/three.core.min.js"):
+        expected = (root / name).read_bytes()
+        with urlopen(f"http://127.0.0.1:{sys.argv[1]}/static/{name}", timeout=10) as response:
+            if response.status != 200 or response.headers.get_content_type() not in {
+                "application/javascript", "text/javascript"
+            }:
+                raise ValueError(f"{name}: expected JavaScript with HTTP 200")
+            actual = response.read(len(expected) + 1)
+        if hashlib.sha256(actual).digest() != hashlib.sha256(expected).digest():
+            raise ValueError(f"{name}: served bytes differ from the installed bundle")
+except (OSError, ValueError) as error:
+    print(error)
+    raise SystemExit(1)
+ASSETS
+)"; then
+    report PASS "operator browser modules match the installed bundle"
+  else
+    report FAIL "operator browser modules are unavailable or changed: ${ASSET_DIAG:-probe failed}"
+  fi
+else
+  report FAIL "operator browser modules cannot be checked: installed Python runtime is missing"
+fi
+
 # The Feishu auth manager must answer with its JSON contract, and an explicitly unconfigured
 # manager is NOT READY: preparation may run without credentials, commissioning may not.
 if FEISHU_DIAG="$(python3 - "$OPERATOR_HTTPS_PORT" <<'PY'

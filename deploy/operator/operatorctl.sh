@@ -121,9 +121,32 @@ case "$ACTION" in
     source "$TOOLCHAIN_LOG"
     python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --units-dir "$TARGET" >/dev/null
     airflow_render
-    if [ -n "${POSTGRES_ROOT:-}" ] && [ ! -f "$POSTGRES_ROOT/data/PG_VERSION" ]; then
-      POSTGRES_ROOT="$POSTGRES_ROOT" POSTGRES_MAJOR="${POSTGRES_MAJOR:-14}" \
-        bash "$AIRFLOW_HERE/scripts/install_postgres.sh"
+    if [ -n "${POSTGRES_ROOT:-}" ]; then
+      if [ ! -f "$POSTGRES_ROOT/data/PG_VERSION" ]; then
+        POSTGRES_ROOT="$POSTGRES_ROOT" POSTGRES_MAJOR="${POSTGRES_MAJOR:-14}" \
+          bash "$AIRFLOW_HERE/scripts/install_postgres.sh"
+      fi
+      # One path for a fresh install and a stopped reinstall: the managed unit owns the server
+      # `airflow db migrate` needs, and install waits for its socket before migration. No other
+      # service is started here.
+      systemctl --user daemon-reload
+      systemctl --user start description-postgres.service \
+        || die "description-postgres.service failed to start"
+      PG_BIN="$POSTGRES_ROOT/root/usr/lib/postgresql/${POSTGRES_MAJOR:-14}/bin"
+      export LD_LIBRARY_PATH="$POSTGRES_ROOT/root/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+      ready=0
+      for _ in $(seq 1 20); do
+        if "$PG_BIN/pg_isready" -q -h "$POSTGRES_ROOT/socket" -p 5433; then ready=1; break; fi
+        sleep 0.5
+      done
+      [ "$ready" = "1" ] || die "PostgreSQL did not become ready on $POSTGRES_ROOT/socket"
+      db_state="$("$PG_BIN/psql" -h "$POSTGRES_ROOT/socket" -p 5433 -U solidworks -d postgres \
+        -tAc "select 1 from pg_database where datname='airflow_meta'")" \
+        || die "could not query pg_database for airflow_meta"
+      if [ "$db_state" != "1" ]; then
+        "$PG_BIN/createdb" -h "$POSTGRES_ROOT/socket" -p 5433 -U solidworks airflow_meta \
+          || die "could not create the airflow_meta database"
+      fi
     fi
     AIRFLOW_VENV="$AIRFLOW_VENV" AIRFLOW_HOME="$AIRFLOW_HOME" AIRFLOW_PYTHON="${AIRFLOW_PYTHON:-}" \
       PIPELINE_WHEEL="${PIPELINE_WHEEL:?PIPELINE_WHEEL is required for install}" \

@@ -129,6 +129,7 @@ Complete these configuration groups once:
 | `FEISHU_ADMIN_OPEN_IDS` | Explicit administrator identities; optional, no automatic administrator |
 
 Use comma-separated tenant and administrator lists without spaces.
+The configuration example defines the remaining service and transport defaults.
 
 Set `OPERATOR_TLS_CERT` and `OPERATOR_TLS_KEY` to the absolute paths of the
 approved certificate chain and its private key. The certificate must cover
@@ -179,9 +180,10 @@ bash deploy/operator/operatorctl.sh health --env-file /home/andy/operator/operat
 ```
 
 Installation provisions the pinned Python toolchain, PostgreSQL 14, Airflow
-3.3.2, the matching tool wheel, proxy and service configuration. It creates the
-sole `solidworks_windows` Connection with the endpoint token and Linux source
-allowlist. Operators need no Connection or DAG setup.
+3.3.2, the matching tool wheel, proxy and service configuration. It starts the
+managed database before migration; `start` launches the remaining services.
+Installation creates the sole `solidworks_windows` Connection with the endpoint
+token and Linux source allowlist. Operators need no Connection or DAG setup.
 
 Only `install` writes configuration, secrets or service units. Start and health
 check installed configuration for drift. Reinstall after a configuration change;
