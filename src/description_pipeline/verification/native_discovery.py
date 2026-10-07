@@ -115,6 +115,24 @@ def _unit_vector(vector) -> list[float] | None:
     return [value / norm for value in values]
 
 
+def _finite_triple(values) -> list[float] | None:
+    """A plain three-number point or vector; non-finite or misshaped data never becomes geometry."""
+    if not isinstance(values, (list, tuple)) or len(values) != 3:
+        return None
+    try:
+        numbers = [float(value) for value in values]
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in numbers):
+        return None
+    return numbers
+
+
+def _finite_limit(value) -> bool:
+    """A real finite number; booleans and strings are not limits."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+
+
 def _cross(left, right) -> list[float]:
     return [
         left[1] * right[2] - left[2] * right[1],
@@ -138,16 +156,6 @@ def _span(rows) -> list[list[float]]:
         if norm > TOL:
             basis.append([value / norm for value in vector])
     return basis
-
-
-def _direction(entity: dict) -> list[float] | None:
-    if isinstance(entity.get("cylinder"), dict):
-        return _unit_vector(entity["cylinder"].get("direction"))
-    if isinstance(entity.get("circle"), dict):
-        return _unit_vector(entity["circle"].get("normal"))
-    if isinstance(entity.get("plane"), dict):
-        return _unit_vector(entity["plane"].get("normal"))
-    return None
 
 
 def _frames(record: dict) -> dict[str, list[list[float]] | None]:
@@ -243,19 +251,40 @@ def _geometry(entity: dict, frames):
     if frame is None:
         return None, None
     if isinstance(entity.get("cylinder"), dict):
+        source = _finite_triple(entity["cylinder"].get("point"))
+        if source is None:
+            return None, None
         direction = _unit_vector(_apply_vector(entity["cylinder"].get("direction") or (), frame))
-        point = _apply_point(entity["cylinder"].get("point") or (), frame)
+        point = _apply_point(source, frame)
+        if not all(math.isfinite(value) for value in point):
+            return None, None
         return point, direction
     if isinstance(entity.get("circle"), dict):
+        source = _finite_triple(entity["circle"].get("center"))
+        if source is None:
+            return None, None
         direction = _unit_vector(_apply_vector(entity["circle"].get("normal") or (), frame))
-        point = _apply_point(entity["circle"].get("center") or (), frame)
+        point = _apply_point(source, frame)
+        if not all(math.isfinite(value) for value in point):
+            return None, None
         return point, direction
     if isinstance(entity.get("plane"), dict):
+        source = _finite_triple(entity["plane"].get("point"))
+        if source is None:
+            return None, None
         direction = _unit_vector(_apply_vector(entity["plane"].get("normal") or (), frame))
-        point = _apply_point(entity["plane"].get("point") or (), frame)
+        point = _apply_point(source, frame)
+        if not all(math.isfinite(value) for value in point):
+            return None, None
         return point, direction
     if isinstance(entity.get("point"), (list, tuple)):
-        return _apply_point(entity["point"], frame), None
+        source = _finite_triple(entity["point"])
+        if source is None:
+            return None, None
+        point = _apply_point(source, frame)
+        if not all(math.isfinite(value) for value in point):
+            return None, None
+        return point, None
     return None, None
 
 
@@ -759,14 +788,91 @@ def verify_discovery(package: Path) -> dict:
         frames = _frames(raw)
         for mate in raw.get("mates") or []:
             _require(isinstance(mate, dict), "discovery.graph", "a mate entry is not an object")
-            if mate.get("suppressed"):
-                continue
+            suppressed = mate.get("suppressed")
             _require(
-                mate.get("error_code") == 0,
+                isinstance(suppressed, bool),
                 "discovery.graph",
-                "the saved mate reports a native error (unsolved or over-defined)",
-                {"mate": mate.get("name"), "error_code": mate.get("error_code")},
+                "a mate suppression flag is not a boolean",
+                {"mate": mate.get("name"), "suppressed": suppressed},
             )
+            if suppressed:
+                continue
+            error_code = mate.get("error_code")
+            _require(
+                isinstance(error_code, int) and not isinstance(error_code, bool) and error_code == 0,
+                "discovery.graph",
+                "the saved mate reports a native error or an unreadable solve state",
+                {"mate": mate.get("name"), "error_code": error_code},
+            )
+            limits = mate.get("limits")
+            if limits is not None:
+                _require(
+                    isinstance(limits, dict)
+                    and _finite_limit(limits.get("lower"))
+                    and _finite_limit(limits.get("upper"))
+                    and float(limits["lower"]) <= float(limits["upper"])
+                    and limits.get("unit") in {"m", "rad"},
+                    "discovery.graph",
+                    "a bounded mate limit is not a finite ordered range with a unit",
+                    {"mate": mate.get("name"), "limits": limits},
+                )
+            for entity in _entities(mate):
+                _require(
+                    str(entity.get("component")) in names,
+                    "discovery.graph",
+                    "a mate entity names an unknown component",
+                    {"component": entity.get("component")},
+                )
+                cylinder = entity.get("cylinder")
+                if isinstance(cylinder, dict):
+                    _require(
+                        _finite_triple(cylinder.get("point")) is not None,
+                        "discovery.graph",
+                        "a cylinder point is not finite",
+                        {"mate": mate.get("name"), "component": entity.get("component")},
+                    )
+                    _require(
+                        _unit_vector(cylinder.get("direction")) is not None,
+                        "discovery.graph",
+                        "a cylinder axis is not usable",
+                    )
+                    radius = cylinder.get("radius")
+                    _require(
+                        isinstance(radius, (int, float))
+                        and not isinstance(radius, bool)
+                        and math.isfinite(float(radius))
+                        and float(radius) > 0,
+                        "discovery.graph",
+                        "a cylinder radius is not a finite positive number",
+                    )
+                plane = entity.get("plane")
+                if isinstance(plane, dict):
+                    _require(
+                        _finite_triple(plane.get("point")) is not None
+                        and _unit_vector(plane.get("normal")) is not None,
+                        "discovery.graph",
+                        "a plane entity is not a finite point and normal",
+                    )
+                if isinstance(entity.get("point"), (list, tuple)):
+                    _require(
+                        _finite_triple(entity.get("point")) is not None,
+                        "discovery.graph",
+                        "a point entity is not a finite point",
+                    )
+                circle = entity.get("circle")
+                if isinstance(circle, dict):
+                    try:
+                        numbers = [
+                            float(value)
+                            for value in (*circle.get("center", ()), *circle.get("normal", ()), circle["radius"])
+                        ]
+                    except (TypeError, ValueError):
+                        numbers = []
+                    _require(
+                        len(numbers) == 7 and all(math.isfinite(value) for value in numbers) and numbers[6] > 0,
+                        "discovery.graph",
+                        "a circle entity is not a finite circle",
+                    )
             _require(
                 _rows_for(mate, frames) is not None,
                 "discovery.graph",
@@ -795,37 +901,6 @@ def verify_discovery(package: Path) -> dict:
                         "discovery.graph",
                         "concentric mate cylinders are radially displaced",
                         {"mate": mate.get("name"), "radial_gap_m": gap},
-                    )
-            for entity in _entities(mate):
-                _require(
-                    str(entity.get("component")) in names,
-                    "discovery.graph",
-                    "a mate entity names an unknown component",
-                    {"component": entity.get("component")},
-                )
-                cylinder = entity.get("cylinder")
-                if isinstance(cylinder, dict):
-                    direction = _unit_vector(cylinder.get("direction"))
-                    _require(direction is not None, "discovery.graph", "a cylinder axis is not usable")
-                    radius = cylinder.get("radius")
-                    _require(
-                        isinstance(radius, (int, float)) and float(radius) > 0,
-                        "discovery.graph",
-                        "a cylinder radius is not positive",
-                    )
-                circle = entity.get("circle")
-                if isinstance(circle, dict):
-                    try:
-                        numbers = [
-                            float(value)
-                            for value in (*circle.get("center", ()), *circle.get("normal", ()), circle["radius"])
-                        ]
-                    except (TypeError, ValueError):
-                        numbers = []
-                    _require(
-                        len(numbers) == 7 and all(math.isfinite(value) for value in numbers) and numbers[6] > 0,
-                        "discovery.graph",
-                        "a circle entity is not a finite circle",
                     )
         for datum in raw.get("datums") or []:
             _require(
