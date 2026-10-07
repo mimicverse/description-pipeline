@@ -155,9 +155,14 @@ def _select_configuration(doc, configuration, occurrence):
 
 
 @contextmanager
-def _temporary_configuration(doc, configuration, occurrence):
-    """Read one occurrence without leaving its shared document switched."""
-    previous = _active_configuration(doc)
+def _temporary_configuration(get_document, configuration, occurrence):
+    """Acquire the exact owned document at each configuration boundary.
+
+    Do not retain a shared document's dispatch interface across native reads.
+    The getter resolves the recorded path again; it never opens another
+    document or retries a failed selection. A lost document blocks restoration.
+    """
+    previous = _active_configuration(get_document())
     if not _is_text_name(previous):
         raise CadError(
             "cad_configuration_unreadable",
@@ -165,17 +170,26 @@ def _temporary_configuration(doc, configuration, occurrence):
             {"component": occurrence, "configuration": previous, "phase": "before_read"},
         )
     try:
+        doc = get_document()
         _select_configuration(doc, configuration, occurrence)
-        yield previous
+        yield doc, previous
     finally:
         pending = sys.exception()
         try:
-            _select_configuration(doc, previous, occurrence)
-        except CadError as error:
-            error.detail["phase"] = "restore"
+            _select_configuration(get_document(), previous, occurrence)
+        except Exception as error:
+            restoration = error if isinstance(error, CadError) else CadError(
+                "cad_configuration_unreadable",
+                "the document could not be restored to its prior configuration",
+                {"component": occurrence, "configuration": previous, "error": str(error)},
+            )
+            detail = restoration.detail if isinstance(restoration.detail, dict) else {"detail": restoration.detail}
+            restoration.detail = {**detail, "phase": "restore"}
             if pending is None:
-                raise
-            pending.add_note(f"Configuration restoration also failed: {error}")
+                if restoration is error:
+                    raise
+                raise restoration from error
+            pending.add_note(f"Configuration restoration also failed: {restoration} ({restoration.detail!r})")
 
 
 def _looks_like_path(value):
@@ -1519,7 +1533,9 @@ class SolidWorksBackend(CadBackend):
                 raise CadError("cad_component_not_on_disk", name, {"component": name, "path": path})
             self._record_save_flag(part, path)
             referenced = _member(comp, "ReferencedConfiguration")
-            with _temporary_configuration(part, referenced, name) as previous:
+            with _temporary_configuration(
+                lambda document_path=path: self._document_by_path(document_path), referenced, name
+            ) as (part, previous):
                 children = list(_member(comp, "GetChildren") or ())
                 placement = self._placement(comp)
                 record_datums(part, name, placement)
@@ -1622,10 +1638,12 @@ class SolidWorksBackend(CadBackend):
         if component not in self._components:
             raise CadError("cad_missing_component", component)
         holder = self._components[component]
-        doc = _member(holder, "GetModelDoc2")
+        path = _member(holder, "GetPathName")
         sources: list[str] = []
         values: list[float] = []
-        with _temporary_configuration(doc, _member(holder, "ReferencedConfiguration"), component):
+        with _temporary_configuration(
+            lambda: self._document_by_path(path), _member(holder, "ReferencedConfiguration"), component
+        ) as (doc, _previous):
             document_values = list(map(float, _member(doc, "GetTessTriangles", True) or ()))
             document_valid = (
                 bool(document_values) and len(document_values) % 9 == 0 and all(map(math.isfinite, document_values))

@@ -68,6 +68,9 @@ class FakeComponent:
     def GetModelDoc2(self):  # noqa: N802 - SolidWorks API name
         return self._document
 
+    def GetPathName(self):  # noqa: N802 - SolidWorks API name
+        return "C:/neutral/pcb.SLDPRT"
+
     def GetBodies2(self, body_type, visible_only):  # noqa: N802 - SolidWorks API name
         return list(self._bodies.get(body_type, ()))
 
@@ -82,6 +85,7 @@ class FakeComponentOneArg(FakeComponent):
 def _backend(component) -> SolidWorksBackend:
     backend = object.__new__(SolidWorksBackend)
     backend._components = {"pcb-1": component}
+    backend._document_by_path = {component.GetPathName(): component.GetModelDoc2()}.__getitem__
     backend.notes = {}
     return backend
 

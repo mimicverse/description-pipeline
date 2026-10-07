@@ -375,7 +375,22 @@ class _App:
         self._docs = {os.path.normcase(os.path.abspath(str(path))): doc for path, doc in docs.items()}
 
     def GetOpenDocumentByName(self, path):
-        return self._docs.get(os.path.normcase(os.path.abspath(str(path))))
+        key = os.path.normcase(os.path.abspath(str(path)))
+        if key in self._docs:
+            return self._docs[key]
+        # Opening an assembly also opens its resolved component documents.
+        stack = [component for doc in self._docs.values() for component in doc._children]
+        visited = set()
+        while stack:
+            component = stack.pop()
+            if id(component) in visited:
+                continue
+            visited.add(id(component))
+            document = component.GetModelDoc2()
+            if document is not None and os.path.normcase(os.path.abspath(document.GetPathName())) == key:
+                return document
+            stack.extend(component.GetChildren())
+        return None
 
     def GetBuildNumbers(self):
         return "portable-mock"
@@ -915,6 +930,71 @@ class CaptureSceneTests(unittest.TestCase):
                     backend.verify_sources_unchanged()
                 self.assertEqual(caught.exception.code, "cad_source_changed")
 
+    def _mesh_with_expiring_document(self, root, *, foreign_replacement=False):
+        part = _write(root, "shared.SLDPRT")
+        replacement_path = _write(root, "foreign.SLDPRT") if foreign_replacement else part
+        replacement = _Doc(
+            replacement_path,
+            configuration="Short",
+            configuration_children={"Short": [], "Parked": []},
+        )
+        app = _App({})
+
+        class ExpiringDocument(_Doc):
+            expired = False
+
+            def __getattribute__(self, name):
+                if name == "ConfigurationManager" and object.__getattribute__(self, "expired"):
+                    raise RuntimeError("RPC_S_UNKNOWN_IF: stale document interface")
+                return super().__getattribute__(name)
+
+            def GetTessTriangles(self, _quality):
+                self.assert_configuration = self.active_configuration
+                app._docs[os.path.normcase(os.path.abspath(str(part)))] = replacement
+                component._doc = replacement
+                self.expired = True
+                return [0, 0, 0, 1, 0, 0, 0, 1, 0]
+
+        original = ExpiringDocument(
+            part,
+            configuration="Parked",
+            configuration_children={"Short": [], "Parked": []},
+        )
+        app._docs[os.path.normcase(os.path.abspath(str(part)))] = original
+        component = _Component("part-short", part, doc=original, configuration="Short")
+        backend = SolidWorksBackend(session_factory=lambda: _Session(app))
+        backend._components["part-short"] = component
+        return backend, original, replacement
+
+    def test_mesh_restores_configuration_through_fresh_owned_document_handle(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            backend, original, replacement = self._mesh_with_expiring_document(root)
+            output = root / "arm.stl"
+
+            result = backend.export_component_mesh("part-short", output)
+
+            self.assertTrue(original.expired)
+            self.assertEqual(original.assert_configuration, "Short")
+            self.assertEqual(replacement.active_configuration, "Parked")
+            self.assertEqual(result["triangles"], 1)
+            self.assertEqual(read_stl(output).high, (1.0, 1.0, 0.0))
+
+    def test_mesh_restore_refuses_replacement_from_another_document(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            backend, original, replacement = self._mesh_with_expiring_document(root, foreign_replacement=True)
+            output = root / "arm.stl"
+
+            with self.assertRaises(CadError) as caught:
+                backend.export_component_mesh("part-short", output)
+
+            self.assertTrue(original.expired)
+            self.assertEqual(caught.exception.code, "document_not_open")
+            self.assertEqual(caught.exception.detail["phase"], "restore")
+            self.assertEqual(replacement.active_configuration, "Short")
+            self.assertFalse(output.exists())
+
     def test_failed_configuration_restore_does_not_mask_a_read_failure(self):
         class RestoreFailure(_Doc):
             def ShowConfiguration2(self, name):
@@ -928,7 +1008,10 @@ class CaptureSceneTests(unittest.TestCase):
                     configuration_children={"Short": [], "Parked": []},
                 )
                 read_error = CadError("cad_mesh_export_failed", "original reading failure")
-                with self.assertRaises(CadError) as caught, _temporary_configuration(doc, "Short", "part-short"):
+                with (
+                    self.assertRaises(CadError) as caught,
+                    _temporary_configuration(lambda document=doc: document, "Short", "part-short"),
+                ):
                     if fail_read:
                         raise read_error
                 if fail_read:
