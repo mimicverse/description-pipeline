@@ -30,6 +30,7 @@ from description_pipeline.orchestration.airflow_client import (
     ResultNotPublishable,
     WindowsEndpoint,
     check_result,
+    config_from_airflow_connection,
     native_run_id,
     resolved_routing,
     validate_artifact_name,
@@ -273,8 +274,8 @@ class MockEndpoint:
 
 
 class ClientTests(unittest.TestCase):
-    def endpoint(self, server: MockEndpoint, token: str = TOKEN) -> WindowsEndpoint:
-        return WindowsEndpoint(EndpointConfig(base_url=server.url, token=token, timeout=5))
+    def endpoint(self, server: MockEndpoint, token: str = TOKEN, roots=()) -> WindowsEndpoint:
+        return WindowsEndpoint(EndpointConfig(base_url=server.url, token=token, timeout=5, handoff_roots=roots))
 
     def test_health_and_auth(self) -> None:
         with MockEndpoint() as server:
@@ -404,9 +405,11 @@ class ClientTests(unittest.TestCase):
 
     def _stub_archive(self, digest: str = "b" * 64):
         module = types.ModuleType("description_pipeline.orchestration.handoffs")
+        self.archived_sources: list[Path] = []
 
         def prepare_archive(source: Path, archive: Path) -> dict:
             self.assertTrue(Path(source).is_dir(), source)
+            self.archived_sources.append(Path(source).resolve())
             Path(archive).write_bytes(b"PK\x03\x04stub-archive")
             return {"handoff_sha256": digest, "files": {"cad-revision.json": "x"}}
 
@@ -415,12 +418,14 @@ class ClientTests(unittest.TestCase):
 
     def test_absolute_posix_path_is_zipped_and_imported(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            source = Path(tmp) / "handoff"
-            source.mkdir()
+            root = Path(tmp) / "handoffs"
+            source = root / "handoff"
+            source.mkdir(parents=True)
             (source / "cad-revision.json").write_text("{}", encoding="utf-8")
             with MockEndpoint() as server, self._stub_archive():
-                resolved = self.endpoint(server).resolve_handoff(str(source))
+                resolved = self.endpoint(server, roots=[root]).resolve_handoff(str(source))
             self.assertEqual(resolved.handoff_sha256, "b" * 64)
+            self.assertEqual(self.archived_sources, [source.resolve()])
             self.assertEqual(server.resolved_paths, [])
             self.assertEqual(len(server.imports), 1)
             upload = server.imports[0]
@@ -430,14 +435,97 @@ class ClientTests(unittest.TestCase):
 
     def test_import_digest_mismatch_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            source = Path(tmp) / "handoff"
-            source.mkdir()
+            root = Path(tmp) / "handoffs"
+            source = root / "handoff"
+            source.mkdir(parents=True)
             with (
                 MockEndpoint() as server,
                 self._stub_archive(digest="c" * 64),
                 self.assertRaises(EndpointProtocolError),
             ):
-                self.endpoint(server).resolve_handoff(str(source))
+                self.endpoint(server, roots=[root]).resolve_handoff(str(source))
+
+    def test_absolute_handoff_requires_configured_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "handoff"
+            source.mkdir()
+            with MockEndpoint() as server:
+                with self.assertRaises(EndpointProtocolError):
+                    self.endpoint(server).resolve_handoff(str(source))
+                self.assertEqual(server.hits, 0)
+                self.assertEqual(server.imports, [])
+
+    def test_absolute_handoff_outside_roots_is_rejected_without_network(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "handoffs"
+            root.mkdir()
+            outside = Path(tmp) / "private"
+            outside.mkdir()
+            with MockEndpoint() as server:
+                with self.assertRaises(EndpointProtocolError):
+                    self.endpoint(server, roots=[root]).resolve_handoff(str(outside))
+                self.assertEqual(server.hits, 0)
+                self.assertEqual(server.imports, [])
+
+    def test_nested_folder_inside_root_is_archived(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "handoffs"
+            nested = root / "team-a" / "robot-cell"
+            nested.mkdir(parents=True)
+            (nested / "part.SLDPRT").write_text("solid", encoding="utf-8")
+            with MockEndpoint() as server, self._stub_archive():
+                resolved = self.endpoint(server, roots=[root]).resolve_handoff(str(nested))
+                self.assertEqual(resolved.handoff_sha256, "b" * 64)
+                self.assertEqual(self.archived_sources, [nested.resolve()])
+                self.assertEqual(len(server.imports), 1)
+
+    def test_linked_handoff_paths_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "handoffs"
+            root.mkdir()
+            outside = Path(tmp) / "outside"
+            outside.mkdir()
+            (root / "linked").symlink_to(outside, target_is_directory=True)
+            with MockEndpoint() as server:
+                with self.assertRaises(EndpointProtocolError):
+                    self.endpoint(server, roots=[root]).resolve_handoff(str(root / "linked" / "cell"))
+                self.assertEqual(server.hits, 0)
+                with self.assertRaises(EndpointProtocolError):
+                    self.endpoint(server, roots=[root / "linked"])
+
+    def test_filesystem_root_and_relative_roots_are_refused(self) -> None:
+        for roots in ("/", ["relative/root"], [123]):
+            with self.subTest(roots=roots), self.assertRaises(EndpointProtocolError):
+                EndpointConfig(base_url="http://127.0.0.1", token=TOKEN, handoff_roots=roots)
+
+    def test_connection_extra_supplies_handoff_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "handoffs"
+            root.mkdir()
+
+            class FakeConnection:
+                host = "127.0.0.1"
+                port = 18765
+                password = "token"
+
+                def __init__(self) -> None:
+                    self.extra_dejson = {"timeout": 5, "handoff_roots": [str(root)]}
+
+            class FakeBaseHook:
+                @staticmethod
+                def get_connection(conn_id):
+                    return FakeConnection()
+
+            airflow = types.ModuleType("airflow")
+            hooks = types.ModuleType("airflow.hooks")
+            base = types.ModuleType("airflow.hooks.base")
+            base.BaseHook = FakeBaseHook
+            hooks.base = base
+            airflow.hooks = hooks
+            with mock.patch.dict(sys.modules, {"airflow": airflow, "airflow.hooks": hooks, "airflow.hooks.base": base}):
+                config = config_from_airflow_connection("solidworks_windows")
+            self.assertEqual(config.handoff_roots, (root.resolve(),))
+            self.assertEqual(config.base_url, "http://127.0.0.1:18765")
 
     def test_native_run_id_is_canonical_and_stable(self) -> None:
         expected = str(uuid.uuid5(uuid.NAMESPACE_URL, f"solidworks_to_urdf:{RUN_ID}"))
