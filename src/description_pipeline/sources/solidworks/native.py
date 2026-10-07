@@ -393,6 +393,160 @@ def legacy_mass_reading(values, status) -> dict:
     }
 
 
+_SW_MATE_TYPES = {
+    0: "coincident",
+    1: "concentric",
+    2: "perpendicular",
+    3: "parallel",
+    4: "tangent",
+    5: "distance",
+    6: "angle",
+    7: "lock",
+}
+
+
+def _custom_properties(doc, configuration=None):
+    """Document and configuration custom properties, unmodified."""
+
+    values = {}
+    for scope in ("", configuration or ""):
+        if scope and scope == "":
+            continue
+        try:
+            manager = _member(_member(doc, "Extension"), "CustomPropertyManager", scope)
+        except Exception:  # noqa: BLE001 - a missing manager is an empty namespace
+            manager = None
+        if manager is None:
+            continue
+        try:
+            names = [str(item) for item in (_as_list(_member(manager, "GetNames")) or [])]
+        except Exception:  # noqa: BLE001
+            continue
+        for name in names:
+            text_value = None
+            for probe in ("Get6", "Get"):
+                try:
+                    raw = _member(manager, probe, name, "", False) if probe == "Get6" else _member(manager, probe, name)
+                except Exception:  # noqa: BLE001
+                    raw = None
+                if isinstance(raw, (list, tuple)) and raw:
+                    raw = raw[0]
+                if _is_text_name(raw):
+                    text_value = str(raw)
+                    break
+            if text_value is not None:
+                values.setdefault(name, text_value)
+    return values
+
+
+def _plane_or_cylinder(target):
+    """Recorded surface geometry of one mate entity, in its component frame."""
+
+    try:
+        surface = _dynamic(_member(target, "GetSurface"))
+    except Exception:  # noqa: BLE001
+        surface = None
+    if surface is not None:
+        try:
+            if _member(surface, "IsCylinder"):
+                params = [float(value) for value in (_as_list(_member(surface, "CylinderParams")) or [])]
+                if len(params) == 7:
+                    direction = params[3:6]
+                    norm = math.sqrt(sum(value * value for value in direction))
+                    if norm > 0 and params[6] > 0:
+                        return {
+                            "cylinder": {
+                                "point": params[0:3],
+                                "direction": [value / norm for value in direction],
+                                "radius": params[6],
+                            }
+                        }
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if _member(surface, "IsPlane"):
+                params = [float(value) for value in (_as_list(_member(surface, "PlaneParams")) or [])]
+                if len(params) == 6:
+                    first = params[0:3]
+                    second = params[3:6]
+                    first_norm = math.sqrt(sum(value * value for value in first))
+                    second_norm = math.sqrt(sum(value * value for value in second))
+                    if abs(first_norm - 1.0) <= 1e-6:
+                        return {"plane": {"normal": first, "point": second}}
+                    if abs(second_norm - 1.0) <= 1e-6:
+                        return {"plane": {"normal": second, "point": first}}
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        point = [float(value) for value in (_as_list(_member(target, "GetPoint")) or [])]
+        if len(point) == 3:
+            return {"point": point}
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
+
+
+def _feature_name(target):
+    try:
+        feature = _dynamic(_member(target, "GetFeature"))
+        name = _member(feature, "Name")
+        return str(name) if _is_text_name(name) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _coordinate_system_features(doc):
+    names = []
+    try:
+        feature = _dynamic(_member(doc, "FirstFeature"))
+    except Exception:  # noqa: BLE001
+        return names
+    while feature is not None:
+        try:
+            type_name = str(_member(feature, "GetTypeName2") or "")
+            name = _member(feature, "Name")
+        except Exception:  # noqa: BLE001
+            break
+        if type_name in ("CoordSys", "CoordinateSystem") and _is_text_name(name):
+            names.append(str(name))
+        try:
+            feature = _dynamic(_member(feature, "GetNextFeature"))
+        except Exception:  # noqa: BLE001
+            break
+    return names
+
+
+def _mate_features(doc):
+    features = []
+    try:
+        feature = _dynamic(_member(doc, "FirstFeature"))
+    except Exception:  # noqa: BLE001
+        return features
+    while feature is not None:
+        try:
+            type_name = str(_member(feature, "GetTypeName2") or "")
+        except Exception:  # noqa: BLE001
+            break
+        if type_name == "Mate":
+            features.append(feature)
+        try:
+            feature = _dynamic(_member(feature, "GetNextFeature"))
+        except Exception:  # noqa: BLE001
+            break
+    return features
+
+
+def _relative_document(path_value, source_root):
+    try:
+        candidate = Path(str(path_value))
+        if not candidate.is_file():
+            return None
+        relative = candidate.resolve().relative_to(Path(source_root).resolve())
+        return relative.as_posix()
+    except (OSError, ValueError):
+        return None
+
+
 class SolidWorksBackend(CadBackend):
     name = "solidworks"
 
@@ -1635,6 +1789,251 @@ class SolidWorksBackend(CadBackend):
             "suppressed": [entry["instance"] for entry in instances if entry["suppressed"]],
             "instances": instances,
         }
+
+    def discover_native(self, frozen_source: Path, settings: dict) -> dict:
+        """Read the raw native record for CAD-only discovery (owned session).
+
+        Opens the immutable engineering directory read-only inside this
+        process's owned session and records the primitives discovery needs:
+        identity properties, the component graph with occurrence transforms,
+        mate features with component-frame entity geometry, coordinate systems
+        (assembly and component scope), materials/masses and per-document
+        hashes.  Every read fails closed; nothing is defaulted.
+        """
+
+        source_root = Path(frozen_source).resolve()
+        candidates = sorted(
+            path
+            for path in source_root.rglob("*")
+            if path.suffix.lower() == ".sldasm" and not path.name.startswith("~$") and path.is_file()
+        )
+        if not candidates:
+            raise CadError("native_discovery_assembly_missing", "no SolidWorks assembly in the engineering directory")
+        with self.session():
+            assemblies = []
+            for candidate in candidates:
+                doc = self.open_document(str(candidate))
+                assemblies.append((candidate, doc))
+            main = None
+            if len(assemblies) == 1:
+                main = assemblies[0]
+            else:
+                referenced = set()
+                for _candidate, doc in assemblies:
+                    for component in _as_list(_member(doc, "GetComponents", False)) or []:
+                        path = _member(_dynamic(component), "GetPathName")
+                        if _is_text_name(path):
+                            referenced.add(normalize_document_path(str(path)))
+                roots = [item for item in assemblies if normalize_document_path(str(item[0])) not in referenced]
+                if len(roots) == 1:
+                    main = roots[0]
+            if main is None:
+                raise CadError(
+                    "native_discovery_main_assembly_ambiguous",
+                    "several assemblies could be the delivered model; keep one top-level assembly",
+                    {"candidates": [str(item[0]) for item in assemblies]},
+                )
+            main_path, doc = main
+            active = _member(_member(doc, "ConfigurationManager"), "ActiveConfiguration")
+            configuration = str(_member(active, "Name") or "")
+            identity_properties = _custom_properties(doc, configuration)
+            components = []
+            by_component = {}
+            by_document: dict[str, str] = {}
+            masses = []
+            stack = [(doc, "", None)]
+            while stack:
+                assembly, prefix, _parent = stack.pop()
+                active_config = _member(_member(assembly, "ConfigurationManager"), "ActiveConfiguration")
+                root = _member(active_config, "GetRootComponent3", True)
+                for raw in list(_member(root, "GetChildren") or []):
+                    component = _dynamic(raw)
+                    name = str(_member(component, "Name2") or "")
+                    if not name:
+                        continue
+                    path_name = f"{prefix}/{name}" if prefix else name
+                    document_path = _member(component, "GetPathName")
+                    relative = _relative_document(document_path, source_root) if _is_text_name(document_path) else None
+                    try:
+                        transform = [
+                            float(value) for value in transform_from_solidworks(_member(component, "GetTotalTransform"))
+                        ]
+                    except Exception:  # noqa: BLE001 - an unreadable transform must block, not guess
+                        transform = []
+                    entry = {
+                        "name2": path_name,
+                        "instance_id": path_name,
+                        "document": relative
+                        or (normalize_document_path(str(document_path)) if _is_text_name(document_path) else ""),
+                        "configuration": str(_member(component, "ReferencedConfiguration") or ""),
+                        "fixed": bool(_member(component, "IsFixed")),
+                        "suppressed": bool(_member(component, "IsSuppressed")),
+                        "lightweight": bool(_member(component, "IsLightweight")),
+                        "transform": transform,
+                    }
+                    components.append(entry)
+                    by_component[path_name] = component
+                    by_document[path_name] = entry["document"]
+                    try:
+                        mass_property = _member(_member(doc, "Extension"), "CreateMassProperty2")
+                        if mass_property is not None and not entry["suppressed"]:
+                            mass_property.UseSystemUnits = True
+                            mass_property.IncludeHiddenBodiesOrComponents = True
+                            import pythoncom
+
+                            mass_property.SelectedItems = _win32().VARIANT(
+                                pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, (component,)
+                            )
+                            _member(mass_property, "Recalculate")
+                            mass = float(_member(mass_property, "Mass"))
+                            volume = float(_member(mass_property, "Volume"))
+                            if math.isfinite(mass) and mass > 0:
+                                masses.append(
+                                    {
+                                        "component": path_name,
+                                        "mass_kg": mass,
+                                        "volume_m3": volume if math.isfinite(volume) else None,
+                                        "material": None,
+                                    }
+                                )
+                    except Exception:  # noqa: BLE001 - masses are informational here
+                        pass
+                    children = list(_member(component, "GetChildren") or [])
+                    if children:
+                        part = _member(component, "GetModelDoc2")
+                        if part is not None:
+                            stack.append((part, path_name, component))
+            mates = []
+            for feature in _mate_features(doc):
+                name = str(_member(feature, "Name") or "")
+                specific = _dynamic(_member(feature, "GetSpecificFeature2"))
+                if specific is None:
+                    mates.append(
+                        {"name": name, "type": "unknown-specific", "suppressed": False, "limits": None, "entities": []}
+                    )
+                    continue
+                try:
+                    raw_type = _member(specific, "Type")
+                    type_index = int(raw_type)
+                except Exception:  # noqa: BLE001
+                    type_index = -1
+                mate_type = _SW_MATE_TYPES.get(type_index, f"unknown-{type_index}")
+                entities = []
+                try:
+                    count = int(_member(specific, "MateEntityCount") or 0)
+                except Exception:  # noqa: BLE001
+                    count = 0
+                for index in range(count):
+                    try:
+                        entity = _dynamic(_member(specific, "MateEntity", index))
+                        reference = _dynamic(_member(entity, "ReferenceComponent"))
+                        reference_name = str(_member(reference, "Name2") or "")
+                        reference_path = _relative_document(_member(reference, "GetPathName"), source_root)
+                        owner = next(
+                            (
+                                key
+                                for key in by_component
+                                if key.split("/")[-1] == reference_name
+                                and (reference_path is None or by_document.get(key) == reference_path)
+                            ),
+                            None,
+                        )
+                        target = _member(entity, "Reference")
+                        geometry = _plane_or_cylinder(target)
+                        entities.append(
+                            {
+                                "component": owner or reference_name,
+                                "feature": _feature_name(target),
+                                "face_index": None,
+                                **geometry,
+                            }
+                        )
+                    except Exception:  # noqa: BLE001 - an unreadable entity blocks via the empty list
+                        continue
+                mates.append(
+                    {
+                        "name": name,
+                        "type": mate_type,
+                        "suppressed": False,
+                        "limits": None,
+                        "entities": entities,
+                    }
+                )
+            datums = []
+            for name in _coordinate_system_features(doc):
+                try:
+                    matrix = [float(value) for value in self._coordinate_system_transform(doc, name)]
+                except Exception:  # noqa: BLE001
+                    continue
+                datums.append({"name": name, "owner": "", "array": matrix})
+            for entry in components:
+                part = by_component.get(entry["name2"])
+                if part is None or entry["suppressed"]:
+                    continue
+                document = _member(part, "GetModelDoc2")
+                if document is None or not entry["transform"]:
+                    continue
+                for name in _coordinate_system_features(document):
+                    try:
+                        local = self._coordinate_system_transform(document, name)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    component_matrix = [
+                        entry["transform"][0:4],
+                        entry["transform"][4:8],
+                        entry["transform"][8:12],
+                        entry["transform"][12:16],
+                    ]
+                    composed = self._multiply_frames(component_matrix, local)
+                    datums.append(
+                        {"name": name, "owner": entry["name2"], "array": [value for row in composed for value in row]}
+                    )
+            property_buckets = {"document": identity_properties, "components": {}, "mates": {}}
+            for entry in components:
+                part = by_component.get(entry["name2"])
+                if part is None:
+                    continue
+                values = _custom_properties(_member(part, "GetModelDoc2"), entry["configuration"] or None)
+                if values:
+                    property_buckets["components"][entry["name2"]] = values
+            files = {}
+            for path in (main_path, *[Path(str(_member(item, "GetPathName"))) for item in by_component.values()]):
+                relative = _relative_document(path, source_root)
+                if relative and relative not in files:
+                    files[relative] = _hash(str(Path(source_root) / relative))
+            return {
+                "schema_version": "solidworks-to-urdf.native-discovery/v1",
+                "contract": "native-discovery/v1",
+                "namespace": "dp",
+                "generator": "solidworks-native-reader",
+                "solidworks": dict(self.environment()),
+                "identity": {
+                    "hardware_id": identity_properties.get("dp.hardware_id"),
+                    "revision": identity_properties.get("dp.revision"),
+                    "parent_revision": identity_properties.get("dp.parent_revision"),
+                    "owner": identity_properties.get("dp.owner"),
+                    "change_summary": identity_properties.get("dp.change_summary"),
+                    "control": {
+                        "system": identity_properties.get("dp.control.system"),
+                        "reference": identity_properties.get("dp.control.reference"),
+                    },
+                    "delivery_configuration": identity_properties.get("dp.delivery_configuration"),
+                    "main_assembly": _relative_document(main_path, source_root),
+                    "robot_name": identity_properties.get("dp.robot_name"),
+                },
+                "components": components,
+                "mates": mates,
+                "datums": datums,
+                "masses": masses,
+                "properties": property_buckets,
+                "files": files,
+            }
+
+    @staticmethod
+    def _multiply_frames(left, right):
+        """Column-vector 4x4 product; ``self._coordinate_system_transform`` returns rows."""
+
+        return [[sum(left[row][k] * right[k][column] for k in range(4)) for column in range(4)] for row in range(4)]
 
     def selftest(self, test_cs=None, export_mesh=None):
         points = {}
