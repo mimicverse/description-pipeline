@@ -106,7 +106,8 @@ class CadBackend:
     ) -> RawScene:
         raise NotImplementedError
 
-    def export_component_mesh(self, component: str, dest_path: str, progress=None) -> dict:
+    def export_component_meshes(self, destinations: dict[str, str], progress=None) -> dict[str, dict]:
+        """Export one geometry batch while its native parent interfaces stay alive."""
         raise NotImplementedError
 
     def verify_sources_unchanged(self) -> dict[str, dict]:

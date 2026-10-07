@@ -72,12 +72,16 @@ Temporary document selections are restored and verified. Meshes use the
 occurrence's solid and surface bodies in component coordinates, without switching
 the shared part document's configuration. Mesh and shaft reads acquire current
 occurrences from the recorded assembly and verify their full names, paths and
-referenced configurations. An unreadable body, invalid face
+referenced configurations. One assembly traversal owns the complete mesh batch;
+its parent interfaces remain alive through all body and face reads. Mesh destinations
+are unique and ordered by full occurrence identity. An unreadable body, invalid face
 triangles or a body with no display mesh blocks capture. Final checks verify
 the document state through each recorded path in the owned session, and compare
 a fresh assembly traversal with the captured active occurrences. Changed
 names, paths, references or suppression block capture. Unreadable state retains
 the affected document and occurrence in diagnostics.
+Environment and owned-session identities are saved before native readings, so
+reading and geometry failures retain those facts with the partial capture.
 Suppressed datums are excluded. Unreadable suppression state or an unreadable
 active datum blocks discovery and capture; active frames cannot disappear
 silently. An unreadable selection or failed restoration blocks capture.

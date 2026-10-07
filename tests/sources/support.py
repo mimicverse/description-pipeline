@@ -387,10 +387,15 @@ class FixtureCadBackend(CadBackend):
         scene.notes = {"backend": self.name}
         return scene
 
-    def export_component_mesh(self, component: str, dest_path: str, progress=None) -> dict[str, Any]:
-        triangles = cube_stl(Path(dest_path))
-        self.exported.append(str(dest_path))
-        return {"component": component, "written": dest_path, "used_api": "fixture", "triangles": triangles}
+    def export_component_meshes(self, destinations: dict[str, str], progress=None) -> dict[str, dict[str, Any]]:
+        entries = {}
+        for component, dest_path in destinations.items():
+            triangles = cube_stl(Path(dest_path))
+            self.exported.append(str(dest_path))
+            entries[component] = {
+                "component": component, "written": dest_path, "used_api": "fixture", "triangles": triangles,
+            }
+        return entries
 
     def verify_sources_unchanged(self) -> dict[str, Any]:
         files = [self.document, *self._dependencies]

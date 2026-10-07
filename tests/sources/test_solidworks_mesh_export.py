@@ -116,7 +116,7 @@ class ComponentMeshExportTests(unittest.TestCase):
             FakeDocument([]),
             {0: [], 1: [FakeBody([FakeFace(TRIANGLE)])]},
         )
-        entry = _backend(component).export_component_mesh("pcb-1", self.dest)
+        entry = _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
         self.assertEqual(entry["triangles"], 1)
         self.assertEqual(entry["tessellation_sources"], ["sheet_body_faces"])
         self.assertEqual(entry["bodies"], {"solid": 0, "sheet": 1})
@@ -128,7 +128,7 @@ class ComponentMeshExportTests(unittest.TestCase):
             FakeDocument(list(TRIANGLE)),
             {0: [FakeBody([FakeFace(TRIANGLE)])], 1: [FakeBody([FakeFace(TRIANGLE)])]},
         )
-        entry = _backend(component).export_component_mesh("pcb-1", self.dest)
+        entry = _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
         self.assertEqual(entry["triangles"], 2)
         self.assertEqual(entry["tessellation_sources"], ["solid_body_faces", "sheet_body_faces"])
 
@@ -137,7 +137,7 @@ class ComponentMeshExportTests(unittest.TestCase):
             FakeDocument([]),
             {0: [FakeBody([FakeFace(TRIANGLE)]), FakeBody([FakeFace(TRIANGLE)])]},
         )
-        entry = _backend(component).export_component_mesh("pcb-1", self.dest)
+        entry = _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
         self.assertEqual(entry["triangles"], 2)
         self.assertEqual(entry["tessellation_sources"], ["solid_body_faces"])
         self.assertEqual(entry["bodies"], {"solid": 2, "sheet": 0})
@@ -146,7 +146,7 @@ class ComponentMeshExportTests(unittest.TestCase):
 
     def test_solid_geometry_does_not_need_document_tessellation(self):
         component = FakeComponent(FakeDocument([]), {0: [FakeBody([FakeFace(TRIANGLE)])], 1: []})
-        entry = _backend(component).export_component_mesh("pcb-1", self.dest)
+        entry = _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
         self.assertEqual(entry["tessellation_sources"], ["solid_body_faces"])
         self.assertEqual(read_stl(self.dest).triangles, 1)
 
@@ -156,7 +156,7 @@ class ComponentMeshExportTests(unittest.TestCase):
             {0: [FakeBody([FakeFace(TRIANGLE)]), FakeBody([FakeFace([])])]},
         )
         with self.assertRaises(CadError) as caught:
-            _backend(component).export_component_mesh("pcb-1", self.dest)
+            _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
         self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
         self.assertEqual(caught.exception.detail["body_index"], 1)
         self.assertFalse(self.dest.exists())
@@ -169,7 +169,7 @@ class ComponentMeshExportTests(unittest.TestCase):
 
         component = UnreadableComponent(FakeDocument(TRIANGLE), {})
         with self.assertRaises(CadError) as caught:
-            _backend(component).export_component_mesh("pcb-1", self.dest)
+            _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
         self.assertEqual(caught.exception.code, "cad_component_bodies_unreadable")
         self.assertEqual(component.body_calls, [(0,)])
         self.assertFalse(self.dest.exists())
@@ -179,7 +179,7 @@ class ComponentMeshExportTests(unittest.TestCase):
             FakeDocument([]), {0: [FakeBody([FakeFace(TRIANGLE), FakeFace([])])]}
         )
         with self.assertRaises(CadError) as caught:
-            _backend(component).export_component_mesh("pcb-1", self.dest)
+            _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
         self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
         self.assertEqual(caught.exception.detail["face_index"], 1)
         self.assertFalse(self.dest.exists())
@@ -187,20 +187,20 @@ class ComponentMeshExportTests(unittest.TestCase):
     def test_bodies_without_display_mesh_fail_instead_of_exporting_nothing(self):
         component = FakeComponent(FakeDocument([]), {0: [], 1: [FakeBody([FakeFace([])])]})
         with self.assertRaises(CadError) as caught:
-            _backend(component).export_component_mesh("pcb-1", self.dest)
+            _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
         self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
         self.assertFalse(self.dest.exists())
 
     def test_empty_part_fails(self):
         component = FakeComponent(FakeDocument([]), {0: [], 1: []})
         with self.assertRaises(CadError) as caught:
-            _backend(component).export_component_mesh("pcb-1", self.dest)
+            _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
         self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
 
     def test_unknown_component_fails(self):
         component = FakeComponent(FakeDocument([]), {})
         with self.assertRaises(CadError) as caught:
-            _backend(component).export_component_mesh("missing-1", self.dest)
+            _backend(component).export_component_meshes({"missing-1": self.dest})
         self.assertEqual(caught.exception.code, "cad_missing_component")
 
 

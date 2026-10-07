@@ -1649,29 +1649,43 @@ class SolidWorksBackend(CadBackend):
             values.extend(body_values)
         return values
 
-    def export_component_mesh(self, component, dest_path, progress=None):
-        """Write occurrence-local solids and sheets without switching documents.
+    def export_component_meshes(self, destinations, progress=None):
+        """Keep one live assembly traversal through the entire geometry batch.
 
         IComponent2 bodies follow the occurrence's referenced configuration;
         the shared part document may have another configuration active.
         """
+        missing = sorted(set(destinations) - self._components)
+        if missing:
+            raise CadError("cad_missing_component", missing[0])
+        if len({os.path.normcase(os.path.abspath(path)) for path in destinations.values()}) != len(destinations):
+            raise CadError("cad_mesh_export_failed", "each occurrence needs a distinct mesh destination")
+        with self._current_components("geometry") as current:
+            entries = {}
+            for component in sorted(destinations):
+                dest_path = destinations[component]
+                try:
+                    entries[component] = self._write_component_mesh(component, dest_path, current[component])
+                except CadError as error:
+                    detail = error.detail if isinstance(error.detail, dict) else {"native_detail": error.detail}
+                    error.detail = {**detail, "component": component, "completed_components": list(entries)}
+                    raise
+            return entries
 
-        if component not in self._components:
-            raise CadError("cad_missing_component", component)
+    def _write_component_mesh(self, component, dest_path, holder):
+        """Write the occurrence's solids and sheets within its owning geometry phase."""
         sources: list[str] = []
         values: list[float] = []
         body_counts = {"solid": 0, "sheet": 0}
-        with self._current_components("geometry") as current:
-            holder = current[component]
-            for body_type, kind, source in (
-                (0, "solid", "solid_body_faces"),
-                (1, "sheet", "sheet_body_faces"),
-            ):
-                bodies = self._body_list(holder, body_type, component)
-                body_counts[kind] = len(bodies)
-                if bodies:
-                    values.extend(self._body_face_triangles(bodies, body_type, component))
-                    sources.append(source)
+        for body_type, kind, source in (
+            (0, "solid", "solid_body_faces"),
+            (1, "sheet", "sheet_body_faces"),
+        ):
+            bodies = self._body_list(holder, body_type, component)
+            body_counts[kind] = len(bodies)
+            if bodies:
+                values.extend(self._body_face_triangles(bodies, body_type, component))
+                sources.append(source)
         if not values:
             raise CadError(
                 "cad_mesh_export_failed",
@@ -1769,7 +1783,7 @@ class SolidWorksBackend(CadBackend):
 
     @contextmanager
     def _current_components(self, phase):
-        """Keep the current parent interfaces alive for one complete occurrence read."""
+        """Keep native parent interfaces alive until the complete read phase finishes."""
         doc = self._captured_document(self._scene_document_key, phase=phase)
         path = self._source_documents[self._scene_document_key][0]
         name = ""

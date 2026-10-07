@@ -1329,12 +1329,26 @@ def _export_geometry(
     backend: Any, cfg: dict[str, Any], geometry_dir: Path, components: list[str]
 ) -> list[dict[str, Any]]:
     geometry_dir.mkdir(parents=True, exist_ok=True)
+    # Keep one native geometry phase alive across all occurrence reads.
+    # Instance identities stay in the evidence; filenames remain bounded.
+    destinations = {
+        component: str(geometry_dir / f"{index:04d}_{digest_json(component)[:24]}.stl")
+        for index, component in enumerate(sorted(components), start=1)
+    }
+    if len(destinations) != len(components):
+        raise BridgeError("cad_mesh_export_failed", "geometry contains duplicate occurrence identities", exit_code=3)
+    entries = backend.export_component_meshes(destinations)
+    if not isinstance(entries, dict) or set(entries) != set(destinations):
+        raise BridgeError("cad_mesh_export_failed", "geometry export returned a different occurrence set", exit_code=3)
     exported: list[dict[str, Any]] = []
-    for index, component in enumerate(components, start=1):
-        # Assembly instance paths can exceed filesystem filename limits. The
-        # evidence record retains the full identity; filenames stay bounded.
-        target = geometry_dir / f"{index:04d}_{digest_json(component)[:24]}.stl"
-        info = backend.export_component_mesh(component, str(target))
+    for component, destination in destinations.items():
+        target = Path(destination)
+        info = entries[component]
+        if not isinstance(info, dict) or info.get("component") != component or str(info.get("written")) != destination:
+            raise BridgeError(
+                "cad_mesh_export_failed", "geometry export returned a different occurrence or path",
+                {"component": component}, exit_code=3,
+            )
         stats = read_stl(target)
         exported.append(
             {
@@ -1414,6 +1428,11 @@ def _freeze_local(
 
         stage = "dependency_closure"
         closure = _dependency_closure(backend, cfg, staging / "source")
+        # Both owned CAD sessions now exist. Persist their identities before
+        # native reads so a failed geometry capture retains its environment.
+        stage = "environment"
+        environment = capture_environment(backend, worker_version)
+        write_json(staging / "evidence" / "environment.json", environment)
         stage = "readings"
         scene, raw = _capture_readings(backend, cfg, closure, staging / "source")
         write_json(staging / "raw" / "scene_raw.json", raw)
@@ -1468,7 +1487,6 @@ def _freeze_local(
         write_json(staging / "scene.json", scene_payload)
 
         source_inputs = _source_inputs(cfg, closure)
-        environment = capture_environment(backend, worker_version)
         identity = {
             "provider": SOURCE_KIND,
             "assembly": cfg["assembly"],
@@ -1509,7 +1527,6 @@ def _freeze_local(
             },
         )
         write_json(staging / "evidence" / "collection.json", evidence)
-        write_json(staging / "evidence" / "environment.json", environment)
 
         # Windows cannot rename a directory while CAD owns file handles inside
         # it. Release the owned applications before atomically publishing.

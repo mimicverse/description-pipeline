@@ -930,11 +930,49 @@ class CaptureSceneTests(unittest.TestCase):
             self.assertEqual(scene.mass_properties["part-long"]["mass_kg"], 3.0)
             for name, triangles, extent in (("part-long", 2, 2.0), ("part-short", 1, 1.0)):
                 path = root / f"{name}.stl"
-                result = backend.export_component_mesh(name, path)
+                result = backend.export_component_meshes({name: path})[name]
                 self.assertEqual(result["triangles"], triangles)
                 self.assertEqual(read_stl(path).high, (extent, extent, 0.0))
                 self.assertEqual(shared.active_configuration, "Parked")
             backend.verify_sources_unchanged()
+
+    def test_geometry_phase_does_not_release_and_reacquire_parents_between_occurrences(self):
+        from contextlib import contextmanager
+
+        from description_pipeline.sources.solidworks.freeze import _export_geometry
+
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            backend, _, shared, _, _ = self._configured_occurrences(root)
+            original = backend._current_components
+            acquisitions = []
+
+            @contextmanager
+            def live_phase(phase):
+                if phase == "geometry":
+                    if acquisitions:
+                        raise CadError("cad_source_state_unreadable", "geometry owner released between occurrences")
+                    acquisitions.append(phase)
+                with original(phase) as current:
+                    yield current
+
+            backend._current_components = live_phase
+            entries = _export_geometry(backend, {}, root / "geometry", ["part-long", "part-short"])
+            self.assertEqual([entry["triangles"] for entry in entries], [2, 1])
+            self.assertEqual(read_stl(root / entries[0]["path"]).high, (2.0, 2.0, 0.0))
+            self.assertEqual(read_stl(root / entries[1]["path"]).high, (1.0, 1.0, 0.0))
+            self.assertEqual(shared.active_configuration, "Parked")
+            backend.verify_sources_unchanged()
+
+    def test_geometry_batch_rejects_shared_destinations_before_writing(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            backend, _, _, _, _ = self._configured_occurrences(root)
+            target = root / "same.stl"
+            with self.assertRaises(CadError) as caught:
+                backend.export_component_meshes({"part-long": target, "part-short": root / "unused/../same.stl"})
+            self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
+            self.assertFalse(target.exists())
 
     def test_repeated_configuration_source_guard_still_rejects_real_drift(self):
         for drift in ("reference", "active", "file", "path", "suppression", "added", "removed", "renamed", "duplicate"):
@@ -974,7 +1012,7 @@ class CaptureSceneTests(unittest.TestCase):
             stale.GetBodies2 = _raiser(RuntimeError("RPC_S_UNKNOWN_IF: expired occurrence"))
             stale.GetPathName = _raiser(RuntimeError("expired occurrence"))
             path = root / "fresh.stl"
-            backend.export_component_mesh("part-short", path)
+            backend.export_component_meshes({"part-short": path})["part-short"]
             self.assertEqual(read_stl(path).high, (1.0, 1.0, 0.0))
             backend.verify_sources_unchanged()
 
@@ -1046,7 +1084,7 @@ class CaptureSceneTests(unittest.TestCase):
             backend, _, _, _, _ = self._configured_occurrences(root)
             lifetimes = self._borrowed_occurrence_geometry(backend, root)
             path = root / "borrowed.stl"
-            backend.export_component_mesh("part-long", path)
+            backend.export_component_meshes({"part-long": path})["part-long"]
             self.assertEqual(read_stl(path).triangles, 2)
             self.assertEqual(read_stl(path).high, (2.0, 2.0, 0.0))
             self.assertTrue(lifetimes)
@@ -1078,7 +1116,7 @@ class CaptureSceneTests(unittest.TestCase):
             )
             path = root / "failed.stl"
             with self.assertRaises(CadError) as caught:
-                backend.export_component_mesh("part-short", path)
+                backend.export_component_meshes({"part-short": path})["part-short"]
             self.assertEqual(caught.exception.code, "cad_face_tessellation_unreadable")
             self.assertEqual(caught.exception.detail["component"], "part-short")
             self.assertEqual(caught.exception.detail["face_index"], 1)
@@ -1094,7 +1132,7 @@ class CaptureSceneTests(unittest.TestCase):
             main._children.reverse()
             for name, count, extent in (("sub-1/part-1", 1, 1.0), ("sub-2/part-1", 2, 2.0)):
                 path = root / f"{count}.stl"
-                backend.export_component_mesh(name, path)
+                backend.export_component_meshes({name: path})[name]
                 self.assertEqual(read_stl(path).triangles, count)
                 self.assertEqual(read_stl(path).high, (extent, extent, 0.0))
             self.assertEqual(shared.active_configuration, "Parked")
@@ -1107,7 +1145,7 @@ class CaptureSceneTests(unittest.TestCase):
             short.GetChildren = _raiser(RuntimeError("fresh occurrence tree unavailable"))
             path = root / "blocked.stl"
             with self.assertRaises(CadError) as caught:
-                backend.export_component_mesh("part-short", path)
+                backend.export_component_meshes({"part-short": path})["part-short"]
             self.assertEqual(caught.exception.code, "cad_source_state_unreadable")
             self.assertEqual(caught.exception.detail["phase"], "geometry")
             self.assertEqual(caught.exception.detail["component"], "part-short")
@@ -1121,7 +1159,7 @@ class CaptureSceneTests(unittest.TestCase):
             backend._sessions.clear()
             backend._session_factory = _raiser(AssertionError("a new CAD application must not be started"))
             with self.assertRaises(CadError) as caught:
-                backend.export_component_mesh("part-short", root / "blocked.stl")
+                backend.export_component_meshes({"part-short": root / "blocked.stl"})["part-short"]
             self.assertEqual(caught.exception.code, "cad_source_state_unreadable")
             self.assertEqual(caught.exception.detail["phase"], "geometry")
             self.assertIn("original owned capture session", caught.exception.detail["error"])
@@ -1133,7 +1171,7 @@ class CaptureSceneTests(unittest.TestCase):
                 backend, _, _, short, _ = self._configured_occurrences(root)
                 setattr(short, field, None)
                 with self.assertRaises(CadError) as caught:
-                    backend.export_component_mesh("part-short", root / "blocked.stl")
+                    backend.export_component_meshes({"part-short": root / "blocked.stl"})["part-short"]
                 self.assertEqual(caught.exception.code, "cad_source_state_unreadable")
                 self.assertEqual(caught.exception.detail["phase"], "geometry")
 
@@ -1153,7 +1191,7 @@ class CaptureSceneTests(unittest.TestCase):
                 "part-short", part, doc=shared, configuration="Short"
             )
             with self.assertRaises(CadError) as caught:
-                backend.export_component_mesh("part-short", root / "blocked.stl")
+                backend.export_component_meshes({"part-short": root / "blocked.stl"})["part-short"]
             self.assertEqual(caught.exception.code, "cad_source_state_unreadable")
             self.assertEqual(caught.exception.detail["component"], "")
             self.assertEqual(caught.exception.detail["phase"], "geometry")

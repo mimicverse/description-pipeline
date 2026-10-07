@@ -855,6 +855,70 @@ class FreezeTests(unittest.TestCase):
         # ... and nothing was delivered
         self.assertFalse(self.destination.exists())
 
+    def test_failed_readings_retain_environment_and_both_owned_session_ids(self) -> None:
+        backend, config = self._two_component_backend()
+        backend.scene_document_override = str(self.assembly)
+        sessions = {
+            "source": {"pid": 41, "executable": "sldworks.exe", "ownership": "windows_job"},
+            "copy": {"pid": 42, "executable": "sldworks.exe", "ownership": "windows_job"},
+        }
+        backend.environment = lambda: {"revision": "34.0.0", "sessions": sessions}
+
+        with self.assertRaises(BridgeError) as caught:
+            freeze(config, self.destination, backend=backend, worker_version="test-worker")
+
+        self.assertEqual(caught.exception.code, "capture_source_mismatch")
+        failure = self.destination.with_name(self.destination.name + ".failed-001")
+        environment = json.loads((failure / "partial/evidence/environment.json").read_text())
+        self.assertEqual(environment["solidworks"]["sessions"], sessions)
+        self.assertEqual(environment["solidworks"]["revision"], "34.0.0")
+        self.assertEqual(environment["worker_version"], "test-worker")
+
+    def test_geometry_failure_retains_environment_without_masking_original_error(self) -> None:
+        from description_pipeline.sources.solidworks.errors import CadError
+
+        backend, config = self._two_component_backend()
+        sessions = {"copy": {"pid": 42, "executable": "sldworks.exe", "ownership": "windows_job"}}
+        backend.environment = lambda: {"revision": "34.0.0", "sessions": sessions}
+
+        def unavailable_mesh(*args, **kwargs):
+            raise CadError("cad_body_faces_unreadable", "native faces unavailable", {"api": "IBody2.GetFaces"})
+
+        backend.export_component_meshes = unavailable_mesh
+        with self.assertRaises(CadError) as caught:
+            freeze(config, self.destination, backend=backend)
+
+        self.assertEqual(caught.exception.code, "cad_body_faces_unreadable")
+        failure = self.destination.with_name(self.destination.name + ".failed-001")
+        record = json.loads((failure / "failure.json").read_text())
+        self.assertEqual(record["stage"], "geometry")
+        self.assertEqual(record["detail"]["api"], "IBody2.GetFaces")
+        environment = json.loads((failure / "partial/evidence/environment.json").read_text())
+        self.assertEqual(environment["solidworks"]["sessions"], sessions)
+        self.assertFalse(self.destination.exists())
+
+    def test_geometry_batch_cannot_omit_or_substitute_an_occurrence(self) -> None:
+        for change in ("omit", "substitute"):
+            with self.subTest(change=change):
+                backend, config = self._two_component_backend()
+                original = backend.export_component_meshes
+
+                def changed_result(destinations, original=original, change=change):
+                    entries = original(destinations)
+                    name = next(iter(entries))
+                    if change == "omit":
+                        entries.pop(name)
+                    else:
+                        entries[name]["component"] = "foreign-occurrence"
+                    return entries
+
+                backend.export_component_meshes = changed_result
+                destination = self.tmp / change
+                with self.assertRaises(BridgeError) as caught:
+                    freeze(config, destination, backend=backend)
+                self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
+                self.assertFalse(destination.exists())
+
     def test_retry_writes_a_second_diagnosis_and_keeps_the_first(self) -> None:
         backend, config = self._two_component_backend()
         backend.copy_configuration = "Other"
