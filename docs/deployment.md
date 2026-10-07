@@ -130,7 +130,15 @@ Store the app credentials in the mode-`0600` JSON file named by
 {"app_id": "<enterprise-app-id>", "app_secret": "<enterprise-app-secret>"}
 ```
 
-Request only identity/profile access needed for sign-in. Membership in an
+The enterprise app is used for sign-in only. The
+[current authorization API](https://open.feishu.cn/document/common-capabilities/sso/api/obtain-oauth-code)
+uses an S256 challenge; the server exchanges the code at the
+[v3 token API](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/authentication-management/access-token/get-user-access-token-v3).
+The [basic profile API](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/authen-v1/user_info/get)
+requires no additional contact-directory, email, phone or employment permissions.
+The workflow does not request offline access or retain Feishu refresh tokens.
+
+Membership in an
 approved tenant grants workflow operator access; administrators must also appear
 in the explicit admin list. Identity is bound to the app, tenant and `open_id`,
 and recorded with the Airflow execution. Feishu does not supply CAD, drive

@@ -117,6 +117,22 @@ signed axes, zero configuration, datum placement and limits against original
 native observations and engineering annotations. Merely validating generated
 YAML against a schema or comparing two derivatives does not prove these facts.
 
+Native admission reconstructs supported coincident, concentric, distance,
+parallel, perpendicular, angle and lock constraints, including recorded position
+limits. Their combined six-dimensional constraint space must establish rigid
+membership or exactly one supported relative motion. A temporary fixed flag or
+a mate name is insufficient. Unresolved entities, unsupported constraints,
+ambiguous motion and a topology that cannot form a tree block derivation.
+
+The capture path requires a rereadable cylindrical interface for each motion
+axis. Named axes alone do not qualify this capture path. Body frames must be
+owned native `CS_<link>` datums, with `CS_base_link` identifying the root.
+The child body frame supplies its incoming joint frame; a separate JCS must
+match it and have the same owner. Recognized installation, TCP and sensor
+datums retain their exact interface names and owning bodies. Positive motion
+requires the explicit native `axis_sign` property; vendor cylinder orientation
+does not establish it.
+
 Drive and physical specifications must resolve to fixed controlled records or
 qualified native engineering properties. Missing, conflicting or ambiguous
 facts block the delivery/use that requires them; no fabricated limits, default
