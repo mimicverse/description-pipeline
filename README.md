@@ -16,7 +16,7 @@ also check and rebuild a frozen delivery without CAD.
 ## Submit through Airflow
 
 Prepare the sealed CAD package and robot definition according to the
-[input specification](docs/input.md). Place the package under the Windows
+[mechanical handoff specification](docs/mechanical-handoff-spec.md). Place the package under the Windows
 endpoint's configured handoff root. In the Airflow UI, trigger
 `solidworks_to_urdf` with the package path, revision digest and configured model
 target. The [deployment guide](docs/deployment.md) defines setup and all trigger
@@ -43,7 +43,7 @@ git clone https://github.com/<owner>/<model-repository>.git C:\description\model
 ```
 
 The structural design must include the CAD datums and robot semantics required
-by the [input specification](docs/input.md). A saved assembly alone cannot
+by the [mechanical handoff specification](docs/mechanical-handoff-spec.md). A saved assembly alone cannot
 establish body grouping, joint direction, limits or physical authority.
 
 Seal each mechanical revision once. The local command below is also available
@@ -80,7 +80,7 @@ their own contracts and acceptance.
 | Document | Purpose |
 |---|---|
 | [Design](docs/design.md) | Principles, workflow, organization and operation |
-| [Input specification](docs/input.md) | CAD preparation, robot semantics and revision management |
+| [结构组交付规范](docs/mechanical-handoff-spec.md) | CAD preparation, mechanical definitions, evidence and revision management (Chinese) |
 | [Quality specification](docs/quality.md) | Required gates, tolerances and evidence |
 | [Operations](docs/operations.md) | Complete local workflow, diagnosis and model review |
 | [Airflow deployment](docs/deployment.md) | Linux orchestration and Windows execution |

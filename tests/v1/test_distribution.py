@@ -23,7 +23,7 @@ class DistributionTests(unittest.TestCase):
             identity = {"source_commit": "a" * 40}
             path = root / "deployment.zip"
             with zipfile.ZipFile(path, "w") as archive:
-                archive.writestr("docs/input.md", "approved\n")
+                archive.writestr("docs/mechanical-handoff-spec.md", "approved\n")
             write_json(root / "release.json", {**identity, "artifacts": inventory(root)})
             write_json(root / "SHA256SUMS.json", inventory(root))
             verify_release(root, identity)

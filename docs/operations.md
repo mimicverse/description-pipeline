@@ -4,7 +4,7 @@
 
 On the SolidWorks computer, save the selected assembly configuration and collect
 its native dependencies into a revision directory. Create the body datums and
-stable shaft references specified in [input.md](input.md). Complete
+stable shaft references specified in the [mechanical handoff specification](mechanical-handoff-spec.md). Complete
 `robot.yaml`, limits/material evidence and reviewed mass/size bounds.
 
 The directory must be complete before sealing. A new CAD design uses a new
