@@ -7,12 +7,7 @@
 # …) are pinned and hashed too. Resolution is constrained by the vendored Apache constraints
 # (constraints-3.12.txt) so already-tested Airflow-side versions win over newer transitive ranges.
 #
-# Regenerate (after any wheel or pin change):
-#   scripts/build_requirements_lock.py --python <venv>/bin/python
-#     --requirements requirements.txt --constraints constraints-3.12.txt
-#     --constraints requirements.lock
-#     --wheel <dist>/mimicverse_description-<version>-py3-none-any.whl
-#     --output requirements.lock
+# Regeneration commands and acceptance: deploy/airflow/README.md, Deployment maintenance.
 apache-airflow==3.3.2
 apache-airflow-providers-standard==1.19.0
 psycopg2-binary==2.9.13

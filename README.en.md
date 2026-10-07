@@ -1,3 +1,3 @@
 # SolidWorks to URDF
 
-The English documentation is maintained in [README.md](README.md).
+This compatibility entry points to the canonical English [README](README.md).

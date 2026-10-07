@@ -1,7 +1,7 @@
 # Quality specification
 
 Report: `solidworks-to-urdf.quality/v1`. Pipeline ID: `solidworks-to-urdf`.
-All required gates must pass before automatic publication. Missing evidence is
+All required gates must pass before automatic publication. Missing required evidence is
 a failure. There is no public bypass or waiver switch.
 
 The table below records the released v1.0.0 prepared-package checks. The
@@ -9,7 +9,9 @@ target mechanical handoff is CAD-only: generated YAML is a derived artifact,
 not a second author input. Additional definition checks below are required
 before that workflow can claim acceptance.
 
-## Required checks
+## Released verification gates
+
+Implementation paths below are relative to `src/description_pipeline/`.
 
 | Gate | Evidence and acceptance | Implementation |
 |---|---|---|
@@ -19,14 +21,14 @@ before that workflow can claim acceptance.
 | Occurrence coverage | Every native occurrence belongs to exactly one body; identity survives normalization | `verification/solidworks_urdf.py` |
 | Coordinates | Finite SI homogeneous transforms, orthonormal right-handed bases, CAD-derived body/joint/reference frames | `verification/solidworks_urdf.py` |
 | Shaft alignment | Numeric cylinder line, stable native identity, origin on shaft and axis collinearity | `verification/solidworks_urdf.py` |
-| Names and topology | Unique snake_case names; exactly one `base_link`; connected acyclic tree; author/model/XML entity agreement | `verification/solidworks_urdf.py` |
+| Names and topology | Unique snake_case names; exactly one `base_link`; connected acyclic tree; input/model/XML entity agreement | `verification/solidworks_urdf.py` |
 | Joint semantics | Exact type, parent/child, signed axis and limits; evidence bound to archived inputs | `verification/solidworks_urdf.py` |
 | Physical authority | Explicit material coverage or complete documented masses; no implicit density or unknown convention | `verification/solidworks_physics.py` |
 | Mass, COM and tensor | Independently rotate/translate raw part readings, apply the parallel-axis theorem and convert to each CAD link datum | `verification/solidworks_physics.py` |
 | Assembly closure | Independent part sum agrees with full whole-assembly mass/COM/tensor and complete component-context readings | `verification/solidworks_physics.py` |
 | Inertia validity | Finite positive mass; positive principal inertia; triangle inequality; XML full tensor agrees with raw-verified model | `verification/solidworks_urdf.py` |
 | Geometry | Native mesh coverage, exact file hashes, SI scale, finite nonempty triangles, CAD placement of actual vertices | `verification/solidworks_urdf.py`, `geometry/stl.py` |
-| Physical plausibility | COM within body bounds; inertia within geometry radius bound; total mass and whole-robot extent within author intervals | `verification/solidworks_urdf.py` |
+| Physical plausibility | COM within body bounds; inertia within geometry radius bound; total mass and largest whole-robot extent within declared intervals | `verification/solidworks_urdf.py` |
 | Consumer loading | MuJoCo loads delivered URDF and meshes and retains expected bodies and movable joints | `verification/solidworks_urdf.py` |
 | Report binding | Recomputed deterministic report equals the saved report and bound file subject | `delivery.py`, `verification/solidworks_urdf.py` |
 | Publication | Reverify copied output and actual Git blob bytes; revision succession; fast-forward push; exact PR head/base | `repository/urdf_pr.py` |
@@ -35,9 +37,9 @@ before that workflow can claim acceptance.
 
 | Quantity | Acceptance tolerance |
 |---|---|
-| Joint/frame position and shaft offset | 0.05 mm |
+| Joint/frame position and radial shaft offset | 0.05 mm |
 | Frame rotation and shaft line angle | 0.05 degrees |
-| Signed XML/author axis | Absolute component difference ≤ 1e-12 |
+| Signed XML/declared axis | Absolute component difference ≤ 1e-12 |
 | Unit joint axis | Norm error ≤ 1e-9 |
 | Independent mass | Relative 1e-6, absolute 1e-12 kg |
 | Independent COM | Absolute 0.05 mm per component |
@@ -86,13 +88,17 @@ blobs, including any effects of newline conversion or clean filters.
 ## Scope of acceptance
 
 A pass establishes the listed consistency, physical arithmetic, geometry and
-URDF-loading checks for its exact files. It does not prove material assignment
-matches real hardware, free-form evidence states correct limits, every motion
-is collision-free, or the model is ready for simulation, training or control.
+URDF-loading checks for its exact files. It does not prove actual CAD rigidity
+or degrees of freedom, physical zero or positive motion, real mechanical limits,
+drive capability, material correctness or full-range clearance. Those facts
+require engineering confirmation. Simulation, training and control require
+their own acceptance evidence.
 
 Mechanical review owns input meaning and measured authority. v1 exports visual
 meshes and physical properties; collision simplification, contact behavior,
 actuator/control interfaces and dynamic validation require separate acceptance.
+The [mechanical specification](mechanical-handoff-spec.md) assigns each handoff
+check to its automatic coverage and required engineering confirmation.
 Unit tests with mocked CAD cannot grant native qualification. The release review
 must include actual Windows capture and a complete passing delivery.
 
@@ -101,6 +107,9 @@ exercises. It does not qualify M3 or another hardware model; each model needs
 its own reviewed inputs, passing delivery and evidence for its intended use.
 
 ## CAD-only definition acceptance
+
+These requirements must be implemented and verified before releasing the
+target workflow; they are additional to the v1.0.0 gates above.
 
 The mechanical team supplies only SolidWorks engineering contents under the
 [mechanical specification](mechanical-handoff-spec.md). The pipeline must
@@ -117,6 +126,11 @@ qualified native engineering properties. Missing, conflicting or ambiguous
 facts block the delivery/use that requires them; no fabricated limits, default
 efforts or guessed directions are acceptable. Source and library revisions,
 original units, transformations and provenance remain bound to the delivery.
+
+The per-item report must distinguish automatic results from engineering
+confirmations as specified in [the mechanical standard](mechanical-handoff-spec.md#112-检查报告与-airflow-展示).
+Each confirmation applies to the recorded structural version; missing,
+unsupported or unexecuted checks cannot become implicit passes.
 
 The released v1.0.0 rejects every effective mass/COM/inertia override. A future
 controlled native-parameter channel requires its own demonstrated acceptance;

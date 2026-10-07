@@ -1,13 +1,14 @@
 # Operations
 
-The target workflow is **one URL → login → one SolidWorks directory → progress
-→ verified URDF and review PR**. The mechanical team works only in SolidWorks;
-all pipeline definitions, manifests and reports are generated automatically.
+This guide follows the target workflow from engineering preparation to model
+release: **one URL → login → one SolidWorks directory → verification → review PR**.
+The mechanical team supplies native engineering; the pipeline generates model
+definitions, manifests and reports.
 
-The CAD-only automatic-definition flow is not yet released. v1.0.0 still uses
-its legacy prepared package and six-field Airflow trigger; it is not the
-mechanical-team interface specified here. Current status and legacy platform
-instructions are in [deployment.md](deployment.md#release-and-deployment-status).
+This interface is not yet released. v1.0.0 requires a prepared package and
+six-field Airflow trigger maintained by the platform team. See
+[deployment status](deployment.md#release-and-deployment-status) and the
+[released trigger procedure](../deploy/airflow/README.md#run-and-inspect-a-delivery).
 
 ## 1. Prepare the SolidWorks engineering model
 
@@ -15,19 +16,23 @@ Follow the [SolidWorks engineering specification](mechanical-handoff-spec.md).
 Confirm assembly organization and dependencies, rigid connections and motion,
 root/body/interface datums, mechanical zero, signed directions, limits,
 materials and the real component identities used for controlled specifications.
+Its responsibility matrix distinguishes automatic consistency checks from the
+engineering facts that the responsible engineers must inspect and confirm.
 
 Complete native engineering properties or platform-provided CAD annotations
 only where standard assembly contents cannot express a necessary fact. Do not
 create `robot.yaml`, revision JSON, pipeline evidence texts or a separate
 manual joint/body mapping file.
 
-For wrists and other multiaxis mechanisms, review actual connection order,
-axis offsets, left/right direction, endpoint poses and tool-frame attachment.
+Review every mechanism's actual connection order, axis relationships, positive
+motion, interface attachment and clearance throughout its working range.
+For coupled mechanisms, preserve and check the actual coupling.
 
-## 2. Save and collect the delivery
+## 2. Save and collect the engineering directory
 
-Select the declared export/zero configuration in SolidWorks, force-rebuild,
-resolve errors and save all referenced documents. Collect dependencies with
+Select the declared delivery configuration in SolidWorks. Confirm its zero or
+reference pose and any declared zero offsets, force-rebuild, resolve errors
+and save all referenced documents. Collect dependencies with
 Pack and Go or an equivalent native mechanism. Reopen the collected copy and
 verify that it resolves without the original workstation paths.
 
@@ -41,12 +46,12 @@ need no per-run SSH or transfer command sequence.
 
 ## 3. Run from the single operator page
 
-Open the published operator URL, log in, select or paste the SolidWorks folder
-and start. No YAML, digest, model repository, branch, connection ID or native
-job ID is an operator field.
+Once commissioned, open the operator URL, log in, select or paste the engineering
+directory path and start. Access, routing and run identity are managed by the platform.
 
 The target interface accepts an absolute Linux folder, an absolute folder on
-the configured Windows worker, or a path relative to its managed handoff root.
+the configured Windows worker, or a path relative to its configured package
+root (`package_root`).
 Linux inputs are transported automatically; all inputs become a fixed native
 inventory before execution.
 
@@ -65,6 +70,11 @@ The platform resolves the hardware destination from native identity. Missing
 or ambiguous identity blocks publication; missing mechanical facts produce
 findings at the corresponding CAD object. Parameters are never invented to
 make a stage pass.
+
+The required check view separates automatic results from engineering
+confirmations. Each item shows its evidence, affected CAD objects and corrective
+guidance. Failed, unexecuted, unsupported and unconfirmed items remain visible;
+automatic success does not complete an outstanding engineering review.
 
 Retries within one Airflow run reuse its frozen input and native UUID. Starting
 a new run creates a new job; changing source contents never silently changes
@@ -94,15 +104,17 @@ require recapturing CAD merely to retry publication.
 ## 5. Review and release the model
 
 Inspect the actual verified URDF on the same operator page. Check root/body
-placement, individual positive motions, left/right differences, ranges and
-endpoint poses, especially the wrists. Compare with the native engineering
+placement, individual positive motions, mirrored-instance differences, ranges,
+endpoint poses and interface motion. Compare with the native engineering
 state and the independent report, not just the overall silhouette.
 
 Confirm the source version, frozen identity, tool identity, quality subject and
-PR commit. The model reviewer approves mechanical meanings and accepted uses;
+PR commit, and that necessary engineering confirmations apply to that version.
+The model reviewer approves mechanical meanings and accepted uses;
 a candidate PR is not automatic model release.
 
-A portable copied delivery can be independently rechecked:
+A portable copied delivery can be independently rechecked after installing the
+recorded tool release and activating its environment:
 
 ```sh
 description check /path/to/reviewed/delivery
@@ -114,7 +126,7 @@ reports with the approved model.
 
 ## 6. Platform diagnostics and frozen replay
 
-These commands are platform tools, not requirements on the mechanical team.
+Platform maintainers use the following commands in the recorded tool environment.
 Fresh native reading requires the licensed Windows worker. A complete frozen
 delivery can be checked and rebuilt on Linux or Windows without opening CAD:
 
@@ -124,7 +136,8 @@ description rebuild /path/to/frozen-delivery --output /path/to/rebuilt-delivery
 description submit /path/to/rebuilt-delivery --repository /path/to/model-clone --base feature/arm
 ```
 
-Use the same recorded tool release and dependencies. Rebuild preserves the
+The final command publishes a candidate PR after verification; use a dedicated,
+clean model clone with GitHub authentication. Rebuild preserves the
 archived native evidence and generated definitions; it does not turn generated
 YAML into a human authoring input. Infrastructure, authentication and worker
 commissioning belong to [deployment.md](deployment.md).
