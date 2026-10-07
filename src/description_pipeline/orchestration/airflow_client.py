@@ -48,6 +48,7 @@ _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _PULL_URL = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/pull/[1-9]\d*\Z")
 _REVIEW_BRANCH = re.compile(r"work/solidworks/[a-z0-9_.-]+\Z")
+_HARDWARE_ID = re.compile(r"[A-Za-z0-9_.-]{1,200}\Z")
 SUBMISSION_STATES = {"published", "updated", "noop"}
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
@@ -505,7 +506,8 @@ def resolved_routing(job: dict) -> dict:
     """The routing a native job resolved inside the serialized Windows execution.
 
     A native handoff cannot name hardware, revision or destination before CAD discovery, so the
-    passed job snapshot must carry the routing it resolved instead of the operator request.
+    passed job snapshot must carry the routing it resolved instead of the operator request. The
+    repository target is keyed directly by the native hardware identity, so no alias is carried.
     """
     if not isinstance(job, dict):
         raise EndpointProtocolError("job is not a JSON object")
@@ -513,13 +515,15 @@ def resolved_routing(job: dict) -> dict:
     if not isinstance(receipt, dict):
         receipt = {}
     routing = {}
-    for field in ("hardware_id", "revision", "target", "repository_slug", "repository_base"):
+    for field in ("hardware_id", "revision", "repository_slug", "repository_base"):
         value = job.get(field)
         if value is None:
             value = receipt.get(field)
         if not isinstance(value, str) or not value.strip() or _CONTROL.search(value):
             raise EndpointProtocolError(f"native job has not resolved {field}")
         routing[field] = value.strip()
+    if _HARDWARE_ID.fullmatch(routing["hardware_id"]) is None:
+        raise EndpointProtocolError("native job resolved a non-ASCII hardware_id")
     if "/" not in routing["repository_slug"]:
         raise EndpointProtocolError("native job resolved a repository_slug without an owner")
     return routing

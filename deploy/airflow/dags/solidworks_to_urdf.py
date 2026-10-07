@@ -133,7 +133,6 @@ def solidworks_to_urdf():
             "handoff_sha256": request["handoff_sha256"],
             "hardware_id": routing["hardware_id"],
             "revision": routing["revision"],
-            "target": routing["target"],
             "repository_slug": routing["repository_slug"],
             "base": routing["repository_base"],
         }

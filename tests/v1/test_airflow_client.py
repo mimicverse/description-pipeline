@@ -168,7 +168,6 @@ class MockEndpoint:
                         job.update(
                             hardware_id="m3.0",
                             revision="r1",
-                            target="m3",
                             repository_slug="example/m3.0",
                             repository_base="feature/m3.0",
                         )
@@ -359,6 +358,10 @@ class ClientTests(unittest.TestCase):
             server.jobs[RUN_ID]["repository_slug"] = " "
             with self.assertRaises(EndpointProtocolError):
                 endpoint.get_job(RUN_ID)
+            server.jobs[RUN_ID]["repository_slug"] = "example/m3.0"
+            server.jobs[RUN_ID]["hardware_id"] = "m3.0 左"
+            with self.assertRaises(EndpointProtocolError):
+                resolved_routing(server.jobs[RUN_ID])
 
     def test_read_artifact_verifies_digest_and_limit(self) -> None:
         urdf = b"<robot name='fixture'/>"
