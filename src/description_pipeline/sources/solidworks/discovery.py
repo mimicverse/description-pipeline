@@ -1150,6 +1150,16 @@ def _body_records(
                     )
                 )
                 continue
+            if str(datum.get("owner") or "") not in members:
+                findings.append(
+                    _finding(
+                        "discovery.body_datum_owner_mismatch",
+                        f"body:{root}",
+                        "body_datum names a datum that no component of this body owns",
+                        {"datum": explicit, "owner": datum.get("owner"), "members": members},
+                    )
+                )
+                continue
         elif len(owned) == 1:
             datum = owned[0]
         elif not owned:
@@ -1400,25 +1410,7 @@ def _root_body(
 
     named = [body for body in bodies if str(body.get("datum")) == "CS_base_link"]
     if len(named) == 1:
-        root = named[0]
-        properties = (record.get("properties") or {}).get("components") or {}
-        annotated = {
-            clusters.of[name]
-            for name, values in properties.items()
-            if isinstance(values, dict)
-            and str(values.get(f"{namespace}.body_root") or "").strip().lower() in {"1", "true", "yes"}
-            and name in clusters.of
-        }
-        if annotated and annotated != {root["root"]}:
-            findings.append(
-                _finding(
-                    "discovery.body_root_conflict",
-                    "assembly",
-                    "dp.body_root contradicts CS_base_link; remove the redundant annotation",
-                    {"body_root": sorted(annotated), "base": root["root"]},
-                )
-            )
-        return root
+        return named[0]
     if len(named) > 1:
         findings.append(
             _finding(

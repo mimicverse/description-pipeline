@@ -571,12 +571,12 @@ class DiscoveryTests(unittest.TestCase):
         result, _source, _output = self._prepare(mutate=mutate)
         self.assertIn("discovery.body_marker_unsupported", self._codes(result))
 
-    def test_contradictory_body_root_blocks(self):
+    def test_explicit_body_datum_must_be_owned_by_the_body(self):
         def mutate(payload):
-            payload["properties"]["components"] = {"arm-1": {"dp.body_root": "true"}}
+            payload["properties"]["components"] = {"arm-1": {"dp.body_datum": "CS_base_link"}}
 
         result, _source, _output = self._prepare(mutate=mutate)
-        self.assertIn("discovery.body_root_conflict", self._codes(result))
+        self.assertIn("discovery.body_datum_owner_mismatch", self._codes(result))
 
     def test_interface_suffix_must_already_be_snake_case(self):
         def mutate(payload):

@@ -894,7 +894,15 @@ def verify_discovery(package: Path) -> dict:
                 )
                 components_properties = (raw.get("properties") or {}).get("components") or {}
                 explicit = {(components_properties.get(component) or {}).get("dp.body_datum") for component in group}
-                if datum_name not in explicit:
+                if datum_name in explicit:
+                    owner = str((_datum(raw, datum_name) or {}).get("owner") or "")
+                    _require(
+                        owner in group,
+                        "discovery.names",
+                        "body_datum names a datum no component of this body owns",
+                        {"body": name, "datum": datum_name, "owner": owner},
+                    )
+                else:
                     _require(
                         str(datum_name) == f"CS_{name}",
                         "discovery.names",
@@ -1223,7 +1231,6 @@ def verify_discovery(package: Path) -> dict:
         source = robot.get("source") or {}
         bodies = [str(body.get("name")) for body in source.get("bodies") or []]
         _require("base_link" in bodies, "discovery.tree", "no base_link body")
-        raw = state["payload"]["raw"]
         _require(
             any(
                 str(body.get("name")) == "base_link"
@@ -1233,22 +1240,6 @@ def verify_discovery(package: Path) -> dict:
             "discovery.tree",
             "no body owns CS_base_link; a temporary IsFixed flag cannot prove the base",
         )
-        component_properties = (raw.get("properties") or {}).get("components") or {}
-        annotated = {
-            str(name)
-            for name, values in component_properties.items()
-            if isinstance(values, dict)
-            and str(values.get("dp.body_root") or "").strip().lower() in {"1", "true", "yes"}
-        }
-        if annotated:
-            base = next(body for body in source["bodies"] if str(body.get("name")) == "base_link")
-            base_components = {str(value) for value in base.get("components") or []}
-            _require(
-                annotated <= base_components,
-                "discovery.tree",
-                "dp.body_root contradicts CS_base_link",
-                {"components": sorted(annotated - base_components)},
-            )
         incoming: dict[str, str] = {}
         edges: dict[str, list[str]] = {}
         for joint in source.get("joints") or []:
