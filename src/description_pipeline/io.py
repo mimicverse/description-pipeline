@@ -179,6 +179,9 @@ def artifact_path_parts(relative: str) -> tuple[str, ...]:
     if any(
         part.endswith((".", " "))
         or ":" in part
+        # Windows-forbidden characters must be rejected before any transfer, even when the
+        # inspection or archive runs on Linux: "< > " | ? *" cannot survive the handoff.
+        or any(character in part for character in '<>"|?*')
         or PureWindowsPath(part).is_reserved()
         or any(ord(character) < 32 for character in part)
         for part in parts
