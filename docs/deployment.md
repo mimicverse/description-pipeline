@@ -23,6 +23,11 @@ The commissioning server uses `https://10.0.0.235:8443/`. Register
 host, register the callback derived from its `OPERATOR_HOST` and HTTPS port.
 The browser must trust the server certificate and be able to reach this address.
 
+Operators use their existing enterprise Feishu accounts; the platform has no
+account-registration step. The enterprise app administrator enables the app
+for its intended users, registers the callback above and provides its App ID,
+private secret file and approved tenant keys to the platform maintainer.
+
 SolidWorks is required for fresh native discovery and capture. Verification and
 rebuild of a complete frozen delivery run on Linux or Windows without opening
 CAD. Windows jobs must run as the logged-in execution user, outside Session 0.

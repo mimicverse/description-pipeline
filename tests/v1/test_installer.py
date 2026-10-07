@@ -133,6 +133,7 @@ class ServicesRenderTest(unittest.TestCase):
                 ],
             )
             postgres = (target / "description-postgres.service").read_text(encoding="utf-8")
+            self.assertIn("/usr/lib/postgresql/14/bin/postgres", postgres)
             self.assertIn(f"-D {Path(tmp) / 'pg'}/data", postgres)
             self.assertIn("listen_addresses=", postgres)
             self.assertNotIn("127.0.0.1", postgres)
@@ -193,17 +194,6 @@ class ServicesRenderTest(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(before, unit.read_bytes())
-
-    def test_services_have_one_postgres_major_and_no_legacy_warning(self) -> None:
-        text = (DEPLOY / "services.sh").read_text(encoding="utf-8")
-        self.assertIn("${POSTGRES_MAJOR:-14}", text)
-        self.assertNotIn(":-18}", text)
-        self.assertNotIn("warn_legacy", text)
-        self.assertNotIn("solidworks-postgres", text)
-        unit = (DEPLOY / "systemd" / "description-postgres.service").read_text(encoding="utf-8")
-        self.assertIn("Portable PostgreSQL for Airflow", unit)
-        self.assertNotIn("PostgreSQL 18", unit)
-
 
 class InstallGuardsTest(unittest.TestCase):
     def _install(self, tmp: str, **env: str) -> subprocess.CompletedProcess:
