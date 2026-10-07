@@ -874,9 +874,18 @@ class CaptureSceneTests(unittest.TestCase):
     def _configured_occurrences(self, root):
         class ConfiguredDocument(_Doc):
             def GetTessTriangles(self, _quality):
-                if self.active_configuration == "Short":
-                    return [0, 0, 0, 1, 0, 0, 0, 1, 0]
-                return [0, 0, 0, 2, 0, 0, 0, 2, 0, 2, 0, 0, 2, 2, 0, 0, 2, 0]
+                raise AssertionError("occurrence geometry must not read the shared document")
+
+        class ConfiguredComponent(_Component):
+            def GetBodies2(self, body_type):
+                if body_type != 0:
+                    return []
+                triangles = {
+                    "Short": [0, 0, 0, 1, 0, 0, 0, 1, 0],
+                    "Long": [0, 0, 0, 2, 0, 0, 0, 2, 0, 2, 0, 0, 2, 2, 0, 0, 2, 0],
+                }[self.ReferencedConfiguration]
+                face = types.SimpleNamespace(GetTessTriangles=lambda _quality: triangles)
+                return [types.SimpleNamespace(GetFaces=lambda: [face])]
 
         class ConfiguredBackend(_CaptureBackend):
             def _mass_properties_document(self, doc, require_material=True):
@@ -894,8 +903,8 @@ class CaptureSceneTests(unittest.TestCase):
             configuration="Parked",
             configuration_children={"Short": [], "Long": [], "Parked": []},
         )
-        short = _Component("part-short", part, doc=shared, configuration="Short")
-        long = _Component("part-long", part, doc=shared, configuration="Long")
+        short = ConfiguredComponent("part-short", part, doc=shared, configuration="Short")
+        long = ConfiguredComponent("part-long", part, doc=shared, configuration="Long")
         assembly = _write(root, "robot.SLDASM")
         main = _Doc(assembly, doc_type=2, children=[short, long])
         backend = ConfiguredBackend(session_factory=lambda: _Session(_App({assembly: main})))
@@ -930,7 +939,7 @@ class CaptureSceneTests(unittest.TestCase):
                     backend.verify_sources_unchanged()
                 self.assertEqual(caught.exception.code, "cad_source_changed")
 
-    def _mesh_with_expiring_document(self, root, *, foreign_replacement=False):
+    def _expiring_document(self, root, *, foreign_replacement=False):
         part = _write(root, "shared.SLDPRT")
         replacement_path = _write(root, "foreign.SLDPRT") if foreign_replacement else part
         replacement = _Doc(
@@ -966,34 +975,38 @@ class CaptureSceneTests(unittest.TestCase):
         backend._components["part-short"] = component
         return backend, original, replacement
 
-    def test_mesh_restores_configuration_through_fresh_owned_document_handle(self):
+    def test_configuration_window_restores_through_fresh_owned_document_handle(self):
         with TemporaryDirectory() as tmp, _com_stubs():
             root = Path(tmp)
-            backend, original, replacement = self._mesh_with_expiring_document(root)
-            output = root / "arm.stl"
-
-            result = backend.export_component_mesh("part-short", output)
+            backend, original, replacement = self._expiring_document(root)
+            path = str(root / "shared.SLDPRT")
+            with _temporary_configuration(
+                lambda: backend._document_by_path(path), "Short", "part-short"
+            ) as (document, _previous):
+                document.GetTessTriangles(True)
 
             self.assertTrue(original.expired)
             self.assertEqual(original.assert_configuration, "Short")
             self.assertEqual(replacement.active_configuration, "Parked")
-            self.assertEqual(result["triangles"], 1)
-            self.assertEqual(read_stl(output).high, (1.0, 1.0, 0.0))
 
-    def test_mesh_restore_refuses_replacement_from_another_document(self):
+    def test_configuration_restore_refuses_replacement_from_another_document(self):
         with TemporaryDirectory() as tmp, _com_stubs():
             root = Path(tmp)
-            backend, original, replacement = self._mesh_with_expiring_document(root, foreign_replacement=True)
-            output = root / "arm.stl"
+            backend, original, replacement = self._expiring_document(root, foreign_replacement=True)
+            path = str(root / "shared.SLDPRT")
 
-            with self.assertRaises(CadError) as caught:
-                backend.export_component_mesh("part-short", output)
+            with (
+                self.assertRaises(CadError) as caught,
+                _temporary_configuration(
+                    lambda: backend._document_by_path(path), "Short", "part-short"
+                ) as (document, _previous),
+            ):
+                document.GetTessTriangles(True)
 
             self.assertTrue(original.expired)
             self.assertEqual(caught.exception.code, "document_not_open")
             self.assertEqual(caught.exception.detail["phase"], "restore")
             self.assertEqual(replacement.active_configuration, "Short")
-            self.assertFalse(output.exists())
 
     def test_failed_configuration_restore_does_not_mask_a_read_failure(self):
         class RestoreFailure(_Doc):

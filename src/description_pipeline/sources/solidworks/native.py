@@ -1224,12 +1224,6 @@ class SolidWorksBackend(CadBackend):
             face = self._cylinder_face_by_feature(holder, str(feature_name), component)
         else:
             bodies = self._body_list(holder, body_type, component)
-            if bodies is None:
-                raise CadError(
-                    "cad_axis_reference_unreadable",
-                    "component bodies could not be enumerated",
-                    {"component": component, "body_type": body_type},
-                )
             faces = []
             for body in bodies:
                 faces.extend(_as_list(_member(body, "GetFaces")))
@@ -1580,94 +1574,79 @@ class SolidWorksBackend(CadBackend):
         return transform_from_solidworks(_member(tf, "ArrayData"))
 
     def _body_list(self, holder, body_type, component):
-        """Bodies of one swBodyType_e, or ``None`` when the API cannot be read.
-
-        ``IPartDoc.GetBodies2`` takes ``(bodyType, visibleOnly)`` while
-        ``IComponent2.GetBodies2`` takes ``(bodyType)`` only; the wrong arity
-        raises a COM parameter error, so both signatures are tried and the one
-        that answered is recorded as evidence.
-        """
-
-        for label, arguments in (
-            ("IPartDoc.GetBodies2(type, False)", (body_type, False)),
-            ("IComponent2.GetBodies2(type)", (body_type,)),
-        ):
-            try:
-                bodies = _as_list(_member(holder, "GetBodies2", *arguments))
-            except Exception:  # noqa: BLE001 - the other arity is tried next
-                continue
-            self.notes[f"bodies_api:{component}:{body_type}"] = label
-            return bodies
-        self.notes[f"bodies_unreadable:{component}:{body_type}"] = "no working GetBodies2 signature"
-        return None
+        """Read bodies from the captured IComponent2 occurrence."""
+        try:
+            bodies = _as_list(_member(holder, "GetBodies2", body_type))
+        except Exception as error:
+            raise CadError(
+                "cad_component_bodies_unreadable",
+                "the component occurrence's bodies could not be read",
+                {"component": component, "body_type": body_type, "error": str(error)},
+            ) from error
+        self.notes[f"bodies_api:{component}:{body_type}"] = "IComponent2.GetBodies2(type)"
+        return bodies
 
     def _body_count(self, holder, body_type, component):
-        bodies = self._body_list(holder, body_type, component)
-        return None if bodies is None else len(bodies)
+        return len(self._body_list(holder, body_type, component))
 
-    def _body_face_triangles(self, holder, body_type, component):
+    def _body_face_triangles(self, bodies, body_type, component):
         """Component-local display triangles of every face of every requested body."""
 
         values: list[float] = []
-        bodies = self._body_list(holder, body_type, component)
-        if not bodies:
-            return values
-        for body in bodies:
-            for face in _as_list(_member(body, "GetFaces")):
+        for index, body in enumerate(bodies):
+            body_values: list[float] = []
+            for face_index, face in enumerate(_as_list(_member(body, "GetFaces"))):
                 face_values = list(map(float, _member(face, "GetTessTriangles", True) or ()))
-                if len(face_values) % 9 or not all(map(math.isfinite, face_values)):
+                if not face_values or len(face_values) % 9 or not all(map(math.isfinite, face_values)):
                     raise CadError(
                         "cad_mesh_export_failed",
                         "invalid face tessellation",
-                        {"component": component, "body_type": body_type},
+                        {
+                            "component": component,
+                            "body_type": body_type,
+                            "body_index": index,
+                            "face_index": face_index,
+                        },
                     )
-                values.extend(face_values)
-        if not values:
-            # Bodies exist but produced no display mesh: exporting nothing here
-            # would silently drop real geometry.
-            raise CadError(
-                "cad_mesh_export_failed",
-                "bodies carry no display tessellation",
-                {"component": component, "body_type": body_type, "bodies": len(bodies)},
-            )
+                body_values.extend(face_values)
+            if not body_values:
+                raise CadError(
+                    "cad_mesh_export_failed",
+                    "a body carries no display tessellation",
+                    {"component": component, "body_type": body_type, "body_index": index},
+                )
+            values.extend(body_values)
         return values
 
     def export_component_mesh(self, component, dest_path, progress=None):
-        """Write one component's display tessellation (solids and sheets)."""
+        """Write occurrence-local solids and sheets without switching documents.
+
+        IComponent2 bodies follow the occurrence's referenced configuration;
+        the shared part document may have another configuration active.
+        """
 
         if component not in self._components:
             raise CadError("cad_missing_component", component)
         holder = self._components[component]
-        path = _member(holder, "GetPathName")
         sources: list[str] = []
         values: list[float] = []
-        with _temporary_configuration(
-            lambda: self._document_by_path(path), _member(holder, "ReferencedConfiguration"), component
-        ) as (doc, _previous):
-            document_values = list(map(float, _member(doc, "GetTessTriangles", True) or ()))
-            document_valid = (
-                bool(document_values) and len(document_values) % 9 == 0 and all(map(math.isfinite, document_values))
-            )
-            solid_bodies = self._body_list(holder, 0, component)
-            sheet_bodies = self._body_list(holder, 1, component)
-            if document_valid:
-                # Part-document tessellation covers solids; append sheets below.
-                values.extend(document_values)
-                sources.append("part_document")
-            elif solid_bodies:
-                values.extend(self._body_face_triangles(holder, 0, component))
-                sources.append("solid_body_faces")
-            if sheet_bodies:
-                values.extend(self._body_face_triangles(holder, 1, component))
-                sources.append("sheet_body_faces")
+        solid_bodies = self._body_list(holder, 0, component)
+        sheet_bodies = self._body_list(holder, 1, component)
+        for bodies, body_type, source in (
+            (solid_bodies, 0, "solid_body_faces"),
+            (sheet_bodies, 1, "sheet_body_faces"),
+        ):
+            if bodies:
+                values.extend(self._body_face_triangles(bodies, body_type, component))
+                sources.append(source)
         if not values:
             raise CadError(
                 "cad_mesh_export_failed",
                 "invalid tessellation",
                 {
                     "component": component,
-                    "solid_bodies": None if solid_bodies is None else len(solid_bodies),
-                    "sheet_bodies": None if sheet_bodies is None else len(sheet_bodies),
+                    "solid_bodies": len(solid_bodies),
+                    "sheet_bodies": len(sheet_bodies),
                 },
             )
         # Native display tessellation, in metres, independent of global STL
@@ -1692,7 +1671,6 @@ class SolidWorksBackend(CadBackend):
             raise CadError("cad_mesh_invalid", str(exc), {"component": component}) from exc
         api = " + ".join(
             {
-                "part_document": "IPartDoc.GetTessTriangles(True)",
                 "solid_body_faces": ("IComponent2.GetBodies2(0)/IBody2.GetFaces/IFace2.GetTessTriangles(True)"),
                 "sheet_body_faces": ("IComponent2.GetBodies2(1)/IBody2.GetFaces/IFace2.GetTessTriangles(True)"),
             }[source]
@@ -1708,8 +1686,8 @@ class SolidWorksBackend(CadBackend):
             "representation": "CAD_display_tessellation",
             "tessellation_sources": sources,
             "bodies": {
-                "solid": None if solid_bodies is None else len(solid_bodies),
-                "sheet": None if sheet_bodies is None else len(sheet_bodies),
+                "solid": len(solid_bodies),
+                "sheet": len(sheet_bodies),
             },
         }
 

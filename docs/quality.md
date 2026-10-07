@@ -65,9 +65,12 @@ before measurements. This refreshes assembly caches, including mass properties;
 it never saves over CAD. The snapshot records the rebuild and verifies both
 original and collected file hashes after capture. A failed rebuild blocks export.
 
-Each occurrence's datums, mass and mesh are read in its exact referenced
-configuration. Shared documents are restored after each read; final checks
-verify both the restored document state and unchanged occurrence references.
+Datums and mass are read in each occurrence's exact referenced configuration.
+Temporary document selections are restored and verified. Meshes use the
+occurrence's solid and surface bodies in component coordinates, without switching
+the shared part document's configuration. An unreadable body, invalid face
+triangles or a body with no display mesh blocks capture. Final checks verify
+the document state and unchanged occurrence references.
 Suppressed datums are excluded. Unreadable suppression state or an unreadable
 active datum blocks discovery and capture; active frames cannot disappear
 silently. An unreadable selection or failed restoration blocks capture.

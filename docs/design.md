@@ -45,7 +45,9 @@ identity and cross-version changes; the report identifies checks that require
 that confirmation. Missing or ambiguous facts produce findings at their source.
 
 The canonical model carries topology, transforms, geometry and complete physical
-semantics. URDF and meshes are derived from it. Original CAD, raw observations
+semantics. URDF and meshes are derived from it. Mesh collection reads each
+assembly occurrence's bodies in its referenced configuration and local frame,
+without switching the shared part document's configuration. Original CAD, raw observations
 and generated definitions remain distinct. Independent verification checks
 mechanical facts against native evidence, then inspects actual XML, mesh bytes
 and consumer loading. Publication repeats verification on the copied delivery
