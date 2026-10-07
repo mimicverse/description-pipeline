@@ -875,6 +875,12 @@ def verify_discovery(package: Path) -> dict:
                 "a body frame datum is not owned by its components",
                 {"body": name, "datum": datum_name},
             )
+            _require(
+                datum_name == f"CS_{name}",
+                "discovery.names",
+                "a frozen name must still match its native CS_<link> datum",
+                {"body": name, "datum": datum_name},
+            )
             item = components.get(group[0], {})
             identity = str(item.get("instance_id") or f"{item.get('document') or ''}#{group[0]}")
             identities[identity] = name
@@ -1085,7 +1091,8 @@ def verify_discovery(package: Path) -> dict:
             frame = _frame(child_datum.get("array"))
             sign_value = properties.get("dp.joint.axis_sign")
             _require(
-                sign_value in (1, "+1", "1", -1, "-1"),
+                (type(sign_value) is int and sign_value in (1, -1))
+                or (type(sign_value) is str and sign_value in ("+1", "1", "-1")),
                 "discovery.joints",
                 "dp.joint.axis_sign must be exactly +1 or -1",
                 {"value": sign_value},

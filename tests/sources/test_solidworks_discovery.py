@@ -19,7 +19,7 @@ import yaml
 
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
-from description_pipeline.io import PipelineError, digest, inventory  # noqa: E402
+from description_pipeline.io import PipelineError, digest, file_digest, inventory  # noqa: E402
 from description_pipeline.sources.solidworks.discovery import (  # noqa: E402
     CONTRACT,
     DISCOVERY_SCHEMA,
@@ -615,6 +615,46 @@ class DiscoveryTests(unittest.TestCase):
 
         result, _source, _output = self._prepare(mutate=mutate)
         self.assertIn("discovery.joint_limits_conflict", self._codes(result))
+
+    def test_axis_sign_rejects_boolean_and_float_values(self):
+        for value in (True, False, 1.0, -1.0):
+            with self.subTest(value=value):
+                result, _source, _output = self._prepare(
+                    mutate=lambda payload, value=value: payload["properties"]["mates"][
+                        "shoulder_pitch_joint__coaxial"
+                    ].update({"dp.joint.axis_sign": value})
+                )
+                self.assertIn("discovery.joint_axis_sign_missing", self._codes(result))
+
+    def test_native_limit_record_must_be_finite(self):
+        def mutate(payload):
+            payload["mates"][0]["limits"] = {"lower": -1.5, "upper": 1.5, "unit": "rad"}
+            path = self.tmp / "records" / "joints" / "arm.json"
+            values = json.loads(path.read_text(encoding="utf-8"))
+            values["limits"]["lower"] = float("nan")
+            path.write_text(json.dumps(values), encoding="utf-8")
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        self.assertIn("discovery.joint_limits_invalid", self._codes(result))
+
+    def test_frozen_names_do_not_mask_a_native_datum_rename_after_resealing(self):
+        settings = DiscoverySettings(record_roots=(self._native()[1],), frozen_names={"arm-1": "arm_link"})
+        result, _source, output = self._prepare(settings=settings)
+        self.assertTrue(result.passed, result.findings)
+        path = output / "discovery" / "native-discovery.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        next(datum for datum in payload["raw"]["datums"] if datum["name"] == "CS_arm_link")["name"] = "CS_renamed_link"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        robot_path = output / "robot.yaml"
+        document = yaml.safe_load(robot_path.read_text(encoding="utf-8"))
+        next(body for body in document["source"]["bodies"] if body["name"] == "arm_link")["frame"][
+            "coordinate_system"
+        ] = "CS_renamed_link"
+        document["provenance"]["discovery_sha256"] = file_digest(path)
+        robot_path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+        report = verify_discovery(output)
+        self.assertTrue(next(check for check in report["checks"] if check["id"] == "discovery.binding")["passed"])
+        self.assertIn("discovery.names", [item["code"] for item in report["errors"]])
 
     # ------------------------------------------------------------ verifier gates
 

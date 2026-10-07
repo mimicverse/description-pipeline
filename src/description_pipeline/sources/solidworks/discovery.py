@@ -919,9 +919,9 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                 )
                 continue
         sign_value = properties.get(f"{NAMESPACE}.joint.axis_sign")
-        if sign_value in (1, "+1", "1"):
+        if (type(sign_value) is int and sign_value == 1) or (type(sign_value) is str and sign_value in ("+1", "1")):
             sign = 1
-        elif sign_value in (-1, "-1"):
+        elif (type(sign_value) is int and sign_value == -1) or (type(sign_value) is str and sign_value == "-1"):
             sign = -1
         else:
             findings.append(
@@ -1007,6 +1007,11 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                                 "controlled record lacks finite lower/upper limits",
                                 {"file": declared["file"]},
                             )
+                        )
+                        continue
+                    if not (math.isfinite(lower) and math.isfinite(upper)):
+                        findings.append(
+                            _finding("discovery.joint_limits_invalid", obj, "controlled position limits must be finite")
                         )
                         continue
                     if abs(lower - limits["lower"]) > 1e-12 or abs(upper - limits["upper"]) > 1e-12:
