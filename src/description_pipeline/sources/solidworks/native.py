@@ -356,43 +356,6 @@ def _instance_error(name: str, parent: str | None, depth: int, stage: str, error
     }
 
 
-def legacy_mass_reading(values, status) -> dict:
-    """Mass-only reading from ``IModelDocExtension.GetMassProperties2``'s 13-value vector.
-
-    Only **mass** (index 5) is used, with volume (index 3) as context.  Mass is corroborated twice:
-    the M3.0 recovery reports match it against the leaf sums exactly (0.0247 kg pre-restore,
-    0.00506754982 kg post-restore), and a 2026-09-29 native pairing on the top assembly returned
-    the same mass — and the same volume, COM and flat inertia group — as ``IMassProperty2`` on that
-    document.  COM and inertia stay out anyway: one paired document is not a layout guarantee, and
-    a caller that needs them has to read ``IMassProperty2``.
-
-    A malformed vector is a *capture* error for the caller to turn into an unavailable record, never
-    a reason to fail an otherwise valid freeze.
-    """
-
-    if status not in (0, None):
-        raise CadError("cad_mass_property_unavailable", "legacy mass properties reported a status", {"status": status})
-    numbers = list(values or ())
-    if len(numbers) < 6:
-        raise CadError(
-            "cad_mass_property_unavailable", "legacy mass property vector is too short", {"length": len(numbers)}
-        )
-    try:
-        mass = float(numbers[5])
-        volume = float(numbers[3])
-    except (TypeError, ValueError) as error:
-        raise CadError(
-            "cad_mass_property_unavailable", "legacy mass property values are not numbers", {"error": str(error)}
-        ) from error
-    if not math.isfinite(mass) or mass <= 0.0:
-        raise CadError("cad_mass_property_invalid", "legacy mass is not finite and positive", {"mass": mass})
-    return {
-        "mass": mass,
-        "volume_m3": volume if math.isfinite(volume) else None,
-        "mode": "mass_only",
-    }
-
-
 _SW_MATE_TYPES = {
     0: "coincident",
     1: "concentric",
@@ -854,11 +817,9 @@ class SolidWorksBackend(CadBackend):
         is a required blocking gate, so a missing or invalid whole-assembly reading fails the
         product gate instead of degrading to an advisory.
 
-        ``CreateMassProperty2`` is tried first.  A session or build where it is unavailable — late
-        binding saw it return nothing during the M3.0 review, even though the 2026-09-29 native run
-        found it working on the release session — falls back to ``Extension.GetMassProperties2`` and
-        keeps **only its mass**, the value the recovery reports and the native pairing both
-        corroborate, with volume as context; COM and inertia are never inferred from the vector.
+        Only ``IMassProperty2`` counts.  When ``CreateMassProperty2`` is unavailable the reader
+        fails with an explicit error: an unqualified vector read is not a second implementation
+        and cannot publish.
         """
 
         doc = self._document_by_path(path)
@@ -868,7 +829,10 @@ class SolidWorksBackend(CadBackend):
         root = _member(configuration, "GetRootComponent3", True)
         mp = _member(_member(doc, "Extension"), "CreateMassProperty2")
         if mp is None:
-            return self._legacy_assembly_mass_properties(doc)
+            raise CadError(
+                "cad_mass_property_unavailable",
+                "CreateMassProperty2 is required; no unqualified mass-only fallback exists",
+            )
         if root is None:
             raise CadError("cad_empty_mass_property", "assembly mass property is unavailable")
         import pythoncom
@@ -912,27 +876,6 @@ class SolidWorksBackend(CadBackend):
                 "configuration": str(_member(configuration, "Name")),
             },
         }
-
-    def _legacy_assembly_mass_properties(self, doc):
-        """Mass-only fallback through ``Extension.GetMassProperties2(1, status, False)``."""
-
-        import pythoncom
-
-        status = _win32().VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-        values = _member(_member(doc, "Extension"), "GetMassProperties2", 1, status, False)
-        reading = legacy_mass_reading(values, getattr(status, "value", None))
-        reading["reference"] = {
-            "used_api": "IModelDocExtension.GetMassProperties2(1, status, False)",
-            "mass_index": 5,
-            "volume_index": 3,
-            "com": "not_inferred",
-            "inertia": "not_inferred",
-            # This fallback array is not covered by the analytic convention
-            # proof, so it must never claim a tensor convention.
-            "product_convention": None,
-            "document": str(_member(doc, "GetPathName")),
-        }
-        return reading
 
     def assembly_component_mass_properties(self, path):
         """Per-instance mass in the *assembly context*, with the instance's override flags.
@@ -1892,8 +1835,7 @@ class SolidWorksBackend(CadBackend):
                         try:
                             holder = _member(component, *probe)
                             transform = [
-                                float(value)
-                                for value in transform_from_solidworks(_member(holder, "ArrayData"))
+                                float(value) for value in transform_from_solidworks(_member(holder, "ArrayData"))
                             ]
                             break
                         except Exception as error:  # noqa: BLE001 - an unreadable transform must block, not guess

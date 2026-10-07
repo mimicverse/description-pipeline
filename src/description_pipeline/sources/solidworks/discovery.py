@@ -460,6 +460,16 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
             return fail(
                 "discovery.mate_geometry_mismatch", "recorded cylinder axes are not parallel in the solved state"
             )
+        delta = [right[0][index] - left[0][index] for index in range(3)]
+        along = _dot(delta, left[1])
+        radial = [delta[index] - along * left[1][index] for index in range(3)]
+        radial_gap = math.sqrt(_dot(radial, radial))
+        if radial_gap > AXIS_OFFSET_TOL_M:
+            return fail(
+                "discovery.joint_axis_misaligned",
+                "concentric mate cylinders are parallel but radially displaced",
+                {"radial_gap_m": radial_gap, "tolerance_m": AXIS_OFFSET_TOL_M},
+            )
         axis = left[1]
         basis = _orthogonal_basis(axis)
         rows = [_translation_row(direction, left[0]) for direction in basis]

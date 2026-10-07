@@ -756,6 +756,29 @@ def verify_discovery(package: Path) -> dict:
                 "a mate is outside the supported constraint scope or lacks usable entities",
                 {"type": mate.get("type"), "name": mate.get("name")},
             )
+            if str(mate.get("type") or "").strip().lower() == "concentric":
+                geometry = [
+                    _geometry(entity, frames) for entity in _entities(mate) if isinstance(entity.get("cylinder"), dict)
+                ]
+                if len(geometry) == 2 and geometry[0][1] is not None and geometry[1][1] is not None:
+                    left_point, left_axis = geometry[0]
+                    right_point, right_axis = geometry[1]
+                    _require(
+                        abs(abs(_dot(left_axis, right_axis)) - 1.0) <= TOL,
+                        "discovery.graph",
+                        "concentric mate cylinders are not parallel",
+                        {"mate": mate.get("name")},
+                    )
+                    delta = [right_point[index] - left_point[index] for index in range(3)]
+                    along = _dot(delta, left_axis)
+                    radial = [delta[index] - along * left_axis[index] for index in range(3)]
+                    gap = math.sqrt(_dot(radial, radial))
+                    _require(
+                        gap <= AXIS_OFFSET_TOL_M,
+                        "discovery.graph",
+                        "concentric mate cylinders are radially displaced",
+                        {"mate": mate.get("name"), "radial_gap_m": gap},
+                    )
             for entity in _entities(mate):
                 _require(
                     str(entity.get("component")) in names,

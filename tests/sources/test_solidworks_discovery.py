@@ -473,6 +473,13 @@ class DiscoveryTests(unittest.TestCase):
         result, _source, _output = self._prepare(mutate=renamed)
         self.assertIn("discovery.root_missing", self._codes(result))
 
+    def test_radially_displaced_concentric_shaft_blocks(self):
+        def mutate(payload):
+            payload["mates"][0]["entities"][1]["cylinder"]["point"] = [0.01, 0.0, 0.1]
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        self.assertIn("discovery.joint_axis_misaligned", self._codes(result))
+
     # ------------------------------------------------------------ verifier gates
 
     def test_verifier_rejects_deleted_or_stripped_metadata(self):
