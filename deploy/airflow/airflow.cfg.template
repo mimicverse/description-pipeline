@@ -4,9 +4,10 @@ executor = LocalExecutor
 load_examples = False
 fernet_key = @FERNET_KEY@
 execution_api_server_url = http://127.0.0.1:8791/execution
-# Simple auth manager: the operator entry (Web UI + /api/v2) needs a login. The generated
-# password lands in @AIRFLOW_HOME@/simple_auth_manager_passwords.json.generated (0600).
-simple_auth_manager_users = operator:admin
+# One operator SSO: the package-local Feishu auth manager. Its FEISHU_* settings come from the
+# private environment file referenced by the api-server unit; with none supplied it fails
+# explicitly (no password login and no fallback).
+auth_manager = description_pipeline.orchestration.feishu_auth.FeishuAuthManager
 [database]
 sql_alchemy_conn = @AIRFLOW_DB_URL@
 [logging]

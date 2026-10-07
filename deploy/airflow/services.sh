@@ -25,15 +25,21 @@ render_units() {
     [[ "$SOLIDWORKS_SSH_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || {
       echo 'SOLIDWORKS_SSH_HOST must be a configured SSH host alias' >&2; exit 1;
     }
+    case "${SOLIDWORKS_ENDPOINT_PORT:-8765}" in
+      *[!0-9]*|"") echo 'SOLIDWORKS_ENDPOINT_PORT must be a TCP port' >&2; exit 1 ;;
+    esac
     sed -e "s#@SSH_HOST@#$SOLIDWORKS_SSH_HOST#g" \
+        -e "s#@ENDPOINT_PORT@#${SOLIDWORKS_ENDPOINT_PORT:-8765}#g" \
       "$HERE/systemd/description-solidworks-tunnel.service" > "$TARGET/description-solidworks-tunnel.service"
   fi
   if [ -n "${POSTGRES_ROOT:-}" ]; then
     sed -e "s#@POSTGRES_ROOT@#$POSTGRES_ROOT#g" \
+        -e "s#@POSTGRES_MAJOR@#${POSTGRES_MAJOR:-18}#g" \
       "$HERE/systemd/description-postgres.service" > "$TARGET/description-postgres.service"
   fi
   for unit in description-airflow-dag-processor description-airflow-scheduler description-airflow-api-server; do
     sed -e "s#@VENV@#$AIRFLOW_VENV#g" -e "s#@AIRFLOW_HOME@#$AIRFLOW_HOME#g" \
+        -e "s#@FEISHU_ENV@#${FEISHU_ENV_FILE:-$AIRFLOW_HOME/feishu.env}#g" \
       "$HERE/systemd/$unit.service" > "$TARGET/$unit.service"
   done
 }

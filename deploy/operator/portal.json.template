@@ -1,0 +1,13 @@
+{
+  "airflow": {
+    "url": "@AIRFLOW_BASE_URL@"
+  },
+  "endpoint": {
+    "url": "http://127.0.0.1:18765",
+    "token_file": "@ENDPOINT_TOKEN_FILE@"
+  },
+  "portal": {
+    "host": "@OPERATOR_UPSTREAM_HOST@",
+    "port": @OPERATOR_UPSTREAM_PORT@
+  }
+}

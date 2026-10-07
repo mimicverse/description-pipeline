@@ -5,6 +5,8 @@ After=network.target
 [Service]
 Type=simple
 Environment=AIRFLOW_HOME=@AIRFLOW_HOME@
+# Feishu SSO settings (0600, outside Git); optional so a missing file fails explicitly in-manager.
+EnvironmentFile=-@FEISHU_ENV@
 # Loopback only: remote operators reach the UI through an SSH tunnel or reverse proxy.
 ExecStart=@VENV@/bin/airflow api-server --host 127.0.0.1 --port 8791
 UMask=0077

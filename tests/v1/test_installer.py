@@ -58,7 +58,8 @@ class RenderConfigTest(unittest.TestCase):
             self.assertIn("# managed-by: description-airflow", text)
             self.assertIn(f"sql_alchemy_conn = {DSN}", text)
             self.assertIn(f"dags_folder = {DEPLOY / 'dags'}", text)
-            self.assertIn("simple_auth_manager_users = operator:admin", text)
+            self.assertIn("auth_manager = description_pipeline.orchestration.feishu_auth.FeishuAuthManager", text)
+            self.assertNotIn("simple_auth_manager_users", text)
             first_keys = re.findall(r"^(?:fernet_key|jwt_secret) = (\S+)$", text, re.M)
             self.assertEqual(len(first_keys), 2)
             # Rerun with a different socket: secrets must survive byte-for-byte.
@@ -142,6 +143,8 @@ class ServicesRenderTest(unittest.TestCase):
             self.assertNotIn("@", scheduler)
             api_server = (target / "description-airflow-api-server.service").read_text(encoding="utf-8")
             self.assertIn("api-server --host 127.0.0.1 --port 8791", api_server)
+            self.assertIn(f"EnvironmentFile=-{Path(tmp) / 'home' / 'feishu.env'}", api_server)
+            self.assertNotIn("@", api_server)
             untouched = (target / "unrelated.service").read_text(encoding="utf-8")
             self.assertEqual(untouched, "[Unit]\nDescription=keep me\n")
 
@@ -174,6 +177,16 @@ class ServicesRenderTest(unittest.TestCase):
             unit = Path(tmp) / "config/systemd/user/description-solidworks-tunnel.service"
             self.assertIn("127.0.0.1:18765:127.0.0.1:8765 windows-worker", unit.read_text())
             before = unit.read_bytes()
+            custom = run(["bash", str(DEPLOY / "services.sh"), "render"],
+                         {**env, "SOLIDWORKS_ENDPOINT_PORT": "9999"})
+            self.assertEqual(custom.returncode, 0, custom.stderr)
+            self.assertIn("127.0.0.1:18765:127.0.0.1:9999 windows-worker", unit.read_text())
+            bad_port = run(["bash", str(DEPLOY / "services.sh"), "render"],
+                           {**env, "SOLIDWORKS_ENDPOINT_PORT": "87;65"})
+            self.assertNotEqual(bad_port.returncode, 0)
+            self.assertIn("127.0.0.1:18765:127.0.0.1:9999 windows-worker", unit.read_text())
+            run(["bash", str(DEPLOY / "services.sh"), "render"], env)
+            self.assertEqual(before, unit.read_bytes())
             result = run(
                 ["bash", str(DEPLOY / "services.sh"), "render"],
                 {**env, "SOLIDWORKS_SSH_HOST": "windows-worker; arbitrary-command"},
@@ -280,6 +293,9 @@ class LockAndScriptsTest(unittest.TestCase):
                     if keyword.arg == "default":
                         defaults[node.args[0].value] = ast.literal_eval(keyword.value)
         self.assertEqual(defaults.get("--conn-id"), "solidworks_windows")
+        self.assertIn("--handoff-root", defaults)
+        source = (DEPLOY / "scripts" / "add_connection.py").read_text(encoding="utf-8")
+        self.assertIn("handoff_roots", source)
         dag = (DEPLOY / "dags" / "solidworks_to_urdf.py").read_text(encoding="utf-8")
         self.assertIn('CONN_ID = os.environ.get("SOLIDWORKS_ENDPOINT_CONN_ID", "solidworks_windows")', dag)
         self.assertNotIn('"conn_id": Param(', dag)

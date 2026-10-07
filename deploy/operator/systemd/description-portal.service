@@ -1,0 +1,17 @@
+[Unit]
+Description=Operator portal (SolidWorks-to-URDF)
+After=network.target description-airflow-api-server.service
+Wants=description-airflow-api-server.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=OPERATOR_STATE=@OPERATOR_STATE@
+Environment=AIRFLOW_HOME=@AIRFLOW_HOME@
+ExecStart=@PORTAL_COMMAND@
+UMask=0077
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

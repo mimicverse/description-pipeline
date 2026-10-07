@@ -6,7 +6,6 @@
 set -euo pipefail
 : "${POSTGRES_ROOT:?set POSTGRES_ROOT to the isolated deployment directory}"
 WORK="$POSTGRES_ROOT"
-BIN="$WORK/root/usr/lib/postgresql/18/bin"
 export LD_LIBRARY_PATH="$WORK/root/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
 SOCKET="$WORK/socket"
 START_OPTS=(-D "$WORK/data" -o "-k $SOCKET -p 5433 -c listen_addresses=''")
@@ -14,8 +13,15 @@ START_OPTS=(-D "$WORK/data" -o "-k $SOCKET -p 5433 -c listen_addresses=''")
 mkdir -p "$WORK/debs" "$WORK/root" "$WORK/data" "$SOCKET"
 chmod 700 "$WORK/data" "$SOCKET"
 cd "$WORK/debs"
-apt-get download postgresql-18 postgresql-client-18 libpq5
-for deb in ./*.deb; do dpkg-deb -x "$deb" "$WORK/root"; done
+# Release 1.0 supports one layout: the distro PostgreSQL major named by POSTGRES_MAJOR (14 on
+# Ubuntu 22.04, matching the supported deployment). No probing or alternate majors.
+MAJOR="${POSTGRES_MAJOR:-14}"
+DEB_DIR="$WORK/debs/$MAJOR"
+mkdir -p "$DEB_DIR"
+(cd "$DEB_DIR" && apt-get download "postgresql-$MAJOR" "postgresql-client-$MAJOR" libpq5)
+BIN="$WORK/root/usr/lib/postgresql/$MAJOR/bin"
+for deb in "$DEB_DIR"/*.deb; do dpkg-deb -x "$deb" "$WORK/root"; done
+[ -x "$BIN/postgres" ] || { echo "extracted PostgreSQL binary missing: $BIN/postgres" >&2; exit 1; }
 "$BIN/postgres" --version
 [ "$(ldd "$BIN/postgres" | grep -c 'not found' || true)" = "0" ] || { echo "missing libraries" >&2; exit 1; }
 
@@ -58,3 +64,4 @@ fi
 "$BIN/createdb" -h "$SOCKET" -p 5433 -U solidworks airflow_meta 2>/dev/null || true
 "$BIN/psql" -h "$SOCKET" -p 5433 -U solidworks -d airflow_meta -tAc "select version();"
 echo "AIRFLOW_DB_URL=postgresql+psycopg2://solidworks@/airflow_meta?host=$SOCKET&port=5433"
+echo "POSTGRES_MAJOR=$MAJOR"

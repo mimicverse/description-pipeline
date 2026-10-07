@@ -1,0 +1,56 @@
+# User-level nginx configuration for the single authenticated operator URL.
+# Renderer: deploy/operator/render_operator.py (do not edit in place).
+worker_processes 1;
+daemon off;
+pid @OPERATOR_STATE@/nginx/nginx.pid;
+error_log @OPERATOR_STATE@/nginx/error.log warn;
+
+events {
+    worker_connections 256;
+}
+
+http {
+    access_log @OPERATOR_STATE@/nginx/access.log;
+    client_body_temp_path @OPERATOR_STATE@/nginx/tmp/body;
+    proxy_temp_path @OPERATOR_STATE@/nginx/tmp/proxy;
+    fastcgi_temp_path @OPERATOR_STATE@/nginx/tmp/fastcgi;
+    uwsgi_temp_path @OPERATOR_STATE@/nginx/tmp/uwsgi;
+    scgi_temp_path @OPERATOR_STATE@/nginx/tmp/scgi;
+    client_max_body_size 64m;
+    server_tokens off;
+
+    server {
+        listen @OPERATOR_BIND@:@OPERATOR_HTTPS_PORT@ ssl;
+        server_name @OPERATOR_HOST@;
+
+        ssl_certificate @OPERATOR_TLS_CERT@;
+        ssl_certificate_key @OPERATOR_TLS_KEY@;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_session_cache shared:SSL:10m;
+        ssl_session_timeout 10m;
+
+        location = /operator-healthz {
+            access_log off;
+            return 200 "ok\n";
+        }
+
+        # Feishu SSO callback goes to the Airflow api-server; the operator page stays on the portal.
+        location ^~ /auth/feishu/ {
+            proxy_pass http://127.0.0.1:8791;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        location / {
+            proxy_pass http://@OPERATOR_UPSTREAM@;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_read_timeout 300s;
+            proxy_send_timeout 300s;
+        }
+    }
+}
