@@ -32,6 +32,11 @@ native engineering properties or linked controlled records. A submitted version
 must remain retrievable and unchanged. Engineering corrections create a new
 structural version.
 
+For an existing model, `dp.parent_revision` names the structural revision in its
+current review-branch delivery, or in the configured base if no review delivery
+exists. Each new delivery continues that baseline. Reusing a revision requires
+identical revision content.
+
 Make the folder accessible to the platform. The path may name a directory on
 the Linux server or the configured Windows worker. Linux folders must be within
 `SOLIDWORKS_HANDOFF_ROOT`; Windows folders must be within the endpoint's

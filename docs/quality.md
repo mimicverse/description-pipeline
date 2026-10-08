@@ -133,7 +133,10 @@ post-publication changes to model evidence.
 `description check` recomputes every gate and compares the entire deterministic
 report. A stale green flag, incomplete check set or changed file cannot qualify.
 Publication repeats this after copying and against the actual committed Git
-blobs, including any effects of newline conversion or clean filters.
+blobs. The publisher generates `.gitattributes` to preserve delivery bytes through
+Git storage and checkout, and records its hash in the publication receipt.
+Effective newline, filter or encoding overrides block publication; the native
+subject remains unchanged.
 
 ## Scope of acceptance
 

@@ -4,7 +4,7 @@ Public API: ``submit_bundle(bundle, repository, *, base, branch, message=None, d
 
 Guarantees:
 
-* only governed paths are staged (``README.md`` + ``input, evidence, model, urdf, meshes, reports``);
+* only delivery paths and generated Git byte-preservation metadata are staged;
 * the bundle subject digest is re-bound to the staged bytes *and* the committed tree before any push;
 * a stale or tampered ``reports/quality.json`` can never escape, even if it says ``passed``;
 * the review branch is only ever fast-forwarded on top of its own remote head (no force pushes,
@@ -25,11 +25,20 @@ import time
 from pathlib import Path
 
 from ..delivery import subject_digest
-from ..io import PipelineError, acquire_process_lock, confined, read_data
+from ..io import PipelineError, acquire_process_lock, confined, file_digest, read_data
 from ..sources.solidworks import revision as cad_revision
 from ..stages import record_check
 
-GOVERNED_PATHS = ("README.md", "input", "evidence", "model", "urdf", "meshes", "reports")
+DELIVERY_PATHS = ("README.md", "input", "evidence", "model", "urdf", "meshes", "reports")
+GOVERNED_PATHS = (*DELIVERY_PATHS, ".gitattributes")
+BYTE_ATTRIBUTES = ("text", "filter", "working-tree-encoding")
+GIT_ATTRIBUTES = (
+    "# Preserve verified delivery bytes in Git and on checkout.\n"
+    + "".join(
+        f"/{name}{'/**' if name not in {'README.md', '.gitattributes'} else ''} -text -filter -working-tree-encoding\n"
+        for name in GOVERNED_PATHS
+    )
+).encode("ascii")
 REPORTS_FILES = ("input.json", "tool.json", "quality.json")
 REQUIRED_FILES = (
     "README.md",
@@ -196,6 +205,9 @@ def _verify_committed(repository: Path, commit: str, subject: str) -> None:
                     stdout=stream,
                     stderr=subprocess.PIPE,
                 )
+        attributes = root / ".gitattributes"
+        if not attributes.is_file() or attributes.read_bytes() != GIT_ATTRIBUTES:
+            raise PrError("committed_git_metadata_mismatch", ".gitattributes")
         _reverify(root, subject)
 
 
@@ -215,7 +227,7 @@ def _copy_governed(bundle: Path, worktree: Path) -> None:
         reports.unlink()
     elif reports.is_dir():
         shutil.rmtree(reports)
-    for name in GOVERNED_PATHS:
+    for name in DELIVERY_PATHS:
         if name == "reports":
             continue
         target = worktree / name
@@ -236,6 +248,33 @@ def _copy_governed(bundle: Path, worktree: Path) -> None:
         source = bundle / "reports" / name
         if source.is_file():
             shutil.copyfile(source, reports / name)
+
+
+def _preserve_git_bytes(worktree: Path) -> None:
+    """Publish one canonical policy and refuse effective overriding attributes."""
+    attributes = worktree / ".gitattributes"
+    if attributes.is_symlink() or attributes.is_junction() or attributes.is_dir():
+        raise PrError("git_metadata_nonregular", ".gitattributes")
+    attributes.write_bytes(GIT_ATTRIBUTES)
+    files = sorted(
+        path.relative_to(worktree).as_posix()
+        for name in GOVERNED_PATHS
+        for path in ((worktree / name).rglob("*") if (worktree / name).is_dir() else [worktree / name])
+        if path.is_file()
+    )
+    result = subprocess.run(
+        ["git", "-C", str(worktree), "check-attr", "-z", "--stdin", *BYTE_ATTRIBUTES],
+        input=b"\0".join(name.encode("utf-8") for name in files) + b"\0",
+        check=True,
+        capture_output=True,
+    )
+    fields = result.stdout.split(b"\0")[:-1]
+    if len(fields) != len(files) * len(BYTE_ATTRIBUTES) * 3:
+        raise PrError("git_attributes_unreadable", "Incomplete Git attribute inventory")
+    for offset in range(0, len(fields), 3):
+        path, attribute, value = (item.decode("utf-8") for item in fields[offset : offset + 3])
+        if value != "unset":
+            raise PrError("git_attributes_conflict", {"file": path, "attribute": attribute, "value": value})
 
 
 def _prepare_worktree(repository: Path, worktree: Path, base_sha: str, head_sha: str) -> None:
@@ -260,6 +299,7 @@ def _stage_commit(bundle: Path, worktree: Path, subject: str, message: str) -> t
             raise PrError("ungoverned_change", path)
     if subject_digest(worktree) != subject:
         raise PrError("staged_subject_mismatch", "staged worktree bytes differ from the verified bundle")
+    _preserve_git_bytes(worktree)
     _git(worktree, "add", "--all")
     staged = _git(worktree, "diff", "--cached", "--quiet", check=False).returncode
     if staged == 0:
@@ -465,7 +505,12 @@ def submit_bundle(
             observed(
                 "publication.git",
                 "passed",
-                {"subject_sha256": subject, "commit": commit, "copied_staged_committed": "reverified"},
+                {
+                    "subject_sha256": subject,
+                    "commit": commit,
+                    "copied_staged_committed": "reverified",
+                    "git_attributes_sha256": file_digest(worktree / ".gitattributes"),
+                },
             )
             phase = "publication.receipt"
             if not noop or commit != head_sha:

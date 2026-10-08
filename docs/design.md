@@ -62,6 +62,10 @@ isolated consumer loading. Publication checks the copied, staged and committed
 bytes, then confirms the remote commit and PR head/base. A candidate PR requires
 engineering approval before model release.
 
+Publication generates byte-preserving Git attributes and rejects conflicting
+repository settings. Frozen evidence and controlled records retain their original
+bytes through commits and fresh checkouts.
+
 The pipeline ID is `solidworks-to-urdf`; every run has a UUID. Source revisions,
 controlled records, tool code, dependencies, environment and file hashes bind the
 execution. Transport retries reconnect to the same UUID and frozen inputs. A
