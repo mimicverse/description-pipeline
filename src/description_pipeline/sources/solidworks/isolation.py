@@ -144,24 +144,38 @@ class CadSession:
     def connect(self, cancelled: threading.Event):
         self._owner_thread = threading.current_thread()
         deadline = time.monotonic() + self.startup_timeout
+        app = None
         while not cancelled.is_set() and self.process.alive():
-            app = self._binder(self.process.pid)
-            if app is not None:
+            try:
+                if app is None:
+                    app = self._binder(self.process.pid)
+                # ROT registration precedes completion of startup and add-ins.
+                # SolidWorks requires this gate before external document/API work.
+                ready = app is not None and app.StartupProcessCompleted
+                if type(ready) is not bool:
+                    raise ValueError("StartupProcessCompleted did not return a Boolean")
+            except EnvironmentError_:
+                raise
+            except Exception as error:
+                raise EnvironmentError_(
+                    "cad_startup_unreadable", "Owned SolidWorks startup state could not be read", self.identity()
+                ) from error
+            if time.monotonic() >= deadline:
+                break
+            if ready and not cancelled.is_set() and self.process.alive():
                 self.app = app
                 # The dedicated process serves an external automation command
                 # throughout this session, including gaps between COM calls.
                 app.CommandInProgress = True
                 app.Visible = False
                 return app
-            if time.monotonic() >= deadline:
-                break
             if os.name == "nt":
                 import pythoncom
 
                 pythoncom.PumpWaitingMessages()
             cancelled.wait(0.2)
         reason = "cad_session_cancelled" if cancelled.is_set() else "cad_startup_failed"
-        raise EnvironmentError_(reason, "Owned SolidWorks instance did not become available", self.identity())
+        raise EnvironmentError_(reason, "Owned SolidWorks instance did not complete startup", self.identity())
 
     def current_application(self):
         """Acquire this process's current dispatch once at a native boundary.

@@ -100,8 +100,9 @@ URDF with joint controls. It shows each automatic check, engineering
 confirmation, evidence and affected object; unsupported or unexecuted checks
 remain explicit.
 
-Native reads reacquire application interfaces at document boundaries within
-the same owned Windows process. A lost process or binding stops capture.
+Each owned Windows process must complete SolidWorks startup, including add-ins,
+before native reads begin. Application interfaces are reacquired at document
+boundaries within that process. A lost process or binding stops capture.
 
 Feishu supplies the signed-in identity and profile. The platform restricts
 access to its approved tenant and assigns operator and administrator permissions.

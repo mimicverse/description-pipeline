@@ -370,6 +370,7 @@ class _Doc:
 
 
 class _App:
+    StartupProcessCompleted = True
     """Minimal ``ISldWorks`` surface; documents are pre-opened read-only."""
 
     RevisionNumber = "2026-portable-mock"
