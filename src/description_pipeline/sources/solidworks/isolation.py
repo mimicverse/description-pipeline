@@ -139,8 +139,10 @@ class CadSession:
         self._binder = binder or application_for_pid
         self.startup_timeout = startup_timeout
         self.app = None
+        self._owner_thread = None
 
     def connect(self, cancelled: threading.Event):
+        self._owner_thread = threading.current_thread()
         deadline = time.monotonic() + self.startup_timeout
         while not cancelled.is_set() and self.process.alive():
             app = self._binder(self.process.pid)
@@ -161,6 +163,34 @@ class CadSession:
         reason = "cad_session_cancelled" if cancelled.is_set() else "cad_startup_failed"
         raise EnvironmentError_(reason, "Owned SolidWorks instance did not become available", self.identity())
 
+    def current_application(self):
+        """Acquire this process's current dispatch once at a native boundary.
+
+        The Windows job and process stay unchanged. A revoked application
+        interface is never reused, and losing the owned binding cannot start
+        another server or retry a native call.
+        """
+        if self._owner_thread is not threading.current_thread():
+            raise EnvironmentError_("cad_thread_mismatch", "Acquire CAD interfaces on their owning STA thread")
+        try:
+            if self.app is None or not self.process.alive():
+                raise ValueError("the original owned SolidWorks process is unavailable")
+            app = self._binder(self.process.pid)
+            if app is None:
+                raise ValueError("the owned SolidWorks process has no registered application binding")
+            if not self.process.alive():
+                raise ValueError("the owned SolidWorks process exited during application acquisition")
+        except EnvironmentError_:
+            raise
+        except Exception as error:
+            raise EnvironmentError_(
+                "cad_application_unreadable",
+                "the owned SolidWorks application could not be acquired",
+                self.identity(),
+            ) from error
+        self.app = app
+        return app
+
     def identity(self) -> dict:
         return {"pid": self.process.pid, "executable": self.process.executable, "ownership": "windows_job"}
 
@@ -170,4 +200,5 @@ class CadSession:
 
     def close(self) -> None:
         self.app = None
+        self._owner_thread = None
         self.terminate()

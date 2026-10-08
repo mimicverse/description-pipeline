@@ -198,6 +198,112 @@ class SessionTests(unittest.TestCase):
         process.close.assert_called_once()
         self.assertIsNone(session.app)
 
+    def test_current_application_uses_a_fresh_interface_for_the_same_owned_pid(self):
+        process = SimpleNamespace(pid=42, executable="test.exe", alive=lambda: True, close=Mock())
+        first = SimpleNamespace(Visible=True, CommandInProgress=False)
+        current = SimpleNamespace()
+        binder = Mock(side_effect=[first, current])
+        session = CadSession(process=process, binder=binder)
+        session.connect(threading.Event())
+
+        self.assertIs(session.current_application(), current)
+        self.assertIs(session.app, current)
+        self.assertEqual([call.args for call in binder.call_args_list], [(42,), (42,)])
+        process.close.assert_not_called()
+        session.close()
+
+    def test_current_application_does_not_rebind_a_dead_owned_process(self):
+        alive = True
+        process = SimpleNamespace(pid=42, executable="test.exe", alive=lambda: alive, close=Mock())
+        binder = Mock(return_value=SimpleNamespace(Visible=True, CommandInProgress=False))
+        session = CadSession(process=process, binder=binder)
+        session.connect(threading.Event())
+        alive = False
+
+        with self.assertRaises(EnvironmentError_) as caught:
+            session.current_application()
+        self.assertEqual(caught.exception.code, "cad_application_unreadable")
+        binder.assert_called_once_with(42)
+        process.close.assert_not_called()
+        session.close()
+
+    def test_current_application_does_not_wait_or_retry_a_missing_binding(self):
+        process = SimpleNamespace(pid=42, executable="test.exe", alive=lambda: True, close=Mock())
+        original = SimpleNamespace(Visible=True, CommandInProgress=False)
+        binder = Mock(side_effect=[original, None])
+        session = CadSession(process=process, binder=binder)
+        session.connect(threading.Event())
+
+        with self.assertRaises(EnvironmentError_) as caught:
+            session.current_application()
+        self.assertEqual(caught.exception.code, "cad_application_unreadable")
+        self.assertIs(session.app, original)
+        self.assertEqual(binder.call_count, 2)
+        process.close.assert_not_called()
+        session.close()
+
+    def test_current_application_retains_the_binding_failure_as_its_cause(self):
+        process = SimpleNamespace(pid=42, executable="test.exe", alive=lambda: True, close=Mock())
+        failure = RuntimeError("RPC_S_UNKNOWN_IF")
+        original = SimpleNamespace(Visible=True, CommandInProgress=False)
+        binder = Mock(side_effect=[original, failure])
+        session = CadSession(process=process, binder=binder)
+        session.connect(threading.Event())
+
+        with self.assertRaises(EnvironmentError_) as caught:
+            session.current_application()
+        self.assertEqual(caught.exception.code, "cad_application_unreadable")
+        self.assertIs(caught.exception.__cause__, failure)
+        self.assertEqual(binder.call_count, 2)
+        self.assertIs(session.app, original)
+        session.close()
+
+    def test_current_application_refuses_an_owner_that_died_during_binding(self):
+        alive = True
+        process = SimpleNamespace(pid=42, executable="test.exe", alive=lambda: alive, close=Mock())
+        original = SimpleNamespace(Visible=True, CommandInProgress=False)
+        replacement = SimpleNamespace()
+
+        def bind(pid):
+            nonlocal alive
+            self.assertEqual(pid, 42)
+            if not hasattr(bind, "connected"):
+                bind.connected = True
+                return original
+            alive = False
+            return replacement
+
+        session = CadSession(process=process, binder=bind)
+        session.connect(threading.Event())
+        with self.assertRaises(EnvironmentError_) as caught:
+            session.current_application()
+        self.assertEqual(caught.exception.code, "cad_application_unreadable")
+        self.assertIs(session.app, original)
+        session.close()
+
+    def test_current_application_cannot_cross_the_owning_sta_thread(self):
+        process = SimpleNamespace(pid=42, executable="test.exe", alive=lambda: True, close=Mock())
+        binder = Mock(return_value=SimpleNamespace(Visible=True, CommandInProgress=False))
+        session = CadSession(process=process, binder=binder)
+        session.connect(threading.Event())
+        failures = []
+
+        def read_elsewhere():
+            try:
+                session.current_application()
+            except Exception as error:
+                failures.append(error)
+
+        thread = threading.Thread(target=read_elsewhere)
+        thread.start()
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], EnvironmentError_)
+        self.assertEqual(failures[0].code, "cad_thread_mismatch")
+        binder.assert_called_once_with(42)
+        session.close()
+
     def test_cancelled_startup_never_binds_an_application(self):
         process = SimpleNamespace(pid=42, executable="test.exe", alive=lambda: True, close=Mock())
         cancelled = threading.Event()
@@ -216,6 +322,8 @@ class SessionTests(unittest.TestCase):
 
         def factory():
             session = SimpleNamespace(app=object(), connect=Mock(), close=Mock(), terminate=Mock())
+            session.connect.return_value = session.app
+            session.current_application = lambda: session.app
             sessions.append(session)
             return session
 

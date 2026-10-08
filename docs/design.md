@@ -100,6 +100,9 @@ URDF with joint controls. It shows each automatic check, engineering
 confirmation, evidence and affected object; unsupported or unexecuted checks
 remain explicit.
 
+Native reads reacquire application interfaces at document boundaries within
+the same owned Windows process. A lost process or binding stops capture.
+
 Feishu supplies the signed-in identity and profile. The platform restricts
 access to its approved tenant and assigns operator and administrator permissions.
 The same identity is recorded with the Airflow execution.

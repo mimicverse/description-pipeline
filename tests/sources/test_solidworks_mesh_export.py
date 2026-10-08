@@ -97,6 +97,8 @@ def _backend(component, name="pcb-1") -> SolidWorksBackend:
         app=SimpleNamespace(GetOpenDocumentByName=lambda _path: doc),
         process=SimpleNamespace(alive=lambda: True),
     )
+    session = backend._sessions["source"]
+    session.current_application = lambda: session.app
     backend._owner_thread = threading.current_thread()
     backend._scene_document_key = backend._record_source_document(path, "Default")
     part_key = backend._record_source_document(component.GetPathName(), "Default")

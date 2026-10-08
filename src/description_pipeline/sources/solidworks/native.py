@@ -814,13 +814,15 @@ class SolidWorksBackend(CadBackend):
             # Register before a potentially blocking COM call so a watchdog can
             # close the owned Windows job without touching COM from its thread.
             try:
-                session.connect(self._cancelled)
+                app = session.connect(self._cancelled)
             except BaseException:
                 session.close()
                 raise
+        else:
+            app = session.current_application()
         if self._cancelled.is_set():
             raise EnvironmentError_("cad_session_cancelled", "Capture was cancelled")
-        return session.app
+        return app
 
     def _role_for_path(self, path):
         normalized = normalize_document_path(os.path.abspath(path))

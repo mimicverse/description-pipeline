@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import types
 import unittest
 import weakref
@@ -24,9 +25,11 @@ from contextlib import contextmanager
 from itertools import pairwise
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import Mock
 
 from description_pipeline.geometry.stl import read as read_stl
 from description_pipeline.sources.solidworks.errors import CadError
+from description_pipeline.sources.solidworks.isolation import CadSession
 from description_pipeline.sources.solidworks.native import SolidWorksBackend, _temporary_configuration
 
 #: SolidWorks ``MathTransform.ArrayData`` order for an identity occurrence.
@@ -409,7 +412,10 @@ class _Session:
         self.process = types.SimpleNamespace(alive=lambda: True)
 
     def connect(self, _cancelled):
-        return None
+        return self.app
+
+    def current_application(self):
+        return self.app
 
     def close(self):
         return None
@@ -866,6 +872,27 @@ class ProducerContextTests(unittest.TestCase):
 
 
 class CaptureSceneTests(unittest.TestCase):
+    def test_owned_document_lookup_does_not_reuse_a_revoked_application_interface(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            part = _write(Path(tmp), "arm.SLDPRT")
+            document = _Doc(part)
+            previous = _App({})
+            previous.GetOpenDocumentByName = _raiser(RuntimeError("RPC_S_UNKNOWN_IF"))
+            current = _App({str(part): document})
+            process = types.SimpleNamespace(pid=42, executable="test.exe", alive=lambda: True, close=Mock())
+            binder = Mock(side_effect=[previous, current])
+            session = CadSession(process=process, binder=binder)
+            session.connect(threading.Event())
+            backend = SolidWorksBackend()
+            backend._sessions["source"] = session
+            backend._owner_thread = threading.current_thread()
+
+            self.assertIs(backend._document_by_path(str(part)), document)
+            self.assertIs(backend._sessions["source"], session)
+            self.assertEqual([call.args for call in binder.call_args_list], [(42,), (42,)])
+            process.close.assert_not_called()
+            backend.release()
+
     """Requested datums must survive capture from every occurrence/document."""
 
     def _capture(self, app, assembly, requested):
