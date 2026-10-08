@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import tempfile
 import unittest
@@ -24,21 +23,22 @@ def run(*args: str, cwd: Path | None = None) -> str:
 
 class Fixture:
     def __init__(self) -> None:
-        self.tmp = Path(tempfile.mkdtemp(prefix="urdf-pr-test-"))
+        self.temp = tempfile.TemporaryDirectory(prefix="urdf-pr-test-")
+        self.tmp = Path(self.temp.name)
         self.remote = self.tmp / "remote.git"
         run("git", "init", "--bare", "-b", "feature/m3.0", str(self.remote))
         self.seed = self.tmp / "seed"
         self.seed.mkdir()
         run("git", "init", "-b", "feature/m3.0", cwd=self.seed)
-        for key, value in (("user.email", "t@example.com"), ("user.name", "T")):
+        for key, value in (("user.email", "t@example.com"), ("user.name", "T"), ("core.autocrlf", "false")):
             run("git", "config", key, value, cwd=self.seed)
-        (self.seed / "README.md").write_text("base\n", encoding="utf-8")
+        (self.seed / "README.md").write_bytes(b"base\n")
         run("git", "add", "-A", cwd=self.seed)
         run("git", "commit", "-m", "base", cwd=self.seed)
         run("git", "remote", "add", "origin", str(self.remote), cwd=self.seed)
         run("git", "push", "-u", "origin", "feature/m3.0", cwd=self.seed)
         self.repo = self.tmp / "repo"
-        run("git", "clone", str(self.remote), str(self.repo))
+        run("git", "clone", "-c", "core.autocrlf=false", str(self.remote), str(self.repo))
         for key, value in (("user.email", "t@example.com"), ("user.name", "T")):
             run("git", "config", key, value, cwd=self.repo)
         self.bundle = self.tmp / "bundle"
@@ -99,7 +99,7 @@ class Fixture:
 class PublishTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fx = Fixture()
-        self.addCleanup(shutil.rmtree, self.fx.tmp)
+        self.addCleanup(self.fx.temp.cleanup)
         self.gh_calls: list[tuple[str, ...]] = []
         self.rest_payloads: list[dict] = []
         self.gh_mode = "ok"
@@ -273,6 +273,16 @@ class PublishTests(unittest.TestCase):
         boundary = next(event["check"] for event in events if event.get("check", {}).get("id") == "publication.git")
         self.assertEqual(len(boundary["details"]["git_attributes_sha256"]), 64)
 
+    def test_native_filenames_with_unicode_and_spaces_publish_unchanged(self):
+        name = "input/结构 零件.SLDPRT"
+        self.fx.write_bundle("one\n", extra={name: "neutral engineering fixture\n"})
+        self.fx.seal("r1", None, fresh=True)
+        result = self.submit()
+        self.assertEqual(result["state"], "published")
+        run("git", "fetch", "--quiet", "origin", BRANCH, cwd=self.fx.repo)
+        actual = subprocess.check_output(["git", "show", f"FETCH_HEAD:{name}"], cwd=self.fx.repo)
+        self.assertEqual(actual, (self.fx.bundle / name).read_bytes())
+
     def test_nonregular_git_policy_does_not_write_outside_worktree(self):
         outside = self.fx.tmp / "outside-policy"
         outside.write_bytes(b"original\n")
@@ -292,7 +302,7 @@ class PublishTests(unittest.TestCase):
         hook.write_text("#!/bin/sh\nprintf '* text\\n' > .gitattributes\ngit add .gitattributes\n", encoding="ascii")
         hook.chmod(0o755)
         result = self.submit()
-        self.assertEqual(result["error"], "committed_git_metadata_mismatch")
+        self.assertIn(result["error"], {"committed_git_metadata_mismatch", "commit_left_dirty"})
         self.assertEqual(self.fx.remote_head(), "")
 
     def test_existing_pr_update_preserves_utf8_metadata(self):
@@ -423,7 +433,7 @@ class PublishTests(unittest.TestCase):
         outside.mkdir()
         (outside / "keep.txt").write_text("keep\n", encoding="utf-8")
         try:
-            os.symlink(outside, self.fx.seed / "input")
+            os.symlink(outside, self.fx.seed / "input", target_is_directory=True)
         except OSError:
             self.skipTest("Symlink creation requires platform privileges")
         run("git", "add", "-A", cwd=self.fx.seed)

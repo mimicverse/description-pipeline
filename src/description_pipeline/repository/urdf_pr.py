@@ -313,7 +313,7 @@ def _stage_commit(bundle: Path, worktree: Path, subject: str, message: str) -> t
         raise PrError("commit_worktree_mismatch", "worktree differs from the committed tree")
     if subject_digest(worktree) != subject:
         raise PrError("committed_subject_mismatch", "committed tree bytes differ from the verified bundle")
-    diff = _git(worktree, "diff", "--name-only", "HEAD^", "HEAD").stdout.splitlines()
+    diff = _git(worktree, "diff", "--name-only", "-z", "HEAD^", "HEAD").stdout.split("\0")
     for path in diff:
         if path and not any(path == name or path.startswith(name + "/") for name in GOVERNED_PATHS):
             raise PrError("commit_touched_ungoverned", path)
