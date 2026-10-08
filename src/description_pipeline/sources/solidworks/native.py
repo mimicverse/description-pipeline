@@ -25,6 +25,9 @@ from ...geometry.stl import read as read_stl
 from .errors import CadError, EnvironmentError_
 from .protocol import CadBackend, RawComponent, RawScene
 
+# Published IComponent2 dual-interface IID in the SolidWorks type library.
+ICOMPONENT2_IID = "{655D6F2A-5441-45D1-8CBA-D35FB26988E4}"
+
 
 def co_initialize():
     if os.name != "nt":
@@ -50,6 +53,18 @@ def _dynamic(value):
 
         return win32com.client.dynamic.DumbDispatch(value._oleobj_)
     return value
+
+
+def _component(value):
+    """Bind a native occurrence to its published component interface."""
+    if not hasattr(value, "_oleobj_"):
+        return value
+    import pythoncom
+    import pywintypes
+    import win32com.client.dynamic
+
+    dispatch = value._oleobj_.QueryInterface(pywintypes.IID(ICOMPONENT2_IID), pythoncom.IID_IDispatch)
+    return win32com.client.dynamic.DumbDispatch(dispatch)
 
 
 def _hint_method(obj, name):
@@ -1085,7 +1100,7 @@ class SolidWorksBackend(CadBackend):
         if _member(doc, "GetType") != 2:
             raise CadError("cad_not_assembly", "assembly mass reader requires a saved SLDASM")
         configuration = _member(_member(doc, "ConfigurationManager"), "ActiveConfiguration")
-        root = _member(configuration, "GetRootComponent3", True)
+        root = _component(_member(configuration, "GetRootComponent3", True))
         mp = _member(_member(doc, "Extension"), "CreateMassProperty2")
         if mp is None:
             raise CadError(
@@ -1156,7 +1171,7 @@ class SolidWorksBackend(CadBackend):
         if _member(doc, "GetType") != 2:
             raise CadError("cad_not_assembly", "component mass context requires a saved SLDASM")
         configuration = _member(_member(doc, "ConfigurationManager"), "ActiveConfiguration")
-        root = _member(configuration, "GetRootComponent3", True)
+        root = _component(_member(configuration, "GetRootComponent3", True))
         if root is None:
             raise CadError("cad_empty_mass_property", "assembly mass context has no root component")
         import pythoncom
@@ -1164,21 +1179,21 @@ class SolidWorksBackend(CadBackend):
         entries: list[dict] = []
         errors: list[dict] = []
         stack: list[tuple[object, str | None, int]] = [
-            (component, None, 0) for component in reversed(list(_member(root, "GetChildren") or ()))
+            (component, None, 0) for component in reversed(list(_method(root, "GetChildren") or ()))
         ]
         while stack:
             raw, parent, depth = stack.pop()
             name = ""
             children: list = []
             try:
-                component = _dynamic(raw)
+                component = _component(raw)
                 raw_name = _member(component, "Name2")
                 if raw_name is None or not str(raw_name):
                     raise CadError("cad_component_name_missing", "component instance has no Name2")
                 name = str(raw_name)
                 if _member(component, "IsSuppressed"):
                     continue
-                children = list(_member(component, "GetChildren") or ())
+                children = list(_method(component, "GetChildren") or ())
             except Exception as error:  # noqa: BLE001 - one unreadable instance must not stop the walk
                 errors.append(_instance_error(name, parent, depth, "hierarchy", error))
                 continue
@@ -1206,7 +1221,7 @@ class SolidWorksBackend(CadBackend):
                         "name": name,
                         "parent": parent,
                         "depth": depth,
-                        "document": str(_member(component, "GetPathName")),
+                        "document": str(_method(component, "GetPathName")),
                         "document_type": "assembly" if children else "part",
                         "context_mass_kg": mass,
                         "context_volume_m3": volume if math.isfinite(volume) else None,
@@ -1402,7 +1417,7 @@ class SolidWorksBackend(CadBackend):
         if _member(doc, "GetType") != 2:
             raise CadError("cad_not_assembly", "group mass reader requires a saved SLDASM")
         configuration = _member(_member(doc, "ConfigurationManager"), "ActiveConfiguration")
-        root = _member(configuration, "GetRootComponent3", True)
+        root = _component(_member(configuration, "GetRootComponent3", True))
         if root is None:
             raise CadError("cad_empty_mass_property", "assembly has no root component")
         wanted = {str(name) for name in names}
@@ -1410,12 +1425,12 @@ class SolidWorksBackend(CadBackend):
             raise CadError("cad_empty_selection", "group mass reader needs at least one component instance")
         selection: list[object] = []
         overrides: dict[str, dict[str, bool]] = {}
-        stack: list[object] = list(reversed(list(_member(root, "GetChildren") or ())))
+        stack: list[object] = list(reversed(list(_method(root, "GetChildren") or ())))
         while stack:
-            component = _dynamic(stack.pop())
+            component = _component(stack.pop())
             if _member(component, "IsSuppressed"):
                 continue
-            children = list(_member(component, "GetChildren") or ())
+            children = list(_method(component, "GetChildren") or ())
             stack.extend(reversed(children))
             name = str(_member(component, "Name2"))
             if name not in wanted:
@@ -1514,8 +1529,8 @@ class SolidWorksBackend(CadBackend):
         manager = _member(doc, "ConfigurationManager")
         config = _member(manager, "ActiveConfiguration")
         self._scene_document_key = self._record_source_document(doc_path, str(_member(config, "Name")))
-        root = _member(config, "GetRootComponent3", True)
-        stack = list(_member(root, "GetChildren") or ())
+        root = _component(_member(config, "GetRootComponent3", True))
+        stack = list(_method(root, "GetChildren") or ())
         borrowed_components = []
         occurrences = []
         components, properties = [], {}
@@ -1551,16 +1566,18 @@ class SolidWorksBackend(CadBackend):
 
         record_datums(doc, "", None)
         while stack:
-            comp = _dynamic(stack.pop())
+            comp = _component(stack.pop())
             if _member(comp, "IsSuppressed"):
                 continue
             borrowed_components.append(comp)
             name = str(_member(comp, "Name2"))
-            part = _member(comp, "GetModelDoc2")
+            part = _method(comp, "GetModelDoc2")
             if part is None:
                 raise CadError("cad_component_unresolved", name)
-            _read_only_document(part)
-            path = _member(comp, "GetPathName")
+            # SetReadOnlyState can change native state. Defer it until the
+            # occurrence tree has been captured as primitives and released;
+            # phase-two document acquisition enforces read-only before reads.
+            path = _method(comp, "GetPathName")
             if not path or not os.path.isfile(path):
                 # Without a file on disk there is no revision to hash or copy, so the
                 # snapshot could not name what it read.
@@ -1569,7 +1586,7 @@ class SolidWorksBackend(CadBackend):
             referenced = _member(comp, "ReferencedConfiguration")
             # Configuration changes can invalidate borrowed occurrence interfaces.
             # Finish the assembly traversal using primitives before any selection.
-            children = list(_member(comp, "GetChildren") or ())
+            children = list(_method(comp, "GetChildren") or ())
             placement = self._placement(comp)
             if children:
                 if _member(part, "GetType") != 2:
@@ -1842,13 +1859,13 @@ class SolidWorksBackend(CadBackend):
         try:
             manager = _member(doc, "ConfigurationManager")
             config = _member(manager, "ActiveConfiguration")
-            root = _member(config, "GetRootComponent3", True)
+            root = _component(_member(config, "GetRootComponent3", True))
             if root is None:
                 raise ValueError("the assembly has no readable root component")
-            stack = list(_member(root, "GetChildren") or ())
+            stack = list(_method(root, "GetChildren") or ())
             while stack:
                 name = ""
-                comp = _dynamic(stack.pop())
+                comp = _component(stack.pop())
                 name = _member(comp, "Name2")
                 if not _is_text_name(name):
                     raise ValueError("the occurrence has no readable full name")
@@ -1864,7 +1881,7 @@ class SolidWorksBackend(CadBackend):
                 document_key, referenced = self._source_components[name]
                 expected_path = self._source_documents[document_key][0]
                 occurrence = {
-                    "path": _member(comp, "GetPathName"),
+                    "path": _method(comp, "GetPathName"),
                     "referenced_configuration": _member(comp, "ReferencedConfiguration"),
                 }
                 if not all(_is_text_name(value) for value in occurrence.values()):
@@ -1883,7 +1900,7 @@ class SolidWorksBackend(CadBackend):
                         },
                     )
                 current[name] = comp
-                stack.extend(_member(comp, "GetChildren") or ())
+                stack.extend(_method(comp, "GetChildren") or ())
         except Exception as error:
             if isinstance(error, CadError) and error.code == "cad_source_changed":
                 raise
@@ -2132,23 +2149,24 @@ class SolidWorksBackend(CadBackend):
         doc = self._document_by_path(assembly_path)
         document_path = str(_member(doc, "GetPathName") or assembly_path)
         configuration = _member(_member(doc, "ConfigurationManager"), "ActiveConfiguration")
-        root = _member(configuration, "GetRootComponent3", True)
+        root = _component(_member(configuration, "GetRootComponent3", True))
         instances = []
+        read_only_paths = set()
 
-        stack = [(child, "", 0) for child in reversed(_as_list(_member(root, "GetChildren")))]
+        stack = [(child, "", 0) for child in reversed(_as_list(_method(root, "GetChildren")))]
         while stack:
             item, context, depth = stack.pop()
             if depth > 40:
                 raise CadError("cad_assembly_too_deep", assembly_path, {"depth": depth})
-            component = _dynamic(item)
+            component = _component(item)
             name = str(_member(component, "Name2") or _member(component, "Name") or "")
             instance = name if not context or name.startswith(context + "/") else f"{context}/{name}"
-            model = _member(component, "GetModelDoc2")
-            if model is not None:
-                _read_only_document(model)
+            model = _method(component, "GetModelDoc2")
             document = _member(model, "GetPathName") if model is not None else None
             if not document:
-                document = _member(component, "GetPathName")
+                document = _method(component, "GetPathName")
+            if model is not None and document:
+                read_only_paths.add(str(document))
             referenced = _member(component, "ReferencedConfiguration")
             suppressed = bool(_member(component, "IsSuppressed"))
             instances.append(
@@ -2166,12 +2184,17 @@ class SolidWorksBackend(CadBackend):
                 # a suppressed placement loads no model, so its children are not
                 # part of the resolved instance set of either side
                 continue
-            for child in reversed(_as_list(_member(component, "GetChildren"))):
+            for child in reversed(_as_list(_method(component, "GetChildren"))):
                 stack.append((child, instance, depth + 1))
+
+        # Finish borrowing occurrence interfaces before any native state change.
+        component = item = child = model = root = configuration = doc = stack = None
+        for path in sorted(read_only_paths):
+            self._document_by_path(path)  # Reacquire and enforce read-only.
 
         return {
             "document": str(opened.get("path") or document_path),
-            "configuration": _active_configuration(doc),
+            "configuration": _active_configuration(self._document_by_path(assembly_path)),
             "components": len(instances),
             # A suppressed instance is not evidence of an escape: it is recorded
             # separately and still has to match between source and copy.
@@ -2213,7 +2236,7 @@ class SolidWorksBackend(CadBackend):
                 referenced = set()
                 for _candidate, doc in assemblies:
                     for component in _as_list(_member(doc, "GetComponents", False)) or []:
-                        path = _member(_dynamic(component), "GetPathName")
+                        path = _method(_component(component), "GetPathName")
                         if _is_text_name(path):
                             referenced.add(normalize_document_path(str(path)))
                 roots = [item for item in assemblies if normalize_document_path(str(item[0])) not in referenced]
@@ -2238,6 +2261,8 @@ class SolidWorksBackend(CadBackend):
             active = _member(_member(doc, "ConfigurationManager"), "ActiveConfiguration")
             configuration = str(_member(active, "Name") or "")
             identity_properties = _custom_properties(doc, configuration)
+            assemblies.clear()
+            main = doc = active = None
             components = []
             by_component = {}
             by_document: dict[str, str] = {}
@@ -2245,19 +2270,20 @@ class SolidWorksBackend(CadBackend):
             mates: list[dict] = []
             stack = [
                 (
-                    doc,
+                    str(main_path),
                     "",
                     configuration,
                     [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
                 )
             ]
             while stack:
-                assembly, prefix, referenced_configuration, parent_matrix = stack.pop()
+                assembly_path, prefix, referenced_configuration, parent_matrix = stack.pop()
+                assembly = self._document_by_path(assembly_path)
                 _select_configuration(assembly, referenced_configuration, prefix or "assembly")
                 active_config = _member(_member(assembly, "ConfigurationManager"), "ActiveConfiguration")
-                root = _member(active_config, "GetRootComponent3", True)
-                for raw in list(_member(root, "GetChildren") or []):
-                    component = _dynamic(raw)
+                root = _component(_member(active_config, "GetRootComponent3", True))
+                for raw in list(_method(root, "GetChildren") or []):
+                    component = _component(raw)
                     name = str(_member(component, "Name2") or "")
                     if not name:
                         continue
@@ -2268,7 +2294,7 @@ class SolidWorksBackend(CadBackend):
                             "two native occurrences have the same scoped identity",
                             {"component": path_name, "configuration": referenced_configuration},
                         )
-                    document_path = _member(component, "GetPathName")
+                    document_path = _method(component, "GetPathName")
                     relative = _relative_document(document_path, source_root) if _is_text_name(document_path) else None
                     local_transform = []
                     transform_error = "no transform API answered"
@@ -2305,10 +2331,12 @@ class SolidWorksBackend(CadBackend):
                         "transform": transform,
                     }
                     components.append(entry)
-                    by_component[path_name] = component
+                    # Keep primitives beyond this traversal scope. Later
+                    # configuration changes must not reuse borrowed occurrences.
+                    by_component[path_name] = (str(document_path), _method(component, "GetModelDoc2") is not None)
                     by_document[path_name] = entry["document"]
                     try:
-                        mass_property = _member(_member(doc, "Extension"), "CreateMassProperty2")
+                        mass_property = _member(_member(assembly, "Extension"), "CreateMassProperty2")
                         if (
                             mass_property is not None
                             and not entry["suppressed"]
@@ -2335,14 +2363,14 @@ class SolidWorksBackend(CadBackend):
                                 )
                     except Exception as error:  # noqa: BLE001 - masses are informational here
                         notes.append(f"mass:{path_name}:{error}")
-                    children = list(_member(component, "GetChildren") or [])
+                    children = list(_method(component, "GetChildren") or [])
                     if children:
-                        part = _member(component, "GetModelDoc2")
+                        part = _method(component, "GetModelDoc2")
                         if part is not None:
                             referenced = str(_member(component, "ReferencedConfiguration") or "")
                             stack.append(
                                 (
-                                    part,
+                                    str(document_path),
                                     path_name,
                                     referenced,
                                     [
@@ -2368,9 +2396,9 @@ class SolidWorksBackend(CadBackend):
                     for entity_index in range(entity_count):
                         try:
                             entity = _dynamic(_method(specific, "MateEntity", entity_index))
-                            reference = _dynamic(_member(entity, "ReferenceComponent"))
+                            reference = _component(_member(entity, "ReferenceComponent"))
                             reference_name = str(_member(reference, "Name2") or "")
-                            reference_path = _relative_document(_member(reference, "GetPathName"), source_root)
+                            reference_path = _relative_document(_method(reference, "GetPathName"), source_root)
                         except Exception as error:  # noqa: BLE001
                             raise CadError(
                                 "cad_mate_unreadable",
@@ -2447,6 +2475,11 @@ class SolidWorksBackend(CadBackend):
                             "configuration": referenced_configuration,
                         }
                     )
+                # The next assembly selection may invalidate this entire borrowed
+                # tree. Pending assemblies and occurrence records contain paths
+                # and primitives only; release all native traversal handles now.
+                component = raw = root = active_config = part = children = holder = mass_property = None
+                entity = reference = target = feature = specific = assembly = None
             # Top-level mates can name descendants that are visited later.
             # Resolve the full scoped occurrence; leaf-name matching loses
             # identity when the same part is inserted more than once.
@@ -2470,17 +2503,18 @@ class SolidWorksBackend(CadBackend):
                         )
                     entity["component"] = scoped_name
             datums = []
+            doc = self._document_by_path(str(main_path))
             _select_configuration(doc, configuration, "assembly")
             for name in _coordinate_system_features(doc):
                 matrix = [float(value) for value in self._coordinate_system_transform(doc, name)]
                 datums.append({"name": name, "owner": "", "array": matrix, "configuration": configuration})
             for entry in components:
-                part = by_component.get(entry["name2"])
-                if part is None or entry["suppressed"]:
+                source = by_component.get(entry["name2"])
+                if source is None or not source[1] or entry["suppressed"]:
                     continue
-                document = _member(part, "GetModelDoc2")
-                if document is None or not entry["transform"]:
+                if not entry["transform"]:
                     continue
+                document = self._document_by_path(source[0])
                 _select_configuration(document, entry["configuration"], entry["name2"])
                 for name in _coordinate_system_features(document):
                     values = [float(value) for value in self._coordinate_system_transform(document, name)]
@@ -2502,17 +2536,16 @@ class SolidWorksBackend(CadBackend):
                     )
             property_buckets = {"document": identity_properties, "components": {}, "mates": {}}
             for entry in components:
-                part = by_component.get(entry["name2"])
-                if part is None or entry["suppressed"]:
+                source = by_component.get(entry["name2"])
+                if source is None or not source[1] or entry["suppressed"]:
                     continue
-                document = _member(part, "GetModelDoc2")
-                if document is not None:
-                    _select_configuration(document, entry["configuration"], entry["name2"])
+                document = self._document_by_path(source[0])
+                _select_configuration(document, entry["configuration"], entry["name2"])
                 values = _custom_properties(document, entry["configuration"] or None)
                 if values:
                     property_buckets["components"][entry["name2"]] = values
             files = {}
-            for path in (main_path, *[Path(str(_member(item, "GetPathName"))) for item in by_component.values()]):
+            for path in (main_path, *[Path(item[0]) for item in by_component.values()]):
                 relative = _relative_document(path, source_root)
                 if relative and relative not in files:
                     files[relative] = _hash(str(Path(source_root) / relative))

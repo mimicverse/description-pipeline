@@ -108,6 +108,9 @@ identity remain in the evidence. Application interfaces are reacquired at
 document boundaries within the live copy. Each acquisition uses the vendor's
 `ISldWorks` interface and verifies the owned process ID. A lost process or
 binding stops capture.
+Occurrence reads use the vendor's `IComponent2` interface. Traversal records
+their primitives before changing any referenced document's read-only state or
+configuration.
 
 Feishu supplies the signed-in identity and profile. The platform restricts
 access to its approved tenant and assigns operator and administrator permissions.

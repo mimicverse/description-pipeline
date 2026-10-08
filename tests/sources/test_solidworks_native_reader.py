@@ -604,6 +604,100 @@ class MateRecordTests(unittest.TestCase):
 
 
 class ProducerContextTests(unittest.TestCase):
+    def test_discovery_reacquires_top_document_after_nested_configuration_mutation(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            arm_path = _write(root, "arm.SLDPRT")
+            sub_path = _write(root, "sub.SLDASM")
+            assembly = _write(root, "robot.SLDASM")
+            state = {"generation": 0}
+            expired_reads = []
+
+            class NestedDocument(_Doc):
+                def ShowConfiguration2(self, name):
+                    previous = self.active_configuration
+                    selected = super().ShowConfiguration2(name)
+                    if selected and self.active_configuration != previous:
+                        state["generation"] += 1
+                    return selected
+
+            arm = _Doc(arm_path)
+            child = _Component("arm-1", arm_path, doc=arm)
+            sub = NestedDocument(
+                sub_path, doc_type=2, configuration="Parked",
+                configuration_children={"Parked": [], "Working": [child]},
+            )
+            occurrence = _Component("sub-1", sub_path, doc=sub, children=[child], configuration="Working")
+            main = _Doc(
+                assembly, doc_type=2, children=[occurrence],
+                coordinate_systems={"CS_base": SW_IDENTITY}, first_feature=_Feature("CS_base", "CoordSys"),
+            )
+
+            class MainHandle:
+                def __init__(self):
+                    self.generation = state["generation"]
+
+                def __getattr__(self, name):
+                    if not name.startswith("_") and self.generation != state["generation"]:
+                        expired_reads.append(name)
+                        raise RuntimeError("top document handle expired after a nested mutation")
+                    return getattr(main, name)
+
+            class App(_App):
+                def GetOpenDocumentByName(self, path):
+                    if os.path.abspath(path) == str(assembly):
+                        return MainHandle()
+                    return super().GetOpenDocumentByName(path)
+
+            record = _read(root, App({assembly: main, sub_path: sub, arm_path: arm}))
+
+            self.assertGreater(state["generation"], 0)
+            self.assertEqual(expired_reads, [])
+            self.assertIn("sub-1/arm-1", [item["name2"] for item in record["components"]])
+            self.assertEqual([(item["owner"], item["name"]) for item in record["datums"]], [("", "CS_base")])
+
+    def test_discovery_keeps_only_primitives_after_occurrence_traversal(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            part_path = _write(root, "shared.SLDPRT")
+            assembly = _write(root, "robot.SLDASM")
+            borrowed = []
+
+            class SharedDocument(_Doc):
+                def ShowConfiguration2(self, name):
+                    if name != self.active_configuration and any(ref() is not None for ref in borrowed):
+                        raise RuntimeError("borrowed occurrences survived a configuration boundary")
+                    return super().ShowConfiguration2(name)
+
+            shared = SharedDocument(
+                part_path, configuration="Parked",
+                configuration_children={"Parked": [], "Short": [], "Long": []},
+                configuration_properties={"Short": {"dp.role": "short"}, "Long": {"dp.role": "long"}},
+                coordinate_systems={"CS_tip": _sw_translation(0.1, 0.0, 0.0)},
+                first_feature=_Feature("CS_tip", "CoordSys"),
+            )
+            main = _Doc(assembly, doc_type=2)
+
+            def occurrences(_configuration):
+                result = []
+                for name, configuration in (("arm-short", "Short"), ("arm-long", "Long")):
+                    component = _Component(name, part_path, doc=shared, configuration=configuration)
+                    borrowed.append(weakref.ref(component))
+                    result.append(component)
+                return result
+
+            main.children_for = occurrences
+            record = _read(root, _App({assembly: main, part_path: shared}))
+
+            self.assertEqual(record["properties"]["components"]["arm-short"]["dp.role"], "short")
+            self.assertEqual(record["properties"]["components"]["arm-long"]["dp.role"], "long")
+            self.assertEqual(
+                {(datum["owner"], datum["configuration"]) for datum in record["datums"]},
+                {("arm-short", "Short"), ("arm-long", "Long")},
+            )
+            self.assertEqual(set(record["files"]), {"robot.SLDASM", "shared.SLDPRT"})
+            self.assertTrue(all(ref() is None for ref in borrowed))
+
     def test_suppressed_datum_with_a_stored_transform_is_not_discovered(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -876,6 +970,103 @@ class ProducerContextTests(unittest.TestCase):
 
 
 class CaptureSceneTests(unittest.TestCase):
+    def test_copy_inspection_releases_occurrences_before_read_only_mutation(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            borrowed = []
+            events = []
+
+            class PartDocument(_Doc):
+                read_only = False
+
+                def IsOpenedReadOnly(self):
+                    return self.read_only
+
+                def SetReadOnlyState(self, value):
+                    if any(ref() is not None for ref in borrowed):
+                        raise RuntimeError("borrowed occurrences survived a read-only boundary")
+                    events.append(("read_only", self._path))
+                    self.read_only = value
+                    return True
+
+            paths = [_write(root, name + ".SLDPRT") for name in ("arm1", "arm2")]
+            documents = {path: PartDocument(path) for path in paths}
+            assembly = _write(root, "robot.SLDASM")
+            main = _Doc(assembly, doc_type=2)
+            documents[assembly] = main
+
+            def occurrences(_configuration):
+                result = []
+                for path in paths:
+                    component = _Component(path.stem, path, doc=documents[path])
+                    borrowed.append(weakref.ref(component))
+                    events.append(("occurrence", path.stem))
+                    result.append(component)
+                return result
+
+            main.children_for = occurrences
+            app = _App(documents)
+            app.OpenDoc6 = lambda *_args: main
+            backend = SolidWorksBackend(session_factory=lambda: _Session(app))
+            result = backend.inspect_copy(str(assembly))
+
+            self.assertEqual({item["instance"] for item in result["instances"]}, {"arm1", "arm2"})
+            self.assertEqual(result["configuration"], "Default")
+            self.assertEqual(result["unresolved"], [])
+            self.assertTrue(all(doc.read_only for path, doc in documents.items() if path != assembly))
+            self.assertEqual([kind for kind, _ in events], ["occurrence", "occurrence", "read_only", "read_only"])
+
+    def test_read_only_mutation_waits_until_all_occurrence_primitives_are_collected(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            events = []
+            components = []
+
+            class PartDocument(_Doc):
+                def __init__(self, path):
+                    super().__init__(path)
+                    self.read_only = False
+
+                def IsOpenedReadOnly(self):
+                    return self.read_only
+
+                def SetReadOnlyState(self, value):
+                    events.append(("read_only", self._path))
+                    # A native mutation may revoke any borrowed occurrence.
+                    # The algorithm must finish the tree before crossing it.
+                    for comp in components:
+                        comp.revoked = True
+                    self.read_only = value
+                    return True
+
+            class Occurrence(_Component):
+                revoked = False
+
+                def GetPathName(self):
+                    if self.revoked:
+                        raise RuntimeError("Borrowed occurrence was revoked by a native mutation")
+                    events.append(("path", self.Name2))
+                    return super().GetPathName()
+
+            documents = {}
+            for name in ("arm1", "arm2"):
+                path = _write(root, name + ".SLDPRT")
+                doc = PartDocument(path)
+                documents[path] = doc
+                components.append(Occurrence(name, path, doc=doc))
+            assembly = _write(root, "robot.SLDASM")
+            documents[assembly] = _Doc(assembly, doc_type=2, children=components)
+            backend = _CaptureBackend(session_factory=lambda: _Session(_App(documents)))
+            scene = backend.collect_scene(str(assembly), [])
+
+            self.assertEqual({c.name for c in scene.components}, {"arm1", "arm2"})
+            paths = [i for i, event in enumerate(events) if event[0] == "path"]
+            mutations = [i for i, event in enumerate(events) if event[0] == "read_only"]
+            self.assertEqual(len(paths), 2)
+            self.assertEqual(len(mutations), 2)
+            self.assertLess(max(paths), min(mutations))
+            self.assertTrue(all(doc.read_only for path, doc in documents.items() if path != assembly))
+
     def test_owned_document_lookup_does_not_reuse_a_revoked_application_interface(self):
         with TemporaryDirectory() as tmp, _com_stubs():
             part = _write(Path(tmp), "arm.SLDPRT")
