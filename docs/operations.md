@@ -11,7 +11,9 @@ scope, names, rigid connections, motion, datums, zero, signed directions,
 limits, materials and component identities in the native engineering model.
 
 Resolve drive specifications and independent mass/dimension budgets through
-fixed controlled records identified by CAD. Responsible engineers confirm
+CAD references to approved, versioned records in the platform's controlled library.
+Mechanical engineers maintain these references in SolidWorks; copying a record
+into the submitted folder does not override the library. Responsible engineers confirm
 facts that automatic consistency checks cannot establish, including actual
 assembly behavior, full-range clearance and applicability of specifications.
 

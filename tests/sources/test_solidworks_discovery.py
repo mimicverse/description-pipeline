@@ -14,12 +14,13 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import yaml
 
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
-from description_pipeline.io import PipelineError, digest, file_digest, inventory  # noqa: E402
+from description_pipeline.io import PipelineError, digest, file_digest, inventory, parse_data  # noqa: E402
 from description_pipeline.sources.solidworks.discovery import (  # noqa: E402
     CONTRACT,
     DISCOVERY_SCHEMA,
@@ -318,6 +319,157 @@ class DiscoveryTests(unittest.TestCase):
         payload = json.loads((output / "discovery/native-discovery.json").read_text(encoding="utf-8"))
         self.assertEqual(payload["frozen_names"].get("arm-1"), "arm_link")
         self.assertTrue(verify_discovery(output)["passed"])
+
+    def test_duplicate_controlled_records_block_regardless_of_content_or_root_order(self):
+        _source, records = self._native()
+        other = self.tmp / "other-records"
+        other.mkdir()
+        for content in ((records / "budget.json").read_bytes(), b'{"robot":{"expected_mass_kg":[9,10]}}'):
+            (other / "budget.json").write_bytes(content)
+            for roots in ((records, other), (other, records)):
+                with self.subTest(content=content, roots=roots):
+                    result, _source, output = self._prepare(settings=DiscoverySettings(record_roots=roots))
+                    self.assertIn("discovery.record_ambiguous", self._codes(result))
+                    self.assertFalse((output / "robot.yaml").exists())
+                    finding = next(f for f in result.findings if f["code"] == "discovery.record_ambiguous")
+                    self.assertEqual(
+                        finding["detail"],
+                        {
+                            "reference": "budget.json#robot",
+                            "candidates": [
+                                {"root_index": 0, "file": "budget.json"},
+                                {"root_index": 1, "file": "budget.json"},
+                            ],
+                        },
+                    )
+
+    def test_invalid_duplicate_does_not_fall_back_to_a_readable_record(self):
+        _source, records = self._native()
+        other = self.tmp / "other-records"
+        other.mkdir()
+        (other / "budget.json").write_bytes(b"not JSON")
+        result, _source, _output = self._prepare(settings=DiscoverySettings(record_roots=(other, records)))
+        self.assertIn("discovery.record_ambiguous", self._codes(result))
+
+    def test_repeated_identical_root_is_one_authority(self):
+        _source, records = self._native()
+        result, _source, output = self._prepare(settings=DiscoverySettings(record_roots=(records, records / ".")))
+        self.assertTrue(result.passed, result.findings)
+        self.assertTrue(verify_discovery(output)["passed"])
+
+    def test_hardlinked_files_in_distinct_roots_are_competing_authorities(self):
+        _source, records = self._native()
+        other = self.tmp / "other-records"
+        other.mkdir()
+        (other / "budget.json").hardlink_to(records / "budget.json")
+        result, _source, _output = self._prepare(settings=DiscoverySettings(record_roots=(records, other)))
+        self.assertIn("discovery.record_ambiguous", self._codes(result))
+
+    def test_handoff_record_does_not_supply_controlled_authority(self):
+        source, records = self._native()
+        shutil.copytree(records, source / "records")
+        result = prepare_native_package(
+            source,
+            self.tmp / "prepared-no-library",
+            "run-1",
+            backend=FakeBackend(record()),
+            settings=DiscoverySettings(),
+        )
+        self.assertIn("discovery.record_missing", self._codes(result))
+
+    def test_invalid_record_encoding_retains_a_blocking_finding(self):
+        source, records = self._native()
+        (records / "budget.json").write_bytes(b"\xff\xfe")
+        result = prepare_native_package(
+            source,
+            self.tmp / "prepared-invalid-encoding",
+            "run-1",
+            backend=FakeBackend(record()),
+            settings=DiscoverySettings(record_roots=(records,)),
+        )
+        self.assertIn("discovery.record_unreadable", self._codes(result))
+
+    def test_missing_file_in_one_root_does_not_hide_a_unique_record(self):
+        _source, records = self._native()
+        empty = self.tmp / "empty-records"
+        empty.mkdir()
+        result, _source, output = self._prepare(settings=DiscoverySettings(record_roots=(empty, records)))
+        self.assertTrue(result.passed, result.findings)
+        self.assertTrue(verify_discovery(output)["passed"])
+
+    def test_versioned_references_coexist_without_changing_the_library(self):
+        _source, records = self._native()
+        for version, bounds in (("r2", [0.28, 0.32]), ("r3", [9.0, 10.0])):
+            path = records / "nd_fixture" / version / "budget.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({"robot": {"expected_mass_kg": bounds, "expected_extent_m": [0.35, 0.5]}}))
+        for version, bounds in (("r2", [0.28, 0.32]), ("r3", [9.0, 10.0])):
+            with self.subTest(version=version):
+
+                def mutate(payload, version=version):
+                    payload["properties"]["document"]["dp.design_budget_record"] = (
+                        f"nd_fixture/{version}/budget.json#robot"
+                    )
+
+                result, _source, output = self._prepare(
+                    mutate=mutate, settings=DiscoverySettings(record_roots=(records,))
+                )
+                self.assertTrue(result.passed, result.findings)
+                self.assertEqual(
+                    yaml.safe_load((output / "robot.yaml").read_text())["checks"]["expected_mass_kg"], bounds
+                )
+                self.assertTrue(verify_discovery(output)["passed"])
+
+    def test_record_bytes_are_parsed_hashed_and_embedded_from_one_read(self):
+        _source, records = self._native()
+        original = b"\xef\xbb\xbf" + (records / "budget.json").read_bytes()
+        replacement = b'{"robot":{"expected_mass_kg":[9,10],"expected_extent_m":[0.35,0.5]}}'
+
+        def read_once(content, path):
+            result = parse_data(content, path)
+            if path.name == "budget.json":
+                path.write_bytes(replacement)
+            return result
+
+        # _prepare creates the native fixture; keep the BOM on the exact read.
+        source, records = self._native()
+        (records / "budget.json").write_bytes(original)
+        output = self.tmp / "prepared-one-read"
+        with mock.patch("description_pipeline.sources.solidworks.discovery.parse_data", side_effect=read_once):
+            result = prepare_native_package(
+                source,
+                output,
+                "run-1",
+                backend=FakeBackend(record()),
+                settings=DiscoverySettings(record_roots=(records,)),
+            )
+        self.assertTrue(result.passed, result.findings)
+        payload = json.loads((output / "discovery/native-discovery.json").read_text())
+        budget = next(item for item in payload["records"] if item["reference"] == "budget.json#robot")
+        self.assertEqual((output / budget["package_file"]).read_bytes(), original)
+        self.assertEqual(budget["sha256"], file_digest(output / budget["package_file"]))
+        self.assertEqual(
+            yaml.safe_load((output / "robot.yaml").read_text())["checks"]["expected_mass_kg"], [0.28, 0.32]
+        )
+        self.assertEqual((records / "budget.json").read_bytes(), replacement)
+        self.assertTrue(verify_discovery(output)["passed"])
+
+    def test_one_record_cannot_change_between_keys_in_the_same_job(self):
+        def change_after_first_reference(content, path):
+            result = parse_data(content, path)
+            if path.name == "arm.json" and result["drive"]["effort"] == 6.0:
+                result["drive"]["effort"] = 7.0
+                path.write_text(json.dumps(result))
+                return parse_data(content, path)
+            return result
+
+        with (
+            mock.patch(
+                "description_pipeline.sources.solidworks.discovery.parse_data", side_effect=change_after_first_reference
+            ),
+            self.assertRaisesRegex(PipelineError, "changed between references"),
+        ):
+            self._prepare()
 
     def test_rigid_accessory_preserves_the_joint_between_solved_bodies(self):
         def mutate(payload):

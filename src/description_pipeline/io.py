@@ -145,15 +145,21 @@ class _UniqueLoader(yaml.SafeLoader):
         )
 
 
+def parse_data(content: bytes, path: Path) -> Any:
+    """Parse one captured byte sequence, retaining its filename for diagnostics."""
+    try:
+        # Windows PowerShell 5.1 writes a BOM for Set-Content -Encoding UTF8.
+        text = content.decode("utf-8-sig")
+        if path.suffix in {".yaml", ".yml"}:
+            return yaml.load(text, Loader=_UniqueLoader)
+        return json.loads(text, object_pairs_hook=_unique_mapping)
+    except (PipelineError, yaml.YAMLError, json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise PipelineError(f"Invalid input {path}: {error}") from error
+
+
 def read_data(path: Path) -> Any:
-    # Windows PowerShell 5.1 writes a BOM for Set-Content -Encoding UTF8.
-    with open(_filesystem_path(path), encoding="utf-8-sig") as stream:
-        try:
-            if path.suffix in {".yaml", ".yml"}:
-                return yaml.load(stream, Loader=_UniqueLoader)
-            return json.load(stream, object_pairs_hook=_unique_mapping)
-        except (PipelineError, yaml.YAMLError, json.JSONDecodeError) as error:
-            raise PipelineError(f"Invalid input {path}: {error}") from error
+    with open(_filesystem_path(path), "rb") as stream:
+        return parse_data(stream.read(), path)
 
 
 def write_json(path: Path, data: Any) -> None:

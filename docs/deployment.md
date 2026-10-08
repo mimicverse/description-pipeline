@@ -61,7 +61,7 @@ the worker collects immutable copies into `C:\description-packages`. Source
 roots must be narrow, real directories and separate from managed storage.
 
 ```powershell
-New-Item -ItemType Directory -Force C:\cad-handoffs, C:\description-packages, C:\description-deliveries, C:\description-state, C:\description-secrets | Out-Null
+New-Item -ItemType Directory -Force C:\cad-handoffs, C:\cad-records, C:\description-packages, C:\description-deliveries, C:\description-state, C:\description-secrets | Out-Null
 $account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 icacls C:\description-secrets /inheritance:r /grant:r "${account}:(OI)(CI)F"
 C:\description-runtime\Scripts\python.exe -c "import secrets; from pathlib import Path; Path('C:/description-secrets/endpoint.token').write_text(secrets.token_hex(32), encoding='ascii')"
@@ -81,6 +81,9 @@ Save `C:\description-state\endpoint.json`:
   "token_file": "C:/description-secrets/endpoint.token",
   "host": "127.0.0.1",
   "port": 8765,
+  "discovery": {
+    "record_roots": ["C:/cad-records"]
+  },
   "targets": {
     "arm": {
       "repository": "C:/description-models/arm",
@@ -91,9 +94,18 @@ Save `C:\description-state\endpoint.json`:
 ```
 
 Replace `arm` with the CAD's `dp.hardware_id` and configure its model base.
-The endpoint rejects unconfigured hardware. Optional `discovery.record_roots`
-identify controlled specification directories; `discovery.frozen_names_file`
-validates approved interface names. Neither setting is an operator input.
+The endpoint rejects unconfigured hardware. Configure `discovery.record_roots`
+for the controlled specification library, for example `["C:/cad-records"]`.
+Populate the library with approved records before admitting jobs.
+CAD references include the approved record version, such as
+`arm/r2/budget.json#robot`, resolved as `C:/cad-records/arm/r2/budget.json`.
+Keep versions immutable and available together; do not replace a shared file
+between runs. Use real directories and files, without symbolic links or junctions.
+Each reference must match one file across the configured roots;
+duplicate matches block discovery even when their bytes agree. Files included
+with an operator's handoff are archived, but do not supply this authority.
+Optional `discovery.frozen_names_file` validates approved interface names.
+Neither setting is an operator input.
 
 Start the endpoint in the logged-in desktop:
 

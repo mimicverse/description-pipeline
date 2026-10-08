@@ -11,7 +11,8 @@ Release 1.0 has one operator workflow: **SolidWorks folder → Airflow → verif
 ## 2. How the system works
 
 SolidWorks defines geometry, assembly relationships, motion and datums. Versioned
-component records supply physical and drive specifications referenced by CAD.
+component records in the platform's controlled library supply physical and drive
+specifications. CAD references identify their approved versions.
 Each fact has one effective definition and a recorded source; conflicting or
 ambiguous definitions stop derivation. Mechanical engineers maintain these inputs;
 the pipeline generates definitions, models, meshes and reports.

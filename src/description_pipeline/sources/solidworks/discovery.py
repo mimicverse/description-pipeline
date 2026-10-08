@@ -58,7 +58,7 @@ from collections.abc import Mapping, Sequence
 
 import yaml
 
-from ...io import PipelineError, confined, digest, inventory, read_data
+from ...io import PipelineError, confined, digest, inventory, parse_data
 from .jsonio import write_json
 from .errors import CadError
 from .revision import package_inventory, seal_revision
@@ -775,64 +775,79 @@ def _clusters(record: dict, findings: list[dict]) -> _Clusters:
 
 def _resolve_record(settings: DiscoverySettings, reference: str, findings: list[dict], obj: str) -> dict | None:
     relative, _, key = str(reference).partition("#")
-    for root in settings.record_roots:
+    matches: dict[Path, tuple[Path, int]] = {}
+    for index, root in enumerate(settings.record_roots):
         try:
             path = confined(Path(root), relative)
         except PipelineError:
             continue
-        if not path.is_file():
-            continue
-        try:
-            data = read_data(path)
-            json.dumps(data, allow_nan=False)
-        except PipelineError as error:
-            findings.append(_finding("discovery.record_unreadable", obj, str(error), {"file": relative}))
-            return None
-        except (TypeError, ValueError):
-            findings.append(
-                _finding(
-                    "discovery.record_unreadable",
-                    obj,
-                    "controlled evidence contains a nonfinite or non-JSON value",
-                    {"file": relative},
-                )
+        matches.setdefault(path.resolve(), (path, index))
+    if not matches:
+        findings.append(
+            _finding(
+                "discovery.record_missing", obj, "referenced controlled record was not found", {"reference": reference}
             )
-            return None
-        node: Any = data
-        for part in [piece for piece in key.split(".") if piece]:
-            if not isinstance(node, dict) or part not in node:
-                findings.append(
-                    _finding(
-                        "discovery.record_key_missing",
-                        obj,
-                        "record reference has no such key",
-                        {"file": relative, "key": key},
-                    )
-                )
-                return None
-            node = node[part]
-        if not isinstance(node, dict):
-            findings.append(
-                _finding(
-                    "discovery.record_shape", obj, "record entry must be an object", {"file": relative, "key": key}
-                )
-            )
-            return None
-        return {
-            "reference": str(reference),
-            "file": relative.replace("\\", "/"),
-            "path": str(path),
-            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            "key": key,
-            "value": node,
-            "text": path.read_text(encoding="utf-8", errors="replace"),
-        }
-    findings.append(
-        _finding(
-            "discovery.record_missing", obj, "referenced controlled record was not found", {"reference": reference}
         )
-    )
-    return None
+        return None
+    if len(matches) > 1:
+        findings.append(
+            _finding(
+                "discovery.record_ambiguous",
+                obj,
+                "controlled reference matches more than one specification file",
+                {
+                    "reference": reference,
+                    "candidates": [{"root_index": index, "file": relative} for _path, index in matches.values()],
+                },
+            )
+        )
+        return None
+    path, _index = next(iter(matches.values()))
+    try:
+        content = path.read_bytes()
+        data = parse_data(content, path)
+        json.dumps(data, allow_nan=False)
+    except (PipelineError, OSError) as error:
+        findings.append(_finding("discovery.record_unreadable", obj, str(error), {"file": relative}))
+        return None
+    except (TypeError, ValueError):
+        findings.append(
+            _finding(
+                "discovery.record_unreadable",
+                obj,
+                "controlled evidence contains a nonfinite or non-JSON value",
+                {"file": relative},
+            )
+        )
+        return None
+    node: Any = data
+    for part in [piece for piece in key.split(".") if piece]:
+        if not isinstance(node, dict) or part not in node:
+            findings.append(
+                _finding(
+                    "discovery.record_key_missing",
+                    obj,
+                    "record reference has no such key",
+                    {"file": relative, "key": key},
+                )
+            )
+            return None
+        node = node[part]
+    if not isinstance(node, dict):
+        findings.append(
+            _finding("discovery.record_shape", obj, "record entry must be an object", {"file": relative, "key": key})
+        )
+        return None
+    return {
+        "reference": str(reference),
+        "file": relative.replace("\\", "/"),
+        "path": str(path),
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "key": key,
+        "value": node,
+        "text": content.decode("utf-8-sig"),
+        "content": content,
+    }
 
 
 def _datum(record: dict, name: str | None, owners: Sequence[str]) -> dict | None:
@@ -1939,8 +1954,11 @@ def _embed_record(output: Path, resolved: dict, records: list[dict]) -> dict:
 
     relative = str(resolved["file"]).replace("\\", "/")
     for existing in records:
-        if existing["file"] == relative and existing["key"] == str(resolved.get("key") or ""):
-            return existing
+        if existing["file"] == relative:
+            if existing["source_sha256"] != resolved["sha256"]:
+                raise PipelineError(f"controlled record {relative!r} changed between references")
+            if existing["key"] == str(resolved.get("key") or ""):
+                return existing
     source = resolved.get("path")
     if not source:
         raise PipelineError(f"controlled record {relative!r} was not resolved from a record root")
@@ -1949,13 +1967,16 @@ def _embed_record(output: Path, resolved: dict, records: list[dict]) -> dict:
     target = confined(output, target_name, exists=False)
     target.parent.mkdir(parents=True, exist_ok=True)
     if not target.exists():
-        shutil.copyfile(source, target)
+        target.write_bytes(resolved["content"])
+    checksum = hashlib.sha256(target.read_bytes()).hexdigest()
+    if checksum != resolved["sha256"]:
+        raise PipelineError(f"embedded controlled record {relative!r} differs from its captured bytes")
     entry = {
         "reference": str(resolved.get("reference") or relative),
         "file": relative,
         "key": str(resolved.get("key") or ""),
         "package_file": target_name,
-        "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+        "sha256": checksum,
         "source_sha256": str(resolved["sha256"]),
         "anchor": _anchor_for(target.read_text(encoding="utf-8", errors="replace"), resolved),
     }
