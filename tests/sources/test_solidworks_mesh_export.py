@@ -96,6 +96,7 @@ def _backend(component, name="pcb-1") -> SolidWorksBackend:
     backend._sessions["source"] = SimpleNamespace(
         app=SimpleNamespace(GetOpenDocumentByName=lambda _path: doc),
         process=SimpleNamespace(alive=lambda: True),
+        closed=False,
     )
     session = backend._sessions["source"]
     session.current_application = lambda: session.app

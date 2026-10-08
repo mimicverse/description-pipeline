@@ -411,6 +411,7 @@ class _Session:
     def __init__(self, app):
         self.app = app
         self.process = types.SimpleNamespace(alive=lambda: True)
+        self.closed = False
 
     def connect(self, _cancelled):
         return self.app
@@ -419,6 +420,8 @@ class _Session:
         return self.app
 
     def close(self):
+        self.closed = True
+        self.app = None
         return None
 
     def identity(self):

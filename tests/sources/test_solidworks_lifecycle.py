@@ -469,7 +469,9 @@ class SessionTests(unittest.TestCase):
         sessions = []
 
         def factory():
-            session = SimpleNamespace(app=object(), connect=Mock(), close=Mock(), terminate=Mock())
+            session = SimpleNamespace(app=object(), connect=Mock(), close=Mock(), terminate=Mock(), closed=False)
+            session.close.side_effect = lambda: setattr(session, "closed", True)
+            session.identity = lambda: {"ownership": "test"}
             session.connect.return_value = session.app
             session.current_application = lambda: session.app
             sessions.append(session)
@@ -485,9 +487,11 @@ class SessionTests(unittest.TestCase):
             copied = backend._app_for_path(os.path.join(copy_root, "robot.SLDASM"))
             self.assertIsNot(source, copied)
             with backend.session():
-                self.assertIs(backend._app_for_path("/source/robot.SLDASM"), source)
+                with self.assertRaises(EnvironmentError_) as retired:
+                    backend._app_for_path("/source/robot.SLDASM")
+                self.assertEqual(retired.exception.code, "cad_session_retired")
             raise RuntimeError("failed")
         self.assertEqual(len(sessions), 2)
-        for session in sessions:
-            session.close.assert_called_once()
+        sessions[0].close.assert_called_once()
+        sessions[1].close.assert_called_once()
         self.assertEqual(backend._sessions, {})

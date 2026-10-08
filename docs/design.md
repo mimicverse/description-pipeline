@@ -101,8 +101,11 @@ confirmation, evidence and affected object; unsupported or unexecuted checks
 remain explicit.
 
 Each owned Windows process must complete SolidWorks startup, including add-ins,
-before native reads begin. Application interfaces are reacquired at document
-boundaries within that process. A lost process or binding stops capture.
+before native reads begin. After collecting the dependency graph and copying
+saved files, the worker closes the source process before starting the copy
+process. The retired source cannot reopen; its initial observations and process
+identity remain in the evidence. Application interfaces are reacquired at
+document boundaries within the live copy. A lost process or binding stops capture.
 
 Feishu supplies the signed-in identity and profile. The platform restricts
 access to its approved tenant and assigns operator and administrator permissions.

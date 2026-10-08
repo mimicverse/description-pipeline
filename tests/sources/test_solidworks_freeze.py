@@ -612,19 +612,18 @@ class FreezeTests(unittest.TestCase):
         self.assertIsInstance(detail, dict)
         self.assertEqual(detail["name"], "arm.sldprt")  # type: ignore[index]
 
-    def test_configuration_changing_while_capturing_blocks_freeze(self) -> None:
+    def test_original_configuration_is_initial_evidence_not_current_state(self) -> None:
         backend, config = self._two_component_backend()
         # the bytes on disk never move: only the session's active configuration
         # does, after the readings have been taken
         backend.drift_configuration_after_reading = True
 
-        with self.assertRaises(BridgeError) as raised:
-            freeze(config, self.destination, backend=backend)
-
-        self.assertEqual(raised.exception.code, "cad_source_changed")
-        drift = raised.exception.detail["state_drift"]  # type: ignore[index]
-        self.assertEqual(drift[0]["before"]["active_configuration"], "Default")
-        self.assertEqual(drift[0]["after"]["active_configuration"], "Other")
+        freeze(config, self.destination, backend=backend)
+        closure = json.loads((self.destination / "raw" / "dependency_closure.json").read_text(encoding="utf-8"))
+        self.assertEqual(closure["original_states"][str(self.assembly)]["active_configuration"], "Default")
+        collection = json.loads((self.destination / "evidence" / "collection.json").read_text(encoding="utf-8"))
+        self.assertEqual(collection["capture"]["originals_unchanged"]["state_scope"], "initial_source_observation")
+        self.assertEqual(collection["capture"]["originals_unchanged"]["files_checked"], 3)
 
     def test_unknown_dependency_state_cannot_prove_a_saved_source(self) -> None:
         for field in ("saved", "active_configuration"):
@@ -646,7 +645,7 @@ class FreezeTests(unittest.TestCase):
                 self.assertEqual(raised.exception.code, "cad_document_state_unreadable")
                 self.assertEqual(backend.collected, [])
 
-    def test_state_reader_disappearing_after_capture_is_rejected(self) -> None:
+    def test_original_state_is_not_reread_after_copy_capture(self) -> None:
         backend, config = self._two_component_backend()
         collect = backend.collect_scene
 
@@ -655,9 +654,11 @@ class FreezeTests(unittest.TestCase):
             backend.document_state = None  # type: ignore[assignment,method-assign]
             return scene
 
-        with patch.object(backend, "collect_scene", side_effect=captured), self.assertRaises(BridgeError) as raised:
+        with patch.object(backend, "collect_scene", side_effect=captured):
             freeze(config, self.destination, backend=backend)
-        self.assertEqual(raised.exception.code, "cad_source_changed")
+        self.assertTrue(self.destination.exists())
+        closure = json.loads((self.destination / "raw" / "dependency_closure.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(closure["original_states"]), 3)
 
     def test_non_instance_dependency_is_checked_for_its_save_flag(self) -> None:
         backend, config = self._two_component_backend()

@@ -140,8 +140,11 @@ class CadSession:
         self.startup_timeout = startup_timeout
         self.app = None
         self._owner_thread = None
+        self.closed = False
 
     def connect(self, cancelled: threading.Event):
+        if self.closed:
+            raise EnvironmentError_("cad_session_retired", "A closed CAD session cannot reconnect", self.identity())
         self._owner_thread = threading.current_thread()
         deadline = time.monotonic() + self.startup_timeout
         app = None
@@ -206,13 +209,21 @@ class CadSession:
         return app
 
     def identity(self) -> dict:
-        return {"pid": self.process.pid, "executable": self.process.executable, "ownership": "windows_job"}
+        return {
+            "pid": self.process.pid,
+            "executable": self.process.executable,
+            "ownership": "windows_job",
+            "state": "closed" if self.closed else "active",
+        }
 
     def terminate(self) -> None:
         # Safe from a watchdog thread: no COM reference is touched here.
         self.process.close()
 
     def close(self) -> None:
+        if self.closed:
+            return
         self.app = None
         self._owner_thread = None
         self.terminate()
+        self.closed = True

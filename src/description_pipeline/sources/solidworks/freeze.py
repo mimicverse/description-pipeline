@@ -1285,21 +1285,16 @@ def _capture_readings(
     return scene, raw
 
 
-def _verify_originals_unchanged(backend: Any, closure: dict[str, Any]) -> dict[str, Any]:
-    """Re-check the working-tree documents the snapshot was collected from.
+def _verify_originals_unchanged(closure: dict[str, Any]) -> dict[str, Any]:
+    """Rehash saved inputs without reopening the retired source application.
 
-    The readings come from the copy, so the working tree still has to hold the bytes
-    the copy was made from: the file digests catch a source written while the capture
-    ran, and the per-document active configuration catches a document that was
-    switched to another configuration while we read it.  ``GetSaveFlag`` is recorded
-    but never compared - it answers "would SolidWorks prompt to save?", which many
-    operations set and which says nothing about the revision on disk.
+    Original configuration/save observations describe the initial source session,
+    not current state. The disk revision supplied the copy; all live configuration
+    and occurrence guards apply to that copy, which supplies the measurements.
     """
 
     recorded = dict(closure.get("original_files") or {})
-    states = dict(closure.get("original_states") or {})
     changed: list[dict[str, Any]] = []
-    drifted: list[dict[str, Any]] = []
     for path, digest in recorded.items():
         try:
             current = sha256_file(Path(path))
@@ -1307,26 +1302,18 @@ def _verify_originals_unchanged(backend: Any, closure: dict[str, Any]) -> dict[s
             current = ""
         if current != digest:
             changed.append({"path": path, "before": digest, "after": current or None})
-    checked_states = 0
-    for path, before in states.items():
-        checked_states += 1
-        try:
-            state = _document_state(backend, {"assembly": path})
-        except Exception as exc:  # noqa: BLE001 - unreadable after the fact is a change
-            drifted.append({"path": path, "problem": "unreadable", "error": f"{type(exc).__name__}: {exc}"})
-            continue
-        after = {"active_configuration": state["active_configuration"]}
-        expected = {"active_configuration": before["active_configuration"]}
-        if after != expected:
-            drifted.append({"path": path, "before": expected, "after": after})
-    if changed or drifted:
+    if changed:
         raise BridgeError(
             "cad_source_changed",
             "a working-tree document changed while the snapshot was being captured",
-            {"changed": changed[:20], "state_drift": drifted[:20], "count": len(changed) + len(drifted)},
+            {"changed": changed[:20], "count": len(changed)},
             exit_code=3,
         )
-    return {"files_checked": len(recorded), "states_checked": checked_states}
+    return {
+        "files_checked": len(recorded),
+        "states_recorded": len(closure.get("original_states") or {}),
+        "state_scope": "initial_source_observation",
+    }
 
 
 def _capture_axis_references(backend: Any, cfg: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1458,7 +1445,7 @@ def _freeze_local(
 
         stage = "dependency_closure"
         closure = _dependency_closure(backend, cfg, staging / "source")
-        # Both owned CAD sessions now exist. Persist their identities before
+        # The source is retired and the copy is active. Persist their identities before
         # native reads so a failed geometry capture retains its environment.
         stage = "environment"
         environment = capture_environment(backend, worker_version)
@@ -1495,10 +1482,9 @@ def _freeze_local(
             write_json(staging / "raw" / "geometry.json", geometry_entries)
 
         stage = "verify_sources"
-        # The readings came from the copy; both the reading session and the working tree
-        # still have to hold what they held when the copy was made.
+        # Verify the live copy state and saved original bytes independently.
         backend.verify_sources_unchanged()
-        originals = _verify_originals_unchanged(backend, closure)
+        originals = _verify_originals_unchanged(closure)
         copied = _copy_inventory(staging / "source")
         if copied != closure["copy_files"]:
             changed = sorted(

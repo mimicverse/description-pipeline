@@ -795,14 +795,30 @@ class SolidWorksBackend(CadBackend):
         self.save_flags: dict[str, bool] = {}
 
     def _app_obj(self):
-        role = getattr(self._local, "role", "source")
         with self._sessions_lock:
             current = threading.current_thread()
             if self._owner_thread is not None and self._owner_thread is not current:
                 raise EnvironmentError_("cad_thread_mismatch", "CAD proxies must stay on their owning STA thread")
             self._owner_thread = current
+            if self._cancelled.is_set():
+                raise EnvironmentError_("cad_session_cancelled", "Capture was cancelled")
+            role = getattr(self._local, "role", "copy" if "copy" in self._sessions else "source")
             session = self._sessions.get(role)
+            source = self._sessions.get("source")
+        if session is not None and session.closed:
+            raise EnvironmentError_(
+                "cad_session_retired", "The selected CAD session has been retired", session.identity()
+            )
         if session is None:
+            # The source has supplied its primitives and saved file bytes. Only
+            # the collected copy needs live CAD now; retain the closed source's
+            # identity, but never keep its process running or revive it.
+            if role == "copy" and source is not None and not source.closed:
+                try:
+                    source.close()
+                except BaseException:
+                    self._cancelled.set()
+                    raise
             from .isolation import CadSession
 
             session = (self._session_factory or CadSession)()
@@ -829,12 +845,15 @@ class SolidWorksBackend(CadBackend):
         return "copy" if any(normalized.startswith(root + "\\") for root in self._capture_roots) else "source"
 
     def _app_for_path(self, path):
-        previous = getattr(self._local, "role", "source")
+        previous = getattr(self._local, "role", None)
         self._local.role = self._role_for_path(path)
         try:
             return self._app_obj()
         finally:
-            self._local.role = previous
+            if previous is None:
+                del self._local.role
+            else:
+                self._local.role = previous
 
     @contextmanager
     def session(self):
@@ -874,6 +893,8 @@ class SolidWorksBackend(CadBackend):
             sessions = list(self._sessions.values())
         terminated, errors = [], []
         for session in sessions:
+            if session.closed:
+                continue
             try:
                 session.terminate()
                 terminated.append(session.identity())
@@ -895,6 +916,8 @@ class SolidWorksBackend(CadBackend):
             self._owner_thread = None
         errors = []
         for session in sessions:
+            if session.closed:
+                continue
             try:
                 session.close()
             except Exception as error:
@@ -2009,8 +2032,8 @@ class SolidWorksBackend(CadBackend):
         """Copy saved native files and rewrite references in a second application.
 
         ReplaceReferencedDocument requires unopened copies with the original
-        internal IDs. Copy bytes first, rewrite every direct reference, then let
-        freeze independently reopen and compare the entire assembly.
+        internal IDs. Copy bytes, retire the source, rewrite every direct
+        reference in a fresh application, then independently inspect the copy.
         """
         source_path = str(Path(path).resolve())
         source_app = self._app_for_path(source_path)
@@ -2064,6 +2087,7 @@ class SolidWorksBackend(CadBackend):
         self._requested_configurations[normalize_document_path(top)] = self._requested_configurations.get(
             normalize_document_path(source_path), ""
         )
+        del source_app
         copy_app = self._app_for_path(top)
         replaced = 0
         for document, references in graph.items():

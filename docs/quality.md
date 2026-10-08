@@ -66,6 +66,9 @@ Native capture rebuilds the collected read-only assembly in its owned session
 before measurements. This refreshes assembly caches, including mass properties;
 it never saves over CAD. The snapshot records the rebuild and verifies both
 original and collected file hashes after capture. A failed rebuild blocks export.
+Original configuration and save-state observations are initial evidence;
+the retired source is not reread. Live configuration, occurrence and geometry
+guards apply to the collected copy that supplies all measurements.
 
 Datums and mass are read in each occurrence's exact referenced configuration.
 Temporary document selections are restored and verified. Meshes use the
