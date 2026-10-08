@@ -480,57 +480,59 @@ class ReturnViewRegistryTests(unittest.TestCase):
                 stubs.generic.QueryInterface.assert_called_once_with(native.IFEATURE_IID, "IDispatch")
                 self.assertIs(view, stubs.view)
 
-    def test_entity_view_selects_face_or_edge_by_interface_presence(self):
-        class _ComError(Exception):
-            def __init__(self, hresult):
-                super().__init__(f"HRESULT {hresult}")
-                self.hresult = hresult
+    def test_mate_entity_reference_is_a_documented_multi_type_exemption(self):
+        source = pathlib.Path(native.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("_entity_view", source)
+        self.assertNotIn("E_NOINTERFACE", source)
+        self.assertIn("EXEMPT (untyped multi-type return): IMateEntity2.Reference", source)
+        self.assertIn('target = _member(entity, "Reference")', source)
+        self.assertIsNone(native.RETURN_VIEWS.get("Reference"))
+        self.assertNotIn("Reference", native.RETURN_ARRAY_VIEWS)
+        tree = ast.parse(source)
+        guarded = False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            raises_cad = any(
+                isinstance(stmt, ast.Raise)
+                and isinstance(stmt.exc, ast.Call)
+                and getattr(stmt.exc.func, "id", "") == "CadError"
+                for handler in node.handlers
+                for stmt in handler.body
+            )
+            reads_reference = any(
+                isinstance(item, ast.Call)
+                and isinstance(item.func, ast.Name)
+                and item.func.id == "_member"
+                and len(item.args) > 1
+                and isinstance(item.args[0], ast.Name)
+                and item.args[0].id == "entity"
+                and isinstance(item.args[1], ast.Constant)
+                and item.args[1].value == "Reference"
+                for item in ast.walk(node)
+            )
+            if raises_cad and reads_reference:
+                guarded = True
+                break
+        self.assertTrue(guarded, "the Reference read must fail closed as cad_mate_unreadable")
 
+    def test_reference_read_returns_a_generic_dispatch_without_a_geometry_qi(self):
         stubs = _InterfaceModules()
-        raw = stubs.raw()
+        raw_reference = types.SimpleNamespace(_oleobj_=stubs.generic)
+        entity = types.SimpleNamespace(Reference=raw_reference)
         with patch.dict(sys.modules, stubs.modules):
-            self.assertIs(native._entity_view(raw), stubs.view)
-        stubs.generic.QueryInterface.assert_called_once_with(native.IFACE2_IID, "IDispatch")
+            target = native._member(entity, "Reference")
+        stubs.generic.QueryInterface.assert_not_called()
+        stubs.dynamic.DumbDispatch.assert_called_once_with(stubs.generic)
+        self.assertIs(target, stubs.view)
 
-        stubs = _InterfaceModules()
-        raw = stubs.raw()
-        stubs.generic.QueryInterface.side_effect = [_ComError(native.E_NOINTERFACE), stubs.vendor]
+        feature_ole = Mock()
+        feature_ole.QueryInterface.return_value = "feature-view"
+        stubs.view.GetFeature = Mock(spec=lambda: None, return_value=types.SimpleNamespace(_oleobj_=feature_ole))
         with patch.dict(sys.modules, stubs.modules):
-            self.assertIs(native._entity_view(raw), stubs.view)
-        self.assertEqual(
-            [call.args[0] for call in stubs.generic.QueryInterface.call_args_list],
-            [native.IFACE2_IID, native.IEDGE_IID],
-        )
-
-        stubs = _InterfaceModules()
-        raw = stubs.raw()
-        stubs.generic.QueryInterface.side_effect = [
-            _ComError(native.E_NOINTERFACE),
-            _ComError(native.E_NOINTERFACE),
-            stubs.vendor,
-        ]
-        with patch.dict(sys.modules, stubs.modules):
-            self.assertIs(native._entity_view(raw), stubs.view)
-        self.assertEqual(
-            [call.args[0] for call in stubs.generic.QueryInterface.call_args_list],
-            [native.IFACE2_IID, native.IEDGE_IID, native.IVERTEX_IID],
-        )
-
-        stubs = _InterfaceModules()
-        raw = stubs.raw()
-        rpc = _ComError(-2147023170)
-        stubs.generic.QueryInterface.side_effect = [_ComError(native.E_NOINTERFACE), rpc]
-        with patch.dict(sys.modules, stubs.modules), self.assertRaises(_ComError) as caught:
-            native._entity_view(raw)
-        self.assertIs(caught.exception, rpc)
-
-        stubs = _InterfaceModules()
-        raw = stubs.raw()
-        failure = _ComError(-2147023170)  # RPC failure, not a missing interface
-        stubs.generic.QueryInterface.side_effect = failure
-        with patch.dict(sys.modules, stubs.modules), self.assertRaises(_ComError) as caught:
-            native._entity_view(raw)
-        self.assertIs(caught.exception, failure)
+            feature = native._member(target, "GetFeature")
+        feature_ole.QueryInterface.assert_called_once_with(native.IFEATURE_IID, "IDispatch")
+        self.assertIs(feature, stubs.view)
 
     def test_mass_readers_capture_configuration_before_stateful_calls(self):
         tree = ast.parse(pathlib.Path(native.__file__).read_text(encoding="utf-8"))

@@ -41,12 +41,9 @@ IMATE2_IID = "{B09D234A-7581-408E-B3B3-FC0A514AAFA8}"
 IMATEENTITY2_IID = "{CE7FE69D-BCFA-441F-A37D-E740546458A4}"
 IBODY2_IID = "{3A075BFD-9962-4431-8321-7AF4903C55AD}"
 IFACE2_IID = "{4A8BA4D8-DA25-4B75-8E2D-4922B74D81ED}"
-IEDGE_IID = "{83A33D42-27C5-11CE-BFD4-00400513BB57}"
-IVERTEX_IID = "{83A33D63-27C5-11CE-BFD4-00400513BB57}"
 ISURFACE_IID = "{83A33D40-27C5-11CE-BFD4-00400513BB57}"
 ICURVE_IID = "{83A33D44-27C5-11CE-BFD4-00400513BB57}"
 IMATHTRANSFORM_IID = "{F7D97F82-162E-11D4-AEAB-00C04FA0AC51}"
-E_NOINTERFACE = -2147467262  # 0x80004002
 
 # Members whose declared return is one published interface of the installed
 # SolidWorks type library. Bound inside the adapter so no caller can keep a
@@ -177,24 +174,6 @@ def _return_view(name, value):
     if element_iid is not None and isinstance(value, (tuple, list)):
         return [_interface(item, element_iid) for item in value]
     return None
-
-
-def _entity_view(value):
-    """Bind a multi-type entity reference to IFace2, IEdge or IVertex by interface presence."""
-
-    if not hasattr(value, "_oleobj_"):
-        return value
-    try:
-        return _interface(value, IFACE2_IID)
-    except Exception as error:  # noqa: BLE001 - only a missing interface selects the next view
-        if getattr(error, "hresult", None) != E_NOINTERFACE:
-            raise
-    try:
-        return _interface(value, IEDGE_IID)
-    except Exception as error:  # noqa: BLE001
-        if getattr(error, "hresult", None) != E_NOINTERFACE:
-            raise
-        return _interface(value, IVERTEX_IID)
 
 
 def _part_bodies(doc, body_type=0):
@@ -2567,13 +2546,18 @@ class SolidWorksBackend(CadBackend):
                             reference = _component(_member(entity, "ReferenceComponent"))
                             reference_name = str(_member(reference, "Name2") or "")
                             reference_path = _relative_document(_method(reference, "GetPathName"), source_root)
+                            # EXEMPT (untyped multi-type return): IMateEntity2.Reference
+                            # is a VT_DISPATCH spanning multiple native geometry kinds
+                            # with no single declared view, so the generic dispatch
+                            # stays and the unambiguous GetFeature/GetSurface/GetCurve
+                            # returns are bound to their own published interfaces.
+                            target = _member(entity, "Reference")
                         except Exception as error:  # noqa: BLE001
                             raise CadError(
                                 "cad_mate_unreadable",
                                 "a mate entity could not be read",
                                 {"mate": name, "error": str(error)},
                             ) from error
-                        target = _entity_view(_member(entity, "Reference"))
                         entities.append(
                             {
                                 "reference_name": reference_name,
