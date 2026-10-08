@@ -59,6 +59,29 @@ airflow_lifecycle() {
     bash "$AIRFLOW_HERE/services.sh" "$1"
 }
 
+open_admission() {
+  local deadline=$((SECONDS + 60))
+  # Unpause alone silently succeeds before the DAG is registered. Confirm its
+  # persisted state before exposing ingress, including on a fresh installation.
+  while ((SECONDS < deadline)); do
+    AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/airflow" dags unpause solidworks_to_urdf >/dev/null
+    if AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" - <<'PY'
+import sys
+from airflow.models.dag import DagModel
+from airflow.utils.session import create_session
+
+with create_session() as session:
+    dag = session.get(DagModel, "solidworks_to_urdf")
+    sys.exit(0 if dag is not None and dag.is_paused is False else 1)
+PY
+    then
+      return
+    fi
+    sleep 2
+  done
+  die "DAG admission did not open; ingress was not started"
+}
+
 load_installed() {
   OPERATOR_STATE_DIR="$(sed -n 's/^OPERATOR_STATE=//p' "$ENV_FILE" | head -1)"
   [ -n "$OPERATOR_STATE_DIR" ] || die "OPERATOR_STATE is not set in $ENV_FILE"
@@ -174,13 +197,17 @@ case "$ACTION" in
     load_installed
     drift_check || die "configuration drift detected; run install before start"
     airflow_lifecycle start
+    open_admission
     systemctl --user enable --now description-portal.service description-operator-proxy.service
     ;;
   stop)
     load_installed
     drift_check || true
     systemctl --user disable --now description-operator-proxy.service description-portal.service || true
+    ADMISSION_RC=0
+    AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/airflow" dags pause solidworks_to_urdf || ADMISSION_RC=$?
     airflow_lifecycle stop
+    exit "$ADMISSION_RC"
     ;;
   status)
     load_installed

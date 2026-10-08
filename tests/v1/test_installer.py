@@ -207,6 +207,43 @@ class InstallGuardsTest(unittest.TestCase):
         base.update(env)
         return run(["bash", str(DEPLOY / "install.sh")], base)
 
+    def test_reinstall_preserves_open_and_closed_admission(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bindir = root / "venv/bin"
+            bindir.mkdir(parents=True)
+            wheel = root / "wheels/mimicverse_description-1.0.1-py3-none-any.whl"
+            wheel.parent.mkdir()
+            wheel.write_bytes(b"fixture")
+            python = bindir / "python"
+            python.write_text('#!/bin/bash\n[ "${1:-}" != "-c" ] || echo 3.12\nexit 0\n')
+            python.chmod(0o755)
+            airflow = bindir / "airflow"
+            airflow.write_text(
+                '#!/bin/bash\necho "$*" >> "$CALLS"\n'
+                'case "$*" in\n'
+                '  "db migrate") ;;\n'
+                '  "dags unpause solidworks_to_urdf") echo false > "$ADMISSION" ;;\n'
+                '  "version") echo 3.3.2 ;;\n'
+                "  *) exit 1 ;;\n"
+                "esac\n"
+            )
+            airflow.chmod(0o755)
+            admission, calls = root / "admission", root / "calls"
+            for initial in ("true", "false"):
+                with self.subTest(initial=initial):
+                    admission.write_text(initial)
+                    result = self._install(
+                        tmp,
+                        AIRFLOW_PYTHON=str(python),
+                        PIPELINE_WHEEL=str(wheel),
+                        ADMISSION=str(admission),
+                        CALLS=str(calls),
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(admission.read_text(), initial)
+            self.assertEqual(calls.read_text().splitlines(), ["db migrate", "version"] * 2)
+
     def test_rejects_relative_forbidden_and_missing_wheel(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             relative = self._install(tmp, AIRFLOW_VENV="relative/venv")

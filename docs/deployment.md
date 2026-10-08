@@ -192,8 +192,11 @@ managed database before migration; `start` launches the remaining services.
 Installation creates the sole `solidworks_windows` Connection with the endpoint
 token and Linux source allowlist. Operators need no Connection or DAG setup.
 
-Only `install` writes configuration, secrets or service units. Start and health
-check installed configuration for drift. Reinstall after a configuration change;
+`install` writes configuration, secrets and service units while preserving the
+DAG's admission state. `start` opens and verifies DAG admission before starting
+the operator page and HTTPS proxy; `stop` closes ingress and pauses the DAG before
+stopping the core services. Start and health check installed configuration for
+drift. Reinstall after a configuration change;
 existing signing and encryption keys are preserved. For services to survive a
 Linux user logout, the host administrator runs the following command with the
 actual service account:

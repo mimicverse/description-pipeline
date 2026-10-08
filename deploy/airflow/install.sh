@@ -60,6 +60,5 @@ AIRFLOW_DB_URL="$AIRFLOW_DB_URL" "$AIRFLOW_VENV/bin/python" "$HERE/render_config
   --template "$HERE/airflow.cfg.template" --dags-folder "$HERE/dags"
 
 AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/airflow" db migrate
-AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/airflow" dags unpause solidworks_to_urdf >/dev/null
-echo "Airflow ready: $("$AIRFLOW_VENV/bin/airflow" version), home=$AIRFLOW_HOME"
-echo "Next: deploy/airflow/services.sh install && deploy/airflow/services.sh start"
+# Installation preserves admission state. Only operatorctl start opens the DAG.
+echo "Airflow installed: $("$AIRFLOW_VENV/bin/airflow" version), home=$AIRFLOW_HOME"

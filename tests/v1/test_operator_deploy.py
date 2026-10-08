@@ -325,6 +325,89 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(airflow.returncode, 0, airflow.stderr)
         return state, config_home, target
 
+    def _admission_fixture(self, tmp: Path, *, register_after: int = 0, unpause_rc: int = 0, pause_rc: int = 0):
+        _, config_home, _ = self._render_units(tmp)
+        bindir = tmp / "bin"
+        bindir.mkdir()
+        write_stub(bindir / "systemctl", '#!/bin/bash\necho "systemctl $*" >> "$ORDER_LOG"\n')
+        write_stub(bindir / "sleep", "#!/bin/bash\nexit 0\n")
+        venv = tmp / "venv/bin"
+        venv.mkdir(parents=True)
+        write_stub(
+            venv / "airflow",
+            '#!/bin/bash\necho "airflow $*" >> "$ORDER_LOG"\n'
+            'count=$(cat "$REGISTER_COUNT" 2>/dev/null || echo 0)\n'
+            'case "$*" in\n'
+            '  "dags unpause solidworks_to_urdf")\n'
+            '    [ "$UNPAUSE_RC" = "0" ] || exit "$UNPAUSE_RC"\n'
+            '    if [ "$count" -ge "$REGISTER_AFTER" ]; then echo false > "$ADMISSION"; fi ;;\n'
+            '  "dags pause solidworks_to_urdf")\n'
+            '    [ "$PAUSE_RC" = "0" ] || exit "$PAUSE_RC"\n'
+            '    echo true > "$ADMISSION" ;;\n'
+            "  *) exit 1 ;;\n"
+            "esac\n",
+        )
+        write_stub(
+            venv / "python",
+            '#!/bin/bash\necho "airflow admission check" >> "$ORDER_LOG"\n'
+            'count=$(cat "$REGISTER_COUNT" 2>/dev/null || echo 0)\n'
+            'if [ "$count" -lt "$REGISTER_AFTER" ]; then\n'
+            '  echo $((count + 1)) > "$REGISTER_COUNT"; exit 1\n'
+            'fi\n[ "$(cat "$ADMISSION")" = "false" ]\n',
+        )
+        admission, order = tmp / "admission", tmp / "order.log"
+        admission.write_text("true")
+        env = {
+            "PATH": f"{bindir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+            "XDG_CONFIG_HOME": str(config_home),
+            "ORDER_LOG": str(order),
+            "ADMISSION": str(admission),
+            "REGISTER_COUNT": str(tmp / "register-count"),
+            "REGISTER_AFTER": str(register_after),
+            "UNPAUSE_RC": str(unpause_rc),
+            "PAUSE_RC": str(pause_rc),
+        }
+        return tmp / "operator.env", env, admission, order
+
+    def test_start_opens_verified_admission_before_ingress(self) -> None:
+        for register_after in (0, 1):
+            with self.subTest(register_after=register_after), tempfile.TemporaryDirectory() as tmp:
+                env_file, env, admission, order = self._admission_fixture(Path(tmp), register_after=register_after)
+                result = run(["bash", str(CONTROL), "start", "--env-file", str(env_file)], env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(admission.read_text().strip(), "false")
+                lines = order.read_text().splitlines()
+                ingress = lines.index(
+                    "systemctl --user enable --now description-portal.service description-operator-proxy.service"
+                )
+                self.assertLess(max(i for i, line in enumerate(lines) if line == "airflow admission check"), ingress)
+                self.assertEqual(lines.count("airflow dags unpause solidworks_to_urdf"), register_after + 1)
+
+    def test_unpause_failure_does_not_start_ingress(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file, env, admission, order = self._admission_fixture(Path(tmp), unpause_rc=7)
+            result = run(["bash", str(CONTROL), "start", "--env-file", str(env_file)], env)
+            self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+            self.assertEqual(admission.read_text(), "true")
+            self.assertNotIn("description-portal.service", order.read_text())
+            self.assertNotIn("description-operator-proxy.service", order.read_text())
+
+    def test_stop_closes_ingress_and_stops_services_even_when_pause_fails(self) -> None:
+        for pause_rc in (0, 9):
+            with self.subTest(pause_rc=pause_rc), tempfile.TemporaryDirectory() as tmp:
+                env_file, env, admission, order = self._admission_fixture(Path(tmp), pause_rc=pause_rc)
+                admission.write_text("false")
+                result = run(["bash", str(CONTROL), "stop", "--env-file", str(env_file)], env)
+                self.assertEqual(result.returncode, pause_rc, result.stdout + result.stderr)
+                self.assertEqual(admission.read_text().strip(), "true" if pause_rc == 0 else "false")
+                lines = order.read_text().splitlines()
+                self.assertEqual(
+                    lines[0],
+                    "systemctl --user disable --now description-operator-proxy.service description-portal.service",
+                )
+                pause = lines.index("airflow dags pause solidworks_to_urdf")
+                self.assertLess(pause, lines.index("systemctl --user disable --now description-airflow-scheduler"))
+
     def test_units_render_and_static_health_passes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state, config_home, target = self._render_units(Path(tmp))
