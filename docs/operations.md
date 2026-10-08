@@ -128,7 +128,8 @@ capture; their `reports/stages.json` marks those stages as out of scope. The
 detailed six-stage completeness belongs to a complete endpoint job.
 
 For publication recovery, use the retained verified delivery and a dedicated
-clean model clone with GitHub access:
+clean model clone with GitHub access. Work on a copy of the delivery so the
+failed run and its diagnostic receipts remain intact:
 
 ```sh
 description submit /path/to/verified-delivery --repository /path/to/model-clone --base feature/arm

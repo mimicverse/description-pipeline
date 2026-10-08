@@ -413,6 +413,8 @@ class PublishTests(unittest.TestCase):
 
     def test_case_duplicate_paths_rejected(self) -> None:
         (self.fx.bundle / "readme.md").write_text("dup\n", encoding="utf-8")
+        if (self.fx.bundle / "readme.md").samefile(self.fx.bundle / "README.md"):
+            self.skipTest("Case-distinct files require a case-sensitive filesystem")
         self.assertEqual(self.submit()["error"], "duplicate_path")
         self.assertEqual(self.fx.remote_head(), "")
 
@@ -420,7 +422,10 @@ class PublishTests(unittest.TestCase):
         outside = self.fx.tmp / "outside"
         outside.mkdir()
         (outside / "keep.txt").write_text("keep\n", encoding="utf-8")
-        os.symlink(outside, self.fx.seed / "input")
+        try:
+            os.symlink(outside, self.fx.seed / "input")
+        except OSError:
+            self.skipTest("Symlink creation requires platform privileges")
         run("git", "add", "-A", cwd=self.fx.seed)
         run("git", "commit", "-m", "symlinked input", cwd=self.fx.seed)
         run("git", "push", "origin", "feature/m3.0", cwd=self.fx.seed)
