@@ -1566,6 +1566,7 @@ class SolidWorksBackend(CadBackend):
             occurrences.append((RawComponent(name, path, placement, fixed, document_type), referenced))
 
         borrowed_components.clear()
+        comp = children = part = root = stack = None
         for occurrence, referenced in occurrences:
             name, path = occurrence.name, occurrence.path
             with _temporary_configuration(

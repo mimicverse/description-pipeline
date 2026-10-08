@@ -937,11 +937,15 @@ class CaptureSceneTests(unittest.TestCase):
             backend.verify_sources_unchanged()
 
     def test_capture_does_not_reuse_occurrence_interfaces_after_configuration_switches(self):
+        borrowed_occurrences = []
+
         class SharedDocument(_Doc):
             generation = 0
 
             def ShowConfiguration2(self, name):
                 previous = self.active_configuration
+                if name != previous and any(reference() is not None for reference in borrowed_occurrences):
+                    raise RuntimeError("borrowed occurrences remain alive across configuration selection")
                 selected = super().ShowConfiguration2(name)
                 if selected and previous != self.active_configuration:
                     self.generation += 1
@@ -970,6 +974,7 @@ class CaptureSceneTests(unittest.TestCase):
                 def __init__(self, inner):
                     self.inner = inner
                     self.generation = shared.generation
+                    borrowed_occurrences.append(weakref.ref(self))
 
                 def __getattr__(self, name):
                     if not name.startswith("_") and self.generation != shared.generation:
