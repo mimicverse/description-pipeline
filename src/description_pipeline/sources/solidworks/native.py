@@ -1495,6 +1495,13 @@ class SolidWorksBackend(CadBackend):
         normalized = normalize_document_path(os.path.abspath(path))
         if not any(normalized.startswith(root + "\\") for root in self._capture_roots):
             raise CadError("cad_rebuild_scope", "Only a collected capture copy may be rebuilt")
+        document = str(_member(doc, "GetPathName") or "")
+        if not document or not document_paths_match(document, path):
+            raise CadError(
+                "cad_document_identity",
+                "Collected capture document has no matching path identity",
+                {"path": path, "document": document},
+            )
         configuration = _active_configuration(doc)
         before = bool(_member(doc, "GetSaveFlag"))
         # Reopened assemblies can have resolved solid components but an empty
@@ -1502,12 +1509,15 @@ class SolidWorksBackend(CadBackend):
         # not just a failed mass reading. Never save the rebuilt document.
         if not _member(doc, "ForceRebuild3", False):
             raise CadError("cad_rebuild_failed", "Collected assembly did not rebuild successfully", {"path": path})
+        # Rebuild can replace model-document handles. Resolve the same open
+        # document in its owned session before reading the rebuilt state.
+        doc = self._document_by_path(path)
         if _active_configuration(doc) != configuration:
             raise CadError("cad_configuration_mismatch", "Capture rebuild changed the selected configuration")
         return {
             "used_api": "IModelDoc2.ForceRebuild3(False)",
             "scope": "collected_copy_in_memory",
-            "document": str(_member(doc, "GetPathName")),
+            "document": document,
             "configuration": configuration,
             "read_only": bool(_member(doc, "IsOpenedReadOnly")),
             "saved_to_disk": False,
@@ -1520,6 +1530,9 @@ class SolidWorksBackend(CadBackend):
         if _member(doc, "GetType") != 2:
             raise CadError("cad_not_assembly", "export requires a saved SLDASM")
         preparation = self._rebuild_capture_copy(doc, doc_path)
+        doc = self._document_by_path(str(preparation["document"]))
+        if _active_configuration(doc) != preparation["configuration"]:
+            raise CadError("cad_configuration_mismatch", "Capture rebuild changed the selected configuration")
         self._record_save_flag(doc, doc_path)
         self._components = set()
         self._source_components = {}

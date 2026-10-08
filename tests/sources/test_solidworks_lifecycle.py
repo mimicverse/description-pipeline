@@ -153,16 +153,25 @@ class SessionTests(unittest.TestCase):
             Save=Mock(),
             ForceRebuild3=Mock(spec=["__call__"], return_value=True),
         )
+        refreshed = []
+
+        def refresh(path):
+            refreshed.append(path)
+            return doc
+
+        backend._document_by_path = refresh
         result = backend._rebuild_capture_copy(doc, doc.GetPathName)
         self.assertEqual(result["scope"], "collected_copy_in_memory")
         self.assertFalse(result["saved_to_disk"])
         self.assertTrue(result["read_only"])
         doc.ForceRebuild3.assert_called_once_with(False)
         doc.Save.assert_not_called()
+        self.assertEqual(refreshed, [doc.GetPathName])
         doc.ForceRebuild3.return_value = False
         with self.assertRaises(CadError) as caught:
             backend._rebuild_capture_copy(doc, doc.GetPathName)
         self.assertEqual(caught.exception.code, "cad_rebuild_failed")
+        self.assertEqual(refreshed, [doc.GetPathName])
 
     def test_loaded_references_must_also_be_read_only(self):
         doc = SimpleNamespace(IsOpenedReadOnly=False, GetPathName="part.SLDPRT")

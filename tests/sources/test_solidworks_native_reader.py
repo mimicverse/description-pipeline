@@ -30,7 +30,11 @@ from unittest.mock import Mock
 from description_pipeline.geometry.stl import read as read_stl
 from description_pipeline.sources.solidworks.errors import CadError
 from description_pipeline.sources.solidworks.isolation import CadSession
-from description_pipeline.sources.solidworks.native import SolidWorksBackend, _temporary_configuration
+from description_pipeline.sources.solidworks.native import (
+    SolidWorksBackend,
+    _read_only_document,
+    _temporary_configuration,
+)
 
 #: SolidWorks ``MathTransform.ArrayData`` order for an identity occurrence.
 SW_IDENTITY = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
@@ -432,7 +436,8 @@ class _CaptureBackend(SolidWorksBackend):
     """Real ``collect_scene`` frame loop; only heavy CAD reads are stubbed."""
 
     def _rebuild_capture_copy(self, doc, path):
-        return {"rebuilt": True, "path": str(path)}
+        return {"rebuilt": True, "path": str(path), "document": str(path),
+                "configuration": str(doc.active_configuration)}
 
     def _record_save_flag(self, doc, path):
         self.save_flags[str(path)] = False
@@ -1739,6 +1744,130 @@ class CaptureSceneTests(unittest.TestCase):
             error = caught.exception
             self.assertEqual(error.code, "cad_coordinate_system_ambiguous")
             self.assertEqual(error.detail["datum"], "CS_tip")
+
+    def test_collect_scene_continues_on_the_refreshed_document_after_rebuild(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            part_path = _write(root, "part.SLDPRT")
+            part = _Doc(part_path, doc_type=1)
+            component = _Component("part-1", part_path, doc=part)
+            assembly = _write(root, "robot.SLDASM")
+            first = _Doc(assembly, doc_type=2, children=[component])
+            refreshed = _Doc(assembly, doc_type=2, children=[component])
+
+            class RefreshingBackend(_CaptureBackend):
+                def __init__(self, **kwargs):
+                    super().__init__(**kwargs)
+                    self.lookups = []
+                    self.save_flag_docs = []
+
+                def _rebuild_capture_copy(self, doc, path):
+                    assert doc is first, "the pre-rebuild handle is the collected copy"
+                    return {"rebuilt": True, "document": str(path),
+                            "configuration": str(first.active_configuration)}
+
+                def _document_by_path(self, path):
+                    self._app_for_path(path)  # keep the owned session registered
+                    self.lookups.append(str(path))
+                    return first if len(self.lookups) == 1 else refreshed
+
+                def _record_save_flag(self, doc, path):
+                    self.save_flag_docs.append(doc)
+                    self.save_flags[str(path)] = False
+
+            backend = RefreshingBackend(session_factory=lambda: _Session(_App({assembly: first})))
+            backend.collect_scene(str(assembly), [])
+            self.assertEqual(backend.lookups[:2], [str(assembly), str(assembly)])
+            self.assertTrue(backend.save_flag_docs)
+            self.assertIs(backend.save_flag_docs[0], refreshed)
+
+    def test_collect_scene_enforces_read_only_on_the_refreshed_handle(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            part_path = _write(root, "part.SLDPRT")
+            part = _Doc(part_path, doc_type=1)
+            component = _Component("part-1", part_path, doc=part)
+            assembly = _write(root, "robot.SLDASM")
+
+            class MutableReadOnly(_Doc):
+                def SetReadOnlyState(self, value):
+                    self.read_only_calls.append(value)
+                    self.IsOpenedReadOnly = value
+                    return True
+
+            first = _Doc(assembly, doc_type=2, children=[component])
+            refreshed = MutableReadOnly(assembly, doc_type=2, children=[component])
+            refreshed.IsOpenedReadOnly = False
+            refreshed.read_only_calls = []
+            refreshed.rebuilt_generation = 0
+
+            class ReadOnlyRefreshingBackend(_CaptureBackend):
+                def __init__(self, **kwargs):
+                    super().__init__(**kwargs)
+                    self.lookups = []
+                    self.reopens = []
+                    self.save_flag_docs = []
+
+                def _rebuild_capture_copy(self, doc, path):
+                    refreshed.rebuilt_generation += 1
+                    return {"rebuilt": True, "document": str(path),
+                            "configuration": str(first.active_configuration)}
+
+                def _document_by_path(self, path):
+                    self._app_for_path(path)
+                    self.lookups.append(str(path))
+                    doc = first if len(self.lookups) == 1 else refreshed
+                    return _read_only_document(doc)
+
+                def _record_save_flag(self, doc, path):
+                    self.save_flag_docs.append(doc)
+                    self.save_flags[str(path)] = False
+
+                def open_document(self, path):
+                    self.reopens.append(path)
+                    raise AssertionError("a refreshed handle must not reopen the document")
+
+                def _ensure_document(self, path):
+                    raise AssertionError("no reopen fallback is allowed")
+
+            backend = ReadOnlyRefreshingBackend(session_factory=lambda: _Session(_App({assembly: first})))
+            backend.collect_scene(str(assembly), [])
+            self.assertEqual(refreshed.read_only_calls, [True])
+            self.assertIs(refreshed.IsOpenedReadOnly, True)
+            self.assertEqual(refreshed.rebuilt_generation, 1)
+            self.assertEqual(backend.lookups[:2], [str(assembly), str(assembly)])
+            self.assertTrue(backend.save_flag_docs)
+            self.assertIs(backend.save_flag_docs[0], refreshed)
+            self.assertEqual(backend.reopens, [])
+
+    def test_collect_scene_rejects_configuration_change_at_the_refresh_boundary(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            part_path = _write(root, "part.SLDPRT")
+            part = _Doc(part_path, doc_type=1)
+            component = _Component("part-1", part_path, doc=part)
+            assembly = _write(root, "robot.SLDASM")
+            first = _Doc(assembly, doc_type=2, children=[component])
+            refreshed = _Doc(assembly, doc_type=2, children=[component])
+
+            class ConfigChangingBackend(_CaptureBackend):
+                def __init__(self, **kwargs):
+                    super().__init__(**kwargs)
+                    self.lookups = []
+
+                def _rebuild_capture_copy(self, doc, path):
+                    return {"rebuilt": True, "document": str(path), "configuration": "Other"}
+
+                def _document_by_path(self, path):
+                    self._app_for_path(path)
+                    self.lookups.append(str(path))
+                    return first if len(self.lookups) == 1 else refreshed
+
+            backend = ConfigChangingBackend(session_factory=lambda: _Session(_App({assembly: first})))
+            with self.assertRaises(CadError) as caught:
+                backend.collect_scene(str(assembly), [])
+            self.assertEqual(caught.exception.code, "cad_configuration_mismatch")
+            self.assertEqual(backend.lookups[:2], [str(assembly), str(assembly)])
 
 
 class PropertyContractTests(unittest.TestCase):
