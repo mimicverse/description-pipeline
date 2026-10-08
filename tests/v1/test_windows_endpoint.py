@@ -95,6 +95,41 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
         jobs.queue.join()
         self.assertEqual("failed", jobs.snapshot(request["run_id"])["status"])
 
+    def test_discovery_failure_retains_diagnostics_across_endpoint_restart(self):
+        from description_pipeline.sources.solidworks.errors import CadError
+        from description_pipeline.verification.consumer import ConsumerError
+
+        def runner(*args, **kwargs):
+            self.fail("Capture or publication ran after discovery failed")
+
+        for error, detail in (
+            (ConsumerError("Consumer loading failed", returncode=1, stderr="ImportError: native library unavailable"),
+             {"returncode": 1, "stderr": "ImportError: native library unavailable"}),
+            (CadError("cad_read_failed", "Native read failed", detail={"phase": "read", "cause": "lost binding"}),
+             {"phase": "read", "cause": "lost binding"}),
+        ):
+            with self.subTest(error=type(error).__name__):
+                def prepare(*args, error=error, **kwargs):
+                    raise error
+
+                jobs = Jobs(self.config, runner=runner, native_preparer=prepare)
+                try:
+                    request = self.request()
+                    jobs.create(request)
+                    jobs.queue.join()
+                    result = jobs.snapshot(request["run_id"])
+                    self.assertEqual("failed", result["status"])
+                    self.assertEqual(f"{type(error).__name__}: {error}", result["error"])
+                    self.assertEqual(detail, result["detail"])
+                finally:
+                    jobs.close()
+                recovered = Jobs(self.config, runner=runner, native_preparer=self.prepare)
+                try:
+                    self.assertEqual(result, recovered.snapshot(request["run_id"]))
+                    self.assertFalse(recovered.create(request)[1])
+                finally:
+                    recovered.close()
+
     def test_wrong_repository_base_subject_or_quality_cannot_pass(self):
         responses = []
         for section, key, value in (

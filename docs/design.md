@@ -100,17 +100,17 @@ URDF with joint controls. It shows each automatic check, engineering
 confirmation, evidence and affected object; unsupported or unexecuted checks
 remain explicit.
 
-Each owned Windows process must complete SolidWorks startup, including add-ins,
-before native reads begin. After collecting the dependency graph and copying
-saved files, the worker closes the source process before starting the copy
-process. The retired source cannot reopen; its initial observations and process
-identity remain in the evidence. Application interfaces are reacquired at
-document boundaries within the live copy. Each acquisition uses the vendor's
-`ISldWorks` interface and verifies the owned process ID. A lost process or
-binding stops capture.
-Occurrence reads use the vendor's `IComponent2` interface. Traversal records
-their primitives before changing any referenced document's read-only state or
-configuration.
+Native collection runs in job-owned processes, separate from engineers' CAD
+sessions. The worker checks runtime readiness, reads frozen inputs and releases
+owned resources on every terminal path. Native references stay within their
+valid lifetime; state changes require fresh bindings. Environment and process
+identity remain in the evidence. Unavailable capabilities or lost bindings stop
+the run; replacing a process cannot repair a failed capture.
+
+The same contracts apply to every supported model and deployment. Analytic and
+adversarial tests enforce them; model details and host settings belong in input
+and deployment configuration. Consumer model loading runs in an isolated process
+without rendering and verifies the delivered bytes.
 
 Feishu supplies the signed-in identity and profile. The platform restricts
 access to its approved tenant and assigns operator and administrator permissions.

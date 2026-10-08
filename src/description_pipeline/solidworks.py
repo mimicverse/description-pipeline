@@ -324,6 +324,10 @@ def run(
             receipt["cad_revision"] = input_report["cad_revision"]["revision"]
             if backend is None and sys.platform != "win32":
                 raise PipelineError("Native SLDASM/SLDPRT capture requires Windows with licensed SolidWorks")
+            if backend is None:
+                from .verification.consumer import readiness
+
+                readiness()
             _copy_definition(package, staging)
             event("inspect", "completed")
             event("capture", "running")
@@ -359,6 +363,8 @@ def run(
                 receipt["error_code"] = error.code
             if hasattr(error, "detail") and error.detail is not None:
                 receipt["detail"] = error.detail
+            elif isinstance(getattr(error, "details", None), dict):
+                receipt["detail"] = error.details
             if staging.exists():
                 failed = _keep_diagnostic(staging, output, receipt)
                 receipt["diagnostic_path"] = str(failed)
@@ -448,6 +454,14 @@ def doctor() -> dict:
             results.append({"id": name, "passed": True, "actual": importlib.metadata.version(name)})
         except importlib.metadata.PackageNotFoundError:
             results.append({"id": name, "passed": False, "message": "Reinstall the pinned release runtime"})
+    from .verification.consumer import readiness
+
+    try:
+        consumer = readiness()
+        results.append({"id": "consumer.urdf", "passed": True, "details": consumer})
+    except Exception as error:
+        results.append({"id": "consumer.urdf", "passed": False, "message": str(error),
+                        "details": getattr(error, "details", {})})
     native = False
     native_detail = "Native CAD capture requires Windows with licensed SolidWorks"
     if sys.platform == "win32":

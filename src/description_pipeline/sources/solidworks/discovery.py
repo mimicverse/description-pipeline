@@ -2007,7 +2007,9 @@ def prepare_native_package(
         raise PipelineError(f"frozen_source already contains authored package files: {authored[:5]}")
     if backend is None:
         from .native import SolidWorksBackend
+        from ...verification.consumer import readiness
 
+        readiness()
         backend = SolidWorksBackend()
     record = backend.discover_native(frozen_source, {"namespace": NAMESPACE, "contract": CONTRACT})
     if not isinstance(record, dict) or record.get("schema_version") != DISCOVERY_SCHEMA:

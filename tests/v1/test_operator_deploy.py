@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import re
 import stat
 import subprocess
 import sys
@@ -455,19 +454,23 @@ class LifecycleTests(unittest.TestCase):
 
     def test_shipped_example_path_relationships_validate(self) -> None:
         example = (OPERATOR / "operator.env.example").read_text(encoding="utf-8")
+        values = dict(line.split("=", 1) for line in example.splitlines() if line and not line.startswith("#"))
+        original_prefix = Path(values["OPERATOR_STATE"]).parent
         with tempfile.TemporaryDirectory() as tmp:
-            prefix = Path(tmp) / "home" / "andy"
-            rewritten = "\n".join(
-                re.sub(r"^([A-Z0-9_]+)=/home/andy(.*)$", rf"\1={prefix}\2", line)
-                for line in example.splitlines())
+            prefix = Path(tmp) / "deployment"
+            rewritten = example.replace(str(original_prefix), str(prefix))
             env_file = Path(tmp) / "example.env"
             env_file.write_text(rewritten + "\n", encoding="utf-8")
             result = run([sys.executable, str(RENDER), "--env-file", str(env_file)], {})
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            resolved = (prefix / "operator/state/resolved.env").read_text(encoding="utf-8")
+            resolved = (prefix / "state/resolved.env").read_text(encoding="utf-8")
             self.assertIn(f"SOLIDWORKS_HANDOFF_ROOT={prefix}/cad-handoffs", resolved)
             # The shipped intake must stay outside the managed state/runtime tree.
-            self.assertNotIn(f"SOLIDWORKS_HANDOFF_ROOT={prefix}/operator/", resolved)
+            resolved_values = dict(line.split("=", 1) for line in resolved.splitlines() if line)
+            intake = Path(resolved_values["SOLIDWORKS_HANDOFF_ROOT"])
+            for key in ("OPERATOR_STATE", "AIRFLOW_VENV", "AIRFLOW_HOME", "POSTGRES_ROOT"):
+                runtime = Path(resolved_values[key])
+                self.assertFalse(intake.is_relative_to(runtime) or runtime.is_relative_to(intake))
 
     def test_scripts_are_syntactically_valid(self) -> None:
         for script in (CONTROL, HEALTH, OPERATOR / "scripts" / "install_toolchain.sh",

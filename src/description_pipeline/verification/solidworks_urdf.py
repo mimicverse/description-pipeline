@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import math
 import re
-import shutil
-import tempfile
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -23,6 +21,7 @@ from ..io import PipelineError, confined, file_digest, inventory, read_data
 from ..sources.snapshot import verify_snapshot
 from ..sources.solidworks.input import inspect_package
 from ..sources.solidworks.revision import package_inventory, read_revision
+from .consumer import load as load_consumer
 
 QUALITY_SCHEMA = "solidworks-to-urdf.quality/v1"
 POSITION_TOL_M = 5e-5
@@ -455,37 +454,6 @@ def _geometry(root, body, node, model_link, geometry, components, body_pose, urd
     return used, world_points
 
 
-def _consumer(root, document):
-    import mujoco
-
-    with tempfile.TemporaryDirectory(prefix="description-consumer-") as directory:
-        temporary = Path(directory)
-        shutil.copytree(root / "meshes", temporary / "meshes")
-        (temporary / "urdf").mkdir()
-        # Explicit reader options retain visuals and fixed reference frames.
-        tree = ET.fromstring(ET.tostring(document))
-        compiler = ET.SubElement(ET.SubElement(tree, "mujoco"), "compiler")
-        compiler.attrib.update(discardvisual="false", fusestatic="false", strippath="false")
-        path = temporary / "urdf/robot.urdf"
-        ET.ElementTree(tree).write(path, encoding="utf-8", xml_declaration=True)
-        loaded = mujoco.MjModel.from_xml_path(str(path))
-        moving = [joint for joint in document.findall("joint") if joint.attrib["type"] != "fixed"]
-        _require(loaded.njnt == len(moving), "Consumer loaded another movable joint set")
-        _require(loaded.nbody == len(document.findall("link")) + 1, "Consumer dropped a link")
-        for joint in moving:
-            _require(
-                mujoco.mj_name2id(loaded, mujoco.mjtObj.mjOBJ_JOINT, joint.attrib["name"]) >= 0,
-                "Consumer lost a joint name",
-            )
-        return {
-            "reader": "mujoco",
-            "version": mujoco.__version__,
-            "bodies": loaded.nbody,
-            "joints": loaded.njnt,
-            "scope": "URDF loading only; no simulation qualification",
-        }
-
-
 def evaluate_bundle(root: Path) -> dict:
     """Recompute the quality report without reading the saved quality decision."""
     root = Path(root)
@@ -642,7 +610,7 @@ def _verify_model(root, gates, definition, model, raw):
     gates.add("geometry.assets", lambda: _assets(root, used))
     gates.add("geometry.expected_extent", lambda: _extent(points, definition["checks"]["expected_extent_m"]))
     gates.add("physics.expected_mass", lambda: _mass(model, definition["checks"]["expected_mass_kg"]))
-    gates.add("consumer.urdf", lambda: _consumer(root, document))
+    gates.add("consumer.urdf", lambda: load_consumer(root))
 
 
 def _physics(root, source, model, verifier):

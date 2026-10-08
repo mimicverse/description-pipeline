@@ -13,7 +13,7 @@ and maintenance; [operations](operations.md) owns the engineering workflow.
 | Host or service | Required preparation |
 |---|---|
 | Linux | Ubuntu 22.04 x86_64, user-level systemd, network access to the Windows worker, GitHub and Feishu |
-| Windows | SolidWorks 2026, Python 3.12 x86_64, Git, GitHub CLI and OpenSSH Server; an interactive desktop session |
+| Windows | Qualified SolidWorks version (tested with 2026), Python 3.12 x86_64, Git, GitHub CLI and OpenSSH Server; an interactive desktop session |
 | Model repository | Private repository, an existing `feature/<hardware>` base and a dedicated clean Windows clone |
 | Feishu | Enterprise app, approved tenant keys, registered OAuth callback and access to basic user identity/profile |
 | Storage | Dedicated CAD intake directories; separate frozen inputs, outputs, state, secrets and model clones |
@@ -30,7 +30,11 @@ private secret file and approved tenant keys to the platform maintainer.
 
 SolidWorks is required for fresh native discovery and capture. Verification and
 rebuild of a complete frozen delivery run on Linux or Windows without opening
-CAD. Windows jobs must run as the logged-in execution user, outside Session 0.
+CAD. Both hosts require Python 3.12 x86_64 and the pinned runtime wheels.
+Consumer checks load models without rendering; they require no display, GPU or
+graphics-driver setup. `description doctor` exercises the actual consumer loader
+in an isolated process, and native jobs check readiness before opening CAD.
+Windows jobs must run as the logged-in execution user, outside Session 0.
 
 ## 1. Install the Windows worker
 
@@ -109,12 +113,15 @@ configuration and secrets outside the checkout. Copy
 file, then set its actual paths and host:
 
 ```sh
-mkdir -p /home/andy/operator/secrets
-chmod 700 /home/andy/operator /home/andy/operator/secrets
-cp deploy/operator/operator.env.example /home/andy/operator/operator.env
-chmod 600 /home/andy/operator/operator.env
+description_base="$HOME/description"
+description_env="$description_base/operator.env"
+mkdir -p "$description_base/secrets"
+chmod 700 "$description_base" "$description_base/secrets"
+cp deploy/operator/operator.env.example "$description_env"
+chmod 600 "$description_env"
 ```
 
+Replace the example `/srv/description` paths with your chosen service directory.
 Complete these configuration groups once:
 
 | Settings | Purpose |
@@ -124,7 +131,7 @@ Complete these configuration groups once:
 | `PIPELINE_WHEEL`, `AIRFLOW_DB_URL` | Matching release wheel and dedicated PostgreSQL connection |
 | `SOLIDWORKS_SSH_HOST`, `SOLIDWORKS_ENDPOINT_PORT` | Key-authenticated SSH alias to Windows and its loopback endpoint |
 | `ENDPOINT_TOKEN_FILE` | Private copy of the Windows endpoint token, mode `0600` |
-| `SOLIDWORKS_HANDOFF_ROOT` | Dedicated Linux intake, such as `/home/andy/cad-handoffs`, outside runtime and state |
+| `SOLIDWORKS_HANDOFF_ROOT` | Dedicated Linux intake, such as `/srv/description/cad-handoffs`, outside runtime and state |
 | `FEISHU_APP_SECRET_FILE`, `FEISHU_TENANT_KEYS` | App credentials and mandatory tenant allowlist |
 | `FEISHU_ADMIN_OPEN_IDS` | Explicit administrator identities; optional, no automatic administrator |
 
@@ -163,7 +170,7 @@ Configure the SSH alias on Linux using a dedicated execution key and verified
 Windows host key. Confirm it works without a password prompt:
 
 ```sh
-ssh -o BatchMode=yes windows-m3 whoami
+ssh -o BatchMode=yes solidworks-worker whoami
 ```
 
 The endpoint binds only to Windows loopback. The managed SSH tunnel exposes it
@@ -174,9 +181,9 @@ on Linux loopback port `18765`; operators never configure transport or tokens.
 From the deployment archive:
 
 ```sh
-bash deploy/operator/operatorctl.sh install --env-file /home/andy/operator/operator.env
-bash deploy/operator/operatorctl.sh start --env-file /home/andy/operator/operator.env
-bash deploy/operator/operatorctl.sh health --env-file /home/andy/operator/operator.env
+bash deploy/operator/operatorctl.sh install --env-file "$description_env"
+bash deploy/operator/operatorctl.sh start --env-file "$description_env"
+bash deploy/operator/operatorctl.sh health --env-file "$description_env"
 ```
 
 Installation provisions the pinned Python toolchain, PostgreSQL 14, Airflow
@@ -206,8 +213,9 @@ health failures, trusted HTTPS and a successful live Feishu sign-in.
 
 Commission the complete workflow with actual native CAD and live Feishu:
 
-1. Confirm HTTPS trust, all services, authenticated Windows endpoint health and
-   the installed Airflow Connection.
+1. Run `description doctor` in each installed runtime and require all checks to
+   pass. Confirm HTTPS trust, all services, authenticated Windows endpoint health
+   and the installed Airflow Connection.
 2. Sign in with Feishu. Verify the displayed identity, approved tenant,
    workflow permissions, explicit admin assignment and denied unauthorized users.
 3. Supply a compliant native folder from an approved Linux or Windows source
@@ -226,10 +234,13 @@ acceptance. Retain reports for the exact tool and native source revision.
 
 ## Maintenance
 
+In a new shell, set `description_env` to the installed configuration file:
+
 ```sh
-bash deploy/operator/operatorctl.sh status --env-file /home/andy/operator/operator.env
-bash deploy/operator/operatorctl.sh health --env-file /home/andy/operator/operator.env
-bash deploy/operator/operatorctl.sh stop --env-file /home/andy/operator/operator.env
+description_env="$HOME/description/operator.env"
+bash deploy/operator/operatorctl.sh status --env-file "$description_env"
+bash deploy/operator/operatorctl.sh health --env-file "$description_env"
+bash deploy/operator/operatorctl.sh stop --env-file "$description_env"
 ```
 
 Service logs use `journalctl --user -u <service>`. Airflow logs, endpoint state

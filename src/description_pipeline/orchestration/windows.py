@@ -501,6 +501,10 @@ class Jobs:
             except Exception as error:
                 with self.mutex:
                     job.update(status="failed", error=f"{type(error).__name__}: {error}")
+                    if getattr(error, "detail", None) is not None:
+                        job["detail"] = error.detail
+                    elif isinstance(getattr(error, "details", None), dict):
+                        job["detail"] = error.details
             finally:
                 with self.mutex:
                     job["completed_at"] = datetime.now(UTC).isoformat()

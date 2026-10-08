@@ -4,7 +4,7 @@
   },
   "endpoint": {
     "url": "http://127.0.0.1:18765",
-    "token_file": "/home/andy/operator/secrets/endpoint.token"
+    "token_file": "/srv/description/secrets/endpoint.token"
   },
   "portal": {
     "host": "127.0.0.1",

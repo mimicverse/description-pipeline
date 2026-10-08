@@ -109,6 +109,24 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual("Existing output bytes", marker.read_text())
         self.assertTrue(solidworks._owned_output(self.output))
 
+    def test_consumer_preflight_failure_blocks_capture_and_retains_diagnostics(self):
+        from description_pipeline.verification.consumer import ConsumerError
+
+        self.seal()
+        error = ConsumerError("Consumer loading failed", stderr="ImportError: native library unavailable")
+        with (
+            patch.object(solidworks.sys, "platform", "win32"),
+            patch("description_pipeline.verification.consumer.readiness", side_effect=error),
+            patch("description_pipeline.sources.solidworks.freeze.freeze") as capture,
+        ):
+            result = solidworks.run(self.package, self.output)
+        capture.assert_not_called()
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["stage"], "inspect")
+        self.assertEqual(result["error"], "Consumer loading failed")
+        self.assertEqual(result["detail"], error.details)
+        self.assertTrue((Path(result["diagnostic_path"]) / "reports/run.json").is_file())
+
     def test_annotated_diagnostic_is_preserved_on_retry(self):
         first = solidworks.run(self.package, self.output)
         old = Path(first["diagnostic_path"])
