@@ -10,6 +10,9 @@ from pathlib import Path
 
 from .errors import EnvironmentError_
 
+# Published ISldWorks dual-interface IID in the SolidWorks type library.
+ISLDWORKS_IID = "{83A33D22-27C5-11CE-BFD4-00400513BB57}"
+
 
 def registered_executable() -> str:
     if os.name != "nt":
@@ -110,6 +113,7 @@ class WindowsCadProcess:
 def application_for_pid(pid: int):
     """Find the server launched by us, without activating another COM server."""
     import pythoncom
+    import pywintypes
     import win32com.client.dynamic
 
     rot = pythoncom.GetRunningObjectTable()
@@ -122,12 +126,17 @@ def application_for_pid(pid: int):
             continue  # unrelated ROT entries need not support display names
         if display_name != expected:
             continue
-        dispatch = rot.GetObject(moniker).QueryInterface(pythoncom.IID_IDispatch)
-        app = win32com.client.dynamic.DumbDispatch(dispatch)
-        app._FlagAsMethod("GetProcessID")
-        if app.GetProcessID() != pid:
+        # ISldWorks is the vendor's dual application interface. Its generic
+        # IDispatch view can stop serving RPC while this interface remains live.
+        # useIID selects only the Python wrapper; calls use the queried interface.
+        dispatch = rot.GetObject(moniker).QueryInterface(
+            pywintypes.IID(ISLDWORKS_IID), pythoncom.IID_IDispatch
+        )
+        # Vendor DISPID166: GetProcessID() -> VT_I4, a method (not a property).
+        actual = dispatch.InvokeTypes(166, 0, pythoncom.DISPATCH_METHOD, (pythoncom.VT_I4, 0), ())
+        if type(actual) is not int or actual != pid:
             raise EnvironmentError_("cad_process_identity_mismatch", "COM server does not match the owned process")
-        return app
+        return win32com.client.dynamic.DumbDispatch(dispatch)
     return None
 
 

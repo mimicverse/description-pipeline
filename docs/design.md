@@ -105,7 +105,9 @@ before native reads begin. After collecting the dependency graph and copying
 saved files, the worker closes the source process before starting the copy
 process. The retired source cannot reopen; its initial observations and process
 identity remain in the evidence. Application interfaces are reacquired at
-document boundaries within the live copy. A lost process or binding stops capture.
+document boundaries within the live copy. Each acquisition uses the vendor's
+`ISldWorks` interface and verifies the owned process ID. A lost process or
+binding stops capture.
 
 Feishu supplies the signed-in identity and profile. The platform restricts
 access to its approved tenant and assigns operator and administrator permissions.
