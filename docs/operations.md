@@ -50,9 +50,11 @@ or configured by the platform; they are not operator form fields.
 | Verify | Each automatic check, its evidence and required engineering confirmations |
 | Publish | Verified commit and candidate PR |
 
-A retry within the same Airflow run retains the frozen input and native job UUID.
-Changed inputs require a new run. Automatic checks and engineering confirmations
-remain separate; pending or unsupported items never become implicit passes.
+Airflow transport retries retain the frozen input and native job UUID; they
+reconnect to the existing job without repeating capture. A terminal native failure,
+including an endpoint restart during capture, requires a new run. Changed inputs
+also require a new run. Automatic checks and engineering confirmations remain
+separate; pending or unsupported items never become implicit passes.
 
 ## 4. Correct findings
 
@@ -66,7 +68,8 @@ reference shown in the result to locate the problem.
 | Zero, direction, limit or drive disagreement | Correct its mechanical definition or controlled specification |
 | Material, mass or inertia disagreement | Correct material assignments, scope or the documented physical source |
 | Independent verification disagreement | Trace the native evidence and generation rule; preserve the failed diagnostics |
-| Infrastructure or PR error | Platform maintainer restores the service and recovers the verified delivery |
+| Infrastructure error | Restore the service; inspect diagnostics and start a new run if the native job failed |
+| PR error | Restore publication access and submit the retained verified delivery |
 
 Return corrections to CAD, controlled records or tool rules, then submit a new
 version. Do not edit generated definitions, XML, meshes or reports. A failed
@@ -98,7 +101,12 @@ description check /path/to/delivery
 description rebuild /path/to/delivery --output /path/to/rebuilt-delivery
 ```
 
-For publication recovery, use a dedicated clean model clone with GitHub access:
+These commands require a complete delivery. A failed or interrupted capture
+cannot be rebuilt from partial evidence; preserve its diagnostics and start a new
+run after resolving the cause.
+
+For publication recovery, use the retained verified delivery and a dedicated
+clean model clone with GitHub access:
 
 ```sh
 description submit /path/to/verified-delivery --repository /path/to/model-clone --base feature/arm

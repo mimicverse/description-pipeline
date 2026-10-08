@@ -195,9 +195,12 @@ actual service account:
 sudo loginctl enable-linger <service-user>
 ```
 
-Credentials missing
-from an installed app must produce an explicit unavailable login, never a
-password fallback or a readiness pass.
+Before Feishu configuration, health exits with failure for missing SSO
+credentials and unavailable SSO commissioning (`HTTP 503`). These identify an
+incomplete installation. Any additional failure requires investigation. A
+self-signed rehearsal certificate also requires browser trust before use;
+service liveness does not establish that trust. Commissioning requires zero
+health failures, trusted HTTPS and a successful live Feishu sign-in.
 
 ## Acceptance
 
@@ -230,14 +233,28 @@ bash deploy/operator/operatorctl.sh stop --env-file /home/andy/operator/operator
 ```
 
 Service logs use `journalctl --user -u <service>`. Airflow logs, endpoint state
-and bound job diagnostics identify failed operations. Resolve infrastructure
-failures and retry the same frozen execution when safe; change the source
-revision and create a new run after engineering corrections.
+and bound job diagnostics identify failed operations. Transport retries reconnect
+to the existing native job. A terminal native failure requires a new run; an
+endpoint restart during capture marks that job failed. Preserve its partial
+evidence for diagnosis. Recover a publication failure from the complete verified
+delivery using [the operations procedure](operations.md#6-independent-review-and-recovery).
+Engineering corrections require a new source revision and run.
 
 After code or deployment changes, run the
 [development checks](../CONTRIBUTING.md#verification), validate shell syntax and
 repeat affected native and deployed acceptance. For an upgrade, let the current
-native job finish, stop the Windows endpoint and Linux services, install the same
-new release on both hosts, then restart the endpoint and Linux services and run
-health. `install` updates files; it does not restart an already running process.
-Published tags and assets remain immutable.
+native job finish and stop new submissions. Retain the previous release archives,
+runtime directories and private configuration, including `operator.env`, its
+`PIPELINE_WHEEL` path and the Windows endpoint configuration. Stop the endpoint
+and Linux services, install the same new release on both hosts, then restart the
+endpoint and Linux services and run health. `install` updates files; it does not
+restart an already running process.
+
+If acceptance fails, drain native work and stop both hosts' services. Restore the
+previous tool installations and private configuration, run `install` from the
+previous deployment archive, then start the endpoint and Linux services. Verify
+both installed source identities and run health before reopening submissions.
+Preserve every frozen input, delivery, diagnostic, signing key, job and ledger
+row created during the upgrade. Do not restore an older database or state snapshot;
+code rollback requires compatible persisted schemas. Published tags and assets
+remain immutable.
