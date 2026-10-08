@@ -107,7 +107,22 @@ button:disabled { opacity: 0.55; cursor: progress; }
 .chip.failed, .chip.upstream_failed { border-color: var(--bad); color: var(--bad); }
 .chip.running { border-color: var(--accent); color: var(--accent); }
 
-.stages { margin: 0; padding-left: 20px; display: grid; gap: 4px; }
+.stages { display: grid; gap: 12px; }
+.stage-card { border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+.stage-card.failed { border-color: var(--bad); }
+.stage-card.running { border-color: var(--accent); }
+.stage-card h4 { margin: 0 0 8px; font-size: 14px; }
+.stage-boundaries { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; font-size: 13px; }
+.stage-boundaries p { margin: 6px 0; overflow-wrap: anywhere; }
+.stage-boundaries pre { font-size: 11px; max-height: 300px; overflow: auto; }
+.stage-files p { margin: 4px 0; overflow-wrap: anywhere; }
+.stage-files code { display: block; font-size: 10.5px; color: var(--muted); }
+.stage-evidence { margin: 8px 0 0; font-size: 12px; overflow-wrap: anywhere; }
+.stage-evidence a { color: var(--accent); }
+.stage-unsupported { margin: 6px 0 0; font-size: 12px; }
+.stage-unsupported .chip { margin-left: 2px; }
+@media (max-width: 800px) { .stage-boundaries { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 480px) { .stage-boundaries { grid-template-columns: 1fr; } }
 .findings { margin: 0; padding-left: 0; list-style: none; display: grid; gap: 8px; }
 .findings li { border-left: 3px solid var(--bad); padding: 6px 10px; background: #fff6f5; border-radius: 0 8px 8px 0; }
 .findings li.warn { border-color: var(--warn); background: #fffaf0; }

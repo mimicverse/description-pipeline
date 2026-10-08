@@ -45,6 +45,7 @@ version = {attr = "description_pipeline.__version__"}
 
 [tool.setuptools.package-data]
 description_pipeline = [
+    "stage-contract.json",
     "model/*.json",
     "orchestration/static/*",
     "orchestration/static/vendor/*",

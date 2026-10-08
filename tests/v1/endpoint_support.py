@@ -10,9 +10,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from description_pipeline.io import digest, file_digest, write_json
-from description_pipeline.orchestration.handoffs import freeze_handoff
+from description_pipeline.sources.solidworks.handoff import freeze_handoff
 from description_pipeline.orchestration.windows import Jobs, read_config
 from description_pipeline.sources.solidworks.revision import package_inventory, seal_revision
+from .protocol_support import protocol_events
 
 
 def prepare_control(source, output, run_id, **kwargs):
@@ -38,6 +39,7 @@ def prepare_control(source, output, run_id, **kwargs):
         discovery_path=discovery,
         discovery_sha256=file_digest(discovery),
         handoff_sha256=digest(package_inventory(source)),
+        prepared_sha256=digest(package_inventory(output)),
     )
 
 
@@ -87,13 +89,16 @@ class EndpointFixture:
         jobs = Jobs(
             self.config,
             native_preparer=preparer or self.prepare,
-            runner=runner or (lambda *args, **kwargs: self.passing_result()),
+            runner=runner or (lambda *args, **kwargs: self.passing_result(on_event=kwargs["on_event"])),
         )
         self.addCleanup(jobs.close)
         return jobs
 
-    def passing_result(self):
+    def passing_result(self, *, on_event=None):
         subject = "a" * 64
+        if on_event is not None:
+            for event in protocol_events(stages=("capture", "generate", "verify", "publish"), subject=subject):
+                on_event(event)
         return {
             "passed": True,
             "subject_sha256": subject,

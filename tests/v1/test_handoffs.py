@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from description_pipeline.io import PipelineError, digest
-from description_pipeline.orchestration.handoffs import (
+from description_pipeline.sources.solidworks.handoff import (
     describe_handoff,
     freeze_handoff,
     import_archive,
@@ -95,7 +95,7 @@ class HandoffTests(unittest.TestCase):
             return result
 
         with (
-            patch("description_pipeline.orchestration.handoffs.shutil.copyfile", side_effect=copying),
+            patch("description_pipeline.sources.solidworks.handoff.shutil.copyfile", side_effect=copying),
             self.assertRaises(PipelineError),
         ):
             freeze_handoff(self.source, self.store)

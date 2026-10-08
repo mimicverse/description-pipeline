@@ -39,7 +39,7 @@ class NativeEndpointTests(EndpointFixture, unittest.TestCase):
             calls.append(package)
             self.assertEqual("feature/arm", kwargs["base"])
             self.assertTrue((package / "robot.yaml").is_file())
-            return self.passing_result()
+            return self.passing_result(on_event=kwargs["on_event"])
 
         jobs = self.jobs(runner=runner)
         request = self.request(jobs)

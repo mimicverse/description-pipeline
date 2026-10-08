@@ -42,13 +42,20 @@ Sign in to the operator page with Feishu. Select the engineering
 folder and click **Start**. Hardware, revision, repository and branch are derived
 or configured by the platform; they are not operator form fields.
 
-| Stage | Result to inspect |
-|---|---|
-| Freeze | Complete immutable input inventory and transfer identity |
-| Read and derive | Native identity, bodies, joints, datums, specification references and object-specific findings |
-| Build | Canonical model, URDF and local meshes |
-| Verify | Each automatic check, its evidence and required engineering confirmations |
-| Publish | Verified commit and candidate PR |
+The page shows the [six engineering steps](design.md#2-how-the-system-works):
+freeze inputs, discover structure, capture evidence, generate URDF, verify and
+publish the review PR. Open each step's **Input**, **Input QC**, **Output** and
+**Output QC** to inspect checks, affected objects, recorded values and file hashes.
+Generation-input inspection belongs to capture; it is not another operator step.
+
+A completed step requires its boundary checks to pass. Failed checks retain their
+diagnostics, and later steps show blocked. Checks whose prerequisites failed show
+not run. Each run records which steps actually ran; steps outside the run are
+shown as not executed. Engineering confirmations stay pending under the relevant
+step, and unsupported items never become implicit passes.
+Airflow's DAG documentation shows the contract; `wait_for_job` logs and its
+`engineering_stages` XCom retain terminal results even when `confirm_job` is blocked.
+The detailed local receipt is `reports/stages.json`.
 
 Airflow transport retries retain the frozen input and native job UUID; they
 reconnect to the existing job without repeating capture. A terminal native failure,
@@ -86,6 +93,7 @@ Confirm that input revision, tool identity, verified subject, commit and
 engineering confirmations refer to the same version. Review the PR and approve
 the intended uses before freezing the model release. Automatic PR creation is
 candidate submission; model release requires engineering approval.
+Record approvals in the subject-bound PR or controlled engineering records.
 
 URDF loading, kinematic consistency, simulation, training and hardware control
 have separate acceptance criteria. Retain native inputs and bound evidence
@@ -104,6 +112,13 @@ description rebuild /path/to/delivery --output /path/to/rebuilt-delivery
 These commands require a complete delivery. A failed or interrupted capture
 cannot be rebuilt from partial evidence; preserve its diagnostics and start a new
 run after resolving the cause.
+
+Maintenance runs declare a narrower `execution_scope`: `description rebuild`
+executes generation and verification (plus publication when a repository is
+given) against the frozen evidence, and `description submit` executes publication
+only. They do not reopen or re-qualify the native stages freeze, discover or
+capture; their `reports/stages.json` marks those stages as out of scope. The
+detailed six-stage completeness belongs to a complete endpoint job.
 
 For publication recovery, use the retained verified delivery and a dedicated
 clean model clone with GitHub access:

@@ -24,6 +24,8 @@ model repository. Retain local acceptance evidence; GitHub CI is not required.
 5. Review code, command help, schemas and all documentation together. Keep
    `main` the smallest complete current system. Remove intermediate workflows,
    compatibility paths, duplicate entry points and transitional instructions.
+   Regenerate contract-derived tables from `contract_markdown()` and confirm the
+   six-stage contract still matches the code before merging.
 6. Merge the reviewed result into public `main`, create a new version tag and
    publish distributions, their SHA-256 manifest and acceptance evidence.
    Verify the remote commit, tag, downloaded bytes and installed identity.

@@ -38,9 +38,9 @@ from urllib import request as urlrequest
 
 from ..delivery import PIPELINE_ID
 from ..io import PipelineError, artifact_path_parts
+from ..sources.solidworks.handoff import HANDOFF_SCHEMA
 
 JOB_SCHEMA = "solidworks-to-urdf.job/v1"
-HANDOFF_SCHEMA = "solidworks-to-urdf.handoff/v1"
 NATIVE_RUN_NAMESPACE = "solidworks_to_urdf"
 EVENT_KEYS = ("stage", "state", "at")
 RUN_STATES = {"queued", "running", "passed", "failed"}
@@ -188,7 +188,7 @@ def _handoff_roots(values) -> tuple[Path, ...]:
     if values is None or values == () or values == "":
         return ()
     try:
-        from .handoffs import validate_handoff_roots
+        from ..sources.solidworks.handoff import validate_handoff_roots
 
         return validate_handoff_roots(values)
     except (ImportError, PipelineError, TypeError, ValueError, OSError) as error:
@@ -317,7 +317,7 @@ class WindowsEndpoint:
                 "absolute Linux handoff folders require handoff_roots in the Airflow endpoint connection"
             )
         try:
-            from .handoffs import authorize_handoff
+            from ..sources.solidworks.handoff import authorize_handoff
 
             return authorize_handoff(Path(path), self.config.handoff_roots)
         except (ImportError, PipelineError, TypeError, ValueError, OSError) as error:
@@ -331,7 +331,7 @@ class WindowsEndpoint:
         return HandoffResolution.from_payload(self._request("POST", "/v1/handoffs/resolve", {"handoff_path": path}))
 
     def _import_handoff(self, source: Path) -> HandoffResolution:
-        from .handoffs import prepare_archive
+        from ..sources.solidworks.handoff import prepare_archive
 
         if not source.is_dir():
             raise EndpointProtocolError(f"handoff_path is not a directory: {source}")

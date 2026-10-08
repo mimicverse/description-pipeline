@@ -32,14 +32,14 @@ from ..io import (
     artifact_path_parts,
     confined,
     digest,
-    file_digest,
     inventory,
     read_data,
     write_json,
 )
 from ..sources.solidworks.revision import package_inventory, read_revision
 from ..repository.urdf_pr import _origin_slug, _slug_hardware
-from .handoffs import HANDOFF_SCHEMA, MAX_HANDOFF_BYTES, freeze_handoff, import_archive
+from ..stages import stage_view
+from ..sources.solidworks.handoff import HANDOFF_SCHEMA, MAX_HANDOFF_BYTES, freeze_handoff, import_archive
 
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _HARDWARE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
@@ -100,7 +100,7 @@ def read_config(path):
     for key in ("package_root", "output_root", "state_root"):
         config[key] = _root(config[key])
     _require(config["package_root"].is_dir(), "Package root does not exist")
-    from .handoffs import validate_handoff_roots
+    from ..sources.solidworks.handoff import validate_handoff_roots
 
     config["handoff_roots"] = validate_handoff_roots(config.get("handoff_roots"))
     settings = config.get("discovery", {})
@@ -241,7 +241,7 @@ class Jobs:
             source = confined(
                 self.config["handoff_roots"][0], path.rstrip("/") + "/.handoff-folder", exists=False
             ).parent
-        from .handoffs import authorize_handoff
+        from ..sources.solidworks.handoff import authorize_handoff
 
         source = authorize_handoff(source, self.config["handoff_roots"])
         package, identity = freeze_handoff(source, self.config["package_root"] / "imports")
@@ -266,7 +266,7 @@ class Jobs:
             "Invalid native handoff digest",
         )
         package = confined(self.config["package_root"], request["package"] + "/.handoff-folder", exists=False).parent
-        from .handoffs import describe_handoff
+        from ..sources.solidworks.handoff import describe_handoff
 
         identity = describe_handoff(package)
         _require(
@@ -353,7 +353,9 @@ class Jobs:
         with self.mutex:
             if identifier not in self.jobs:
                 raise RequestError("Unknown run_id", 404)
-            return json.loads(json.dumps(self.jobs[identifier]))
+            job = json.loads(json.dumps(self.jobs[identifier]))
+            job["stages"] = stage_view(job)
+            return job
 
     def _event(self, identifier, event):
         with self.mutex:
@@ -361,72 +363,26 @@ class Jobs:
             entry = dict(event)
             entry.setdefault("at", datetime.now(UTC).isoformat())
             job["events"].append(entry)
+            if isinstance(entry.get("discovery"), dict):
+                job["discovery"] = entry["discovery"]
             self._save(job)
 
     def _prepare_native(self, identifier, frozen):
-        """Discover semantics on the owned queue, then select a platform target."""
+        from ..steps import discover_structure
+
         job = self.jobs[identifier]
-        output = self.config["state_root"] / "prepared" / identifier
-
-        def event(item):
-            self._event(identifier, item)
-
-        event({"stage": "discover", "state": "running"})
-        preparer = self.native_preparer
-        settings = None
-        if preparer is None:
-            from ..sources.solidworks.discovery import DiscoverySettings, prepare_native_package
-
-            preparer = prepare_native_package
-            configured = self.config.get("discovery", {})
-            names = read_data(configured["frozen_names_file"]) if configured.get("frozen_names_file") else {}
-            _require(
-                isinstance(names, dict)
-                and all(isinstance(key, str) and isinstance(value, str) for key, value in names.items()),
-                "Frozen-name registry must map stable native identities to interface names",
-            )
-            settings = DiscoverySettings(record_roots=tuple(configured.get("record_roots", [])), frozen_names=names)
-        prepared = preparer(frozen, output, identifier, settings=settings, on_event=event)
+        package, target, prepared, files = discover_structure(
+            frozen, self.config["state_root"] / "prepared" / identifier, identifier,
+            expected_digest=job["request"]["handoff_sha256"], expected_files=job["package_files"],
+            configuration=self.config.get("discovery", {}), targets=self.config["targets"],
+            preparer=self.native_preparer,
+            on_event=lambda item: self._event(identifier, item),
+        )
         with self.mutex:
-            job["discovery"] = {
-                "passed": prepared.passed,
-                "findings": list(prepared.findings),
-                "hardware_id": prepared.hardware_id,
-                "revision": prepared.revision,
-                "discovery_sha256": prepared.discovery_sha256,
-            }
+            job.update(hardware_id=prepared.hardware_id, revision=prepared.revision,
+                       repository_slug=_origin_slug(target["repository"]), repository_base=target["base"],
+                       prepared_files=files)
             self._save(job)
-        _require(prepared.passed is True, "Native discovery has blocking findings; correct the engineering source")
-        _require(
-            prepared.handoff_sha256 == job["request"]["handoff_sha256"],
-            "Native discovery is bound to a different handoff",
-        )
-        package = Path(prepared.package).resolve()
-        _require(package.is_relative_to(output.resolve()), "Native preparation returned an unmanaged package")
-        discovery = Path(prepared.discovery_path).resolve()
-        _require(
-            discovery.is_relative_to(package) and file_digest(discovery) == prepared.discovery_sha256,
-            "Prepared inputs lack the bound raw native discovery record",
-        )
-        _require(package_inventory(frozen) == job["package_files"], "Frozen engineering changed during discovery")
-        for name, checksum in job["package_files"].items():
-            _require(file_digest(confined(package, name)) == checksum, "Native preparation changed engineering files")
-        revision = read_revision(package)
-        _require(
-            revision["hardware_id"] == prepared.hardware_id and revision["revision"] == prepared.revision,
-            "Generated revision differs from native discovery",
-        )
-        target = self.config["targets"].get(prepared.hardware_id)
-        _require(target is not None, f"Hardware {prepared.hardware_id!r} has no configured model repository")
-        with self.mutex:
-            job.update(
-                hardware_id=prepared.hardware_id,
-                revision=prepared.revision,
-                repository_slug=_origin_slug(target["repository"]),
-                repository_base=target["base"],
-            )
-            self._save(job)
-        event({"stage": "discover", "state": "completed"})
         return package, target
 
     def _work(self):
@@ -440,10 +396,12 @@ class Jobs:
                 with self.mutex:
                     job.update(status="running", started_at=datetime.now(UTC).isoformat())
                     self._save(job)
-                package = self.validate(job["request"])
-                _require(
-                    package_inventory(package) == job["package_files"], "Native inputs changed while the job was queued"
-                )
+                from ..steps import freeze_inputs
+
+                package = confined(self.config["package_root"], job["request"]["package"] + "/.handoff-folder",
+                                   exists=False).parent
+                freeze_inputs(package, job["request"]["handoff_sha256"], job["package_files"],
+                              on_event=lambda item, identifier=identifier: self._event(identifier, item))
                 package, target = self._prepare_native(identifier, package)
                 _require(
                     isinstance(job.get("repository_slug"), str)
@@ -462,6 +420,9 @@ class Jobs:
                     base=target["base"],
                     run_id=identifier,
                     on_event=lambda event, identifier=identifier: self._event(identifier, event),
+                    prior_events=list(job["events"]),
+                    expected_inputs=job["prepared_files"],
+                    handoff_sha256=job["request"]["handoff_sha256"],
                 )
                 with self.mutex:
                     job["result"] = result
@@ -494,6 +455,10 @@ class Jobs:
                             for check in quality.get("checks", [])
                         )
                     )
+                    if passed:
+                        from ..stages import require_complete
+
+                        require_complete(stage_view(job))
                     job.update(
                         status="passed" if passed else "failed",
                         error=None if passed else result.get("error") or "Incomplete or mismatched publication receipt",
@@ -507,6 +472,9 @@ class Jobs:
                         job["detail"] = error.details
             finally:
                 with self.mutex:
+                    if job["status"] == "failed" and (not job["events"] or job["events"][-1]["state"] != "failed"):
+                        phase = (job["events"][-1] if job["events"] else {}).get("stage", "freeze")
+                        self._event(identifier, {"stage": phase, "state": "failed", "error": job.get("error")})
                     job["completed_at"] = datetime.now(UTC).isoformat()
                     self._save(job)
                 self.queue.task_done()

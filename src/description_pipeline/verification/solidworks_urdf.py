@@ -109,14 +109,57 @@ class _Gates:
     def add(self, identifier, callback):
         try:
             details = callback() or {}
-            self.checks.append({"id": identifier, "passed": True, "details": details})
+            self.checks.append({"id": identifier, "state": "passed", "passed": True, "details": details})
             return details
         except Exception as error:
             details = {"error": f"{type(error).__name__}: {error}"}
             if isinstance(getattr(error, "details", None), dict):
                 details.update(error.details)
-            self.checks.append({"id": identifier, "passed": False, "details": details})
+            self.checks.append({"id": identifier, "state": "failed", "passed": False, "details": details})
             return None
+
+
+def required_checks(definition=None):
+    """Required independent gates, including every declared body, joint and frame."""
+    identifiers = {
+        "bundle.subject", "input.valid", "source.native_discovery", "tool.identity",
+        "source.integrity", "source.native", "model.schema", "source.raw",
+        "physics.mass_closure_equality", "source.dependencies", "source.coverage",
+        "verification.complete", "model.policy", "physics.independent", "frames.native",
+        "frames.components", "frames.references", "urdf.syntax_names", "urdf.topology",
+        "geometry.coverage", "geometry.assets", "geometry.expected_extent", "physics.expected_mass",
+        "consumer.urdf",
+    }
+    source = (definition or {}).get("source") or {}
+    for body in source.get("bodies", []):
+        identifiers.update(("inertia." + body["name"], "geometry." + body["name"]))
+    for joint in source.get("joints", []):
+        identifiers.add("joints." + joint["name"])
+        if joint["type"] != "fixed":
+            identifiers.add("shafts." + joint["name"])
+    identifiers.update("frames." + frame["name"] for frame in source.get("frames", []))
+    return sorted(identifiers)
+
+
+def require_qualified_report(report):
+    """Reject an incomplete/forged green flag before it can become a boundary pass."""
+    try:
+        _require(isinstance(report, dict), "Quality report must be an object")
+        rows = report.get("checks") or []
+        expected = report.get("required_checks") or []
+        _require(isinstance(rows, list) and isinstance(expected, list)
+                 and all(isinstance(row, dict) and isinstance(row.get("id"), str) for row in rows)
+                 and all(isinstance(name, str) for name in expected), "Quality gate inventory is malformed")
+        identifiers = {row["id"] for row in rows}
+        _require(report.get("passed") is True and bool(expected) and len(set(expected)) == len(expected)
+                 and set(required_checks()) <= set(expected)
+                 and set(expected) <= identifiers and len(identifiers) == len(rows)
+                 and all(row.get("state") == "passed" and row.get("passed") is True for row in rows),
+                 "URDF verification failed or required checks were not executed; see reports/quality.json")
+    except PipelineError as error:
+        error.details = report
+        raise
+    return report
 
 
 def _input(root):
@@ -474,6 +517,12 @@ def evaluate_bundle(root: Path) -> dict:
         source = definition["source"]
         gates.add("source.coverage", lambda: _entities(source, raw, model))
         gates.add("verification.complete", lambda: _verify_model(root, gates, definition, model, raw))
+    required = required_checks(definition)
+    observed = {check["id"] for check in gates.checks}
+    for identifier in required:
+        if identifier not in observed:
+            gates.checks.append({"id": identifier, "state": "not_run", "passed": False,
+                                 "details": {"reason": "A required prerequisite failed; this check was not executed"}})
     # Large internal inputs are read by later gates, not copied into the report.
     internal = {
         "input.valid",
@@ -496,6 +545,7 @@ def evaluate_bundle(root: Path) -> dict:
         "subject_status": "bound" if subject else "unavailable",
         "passed": bool(gates.checks) and all(check["passed"] for check in gates.checks),
         "checks": gates.checks,
+        "required_checks": required,
     }
 
 
@@ -685,6 +735,7 @@ def check_bundle(root: Path) -> dict:
         saved = read_data(confined(Path(root), "reports/quality.json"))
         _require(saved == report, "Saved quality report differs from recomputation")
     except (OSError, ValueError) as error:
-        report["checks"].append({"id": "report.binding", "passed": False, "details": {"error": str(error)}})
+        report["checks"].append({"id": "report.binding", "state": "failed", "passed": False,
+                                 "details": {"error": str(error)}})
         report["passed"] = False
     return report

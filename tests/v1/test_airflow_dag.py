@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tests.v1._airflow_env import pinned_airflow_home
 
@@ -63,6 +65,69 @@ class DagTests(unittest.TestCase):
         handoff_param = dict(dag.params.items())["handoff_path"]
         self.assertEqual(handoff_param.schema["title"], "Engineering folder path")
         self.assertEqual(handoff_param.schema["type"], "string")
+        from description_pipeline.stages import contract_markdown
+
+        self.assertIn(contract_markdown(), dag.doc_md)
+        self.assertTrue(all(task.doc_md for task in dag.tasks))
+
+    def _module(self):
+        spec = importlib.util.spec_from_file_location("test_solidworks_dag", DAG_DIR / "solidworks_to_urdf.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        self.addCleanup(sys.modules.pop, spec.name, None)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_failure_stores_terminal_checks_before_raising_and_progress_logs_only_changes(self):
+        from types import SimpleNamespace
+        from airflow.sdk.exceptions import AirflowFailException
+        from tests.v1.protocol_support import protocol_events
+
+        module = self._module()
+        request = {"run_id": "protocol-control", "package": "control", "handoff_sha256": "b" * 64, "conn_id": "test"}
+        job = {"request": {key: request[key] for key in ("run_id", "package", "handoff_sha256")},
+               "run_id": request["run_id"], "status": "running", "events": protocol_events(stages=("freeze",))}
+
+        class TaskInstance:
+            def __init__(self):
+                self.values = {}
+
+            def xcom_pull(self, *, task_ids, key):
+                return self.values.get(key)
+
+            def xcom_push(self, *, key, value):
+                self.values[key] = value
+
+        ti = TaskInstance()
+        with patch.object(module, "_endpoint", return_value=SimpleNamespace(get_job=lambda _: job)):
+            with self.assertLogs(module.log.name, level="INFO") as first:
+                self.assertFalse(module._poke(request, ti=ti))
+            with self.assertLogs(module.log.name, level="INFO") as unchanged:
+                self.assertFalse(module._poke(request, ti=ti))
+            self.assertEqual(sum("engineering stage=" in line for line in first.output), 6)
+            self.assertFalse(any("engineering stage=" in line for line in unchanged.output))
+            job.update(status="failed", error="Native control failed", events=protocol_events(failed_stage="capture"))
+            with self.assertLogs(module.log.name, level="INFO") as terminal, self.assertRaises(AirflowFailException):
+                module._poke(request, ti=ti)
+            stages = {row["id"]: row["state"] for row in ti.values["engineering_stages"]["stages"]}
+            self.assertEqual(stages["capture"], "failed")
+            self.assertEqual(stages["generate"], "blocked")
+            self.assertEqual(sum("engineering result=" in line for line in terminal.output), 6)
+
+    def test_terminal_summary_without_task_instance_warns_and_never_crashes(self):
+        from types import SimpleNamespace
+        from tests.v1.protocol_support import protocol_events
+
+        module = self._module()
+        request = {"run_id": "protocol-control", "package": "control", "handoff_sha256": "b" * 64, "conn_id": "test"}
+        job = {"request": {key: request[key] for key in ("run_id", "package", "handoff_sha256")},
+               "run_id": request["run_id"], "status": "passed", "events": protocol_events(subject="c" * 64)}
+        with (
+            patch.object(module, "_endpoint", return_value=SimpleNamespace(get_job=lambda _: job)),
+            self.assertLogs(module.log.name, level="WARNING") as captured,
+        ):
+            self.assertTrue(module._poke(request, ti=None))
+        self.assertTrue(any("XCom was not stored" in line for line in captured.output))
 
     def test_dag_run_against_mock_endpoint(self) -> None:
         from tests.v1.test_airflow_client import MockEndpoint

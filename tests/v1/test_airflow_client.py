@@ -16,6 +16,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 from urllib import parse as urlparse
 
+from tests.v1.protocol_support import protocol_events
+
 from description_pipeline.orchestration.airflow_client import (
     EndpointAuthError,
     EndpointConfig,
@@ -193,6 +195,7 @@ class MockEndpoint:
                             "revision": "r1",
                             "discovery_sha256": "d" * 64,
                         }
+                        job["events"] = protocol_events(failed_stage="discover")
                     elif job["pokes"] >= 2:
                         job["status"] = "passed"
                         result = {
@@ -216,6 +219,7 @@ class MockEndpoint:
                         if outer.omit_submission:
                             result["submission"] = {"passed": False, "subject_sha256": SHA}
                         job["result"] = result
+                        job["events"] = protocol_events(subject=SHA)
                     else:
                         job["status"] = "running"
                     event = (
@@ -420,7 +424,7 @@ class ClientTests(unittest.TestCase):
                 endpoint.read_artifact(RUN_ID, "urdf/robot.urdf", sha256=SHA, limit=4)
 
     def _stub_archive(self, digest: str = "b" * 64):
-        from description_pipeline.orchestration import handoffs as handoffs_module
+        from description_pipeline.sources.solidworks import handoff as handoffs_module
 
         self.archived_sources: list[Path] = []
 

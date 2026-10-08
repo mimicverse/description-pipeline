@@ -15,8 +15,9 @@ Open the single HTTPS address provided by the platform maintainer.
    [mechanical specification](docs/mechanical-handoff-spec.md).
 2. Sign in with Feishu, select its accessible engineering-folder path,
    and start the run.
-3. Review progress and findings, inspect the verified URDF and joint limits,
-   and open the PR for engineering approval.
+3. Review the six steps and their input/output checks (pending confirmations and
+   per-stage unsupported items stay visible), inspect the verified URDF and joint
+   limits, and open the PR for engineering approval.
 
 Mechanical engineers provide SolidWorks files and engineering facts. Robot
 YAML, version manifests, model artifacts and reports are generated. Corrections
@@ -34,7 +35,9 @@ the platform maintainer.
 ## Delivery
 
 The self-contained delivery contains `urdf/robot.urdf`, `meshes/`, frozen
-engineering, raw evidence, the canonical model, and bound quality reports.
+engineering, raw evidence, the canonical model and bound quality reports.
+`reports/stages.json` records each step's inputs, checks, outputs and evidence,
+and which steps actually ran.
 With the recorded tool environment installed, recheck it on Linux or Windows:
 
 ```sh

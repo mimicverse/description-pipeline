@@ -1132,7 +1132,16 @@ def inspect_package(path: Path) -> dict[str, Any]:
 def load_package(path: Path) -> dict[str, Any]:
     """Load one static v1 package or raise ``PipelineError`` with all findings."""
 
-    inspection = inspect_package(path)
+    return resolve_package(inspect_package(path))
+
+
+def resolve_package(inspection: dict[str, Any]) -> dict[str, Any]:
+    """Resolve an inspected definition only while its original file receipt still matches.
+
+    Capture uses this result, rather than inspecting again and potentially
+    consuming different inputs from those retained in its inspection report.
+    """
+
     if not inspection["passed"]:
         errors = inspection.get("errors") or []
         message = "; ".join(f"{item['code']}: {item['message']}" for item in errors[:8])

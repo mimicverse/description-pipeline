@@ -8,6 +8,8 @@ const state = {
   dagRunId: null,
   previewSubject: null,
   previewRequest: null,
+  previewFiles: null,
+  lastRun: null,
   viewer: null,
   controls: null,
   timer: null,
@@ -33,20 +35,14 @@ const TASK_STATES = {
   none: "待执行",
   completed: "完成",
 };
-const STAGES = {
-  resolve_handoff: "冻结素材",
-  validate_request: "检查素材",
-  start_job: "开始执行",
-  wait_for_job: "等待结果",
-  confirm_job: "确认结果",
-  discover: "读取工程定义",
-  inspect: "检查输入",
-  capture: "采集 CAD",
-  build: "生成模型",
-  generate: "生成模型",
-  verify: "独立验证",
-  submit: "提交 PR",
+const TRANSPORT = {
+  resolve_handoff: "接收目录",
+  start_job: "提交作业",
+  wait_for_job: "查询作业",
+  confirm_job: "确认交付",
 };
+const CHECK_STATES = { passed: "通过", failed: "失败", not_run: "未执行", unsupported: "不支持" };
+const STAGE_STATES = { not_run: "未执行", running: "执行中", completed: "完成", failed: "失败", blocked: "上游阻断" };
 const AUTOMATIC_STATES = {
   passed: "自动校验通过",
   failed: "自动校验失败",
@@ -126,6 +122,7 @@ function clearPreview() {
   if (state.previewRequest) state.previewRequest.abort();
   state.previewRequest = null;
   state.previewSubject = null;
+  state.previewFiles = null;
   state.controls = null;
   if (state.viewer) disposeRobot(state.viewer);
   $("viewer-card").hidden = true;
@@ -139,6 +136,7 @@ function clearSession() {
   state.csrf = null;
   state.user = null;
   state.dagRunId = null;
+  state.lastRun = null;
   if (state.timer) window.clearInterval(state.timer);
   state.timer = null;
   $("workspace").hidden = true;
@@ -178,6 +176,35 @@ async function refreshRuns() {
 }
 
 function renderRun(run) {
+  const runId = String(run.dag_run_id || "");
+  const authorized = state.previewFiles || {};
+  const artifactUrl = (name) =>
+    `/api/runs/${encodeURIComponent(runId)}/artifacts/${String(name)
+      .split("/")
+      .map(encodeURIComponent)
+      .join("/")}`;
+  const authorizedDigest = (path, hash) =>
+    Boolean(hash) && Object.prototype.hasOwnProperty.call(authorized, path) && authorized[path] === hash;
+  const reference = (path, hash) => {
+    const line = document.createElement("p");
+    if (authorizedDigest(path, hash)) {
+      const link = document.createElement("a");
+      link.href = artifactUrl(path);
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.textContent = path;
+      line.append(link);
+    } else {
+      line.append(document.createTextNode(path));
+      line.title = "引用与明细；仅已验证且摘要绑定的 URDF／网格资产提供下载";
+    }
+    if (hash) {
+      const digest = document.createElement("code");
+      digest.textContent = hash;
+      line.append(" ", digest);
+    }
+    return line;
+  };
   const meta = $("run-meta");
   meta.textContent = "";
   const rows = [
@@ -200,22 +227,104 @@ function renderRun(run) {
   for (const task of run.tasks || []) {
     const chip = document.createElement("span");
     chip.className = `chip ${task.state || ""}`.trim();
-    chip.textContent = `${STAGES[task.task_id] || task.task_id}：${TASK_STATES[task.state] || task.state || "—"}`;
+    chip.textContent = `${TRANSPORT[task.task_id] || task.task_id}：${TASK_STATES[task.state] || task.state || "—"}`;
     progress.append(chip);
   }
 
   const stages = $("stages");
   stages.textContent = "";
-  const stageRows = run.stages || [];
-  if (!stageRows.length) {
-    const item = document.createElement("li");
-    item.className = "muted";
-    item.textContent = run.job ? "等待阶段事件" : "CAD 作业尚未开始";
-    stages.append(item);
-  }
-  for (const stage of stageRows) {
-    const item = document.createElement("li");
-    item.textContent = `${STAGES[stage.stage] || stage.stage || "阶段"} · ${TASK_STATES[stage.state] || stage.state || ""} · ${formatTime(stage.at)}`;
+  for (const [index, stage] of ((run.stage_view && run.stage_view.stages) || []).entries()) {
+    const item = document.createElement("section");
+    item.className = `stage-card ${stage.state}`;
+    const heading = document.createElement("h4");
+    heading.textContent = `${index + 1}. ${stage.name_zh || stage.name} · ${STAGE_STATES[stage.state] || stage.state} · ${stage.checks_passed}/${stage.checks_total} 项`;
+    item.append(heading);
+    if (stage.error) {
+      const error = document.createElement("p");
+      error.className = "error";
+      error.textContent = stage.error;
+      item.append(error);
+      if (stage.diagnostic) {
+        const evidence = document.createElement("pre");
+        evidence.textContent = JSON.stringify(stage.diagnostic, null, 2);
+        expandable(item, "失败诊断").append(evidence);
+      }
+    }
+    const grid = document.createElement("div");
+    grid.className = "stage-boundaries";
+    for (const [key, title] of [["inputs", "输入"], ["input_qc", "输入质检"], ["outputs", "输出"], ["output_qc", "输出质检"]]) {
+      const column = document.createElement("div");
+      const label = document.createElement("strong");
+      label.textContent = title;
+      column.append(label);
+      for (const row of stage[key]) {
+        const line = document.createElement("p");
+        line.textContent = row.label;
+        column.append(line);
+        if (row.state) {
+          line.append(" ", badge(CHECK_STATES[row.state] || row.state, row.state === "passed" ? "ok" : row.state === "failed" ? "bad" : "pending"));
+          const detail = expandable(column, `${row.id} · 结果与证据`);
+          const checks = row.details && (row.details.checks || (row.details.diagnostic && row.details.diagnostic.checks));
+          if (checks) {
+            for (const check of checks) {
+              const child = expandable(detail, `${check.id} · ${CHECK_STATES[check.state] || "未报告"}`);
+              const evidence = document.createElement("pre");
+              evidence.textContent = JSON.stringify(check.details || {}, null, 2);
+              child.append(evidence);
+            }
+          } else {
+            const evidence = document.createElement("pre");
+            evidence.textContent = JSON.stringify(row.details || {}, null, 2);
+            detail.append(evidence);
+          }
+        } else {
+          const files = Object.entries(row.files || {});
+          const info = document.createElement("p");
+          info.className = "muted";
+          info.textContent = `${row.path} · ${row.class} · ${files.length ? `${files.length} 个文件` : "尚无文件记录"}`;
+          column.append(info);
+          if (files.length) {
+            const detail = expandable(column, "文件与 SHA-256");
+            const list = document.createElement("div");
+            list.className = "stage-files";
+            for (const [path, hash] of files) list.append(reference(path, hash));
+            detail.append(list);
+          }
+        }
+      }
+      grid.append(column);
+    }
+    item.append(grid);
+    const evidencePaths = (stage.evidence || []).filter((path) => typeof path === "string" && path);
+    if (evidencePaths.length) {
+      const evidenceRow = document.createElement("div");
+      evidenceRow.className = "stage-evidence muted";
+      evidenceRow.append("契约证据引用：");
+      evidencePaths.forEach((path, position) => {
+        if (position) evidenceRow.append("、");
+        evidenceRow.append(reference(path, authorized[path]));
+      });
+      item.append(evidenceRow);
+    }
+    const unsupported = (stage.unsupported || []).filter((item) => item && item.label);
+    if (unsupported.length) {
+      const row = document.createElement("div");
+      row.className = "stage-unsupported muted";
+      row.append("未支持项（工程确认后才能关闭，不代表通过）：");
+      for (const item of unsupported) {
+        const chip = document.createElement("span");
+        chip.className = "chip pending";
+        chip.textContent = `${item.label} · 不支持/待工程确认`;
+        row.append(" ", chip);
+      }
+      item.append(row);
+    }
+    if (stage.confirmations.length) {
+      const pending = document.createElement("p");
+      pending.className = "muted";
+      pending.textContent = `工程确认（在本版本 PR／受控记录中完成）：${stage.confirmations.map((row) => row.label).join("、")} · 待确认`;
+      item.append(pending);
+    }
     stages.append(item);
   }
 
@@ -235,7 +344,7 @@ function renderRun(run) {
   for (const check of checks) {
     const chip = document.createElement("span");
     chip.className = `chip ${check.passed === false ? "failed" : check.passed === true ? "success" : ""}`.trim();
-    chip.textContent = `${check.id || "检查"}：${check.passed === false ? "未通过" : check.passed === true ? "通过" : "未报告"}`;
+    chip.textContent = `${check.id || "检查"}：${CHECK_STATES[check.state] || "未报告"}`;
     allChecks.append(chip);
   }
 
@@ -350,6 +459,8 @@ async function loadPreview(dagRunId) {
     if (request.signal.aborted || state.dagRunId !== dagRunId) return;
     state.controls = buildJointControls($("joint-controls"), loaded.joints, {});
     state.previewSubject = preview.subject_sha256;
+    state.previewFiles = preview.files || {};
+    if (state.lastRun) renderRun(state.lastRun);
     $("viewer-card").hidden = false;
     state.viewer.frame();
   } catch (error) {
@@ -357,6 +468,8 @@ async function loadPreview(dagRunId) {
     if (state.viewer) disposeRobot(state.viewer);
     state.controls = null;
     state.previewSubject = null;
+    state.previewFiles = null;
+    if (state.lastRun) renderRun(state.lastRun);
     $("joint-controls").textContent = "";
     $("viewer-card").hidden = false;
     if (error.status === 404 || error.status === 409) {
@@ -378,15 +491,15 @@ async function poll() {
     const run = await api(`/api/runs/${encodeURIComponent(dagRunId)}`);
     if (state.dagRunId !== dagRunId) return;
     setError($("run-error"), "");
+    const verified = run.automatic && run.automatic.state === "passed";
+    if (!verified) clearPreview();
+    state.lastRun = run;
     renderRun(run);
-    if (run.automatic && run.automatic.state === "passed") {
+    if (verified) {
       await loadPreview(dagRunId);
-    } else {
-      clearPreview();
     }
     if (state.dagRunId !== dagRunId) return;
     const jobDone = run.job && (run.job.status === "passed" || run.job.status === "failed");
-    const verified = run.automatic && run.automatic.state === "passed";
     if ((run.state === "success" || run.state === "failed") && jobDone && (!verified || state.previewSubject)) {
       if (state.timer) window.clearInterval(state.timer);
       state.timer = null;
@@ -408,6 +521,7 @@ async function selectRun(dagRunId) {
   state.timer = null;
   clearPreview();
   state.dagRunId = dagRunId;
+  state.lastRun = null;
   $("detail-card").hidden = false;
   await refreshRuns();
   if (state.dagRunId !== dagRunId) return;

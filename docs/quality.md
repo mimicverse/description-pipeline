@@ -7,11 +7,35 @@ a failure. There is no public bypass or waiver switch.
 Native SolidWorks engineering is the input. Generated YAML is an internal
 artifact and must be verified against original native observations.
 
+## Step and result contract
+
+The [six-step architecture](design.md#2-how-the-system-works) owns the execution
+boundaries. Each step records input QC and output QC; generation-input inspection
+belongs to capture. Independent verification repeats the engineering checks against
+frozen evidence and actual files rather than trusting earlier success flags.
+
+| Result | States and meaning |
+|---|---|
+| Step | `not_run`, `running`, `completed`, `failed`, `blocked`; completed requires every boundary check to pass |
+| Automatic check | `passed`, `failed`, `not_run`; missing prerequisites leave a required check unexecuted and prevent qualification |
+| Unsupported check | `unsupported`, with its scope and responsible stage stated; it is never an automatic pass |
+| Engineering confirmation | `pending` on the page under its `review_stage` (a UI anchor for the responsible step, not an execution stage); approval is recorded in the matching subject-bound PR or controlled engineering record |
+
+`quality.json` records the required gate inventory and every executed or unexecuted
+gate. `stages.json` records boundary results, inputs/outputs, file hashes and
+responsibility references. Airflow task logs retain detailed terminal results,
+including failures; XCom retains the compact stage summary. Automatic publication
+creates a candidate PR and cannot set an engineering-approved release state.
+Each receipt declares its `execution_scope`: a complete endpoint job covers all
+six stages, while maintenance generation/verification runs cover only the stages
+they execute ([operations](operations.md#6-independent-review-and-recovery));
+unexecuted native stages are shown as out of scope rather than qualified.
+
 ## Verification gates
 
 Implementation paths below are relative to `src/description_pipeline/`.
 
-| Gate | Evidence and acceptance | Implementation |
+| Gate | Independent evidence and acceptance | Implementation |
 |---|---|---|
 | Derived-input contract | Reinspect generated YAML, native provenance, controlled records, inventories and generated revision | `sources/solidworks/input.py`, `revision.py` |
 | Native definition | Independently reconstruct membership, adjacency, motion, names, frames and limits from native observations; required gate `source.native_discovery` | `verification/native_discovery.py` |
@@ -101,7 +125,10 @@ The subject digest binds every file under `input/`, `evidence/`, `model/`,
 `urdf/`, `meshes/`, plus `README.md`, `reports/input.json` and
 `reports/tool.json`. The quality report refers to that subject and cannot hash
 itself. Local run/PR receipts are also outside the subject and are not published
-as model evidence.
+as model evidence. `reports/stages.json` is also a run receipt: it records
+the subject and contract hashes, and its own file hash is retained in
+`reports/run.json`. It stays outside the subject to avoid circular hashes and
+post-publication changes to model evidence.
 
 `description check` recomputes every gate and compares the entire deterministic
 report. A stale green flag, incomplete check set or changed file cannot qualify.
@@ -126,48 +153,36 @@ Unit tests with mocked CAD cannot grant native qualification. The release review
 must include actual Windows capture and a complete passing delivery.
 
 Acceptance on the neutral analytic fixture qualifies the tool behaviors it
-exercises. It does not qualify M3 or another hardware model; each model needs
+exercises. It does not qualify a specific hardware model; each model needs
 its own reviewed inputs, passing delivery and evidence for its intended use.
 
 ## Native definition verification
 
-The mechanical team supplies only SolidWorks engineering contents under the
-[mechanical specification](mechanical-handoff-spec.md). The pipeline
-generates definitions, manifests and evidence, and records a source for every
-derived mechanical fact.
-
-Independent verification checks body membership, joint adjacency/type,
-signed axes, zero configuration, datum placement and limits against original
-native observations and engineering annotations. Merely validating generated
-YAML against a schema or comparing two derivatives does not prove these facts.
+The [mechanical specification](mechanical-handoff-spec.md) owns the handoff
+requirements, naming and engineering confirmations. Definitions, manifests and
+reports are generated; every derived mechanical fact keeps its source.
 
 Native admission reconstructs supported coincident, concentric, distance,
-parallel, perpendicular, angle and lock constraints, including recorded position
-limits. Their combined six-dimensional constraint space must establish rigid
-membership or exactly one supported relative motion. A temporary fixed flag or
-a mate name is insufficient. Unresolved entities, unsupported constraints,
-ambiguous motion and a topology that cannot form a tree block derivation.
+parallel, perpendicular, angle and lock constraints, including position limits.
+Their combined six-dimensional constraint space must establish rigid membership
+or one supported relative motion. Temporary fixed flags and mate names cannot
+establish motion. Unresolved entities, unsupported constraints, ambiguous motion
+and non-tree topology block derivation.
 
-The capture path requires a rereadable cylindrical interface for each motion
-axis. Named axes alone do not qualify this capture path. Body frames must be
-owned native `CS_<link>` datums, with `CS_base_link` identifying the root.
-The child body frame supplies its incoming joint frame; a separate JCS must
-match it and have the same owner. Recognized installation, TCP and sensor
-datums retain their exact interface names and owning bodies. Positive motion
-requires the explicit native `axis_sign` property; vendor cylinder orientation
-does not establish it.
+Capture requires a rereadable cylindrical interface for each motion axis.
+Named axes alone do not qualify this capture path. Owned `CS_<link>` datums
+identify body frames and `CS_base_link` the root; an optional JCS must match its
+child body frame and owner. Native `axis_sign` supplies the confirmed positive
+direction. Installation, TCP and sensor datums retain their interface names and
+owners.
 
-Drive and physical specifications must resolve to fixed controlled records or
-qualified native engineering properties. Missing, conflicting or ambiguous
-facts block the delivery/use that requires them; no fabricated limits, default
-efforts or guessed directions are acceptable. Source and library revisions,
-original units, transformations and provenance remain bound to the delivery.
+Independent verification reconstructs membership, joint adjacency/type, signed
+axes, zero configuration, datum placement and limits from native observations
+and engineering annotations. Comparing generated YAML with a model does not
+establish these facts. Controlled physical and drive records must be fixed,
+retrievable and applicable to the engineering revision.
 
-The per-item report distinguishes automatic results from engineering
-confirmations as specified in [the mechanical standard](mechanical-handoff-spec.md#112-检查报告与-airflow-展示).
-Each confirmation applies to the recorded structural version; missing,
-unsupported or unexecuted checks cannot become implicit passes.
-
-Effective native mass, COM or inertia overrides are rejected. A controlled
-parameter source must satisfy the complete physical contract; recording a
-source does not waive verification.
+Effective native mass, COM and inertia overrides are rejected. Complete physical
+source records remain subject to independent checks. The
+[per-item responsibility table](mechanical-handoff-spec.md#111-自动检查与工程师确认)
+separates automatic coverage from engineer-confirmed physical meaning.

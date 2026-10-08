@@ -23,6 +23,8 @@ from description_pipeline.orchestration.airflow_client import (
     native_run_id,
     resolved_routing,
 )
+from description_pipeline.stages import compact_view, contract_markdown, require_complete, stage_log, stage_view
+from description_pipeline.io import digest
 
 DAG_ID = "solidworks_to_urdf"
 CONN_ID = os.environ.get("SOLIDWORKS_ENDPOINT_CONN_ID", "solidworks_windows")
@@ -47,7 +49,7 @@ def _resolution(request: dict) -> HandoffResolution:
     )
 
 
-def _poke(request: dict) -> bool:
+def _poke(request: dict, **context) -> bool:
     job = _endpoint(request["conn_id"]).get_job(request["run_id"])
     _same_request(job, request)
     latest = job["events"][-1] if job["events"] else {}
@@ -58,6 +60,23 @@ def _poke(request: dict) -> bool:
         latest.get("stage"),
         latest.get("state"),
     )
+    stages = stage_view(job)
+    ti = context.get("ti")
+    progress = digest(compact_view(stages))
+    if ti is None or ti.xcom_pull(task_ids="wait_for_job", key="engineering_progress") != progress:
+        for stage in stages["stages"]:
+            log.info("engineering stage=%s state=%s input_qc=%s output_qc=%s", stage["id"], stage["state"],
+                     [(item["id"], item["state"]) for item in stage["input_qc"]],
+                     [(item["id"], item["state"]) for item in stage["output_qc"]])
+        if ti is not None:
+            ti.xcom_push(key="engineering_progress", value=progress)
+    if job["status"] in {"passed", "failed"}:
+        for row in stage_log(stages):
+            log.info("engineering result=%s", row)
+        if ti is not None:
+            ti.xcom_push(key="engineering_stages", value=compact_view(stages))
+        else:
+            log.warning("Terminal engineering summary has no task instance; XCom was not stored")
     if job["status"] == "failed":
         result = job.get("result") or {}
         log.error("native diagnostics=%s events=%s", result.get("diagnostic_path"), job["events"])
@@ -78,6 +97,15 @@ def _same_request(job: dict, request: dict) -> None:
     catchup=False,
     tags=["solidworks", "urdf", "windows"],
     default_args={"retries": 2, "retry_delay": timedelta(seconds=15)},
+    doc_md=(
+        "# SolidWorks to URDF\n\nSix engineering stages execute in one serialized Windows job. "
+        "The graph below transports that job; polling is not an engineering stage.\n\n"
+        + contract_markdown()
+        + "\n\nRun results: `wait_for_job` logs every stage and terminal QC details, including failures. "
+        "Its `engineering_stages` XCom contains the terminal summary. The operator page shows "
+        "inputs, checks, outputs and evidence per stage; `reports/stages.json` retains the detailed receipt. "
+        "Engineering confirmations remain pending until approved in the bound review records."
+    ),
     params={
         "handoff_path": Param(
             "",
@@ -91,7 +119,7 @@ def _same_request(job: dict, request: dict) -> None:
     },
 )
 def solidworks_to_urdf():
-    @task
+    @task(doc_md="Collect the admitted native folder and bind its file inventory for the queued engineering job.")
     def resolve_handoff(**context) -> dict:
         handoff_path = str(context["params"]["handoff_path"]).strip()
         if not handoff_path:
@@ -112,7 +140,7 @@ def solidworks_to_urdf():
             "conn_id": CONN_ID,
         }
 
-    @task
+    @task(doc_md="Submit the same UUID and frozen handoff to the serial Windows queue; retries never replay CAD.")
     def start_job(request: dict) -> dict:
         job = _endpoint(request["conn_id"]).start_job(
             run_id=request["run_id"],
@@ -121,7 +149,7 @@ def solidworks_to_urdf():
         log.info("started run_id=%s status=%s", job["run_id"], job["status"])
         return {**request, "status": job["status"]}
 
-    @task
+    @task(doc_md="Confirm all six engineering stages and the verified candidate PR; return the bound stage summary.")
     def confirm_job(request: dict) -> dict:
         job = _endpoint(request["conn_id"]).get_job(request["run_id"])
         _same_request(job, request)
@@ -141,6 +169,8 @@ def solidworks_to_urdf():
             expected_slug=routing["repository_slug"],
             expected_base=routing["repository_base"],
         )
+        stages = stage_view(job)
+        require_complete(stages)
         log.info(
             "published run_id=%s quality=%s submission=%s",
             request["run_id"],
@@ -151,8 +181,8 @@ def solidworks_to_urdf():
             "run_id": request["run_id"],
             "pipeline_id": result["pipeline_id"],
             "handoff": handoff,
-            "events": job["events"],
-            "quality": result["quality"],
+            "stages": compact_view(stages),
+            "quality": {key: result["quality"].get(key) for key in ("passed", "subject_sha256")},
             "submission": result["submission"],
         }
 
@@ -165,6 +195,8 @@ def solidworks_to_urdf():
         mode=SENSOR_MODE,
         poke_interval=POLL_INTERVAL,
         timeout=POLL_TIMEOUT,
+        doc_md=("Transport polling only. Engineering stage/QC results are in these logs "
+                "and the engineering_stages XCom."),
     )
     confirm = confirm_job(started)
     wait_for_job >> confirm

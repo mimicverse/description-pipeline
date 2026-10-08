@@ -35,6 +35,7 @@ from urllib import parse as urlparse
 from urllib import request as urlrequest
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
+from ..stages import CONTRACT, stage_view
 from .airflow_client import (
     EndpointConfig,
     EndpointError,
@@ -424,7 +425,8 @@ def _findings(job: dict | None) -> list[dict]:
         )
     if job.get("error"):
         findings.append(
-            {"id": "", "severity": "error", "stage": "", "object": "", "message": str(job["error"]), "evidence": {}}
+            {"id": "", "severity": "error", "stage": (job.get("events") or [{}])[-1].get("stage", ""),
+             "object": "", "message": str(job["error"]), "evidence": job.get("detail") or result.get("detail") or {}}
         )
     quality = result.get("quality")
     if isinstance(quality, dict):
@@ -434,10 +436,11 @@ def _findings(job: dict | None) -> list[dict]:
                     {
                         "id": str(check.get("id") or ""),
                         "severity": "error",
-                        "stage": "自动检查",
+                        "stage": "verify",
                         "object": str(check.get("object") or ""),
-                        "message": str(check.get("details") or check.get("error") or "自动检查未通过"),
-                        "evidence": {},
+                        "message": str((check.get("details") or {}).get("error")
+                                       or (check.get("details") or {}).get("reason") or "自动检查未通过"),
+                        "evidence": check.get("details") or {},
                     }
                 )
     return findings
@@ -489,30 +492,6 @@ def _automatic_summary(job: dict | None) -> dict:
 #: Canonical responsibility rows of docs/mechanical-handoff-spec.md §11.1. The automatic column
 #: below mirrors only the spec's explicit coverage statements; every engineering item stays
 #: pending until the review PR/native controlled records carry the confirmation for this version.
-MECHANICAL_CHECKS = (
-    "范围与身份",
-    "版本留存",
-    "文件依赖",
-    "重建与保存",
-    "配置与实例",
-    "刚体归属",
-    "拓扑与配合",
-    "轴线与基准",
-    "零位与正向",
-    "工作范围",
-    "干涉与间隙",
-    "工具与传感器",
-    "驱动规格",
-    "物理属性",
-    "独立依据",
-    "几何与引用",
-)
-UNSUPPORTED_AUTOMATIC = (
-    "干涉与间隙：全行程干涉、碰撞及制造公差验算",
-    "命名契约的剩余人工项（第 2 节术语与物料号身份绑定、跨版本改名对应关系）",
-)
-
-
 def _coverage_report(job: dict | None) -> dict:
     """Per-item canonical check state bound to the native structural identity of this run."""
     job = job if isinstance(job, dict) else {}
@@ -528,12 +507,14 @@ def _coverage_report(job: dict | None) -> dict:
         },
         "automatic": {
             "state": "unsupported-present",
-            "unsupported": list(UNSUPPORTED_AUTOMATIC),
+            "unsupported": [item["label"] for item in CONTRACT["unsupported"]],
             "message": "其余检查项按已发布的自动校验执行；未覆盖项必须由工程师确认。",
         },
         "engineering": {
             "state": "pending",
-            "items": [{"id": name, "state": "pending"} for name in MECHANICAL_CHECKS],
+            "items": [{"id": item["label"], "review_stage": item["review_stage"], "state": "pending",
+                       "subject_sha256": result.get("subject_sha256"), "reference": item["reference"]}
+                      for item in CONTRACT["confirmations"]],
             "message": "工程确认由结构负责人在本版本原生工程及评审 PR 中完成，本页只显示逐项待确认状态。",
         },
     }
@@ -816,7 +797,7 @@ class PortalApp:
                     "revision": job["discovery"].get("revision"),
                     "discovery_sha256": job["discovery"].get("discovery_sha256"),
                 },
-                "stages": [] if job is None else _stages(job),
+                "stage_view": stage_view(job),
                 "findings": _findings(job),
                 "automatic": _automatic_summary(job),
                 "coverage": _coverage_report(job),
@@ -941,21 +922,6 @@ class PortalApp:
         if not isinstance(payload, dict):
             raise PortalError(HTTPStatus.BAD_REQUEST, "请求内容不是 JSON 对象")
         return payload
-
-
-def _stages(job: dict) -> list[dict]:
-    stages = []
-    for event in job.get("events") or []:
-        if not isinstance(event, dict):
-            continue
-        stages.append(
-            {
-                "stage": str(event.get("stage") or ""),
-                "state": str(event.get("state") or ""),
-                "at": str(event.get("at") or ""),
-            }
-        )
-    return stages
 
 
 def _parse_cookies(header: str | None) -> dict[str, str]:

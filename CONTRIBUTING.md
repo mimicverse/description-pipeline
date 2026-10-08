@@ -53,6 +53,9 @@ The [design](docs/design.md) owns architecture, [operations](docs/operations.md)
 owns the end-to-end workflow, [deployment](docs/deployment.md) owns availability
 and configuration, and [quality](docs/quality.md) owns verification claims.
 
+The six-stage contract is `src/description_pipeline/stage-contract.json`; the
+generated table in the design document must match `contract_markdown()`.
+
 Do not commit real robot/CAD data, credentials, workstation state or build
 outputs to this public repository. Neutral fixtures are synthetic and cannot
 grant hardware qualification. Tool publication follows the

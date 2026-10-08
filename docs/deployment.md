@@ -13,7 +13,7 @@ and maintenance; [operations](operations.md) owns the engineering workflow.
 | Host or service | Required preparation |
 |---|---|
 | Linux | Ubuntu 22.04 x86_64, user-level systemd, network access to the Windows worker, GitHub and Feishu |
-| Windows | Qualified SolidWorks version (tested with 2026), Python 3.12 x86_64, Git, GitHub CLI and OpenSSH Server; an interactive desktop session |
+| Windows | SolidWorks 2026 (native major 34; other versions require platform acceptance first), Python 3.12 x86_64, Git, GitHub CLI and OpenSSH Server; an interactive desktop session |
 | Model repository | Private repository, an existing `feature/<hardware>` base and a dedicated clean Windows clone |
 | Feishu | Enterprise app, approved tenant keys, registered OAuth callback and access to basic user identity/profile |
 | Storage | Dedicated CAD intake directories; separate frozen inputs, outputs, state, secrets and model clones |
@@ -220,8 +220,11 @@ Commission the complete workflow with actual native CAD and live Feishu:
    workflow permissions, explicit admin assignment and denied unauthorized users.
 3. Supply a compliant native folder from an approved Linux or Windows source
    root. Start without YAML, branch, hardware or credential fields.
-4. Verify the UUID, frozen inventory, actual native discovery, generated
-   definition and every independent quality result.
+4. Verify the UUID, frozen inventory and all six engineering steps. Inspect
+   input/input QC/output/output QC in the page, the DAG contract table,
+   terminal task logs and `engineering_stages` XCom. Confirm failed, blocked,
+   not-run and pending-confirmation states, and the hashed `reports/stages.json`.
+   Verify the actual native discovery and every independent quality result.
 5. Inspect the delivered URDF and actual meshes in the page. Exercise individual
    joint controls and limits; confirm preview binds to the passing file subject.
 6. Check the resulting private-model PR's exact base, head, structural revision

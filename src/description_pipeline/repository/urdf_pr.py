@@ -27,6 +27,7 @@ from pathlib import Path
 from ..delivery import subject_digest
 from ..io import PipelineError, acquire_process_lock, confined, read_data
 from ..sources.solidworks import revision as cad_revision
+from ..stages import record_check
 
 GOVERNED_PATHS = ("README.md", "input", "evidence", "model", "urdf", "meshes", "reports")
 REPORTS_FILES = ("input.json", "tool.json", "quality.json")
@@ -390,7 +391,8 @@ def _verify_pr(repository, slug, url, base, branch, commit):
 
 
 def submit_bundle(
-    bundle: Path, repository: Path, *, base: str, branch: str, message: str | None = None, dry_run: bool = False
+    bundle: Path, repository: Path, *, base: str, branch: str, message: str | None = None, dry_run: bool = False,
+    on_event=None,
 ) -> dict:
     """Validate, verify and publish one bundle through a fast-forward review branch and PR."""
     bundle = Path(bundle).resolve()
@@ -400,6 +402,12 @@ def submit_bundle(
     pushed = ""
     subject = ""
     slug = ""
+    phase = "publication.inputs"
+
+    def observed(identifier, state, details):
+        record_check(on_event, "publish", "input" if identifier == "publication.inputs" else "output",
+                     identifier, state, details)
+
     try:
         hardware, _, current_revision = _validate(bundle)
         expected = REVIEW_BRANCH.format(hardware=hardware)
@@ -412,6 +420,9 @@ def submit_bundle(
         if _git(repository, "status", "--porcelain").stdout.strip():
             raise PrError("dirty_repository", "commit, stash or remove unrelated changes first")
         subject, report = _verify(bundle)
+        observed("publication.inputs", "passed", {"subject_sha256": subject, "base": base,
+                                                   "branch": branch, "repository_slug": slug})
+        phase = "publication.git"
         _git(repository, "fetch", "--quiet", "origin", base)
         base_sha = _git(repository, "rev-parse", "FETCH_HEAD").stdout.strip()
         head_sha, head_message = _remote_branch(repository, branch)
@@ -441,6 +452,9 @@ def submit_bundle(
             )
             _reverify(worktree, subject)
             _verify_committed(worktree, commit, subject)
+            observed("publication.git", "passed", {"subject_sha256": subject, "commit": commit,
+                                                    "copied_staged_committed": "reverified"})
+            phase = "publication.receipt"
             if not noop or commit != head_sha:
                 _git(worktree, "push", "origin", f"HEAD:refs/heads/{branch}")
             pushed = commit
@@ -452,7 +466,7 @@ def submit_bundle(
             raise PrError("remote_head_mismatch", {"expected": pushed})
         state, url = _pr(repository, slug, base, branch, subject, pushed, report, message)
         content_noop = noop and pushed == head_sha
-        return {
+        result = {
             "state": "noop" if content_noop else state,
             "branch": branch,
             "base": base,
@@ -461,7 +475,10 @@ def submit_bundle(
             "url": url,
             "repository_slug": slug,
         }
+        observed("publication.receipt", "passed", {**result, "subject_sha256": subject})
+        return result
     except PrError as error:
+        observed(phase, "failed", {"error": error.code, "detail": error.detail})
         return {
             "state": "failed",
             "error": error.code,
@@ -472,6 +489,8 @@ def submit_bundle(
             "url": getattr(error, "pr_url", ""),
         }
     except subprocess.CalledProcessError as error:
+        observed(phase, "failed", {"error": "github_failed" if pushed else "git_failed",
+                                   "detail": (error.stderr or "")[-300:]})
         if pushed:
             return {
                 "state": "gh_failed_after_push",
@@ -492,6 +511,7 @@ def submit_bundle(
             "subject": subject,
         }
     except Exception as error:  # noqa: BLE001 - receipts must never crash the caller
+        observed(phase, "failed", {"error": type(error).__name__, "detail": str(error)[:300]})
         return {
             "state": "failed",
             "error": type(error).__name__,

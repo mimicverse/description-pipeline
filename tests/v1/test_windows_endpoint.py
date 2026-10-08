@@ -34,7 +34,7 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
 
         def runner(*args, **kwargs):
             kwargs["on_event"](captured)
-            return self.passing_result()
+            return self.passing_result(on_event=kwargs["on_event"])
 
         jobs = self.jobs(runner, preparer=prepare)
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler(jobs, self.config["token"]))
@@ -54,7 +54,10 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
         try:
             running = client.get_job(request["run_id"])
             self.assertEqual("running", running["status"])
-            self.assertEqual(("discover", "running"), (running["events"][0]["stage"], running["events"][0]["state"]))
+            self.assertEqual(("freeze", "running"), (running["events"][0]["stage"], running["events"][0]["state"]))
+            stage_states = {stage["id"]: stage["state"] for stage in running["stages"]["stages"]}
+            self.assertEqual(stage_states["freeze"], "completed")
+            self.assertEqual(stage_states["discover"], "running")
             self.assertIsNotNone(datetime.fromisoformat(running["events"][0]["at"]).tzinfo)
         finally:
             release.set()
@@ -69,7 +72,7 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
 
         def runner(package, output, **kwargs):
             calls.append(kwargs["run_id"])
-            return self.passing_result()
+            return self.passing_result(on_event=kwargs["on_event"])
 
         jobs = Jobs(self.config, runner=runner, native_preparer=self.prepare)
         request = self.request()
@@ -94,6 +97,15 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
         jobs.create(request)
         jobs.queue.join()
         self.assertEqual("failed", jobs.snapshot(request["run_id"])["status"])
+
+    def test_green_publication_without_recorded_boundary_checks_is_rejected(self):
+        jobs = self.jobs(lambda *args, **kwargs: self.passing_result())
+        request = self.request()
+        jobs.create(request)
+        jobs.queue.join()
+        result = jobs.snapshot(request["run_id"])
+        self.assertEqual("failed", result["status"])
+        self.assertIn("Engineering stages are incomplete", result["error"])
 
     def test_discovery_failure_retains_diagnostics_across_endpoint_restart(self):
         from description_pipeline.sources.solidworks.errors import CadError
@@ -181,7 +193,7 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
 
             def runner(*a, calls=calls, **k):
                 calls.append(k["run_id"])
-                return self.passing_result()
+                return self.passing_result(on_event=k["on_event"])
 
             resumed = Jobs(self.config, runner=runner, native_preparer=self.prepare)
             resumed.queue.join()

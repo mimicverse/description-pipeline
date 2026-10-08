@@ -507,6 +507,39 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(status, 502)
         self.assertNotIn(b"tampered", body)
 
+    def test_stage_view_exposes_contract_evidence_and_only_verified_assets_are_linkable(self) -> None:
+        from description_pipeline.stages import CONTRACT, STAGE_IDS
+
+        self.client.login()
+        self._seed_passed_job()
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 200, body)
+        view = json.loads(body)["stage_view"]
+        self.assertEqual([stage["id"] for stage in view["stages"]], list(STAGE_IDS))
+        definitions = {stage["id"]: stage for stage in CONTRACT["stages"]}
+        for stage in view["stages"]:
+            self.assertTrue(stage["evidence"], stage["id"])
+            self.assertEqual(
+                [item["id"] for item in stage["input_qc"]],
+                [item["id"] for item in definitions[stage["id"]]["input_qc"]],
+            )
+            self.assertEqual(
+                [item["id"] for item in stage["output_qc"]],
+                [item["id"] for item in definitions[stage["id"]]["output_qc"]],
+            )
+            expected_unsupported = [item for item in CONTRACT["unsupported"] if item["stage"] == stage["id"]]
+            self.assertEqual([item["label"] for item in stage["unsupported"]],
+                             [item["label"] for item in expected_unsupported])
+            self.assertTrue(all(item["state"] == "unsupported" for item in stage["unsupported"]))
+        unsupported_stages = {stage["id"] for stage in view["stages"] if stage["unsupported"]}
+        self.assertEqual(unsupported_stages, {item["stage"] for item in CONTRACT["unsupported"]})
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
+        self.assertEqual(status, 200, body)
+        preview = json.loads(body)
+        self.assertTrue(preview["files"])
+        for name in preview["files"]:
+            self.assertTrue(name.startswith(("urdf/", "meshes/")), name)
+
     def test_preview_waits_for_verification(self) -> None:
         self.client.login()
         self._seed_airflow_run()

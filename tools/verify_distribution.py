@@ -129,7 +129,8 @@ def verify(wheel, runtime_lock, *, wheelhouse=None, bundle=None):
         subprocess.run([*install, "-r", str(runtime_lock)], check=True)
         subprocess.run([*install, "--no-deps", str(wheel)], check=True)
         code = (
-            "import json;from description_pipeline.solidworks import tool_record,doctor;"
+            "import json;from description_pipeline.runtime import tool_record;"
+            "from description_pipeline.solidworks import doctor;"
             "r=tool_record();d=doctor();print(json.dumps({'tool':r,'doctor':d}));"
             "raise SystemExit(0 if d['passed'] else 1)"
         )

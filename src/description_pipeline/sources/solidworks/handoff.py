@@ -9,8 +9,8 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-from ..io import PipelineError, _filesystem_path, artifact_path_parts, confined, digest
-from ..sources.solidworks.revision import package_inventory
+from ...io import PipelineError, _filesystem_path, artifact_path_parts, confined, digest
+from .revision import package_inventory
 
 HANDOFF_SCHEMA = "solidworks-to-urdf.handoff/v1"
 MAX_HANDOFF_BYTES = 16 * 1024**3
