@@ -218,8 +218,10 @@ class AxisReferenceTests(unittest.TestCase):
         self.assertEqual(record["axis_point_m"], [0.01, 0.02, 0.03])
         self.assertEqual(record["axis_direction"], [0.0, 0.0, 1.0])
         self.assertEqual(record["radius_m"], 0.005)
-        self.assertEqual(record["face_name"], "Face3")
         self.assertEqual(record["component"], "pcb-1")
+        self.assertEqual(record["selector"], {"component": "pcb-1", "face_index": 0})
+        self.assertEqual(record["face_index"], 0)
+        self.assertNotIn("face_name", record)
         self.assertIn("CylinderParams", record["used_api"])
 
     def test_named_feature_uses_occurrence_faces_without_shared_document_reads(self):

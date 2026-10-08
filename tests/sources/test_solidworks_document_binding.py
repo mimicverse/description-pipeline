@@ -4,15 +4,25 @@ import sys
 import types
 import unittest
 from unittest.mock import Mock, patch
+import ast
+import pathlib
+from typing import ClassVar
 
 from description_pipeline.sources.solidworks import native
 from description_pipeline.sources.solidworks.native import (
     IASSEMBLYDOC_IID,
+    ICONFIGURATION_IID,
+    ICONFIGURATIONMANAGER_IID,
     IMODELDOC2_IID,
     IPARTDOC_IID,
     SolidWorksBackend,
+    _active_configuration,
+    _active_configuration_view,
     _assembly_components,
     _component_document,
+    _configuration_context,
+    _configuration,
+    _configurationmanager,
     _modeldoc2,
     _part_bodies,
     _part_material,
@@ -102,6 +112,29 @@ class DocumentInterfaceBindingTests(unittest.TestCase):
         self.stubs.assert_bound_once(IASSEMBLYDOC_IID)
         self.stubs.view.GetComponents.assert_called_once_with(False)
 
+    def test_configuration_manager_and_configuration_bind_their_published_interfaces(self):
+        with patch.dict(sys.modules, self.stubs.modules):
+            manager = _configurationmanager(self.stubs.raw())
+        self.assertIs(manager, self.stubs.view)
+        self.stubs.assert_bound_once(ICONFIGURATIONMANAGER_IID)
+        self.stubs.generic.reset_mock()
+        self.stubs.dynamic.DumbDispatch.reset_mock()
+        with patch.dict(sys.modules, self.stubs.modules):
+            configuration = _configuration(self.stubs.raw())
+        self.assertIs(configuration, self.stubs.view)
+        self.stubs.assert_bound_once(ICONFIGURATION_IID)
+
+    def test_configuration_binding_failures_are_fail_closed(self):
+        error = RuntimeError("IConfiguration interface unavailable")
+        self.stubs.generic.QueryInterface.side_effect = error
+        with patch.dict(sys.modules, self.stubs.modules), self.assertRaises(RuntimeError) as caught:
+            _configuration(self.stubs.raw())
+        self.assertIs(caught.exception, error)
+        self.stubs.dynamic.DumbDispatch.assert_not_called()
+        value = object()
+        self.assertIs(_configurationmanager(value), value)
+        self.assertIs(_configuration(None), None)
+
     def test_domain_binding_failures_are_fail_closed(self):
         error = RuntimeError("IPartDoc interface unavailable")
         self.stubs.generic.QueryInterface.side_effect = error
@@ -160,7 +193,12 @@ class DocumentBoundaryTests(unittest.TestCase):
         self.assertIs(document, view)
 
     def test_mass_properties_document_reads_bodies_through_the_part_helper(self):
-        doc = types.SimpleNamespace(GetType=Mock(spec=lambda: None, return_value=1))
+        doc = types.SimpleNamespace(
+            GetType=Mock(spec=lambda: None, return_value=1),
+            GetPathName=Mock(spec=lambda: None, return_value="C:/captures/base.SLDPRT"),
+            GetTitle=Mock(spec=lambda: None, return_value="base"),
+            ConfigurationManager=types.SimpleNamespace(ActiveConfiguration=types.SimpleNamespace(Name="Default")),
+        )
         backend = SolidWorksBackend()
         with (
             patch.object(native, "_part_bodies", return_value=[]) as helper,
@@ -169,6 +207,436 @@ class DocumentBoundaryTests(unittest.TestCase):
             backend._mass_properties_document(doc)
         self.assertEqual(caught.exception.code, "cad_empty_model")
         helper.assert_called_once_with(doc)
+
+
+class _Revocable:
+    """Dispatch whose member access fails after revocation, recording late reads."""
+
+    def __init__(self, inner):
+        object.__setattr__(self, "_inner", inner)
+        object.__setattr__(self, "revoked", False)
+        object.__setattr__(self, "late", [])
+
+    def revoke(self):
+        object.__setattr__(self, "revoked", True)
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        if object.__getattribute__(self, "revoked"):
+            object.__getattribute__(self, "late").append(name)
+            raise RuntimeError(f"revoked dispatch read: {name}")
+        return getattr(object.__getattribute__(self, "_inner"), name)
+
+
+class _Configuration:
+    def __init__(self, root):
+        self.root = root
+
+    @property
+    def Name(self):
+        return "Default"
+
+    def GetRootComponent3(self, *args):
+        return self.root
+
+
+class _MassProperty:
+    def __init__(self, *handles):
+        self.handles = handles
+        self.Mass = 1.5
+        self.Volume = 0.001
+        self.Density = 7900.0
+        self.CenterOfMass = (0.0, 0.0, 0.0)
+
+    def Recalculate(self):
+        for handle in self.handles:
+            handle.revoke()
+
+    def GetMomentOfInertia(self, _mode):
+        return (1e-3, 0.0, 0.0, 0.0, 1e-3, 0.0, 0.0, 0.0, 1e-3)
+
+    def GetOverrideOptions(self):
+        return types.SimpleNamespace(OverrideMass=False, OverrideCenterOfMass=False, OverrideMomentsOfInertia=False)
+
+
+class _Extension:
+    def __init__(self, mass_property):
+        self.mass_property = mass_property
+
+    def CreateMassProperty2(self):
+        return self.mass_property
+
+
+class ConfigurationPrimitiveTests(unittest.TestCase):
+    def setUp(self):
+        pythoncom = types.ModuleType("pythoncom")
+        pythoncom.VT_ARRAY = 0x2000
+        pythoncom.VT_DISPATCH = 9
+        pythoncom.IID_IDispatch = "IDispatch"
+        client = types.ModuleType("win32com.client")
+        client.VARIANT = Mock(return_value="VARIANT")
+        win32com = types.ModuleType("win32com")
+        win32com.client = client
+        self.modules = {"pythoncom": pythoncom, "win32com": win32com, "win32com.client": client}
+        self._modules_patch = patch.dict(sys.modules, self.modules)
+        self._modules_patch.start()
+
+    def tearDown(self):
+        self._modules_patch.stop()
+
+    def _backend(self):
+        child = types.SimpleNamespace(
+            Name2="arm-1",
+            IsSuppressed=False,
+            GetChildren=Mock(spec=lambda: None, return_value=[]),
+            GetPathName=Mock(spec=lambda: None, return_value="C:/captures/arm.SLDPRT"),
+        )
+        root = types.SimpleNamespace(GetChildren=Mock(spec=lambda: None, return_value=[child]))
+        configuration = _Revocable(_Configuration(root))
+        manager = types.SimpleNamespace(ActiveConfiguration=configuration)
+        inner = types.SimpleNamespace(
+            GetType=Mock(spec=lambda: None, return_value=2),
+            ConfigurationManager=manager,
+            GetPathName=Mock(spec=lambda: None, return_value="C:/captures/robot.SLDASM"),
+            GetTitle=Mock(spec=lambda: None, return_value="robot"),
+        )
+        document = _Revocable(inner)
+        mass_property = _MassProperty(document, configuration)
+        inner.Extension = _Extension(mass_property)
+        backend = SolidWorksBackend()
+        backend._document_by_path = lambda path: document
+        return backend, document, configuration
+
+    def test_configuration_context_captures_the_name_before_stateful_use(self):
+        configuration = _Revocable(_Configuration(root=None))
+        document = types.SimpleNamespace(ConfigurationManager=types.SimpleNamespace(ActiveConfiguration=configuration))
+        self.assertIs(_active_configuration_view(document)[1], configuration)
+        self.assertEqual(_active_configuration(document), "Default")
+        manager, view, name = _configuration_context(document)
+        self.assertIs(manager, document.ConfigurationManager)
+        self.assertIs(view, configuration)
+        self.assertEqual(name, "Default")
+        configuration.revoke()  # a stateful read would now fail
+        with self.assertRaises(RuntimeError):
+            _ = configuration.Name
+        self.assertEqual(configuration.late, ["Name"])
+
+    def test_component_context_survives_configuration_invalidation_after_recalculation(self):
+        backend, document, configuration = self._backend()
+        result = backend.assembly_component_mass_properties("C:/captures/robot.SLDASM")
+        self.assertTrue(configuration.revoked, "the reader must have run a stateful recalculation")
+        self.assertEqual(document.late, [])
+        self.assertEqual(configuration.late, [])
+        self.assertEqual(result["configuration"], "Default")
+        self.assertEqual(result["reference"]["configuration"], "Default")
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(len(result["instances"]), 1)
+        self.assertEqual(result["instances"][0]["context_mass_kg"], 1.5)
+        with self.assertRaises(RuntimeError):
+            _ = document.GetPathName
+        self.assertEqual(document.late, ["GetPathName"])
+
+    def test_part_mass_reader_uses_captured_primitives_after_recalculation(self):
+        body = object()
+        inner = types.SimpleNamespace(
+            GetType=Mock(spec=lambda: None, return_value=1),
+            ConfigurationManager=None,
+            GetPathName=Mock(spec=lambda: None, return_value="C:/captures/base.SLDPRT"),
+            GetTitle=Mock(spec=lambda: None, return_value="base"),
+        )
+        configuration = _Revocable(_Configuration(root=None))
+        inner.ConfigurationManager = types.SimpleNamespace(ActiveConfiguration=configuration)
+        document = _Revocable(inner)
+        mass_property = _MassProperty(document, configuration)
+        inner.Extension = _Extension(mass_property)
+        backend = SolidWorksBackend()
+        error = native.CadError("cad_material_read_failed", "documented table without CAD material")
+        with (
+            patch.object(native, "_part_bodies", return_value=[body]),
+            patch.object(native, "_material_assignments_document", side_effect=error),
+        ):
+            result = backend._mass_properties_document(document, require_material=False)
+        self.assertTrue(configuration.revoked)
+        self.assertEqual(document.late, [])
+        self.assertEqual(configuration.late, [])
+        self.assertEqual(result["reference"]["part_document"], "C:/captures/base.SLDPRT")
+        self.assertEqual(result["reference"]["configuration"], "Default")
+        self.assertEqual(result["reference"]["material_assignment"]["configuration"], "Default")
+
+    def test_unreadable_component_path_keeps_other_rows_and_records_the_error(self):
+        ok_child = types.SimpleNamespace(
+            Name2="ok-1",
+            IsSuppressed=False,
+            GetChildren=Mock(spec=lambda: None, return_value=[]),
+            GetPathName=Mock(spec=lambda: None, return_value="C:/captures/ok.SLDPRT"),
+        )
+        bad_child = types.SimpleNamespace(
+            Name2="bad-2",
+            IsSuppressed=False,
+            GetChildren=Mock(spec=lambda: None, return_value=[]),
+            GetPathName=Mock(spec=lambda: None, side_effect=RuntimeError("RPC_S_UNKNOWN_IF")),
+        )
+        root = types.SimpleNamespace(GetChildren=Mock(spec=lambda: None, return_value=[ok_child, bad_child]))
+        configuration = _Revocable(_Configuration(root))
+        mass_property = _MassProperty(configuration)
+        inner = types.SimpleNamespace(
+            GetType=Mock(spec=lambda: None, return_value=2),
+            ConfigurationManager=types.SimpleNamespace(ActiveConfiguration=configuration),
+            Extension=_Extension(mass_property),
+            GetPathName=Mock(spec=lambda: None, return_value="C:/captures/robot.SLDASM"),
+            GetTitle=Mock(spec=lambda: None, return_value="robot"),
+        )
+        document = _Revocable(inner)
+        mass_property.handles = (document, configuration)
+        backend = SolidWorksBackend()
+        backend._document_by_path = lambda path: document
+        result = backend.assembly_component_mass_properties("C:/captures/robot.SLDASM")
+        self.assertEqual([row["name"] for row in result["instances"]], ["ok-1"])
+        self.assertEqual([row["name"] for row in result["errors"]], ["bad-2"])
+        self.assertEqual(result["errors"][0]["stage"], "hierarchy")
+        self.assertEqual(document.late, [])
+        self.assertEqual(configuration.late, [])
+        self.assertEqual(result["configuration"], "Default")
+
+
+class ReturnViewRegistryTests(unittest.TestCase):
+    """Every declared single/array return is bound to its published interface."""
+
+    EXPECTED_SINGLE: ClassVar[dict[str, str]] = {
+        "Extension": native.IMODELDOCEXTENSION_IID,
+        "CreateMassProperty2": native.IMASSPROPERTY2_IID,
+        "CustomPropertyManager": native.ICUSTOMPROPERTYMANAGER_IID,
+        "GetCoordinateSystemTransformByName": native.IMATHTRANSFORM_IID,
+        "GetOverrideOptions": native.IMASSPROPERTYOVERRIDEOPTIONS_IID,
+        "FirstFeature": native.IFEATURE_IID,
+        "GetNextFeature": native.IFEATURE_IID,
+        "GetNextSubFeature": native.IFEATURE_IID,
+        "GetFirstSubFeature": native.IFEATURE_IID,
+        "GetFeature": native.IFEATURE_IID,
+        "GetSpecificFeature2": native.IMATE2_IID,
+        "MateEntity": native.IMATEENTITY2_IID,
+        "GetSurface": native.ISURFACE_IID,
+        "GetCurve": native.ICURVE_IID,
+        "GetTotalTransform": native.IMATHTRANSFORM_IID,
+        "OpenDoc6": native.IMODELDOC2_IID,
+    }
+    EXPECTED_ARRAYS: ClassVar[dict[str, str]] = {"GetBodies2": native.IBODY2_IID, "GetFaces": native.IFACE2_IID}
+
+    def setUp(self):
+        self.stubs = _InterfaceModules()
+
+    def test_registries_cover_the_installed_tlb_map_exactly(self):
+        self.assertEqual(dict(native.RETURN_VIEWS), self.EXPECTED_SINGLE)
+        self.assertEqual(dict(native.RETURN_ARRAY_VIEWS), self.EXPECTED_ARRAYS)
+
+    def test_single_return_members_bind_the_declared_interface(self):
+        for member, iid in self.EXPECTED_SINGLE.items():
+            with self.subTest(member=member):
+                stubs = _InterfaceModules()
+                returned = types.SimpleNamespace(_oleobj_=stubs.generic)
+                raw = types.SimpleNamespace(**{member: returned})
+                with patch.dict(sys.modules, stubs.modules):
+                    view = native._member(raw, member)
+                stubs.generic.QueryInterface.assert_called_once_with(iid, "IDispatch")
+                self.assertIs(view, stubs.view)
+
+    def test_array_return_members_bind_every_element(self):
+        for member, iid in self.EXPECTED_ARRAYS.items():
+            with self.subTest(member=member):
+                stubs = _InterfaceModules()
+                elements = [types.SimpleNamespace(_oleobj_=Mock()) for _ in range(2)]
+                for element in elements:
+                    element._oleobj_.QueryInterface.return_value = stubs.vendor
+                raw = types.SimpleNamespace(**{member: Mock(spec=lambda *args: None, return_value=elements)})
+                with patch.dict(sys.modules, stubs.modules):
+                    views = native._member(raw, member)
+                self.assertEqual(len(views), 2)
+                for element in elements:
+                    element._oleobj_.QueryInterface.assert_called_once_with(iid, "IDispatch")
+                self.assertTrue(all(view is stubs.view for view in views))
+
+    def test_late_bound_non_callable_array_return_is_bound(self):
+        stubs = _InterfaceModules()
+        elements = [types.SimpleNamespace(_oleobj_=Mock()) for _ in range(2)]
+        for element in elements:
+            element._oleobj_.QueryInterface.return_value = stubs.vendor
+        raw = types.SimpleNamespace(GetFaces=tuple(elements))  # property-shaped, not callable
+        with patch.dict(sys.modules, stubs.modules):
+            views = native._member(raw, "GetFaces")
+        self.assertEqual(len(views), 2)
+        for element in elements:
+            element._oleobj_.QueryInterface.assert_called_once_with(native.IFACE2_IID, "IDispatch")
+        self.assertTrue(all(view is stubs.view for view in views))
+
+    def test_method_binding_covers_dynamic_step_members(self):
+        for member in ("GetNextFeature", "GetNextSubFeature", "GetFirstSubFeature"):
+            with self.subTest(member=member):
+                stubs = _InterfaceModules()
+                returned = types.SimpleNamespace(_oleobj_=stubs.generic)
+                raw = types.SimpleNamespace(**{member: Mock(spec=lambda *args: None, return_value=returned)})
+                with patch.dict(sys.modules, stubs.modules):
+                    view = native._method(raw, member)
+                stubs.generic.QueryInterface.assert_called_once_with(native.IFEATURE_IID, "IDispatch")
+                self.assertIs(view, stubs.view)
+
+    def test_entity_view_selects_face_or_edge_by_interface_presence(self):
+        class _ComError(Exception):
+            def __init__(self, hresult):
+                super().__init__(f"HRESULT {hresult}")
+                self.hresult = hresult
+
+        stubs = _InterfaceModules()
+        raw = stubs.raw()
+        with patch.dict(sys.modules, stubs.modules):
+            self.assertIs(native._entity_view(raw), stubs.view)
+        stubs.generic.QueryInterface.assert_called_once_with(native.IFACE2_IID, "IDispatch")
+
+        stubs = _InterfaceModules()
+        raw = stubs.raw()
+        stubs.generic.QueryInterface.side_effect = [_ComError(native.E_NOINTERFACE), stubs.vendor]
+        with patch.dict(sys.modules, stubs.modules):
+            self.assertIs(native._entity_view(raw), stubs.view)
+        self.assertEqual(
+            [call.args[0] for call in stubs.generic.QueryInterface.call_args_list],
+            [native.IFACE2_IID, native.IEDGE_IID],
+        )
+
+        stubs = _InterfaceModules()
+        raw = stubs.raw()
+        stubs.generic.QueryInterface.side_effect = [
+            _ComError(native.E_NOINTERFACE),
+            _ComError(native.E_NOINTERFACE),
+            stubs.vendor,
+        ]
+        with patch.dict(sys.modules, stubs.modules):
+            self.assertIs(native._entity_view(raw), stubs.view)
+        self.assertEqual(
+            [call.args[0] for call in stubs.generic.QueryInterface.call_args_list],
+            [native.IFACE2_IID, native.IEDGE_IID, native.IVERTEX_IID],
+        )
+
+        stubs = _InterfaceModules()
+        raw = stubs.raw()
+        rpc = _ComError(-2147023170)
+        stubs.generic.QueryInterface.side_effect = [_ComError(native.E_NOINTERFACE), rpc]
+        with patch.dict(sys.modules, stubs.modules), self.assertRaises(_ComError) as caught:
+            native._entity_view(raw)
+        self.assertIs(caught.exception, rpc)
+
+        stubs = _InterfaceModules()
+        raw = stubs.raw()
+        failure = _ComError(-2147023170)  # RPC failure, not a missing interface
+        stubs.generic.QueryInterface.side_effect = failure
+        with patch.dict(sys.modules, stubs.modules), self.assertRaises(_ComError) as caught:
+            native._entity_view(raw)
+        self.assertIs(caught.exception, failure)
+
+    def test_mass_readers_capture_configuration_before_stateful_calls(self):
+        tree = ast.parse(pathlib.Path(native.__file__).read_text(encoding="utf-8"))
+        readers = (
+            "_mass_properties_document",
+            "assembly_mass_properties",
+            "assembly_component_mass_properties",
+            "assembly_group_mass_properties",
+        )
+        seen = set()
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.FunctionDef) and node.name in readers):
+                continue
+            seen.add(node.name)
+            stateful = [
+                item.lineno
+                for item in ast.walk(node)
+                if isinstance(item, ast.Call)
+                and isinstance(item.func, ast.Name)
+                and item.func.id == "_member"
+                and len(item.args) > 1
+                and isinstance(item.args[1], ast.Constant)
+                and item.args[1].value == "Recalculate"
+            ]
+            stateful += [
+                item.lineno
+                for item in ast.walk(node)
+                if isinstance(item, ast.Assign)
+                and isinstance(item.targets[0], ast.Attribute)
+                and item.targets[0].attr == "SelectedItems"
+            ]
+            self.assertTrue(stateful, node.name)
+            first_stateful = min(stateful)
+            captures = [
+                item.lineno
+                for item in ast.walk(node)
+                if isinstance(item, ast.Call)
+                and isinstance(item.func, ast.Name)
+                and item.func.id == "_configuration_context"
+            ]
+            paths = [
+                item.lineno
+                for item in ast.walk(node)
+                if isinstance(item, ast.Call)
+                and isinstance(item.func, ast.Name)
+                and item.func.id == "_member"
+                and len(item.args) > 1
+                and isinstance(item.args[1], ast.Constant)
+                and item.args[1].value in ("GetPathName", "GetTitle")
+                and isinstance(item.args[0], ast.Name)
+                and item.args[0].id == "doc"
+            ]
+            self.assertTrue(captures, node.name)
+            self.assertTrue(paths, node.name)
+            self.assertLess(max(captures), first_stateful, node.name)
+            self.assertLess(max(paths), first_stateful, node.name)
+            late = [
+                item.lineno
+                for item in ast.walk(node)
+                if isinstance(item, ast.Call)
+                and isinstance(item.func, ast.Name)
+                and item.func.id in ("_member", "_method")
+                and item.args
+                and isinstance(item.args[0], ast.Name)
+                and item.args[0].id in ("doc", "active", "config", "configuration")
+                and item.lineno > first_stateful
+            ]
+            self.assertEqual(late, [], f"{node.name} late doc/config reads at lines {late}")
+        self.assertEqual(seen, set(readers))
+
+    def test_configuration_reads_funnel_through_the_bound_helpers(self):
+        source = pathlib.Path(native.__file__).read_text(encoding="utf-8")
+        self.assertEqual(source.count('"ConfigurationManager"'), 1)
+        self.assertEqual(source.count('"ActiveConfiguration"'), 1)
+        self.assertGreaterEqual(source.count("_active_configuration_view("), 10)
+
+    def test_mechanical_transform_never_falls_back_to_presentation_state(self):
+        source = pathlib.Path(native.__file__).read_text(encoding="utf-8")
+        self.assertNotIn('("GetTotalTransform", True)', source)
+        self.assertIn('_member(component, "GetTotalTransform", False)', source)
+
+    def test_undeclared_lightweight_member_is_reported_not_probed(self):
+        source = pathlib.Path(native.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("_optional_bool", source)
+        self.assertNotIn('"IsLightWeight"', source)
+        self.assertNotIn('"IsLightweight"', source)
+        self.assertIn('state["lightweight"] = None', source)
+        self.assertIn('state["unsupported"] = ["lightweight"]', source)
+        self.assertIn("lightweight:{path_name}:unsupported_declared", source)
+
+    def test_document_state_reports_unsupported_lightweight_without_probing(self):
+        doc = types.SimpleNamespace(
+            GetPathName=Mock(spec=lambda: None, return_value="C:/captures/robot.SLDASM"),
+            GetTitle=Mock(spec=lambda: None, return_value="robot"),
+            GetSaveFlag=Mock(spec=lambda: None, return_value=False),
+            IsOpenedReadOnly=True,
+            ConfigurationManager=types.SimpleNamespace(ActiveConfiguration=types.SimpleNamespace(Name="Default")),
+        )
+        backend = SolidWorksBackend()
+        backend._ensure_document = lambda path: doc
+        backend.list_configurations = lambda path: ["Default"]
+        state = backend.document_state("C:/captures/robot.SLDASM")
+        self.assertIsNone(state["lightweight"])
+        self.assertEqual(state["unsupported"], ["lightweight"])
+        self.assertTrue(state["saved"])
+        self.assertTrue(state["read_only"])
 
     def test_only_presence_checks_read_getmodeldoc2_directly(self):
         import ast
