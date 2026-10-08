@@ -44,9 +44,7 @@ def generate_urdf(robot: Robot, source: Path, destination: Path, *, name: str) -
                 "inertia",
                 attrib={
                     key: _numbers([value])
-                    for key, value in zip(
-                        ("ixx", "ixy", "ixz", "iyy", "iyz", "izz"), inertia["inertia"], strict=True
-                    )
+                    for key, value in zip(("ixx", "ixy", "ixz", "iyy", "iyz", "izz"), inertia["inertia"], strict=True)
                 },
             )
         for role in ("visuals", "collisions"):
@@ -70,9 +68,7 @@ def generate_urdf(robot: Robot, source: Path, destination: Path, *, name: str) -
                 elif kind == "sphere":
                     ET.SubElement(element, kind, radius=_numbers([shape["radius"]]))
                 elif kind == "cylinder":
-                    ET.SubElement(
-                        element, kind, radius=_numbers([shape["radius"]]), length=_numbers([shape["length"]])
-                    )
+                    ET.SubElement(element, kind, radius=_numbers([shape["radius"]]), length=_numbers([shape["length"]]))
                 else:
                     raise PipelineError(f"Unsupported URDF geometry: {kind}")
                 if tag == "visual" and "rgba" in shape:
@@ -88,9 +84,7 @@ def generate_urdf(robot: Robot, source: Path, destination: Path, *, name: str) -
         if "limits" in joint:
             ET.SubElement(node, "limit", attrib={key: _numbers([value]) for key, value in joint["limits"].items()})
         if joint.get("dynamics"):
-            ET.SubElement(
-                node, "dynamics", attrib={key: _numbers([value]) for key, value in joint["dynamics"].items()}
-            )
+            ET.SubElement(node, "dynamics", attrib={key: _numbers([value]) for key, value in joint["dynamics"].items()})
         if joint.get("mimic"):
             mimic = joint["mimic"]
             ET.SubElement(

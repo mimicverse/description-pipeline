@@ -160,8 +160,7 @@ class WorkflowTests(unittest.TestCase):
             return report
 
         with (
-            patch("description_pipeline.sources.solidworks.input.inspect_package", wraps=inspect_package)
-            as inspect,
+            patch("description_pipeline.sources.solidworks.input.inspect_package", wraps=inspect_package) as inspect,
             patch.object(steps, "inspect_prepared_input", side_effect=change_after_inspection),
             patch("description_pipeline.sources.solidworks.freeze.freeze") as native,
         ):
@@ -206,14 +205,18 @@ class WorkflowTests(unittest.TestCase):
             scene = evidence / "scene.json"
             scene.write_text(json.dumps({"synthetic": True}))
             manifest_path = evidence / "manifest.json"
-            manifest_path.write_text(json.dumps({
-                "schema_version": SCHEMA,
-                "evidence_class": "fixture",
-                "kind": "fixture",
-                "identity": {"id": "adversarial control"},
-                "files": {"scene.json": file_digest(scene)},
-                "scene": "scene.json",
-            }))
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": SCHEMA,
+                        "evidence_class": "fixture",
+                        "kind": "fixture",
+                        "identity": {"id": "adversarial control"},
+                        "files": {"scene.json": file_digest(scene)},
+                        "scene": "scene.json",
+                    }
+                )
+            )
             manifest = verify_snapshot(evidence)
             details = steps._snapshot_details(delivery, manifest)
             self.assertEqual(details["manifest_sha256"], file_digest(manifest_path))
@@ -334,19 +337,33 @@ class WorkflowTests(unittest.TestCase):
         from .protocol_support import protocol_events
 
         self.output.mkdir()
-        prior = {"passed": True, "state": "published", "subject_sha256": "a" * 64,
-                 "url": "https://github.com/example/control/pull/1"}
-        receipt = {"schema_version": BUNDLE_SCHEMA, "pipeline_id": PIPELINE_ID, "run_id": "retry-run",
-                   "execution_scope": ["generate", "verify", "publish"], "submission": prior,
-                   "events": protocol_events(stages=("generate", "verify", "publish"), subject="a" * 64)}
+        prior = {
+            "passed": True,
+            "state": "published",
+            "subject_sha256": "a" * 64,
+            "url": "https://github.com/example/control/pull/1",
+        }
+        receipt = {
+            "schema_version": BUNDLE_SCHEMA,
+            "pipeline_id": PIPELINE_ID,
+            "run_id": "retry-run",
+            "execution_scope": ["generate", "verify", "publish"],
+            "submission": prior,
+            "events": protocol_events(stages=("generate", "verify", "publish"), subject="a" * 64),
+        }
         solidworks._stamp(self.output, receipt)
         previous = list(receipt["events"])
 
         def recover(bundle, repository, *, base, message, on_event):
             for event in protocol_events(stages=("publish",), subject="a" * 64):
                 on_event(event)
-            return {"passed": True, "state": "noop", "subject_sha256": "a" * 64,
-                    "url": "https://github.com/example/control/pull/1", "scope": "Synthetic publication retry"}
+            return {
+                "passed": True,
+                "state": "noop",
+                "subject_sha256": "a" * 64,
+                "url": "https://github.com/example/control/pull/1",
+                "scope": "Synthetic publication retry",
+            }
 
         with patch.object(steps, "publish_model", side_effect=recover):
             result = solidworks.submit(self.output, self.root / "repository")
@@ -354,7 +371,7 @@ class WorkflowTests(unittest.TestCase):
         after = read_data(self.output / "reports/run.json")
         self.assertEqual(after["execution_scope"], ["publish"])
         self.assertEqual(after["publication_attempts"], [prior, result])
-        self.assertEqual(after["events"][:len(previous)], previous)
+        self.assertEqual(after["events"][: len(previous)], previous)
         self.assertEqual(after["submission"], result)
         self.assertEqual(after["stage_report"]["sha256"], file_digest(self.output / "reports/stages.json"))
         self.assertTrue(solidworks._owned_output(self.output))
@@ -363,23 +380,32 @@ class WorkflowTests(unittest.TestCase):
         from .protocol_support import protocol_events
 
         self.output.mkdir()
-        receipt = {"schema_version": BUNDLE_SCHEMA, "pipeline_id": PIPELINE_ID, "run_id": "retry-run",
-                   "execution_scope": ["publish"],
-                   "events": protocol_events(stages=("publish",), failed_stage="publish")}
+        receipt = {
+            "schema_version": BUNDLE_SCHEMA,
+            "pipeline_id": PIPELINE_ID,
+            "run_id": "retry-run",
+            "execution_scope": ["publish"],
+            "events": protocol_events(stages=("publish",), failed_stage="publish"),
+        }
         solidworks._stamp(self.output, receipt)
         previous = list(receipt["events"])
 
         def recover(bundle, repository, *, base, message, on_event):
             for event in protocol_events(stages=("publish",), subject="a" * 64):
                 on_event(event)
-            return {"passed": True, "state": "published", "subject_sha256": "a" * 64,
-                    "url": "https://github.com/example/control/pull/1", "scope": "Synthetic publication retry"}
+            return {
+                "passed": True,
+                "state": "published",
+                "subject_sha256": "a" * 64,
+                "url": "https://github.com/example/control/pull/1",
+                "scope": "Synthetic publication retry",
+            }
 
         with patch.object(steps, "publish_model", side_effect=recover):
             result = solidworks.submit(self.output, self.root / "repository")
         self.assertTrue(result["passed"])
         after = read_data(self.output / "reports/run.json")
-        self.assertEqual(after["events"][:len(previous)], previous)
+        self.assertEqual(after["events"][: len(previous)], previous)
         self.assertEqual(after["publication_attempts"], [result])
         self.assertEqual(after["stage_report"]["sha256"], file_digest(self.output / "reports/stages.json"))
         self.assertTrue(solidworks._owned_output(self.output))

@@ -110,6 +110,7 @@ def _keep_diagnostic(staging: Path, output: Path, receipt: dict) -> Path:
 
 def _event_sink(receipt, on_event=None):
     """One timestamped engineering event stream for the receipt and endpoint."""
+
     def event(item):
         entry = {"at": datetime.now(UTC).isoformat(), **item}
         receipt.setdefault("events", []).append(entry)
@@ -189,17 +190,25 @@ def run(
             "handoff_sha256": handoff_sha256,
             "state": "failed",
             "events": list(prior_events or []),
-            "execution_scope": [stage for stage in STAGE_IDS[:2]
-                                if any(event["stage"] == stage for event in prior_events or [])]
-                               + ["capture", "generate", "verify"] + (["publish"] if repository else []),
+            "execution_scope": [
+                stage for stage in STAGE_IDS[:2] if any(event["stage"] == stage for event in prior_events or [])
+            ]
+            + ["capture", "generate", "verify"]
+            + (["publish"] if repository else []),
         }
         event = _event_sink(receipt, on_event)
 
         try:
             from .steps import capture_evidence, generate_model, publish_model, verify_delivery
 
-            definition, input_report = capture_evidence(package, staging, backend=backend, on_event=event,
-                                                       expected_inputs=expected_inputs, handoff_sha256=handoff_sha256)
+            definition, input_report = capture_evidence(
+                package,
+                staging,
+                backend=backend,
+                on_event=event,
+                expected_inputs=expected_inputs,
+                handoff_sha256=handoff_sha256,
+            )
             receipt["cad_revision"] = input_report["cad_revision"]["revision"]
             generated_subject = generate_model(staging, definition, input_report, on_event=event)
             report = verify_delivery(staging, generated_subject, on_event=event)
@@ -260,8 +269,11 @@ def rebuild(
             "run_id": str(uuid.uuid4()),
             "state": "failed",
             "passed": False,
-            "rebuild_from": {"subject_sha256": previous.get("subject_sha256"),
-                             "run_id": source_receipt.get("run_id"), "handoff_sha256": handoff_sha256},
+            "rebuild_from": {
+                "subject_sha256": previous.get("subject_sha256"),
+                "run_id": source_receipt.get("run_id"),
+                "handoff_sha256": handoff_sha256,
+            },
             "handoff_sha256": handoff_sha256,
             "execution_scope": ["generate", "verify"] + (["publish"] if repository else []),
         }
@@ -269,15 +281,26 @@ def rebuild(
         try:
             shutil.copytree(bundle / "input", staging / "input")
             shutil.copytree(bundle / "evidence", staging / "evidence")
-            copied = {prefix + "/" + name: checksum for prefix in ("input", "evidence")
-                      for name, checksum in inventory(staging / prefix).items()}
-            if copied != {name: checksum for name, checksum in source_files.items()
-                          if name.startswith(("input/", "evidence/"))} or subject_inventory(bundle) != source_files:
+            copied = {
+                prefix + "/" + name: checksum
+                for prefix in ("input", "evidence")
+                for name, checksum in inventory(staging / prefix).items()
+            }
+            if (
+                copied
+                != {
+                    name: checksum
+                    for name, checksum in source_files.items()
+                    if name.startswith(("input/", "evidence/"))
+                }
+                or subject_inventory(bundle) != source_files
+            ):
                 raise PipelineError("Frozen evidence changed during rebuild preparation")
             from .steps import generate_model, publish_model, verify_delivery
 
-            generated_subject = generate_model(staging, definition, read_data(bundle / "reports/input.json"),
-                                               on_event=event)
+            generated_subject = generate_model(
+                staging, definition, read_data(bundle / "reports/input.json"), on_event=event
+            )
             report = verify_delivery(staging, generated_subject, on_event=event)
             receipt.update(
                 state="verified" if report.get("passed") is True else "failed",
@@ -308,10 +331,17 @@ def submit(bundle: Path, repository: Path, *, base=None, message=None):
 
     with output_lock(Path(bundle)) as bundle:
         marker = bundle / "reports/run.json"
-        receipt = read_data(marker) if marker.is_file() else {
-            "schema_version": BUNDLE_SCHEMA, "pipeline_id": PIPELINE_ID, "run_id": str(uuid.uuid4()),
-            "execution_scope": ["publish"], "events": [],
-        }
+        receipt = (
+            read_data(marker)
+            if marker.is_file()
+            else {
+                "schema_version": BUNDLE_SCHEMA,
+                "pipeline_id": PIPELINE_ID,
+                "run_id": str(uuid.uuid4()),
+                "execution_scope": ["publish"],
+                "events": [],
+            }
+        )
         receipt["execution_scope"] = ["publish"]
         receipt.setdefault("publication_attempts", [receipt["submission"]] if receipt.get("submission") else [])
         event = _event_sink(receipt)
@@ -320,9 +350,14 @@ def submit(bundle: Path, repository: Path, *, base=None, message=None):
         except Exception as error:
             return _failed_run(None, bundle, receipt, event, error)
         receipt["publication_attempts"].append(result)
-        receipt.update(submission=result, state=result["state"], passed=result["passed"],
-                       subject_sha256=result.get("subject_sha256"), error=result.get("error"),
-                       detail=result.get("detail"))
+        receipt.update(
+            submission=result,
+            state=result["state"],
+            passed=result["passed"],
+            subject_sha256=result.get("subject_sha256"),
+            error=result.get("error"),
+            detail=result.get("detail"),
+        )
         _stamp(bundle, receipt)
         return result
 
@@ -342,8 +377,9 @@ def doctor() -> dict:
         consumer = readiness()
         results.append({"id": "consumer.urdf", "passed": True, "details": consumer})
     except Exception as error:
-        results.append({"id": "consumer.urdf", "passed": False, "message": str(error),
-                        "details": getattr(error, "details", {})})
+        results.append(
+            {"id": "consumer.urdf", "passed": False, "message": str(error), "details": getattr(error, "details", {})}
+        )
     native = False
     native_detail = "Native CAD capture requires Windows with licensed SolidWorks"
     if sys.platform == "win32":

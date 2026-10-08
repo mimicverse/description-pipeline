@@ -238,6 +238,7 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_nonfinite_raw_evidence_is_rejected_with_a_json_safe_field_path(self):
         for value in (float("inf"), float("-inf"), float("nan")):
+
             def nonfinite(payload, value=value):
                 payload["components"][0]["transform"][3] = value
 
@@ -250,8 +251,8 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_large_finite_axis_normalizes_without_squared_norm_overflow(self):
         axis = _unit([1e308, 1e308, 0.0])
-        self.assertAlmostEqual(axis[0], 2 ** -0.5)
-        self.assertAlmostEqual(axis[1], 2 ** -0.5)
+        self.assertAlmostEqual(axis[0], 2**-0.5)
+        self.assertAlmostEqual(axis[1], 2**-0.5)
         self.assertEqual(axis[2], 0.0)
 
     def test_positive_package_is_generated_and_independently_verified(self):
@@ -345,6 +346,7 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_container_datum_requires_solved_rigidity_and_excludes_container_material(self):
         for connected in (True, False):
+
             def mutate(payload, connected=connected):
                 native = self.tmp / f"native{self.serial}" / "cad/sub.SLDASM"
                 native.write_bytes(b"neutral container fixture\n")
@@ -778,6 +780,7 @@ class DiscoveryTests(unittest.TestCase):
         report = verify_discovery(output)
         self.assertTrue(next(check for check in report["checks"] if check["id"] == "discovery.binding")["passed"])
         self.assertIn("discovery.names", [item["code"] for item in report["errors"]])
+
     def test_circle_edge_coincident_keeps_the_hinge(self):
         def mutate(payload):
             seat = payload["mates"][1]

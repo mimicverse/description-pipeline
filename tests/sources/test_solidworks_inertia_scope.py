@@ -56,9 +56,7 @@ class GeneratorScopeTests(unittest.TestCase):
 
     def test_explicit_positive_convention_is_rejected(self):
         with self.assertRaises(ConfigError):
-            tensor_from_raw(
-                POSITIVE_PRODUCT, {"product_convention": "solidworks_positive"}, where="analytic fixture"
-            )
+            tensor_from_raw(POSITIVE_PRODUCT, {"product_convention": "solidworks_positive"}, where="analytic fixture")
 
     def test_scope_and_convention_must_agree(self):
         for raw, reference in (

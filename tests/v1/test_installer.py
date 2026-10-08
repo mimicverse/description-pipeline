@@ -178,12 +178,12 @@ class ServicesRenderTest(unittest.TestCase):
             unit = Path(tmp) / "config/systemd/user/description-solidworks-tunnel.service"
             self.assertIn("127.0.0.1:18765:127.0.0.1:8765 windows-worker", unit.read_text())
             before = unit.read_bytes()
-            custom = run(["bash", str(DEPLOY / "services.sh"), "render"],
-                         {**env, "SOLIDWORKS_ENDPOINT_PORT": "9999"})
+            custom = run(["bash", str(DEPLOY / "services.sh"), "render"], {**env, "SOLIDWORKS_ENDPOINT_PORT": "9999"})
             self.assertEqual(custom.returncode, 0, custom.stderr)
             self.assertIn("127.0.0.1:18765:127.0.0.1:9999 windows-worker", unit.read_text())
-            bad_port = run(["bash", str(DEPLOY / "services.sh"), "render"],
-                           {**env, "SOLIDWORKS_ENDPOINT_PORT": "87;65"})
+            bad_port = run(
+                ["bash", str(DEPLOY / "services.sh"), "render"], {**env, "SOLIDWORKS_ENDPOINT_PORT": "87;65"}
+            )
             self.assertNotEqual(bad_port.returncode, 0)
             self.assertIn("127.0.0.1:18765:127.0.0.1:9999 windows-worker", unit.read_text())
             run(["bash", str(DEPLOY / "services.sh"), "render"], env)
@@ -194,6 +194,7 @@ class ServicesRenderTest(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(before, unit.read_bytes())
+
 
 class InstallGuardsTest(unittest.TestCase):
     def _install(self, tmp: str, **env: str) -> subprocess.CompletedProcess:

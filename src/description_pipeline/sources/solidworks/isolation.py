@@ -129,9 +129,7 @@ def application_for_pid(pid: int):
         # ISldWorks is the vendor's dual application interface. Its generic
         # IDispatch view can stop serving RPC while this interface remains live.
         # useIID selects only the Python wrapper; calls use the queried interface.
-        dispatch = rot.GetObject(moniker).QueryInterface(
-            pywintypes.IID(ISLDWORKS_IID), pythoncom.IID_IDispatch
-        )
+        dispatch = rot.GetObject(moniker).QueryInterface(pywintypes.IID(ISLDWORKS_IID), pythoncom.IID_IDispatch)
         # Vendor DISPID166: GetProcessID() -> VT_I4, a method (not a property).
         actual = dispatch.InvokeTypes(166, 0, pythoncom.DISPATCH_METHOD, (pythoncom.VT_I4, 0), ())
         if type(actual) is not int or actual != pid:

@@ -22,9 +22,11 @@ VIEW_SCHEMA = "solidworks-to-urdf.stages/v1"
 
 def _boundary(stage, boundary, identifier):
     definition = next((item for item in CONTRACT["stages"] if item["id"] == stage), None)
-    if boundary not in {"input", "output"} or definition is None or identifier not in {
-        item["id"] for item in definition[f"{boundary}_qc"]
-    }:
+    if (
+        boundary not in {"input", "output"}
+        or definition is None
+        or identifier not in {item["id"] for item in definition[f"{boundary}_qc"]}
+    ):
         raise PipelineError("Boundary check is absent from the engineering-stage contract")
 
 
@@ -34,8 +36,13 @@ def record_check(emit, stage, boundary, identifier, state, details):
     if state not in {"passed", "failed"}:
         raise PipelineError("A recorded boundary check must pass or fail")
     if emit is not None:
-        emit({"stage": stage, "state": "failed" if state == "failed" else "running",
-              "check": {"id": identifier, "boundary": boundary, "state": state, "details": details or {}}})
+        emit(
+            {
+                "stage": stage,
+                "state": "failed" if state == "failed" else "running",
+                "check": {"id": identifier, "boundary": boundary, "state": state, "details": details or {}},
+            }
+        )
 
 
 def checked(emit, stage, boundary, identifier, action, *, describe=None):
@@ -62,13 +69,22 @@ def checked(emit, stage, boundary, identifier, action, *, describe=None):
 def _complete_checks(details):
     """Nested gates must be explicit, unique and individually passed."""
     required, rows = details.get("required_checks"), details.get("checks")
-    if (not isinstance(required, list) or not required or not all(isinstance(name, str) for name in required)
-            or not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows)):
+    if (
+        not isinstance(required, list)
+        or not required
+        or not all(isinstance(name, str) for name in required)
+        or not isinstance(rows, list)
+        or not all(isinstance(row, dict) for row in rows)
+    ):
         return False
     names = [row.get("id") for row in rows]
-    return (all(isinstance(name, str) for name in names) and len(set(names)) == len(names)
-            and len(set(required)) == len(required) and set(required) <= set(names)
-            and all(row.get("state") == "passed" and row.get("passed") is True for row in rows))
+    return (
+        all(isinstance(name, str) for name in names)
+        and len(set(names)) == len(names)
+        and len(set(required)) == len(required)
+        and set(required) <= set(names)
+        and all(row.get("state") == "passed" and row.get("passed") is True for row in rows)
+    )
 
 
 def stage_view(job=None):
@@ -76,12 +92,13 @@ def stage_view(job=None):
     job = job or {}
     result = job.get("result") or job
     events = job.get("events") or []
-    observations = [event["check"].get("details") or {} for event in events
-                    if isinstance(event.get("check"), dict)]
-    subject = result.get("subject_sha256") or next((value.get("subject_sha256")
-                   for value in reversed(observations) if value.get("subject_sha256")), None)
-    handoff = next((value.get("handoff_sha256") for value in reversed(observations)
-                    if value.get("handoff_sha256")), None)
+    observations = [event["check"].get("details") or {} for event in events if isinstance(event.get("check"), dict)]
+    subject = result.get("subject_sha256") or next(
+        (value.get("subject_sha256") for value in reversed(observations) if value.get("subject_sha256")), None
+    )
+    handoff = next(
+        (value.get("handoff_sha256") for value in reversed(observations) if value.get("handoff_sha256")), None
+    )
     files = {}
     for record in observations:
         files.update(record.get("files") or {})
@@ -107,7 +124,8 @@ def stage_view(job=None):
         for boundary in ("input", "output"):
             for item in stage[f"{boundary}_qc"]:
                 matches = [
-                    event["check"] for event in observed
+                    event["check"]
+                    for event in observed
                     if isinstance(event.get("check"), dict)
                     and event["check"].get("boundary") == boundary
                     and event["check"].get("id") == item["id"]
@@ -122,8 +140,11 @@ def stage_view(job=None):
                     bound = item["details"].get("subject_sha256")
                     if subject is not None and bound is not None and bound != subject:
                         item.update(state="failed", details={"error": "Check evidence binds a different file subject"})
-                    if ("required_checks" in item["details"] and item["state"] == "passed"
-                            and not _complete_checks(item["details"])):
+                    if (
+                        "required_checks" in item["details"]
+                        and item["state"] == "passed"
+                        and not _complete_checks(item["details"])
+                    ):
                         item["state"] = "failed"
         checks = stage["input_qc"] + stage["output_qc"]
         failed = any(item["state"] == "failed" for item in checks)
@@ -150,7 +171,8 @@ def stage_view(job=None):
         for item in stage["inputs"] + stage["outputs"]:
             paths = item["path"].split(" + ")
             matches = {
-                name: checksum for name, checksum in files.items()
+                name: checksum
+                for name, checksum in files.items()
                 if any(name == path or (path.endswith("/") and name.startswith(path)) for path in paths)
             }
             item.update(files=matches, availability="recorded" if matches else "not_produced")
@@ -160,7 +182,8 @@ def stage_view(job=None):
             blocked = True
         stage["confirmations"] = [
             {**item, "state": "pending", "subject_sha256": subject}
-            for item in CONTRACT["confirmations"] if item["review_stage"] == stage["id"]
+            for item in CONTRACT["confirmations"]
+            if item["review_stage"] == stage["id"]
         ]
         stage["unsupported"] = [{**item} for item in view["unsupported"] if item["stage"] == stage["id"]]
         view["stages"].append(stage)
@@ -175,9 +198,11 @@ def require_complete(view):
     for stage, definition in zip(view["stages"], CONTRACT["stages"], strict=True):
         for boundary in ("input_qc", "output_qc"):
             rows = stage.get(boundary) or []
-            if ([row.get("id") for row in rows] != [row["id"] for row in definition[boundary]]
-                    or any(row.get("state") != "passed" for row in rows)
-                    or stage.get("state") != "completed"):
+            if (
+                [row.get("id") for row in rows] != [row["id"] for row in definition[boundary]]
+                or any(row.get("state") != "passed" for row in rows)
+                or stage.get("state") != "completed"
+            ):
                 raise PipelineError("Engineering stages are incomplete; missing checks cannot qualify a run")
 
 
@@ -204,15 +229,33 @@ def stage_log(view):
 def compact_view(view):
     """Bounded terminal XCom: contract and file hashes point to the detailed run receipt."""
     return {
-        **{key: view[key] for key in ("schema_version", "pipeline_id", "contract_sha256", "contract_file_sha256",
-                                     "run_id", "execution_scope", "subject_sha256", "handoff_sha256",
-                                     "release_approval")},
+        **{
+            key: view[key]
+            for key in (
+                "schema_version",
+                "pipeline_id",
+                "contract_sha256",
+                "contract_file_sha256",
+                "run_id",
+                "execution_scope",
+                "subject_sha256",
+                "handoff_sha256",
+                "release_approval",
+            )
+        },
         "stages": [
-            {"id": stage["id"], "state": stage["state"], "checks_passed": stage["checks_passed"],
-             "checks_total": stage["checks_total"],
-             **{key: [{"id": item["id"], "state": item["state"]} for item in stage[key]]
-                for key in ("input_qc", "output_qc")},
-             "evidence": stage["evidence"], "confirmations": "pending"}
+            {
+                "id": stage["id"],
+                "state": stage["state"],
+                "checks_passed": stage["checks_passed"],
+                "checks_total": stage["checks_total"],
+                **{
+                    key: [{"id": item["id"], "state": item["state"]} for item in stage[key]]
+                    for key in ("input_qc", "output_qc")
+                },
+                "evidence": stage["evidence"],
+                "confirmations": "pending",
+            }
             for stage in view["stages"]
         ],
         "report": "reports/stages.json",

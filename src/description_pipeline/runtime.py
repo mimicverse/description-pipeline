@@ -48,7 +48,6 @@ def tool_record() -> dict:
     }
 
 
-
 def runtime_packages() -> dict:
     """Record runtime dependency closure, excluding unrelated developer tools."""
     from packaging.requirements import Requirement
@@ -73,4 +72,3 @@ def runtime_packages() -> dict:
             ):
                 pending.append((requirement.name, frozenset(requirement.extras)))
     return dict(sorted(versions.items()))
-

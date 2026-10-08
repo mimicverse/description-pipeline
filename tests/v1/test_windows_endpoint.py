@@ -115,12 +115,19 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
             self.fail("Capture or publication ran after discovery failed")
 
         for error, detail in (
-            (ConsumerError("Consumer loading failed", returncode=1, stderr="ImportError: native library unavailable"),
-             {"returncode": 1, "stderr": "ImportError: native library unavailable"}),
-            (CadError("cad_read_failed", "Native read failed", detail={"phase": "read", "cause": "lost binding"}),
-             {"phase": "read", "cause": "lost binding"}),
+            (
+                ConsumerError(
+                    "Consumer loading failed", returncode=1, stderr="ImportError: native library unavailable"
+                ),
+                {"returncode": 1, "stderr": "ImportError: native library unavailable"},
+            ),
+            (
+                CadError("cad_read_failed", "Native read failed", detail={"phase": "read", "cause": "lost binding"}),
+                {"phase": "read", "cause": "lost binding"},
+            ),
         ):
             with self.subTest(error=type(error).__name__):
+
                 def prepare(*args, error=error, **kwargs):
                     raise error
 

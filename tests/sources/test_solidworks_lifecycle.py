@@ -160,7 +160,8 @@ class SessionTests(unittest.TestCase):
             return doc
 
         backend._document_by_path = refresh
-        result = backend._rebuild_capture_copy(doc, doc.GetPathName)
+        rebuilt, result = backend._rebuild_capture_copy(doc, doc.GetPathName)
+        self.assertIs(rebuilt, doc)
         self.assertEqual(result["scope"], "collected_copy_in_memory")
         self.assertFalse(result["saved_to_disk"])
         self.assertTrue(result["read_only"])
@@ -233,8 +234,18 @@ class SessionTests(unittest.TestCase):
         session = CadSession(process=process, binder=binder)
 
         self.assertIs(session.connect(cancelled), app)
-        self.assertEqual(events, [("startup", False), ("wait",), ("startup", False), ("wait",),
-                                  ("startup", True), ("CommandInProgress", True), ("Visible", False)])
+        self.assertEqual(
+            events,
+            [
+                ("startup", False),
+                ("wait",),
+                ("startup", False),
+                ("wait",),
+                ("startup", True),
+                ("CommandInProgress", True),
+                ("Visible", False),
+            ],
+        )
         binder.assert_called_once_with(42)
         session.close()
 

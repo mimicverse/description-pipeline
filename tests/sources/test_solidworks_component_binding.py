@@ -28,17 +28,18 @@ class ComponentBindingTests(unittest.TestCase):
         wc = types.ModuleType("win32com")
         wc.client = client
         self.modules = {
-            "pythoncom": pc, "pywintypes": wt, "win32com": wc,
-            "win32com.client": client, "win32com.client.dynamic": self.dynamic,
+            "pythoncom": pc,
+            "pywintypes": wt,
+            "win32com": wc,
+            "win32com.client": client,
+            "win32com.client.dynamic": self.dynamic,
         }
 
     def test_occurrence_reads_use_the_published_vendor_interface(self):
         with patch.dict(sys.modules, self.modules):
             comp = _component(self.raw)
             self.assertEqual(_method(comp, "GetPathName"), "C:/copy/arm.SLDPRT")
-        self.generic.QueryInterface.assert_called_once_with(
-            "{655D6F2A-5441-45D1-8CBA-D35FB26988E4}", "IDispatch"
-        )
+        self.generic.QueryInterface.assert_called_once_with("{655D6F2A-5441-45D1-8CBA-D35FB26988E4}", "IDispatch")
         self.dynamic.DumbDispatch.assert_called_once_with(self.vendor)
         self.component._FlagAsMethod.assert_called_once_with("GetPathName")
         self.component.GetPathName.assert_called_once_with()

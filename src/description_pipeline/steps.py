@@ -51,16 +51,28 @@ def freeze_inputs(package: Path, expected_digest: str, expected_files: dict, *, 
     def bound():
         files = package_inventory(package)
         _require(files == expected_files, "Native inputs changed while the job was queued")
-        return {"handoff_sha256": expected_digest,
-                "files": {"handoff/" + path: checksum for path, checksum in files.items()}}
+        return {
+            "handoff_sha256": expected_digest,
+            "files": {"handoff/" + path: checksum for path, checksum in files.items()},
+        }
 
     identity = checked(on_event, "freeze", "output", "handoff.integrity", bound)
     _state(on_event, "freeze", "completed")
     return identity
 
 
-def discover_structure(frozen: Path, output: Path, run_id: str, *, expected_digest: str,
-                       expected_files: dict, configuration: dict, targets: dict, preparer=None, on_event=None):
+def discover_structure(
+    frozen: Path,
+    output: Path,
+    run_id: str,
+    *,
+    expected_digest: str,
+    expected_files: dict,
+    configuration: dict,
+    targets: dict,
+    preparer=None,
+    on_event=None,
+):
     """Derive mechanical semantics and bind their native observations to the handoff."""
     from .repository.urdf_pr import _origin_slug
     from .sources.solidworks.discovery import DiscoverySettings, prepare_native_package
@@ -70,19 +82,33 @@ def discover_structure(frozen: Path, output: Path, run_id: str, *, expected_dige
     def discovery_inputs():
         _require(package_inventory(frozen) == expected_files, "Frozen engineering changed before discovery")
         names = read_data(configuration["frozen_names_file"]) if configuration.get("frozen_names_file") else {}
-        _require(isinstance(names, dict)
-                 and all(isinstance(key, str) and isinstance(value, str) for key, value in names.items()),
-                 "Frozen-name registry must map native identities to interface names")
+        _require(
+            isinstance(names, dict)
+            and all(isinstance(key, str) and isinstance(value, str) for key, value in names.items()),
+            "Frozen-name registry must map native identities to interface names",
+        )
         return DiscoverySettings(record_roots=tuple(configuration.get("record_roots", [])), frozen_names=names)
 
-    settings = checked(on_event, "discover", "input", "discovery.inputs", discovery_inputs,
-                       describe=lambda value: {"handoff_sha256": expected_digest,
-                                               "files_sha256": digest(expected_files),
-                                               "frozen_names_sha256": digest(value.frozen_names)})
+    settings = checked(
+        on_event,
+        "discover",
+        "input",
+        "discovery.inputs",
+        discovery_inputs,
+        describe=lambda value: {
+            "handoff_sha256": expected_digest,
+            "files_sha256": digest(expected_files),
+            "frozen_names_sha256": digest(value.frozen_names),
+        },
+    )
     prepared = (preparer or prepare_native_package)(frozen, output, run_id, settings=settings, on_event=on_event)
-    discovery = {"passed": prepared.passed, "findings": list(prepared.findings),
-                 "hardware_id": prepared.hardware_id, "revision": prepared.revision,
-                 "discovery_sha256": prepared.discovery_sha256}
+    discovery = {
+        "passed": prepared.passed,
+        "findings": list(prepared.findings),
+        "hardware_id": prepared.hardware_id,
+        "revision": prepared.revision,
+        "discovery_sha256": prepared.discovery_sha256,
+    }
     _state(on_event, "discover", "running", discovery=discovery)
     checked(on_event, "discover", "output", "discovery.definition", lambda: discovery)
 
@@ -91,29 +117,40 @@ def discover_structure(frozen: Path, output: Path, run_id: str, *, expected_dige
         package = Path(prepared.package).resolve()
         _require(package.is_relative_to(output.resolve()), "Native preparation returned an unmanaged package")
         record = Path(prepared.discovery_path).resolve()
-        _require(record.is_relative_to(package) and file_digest(record) == prepared.discovery_sha256,
-                 "Prepared inputs lack the bound raw native discovery record")
+        _require(
+            record.is_relative_to(package) and file_digest(record) == prepared.discovery_sha256,
+            "Prepared inputs lack the bound raw native discovery record",
+        )
         _require(package_inventory(frozen) == expected_files, "Frozen engineering changed during discovery")
         for name, checksum in expected_files.items():
             _require(file_digest(confined(package, name)) == checksum, "Native preparation changed engineering files")
         revision = read_revision(package)
-        _require(revision["hardware_id"] == prepared.hardware_id and revision["revision"] == prepared.revision,
-                 "Generated revision differs from native discovery")
+        _require(
+            revision["hardware_id"] == prepared.hardware_id and revision["revision"] == prepared.revision,
+            "Generated revision differs from native discovery",
+        )
         target = targets.get(prepared.hardware_id)
         _require(target is not None, f"Hardware {prepared.hardware_id!r} has no configured model repository")
         files = package_inventory(package)
         _require(digest(files) == prepared.prepared_sha256, "Prepared files differ from native discovery")
         return package, target, files
 
-    package, target, files = checked(on_event, "discover", "output", "discovery.binding", bind_discovery,
-                              describe=lambda value: {"discovery_sha256": prepared.discovery_sha256,
-                                                      "hardware_id": prepared.hardware_id,
-                                                      "revision": prepared.revision,
-                                                      "repository_slug": _origin_slug(value[1]["repository"]),
-                                                      "base": value[1]["base"],
-                                                      "prepared_sha256": digest(value[2]),
-                                                      "files": {"input/" + name: checksum
-                                                                for name, checksum in value[2].items()}})
+    package, target, files = checked(
+        on_event,
+        "discover",
+        "output",
+        "discovery.binding",
+        bind_discovery,
+        describe=lambda value: {
+            "discovery_sha256": prepared.discovery_sha256,
+            "hardware_id": prepared.hardware_id,
+            "revision": prepared.revision,
+            "repository_slug": _origin_slug(value[1]["repository"]),
+            "base": value[1]["base"],
+            "prepared_sha256": digest(value[2]),
+            "files": {"input/" + name: checksum for name, checksum in value[2].items()},
+        },
+    )
     _state(on_event, "discover", "completed")
     return package, target, prepared, files
 
@@ -133,6 +170,7 @@ def inspect_prepared_input(package: Path) -> dict:
         report["passed"] = False
     return report
 
+
 def _archive_input(package: Path, staging: Path) -> None:
     """Archive the original handoff; evidence/source holds the relinked CAD copy."""
 
@@ -143,6 +181,7 @@ def _archive_input(package: Path, staging: Path) -> None:
         target = confined(destination, name, exists=False)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(original, target)
+
 
 def _delivery_readme(hardware: str) -> str:
     return (
@@ -168,13 +207,18 @@ def _snapshot_details(staging, manifest):
     if parsed != manifest:
         raise PipelineError("Evidence manifest changed after verification")
     manifest_hash = hashlib.sha256(raw).hexdigest()
-    return {"manifest_sha256": manifest_hash,
-            "files": {"evidence/manifest.json": manifest_hash,
-                      **{"evidence/" + path: checksum for path, checksum in manifest["files"].items()}}}
+    return {
+        "manifest_sha256": manifest_hash,
+        "files": {
+            "evidence/manifest.json": manifest_hash,
+            **{"evidence/" + path: checksum for path, checksum in manifest["files"].items()},
+        },
+    }
 
 
-def capture_evidence(package: Path, staging: Path, *, expected_inputs=None, handoff_sha256=None,
-                     backend=None, on_event=None):
+def capture_evidence(
+    package: Path, staging: Path, *, expected_inputs=None, handoff_sha256=None, backend=None, on_event=None
+):
     """Inspect generated inputs, archive them and capture a complete immutable snapshot."""
     from .sources.solidworks.freeze import freeze
     from .sources.solidworks.input import resolve_package
@@ -201,13 +245,20 @@ def capture_evidence(package: Path, staging: Path, *, expected_inputs=None, hand
         write_json(staging / "reports/input.json", report)
         return definition, report
 
-    definition, input_report = checked(on_event, "capture", "input", "input.valid", inspect_and_archive,
-                           describe=lambda value: {"passed": value[1]["passed"],
-                                                   "handoff_sha256": handoff_sha256,
-                                                   "files_sha256": digest(value[1]["package_files"]),
-                                                   "cad_revision": value[1]["cad_revision"],
-                                                   "files": {"input/" + path: checksum
-                                                       for path, checksum in value[1]["package_files"].items()}})
+    definition, input_report = checked(
+        on_event,
+        "capture",
+        "input",
+        "input.valid",
+        inspect_and_archive,
+        describe=lambda value: {
+            "passed": value[1]["passed"],
+            "handoff_sha256": handoff_sha256,
+            "files_sha256": digest(value[1]["package_files"]),
+            "cad_revision": value[1]["cad_revision"],
+            "files": {"input/" + path: checksum for path, checksum in value[1]["package_files"].items()},
+        },
+    )
     original_files = input_report["package_files"]
 
     def ready():
@@ -222,8 +273,14 @@ def capture_evidence(package: Path, staging: Path, *, expected_inputs=None, hand
     checked(on_event, "capture", "input", "runtime.ready", ready)
     _require(package_inventory(package) == original_files, "Prepared inputs changed before native capture")
     freeze(definition["source"], staging / "evidence", backend=backend, worker_version=__version__)
-    checked(on_event, "capture", "output", "capture.integrity", lambda: verify_snapshot(staging / "evidence"),
-            describe=lambda value: _snapshot_details(staging, value))
+    checked(
+        on_event,
+        "capture",
+        "output",
+        "capture.integrity",
+        lambda: verify_snapshot(staging / "evidence"),
+        describe=lambda value: _snapshot_details(staging, value),
+    )
 
     def stable_inputs():
         if package_inventory(package) != original_files:
@@ -238,8 +295,14 @@ def capture_evidence(package: Path, staging: Path, *, expected_inputs=None, hand
 def generate_model(staging: Path, definition: dict, input_report: dict, *, on_event=None) -> str:
     """Generate one canonical model and bind every derived file before independent checking."""
     _state(on_event, "generate", "running")
-    checked(on_event, "generate", "input", "generation.inputs", lambda: verify_snapshot(staging / "evidence"),
-            describe=lambda value: _snapshot_details(staging, value))
+    checked(
+        on_event,
+        "generate",
+        "input",
+        "generation.inputs",
+        lambda: verify_snapshot(staging / "evidence"),
+        describe=lambda value: _snapshot_details(staging, value),
+    )
     hardware = definition["hardware_id"]
     (staging / "README.md").write_text(_delivery_readme(hardware), encoding="utf-8", newline="\n")
     write_json(staging / "reports/input.json", input_report)
@@ -274,17 +337,25 @@ def verify_delivery(staging: Path, generated_subject: str, *, on_event=None) -> 
     report = evaluate_bundle(staging)
     write_json(staging / "reports/quality.json", report)
     checked(on_event, "verify", "output", "verification.gates", lambda: require_qualified_report(report))
-    report = checked(on_event, "verify", "output", "verification.report_binding",
-                     lambda: require_qualified_report(check_bundle(staging)),
-                     describe=lambda value: {"passed": value.get("passed"),
-                                             "subject_sha256": value.get("subject_sha256"),
-                                             "report_sha256": file_digest(staging / "reports/quality.json")})
+    report = checked(
+        on_event,
+        "verify",
+        "output",
+        "verification.report_binding",
+        lambda: require_qualified_report(check_bundle(staging)),
+        describe=lambda value: {
+            "passed": value.get("passed"),
+            "subject_sha256": value.get("subject_sha256"),
+            "report_sha256": file_digest(staging / "reports/quality.json"),
+        },
+    )
     _state(on_event, "verify", "completed")
     return report
 
 
-def publish_model(bundle: Path, repository: Path, *, base: str | None = None,
-                  message: str | None = None, on_event=None) -> dict:
+def publish_model(
+    bundle: Path, repository: Path, *, base: str | None = None, message: str | None = None, on_event=None
+) -> dict:
     """Recheck and submit a frozen delivery from either Windows or Linux."""
 
     from .repository.urdf_pr import submit_bundle

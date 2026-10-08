@@ -65,9 +65,13 @@ def _poke(request: dict, **context) -> bool:
     progress = digest(compact_view(stages))
     if ti is None or ti.xcom_pull(task_ids="wait_for_job", key="engineering_progress") != progress:
         for stage in stages["stages"]:
-            log.info("engineering stage=%s state=%s input_qc=%s output_qc=%s", stage["id"], stage["state"],
-                     [(item["id"], item["state"]) for item in stage["input_qc"]],
-                     [(item["id"], item["state"]) for item in stage["output_qc"]])
+            log.info(
+                "engineering stage=%s state=%s input_qc=%s output_qc=%s",
+                stage["id"],
+                stage["state"],
+                [(item["id"], item["state"]) for item in stage["input_qc"]],
+                [(item["id"], item["state"]) for item in stage["output_qc"]],
+            )
         if ti is not None:
             ti.xcom_push(key="engineering_progress", value=progress)
     if job["status"] in {"passed", "failed"}:
@@ -195,8 +199,9 @@ def solidworks_to_urdf():
         mode=SENSOR_MODE,
         poke_interval=POLL_INTERVAL,
         timeout=POLL_TIMEOUT,
-        doc_md=("Transport polling only. Engineering stage/QC results are in these logs "
-                "and the engineering_stages XCom."),
+        doc_md=(
+            "Transport polling only. Engineering stage/QC results are in these logs and the engineering_stages XCom."
+        ),
     )
     confirm = confirm_job(started)
     wait_for_job >> confirm

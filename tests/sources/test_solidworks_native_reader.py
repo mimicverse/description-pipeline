@@ -32,6 +32,7 @@ from description_pipeline.sources.solidworks.errors import CadError
 from description_pipeline.sources.solidworks.isolation import CadSession
 from description_pipeline.sources.solidworks.native import (
     SolidWorksBackend,
+    normalize_document_path,
     _read_only_document,
     _temporary_configuration,
 )
@@ -325,9 +326,7 @@ class _Doc:
     ):
         self._path = str(path)
         self._children = list(children)
-        self._configuration_children = {
-            name: list(items) for name, items in (configuration_children or {}).items()
-        }
+        self._configuration_children = {name: list(items) for name, items in (configuration_children or {}).items()}
         self._configuration_features = dict(configuration_features or {})
         self._doc_type = doc_type
         self.active_configuration = configuration
@@ -436,8 +435,12 @@ class _CaptureBackend(SolidWorksBackend):
     """Real ``collect_scene`` frame loop; only heavy CAD reads are stubbed."""
 
     def _rebuild_capture_copy(self, doc, path):
-        return {"rebuilt": True, "path": str(path), "document": str(path),
-                "configuration": str(doc.active_configuration)}
+        return doc, {
+            "rebuilt": True,
+            "path": str(path),
+            "document": str(path),
+            "configuration": str(doc.active_configuration),
+        }
 
     def _record_save_flag(self, doc, path):
         self.save_flags[str(path)] = False
@@ -520,9 +523,7 @@ class MateRecordTests(unittest.TestCase):
             base = _write(root, "base.SLDPRT")
             component = _Component("base-1", base)
             plane_entity = _MateEntity(component, "Plane1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0)))
-            cylinder_entity = _MateEntity(
-                component, "Cylinder1", _Cylinder((0.0, 0.0, 0.0), (0.0, 0.0, 2.0), 0.02)
-            )
+            cylinder_entity = _MateEntity(component, "Cylinder1", _Cylinder((0.0, 0.0, 0.0), (0.0, 0.0, 2.0), 0.02))
             travel = _mate("travel_limit", 5, [plane_entity], lower=0.0, upper=0.03)
             swing = _mate("swing_limit", 6, [cylinder_entity], lower=-0.1, upper=0.2, suppressed=True)
             open_distance = _mate("travel_open", 5, [plane_entity], lower=0.0, upper=0.0)
@@ -587,9 +588,7 @@ class MateRecordTests(unittest.TestCase):
                 configuration="Sub",
                 configuration_children={"Sub": [arm_component]},
             )
-            sub_component = _Component(
-                "sub-1", sub_path, children=[arm_component], doc=sub_doc, configuration="Sub"
-            )
+            sub_component = _Component("sub-1", sub_path, children=[arm_component], doc=sub_doc, configuration="Sub")
             assembly = _write(root, "robot.SLDASM")
             main_doc = _Doc(assembly, children=[sub_component])
 
@@ -603,9 +602,7 @@ class MateRecordTests(unittest.TestCase):
             self.assertEqual(record["mates"][0]["scope"], "sub-1")
             self.assertEqual(record["mates"][0]["configuration"], "Sub")
             self.assertEqual(record["mates"][0]["entities"][0]["component"], "sub-1/arm-1")
-            self.assertEqual(
-                sorted(record["files"]), ["arm.SLDPRT", "robot.SLDASM", "sub.SLDASM"]
-            )
+            self.assertEqual(sorted(record["files"]), ["arm.SLDPRT", "robot.SLDASM", "sub.SLDASM"])
 
 
 class ProducerContextTests(unittest.TestCase):
@@ -629,13 +626,18 @@ class ProducerContextTests(unittest.TestCase):
             arm = _Doc(arm_path)
             child = _Component("arm-1", arm_path, doc=arm)
             sub = NestedDocument(
-                sub_path, doc_type=2, configuration="Parked",
+                sub_path,
+                doc_type=2,
+                configuration="Parked",
                 configuration_children={"Parked": [], "Working": [child]},
             )
             occurrence = _Component("sub-1", sub_path, doc=sub, children=[child], configuration="Working")
             main = _Doc(
-                assembly, doc_type=2, children=[occurrence],
-                coordinate_systems={"CS_base": SW_IDENTITY}, first_feature=_Feature("CS_base", "CoordSys"),
+                assembly,
+                doc_type=2,
+                children=[occurrence],
+                coordinate_systems={"CS_base": SW_IDENTITY},
+                first_feature=_Feature("CS_base", "CoordSys"),
             )
 
             class MainHandle:
@@ -675,7 +677,8 @@ class ProducerContextTests(unittest.TestCase):
                     return super().ShowConfiguration2(name)
 
             shared = SharedDocument(
-                part_path, configuration="Parked",
+                part_path,
+                configuration="Parked",
                 configuration_children={"Parked": [], "Short": [], "Long": []},
                 configuration_properties={"Short": {"dp.role": "short"}, "Long": {"dp.role": "long"}},
                 coordinate_systems={"CS_tip": _sw_translation(0.1, 0.0, 0.0)},
@@ -808,9 +811,7 @@ class ProducerContextTests(unittest.TestCase):
             self.assertEqual([datum["name"] for datum in datums], ["CS_tip"])
             self.assertEqual(datums[0]["configuration"], "Tip")
             matrix = datums[0]["array"]
-            self.assertEqual(
-                [round(value, 10) for value in (matrix[0], matrix[5], matrix[10])], [1.0, 1.0, 1.0]
-            )
+            self.assertEqual([round(value, 10) for value in (matrix[0], matrix[5], matrix[10])], [1.0, 1.0, 1.0])
             # sub-1 at (1, 0, 0), arm-1 at (0, 0.5, 0), CS_tip at (0.05, 0, 0) in the arm frame.
             self.assertAlmostEqual(matrix[3], 1.05, msg=f"translation x not composed through parents: {matrix}")
             self.assertAlmostEqual(matrix[7], 0.5, msg=f"translation y not composed through parents: {matrix}")
@@ -831,12 +832,8 @@ class ProducerContextTests(unittest.TestCase):
                 configuration_children={"Left": [arm_left], "Right": [arm_right]},
                 configuration_properties={"Left": {"dp.role": "left"}, "Right": {"dp.role": "right"}},
             )
-            occurrence_left = _Component(
-                "sub-a", sub_path, children=[arm_left], doc=sub_doc, configuration="Left"
-            )
-            occurrence_right = _Component(
-                "sub-b", sub_path, children=[arm_right], doc=sub_doc, configuration="Right"
-            )
+            occurrence_left = _Component("sub-a", sub_path, children=[arm_left], doc=sub_doc, configuration="Left")
+            occurrence_right = _Component("sub-b", sub_path, children=[arm_right], doc=sub_doc, configuration="Right")
             assembly = _write(root, "robot.SLDASM")
             main_doc = _Doc(assembly, children=[occurrence_left, occurrence_right])
 
@@ -1193,7 +1190,9 @@ class CaptureSceneTests(unittest.TestCase):
             path = _write(root, "shared.SLDPRT")
             assembly = _write(root, "robot.SLDASM")
             shared = SharedDocument(
-                path, configuration="Parked", configuration_children={"Short": [], "Long": [], "Parked": []},
+                path,
+                configuration="Parked",
+                configuration_children={"Short": [], "Long": [], "Parked": []},
             )
             expired_reads = []
 
@@ -1503,7 +1502,9 @@ class CaptureSceneTests(unittest.TestCase):
             app = backend._app_obj()
             original = backend._document_by_path(path)
             app._docs[os.path.normcase(os.path.abspath(path))] = _Doc(
-                path, doc_type=2, children=original._children,
+                path,
+                doc_type=2,
+                children=original._children,
             )
             original.ConfigurationManager = Expired()
             self.assertIn(str(Path(tmp) / "robot.SLDASM"), backend.verify_sources_unchanged())
@@ -1590,9 +1591,10 @@ class CaptureSceneTests(unittest.TestCase):
             root = Path(tmp)
             backend, original, replacement = self._expiring_document(root)
             path = str(root / "shared.SLDPRT")
-            with _temporary_configuration(
-                lambda: backend._document_by_path(path), "Short", "part-short"
-            ) as (document, _previous):
+            with _temporary_configuration(lambda: backend._document_by_path(path), "Short", "part-short") as (
+                document,
+                _previous,
+            ):
                 document.GetTessTriangles(True)
 
             self.assertTrue(original.expired)
@@ -1607,9 +1609,10 @@ class CaptureSceneTests(unittest.TestCase):
 
             with (
                 self.assertRaises(CadError) as caught,
-                _temporary_configuration(
-                    lambda: backend._document_by_path(path), "Short", "part-short"
-                ) as (document, _previous),
+                _temporary_configuration(lambda: backend._document_by_path(path), "Short", "part-short") as (
+                    document,
+                    _previous,
+                ),
             ):
                 document.GetTessTriangles(True)
 
@@ -1680,9 +1683,7 @@ class CaptureSceneTests(unittest.TestCase):
             )
             # SolidWorks retains suppressed features in the tree, and a stored
             # transform can remain readable. Selection must use suppression.
-            right_datum = _Feature(
-                "CS_right", "CoordSys", suppressed=lambda: arm_doc.active_configuration != "Right"
-            )
+            right_datum = _Feature("CS_right", "CoordSys", suppressed=lambda: arm_doc.active_configuration != "Right")
             arm_doc._first_feature = _Feature(
                 "CS_left",
                 "CoordSys",
@@ -1763,13 +1764,19 @@ class CaptureSceneTests(unittest.TestCase):
 
                 def _rebuild_capture_copy(self, doc, path):
                     assert doc is first, "the pre-rebuild handle is the collected copy"
-                    return {"rebuilt": True, "document": str(path),
-                            "configuration": str(first.active_configuration)}
+                    refreshed_doc = self._document_by_path(path)
+                    return refreshed_doc, {
+                        "rebuilt": True,
+                        "document": str(path),
+                        "configuration": str(first.active_configuration),
+                    }
 
                 def _document_by_path(self, path):
                     self._app_for_path(path)  # keep the owned session registered
                     self.lookups.append(str(path))
-                    return first if len(self.lookups) == 1 else refreshed
+                    if str(path) == str(assembly):
+                        return first if self.lookups.count(str(assembly)) == 1 else refreshed
+                    return part
 
                 def _record_save_flag(self, doc, path):
                     self.save_flag_docs.append(doc)
@@ -1810,13 +1817,19 @@ class CaptureSceneTests(unittest.TestCase):
 
                 def _rebuild_capture_copy(self, doc, path):
                     refreshed.rebuilt_generation += 1
-                    return {"rebuilt": True, "document": str(path),
-                            "configuration": str(first.active_configuration)}
+                    refreshed_doc = self._document_by_path(path)
+                    return refreshed_doc, {
+                        "rebuilt": True,
+                        "document": str(path),
+                        "configuration": str(first.active_configuration),
+                    }
 
                 def _document_by_path(self, path):
                     self._app_for_path(path)
                     self.lookups.append(str(path))
-                    doc = first if len(self.lookups) == 1 else refreshed
+                    doc = part
+                    if str(path) == str(assembly):
+                        doc = first if self.lookups.count(str(assembly)) == 1 else refreshed
                     return _read_only_document(doc)
 
                 def _record_save_flag(self, doc, path):
@@ -1847,27 +1860,71 @@ class CaptureSceneTests(unittest.TestCase):
             part = _Doc(part_path, doc_type=1)
             component = _Component("part-1", part_path, doc=part)
             assembly = _write(root, "robot.SLDASM")
-            first = _Doc(assembly, doc_type=2, children=[component])
-            refreshed = _Doc(assembly, doc_type=2, children=[component])
+
+            class RebuildableDoc(_Doc):
+                def GetSaveFlag(self):
+                    return False
+
+            first = RebuildableDoc(assembly, doc_type=2, children=[component])
+            refreshed = RebuildableDoc(assembly, doc_type=2, children=[component], configuration="Other")
 
             class ConfigChangingBackend(_CaptureBackend):
                 def __init__(self, **kwargs):
                     super().__init__(**kwargs)
                     self.lookups = []
+                    self._capture_roots = [normalize_document_path(os.path.abspath(str(root)))]
 
                 def _rebuild_capture_copy(self, doc, path):
-                    return {"rebuilt": True, "document": str(path), "configuration": "Other"}
+                    return SolidWorksBackend._rebuild_capture_copy(self, doc, path)
 
                 def _document_by_path(self, path):
                     self._app_for_path(path)
                     self.lookups.append(str(path))
-                    return first if len(self.lookups) == 1 else refreshed
+                    if str(path) == str(assembly):
+                        return first if self.lookups.count(str(assembly)) == 1 else refreshed
+                    return part
 
             backend = ConfigChangingBackend(session_factory=lambda: _Session(_App({assembly: first})))
             with self.assertRaises(CadError) as caught:
                 backend.collect_scene(str(assembly), [])
             self.assertEqual(caught.exception.code, "cad_configuration_mismatch")
             self.assertEqual(backend.lookups[:2], [str(assembly), str(assembly)])
+
+    def test_collect_scene_performs_one_post_rebuild_document_lookup(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            part_path = _write(root, "part.SLDPRT")
+            part = _Doc(part_path, doc_type=1)
+            component = _Component("part-1", part_path, doc=part)
+            assembly = _write(root, "robot.SLDASM")
+            first = _Doc(assembly, doc_type=2, children=[component])
+            refreshed = _Doc(assembly, doc_type=2, children=[component])
+
+            class CountingBackend(_CaptureBackend):
+                """Mimics production: the rebuild resolves the document once itself."""
+
+                def __init__(self, **kwargs):
+                    super().__init__(**kwargs)
+                    self.lookups = []
+
+                def _rebuild_capture_copy(self, doc, path):
+                    refreshed_doc = self._document_by_path(path)
+                    return refreshed_doc, {
+                        "rebuilt": True,
+                        "document": str(path),
+                        "configuration": str(first.active_configuration),
+                    }
+
+                def _document_by_path(self, path):
+                    self._app_for_path(path)
+                    self.lookups.append(str(path))
+                    if str(path) == str(assembly):
+                        return first if self.lookups.count(str(assembly)) == 1 else refreshed
+                    return part
+
+            backend = CountingBackend(session_factory=lambda: _Session(_App({assembly: first})))
+            backend.collect_scene(str(assembly), [])
+            self.assertEqual(backend.lookups.count(str(assembly)), 2)
 
 
 class PropertyContractTests(unittest.TestCase):
@@ -2033,9 +2090,7 @@ class EntityGeometryTests(unittest.TestCase):
             record = self._record(tmp, [("seat", entity)])
 
             geometry = record["mates"][0]["entities"][0]
-            self.assertEqual(
-                set(geometry), {"component", "feature", "face_index", "cylinder"}
-            )
+            self.assertEqual(set(geometry), {"component", "feature", "face_index", "cylinder"})
             self.assertEqual(
                 geometry["cylinder"],
                 {"point": [0.1, 0.2, 0.3], "direction": [0.0, 1.0, 0.0], "radius": 0.05},
@@ -2071,9 +2126,7 @@ class EntityGeometryTests(unittest.TestCase):
 
             geometry = {mate["name"]: mate["entities"][0] for mate in record["mates"]}
             self.assertEqual(geometry["both_unit"]["plane"], {"normal": [0.0, 1.0, 0.0], "point": [1.0, 0.0, 0.0]})
-            self.assertEqual(
-                geometry["scaled_normal"]["plane"], {"normal": [0.0, 0.0, 1.0], "point": [1.0, 0.0, 0.0]}
-            )
+            self.assertEqual(geometry["scaled_normal"]["plane"], {"normal": [0.0, 0.0, 1.0], "point": [1.0, 0.0, 0.0]})
 
     def test_vertex_point_geometry_is_recorded(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -2090,9 +2143,7 @@ class EntityGeometryTests(unittest.TestCase):
 
     def test_nonfinite_entity_geometry_blocks(self) -> None:
         def cylinder(component):
-            return _MateEntity(
-                component, "C1", _Cylinder((float("nan"), 0.0, 0.0), (0.0, 0.0, 1.0), 0.05)
-            )
+            return _MateEntity(component, "C1", _Cylinder((float("nan"), 0.0, 0.0), (0.0, 0.0, 1.0), 0.05))
 
         def plane(component):
             return _MateEntity(component, "F1", _Plane((0.0, 0.0, 1.0), (float("nan"), 0.0, 0.0)))
@@ -2171,9 +2222,9 @@ class MateFailureTests(unittest.TestCase):
                     "MateCoincident",
                     specific=_MateSpecific(
                         0,
-                        lambda index: _MateEntity(component, "Plane1")
-                        if index
-                        else _raiser(RuntimeError("no entity"))(index),
+                        lambda index: (
+                            _MateEntity(component, "Plane1") if index else _raiser(RuntimeError("no entity"))(index)
+                        ),
                         count=1,
                     ),
                 ),

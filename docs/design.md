@@ -116,8 +116,9 @@ receipts; the renderer does not execute engineering work.
 
 One Linux server hosts Airflow, its database and the operator page. One licensed
 Windows endpoint serializes native jobs in owned processes, separate from an
-engineer's CAD session. Runtime readiness precedes CAD access; native references
-remain within their valid lifetime. Lost bindings or unavailable capabilities
+engineer's CAD session. Runtime readiness precedes CAD access. Native acquisitions
+bind their documented interfaces; each rebuild refreshes and verifies the owned
+document once before continuation. Lost bindings or unavailable capabilities
 stop execution, retain diagnostics and release owned resources.
 
 Feishu supplies operator identity and profile. The platform restricts tenant and

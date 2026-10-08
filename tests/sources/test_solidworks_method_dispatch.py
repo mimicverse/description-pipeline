@@ -47,11 +47,14 @@ class MethodDispatchTests(unittest.TestCase):
         self.assertIs(second, app.value)
         self.assertIs(_method(app, "GetOpenDocumentByName", "third.SLDPRT"), app.value)
         self.assertEqual(app.hints, ["GetOpenDocumentByName"])
-        self.assertEqual(app.calls, [
-            ("GetOpenDocumentByName", ("first.SLDPRT",)),
-            ("GetOpenDocumentByName", ("second.SLDPRT",)),
-            ("GetOpenDocumentByName", ("third.SLDPRT",)),
-        ])
+        self.assertEqual(
+            app.calls,
+            [
+                ("GetOpenDocumentByName", ("first.SLDPRT",)),
+                ("GetOpenDocumentByName", ("second.SLDPRT",)),
+                ("GetOpenDocumentByName", ("third.SLDPRT",)),
+            ],
+        )
 
     def test_parameterless_method_still_invokes_each_time(self):
         doc = Dispatch()

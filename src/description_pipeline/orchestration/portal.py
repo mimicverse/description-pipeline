@@ -425,8 +425,14 @@ def _findings(job: dict | None) -> list[dict]:
         )
     if job.get("error"):
         findings.append(
-            {"id": "", "severity": "error", "stage": (job.get("events") or [{}])[-1].get("stage", ""),
-             "object": "", "message": str(job["error"]), "evidence": job.get("detail") or result.get("detail") or {}}
+            {
+                "id": "",
+                "severity": "error",
+                "stage": (job.get("events") or [{}])[-1].get("stage", ""),
+                "object": "",
+                "message": str(job["error"]),
+                "evidence": job.get("detail") or result.get("detail") or {},
+            }
         )
     quality = result.get("quality")
     if isinstance(quality, dict):
@@ -438,8 +444,11 @@ def _findings(job: dict | None) -> list[dict]:
                         "severity": "error",
                         "stage": "verify",
                         "object": str(check.get("object") or ""),
-                        "message": str((check.get("details") or {}).get("error")
-                                       or (check.get("details") or {}).get("reason") or "自动检查未通过"),
+                        "message": str(
+                            (check.get("details") or {}).get("error")
+                            or (check.get("details") or {}).get("reason")
+                            or "自动检查未通过"
+                        ),
                         "evidence": check.get("details") or {},
                     }
                 )
@@ -512,9 +521,16 @@ def _coverage_report(job: dict | None) -> dict:
         },
         "engineering": {
             "state": "pending",
-            "items": [{"id": item["label"], "review_stage": item["review_stage"], "state": "pending",
-                       "subject_sha256": result.get("subject_sha256"), "reference": item["reference"]}
-                      for item in CONTRACT["confirmations"]],
+            "items": [
+                {
+                    "id": item["label"],
+                    "review_stage": item["review_stage"],
+                    "state": "pending",
+                    "subject_sha256": result.get("subject_sha256"),
+                    "reference": item["reference"],
+                }
+                for item in CONTRACT["confirmations"]
+            ],
             "message": "工程确认由结构负责人在本版本原生工程及评审 PR 中完成，本页只显示逐项待确认状态。",
         },
     }

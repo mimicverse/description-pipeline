@@ -42,7 +42,10 @@ def load(root: Path) -> dict:
     try:
         result = subprocess.run(
             [sys.executable, "-I", str(Path(__file__).resolve()), str(root)],
-            capture_output=True, text=True, encoding="utf-8", timeout=TIMEOUT_SECONDS,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as error:
         # subprocess.run kills and waits for the child before raising.
@@ -56,10 +59,14 @@ def load(root: Path) -> dict:
     if not isinstance(report, dict) or report.get("inputs") != inputs or _inputs(root) != inputs:
         raise ConsumerError("Consumer input hashes differ from delivered bytes")
     if (
-        report.get("reader") != "mujoco" or report.get("version") != importlib.metadata.version("mujoco")
-        or type(report.get("bodies")) is not int or report["bodies"] != len(bodies) + 1
-        or type(report.get("joints")) is not int or report["joints"] != len(joints)
-        or report.get("body_names") != bodies or report.get("joint_names") != joints
+        report.get("reader") != "mujoco"
+        or report.get("version") != importlib.metadata.version("mujoco")
+        or type(report.get("bodies")) is not int
+        or report["bodies"] != len(bodies) + 1
+        or type(report.get("joints")) is not int
+        or report["joints"] != len(joints)
+        or report.get("body_names") != bodies
+        or report.get("joint_names") != joints
     ):
         raise ConsumerError("Consumer loaded another link or joint set")
     return report
@@ -74,7 +81,8 @@ def readiness() -> dict:
         (root / "urdf/robot.urdf").write_text(
             '<robot name="consumer_probe"><link name="base_link"><inertial>'
             '<mass value="1"/><inertia ixx="1" ixy="0" ixz="0" iyy="1" iyz="0" izz="1"/>'
-            '</inertial></link></robot>', encoding="utf-8",
+            "</inertial></link></robot>",
+            encoding="utf-8",
         )
         return load(root)
 
@@ -94,8 +102,11 @@ def _read(root):
         ET.ElementTree(document).write(path, encoding="utf-8", xml_declaration=True)
         model = mujoco.MjModel.from_xml_path(str(path))
         return {
-            "reader": "mujoco", "version": mujoco.__version__, "inputs": inputs,
-            "bodies": model.nbody, "joints": model.njnt,
+            "reader": "mujoco",
+            "version": mujoco.__version__,
+            "inputs": inputs,
+            "bodies": model.nbody,
+            "joints": model.njnt,
             "body_names": sorted(model.body(i).name for i in range(1, model.nbody)),
             "joint_names": sorted(model.joint(i).name for i in range(model.njnt)),
             "scope": "URDF loading only; no simulation qualification",

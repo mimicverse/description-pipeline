@@ -839,9 +839,7 @@ def _datum(record: dict, name: str | None, owners: Sequence[str]) -> dict | None
     matches = [
         datum
         for datum in record.get("datums") or []
-        if isinstance(datum, dict)
-        and str(datum.get("name")) == str(name)
-        and str(datum.get("owner") or "") in owners
+        if isinstance(datum, dict) and str(datum.get("name")) == str(name) and str(datum.get("owner") or "") in owners
     ]
     return matches[0] if len(matches) == 1 else None
 

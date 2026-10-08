@@ -1153,9 +1153,7 @@ def _component_mass_context(
         }
 
 
-def _mass_closure(
-    backend: Any, cfg: dict[str, Any], scene: Any, document: str | None = None
-) -> dict[str, Any] | None:
+def _mass_closure(backend: Any, cfg: dict[str, Any], scene: Any, document: str | None = None) -> dict[str, Any] | None:
     """The assembly's own reading next to the recombined leaf readings, as capture evidence.
 
     Capture retains full readings, closure deltas and explicit unavailable/error
@@ -1363,8 +1361,10 @@ def _export_geometry(
         info = entries[component]
         if not isinstance(info, dict) or info.get("component") != component or str(info.get("written")) != destination:
             raise BridgeError(
-                "cad_mesh_export_failed", "geometry export returned a different occurrence or path",
-                {"component": component}, exit_code=3,
+                "cad_mesh_export_failed",
+                "geometry export returned a different occurrence or path",
+                {"component": component},
+                exit_code=3,
             )
         stats = read_stl(target)
         exported.append(

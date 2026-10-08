@@ -372,16 +372,24 @@ class Jobs:
 
         job = self.jobs[identifier]
         package, target, prepared, files = discover_structure(
-            frozen, self.config["state_root"] / "prepared" / identifier, identifier,
-            expected_digest=job["request"]["handoff_sha256"], expected_files=job["package_files"],
-            configuration=self.config.get("discovery", {}), targets=self.config["targets"],
+            frozen,
+            self.config["state_root"] / "prepared" / identifier,
+            identifier,
+            expected_digest=job["request"]["handoff_sha256"],
+            expected_files=job["package_files"],
+            configuration=self.config.get("discovery", {}),
+            targets=self.config["targets"],
             preparer=self.native_preparer,
             on_event=lambda item: self._event(identifier, item),
         )
         with self.mutex:
-            job.update(hardware_id=prepared.hardware_id, revision=prepared.revision,
-                       repository_slug=_origin_slug(target["repository"]), repository_base=target["base"],
-                       prepared_files=files)
+            job.update(
+                hardware_id=prepared.hardware_id,
+                revision=prepared.revision,
+                repository_slug=_origin_slug(target["repository"]),
+                repository_base=target["base"],
+                prepared_files=files,
+            )
             self._save(job)
         return package, target
 
@@ -398,10 +406,15 @@ class Jobs:
                     self._save(job)
                 from ..steps import freeze_inputs
 
-                package = confined(self.config["package_root"], job["request"]["package"] + "/.handoff-folder",
-                                   exists=False).parent
-                freeze_inputs(package, job["request"]["handoff_sha256"], job["package_files"],
-                              on_event=lambda item, identifier=identifier: self._event(identifier, item))
+                package = confined(
+                    self.config["package_root"], job["request"]["package"] + "/.handoff-folder", exists=False
+                ).parent
+                freeze_inputs(
+                    package,
+                    job["request"]["handoff_sha256"],
+                    job["package_files"],
+                    on_event=lambda item, identifier=identifier: self._event(identifier, item),
+                )
                 package, target = self._prepare_native(identifier, package)
                 _require(
                     isinstance(job.get("repository_slug"), str)

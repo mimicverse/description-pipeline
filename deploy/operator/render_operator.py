@@ -26,8 +26,20 @@ TEMPLATE = Path(__file__).resolve().parent / "nginx.conf.template"
 PORTAL_TEMPLATE = Path(__file__).resolve().parent / "portal.json.template"
 UNIT_TEMPLATES = Path(__file__).resolve().parent / "systemd"
 FORBIDDEN = {Path("/"), Path("/usr"), Path("/etc"), Path("/opt"), Path("/var"), Path.home()}
-BROAD_ROOTS = {Path("/"), Path("/usr"), Path("/etc"), Path("/opt"), Path("/var"), Path("/home"),
-               Path("/root"), Path("/tmp"), Path("/srv"), Path("/mnt"), Path("/media"), Path.home()}
+BROAD_ROOTS = {
+    Path("/"),
+    Path("/usr"),
+    Path("/etc"),
+    Path("/opt"),
+    Path("/var"),
+    Path("/home"),
+    Path("/root"),
+    Path("/tmp"),
+    Path("/srv"),
+    Path("/mnt"),
+    Path("/media"),
+    Path.home(),
+}
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 # Keys that must not appear in the operator env: removed auth modes and credential values that
 # belong in the 0600 secret file. Refusing them keeps a stale/hand-edited file from silently
@@ -42,8 +54,7 @@ UNSUPPORTED_ENV_KEYS = {
     "FEISHU_USERINFO_URL": "the deployment uses the fixed official Feishu endpoints",
     "FEISHU_STATE_TTL_SECONDS": "the deployment uses the module's fixed state lifetime",
 }
-FEISHU_ENV_KEYS = ("FEISHU_APP_SECRET_FILE", "FEISHU_TENANT_KEYS", "FEISHU_REDIRECT_URI",
-                   "FEISHU_ADMIN_OPEN_IDS")
+FEISHU_ENV_KEYS = ("FEISHU_APP_SECRET_FILE", "FEISHU_TENANT_KEYS", "FEISHU_REDIRECT_URI", "FEISHU_ADMIN_OPEN_IDS")
 
 
 def die(message: str) -> None:
@@ -65,8 +76,15 @@ def load_env(path: Path | None) -> dict[str, str]:
             values[key.strip()] = value.strip()
     else:
         values = {key: value for key, value in os.environ.items() if re.fullmatch(r"[A-Z][A-Z0-9_]*", key)}
-    for required in ("OPERATOR_HOST", "OPERATOR_STATE", "AIRFLOW_VENV", "AIRFLOW_HOME", "AIRFLOW_DB_URL",
-                     "SOLIDWORKS_SSH_HOST", "SOLIDWORKS_HANDOFF_ROOT"):
+    for required in (
+        "OPERATOR_HOST",
+        "OPERATOR_STATE",
+        "AIRFLOW_VENV",
+        "AIRFLOW_HOME",
+        "AIRFLOW_DB_URL",
+        "SOLIDWORKS_SSH_HOST",
+        "SOLIDWORKS_HANDOFF_ROOT",
+    ):
         if not values.get(required):
             die(f"{required} is required")
     for unsupported, reason in UNSUPPORTED_ENV_KEYS.items():
@@ -130,8 +148,9 @@ def write_private(path: Path, text: str, mode: int = 0o600) -> None:
     os.chmod(path, mode)
 
 
-def ensure_certificate(state: Path, host: str, days: int, provided_cert: str,
-                       provided_key: str) -> tuple[Path, Path, str]:
+def ensure_certificate(
+    state: Path, host: str, days: int, provided_cert: str, provided_key: str
+) -> tuple[Path, Path, str]:
     certificate = state / "secrets" / "tls.crt"
     key = state / "secrets" / "tls.key"
     if provided_cert or provided_key:
@@ -148,12 +167,27 @@ def ensure_certificate(state: Path, host: str, days: int, provided_cert: str,
     certificate.parent.mkdir(parents=True, exist_ok=True)
     result = subprocess.run(
         [
-            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-nodes",
-            "-days", str(days), "-subj", f"/CN={host}",
-            "-addext", f"subjectAltName={tls_subject_alt_name(host)}",
-            "-keyout", str(key), "-out", str(certificate),
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-sha256",
+            "-nodes",
+            "-days",
+            str(days),
+            "-subj",
+            f"/CN={host}",
+            "-addext",
+            f"subjectAltName={tls_subject_alt_name(host)}",
+            "-keyout",
+            str(key),
+            "-out",
+            str(certificate),
         ],
-        capture_output=True, text=True)
+        capture_output=True,
+        text=True,
+    )
     if result.returncode != 0:
         die(f"openssl certificate generation failed: {result.stderr.strip()[-200:]}")
     os.chmod(key, 0o600)
@@ -190,8 +224,11 @@ def main() -> int:
     parser.add_argument("--state", help="override OPERATOR_STATE")
     parser.add_argument("--check-paths", action="store_true", help="require runtime paths to exist")
     parser.add_argument("--units-dir", type=Path, help="also render the two operator unit files here")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="render into a temporary directory and report drift against the installed state")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="render into a temporary directory and report drift against the installed state",
+    )
     parser.add_argument("--json", action="store_true", help="print the resolved environment as JSON")
     args = parser.parse_args()
 
@@ -231,8 +268,9 @@ def main() -> int:
     home = private_dir(require_no_space(values["AIRFLOW_HOME"], "AIRFLOW_HOME"), "AIRFLOW_HOME")
     if venv == home:
         die("AIRFLOW_VENV and AIRFLOW_HOME must be distinct")
-    handoff_root = private_dir(require_no_space(values["SOLIDWORKS_HANDOFF_ROOT"], "SOLIDWORKS_HANDOFF_ROOT"),
-                               "SOLIDWORKS_HANDOFF_ROOT")
+    handoff_root = private_dir(
+        require_no_space(values["SOLIDWORKS_HANDOFF_ROOT"], "SOLIDWORKS_HANDOFF_ROOT"), "SOLIDWORKS_HANDOFF_ROOT"
+    )
     if handoff_root in BROAD_ROOTS:
         die(f"SOLIDWORKS_HANDOFF_ROOT must be a dedicated intake directory, not a broad root: {handoff_root}")
     runtime_paths = [("OPERATOR_STATE", state), ("AIRFLOW_VENV", venv), ("AIRFLOW_HOME", home)]
@@ -260,8 +298,9 @@ def main() -> int:
     if admin_open_ids:
         require_no_space(admin_open_ids, "FEISHU_ADMIN_OPEN_IDS")
 
-    resolved: dict[str, str] = {key: value for key, value in values.items()
-                                if key not in {"PORTAL_COMMAND", "PORTAL_CONFIG"}}
+    resolved: dict[str, str] = {
+        key: value for key, value in values.items() if key not in {"PORTAL_COMMAND", "PORTAL_CONFIG"}
+    }
     resolved.update(
         OPERATOR_STATE=str(state),
         OPERATOR_BIND=bind,
@@ -293,15 +332,20 @@ def main() -> int:
             elif stat.S_IMODE(path.stat().st_mode) != 0o600:
                 drift.append(f"TLS file mode is not 0600: {path}")
         if certificate.is_file():
-            check = subprocess.run(["openssl", "x509", "-in", str(certificate), "-noout", "-checkhost", host],
-                                   capture_output=True, text=True)
-            check_ip = subprocess.run(["openssl", "x509", "-in", str(certificate), "-noout", "-checkip", host],
-                                      capture_output=True, text=True)
+            check = subprocess.run(
+                ["openssl", "x509", "-in", str(certificate), "-noout", "-checkhost", host],
+                capture_output=True,
+                text=True,
+            )
+            check_ip = subprocess.run(
+                ["openssl", "x509", "-in", str(certificate), "-noout", "-checkip", host], capture_output=True, text=True
+            )
             if check.returncode != 0 and check_ip.returncode != 0:
                 drift.append(f"TLS certificate does not cover {host}")
     else:
         certificate, key, tls_origin = ensure_certificate(
-            state, host, int(values.get("OPERATOR_TLS_DAYS", "825") or 825), provided_cert, provided_key)
+            state, host, int(values.get("OPERATOR_TLS_DAYS", "825") or 825), provided_cert, provided_key
+        )
     resolved["OPERATOR_TLS_CERT"] = str(certificate)
     resolved["OPERATOR_TLS_KEY"] = str(key)
     portal_config = ensure_portal_config(state, resolved)
@@ -309,7 +353,8 @@ def main() -> int:
     feishu_env = ensure_feishu_env(state, resolved)
     resolved["FEISHU_ENV_FILE"] = str(feishu_env)
     resolved["PORTAL_COMMAND"] = (
-        f"{venv}/bin/python -m description_pipeline.orchestration.portal --config {portal_config}")
+        f"{venv}/bin/python -m description_pipeline.orchestration.portal --config {portal_config}"
+    )
 
     nginx_root = state / "nginx"
     for temporary in ("body", "proxy", "fastcgi", "uwsgi", "scgi"):
@@ -333,13 +378,19 @@ def main() -> int:
     if args.units_dir:
         args.units_dir.mkdir(parents=True, exist_ok=True)
         portal_unit = (UNIT_TEMPLATES / "description-portal.service").read_text(encoding="utf-8")
-        for token, value in (("@OPERATOR_STATE@", str(state)), ("@AIRFLOW_HOME@", str(home)),
-                             ("@PORTAL_COMMAND@", resolved["PORTAL_COMMAND"])):
+        for token, value in (
+            ("@OPERATOR_STATE@", str(state)),
+            ("@AIRFLOW_HOME@", str(home)),
+            ("@PORTAL_COMMAND@", resolved["PORTAL_COMMAND"]),
+        ):
             portal_unit = portal_unit.replace(token, value)
         (args.units_dir / "description-portal.service").write_text(portal_unit, encoding="utf-8")
         proxy_unit = (UNIT_TEMPLATES / "description-operator-proxy.service").read_text(encoding="utf-8")
-        for token, value in (("@OPERATOR_STATE@", str(state)), ("@OPERATOR_NGINX_CONF@", str(nginx_conf)),
-                             ("@NGINX_BIN@", nginx_bin)):
+        for token, value in (
+            ("@OPERATOR_STATE@", str(state)),
+            ("@OPERATOR_NGINX_CONF@", str(nginx_conf)),
+            ("@NGINX_BIN@", nginx_bin),
+        ):
             proxy_unit = proxy_unit.replace(token, value)
         (args.units_dir / "description-operator-proxy.service").write_text(proxy_unit, encoding="utf-8")
         print(f"OPERATOR_UNITS={args.units_dir}")

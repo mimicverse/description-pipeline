@@ -130,8 +130,7 @@ def build(root, output, *, offline=False):
             if path.is_file()
         ]
         resources += [
-            source / name
-            for name in ("README.md", "LICENSE", "CODE_OF_CONDUCT.md", "CONTRIBUTING.md", "RELEASING.md")
+            source / name for name in ("README.md", "LICENSE", "CODE_OF_CONDUCT.md", "CONTRIBUTING.md", "RELEASING.md")
         ]
         write_zip(deployment, ((path.relative_to(source).as_posix(), path.read_bytes()) for path in resources))
         if offline:

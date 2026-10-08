@@ -21,8 +21,9 @@ def main() -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18765)
     parser.add_argument("--token-file", required=True)
-    parser.add_argument("--handoff-root", action="append", default=[],
-                        help="absolute allowed Linux CAD source directory (repeatable)")
+    parser.add_argument(
+        "--handoff-root", action="append", default=[], help="absolute allowed Linux CAD source directory (repeatable)"
+    )
     args = parser.parse_args()
     for root in args.handoff_root:
         if not root.startswith("/") or root == "/" or any(part in {"..", ""} for part in Path(root).parts[1:]):

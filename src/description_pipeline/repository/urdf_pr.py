@@ -391,7 +391,13 @@ def _verify_pr(repository, slug, url, base, branch, commit):
 
 
 def submit_bundle(
-    bundle: Path, repository: Path, *, base: str, branch: str, message: str | None = None, dry_run: bool = False,
+    bundle: Path,
+    repository: Path,
+    *,
+    base: str,
+    branch: str,
+    message: str | None = None,
+    dry_run: bool = False,
     on_event=None,
 ) -> dict:
     """Validate, verify and publish one bundle through a fast-forward review branch and PR."""
@@ -405,8 +411,9 @@ def submit_bundle(
     phase = "publication.inputs"
 
     def observed(identifier, state, details):
-        record_check(on_event, "publish", "input" if identifier == "publication.inputs" else "output",
-                     identifier, state, details)
+        record_check(
+            on_event, "publish", "input" if identifier == "publication.inputs" else "output", identifier, state, details
+        )
 
     try:
         hardware, _, current_revision = _validate(bundle)
@@ -420,8 +427,11 @@ def submit_bundle(
         if _git(repository, "status", "--porcelain").stdout.strip():
             raise PrError("dirty_repository", "commit, stash or remove unrelated changes first")
         subject, report = _verify(bundle)
-        observed("publication.inputs", "passed", {"subject_sha256": subject, "base": base,
-                                                   "branch": branch, "repository_slug": slug})
+        observed(
+            "publication.inputs",
+            "passed",
+            {"subject_sha256": subject, "base": base, "branch": branch, "repository_slug": slug},
+        )
         phase = "publication.git"
         _git(repository, "fetch", "--quiet", "origin", base)
         base_sha = _git(repository, "rev-parse", "FETCH_HEAD").stdout.strip()
@@ -452,8 +462,11 @@ def submit_bundle(
             )
             _reverify(worktree, subject)
             _verify_committed(worktree, commit, subject)
-            observed("publication.git", "passed", {"subject_sha256": subject, "commit": commit,
-                                                    "copied_staged_committed": "reverified"})
+            observed(
+                "publication.git",
+                "passed",
+                {"subject_sha256": subject, "commit": commit, "copied_staged_committed": "reverified"},
+            )
             phase = "publication.receipt"
             if not noop or commit != head_sha:
                 _git(worktree, "push", "origin", f"HEAD:refs/heads/{branch}")
@@ -489,8 +502,11 @@ def submit_bundle(
             "url": getattr(error, "pr_url", ""),
         }
     except subprocess.CalledProcessError as error:
-        observed(phase, "failed", {"error": "github_failed" if pushed else "git_failed",
-                                   "detail": (error.stderr or "")[-300:]})
+        observed(
+            phase,
+            "failed",
+            {"error": "github_failed" if pushed else "git_failed", "detail": (error.stderr or "")[-300:]},
+        )
         if pushed:
             return {
                 "state": "gh_failed_after_push",

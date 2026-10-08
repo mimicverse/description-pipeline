@@ -25,8 +25,11 @@ from ...geometry.stl import read as read_stl
 from .errors import CadError, EnvironmentError_
 from .protocol import CadBackend, RawComponent, RawScene
 
-# Published IComponent2 dual-interface IID in the SolidWorks type library.
+# Published dual-interface IIDs in the SolidWorks type library.
 ICOMPONENT2_IID = "{655D6F2A-5441-45D1-8CBA-D35FB26988E4}"
+IMODELDOC2_IID = "{B90793FB-EF3D-4B80-A5C4-99959CDB6CEB}"
+IPARTDOC_IID = "{83A33D32-27C5-11CE-BFD4-00400513BB57}"
+IASSEMBLYDOC_IID = "{83A33D35-27C5-11CE-BFD4-00400513BB57}"
 
 
 def co_initialize():
@@ -55,16 +58,56 @@ def _dynamic(value):
     return value
 
 
-def _component(value):
-    """Bind a native occurrence to its published component interface."""
+def _interface(value, iid):
+    """Bind a native dispatch to one published dual interface; fail closed."""
     if not hasattr(value, "_oleobj_"):
         return value
     import pythoncom
     import pywintypes
     import win32com.client.dynamic
 
-    dispatch = value._oleobj_.QueryInterface(pywintypes.IID(ICOMPONENT2_IID), pythoncom.IID_IDispatch)
+    dispatch = value._oleobj_.QueryInterface(pywintypes.IID(iid), pythoncom.IID_IDispatch)
     return win32com.client.dynamic.DumbDispatch(dispatch)
+
+
+def _component(value):
+    """Bind a native occurrence to its published component interface."""
+    return _interface(value, ICOMPONENT2_IID)
+
+
+def _modeldoc2(value):
+    """Bind a native document dispatch to the common IModelDoc2 interface."""
+    return _interface(value, IMODELDOC2_IID)
+
+
+def _partdoc(value):
+    """Bind a part document dispatch to the IPartDoc domain interface."""
+    return _interface(value, IPARTDOC_IID)
+
+
+def _assemblydoc(value):
+    """Bind an assembly document dispatch to the IAssemblyDoc domain interface."""
+    return _interface(value, IASSEMBLYDOC_IID)
+
+
+def _part_bodies(doc, body_type=0):
+    """Part bodies through the published IPartDoc interface (memid 132)."""
+    return _as_list(_member(_partdoc(doc), "GetBodies2", body_type, False) or ())
+
+
+def _part_material(doc, query):
+    """Part-level material read through the published IPartDoc interface (memid 141)."""
+    return _read_material(_partdoc(doc), "GetMaterialPropertyName2", query)
+
+
+def _assembly_components(doc):
+    """Assembly component traversal through the published IAssemblyDoc interface (memid 118)."""
+    return _as_list(_member(_assemblydoc(doc), "GetComponents", False))
+
+
+def _component_document(component):
+    """Model document behind a captured occurrence, on the common IModelDoc2 interface."""
+    return _modeldoc2(_method(component, "GetModelDoc2"))
 
 
 def _hint_method(obj, name):
@@ -204,10 +247,14 @@ def _temporary_configuration(get_document, configuration, occurrence):
         try:
             _select_configuration(get_document(), previous, occurrence)
         except Exception as error:
-            restoration = error if isinstance(error, CadError) else CadError(
-                "cad_configuration_unreadable",
-                "the document could not be restored to its prior configuration",
-                {"component": occurrence, "configuration": previous, "error": str(error)},
+            restoration = (
+                error
+                if isinstance(error, CadError)
+                else CadError(
+                    "cad_configuration_unreadable",
+                    "the document could not be restored to its prior configuration",
+                    {"component": occurrence, "configuration": previous, "error": str(error)},
+                )
             )
             detail = restoration.detail if isinstance(restoration.detail, dict) else {"detail": restoration.detail}
             restoration.detail = {**detail, "phase": "restore"}
@@ -361,7 +408,7 @@ def _material_assignments_document(doc, bodies):
             raise ValueError("Active configuration is not in the document")
         # The API documents an empty argument for a sole Default configuration.
         query = "" if configurations == ["Default"] else configuration
-        part = _read_material(doc, "GetMaterialPropertyName2", query)
+        part = _part_material(doc, query)
         rows = []
         for index, body in enumerate(bodies):
             body = _dynamic(body)
@@ -763,9 +810,7 @@ def _mate_features(doc):
             try:
                 sub = _dynamic(_method(feature, "GetFirstSubFeature"))
             except Exception as error:  # noqa: BLE001
-                raise CadError(
-                    "cad_mate_unreadable", "mate sub-feature walk failed", {"error": str(error)}
-                ) from error
+                raise CadError("cad_mate_unreadable", "mate sub-feature walk failed", {"error": str(error)}) from error
             if sub is not None:
                 walk(sub, "GetNextSubFeature", inside_group or type_name == "MateGroup")
             try:
@@ -943,7 +988,7 @@ class SolidWorksBackend(CadBackend):
             raise EnvironmentError_("cad_process_cleanup_failed", "; ".join(errors))
 
     def _active_document(self):
-        doc = _member(self._app_obj(), "ActiveDoc")
+        doc = _modeldoc2(_member(self._app_obj(), "ActiveDoc"))
         if doc is None:
             raise EnvironmentError_("no_active_document", "SolidWorks has no active document")
         return _read_only_document(doc)
@@ -951,7 +996,7 @@ class SolidWorksBackend(CadBackend):
     def _document_by_path(self, path):
         if not path:
             return self._active_document()
-        doc = _member(self._app_for_path(path), "GetOpenDocumentByName", path)
+        doc = _modeldoc2(_member(self._app_for_path(path), "GetOpenDocumentByName", path))
         if doc is None or not document_paths_match(_member(doc, "GetPathName"), path):
             raise CadError(
                 "document_not_open",
@@ -963,7 +1008,7 @@ class SolidWorksBackend(CadBackend):
 
     def health(self):
         app = self._app_obj()
-        doc = _member(app, "ActiveDoc")
+        doc = _modeldoc2(_member(app, "ActiveDoc"))
         return {
             "ok": True,
             "backend": self.name,
@@ -972,10 +1017,11 @@ class SolidWorksBackend(CadBackend):
         }
 
     def list_documents(self):
-        return [
-            _member(_dynamic(doc), "GetPathName") or _member(_dynamic(doc), "GetTitle")
-            for doc in (_member(self._app_obj(), "GetDocuments") or ())
-        ]
+        documents = []
+        for doc in _member(self._app_obj(), "GetDocuments") or ():
+            document = _modeldoc2(doc)
+            documents.append(_member(document, "GetPathName") or _member(document, "GetTitle"))
+        return documents
 
     def open_document(self, path):
         # Silent + read-only in the owned application for this phase.
@@ -1014,7 +1060,7 @@ class SolidWorksBackend(CadBackend):
     def _mass_properties_document(self, doc, require_material=True):
         if _member(doc, "GetType") != 1:
             raise CadError("cad_not_part", "mass reader requires a leaf part")
-        bodies = _member(doc, "GetBodies2", 0, False) or ()
+        bodies = _part_bodies(doc)
         if not bodies:
             raise CadError("cad_empty_model", "part has no solid bodies")
         if require_material:
@@ -1510,11 +1556,12 @@ class SolidWorksBackend(CadBackend):
         if not _member(doc, "ForceRebuild3", False):
             raise CadError("cad_rebuild_failed", "Collected assembly did not rebuild successfully", {"path": path})
         # Rebuild can replace model-document handles. Resolve the same open
-        # document in its owned session before reading the rebuilt state.
+        # document once, verify the state, and hand the proven handle back with
+        # the serializable metadata so callers never re-acquire it.
         doc = self._document_by_path(path)
         if _active_configuration(doc) != configuration:
             raise CadError("cad_configuration_mismatch", "Capture rebuild changed the selected configuration")
-        return {
+        return doc, {
             "used_api": "IModelDoc2.ForceRebuild3(False)",
             "scope": "collected_copy_in_memory",
             "document": document,
@@ -1529,10 +1576,7 @@ class SolidWorksBackend(CadBackend):
         doc = self._document_by_path(doc_path)
         if _member(doc, "GetType") != 2:
             raise CadError("cad_not_assembly", "export requires a saved SLDASM")
-        preparation = self._rebuild_capture_copy(doc, doc_path)
-        doc = self._document_by_path(str(preparation["document"]))
-        if _active_configuration(doc) != preparation["configuration"]:
-            raise CadError("cad_configuration_mismatch", "Capture rebuild changed the selected configuration")
+        doc, preparation = self._rebuild_capture_copy(doc, doc_path)
         self._record_save_flag(doc, doc_path)
         self._components = set()
         self._source_components = {}
@@ -1584,7 +1628,7 @@ class SolidWorksBackend(CadBackend):
                 continue
             borrowed_components.append(comp)
             name = str(_member(comp, "Name2"))
-            part = _method(comp, "GetModelDoc2")
+            part = _component_document(comp)
             if part is None:
                 raise CadError("cad_component_unresolved", name)
             # SetReadOnlyState can change native state. Defer it until the
@@ -2174,7 +2218,7 @@ class SolidWorksBackend(CadBackend):
             component = _component(item)
             name = str(_member(component, "Name2") or _member(component, "Name") or "")
             instance = name if not context or name.startswith(context + "/") else f"{context}/{name}"
-            model = _method(component, "GetModelDoc2")
+            model = _component_document(component)
             document = _member(model, "GetPathName") if model is not None else None
             if not document:
                 document = _method(component, "GetPathName")
@@ -2248,7 +2292,7 @@ class SolidWorksBackend(CadBackend):
             else:
                 referenced = set()
                 for _candidate, doc in assemblies:
-                    for component in _as_list(_member(doc, "GetComponents", False)) or []:
+                    for component in _assembly_components(doc):
                         path = _method(_component(component), "GetPathName")
                         if _is_text_name(path):
                             referenced.add(normalize_document_path(str(path)))

@@ -393,7 +393,10 @@ class FixtureCadBackend(CadBackend):
             triangles = cube_stl(Path(dest_path))
             self.exported.append(str(dest_path))
             entries[component] = {
-                "component": component, "written": dest_path, "used_api": "fixture", "triangles": triangles,
+                "component": component,
+                "written": dest_path,
+                "used_api": "fixture",
+                "triangles": triangles,
             }
         return entries
 

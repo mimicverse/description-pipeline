@@ -11,7 +11,14 @@ from pathlib import Path
 
 from description_pipeline.io import PipelineError
 from description_pipeline.stages import (
-    CONTRACT, STAGE_IDS, checked, compact_view, contract_markdown, record_check, require_complete, stage_view,
+    CONTRACT,
+    STAGE_IDS,
+    checked,
+    compact_view,
+    contract_markdown,
+    record_check,
+    require_complete,
+    stage_view,
 )
 from description_pipeline.verification.solidworks_urdf import evaluate_bundle, require_qualified_report
 
@@ -24,8 +31,13 @@ class StageTests(unittest.TestCase):
         for job in ({}, {"events": [{"stage": "capture", "state": "completed"}]}):
             view = stage_view(job)
             self.assertEqual(tuple(stage["id"] for stage in view["stages"]), STAGE_IDS)
-            self.assertFalse(any(check["state"] == "passed" for stage in view["stages"]
-                                 for check in stage["input_qc"] + stage["output_qc"]))
+            self.assertFalse(
+                any(
+                    check["state"] == "passed"
+                    for stage in view["stages"]
+                    for check in stage["input_qc"] + stage["output_qc"]
+                )
+            )
         self.assertEqual(self.stage(stage_view(job), "capture")["state"], "failed")
         self.assertEqual(self.stage(stage_view(job), "generate")["state"], "blocked")
 
@@ -71,13 +83,20 @@ class StageTests(unittest.TestCase):
         self.assertIn("different file subject", check["details"]["error"])
 
     def test_unknown_gates_or_forged_quality_flag_never_qualify_verification(self):
-        for report in ({"passed": True}, {"passed": True, "required_checks": ["native"], "checks": []},
-                       {"passed": True, "required_checks": [1],
-                        "checks": [{"id": "x", "state": "passed", "passed": True}]}):
+        for report in (
+            {"passed": True},
+            {"passed": True, "required_checks": ["native"], "checks": []},
+            {"passed": True, "required_checks": [1], "checks": [{"id": "x", "state": "passed", "passed": True}]},
+        ):
             events = []
             with self.assertRaises(PipelineError):
-                checked(events.append, "verify", "output", "verification.gates",
-                        lambda report=report: require_qualified_report(report))
+                checked(
+                    events.append,
+                    "verify",
+                    "output",
+                    "verification.gates",
+                    lambda report=report: require_qualified_report(report),
+                )
             self.assertEqual(self.stage(stage_view({"events": events}), "verify")["output_qc"][0]["state"], "failed")
 
     def test_unknown_boundary_id_is_rejected_before_executing_an_action(self):
@@ -113,13 +132,21 @@ class StageTests(unittest.TestCase):
                 if node.func.id == "checked":
                     stage, boundary, identifier = [ast.literal_eval(value) for value in node.args[1:4]]
                     producers.append((stage, boundary, identifier))
-                elif (node.func.id == "observed" and isinstance(node.args[0], ast.Constant)
-                      and len(node.args) >= 2 and node.args[1].value == "passed"):
+                elif (
+                    node.func.id == "observed"
+                    and isinstance(node.args[0], ast.Constant)
+                    and len(node.args) >= 2
+                    and node.args[1].value == "passed"
+                ):
                     identifier = node.args[0].value
                     boundary = "input" if identifier == "publication.inputs" else "output"
                     producers.append(("publish", boundary, identifier))
-        expected = [(stage["id"], boundary, check["id"]) for stage in CONTRACT["stages"]
-                    for boundary in ("input", "output") for check in stage[f"{boundary}_qc"]]
+        expected = [
+            (stage["id"], boundary, check["id"])
+            for stage in CONTRACT["stages"]
+            for boundary in ("input", "output")
+            for check in stage[f"{boundary}_qc"]
+        ]
         self.assertCountEqual(producers, expected)
 
     def test_architecture_table_and_mechanical_responsibilities_match_the_contract(self):
@@ -135,8 +162,11 @@ class StageTests(unittest.TestCase):
         self.assertEqual({row["stage"] for row in view["unsupported"]}, {"discover", "verify"})
 
     def test_transport_is_not_an_engineering_stage_and_manual_remains_pending(self):
-        job = {"events": [{"stage": "wait_for_job", "state": "completed"}],
-               "confirmations": [{"id": "bodies", "state": "confirmed"}], "subject_sha256": "a" * 64}
+        job = {
+            "events": [{"stage": "wait_for_job", "state": "completed"}],
+            "confirmations": [{"id": "bodies", "state": "confirmed"}],
+            "subject_sha256": "a" * 64,
+        }
         view = stage_view(job)
         self.assertEqual(len(view["stages"]), 6)
         self.assertNotIn("wait_for_job", STAGE_IDS)

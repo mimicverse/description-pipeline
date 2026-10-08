@@ -86,10 +86,12 @@ def _backend(component, name="pcb-1") -> SolidWorksBackend:
     component.Name2 = name
     path = "C:/neutral/robot.SLDASM"
     doc = SimpleNamespace(
-        ConfigurationManager=SimpleNamespace(ActiveConfiguration=SimpleNamespace(
-            Name="Default",
-            GetRootComponent3=lambda _resolve: SimpleNamespace(GetChildren=lambda: [component]),
-        )),
+        ConfigurationManager=SimpleNamespace(
+            ActiveConfiguration=SimpleNamespace(
+                Name="Default",
+                GetRootComponent3=lambda _resolve: SimpleNamespace(GetChildren=lambda: [component]),
+            )
+        ),
         IsOpenedReadOnly=True,
         GetPathName=lambda: path,
     )
@@ -178,9 +180,7 @@ class ComponentMeshExportTests(unittest.TestCase):
         self.assertFalse(self.dest.exists())
 
     def test_missing_face_blocks_even_when_other_faces_have_triangles(self):
-        component = FakeComponent(
-            FakeDocument([]), {0: [FakeBody([FakeFace(TRIANGLE), FakeFace([])])]}
-        )
+        component = FakeComponent(FakeDocument([]), {0: [FakeBody([FakeFace(TRIANGLE), FakeFace([])])]})
         with self.assertRaises(CadError) as caught:
             _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
         self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
@@ -213,9 +213,7 @@ class AxisReferenceTests(unittest.TestCase):
 
     def test_cylinder_face_resolves_to_a_native_line(self):
         face = FakeFace(TRIANGLE, FakeSurface([0.01, 0.02, 0.03, 0.0, 0.0, 1.0, 0.005]))
-        record = _backend(self._component_with(face)).capture_axis_reference(
-            {"component": "pcb-1", "face_index": 0}
-        )
+        record = _backend(self._component_with(face)).capture_axis_reference({"component": "pcb-1", "face_index": 0})
         self.assertEqual(record["surface"], "cylinder")
         self.assertEqual(record["axis_point_m"], [0.01, 0.02, 0.03])
         self.assertEqual(record["axis_direction"], [0.0, 0.0, 1.0])

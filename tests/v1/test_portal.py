@@ -528,8 +528,9 @@ class PortalTests(unittest.TestCase):
                 [item["id"] for item in definitions[stage["id"]]["output_qc"]],
             )
             expected_unsupported = [item for item in CONTRACT["unsupported"] if item["stage"] == stage["id"]]
-            self.assertEqual([item["label"] for item in stage["unsupported"]],
-                             [item["label"] for item in expected_unsupported])
+            self.assertEqual(
+                [item["label"] for item in stage["unsupported"]], [item["label"] for item in expected_unsupported]
+            )
             self.assertTrue(all(item["state"] == "unsupported" for item in stage["unsupported"]))
         unsupported_stages = {stage["id"] for stage in view["stages"] if stage["unsupported"]}
         self.assertEqual(unsupported_stages, {item["stage"] for item in CONTRACT["unsupported"]})

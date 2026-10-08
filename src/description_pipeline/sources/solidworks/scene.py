@@ -251,8 +251,6 @@ def closure_delta(top_level: dict[str, Any], leaf_total: dict[str, Any]) -> dict
     }
 
 
-
-
 def map_from_row_major(values: Sequence[float]) -> tuple[Matrix3, Vector3]:
     """Split a row-major 4x4 into (rotation, translation)."""
 

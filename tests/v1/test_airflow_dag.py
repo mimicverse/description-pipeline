@@ -85,8 +85,12 @@ class DagTests(unittest.TestCase):
 
         module = self._module()
         request = {"run_id": "protocol-control", "package": "control", "handoff_sha256": "b" * 64, "conn_id": "test"}
-        job = {"request": {key: request[key] for key in ("run_id", "package", "handoff_sha256")},
-               "run_id": request["run_id"], "status": "running", "events": protocol_events(stages=("freeze",))}
+        job = {
+            "request": {key: request[key] for key in ("run_id", "package", "handoff_sha256")},
+            "run_id": request["run_id"],
+            "status": "running",
+            "events": protocol_events(stages=("freeze",)),
+        }
 
         class TaskInstance:
             def __init__(self):
@@ -120,8 +124,12 @@ class DagTests(unittest.TestCase):
 
         module = self._module()
         request = {"run_id": "protocol-control", "package": "control", "handoff_sha256": "b" * 64, "conn_id": "test"}
-        job = {"request": {key: request[key] for key in ("run_id", "package", "handoff_sha256")},
-               "run_id": request["run_id"], "status": "passed", "events": protocol_events(subject="c" * 64)}
+        job = {
+            "request": {key: request[key] for key in ("run_id", "package", "handoff_sha256")},
+            "run_id": request["run_id"],
+            "status": "passed",
+            "events": protocol_events(subject="c" * 64),
+        }
         with (
             patch.object(module, "_endpoint", return_value=SimpleNamespace(get_job=lambda _: job)),
             self.assertLogs(module.log.name, level="WARNING") as captured,
