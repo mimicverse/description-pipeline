@@ -52,11 +52,23 @@ def _dynamic(value):
     return value
 
 
+def _hint_method(obj, name):
+    """Resolve a method name once per dispatch; never cache its return values."""
+    flag = getattr(obj, "_FlagAsMethod", None)
+    if flag is not None:
+        hints = vars(obj).setdefault("_description_method_hints_", set())
+        if name not in hints:
+            # pywin32 resolves GetIDsOfNames on every _FlagAsMethod call.
+            # Reuse successful metadata; initial resolution errors still block.
+            flag(name)
+            hints.add(name)
+
+
 def _member(obj, name, *args):
     # Flag methods BEFORE getattr: late binding may otherwise invoke them as
     # zero-argument properties, even crashing an incorrectly invoked CAD API.
-    if args and hasattr(obj, "_FlagAsMethod"):
-        obj._FlagAsMethod(name)
+    if args:
+        _hint_method(obj, name)
     try:
         value = getattr(obj, name)
     except AttributeError as error:  # 稳定的错误码，避免上层看到裸 AttributeError
@@ -109,8 +121,7 @@ def _method(obj, name, *args):
     through here.
     """
 
-    if hasattr(obj, "_FlagAsMethod"):
-        obj._FlagAsMethod(name)
+    _hint_method(obj, name)
     try:
         value = getattr(obj, name)
     except AttributeError as error:  # 稳定的错误码，避免上层看到裸 AttributeError
