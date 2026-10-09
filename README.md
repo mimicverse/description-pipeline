@@ -17,6 +17,11 @@ The page is **SolidWorks2URDF 交付操作台**.
 2. Sign in with Feishu, choose the complete project folder on your computer
    (Chrome or Edge) and start the run. The browser uploads the folder's files to
    the platform before anything is frozen; no server path is entered by hand.
+   When the folder holds several saved `.SLDASM` assemblies the page lists their
+   relative paths and you must choose the main assembly before starting; a single
+   assembly is selected automatically. The choice is recorded with the run and its
+   evidence, is kept by retries and reruns, and only fixes the entry point —
+   identity and physical checks still run on the native data.
 3. Review each step's actual check results and any failure diagnosis. Automatic
    passes need no manual repetition; external engineering scope remains explicit.
    Inspect the verified URDF and joint

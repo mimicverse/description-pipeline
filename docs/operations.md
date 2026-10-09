@@ -44,11 +44,18 @@ the same naming, case and generated-input rules as the native handoff
 (`robot.yaml` and `cad-revision.json` are generated and must not be included).
 Platform-managed paths are never entered by hand.
 
+When the folder contains more than one saved `.SLDASM`, the page always lists their
+relative paths and you must choose the main assembly before starting; a single
+assembly is selected automatically. The choice is recorded with the frozen evidence
+and kept by retries and reruns, and it resolves only the entry point — identity,
+dependency and physical checks still apply to the native data.
+
 ## 3. Start and inspect the run
 
-Sign in to the operator page with Feishu. Select the engineering
-folder and click **Start**. Hardware, revision, repository and branch are derived
-or configured by the platform; they are not operator form fields.
+Sign in to the operator page with Feishu. Select the engineering folder and, when
+it offers more than one `.SLDASM`, choose the main assembly; then click **Start**.
+Hardware, revision, repository and branch are derived or configured by the platform;
+they are not operator form fields.
 
 Approved Feishu users may start new pipeline runs and view shared results. A run
 records its initiator's stable authenticated identity and shows that operator's
@@ -101,6 +108,9 @@ linked attempt is active returns that attempt instead of creating duplicate work
 Changing CAD requires a new folder upload and a new run from freeze. A tool
 change also requires starting from freeze, using the retained unchanged upload
 when available. A partial capture cannot serve as complete evidence for generation.
+The recorded main assembly is part of the frozen evidence: retries and reruns keep
+it, and choosing a different main assembly requires a new folder upload and a new
+run.
 
 **继续原作业** is a separate action for recoverable transport failures. It
 reconnects the same Airflow run to the same native job without repeating CAD work.
