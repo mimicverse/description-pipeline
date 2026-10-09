@@ -21,6 +21,7 @@ from http.cookiejar import Cookie, CookieJar
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from urllib import error as urlerror
+from urllib import parse as urlparse
 from urllib import request as urlrequest
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
@@ -209,7 +210,13 @@ class MockAirflow:
                     return
                 if self.path.startswith("/api/v2/dags/solidworks_to_urdf/dagRuns?"):
                     runs = sorted(outer.dag_runs.values(), key=lambda run: run.get("start_date") or "", reverse=True)
-                    self._reply(200, {"dag_runs": runs, "total_entries": len(runs)})
+                    query = dict(urlparse.parse_qsl(urlparse.urlsplit(self.path).query))
+                    offset = int(query.get("offset") or 0)
+                    limit = int(query.get("limit") or 20)
+                    self._reply(
+                        200,
+                        {"dag_runs": runs[offset : offset + limit], "total_entries": len(runs)},
+                    )
                     return
                 prefix = "/api/v2/dags/solidworks_to_urdf/dagRuns/"
                 if outer.deny_runs and self.path.startswith(prefix):
