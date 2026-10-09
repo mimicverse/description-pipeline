@@ -13,6 +13,9 @@ Admission rules (any violation rejects the whole upload and removes staging):
 * explicit duplicate and casefold-alias rejection including file/directory collisions, so the
   upload cannot alias differently on a case-insensitive Windows extraction;
 * SolidWorks lock transients (``~$*``) are rejected rather than silently dropped;
+* an optional ``main_assembly`` text part selects the delivered assembly: a canonical POSIX
+  path inside the selected top folder (top folder excluded), case-exact against the admitted
+  files, ``.sldasm`` only; absent keeps the current native marker / unique-root discovery;
 * 4096 files / 2 GiB aggregate / 512 MiB per file / path and component length caps, enforced
   incrementally while streaming (never after buffering the whole body).
 
@@ -50,6 +53,8 @@ from ..io import PipelineError, artifact_path_parts
 from ..sources.solidworks.handoff import describe_handoff
 
 UPLOAD_FIELD = "files"
+MAIN_ASSEMBLY_FIELD = "main_assembly"
+MAX_MAIN_ASSEMBLY_BYTES = 1024
 MAX_FILES = 4096
 MAX_TOTAL_BYTES = 2 * 1024**3
 MAX_FILE_BYTES = 512 * 1024**2
@@ -84,6 +89,7 @@ class UploadReceipt:
     files: int
     bytes: int
     handoff_sha256: str
+    main_assembly: str | None = None
 
 
 class UploadGate:
@@ -243,6 +249,10 @@ class _Receiver:
         self._handle: int | None = None
         self._part_bytes = 0
         self.ended = False
+        self._text_field: str | None = None
+        self._text_data = bytearray()
+        self._assembly_seen = False
+        self._assembly: str | None = None
 
     def callbacks(self) -> dict[str, Any]:
         return {
@@ -261,6 +271,8 @@ class _Receiver:
         self._header_value = bytearray()
         self._disposition = b""
         self._part_bytes = 0
+        self._text_field = None
+        self._text_data = bytearray()
 
     def _on_header_field(self, data: bytes, start: int, end: int) -> None:
         self._header_field.extend(bytes(data[start:end]))
@@ -280,8 +292,17 @@ class _Receiver:
         disposition, params = parse_options_header(self._disposition)
         if disposition.lower() != b"form-data":
             raise UploadRejected(400, "上传分片缺少表单描述")
-        if params.get(b"name") != UPLOAD_FIELD.encode("ascii"):
-            raise UploadRejected(400, "只接受名为 files 的文件部分")
+        field = params.get(b"name")
+        if field == MAIN_ASSEMBLY_FIELD.encode("ascii"):
+            if params.get(b"filename"):
+                raise UploadRejected(400, "主装配选择不能作为文件上传")
+            if self._assembly_seen:
+                raise UploadRejected(400, "上传包含重复的主装配选择")
+            self._assembly_seen = True
+            self._text_field = MAIN_ASSEMBLY_FIELD
+            return
+        if field != UPLOAD_FIELD.encode("ascii"):
+            raise UploadRejected(400, "只接受名为 files 的文件部分与 main_assembly 选择")
         raw_name = params.get(b"filename")
         if not raw_name:
             raise UploadRejected(400, "上传分片缺少文件名")
@@ -328,6 +349,11 @@ class _Receiver:
         self.count += 1
 
     def _on_part_data(self, data: bytes, start: int, end: int) -> None:
+        if self._text_field is not None:
+            self._text_data.extend(bytes(data[start:end]))
+            if len(self._text_data) > MAX_MAIN_ASSEMBLY_BYTES:
+                raise UploadRejected(400, "主装配选择过长")
+            return
         if self._handle is None:
             raise UploadRejected(400, "上传分片数据出现在文件打开之前")
         chunk = bytes(data[start:end])
@@ -354,11 +380,50 @@ class _Receiver:
             raise UploadRejected(500, "写入上传文件失败") from error
 
     def _on_part_end(self) -> None:
+        if self._text_field is not None:
+            self._finish_text()
+            return
         self.close()
 
     def _on_end(self) -> None:
         self._on_part_end()
         self.ended = True
+
+    def _finish_text(self) -> None:
+        raw = bytes(self._text_data)
+        try:
+            value = raw.decode("utf-8", "strict")
+        except UnicodeDecodeError as error:
+            raise UploadRejected(400, "主装配选择不是有效的 UTF-8 文本") from error
+        self._assembly = value
+        self._text_field = None
+        self._text_data = bytearray()
+
+    def _validate_main_assembly(self) -> str | None:
+        """One canonical, case-exact selection inside the uploaded top folder."""
+        raw = self._assembly
+        if raw is None:
+            return None
+        value = unicodedata.normalize("NFC", raw)
+        if value != raw.strip():
+            raise UploadRejected(400, "主装配路径不能包含首尾空白")
+        if not value:
+            raise UploadRejected(400, "主装配选择为空")
+        try:
+            parts = artifact_path_parts(value)
+        except PipelineError as error:
+            raise UploadRejected(400, f"主装配路径不符合平台文件命名规则：{str(error)[:200]}") from error
+        if parts != tuple(value.split("/")):
+            raise UploadRejected(400, "主装配路径规范化结果不一致")
+        if Path(value).suffix.casefold() != ".sldasm":
+            raise UploadRejected(400, "主装配必须是 .SLDASM 文件")
+        prefix = f"{self.top}/"
+        relative = {name[len(prefix):]: name for name in self.files.values() if name.startswith(prefix)}
+        if value in relative:
+            return value
+        if any(key.casefold() == value.casefold() for key in relative):
+            raise UploadRejected(400, "主装配路径的大小写与上传文件不一致，请从列表中选择")
+        raise UploadRejected(400, "主装配不在所选工程文件夹中")
 
     def finish(self) -> UploadReceipt:
         self.close()
@@ -374,6 +439,7 @@ class _Receiver:
             files=self.count,
             bytes=self.total,
             handoff_sha256=str(identity["handoff_sha256"]),
+            main_assembly=self._validate_main_assembly(),
         )
 
     def close(self) -> None:

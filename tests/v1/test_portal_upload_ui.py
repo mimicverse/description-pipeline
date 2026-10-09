@@ -297,6 +297,28 @@ class ReportUiContractTests(unittest.TestCase):
         self.assertIn("visibleFindings", app)
 
 
+class AssemblySelectorUiContractTests(unittest.TestCase):
+    """One delivered assembly is chosen from the picked folder before the upload starts."""
+
+    def test_selector_markup_and_payload_contract(self) -> None:
+        html = (STATIC / "index.html").read_text(encoding="utf-8")
+        app = (STATIC / "app.js").read_text(encoding="utf-8")
+        css = (STATIC / "style.css").read_text(encoding="utf-8")
+        for element in ('id="assembly-row"', 'id="assembly-select"', 'id="assembly-note"'):
+            self.assertIn(element, html)
+        for token in (
+            'endsWith(".sldasm")',
+            "applyAssemblies",
+            "updateStartEnabled",
+            "state.assemblyChoice",
+            'form.append("main_assembly", state.assemblyChoice)',
+            "主装配",
+            "请选择主装配…",
+        ):
+            self.assertIn(token, app)
+        self.assertIn(".assembly-row", css)
+
+
 class RunHistoryUiContractTests(unittest.TestCase):
     """Readable run history with rename and explicit reversible delete/restore.
 

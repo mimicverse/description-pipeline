@@ -173,6 +173,13 @@ input, select, textarea { font: inherit; }
 .dropzone:hover { border-color: var(--accent); background: var(--accent-soft); }
 .dropzone strong { font-size: 14px; }
 .upload-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.assembly-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.assembly-row label { flex: none; }
+.assembly-row select {
+  min-width: 240px; max-width: 100%; padding: 6px 8px; font: inherit;
+  border: 1px solid var(--line-strong); border-radius: var(--radius-sm); background: var(--card);
+}
+.assembly-row p { margin: 0; }
 .folder-summary { font-size: 12.5px; overflow-wrap: anywhere; }
 #upload-status { font-variant-numeric: tabular-nums; }
 .requirements { margin-top: 2px; }

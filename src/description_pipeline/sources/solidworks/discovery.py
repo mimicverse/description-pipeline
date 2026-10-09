@@ -124,10 +124,11 @@ def _finding(code: str, obj: str, message: str, detail: Any = None, *, blocking:
 
 @dataclass(frozen=True)
 class DiscoverySettings:
-    """The two platform-controlled inputs: records and published names."""
+    """The platform-controlled inputs: records, published names and the explicit entry."""
 
     record_roots: tuple[Path, ...] = ()
     frozen_names: Mapping[str, str] = field(default_factory=dict)
+    main_assembly: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2030,10 +2031,24 @@ def prepare_native_package(
 
         readiness()
         backend = SolidWorksBackend()
-    record = backend.discover_native(frozen_source, {"namespace": NAMESPACE, "contract": CONTRACT})
+    native_settings = {"namespace": NAMESPACE, "contract": CONTRACT}
+    if settings.main_assembly:
+        native_settings["main_assembly"] = settings.main_assembly
+    record = backend.discover_native(frozen_source, native_settings)
     if not isinstance(record, dict) or record.get("schema_version") != DISCOVERY_SCHEMA:
         raise PipelineError("native discovery backend returned an unexpected record schema")
     _validate_native_record(record)
+    if settings.main_assembly:
+        identity_block = record.get("identity") if isinstance(record.get("identity"), dict) else {}
+        recorded_main = identity_block.get("main_assembly")
+        if not _text(recorded_main):
+            recorded_main = _identity_value(record, NAMESPACE, "main_assembly")
+        recorded_main = str(recorded_main).replace("\\", "/") if _text(recorded_main) else None
+        if recorded_main != settings.main_assembly:
+            raise PipelineError(
+                "Native discovery did not open the selected main assembly "
+                f"({recorded_main!r} != {settings.main_assembly!r})"
+            )
     findings: list[dict] = []
     datum_ids: set[tuple[str, str]] = set()
     for datum in record.get("datums") or []:
