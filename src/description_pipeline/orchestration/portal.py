@@ -46,7 +46,6 @@ from .airflow_client import (
     check_result,
     native_run_id,
     validate_artifact_name,
-    validate_handoff_path,
     verified_result,
 )
 from .feishu_oauth import (
@@ -62,6 +61,14 @@ from .run_ownership import (
     RetryAssessment,
     classify_transport_retry,
     recorded_actor_principal,
+)
+from .uploads import (
+    MAX_FILE_BYTES,
+    MAX_FILES,
+    MAX_TOTAL_BYTES,
+    UploadGate,
+    UploadRejected,
+    receive_folder,
 )
 
 log = logging.getLogger(__name__)
@@ -331,12 +338,14 @@ class PortalConfig:
     artifact_limit: int = 64 * 1024 * 1024
     preview_ttl: float = 60.0
     max_body_bytes: int = 64 * 1024
+    upload_root: Path | None = None
+    upload_concurrency: int = 2
 
 
 _CONFIG_KEYS = {
     "airflow": {"url"},
     "endpoint": {"url", "token_file"},
-    "portal": {"host", "port"},
+    "portal": {"host", "port", "upload_root", "upload_concurrency"},
 }
 
 
@@ -398,7 +407,32 @@ def load_portal_config(path: Path) -> PortalConfig:
         endpoint=_endpoint_from_config(endpoint_section),
         host=str(portal_section.get("host") or "127.0.0.1"),
         port=int(portal_section.get("port", 8780)),
+        upload_root=_upload_root(portal_section),
+        upload_concurrency=_upload_concurrency(portal_section),
     )
+
+
+def _upload_root(section: dict) -> Path | None:
+    """One absolute, existing, non-symlink intake directory; unset stays fail-closed."""
+    value = section.get("upload_root")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise AirflowApiError("portal.upload_root must be an absolute directory path")
+    path = Path(value.strip())
+    if not path.is_absolute() or path.is_symlink() or not path.is_dir():
+        raise AirflowApiError("portal.upload_root must be an existing absolute directory")
+    return path
+
+
+def _upload_concurrency(section: dict) -> int:
+    try:
+        value = int(section.get("upload_concurrency", 2))
+    except (TypeError, ValueError) as error:
+        raise AirflowApiError("portal.upload_concurrency must be a positive integer") from error
+    if value < 1 or value > 16:
+        raise AirflowApiError("portal.upload_concurrency must be between 1 and 16")
+    return value
 
 
 @dataclass
@@ -634,6 +668,7 @@ class PortalApp:
         self._lock = threading.Lock()
         self._runs: dict[str, PortalRun] = {}
         self._previews: dict[str, tuple[float, dict]] = {}
+        self._upload_gate = UploadGate(config.upload_concurrency)
 
     # ------------------------------------------------------------------ WSGI
     def __call__(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
@@ -770,6 +805,11 @@ class PortalApp:
                 "user": session.user,
                 "avatar_url": session.avatar_url,
                 "csrf_token": session.csrf_token,
+                "upload_limits": {
+                    "max_files": MAX_FILES,
+                    "max_bytes": MAX_TOTAL_BYTES,
+                    "max_file_bytes": MAX_FILE_BYTES,
+                },
             },
             self.config,
             headers,
@@ -839,26 +879,51 @@ class PortalApp:
         )
 
     def _start_run(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
+        """One uploaded SolidWorks folder starts one run; manual platform paths are gone."""
         session = self._session(environ, csrf=True)
-        payload = self._body(environ)
-        if set(payload) - {"handoff_path"}:
-            raise PortalError(HTTPStatus.BAD_REQUEST, "只允许提供工程文件夹路径，不接受其他运行参数")
+        content_type = str(environ.get("CONTENT_TYPE") or "")
+        if not content_type.lower().startswith("multipart/form-data"):
+            raise PortalError(HTTPStatus.BAD_REQUEST, "请通过页面上的文件夹按钮上传工程文件夹后启动运行")
+        if self.config.upload_root is None:
+            raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "服务端尚未配置上传目录，请联系管理员")
+        # A cached portal session can outlive the Airflow token behind it; prove the live
+        # profile before reading a single byte of a possibly multi-gigabyte body.
         try:
-            handoff_path = validate_handoff_path(payload.get("handoff_path"))
-        except EndpointProtocolError as error:
-            raise PortalError(HTTPStatus.BAD_REQUEST, str(error)) from error
+            self.config.airflow.profile(session.token)
+        except AirflowAuthError:
+            return _json_response(
+                start_response,
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "飞书登录已失效，请重新登录后重试"},
+                self.config,
+            )
+        except AirflowApiError:
+            return _json_response(
+                start_response,
+                HTTPStatus.BAD_GATEWAY,
+                {"error": "Airflow 暂时不可用，请稍后重试"},
+                self.config,
+            )
         dag_run_id = f"portal-{datetime.now(UTC):%Y%m%dT%H%M%S}-{secrets.token_hex(4)}"
         try:
-            self.config.airflow.trigger_dag_run(
-                session.token,
-                self.config.dag_id,
-                dag_run_id,
-                {"handoff_path": handoff_path},
+            receipt = receive_folder(
+                environ,
+                intake_root=self.config.upload_root,
+                run_id=dag_run_id,
+                principal=session.principal,
+                gate=self._upload_gate,
             )
-        except AirflowAuthError as error:
-            raise PortalError(HTTPStatus.UNAUTHORIZED, str(error)) from error
-        except AirflowApiError as error:
-            raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
+        except UploadRejected as error:
+            if error.status == 429:
+                return _json_response(
+                    start_response,
+                    error.status,
+                    {"error": error.message},
+                    self.config,
+                    [("Retry-After", "5")],
+                )
+            raise PortalError(error.status, error.message) from error
+        handoff_path = str(self.config.upload_root / dag_run_id / receipt.folder)
         with self._lock:
             self._runs[dag_run_id] = PortalRun(
                 dag_run_id=dag_run_id,
@@ -866,8 +931,69 @@ class PortalApp:
                 principal=session.principal,
                 started_at=time.time(),
             )
-        log.info("portal started dag_run_id=%s user=%s principal=%s", dag_run_id, session.user, session.principal)
-        return _json_response(start_response, 201, {"dag_run_id": dag_run_id}, self.config)
+        outcome = self._trigger_uploaded_run(session, dag_run_id, handoff_path)
+        if outcome == "auth":
+            return _json_response(
+                start_response,
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "飞书登录已失效，请重新登录后重试", "dag_run_id": dag_run_id},
+                self.config,
+            )
+        if outcome != "created":
+            log.warning("portal upload trigger unresolved dag_run_id=%s trigger=%s", dag_run_id, outcome)
+            return _json_response(
+                start_response,
+                HTTPStatus.BAD_GATEWAY,
+                {
+                    "error": "运行未能确认启动；上传已保留，请稍后重试或联系管理员",
+                    "dag_run_id": dag_run_id,
+                    "trigger": outcome,
+                },
+                self.config,
+            )
+        log.info(
+            "portal started dag_run_id=%s user=%s principal=%s folder=%s files=%d bytes=%d digest=%s",
+            dag_run_id,
+            session.user,
+            session.principal,
+            receipt.folder,
+            receipt.files,
+            receipt.bytes,
+            receipt.handoff_sha256,
+        )
+        return _json_response(
+            start_response,
+            201,
+            {"dag_run_id": dag_run_id, "folder": receipt.folder, "files": receipt.files, "bytes": receipt.bytes},
+            self.config,
+        )
+
+    def _trigger_uploaded_run(self, session: PortalSession, dag_run_id: str, handoff_path: str) -> str:
+        """Trigger once; an ambiguous failure is reconciled on the exact run id, never blind-retried."""
+        conf = {"handoff_path": handoff_path}
+        try:
+            self.config.airflow.trigger_dag_run(session.token, self.config.dag_id, dag_run_id, conf)
+            return "created"
+        except AirflowAuthError:
+            return "auth"
+        except AirflowApiError:
+            pass
+        if self._uploaded_run_exists(session, dag_run_id):
+            return "created"
+        try:
+            self.config.airflow.trigger_dag_run(session.token, self.config.dag_id, dag_run_id, conf)
+            return "created"
+        except AirflowAuthError:
+            return "auth"
+        except AirflowApiError:
+            return "created" if self._uploaded_run_exists(session, dag_run_id) else "absent"
+
+    def _uploaded_run_exists(self, session: PortalSession, dag_run_id: str) -> bool:
+        try:
+            self.config.airflow.dag_run(session.token, self.config.dag_id, dag_run_id)
+            return True
+        except (AirflowApiError, AirflowAuthError):
+            return False
 
     def _run_status(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
         session = self._session(environ)
