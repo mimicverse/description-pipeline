@@ -46,9 +46,13 @@ class ScheduledSmokeTests(unittest.TestCase):
         report = json.loads([line for line in result.stdout.splitlines() if line.startswith("{")][-1])
         # The api-server runs the real Feishu manager with a configured smoke app, and the run was
         # submitted through the portal client, so Airflow recorded the compound audit identity.
-        self.assertEqual(report["auth_health"], {"status": 200, "configured": True})
+        self.assertEqual(report["auth_health"], {"status": 200, "configured": True, "request_context": True})
         self.assertEqual(report["trigger"], "portal-airflow-client")
-        self.assertEqual(report["triggering_user_name"], "cli_smoke:smoke-tenant:ou_smoke")
+        from description_pipeline.orchestration.run_ownership import recorded_actor_principal
+
+        actor = report["triggering_user_name"]
+        self.assertEqual(recorded_actor_principal(actor), "cli_smoke:smoke-tenant:ou_smoke")
+        self.assertEqual(json.loads(actor.split("|", 1)[1]), "smoke")
 
 
 if __name__ == "__main__":
