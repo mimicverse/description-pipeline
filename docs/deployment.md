@@ -227,9 +227,6 @@ self-signed rehearsal certificate also requires browser trust before use;
 service liveness does not establish that trust. Commissioning requires zero
 health failures, trusted HTTPS and a successful live Feishu sign-in.
 
-Live Feishu authentication and trusted HTTPS have not yet been commissioned.
-Complete the acceptance below before shared use.
-
 ## Acceptance
 
 Commission the complete workflow with actual native CAD and live Feishu:
