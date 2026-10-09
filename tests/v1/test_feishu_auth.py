@@ -76,6 +76,8 @@ class _RoutedRequest:
         clear_body_safe: bool | None = None,
     ) -> None:
         self.scope = {"type": "http", "endpoint": endpoint, "method": http_method}
+        if getattr(endpoint, "__name__", None) == "trigger_dag_run":
+            self.scope[request_context.CREATE_BODY_SCOPE_KEY] = {"safe": True, "parent_dag_run_id": None}
         if clear_body_safe is not None:
             self.scope[request_context.CLEAR_BODY_SCOPE_KEY] = {"safe": clear_body_safe}
         self.path_params = {"dag_id": dag_id}
@@ -411,6 +413,42 @@ class FeishuAuthManagerTests(unittest.TestCase):
                     )
                 )
             session.commit()
+
+    def test_linked_creation_requires_stored_parent_ownership(self) -> None:
+        manager = self.manager(_environment(self.root))
+        owner = auth.FeishuUser(
+            app_id="cli_app", open_id="ou_worker", name="Owner", avatar_url="", tenant_key="tenant-a"
+        )
+        other = auth.FeishuUser(
+            app_id="cli_app", open_id="ou_other", name="Other", avatar_url="", tenant_key="tenant-a"
+        )
+        admin = auth.FeishuUser(
+            app_id="cli_app", open_id="ou_admin", name="Admin", avatar_url="", tenant_key="tenant-a"
+        )
+        self._record_run("linked-parent", owner.get_name(), state="success")
+        request = _RoutedRequest(trigger_dag_run, auth.ALLOWED_DAG_ID)
+        request.scope[request_context.CREATE_BODY_SCOPE_KEY] = {"safe": True, "parent_dag_run_id": "linked-parent"}
+        with request_context.use_request(request):
+            for user, expected in ((owner, True), (other, False), (admin, True)):
+                self.assertEqual(
+                    manager.is_authorized_dag(
+                        method="POST",
+                        user=user,
+                        details=auth.DagDetails(id=auth.ALLOWED_DAG_ID),
+                        access_entity=auth.DagAccessEntity.RUN,
+                    ),
+                    expected,
+                )
+        del request.scope[request_context.CREATE_BODY_SCOPE_KEY]
+        with request_context.use_request(request):
+            self.assertFalse(
+                manager.is_authorized_dag(
+                    method="POST",
+                    user=owner,
+                    details=auth.DagDetails(id=auth.ALLOWED_DAG_ID),
+                    access_entity=auth.DagAccessEntity.RUN,
+                )
+            )
 
     def test_run_ownership_grants_only_the_routed_single_run_clear(self) -> None:
         manager = self.manager(_environment(self.root))

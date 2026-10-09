@@ -57,6 +57,7 @@ from description_pipeline.orchestration.run_ownership import (
     MANUAL_CREATE_ENDPOINT,
     SINGLE_RUN_CLEAR_ENDPOINT,
     owner_retry_allowed,
+    owner_create_allowed,
     routed_route,
 )
 
@@ -394,8 +395,8 @@ class FeishuAuthManager(BaseAuthManager[FeishuUser]):
             and route.http_method == "POST"
             and route.dag_run_id is None
         ):
-            # The one create path with canonically proven context: the manual trigger route.
-            return True
+            # Parent selection is untrusted; persisted parent ownership must match the caller.
+            return owner_create_allowed(user, route.dag_id)
         if (
             method == "PUT"
             and route.endpoint == SINGLE_RUN_CLEAR_ENDPOINT
