@@ -61,10 +61,13 @@ class DagTests(unittest.TestCase):
         dag = bag.dags["solidworks_to_urdf"]
         self.assertIsNone(dag.schedule)
         self.assertEqual(set(dag.task_ids), {"resolve_handoff", "start_job", "wait_for_job", "confirm_job"})
-        self.assertEqual(set(dag.params), {"handoff_path"})
+        self.assertEqual(set(dag.params), {"handoff_path", "main_assembly"})
         handoff_param = dict(dag.params.items())["handoff_path"]
         self.assertEqual(handoff_param.schema["title"], "Engineering folder path")
         self.assertEqual(handoff_param.schema["type"], "string")
+        assembly_param = dict(dag.params.items())["main_assembly"]
+        self.assertEqual(assembly_param.schema["title"], "Delivered main assembly")
+        self.assertEqual(assembly_param.schema["type"], "string")
         from description_pipeline.stages import contract_markdown
 
         self.assertIn(contract_markdown(), dag.doc_md)
@@ -209,6 +212,76 @@ class DagTests(unittest.TestCase):
             with self.subTest(conf=str(conf)), self.assertRaises(AirflowFailException):
                 module._linked_conf(context(conf))
 
+    def test_linked_attempt_selection_rules(self) -> None:
+        from airflow.sdk.exceptions import AirflowFailException
+        from description_pipeline.orchestration.airflow_client import EndpointProtocolError
+
+        module = self._module()
+        self.assertIsNone(module._linked_selection(None, None))
+        self.assertIsNone(module._linked_selection(None, ""))
+        self.assertEqual("parent.SLDASM", module._linked_selection("parent.SLDASM", None))
+        self.assertEqual("parent.SLDASM", module._linked_selection("parent.SLDASM", ""))
+        self.assertEqual("parent.SLDASM", module._linked_selection("parent.SLDASM", "parent.SLDASM"))
+        with self.assertRaises(AirflowFailException):
+            module._linked_selection("parent.SLDASM", "other.SLDASM")
+        with self.assertRaises(AirflowFailException):
+            module._linked_selection(None, "other.SLDASM")
+        with self.assertRaises(EndpointProtocolError):
+            module._linked_selection("parent.SLDASM", "../other.SLDASM")
+
+    def test_dag_run_with_explicit_main_assembly(self) -> None:
+        from tests.v1.test_airflow_client import MockEndpoint
+
+        venv = Path(os.environ.get("AIRFLOW_VENV", sys.prefix))
+        airflow = venv / "bin" / "airflow"
+        self.assertTrue(airflow.is_file(), airflow)
+        with MockEndpoint() as server:
+            connection = json.dumps(
+                {
+                    "conn_type": "http",
+                    "host": "127.0.0.1",
+                    "port": server.server.server_address[1],
+                    "password": "test-token",
+                }
+            )
+            env = dict(
+                os.environ,
+                AIRFLOW_HOME=str(migrated_airflow_home(venv)),
+                AIRFLOW__CORE__DAGS_FOLDER=str(DAG_DIR),
+                PYTHONPATH=str(ROOT / "src"),
+                AIRFLOW_CONN_SOLIDWORKS_WINDOWS=connection,
+                SOLIDWORKS_SENSOR_MODE="poke",
+                SOLIDWORKS_POLL_INTERVAL="0.2",
+                SOLIDWORKS_TIMEOUT="60",
+            )
+            conf = json.dumps(
+                {
+                    "handoff_path": "handoff/m3.0",
+                    "main_assembly": "3.0 总装1008.SLDASM",
+                }
+            )
+            result = subprocess.run(
+                [str(airflow), "dags", "test", "solidworks_to_urdf", "2026-01-01", "--conf", conf],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+            self.assertEqual(len(server.jobs), 1)
+            job = next(iter(server.jobs.values()))
+            self.assertEqual(job["status"], "passed")
+            self.assertEqual(
+                job["request"],
+                {
+                    "run_id": job["run_id"],
+                    "package": "handoff/m3.0",
+                    "handoff_sha256": "b" * 64,
+                    "main_assembly": "3.0 总装1008.SLDASM",
+                },
+            )
+
     def test_linked_dag_run_derives_the_retained_upload_from_the_parent_job(self) -> None:
         from tests.v1.test_airflow_client import JOB_SCHEMA, MockEndpoint, PIPELINE_ID
         from description_pipeline.orchestration.airflow_client import native_run_id
@@ -228,7 +301,12 @@ class DagTests(unittest.TestCase):
                 "result": None,
                 "error": "verification failed",
                 "pokes": 0,
-                "request": {"run_id": parent_run_id, "package": "handoff/m3.0", "handoff_sha256": "b" * 64},
+                "request": {
+                    "run_id": parent_run_id,
+                    "package": "handoff/m3.0",
+                    "handoff_sha256": "b" * 64,
+                    "main_assembly": "3.0 总装1008.SLDASM",
+                },
             }
             connection = json.dumps(
                 {
@@ -271,6 +349,7 @@ class DagTests(unittest.TestCase):
             self.assertEqual(child["status"], "passed")
             self.assertEqual(child["request"]["package"], "handoff/m3.0")
             self.assertEqual(child["request"]["handoff_sha256"], "b" * 64)
+            self.assertEqual(child["request"]["main_assembly"], "3.0 总装1008.SLDASM")
             self.assertEqual(child["request"]["resume"], {"parent_run": parent_run_id, "from_stage": "verify"})
 
 
