@@ -24,6 +24,7 @@ const state = {
   rerunningRunId: null,
   rerunNotice: null,
   rerunError: null,
+  runsList: [],
 };
 
 const RUN_STATES = {
@@ -308,6 +309,7 @@ function clearSession() {
   state.tabsInitializedFor = null;
   state.rerunNotice = "";
   state.rerunError = "";
+  state.runsList = [];
   $("stage-rerun").hidden = true;
   if (state.timer) window.clearInterval(state.timer);
   state.timer = null;
@@ -324,6 +326,7 @@ async function refreshRuns() {
   const list = $("runs");
   try {
     const payload = await api("/api/runs");
+    state.runsList = Array.isArray(payload.runs) ? payload.runs : [];
     list.textContent = "";
     if (!payload.runs.length) {
       const item = document.createElement("li");
@@ -878,15 +881,27 @@ async function rerunFromStage(stageId) {
       method: "POST",
       body: { stage: stageId },
     });
-    const name = payload.resume_from_name_zh || stageId;
-    state.rerunNotice = `已创建新关联运行，自「${name}」重新执行；原始运行与证据保留。`;
-    if (!state.timer && state.dagRunId === runId) {
-      state.timer = window.setInterval(() => {
-        void poll();
-      }, 3000);
-    }
-    await poll();
+    const nextRunId = String(payload.dag_run_id || "");
+    const stageToShow = String(payload.resume_from || stageId);
     await refreshRuns();
+    if (state.dagRunId !== runId) return; // the operator moved on; the list is refreshed
+    if (!nextRunId) {
+      const name = payload.resume_from_name_zh || stageId;
+      state.rerunNotice = `已创建新关联运行，自「${name}」重新执行；原始运行与证据保留。`;
+      if (!state.timer) {
+        state.timer = window.setInterval(() => {
+          void poll();
+        }, 3000);
+      }
+      await poll();
+      return;
+    }
+    try {
+      localStorage.setItem(stageSelectionKey(nextRunId), stageToShow);
+    } catch {
+      // remembering the requested stage is best-effort
+    }
+    await selectRun(nextRunId);
   } catch (error) {
     if (error.status === 401) {
       clearSession();
@@ -897,8 +912,17 @@ async function rerunFromStage(stageId) {
       const detail = error.payload && typeof error.payload === "object" ? error.payload : {};
       state.rerunError = detail.reason_zh || error.message || "重新运行未受理。";
       if (detail.earliest_required) {
-        const index = state.stages.findIndex((item) => item.id === detail.earliest_required);
-        if (index !== -1) state.selectedStage = index;
+        const target = String(detail.earliest_required);
+        const index = state.stages.findIndex((item) => item.id === target);
+        if (index !== -1) {
+          state.selectedStage = index;
+          try {
+            // Persist the jump so the poll's stage chooser cannot overwrite it.
+            localStorage.setItem(stageSelectionKey(runId), target);
+          } catch {
+            // best-effort persistence
+          }
+        }
       }
       await poll();
       await refreshRuns();
@@ -915,6 +939,24 @@ function renderRun(run) {
   $("run-state-label").textContent = RUN_STATES[run.state] || run.state || "";
   $("run-dot").className = `dot ${runDotState(run.state)}`;
   $("run-initiator").textContent = `发起人：${run.operator || run.user || "未记录"}`;
+  const listEntry = (state.runsList || []).find((item) => item && item.dag_run_id === runId) || null;
+  const origin = $("run-origin");
+  origin.textContent = "";
+  if (listEntry && listEntry.parent_dag_run_id) {
+    origin.append(`自「${listEntry.resume_from_name_zh || "上游阶段"}」重新运行 · 来源 `);
+    const link = document.createElement("button");
+    link.type = "button";
+    link.className = "ghost";
+    link.textContent = shortRunId(listEntry.parent_dag_run_id);
+    link.title = String(listEntry.parent_dag_run_id);
+    link.addEventListener("click", () => {
+      void selectRun(listEntry.parent_dag_run_id);
+    });
+    origin.append(link);
+    origin.hidden = false;
+  } else {
+    origin.hidden = true;
+  }
   const meta = $("run-meta");
   meta.textContent = "";
   const report = run.report && Array.isArray(run.report.stages) ? run.report : null;

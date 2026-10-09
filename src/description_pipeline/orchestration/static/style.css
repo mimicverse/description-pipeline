@@ -149,6 +149,8 @@ input, select, textarea { font: inherit; }
 .run-title h2 { overflow-wrap: anywhere; }
 .run-header-side { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .run-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.run-origin { display: inline-flex; align-items: center; gap: 6px; }
+.run-origin button { padding: 2px 8px; font-size: 12px; }
 
 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--line-strong); flex: none; }
 .dot.ok { background: var(--ok); }
