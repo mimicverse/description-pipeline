@@ -904,13 +904,13 @@ function renderRun(run) {
       item.append(label);
       if (scope.scope) {
         const text = document.createElement("p");
-        text.textContent = `确认内容：${scope.scope}`;
+        text.textContent = scope.scope;
         item.append(text);
       }
       if (scope.automatic_exclusion) {
         const text = document.createElement("p");
         text.className = "muted small";
-        text.textContent = `不重复检查：${scope.automatic_exclusion}`;
+        text.textContent = scope.automatic_exclusion;
         item.append(text);
       }
       const stageName = (state.stages.find((entry) => entry.id === scope.stage) || {}).nameZh;
