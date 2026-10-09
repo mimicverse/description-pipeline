@@ -1,10 +1,4 @@
-"""Make the adapter importable with or without the integration checkout.
-
-When the integration tree is on ``PYTHONPATH`` (a merged package that contains
-both ``sources/snapshot.py`` and this adapter), that copy wins.  Otherwise the
-adapter's own ``src`` directory is used, which is enough for every test that
-does not need the shared model package.
-"""
+"""Make local source tests importable without installing the package."""
 
 from __future__ import annotations
 

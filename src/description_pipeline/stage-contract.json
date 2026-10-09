@@ -1,0 +1,367 @@
+{
+  "schema_version": "solidworks-to-urdf.stage-contract/v1",
+  "pipeline_id": "solidworks-to-urdf",
+  "stages": [
+    {
+      "id": "freeze",
+      "name": "Freeze inputs",
+      "name_zh": "冻结输入",
+      "inputs": [
+        {
+          "label": "Saved SolidWorks folder",
+          "path": "handoff/",
+          "class": "native"
+        }
+      ],
+      "input_qc": [
+        {
+          "id": "handoff.admission",
+          "label": "Admitted path, regular files and native package"
+        }
+      ],
+      "outputs": [
+        {
+          "label": "Frozen handoff, file inventory and digest",
+          "path": "handoff/",
+          "class": "frozen"
+        }
+      ],
+      "output_qc": [
+        {
+          "id": "handoff.integrity",
+          "label": "Exact file inventory and handoff digest"
+        }
+      ],
+      "evidence": [
+        "handoff_sha256",
+        "package_files"
+      ]
+    },
+    {
+      "id": "discover",
+      "name": "Discover structure",
+      "name_zh": "解析结构",
+      "inputs": [
+        {
+          "label": "Frozen handoff and versioned component records",
+          "path": "handoff/",
+          "class": "frozen"
+        }
+      ],
+      "input_qc": [
+        {
+          "id": "discovery.inputs",
+          "label": "Unchanged handoff and controlled discovery settings"
+        }
+      ],
+      "outputs": [
+        {
+          "label": "Native observations and findings",
+          "path": "input/discovery/",
+          "class": "frozen"
+        },
+        {
+          "label": "Derived definition and structural revision",
+          "path": "input/robot.yaml + input/cad-revision.json",
+          "class": "derived"
+        }
+      ],
+      "output_qc": [
+        {
+          "id": "discovery.definition",
+          "label": "Unambiguous identity, bodies, motion, names and references"
+        },
+        {
+          "id": "discovery.binding",
+          "label": "Native evidence, original files, revision and routing agree"
+        }
+      ],
+      "evidence": [
+        "input/discovery/native-discovery.json",
+        "input/robot.yaml",
+        "input/cad-revision.json"
+      ]
+    },
+    {
+      "id": "capture",
+      "name": "Capture evidence",
+      "name_zh": "采集证据",
+      "inputs": [
+        {
+          "label": "Prepared definition, saved CAD and native runtime",
+          "path": "input/",
+          "class": "prepared"
+        }
+      ],
+      "input_qc": [
+        {
+          "id": "input.valid",
+          "label": "Derived definition, structural revision and archive integrity"
+        },
+        {
+          "id": "runtime.ready",
+          "label": "Native platform and isolated URDF consumer readiness"
+        }
+      ],
+      "outputs": [
+        {
+          "label": "Collected CAD, raw measurements, native meshes and manifest",
+          "path": "evidence/",
+          "class": "frozen"
+        }
+      ],
+      "output_qc": [
+        {
+          "id": "capture.integrity",
+          "label": "Complete snapshot with capture and saved-state guards"
+        },
+        {
+          "id": "capture.input_stability",
+          "label": "Original handoff unchanged after capture"
+        }
+      ],
+      "evidence": [
+        "reports/input.json",
+        "evidence/manifest.json",
+        "evidence/raw/",
+        "evidence/source/"
+      ]
+    },
+    {
+      "id": "generate",
+      "name": "Generate URDF",
+      "name_zh": "生成 URDF",
+      "inputs": [
+        {
+          "label": "Frozen native evidence",
+          "path": "evidence/",
+          "class": "frozen"
+        }
+      ],
+      "input_qc": [
+        {
+          "id": "generation.inputs",
+          "label": "Snapshot integrity before consumption"
+        }
+      ],
+      "outputs": [
+        {
+          "label": "Canonical model",
+          "path": "model/robot.json",
+          "class": "derived"
+        },
+        {
+          "label": "URDF and local meshes",
+          "path": "urdf/ + meshes/",
+          "class": "derived"
+        },
+        {
+          "label": "Tool identity and file subject",
+          "path": "reports/tool.json",
+          "class": "derived"
+        }
+      ],
+      "output_qc": [
+        {
+          "id": "generation.artifacts",
+          "label": "Valid canonical schema and complete hashed delivery"
+        }
+      ],
+      "evidence": [
+        "model/robot.json",
+        "urdf/robot.urdf",
+        "meshes/",
+        "reports/tool.json"
+      ]
+    },
+    {
+      "id": "verify",
+      "name": "Independent verification",
+      "name_zh": "独立验证",
+      "inputs": [
+        {
+          "label": "Original evidence and actual generated files",
+          "path": "input/ + evidence/ + model/ + urdf/ + meshes/",
+          "class": "bound"
+        }
+      ],
+      "input_qc": [
+        {
+          "id": "verification.subject",
+          "label": "Generated file subject unchanged"
+        }
+      ],
+      "outputs": [
+        {
+          "label": "Deterministic per-object quality report",
+          "path": "reports/quality.json",
+          "class": "derived"
+        }
+      ],
+      "output_qc": [
+        {
+          "id": "verification.gates",
+          "label": "All required native, physical, frame, geometry and consumer checks"
+        },
+        {
+          "id": "verification.report_binding",
+          "label": "Saved report equals independent recomputation"
+        }
+      ],
+      "evidence": [
+        "reports/quality.json",
+        "subject_sha256"
+      ]
+    },
+    {
+      "id": "publish",
+      "name": "Publish review PR",
+      "name_zh": "提交评审 PR",
+      "inputs": [
+        {
+          "label": "Verified delivery and configured model repository",
+          "path": "urdf/ + meshes/ + reports/quality.json",
+          "class": "verified"
+        }
+      ],
+      "input_qc": [
+        {
+          "id": "publication.inputs",
+          "label": "Reverified delivery, clean repository and deterministic review branch"
+        }
+      ],
+      "outputs": [
+        {
+          "label": "Candidate commit and PR receipt",
+          "path": "reports/pr.json",
+          "class": "receipt"
+        }
+      ],
+      "output_qc": [
+        {
+          "id": "publication.git",
+          "label": "Copied, staged and committed bytes match the verified subject"
+        },
+        {
+          "id": "publication.receipt",
+          "label": "Remote commit, PR head/base and subject agree"
+        }
+      ],
+      "evidence": [
+        "reports/pr.json",
+        "commit",
+        "url"
+      ]
+    }
+  ],
+  "confirmations": [
+    {
+      "id": "scope",
+      "label": "范围与身份",
+      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
+      "review_stage": "discover"
+    },
+    {
+      "id": "revision",
+      "label": "版本留存",
+      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
+      "review_stage": "freeze"
+    },
+    {
+      "id": "dependencies",
+      "label": "文件依赖",
+      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
+      "review_stage": "capture"
+    },
+    {
+      "id": "saved_state",
+      "label": "重建与保存",
+      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
+      "review_stage": "capture"
+    },
+    {
+      "id": "configuration",
+      "label": "配置与实例",
+      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
+      "review_stage": "discover"
+    },
+    {
+      "id": "bodies",
+      "label": "刚体归属",
+      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
+      "review_stage": "discover"
+    },
+    {
+      "id": "topology",
+      "label": "拓扑与配合",
+      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
+      "review_stage": "discover"
+    },
+    {
+      "id": "datums",
+      "label": "轴线与基准",
+      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
+      "review_stage": "discover"
+    },
+    {
+      "id": "motion",
+      "label": "零位与正向",
+      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
+      "review_stage": "discover"
+    },
+    {
+      "id": "limits",
+      "label": "工作范围",
+      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
+      "review_stage": "discover"
+    },
+    {
+      "id": "clearance",
+      "label": "干涉与间隙",
+      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
+      "review_stage": "verify"
+    },
+    {
+      "id": "interfaces",
+      "label": "工具与传感器",
+      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
+      "review_stage": "discover"
+    },
+    {
+      "id": "drives",
+      "label": "驱动规格",
+      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
+      "review_stage": "discover"
+    },
+    {
+      "id": "physics",
+      "label": "物理属性",
+      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
+      "review_stage": "capture"
+    },
+    {
+      "id": "budgets",
+      "label": "独立依据",
+      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
+      "review_stage": "verify"
+    },
+    {
+      "id": "geometry",
+      "label": "几何与引用",
+      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
+      "review_stage": "generate"
+    }
+  ],
+  "unsupported": [
+    {
+      "id": "interference",
+      "label": "干涉与间隙：全行程干涉、碰撞及制造公差验算",
+      "stage": "verify"
+    },
+    {
+      "id": "naming_identity",
+      "label": "命名与身份：术语与物料号身份绑定、跨版本改名对应关系",
+      "stage": "discover"
+    }
+  ]
+}

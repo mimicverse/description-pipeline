@@ -1,10 +1,14 @@
-"""Submit one configured CAD package to the Windows SolidWorks execution endpoint."""
+"""Submit one engineering folder to the Windows SolidWorks execution endpoint.
+
+The DAG carries one operator value, ``handoff_path``. It sends only the resolved native package
+and its digest; hardware, revision and repository routing resolve inside the serialized Windows
+job after CAD discovery and are confirmed here before publication.
+"""
 
 from __future__ import annotations
 
 import logging
 import os
-import uuid
 from datetime import datetime, timedelta
 
 from airflow.providers.standard.sensors.python import PythonSensor
@@ -12,14 +16,18 @@ from airflow.sdk import Param, dag, task
 from airflow.sdk.exceptions import AirflowFailException
 
 from description_pipeline.orchestration.airflow_client import (
+    HandoffResolution,
     WindowsEndpoint,
     check_result,
     config_from_airflow_connection,
-    validate_package,
-    validate_revision_sha,
+    native_run_id,
+    resolved_routing,
 )
+from description_pipeline.stages import compact_view, contract_markdown, require_complete, stage_log, stage_view
+from description_pipeline.io import digest
 
 DAG_ID = "solidworks_to_urdf"
+CONN_ID = os.environ.get("SOLIDWORKS_ENDPOINT_CONN_ID", "solidworks_windows")
 SENSOR_MODE = os.environ.get("SOLIDWORKS_SENSOR_MODE", "reschedule")
 POLL_INTERVAL = float(os.environ.get("SOLIDWORKS_POLL_INTERVAL", "10"))
 POLL_TIMEOUT = float(os.environ.get("SOLIDWORKS_TIMEOUT", "3600"))
@@ -31,10 +39,17 @@ def _endpoint(conn_id: str) -> WindowsEndpoint:
 
 
 def _run_uuid(context) -> str:
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{DAG_ID}:{context['dag_run'].run_id}"))
+    return native_run_id(context["dag_run"].run_id)
 
 
-def _poke(request: dict) -> bool:
+def _resolution(request: dict) -> HandoffResolution:
+    return HandoffResolution(
+        package=request["package"],
+        handoff_sha256=request["handoff_sha256"],
+    )
+
+
+def _poke(request: dict, **context) -> bool:
     job = _endpoint(request["conn_id"]).get_job(request["run_id"])
     _same_request(job, request)
     latest = job["events"][-1] if job["events"] else {}
@@ -45,6 +60,27 @@ def _poke(request: dict) -> bool:
         latest.get("stage"),
         latest.get("state"),
     )
+    stages = stage_view(job)
+    ti = context.get("ti")
+    progress = digest(compact_view(stages))
+    if ti is None or ti.xcom_pull(task_ids="wait_for_job", key="engineering_progress") != progress:
+        for stage in stages["stages"]:
+            log.info(
+                "engineering stage=%s state=%s input_qc=%s output_qc=%s",
+                stage["id"],
+                stage["state"],
+                [(item["id"], item["state"]) for item in stage["input_qc"]],
+                [(item["id"], item["state"]) for item in stage["output_qc"]],
+            )
+        if ti is not None:
+            ti.xcom_push(key="engineering_progress", value=progress)
+    if job["status"] in {"passed", "failed"}:
+        for row in stage_log(stages):
+            log.info("engineering result=%s", row)
+        if ti is not None:
+            ti.xcom_push(key="engineering_stages", value=compact_view(stages))
+        else:
+            log.warning("Terminal engineering summary has no task instance; XCom was not stored")
     if job["status"] == "failed":
         result = job.get("result") or {}
         log.error("native diagnostics=%s events=%s", result.get("diagnostic_path"), job["events"])
@@ -53,7 +89,7 @@ def _poke(request: dict) -> bool:
 
 
 def _same_request(job: dict, request: dict) -> None:
-    expected = {key: request[key] for key in ("run_id", "package", "revision_sha256", "target")}
+    expected = {key: request[key] for key in ("run_id", "package", "handoff_sha256")}
     if job.get("request") != expected:
         raise AirflowFailException("Endpoint job differs from the requested mechanical handoff")
 
@@ -65,64 +101,80 @@ def _same_request(job: dict, request: dict) -> None:
     catchup=False,
     tags=["solidworks", "urdf", "windows"],
     default_args={"retries": 2, "retry_delay": timedelta(seconds=15)},
+    doc_md=(
+        "# SolidWorks to URDF\n\nSix engineering stages execute in one serialized Windows job. "
+        "The graph below transports that job; polling is not an engineering stage.\n\n"
+        + contract_markdown()
+        + "\n\nRun results: `wait_for_job` logs every stage and terminal QC details, including failures. "
+        "Its `engineering_stages` XCom contains the terminal summary. The operator page shows "
+        "inputs, checks, outputs and evidence per stage; `reports/stages.json` retains the detailed receipt. "
+        "Engineering confirmations remain pending until approved in the bound review records."
+    ),
     params={
-        "package": Param("", type="string", description="POSIX relative package path"),
-        "revision_sha256": Param("", type="string", description="sealed cad-revision.json digest"),
-        "target": Param("", type="string", description="configured repository alias"),
-        "repository_slug": Param("", type="string", description="expected origin owner/repo"),
-        "base": Param("", type="string", description="expected base branch feature/<hardware>"),
-        "conn_id": Param("solidworks_windows", type="string", description="Airflow connection"),
+        "handoff_path": Param(
+            "",
+            type="string",
+            title="Engineering folder path",
+            description=(
+                "Folder the Windows endpoint inspects (an absolute Linux folder is archived and "
+                "imported before the run starts)"
+            ),
+        ),
     },
 )
 def solidworks_to_urdf():
-    @task
-    def validate_request(**context) -> dict:
-        params = context["params"]
-        package = validate_package(params["package"])
-        revision_sha256 = validate_revision_sha(params["revision_sha256"])
-        target = str(params["target"]).strip()
-        if not target:
-            raise AirflowFailException("target repository alias is required")
-        repository_slug = str(params["repository_slug"]).strip()
-        base = str(params["base"]).strip()
-        if not repository_slug or "/" not in repository_slug or not base.startswith("feature/"):
-            raise AirflowFailException("repository_slug and feature/<hardware> base are required")
+    @task(doc_md="Collect the admitted native folder and bind its file inventory for the queued engineering job.")
+    def resolve_handoff(**context) -> dict:
+        handoff_path = str(context["params"]["handoff_path"]).strip()
+        if not handoff_path:
+            raise AirflowFailException("handoff_path is required")
+        resolved = _endpoint(CONN_ID).resolve_handoff(handoff_path)
         run_id = _run_uuid(context)
-        log.info("queue run_id=%s package=%s target=%s endpoint_conn=%s", run_id, package, target, params["conn_id"])
+        log.info(
+            "resolved handoff_path=%s package=%s handoff_sha256=%s endpoint_conn=%s",
+            handoff_path,
+            resolved.package,
+            resolved.handoff_sha256,
+            CONN_ID,
+        )
         return {
             "run_id": run_id,
-            "package": package,
-            "revision_sha256": revision_sha256,
-            "target": target,
-            "repository_slug": repository_slug,
-            "base": base,
-            "conn_id": params["conn_id"],
+            "package": resolved.package,
+            "handoff_sha256": resolved.handoff_sha256,
+            "conn_id": CONN_ID,
         }
 
-    @task
+    @task(doc_md="Submit the same UUID and frozen handoff to the serial Windows queue; retries never replay CAD.")
     def start_job(request: dict) -> dict:
         job = _endpoint(request["conn_id"]).start_job(
             run_id=request["run_id"],
-            package=request["package"],
-            revision_sha256=request["revision_sha256"],
-            target=request["target"],
+            resolution=_resolution(request),
         )
         log.info("started run_id=%s status=%s", job["run_id"], job["status"])
         return {**request, "status": job["status"]}
 
-    @task
+    @task(doc_md="Confirm all six engineering stages and the verified candidate PR; return the bound stage summary.")
     def confirm_job(request: dict) -> dict:
         job = _endpoint(request["conn_id"]).get_job(request["run_id"])
         _same_request(job, request)
         if job["status"] != "passed":
             raise AirflowFailException(f"job {request['run_id']} is {job['status']}, not passed")
-        if job.get("repository_slug") != request["repository_slug"]:
-            raise AirflowFailException("job repository_slug differs from the requested origin")
-        if job.get("repository_base") != request["base"]:
-            raise AirflowFailException("job repository_base differs from the requested base")
+        routing = resolved_routing(job)
+        handoff = {
+            "package": request["package"],
+            "handoff_sha256": request["handoff_sha256"],
+            "hardware_id": routing["hardware_id"],
+            "revision": routing["revision"],
+            "repository_slug": routing["repository_slug"],
+            "base": routing["repository_base"],
+        }
         result = check_result(
-            job.get("result"), expected_slug=request["repository_slug"], expected_base=request["base"]
+            job.get("result"),
+            expected_slug=routing["repository_slug"],
+            expected_base=routing["repository_base"],
         )
+        stages = stage_view(job)
+        require_complete(stages)
         log.info(
             "published run_id=%s quality=%s submission=%s",
             request["run_id"],
@@ -132,12 +184,13 @@ def solidworks_to_urdf():
         return {
             "run_id": request["run_id"],
             "pipeline_id": result["pipeline_id"],
-            "events": job["events"],
-            "quality": result["quality"],
+            "handoff": handoff,
+            "stages": compact_view(stages),
+            "quality": {key: result["quality"].get(key) for key in ("passed", "subject_sha256")},
             "submission": result["submission"],
         }
 
-    request = validate_request()
+    request = resolve_handoff()
     started = start_job(request)
     wait_for_job = PythonSensor(
         task_id="wait_for_job",
@@ -146,6 +199,9 @@ def solidworks_to_urdf():
         mode=SENSOR_MODE,
         poke_interval=POLL_INTERVAL,
         timeout=POLL_TIMEOUT,
+        doc_md=(
+            "Transport polling only. Engineering stage/QC results are in these logs and the engineering_stages XCom."
+        ),
     )
     confirm = confirm_job(started)
     wait_for_job >> confirm

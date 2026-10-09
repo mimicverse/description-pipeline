@@ -31,12 +31,12 @@ In the activated Linux environment:
 
 ```sh
 python -B -m unittest discover -s tests -t .
-python -m ruff check src tests tools deploy/airflow
+python -m ruff check src tests tools deploy
 ```
 
 On Windows, use `.venv\Scripts\python.exe` in place of `python` for both commands.
 For changes to Airflow deployment, also follow its
-[isolated smoke-test procedure](deploy/airflow/README.md#deployment-maintenance).
+[deployment checks](docs/deployment.md#maintenance).
 
 Keep source inputs, raw native evidence, generation and independent verification
 separate. A verifier must not obtain its expected answer from the generator.
@@ -46,10 +46,15 @@ actual native rehearsal evidence; mocks cannot establish native behavior.
 ## Documentation and repository boundaries
 
 Keep examples consistent with command help, schemas and measured behavior.
-Describe target features as requirements until they pass release acceptance.
+Keep `main` within the [Release 1.0 design](docs/design.md): one current workflow,
+no compatibility layers or transitional documentation. Merge implementation and
+instructions together after the required acceptance passes.
 The [design](docs/design.md) owns architecture, [operations](docs/operations.md)
 owns the end-to-end workflow, [deployment](docs/deployment.md) owns availability
 and configuration, and [quality](docs/quality.md) owns verification claims.
+
+The six-stage contract is `src/description_pipeline/stage-contract.json`; the
+generated table in the design document must match `contract_markdown()`.
 
 Do not commit real robot/CAD data, credentials, workstation state or build
 outputs to this public repository. Neutral fixtures are synthetic and cannot

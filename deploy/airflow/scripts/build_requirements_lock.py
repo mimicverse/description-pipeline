@@ -127,9 +127,7 @@ def main() -> int:
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="airflow-lock-") as tmp:
         dest = Path(tmp)
-        entries = resolve(
-            args.python, args.requirements, args.wheel, args.resolve_requirements, args.constraints, dest
-        )
+        entries = resolve(args.python, args.requirements, args.wheel, args.resolve_requirements, args.constraints, dest)
         lines = [
             f"# {args.header}",
             f"# {len(entries)} pins; regenerate with scripts/build_requirements_lock.py --python <venv>/bin/python",

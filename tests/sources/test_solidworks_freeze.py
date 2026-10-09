@@ -48,14 +48,19 @@ class FreezeTests(unittest.TestCase):
             "configuration": "Default",
             "allowed_roots": [str(self.tmp / "cad")],
             "geometry": {"enabled": True, "format": "stl_binary"},
-            "coordinate_systems": ["CS_arm"],
+            "coordinate_systems": ["base_datum", "arm_datum", "imu_datum"],
             "bodies": [
-                {"id": "base", "name": "base_link", "components": ["base-1"]},
+                {
+                    "id": "base",
+                    "name": "base_link",
+                    "components": ["base-1"],
+                    "frame": {"coordinate_system": "base_datum"},
+                },
                 {
                     "id": "arm",
                     "name": "arm_link",
                     "components": ["arm-1"],
-                    "frame": {"xyz": [0.0, 0.0, 0.2], "rpy": [0.0, 0.0, 0.0]},
+                    "frame": {"coordinate_system": "arm_datum"},
                 },
             ],
             "joints": [
@@ -65,13 +70,11 @@ class FreezeTests(unittest.TestCase):
                     "type": "revolute",
                     "parent": "base_link",
                     "child": "arm_link",
-                    "xyz": [0.0, 0.0, 0.2],
-                    "rpy": [0.0, 0.0, 0.0],
                     "axis": [0.0, 0.0, 1.0],
                     "limits": {"lower": -1.0, "upper": 1.0, "effort": 2.0, "velocity": 3.0},
                 }
             ],
-            "frames": [{"id": "imu", "parent": "base_link", "xyz": [0.01, 0.0, 0.03]}],
+            "frames": [{"id": "imu", "parent": "base_link", "coordinate_system": "imu_datum"}],
         }
         self.destination = self.tmp / "snapshot"
 
@@ -128,7 +131,7 @@ class FreezeTests(unittest.TestCase):
         config = json.loads(json.dumps(self.config))
         # rotate the arm link frame 90 degrees about Z: the COM rotates with it,
         # and the inertia tensor has to be re-expressed in the rotated axes
-        config["bodies"][1]["frame"] = {"xyz": [-0.2, 0.0, 0.0], "rpy": [0.0, 0.0, 1.5707963267948966]}
+        config["bodies"][1]["frame"] = {"coordinate_system": "arm_datum"}
         backend = support.FixtureCadBackend(
             self.assembly,
             [
@@ -146,6 +149,9 @@ class FreezeTests(unittest.TestCase):
                 },
             ],
             dependencies=self.parts,
+        )
+        backend.coordinate_system_matrices["arm_datum"] = support.placement(
+            (-0.2, 0.0, 0.0), (0.0, 0.0, 1.5707963267948966)
         )
         freeze(config, self.destination, backend=backend)
         scene = load_scene(self.destination)
@@ -214,8 +220,8 @@ class FreezeTests(unittest.TestCase):
         backend.pack_drop_files = {self.parts[1].name}
         config = json.loads(json.dumps(self.config))
         config["bodies"] = [
-            {"id": "base", "name": "base_link", "components": ["base-1"]},
-            {"id": "arm", "name": "arm_link", "components": ["arm-1"]},
+            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "base_datum"}},
+            {"id": "arm", "name": "arm_link", "components": ["arm-1"], "frame": {"coordinate_system": "arm_datum"}},
         ]
 
         with self.assertRaises(BridgeError) as raised:
@@ -239,7 +245,9 @@ class FreezeTests(unittest.TestCase):
         )
         backend.resolve_returns_empty = True
         config = json.loads(json.dumps(self.config))
-        config["bodies"] = [{"id": "base", "name": "base_link", "components": ["base-1"]}]
+        config["bodies"] = [
+            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "base_datum"}}
+        ]
         config["joints"] = []
         config.pop("frames", None)
 
@@ -263,7 +271,9 @@ class FreezeTests(unittest.TestCase):
         )
         backend.copy_extra_components = 1
         config = json.loads(json.dumps(self.config))
-        config["bodies"] = [{"id": "base", "name": "base_link", "components": ["base-1"]}]
+        config["bodies"] = [
+            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "base_datum"}}
+        ]
         config["joints"] = []
         config.pop("frames", None)
 
@@ -293,7 +303,9 @@ class FreezeTests(unittest.TestCase):
 
         backend.collect_dependencies = broken_pack  # type: ignore[method-assign]
         config = json.loads(json.dumps(self.config))
-        config["bodies"] = [{"id": "base", "name": "base_link", "components": ["base-1"]}]
+        config["bodies"] = [
+            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "base_datum"}}
+        ]
         config["joints"] = []
         config.pop("frames", None)
 
@@ -343,9 +355,9 @@ class FreezeTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "cad_configuration_missing")
 
-    def test_joint_without_explicit_geometry_is_refused(self) -> None:
+    def test_joint_with_authored_origin_is_refused(self) -> None:
         config = json.loads(json.dumps(self.config))
-        config["joints"][0].pop("xyz")
+        config["joints"][0]["xyz"] = [0.0, 0.0, 0.2]
 
         with self.assertRaises(ConfigError) as raised:
             freeze(config, self.destination, backend=self.backend)
@@ -392,8 +404,8 @@ class FreezeTests(unittest.TestCase):
         )
         config = json.loads(json.dumps(self.config))
         config["bodies"] = [
-            {"id": "base", "name": "base_link", "components": ["base-1"]},
-            {"id": "arm", "name": "arm_link", "components": ["arm-1"]},
+            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "base_datum"}},
+            {"id": "arm", "name": "arm_link", "components": ["arm-1"], "frame": {"coordinate_system": "arm_datum"}},
         ]
         return backend, config
 
@@ -600,19 +612,18 @@ class FreezeTests(unittest.TestCase):
         self.assertIsInstance(detail, dict)
         self.assertEqual(detail["name"], "arm.sldprt")  # type: ignore[index]
 
-    def test_configuration_changing_while_capturing_blocks_freeze(self) -> None:
+    def test_original_configuration_is_initial_evidence_not_current_state(self) -> None:
         backend, config = self._two_component_backend()
         # the bytes on disk never move: only the session's active configuration
         # does, after the readings have been taken
         backend.drift_configuration_after_reading = True
 
-        with self.assertRaises(BridgeError) as raised:
-            freeze(config, self.destination, backend=backend)
-
-        self.assertEqual(raised.exception.code, "cad_source_changed")
-        drift = raised.exception.detail["state_drift"]  # type: ignore[index]
-        self.assertEqual(drift[0]["before"]["active_configuration"], "Default")
-        self.assertEqual(drift[0]["after"]["active_configuration"], "Other")
+        freeze(config, self.destination, backend=backend)
+        closure = json.loads((self.destination / "raw" / "dependency_closure.json").read_text(encoding="utf-8"))
+        self.assertEqual(closure["original_states"][str(self.assembly)]["active_configuration"], "Default")
+        collection = json.loads((self.destination / "evidence" / "collection.json").read_text(encoding="utf-8"))
+        self.assertEqual(collection["capture"]["originals_unchanged"]["state_scope"], "initial_source_observation")
+        self.assertEqual(collection["capture"]["originals_unchanged"]["files_checked"], 3)
 
     def test_unknown_dependency_state_cannot_prove_a_saved_source(self) -> None:
         for field in ("saved", "active_configuration"):
@@ -634,7 +645,7 @@ class FreezeTests(unittest.TestCase):
                 self.assertEqual(raised.exception.code, "cad_document_state_unreadable")
                 self.assertEqual(backend.collected, [])
 
-    def test_state_reader_disappearing_after_capture_is_rejected(self) -> None:
+    def test_original_state_is_not_reread_after_copy_capture(self) -> None:
         backend, config = self._two_component_backend()
         collect = backend.collect_scene
 
@@ -643,9 +654,11 @@ class FreezeTests(unittest.TestCase):
             backend.document_state = None  # type: ignore[assignment,method-assign]
             return scene
 
-        with patch.object(backend, "collect_scene", side_effect=captured), self.assertRaises(BridgeError) as raised:
+        with patch.object(backend, "collect_scene", side_effect=captured):
             freeze(config, self.destination, backend=backend)
-        self.assertEqual(raised.exception.code, "cad_source_changed")
+        self.assertTrue(self.destination.exists())
+        closure = json.loads((self.destination / "raw" / "dependency_closure.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(closure["original_states"]), 3)
 
     def test_non_instance_dependency_is_checked_for_its_save_flag(self) -> None:
         backend, config = self._two_component_backend()
@@ -718,8 +731,8 @@ class FreezeTests(unittest.TestCase):
         # switching the user's document is not this adapter's job
         config["configuration"] = "Other"
         config["bodies"] = [
-            {"id": "base", "name": "base_link", "components": ["base-1"]},
-            {"id": "arm", "name": "arm_link", "components": ["arm-1"]},
+            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "base_datum"}},
+            {"id": "arm", "name": "arm_link", "components": ["arm-1"], "frame": {"coordinate_system": "arm_datum"}},
         ]
 
         with self.assertRaises(BridgeError) as raised:
@@ -809,7 +822,9 @@ class FreezeTests(unittest.TestCase):
             dependencies=self.parts,
         )
         config = json.loads(json.dumps(self.config))
-        config["bodies"] = [{"id": "base", "name": "base_link", "components": ["base-1"]}]
+        config["bodies"] = [
+            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "base_datum"}}
+        ]
         config["joints"] = []
         config.pop("frames", None)
 
@@ -840,6 +855,131 @@ class FreezeTests(unittest.TestCase):
         self.assertTrue((failure / "partial" / "source" / self.parts[0].name).is_file())
         # ... and nothing was delivered
         self.assertFalse(self.destination.exists())
+
+    def test_failed_readings_retain_environment_and_both_owned_session_ids(self) -> None:
+        backend, config = self._two_component_backend()
+        backend.scene_document_override = str(self.assembly)
+        sessions = {
+            "source": {"pid": 41, "executable": "sldworks.exe", "ownership": "windows_job"},
+            "copy": {"pid": 42, "executable": "sldworks.exe", "ownership": "windows_job"},
+        }
+        backend.environment = lambda: {"revision": "34.0.0", "sessions": sessions}
+
+        with self.assertRaises(BridgeError) as caught:
+            freeze(config, self.destination, backend=backend, worker_version="test-worker")
+
+        self.assertEqual(caught.exception.code, "capture_source_mismatch")
+        failure = self.destination.with_name(self.destination.name + ".failed-001")
+        environment = json.loads((failure / "partial/evidence/environment.json").read_text())
+        self.assertEqual(environment["solidworks"]["sessions"], sessions)
+        self.assertEqual(environment["solidworks"]["revision"], "34.0.0")
+        self.assertEqual(environment["worker_version"], "test-worker")
+
+    def test_geometry_failure_retains_environment_without_masking_original_error(self) -> None:
+        from description_pipeline.sources.solidworks.errors import CadError
+
+        backend, config = self._two_component_backend()
+        sessions = {"copy": {"pid": 42, "executable": "sldworks.exe", "ownership": "windows_job"}}
+        backend.environment = lambda: {"revision": "34.0.0", "sessions": sessions}
+
+        def unavailable_mesh(*args, **kwargs):
+            raise CadError("cad_body_faces_unreadable", "native faces unavailable", {"api": "IBody2.GetFaces"})
+
+        backend.export_component_meshes = unavailable_mesh
+        with self.assertRaises(CadError) as caught:
+            freeze(config, self.destination, backend=backend)
+
+        self.assertEqual(caught.exception.code, "cad_body_faces_unreadable")
+        failure = self.destination.with_name(self.destination.name + ".failed-001")
+        record = json.loads((failure / "failure.json").read_text())
+        self.assertEqual(record["stage"], "geometry")
+        self.assertEqual(record["detail"]["api"], "IBody2.GetFaces")
+        environment = json.loads((failure / "partial/evidence/environment.json").read_text())
+        self.assertEqual(environment["solidworks"]["sessions"], sessions)
+        self.assertFalse(self.destination.exists())
+
+    def test_failed_readings_retain_exact_native_member_and_original_rpc_cause(self) -> None:
+        from description_pipeline.sources.solidworks.errors import CadError
+        from description_pipeline.sources.solidworks.native import _member, _method
+
+        class RpcError(Exception):
+            hresult = -2147023130
+
+        class NoRepresentation:
+            def __repr__(self):
+                raise AssertionError("diagnostics must not inspect COM arguments")
+
+        class Unreadable:
+            def __init__(self):
+                self.attempts = []
+
+            @property
+            def ConfigurationManager(self):
+                self.attempts.append("property")
+                raise RpcError("RPC failed at http://user:secret@192.0.2.10/api?token=abc")
+
+            def ReadValue(self, argument):
+                self.attempts.append("method")
+                raise RpcError("RPC failed at http://user:secret@192.0.2.10/api?token=abc")
+
+        for reader, name, arguments in (
+            (_member, "ConfigurationManager", ()),
+            (_method, "ReadValue", (NoRepresentation(),)),
+        ):
+            with self.subTest(reader=reader.__name__):
+                backend, config = self._two_component_backend()
+                native = Unreadable()
+
+                def fail_reading(*args, reader=reader, native=native, member=name, arguments=arguments, **kwargs):
+                    try:
+                        reader(native, member, *arguments)
+                    except RpcError as cause:
+                        raise CadError("cad_source_state_unreadable", "native source unreadable") from cause
+
+                backend.collect_scene = fail_reading
+                destination = self.tmp / reader.__name__
+                with self.assertRaises(CadError) as caught:
+                    freeze(config, destination, backend=backend)
+
+                self.assertEqual(caught.exception.code, "cad_source_state_unreadable")
+                self.assertEqual(len(native.attempts), 1)
+                failure = destination.with_name(destination.name + ".failed-001")
+                payload = (failure / "failure.json").read_text()
+                record = json.loads(payload)
+                self.assertEqual(record["stage"], "readings")
+                self.assertEqual([item["type"] for item in record["exceptions"]], ["CadError", "RpcError"])
+                rpc = record["exceptions"][1]
+                self.assertEqual(rpc["hresult"], -2147023130)
+                site = next(item for item in rpc["frames"] if item["function"] == reader.__name__)
+                self.assertEqual(site["member"], name)
+                self.assertEqual(site["module"], "description_pipeline.sources.solidworks.native")
+                self.assertGreater(site["line"], 0)
+                self.assertNotIn("secret", payload)
+                self.assertNotIn("token=abc", payload)
+                self.assertTrue((failure / "partial/source" / self.assembly.name).is_file())
+                self.assertFalse(destination.exists())
+
+    def test_geometry_batch_cannot_omit_or_substitute_an_occurrence(self) -> None:
+        for change in ("omit", "substitute"):
+            with self.subTest(change=change):
+                backend, config = self._two_component_backend()
+                original = backend.export_component_meshes
+
+                def changed_result(destinations, original=original, change=change):
+                    entries = original(destinations)
+                    name = next(iter(entries))
+                    if change == "omit":
+                        entries.pop(name)
+                    else:
+                        entries[name]["component"] = "foreign-occurrence"
+                    return entries
+
+                backend.export_component_meshes = changed_result
+                destination = self.tmp / change
+                with self.assertRaises(BridgeError) as caught:
+                    freeze(config, destination, backend=backend)
+                self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
+                self.assertFalse(destination.exists())
 
     def test_retry_writes_a_second_diagnosis_and_keeps_the_first(self) -> None:
         backend, config = self._two_component_backend()
@@ -969,8 +1109,13 @@ class SharedModelContractTests(unittest.TestCase):
             "robot_name": "robot",
             "geometry": {"enabled": True},
             "bodies": [
-                {"id": "base", "name": "base_link", "components": ["base-1"]},
-                {"id": "arm", "name": "arm_link", "components": ["arm-1"]},
+                {
+                    "id": "base",
+                    "name": "base_link",
+                    "components": ["base-1"],
+                    "frame": {"coordinate_system": "base_datum"},
+                },
+                {"id": "arm", "name": "arm_link", "components": ["arm-1"], "frame": {"coordinate_system": "arm_datum"}},
             ],
             "joints": [
                 {
@@ -979,8 +1124,6 @@ class SharedModelContractTests(unittest.TestCase):
                     "type": "revolute",
                     "parent": "base_link",
                     "child": "arm_link",
-                    "xyz": [0.0, 0.0, 0.2],
-                    "rpy": [0.0, 0.0, 0.0],
                     "axis": [0.0, 0.0, 1.0],
                     "limits": {"lower": -1.0, "upper": 1.0, "effort": 2.0, "velocity": 3.0},
                 }
@@ -1045,7 +1188,14 @@ class DocumentedMassTests(unittest.TestCase):
                 "file": "docs/provenance/drawing-12-3.json",
                 "sha256": "0" * 64,
             },
-            "bodies": [{"id": "base", "name": "base_link", "components": ["base-1"]}],
+            "bodies": [
+                {
+                    "id": "base",
+                    "name": "base_link",
+                    "components": ["base-1"],
+                    "frame": {"coordinate_system": "base_datum"},
+                }
+            ],
             "joints": [],
         }
 

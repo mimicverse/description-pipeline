@@ -114,7 +114,7 @@ def read_revision(package: Path, *, hardware_id: str | None = None) -> dict:
     _require(not package.is_symlink() and not package.is_junction(), "A CAD handoff cannot be a symlink or junction")
     package = package.resolve()
     path = package / FILENAME
-    _require(path.is_file(), f"Missing {FILENAME}; the mechanical team must seal the handoff revision")
+    _require(path.is_file(), f"Missing generated {FILENAME}; native discovery must prepare the frozen inputs")
     return _validate(read_data(path), cad_inventory(package), hardware_id)
 
 

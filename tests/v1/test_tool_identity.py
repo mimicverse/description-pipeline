@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from description_pipeline import __version__, solidworks
+from description_pipeline import __version__, runtime
 from description_pipeline.delivery import PIPELINE_ID
 from description_pipeline.io import PipelineError, digest, inventory, write_json
 
@@ -25,16 +25,16 @@ class ToolIdentityTests(unittest.TestCase):
             return SimpleNamespace(metadata={"Name": name}, version="1.0", requires=rows[name])
 
         with (
-            patch.object(solidworks, "RUNTIME_PACKAGES", ("reader",)),
-            patch.object(solidworks.sys, "platform", "linux"),
-            patch.object(solidworks.importlib.metadata, "distribution", distribution),
+            patch.object(runtime, "RUNTIME_PACKAGES", ("reader",)),
+            patch.object(runtime.sys, "platform", "linux"),
+            patch.object(runtime.importlib.metadata, "distribution", distribution),
         ):
-            self.assertEqual(solidworks.runtime_packages(), {"paths": "1.0", "reader": "1.0", "storage": "1.0"})
+            self.assertEqual(runtime.runtime_packages(), {"paths": "1.0", "reader": "1.0", "storage": "1.0"})
 
     def test_installed_identity_rejects_source_mutation_and_unlisted_files(self):
         with tempfile.TemporaryDirectory() as directory:
             package = Path(directory)
-            module = package / "solidworks.py"
+            module = package / "runtime.py"
             module.write_text("source\n", encoding="utf-8")
             files = inventory(package)
             identity = {
@@ -46,14 +46,14 @@ class ToolIdentityTests(unittest.TestCase):
             }
             write_json(package / "tool-release.json", identity)
             with (
-                patch.object(solidworks, "__file__", str(module)),
-                patch.object(solidworks, "runtime_packages", return_value={}),
+                patch.object(runtime, "__file__", str(module)),
+                patch.object(runtime, "runtime_packages", return_value={}),
             ):
-                self.assertEqual(solidworks.tool_record()["release"], identity)
+                self.assertEqual(runtime.tool_record()["release"], identity)
                 module.write_text("changed\n", encoding="utf-8")
                 with self.assertRaises(PipelineError):
-                    solidworks.tool_record()
+                    runtime.tool_record()
                 module.write_text("source\n", encoding="utf-8")
                 (package / "unlisted.py").write_text("unlisted\n", encoding="utf-8")
                 with self.assertRaises(PipelineError):
-                    solidworks.tool_record()
+                    runtime.tool_record()

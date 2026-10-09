@@ -153,16 +153,26 @@ class SessionTests(unittest.TestCase):
             Save=Mock(),
             ForceRebuild3=Mock(spec=["__call__"], return_value=True),
         )
-        result = backend._rebuild_capture_copy(doc, doc.GetPathName)
+        refreshed = []
+
+        def refresh(path):
+            refreshed.append(path)
+            return doc
+
+        backend._document_by_path = refresh
+        rebuilt, result = backend._rebuild_capture_copy(doc, doc.GetPathName)
+        self.assertIs(rebuilt, doc)
         self.assertEqual(result["scope"], "collected_copy_in_memory")
         self.assertFalse(result["saved_to_disk"])
         self.assertTrue(result["read_only"])
         doc.ForceRebuild3.assert_called_once_with(False)
         doc.Save.assert_not_called()
+        self.assertEqual(refreshed, [doc.GetPathName])
         doc.ForceRebuild3.return_value = False
         with self.assertRaises(CadError) as caught:
             backend._rebuild_capture_copy(doc, doc.GetPathName)
         self.assertEqual(caught.exception.code, "cad_rebuild_failed")
+        self.assertEqual(refreshed, [doc.GetPathName])
 
     def test_loaded_references_must_also_be_read_only(self):
         doc = SimpleNamespace(IsOpenedReadOnly=False, GetPathName="part.SLDPRT")
@@ -187,7 +197,7 @@ class SessionTests(unittest.TestCase):
 
     def test_com_is_bound_only_to_owned_pid(self):
         process = SimpleNamespace(pid=42, executable="test.exe", alive=lambda: True, close=Mock())
-        app = SimpleNamespace(Visible=True, CommandInProgress=False)
+        app = SimpleNamespace(Visible=True, CommandInProgress=False, StartupProcessCompleted=True)
         binder = Mock(return_value=app)
         session = CadSession(process=process, binder=binder)
         self.assertIs(session.connect(threading.Event()), app)
@@ -197,6 +207,270 @@ class SessionTests(unittest.TestCase):
         session.close()
         process.close.assert_called_once()
         self.assertIsNone(session.app)
+
+    def test_startup_waits_for_add_ins_before_enabling_automation(self):
+        events = []
+
+        class StartingApplication:
+            ready = False
+
+            @property
+            def StartupProcessCompleted(self):
+                self.ready = sum(event[0] == "startup" for event in events) == 2
+                events.append(("startup", self.ready))
+                return self.ready
+
+            def __setattr__(self, name, value):
+                if name in {"CommandInProgress", "Visible"}:
+                    if not self.ready:
+                        raise AssertionError("automation started before SolidWorks finished loading add-ins")
+                    events.append((name, value))
+                object.__setattr__(self, name, value)
+
+        process = SimpleNamespace(pid=42, executable="test.exe", alive=lambda: True, close=Mock())
+        app = StartingApplication()
+        binder = Mock(return_value=app)
+        cancelled = Mock(is_set=Mock(return_value=False), wait=Mock(side_effect=lambda _: events.append(("wait",))))
+        session = CadSession(process=process, binder=binder)
+
+        self.assertIs(session.connect(cancelled), app)
+        self.assertEqual(
+            events,
+            [
+                ("startup", False),
+                ("wait",),
+                ("startup", False),
+                ("wait",),
+                ("startup", True),
+                ("CommandInProgress", True),
+                ("Visible", False),
+            ],
+        )
+        binder.assert_called_once_with(42)
+        session.close()
+
+    def test_incomplete_startup_has_a_deadline_and_never_enables_automation(self):
+        process = SimpleNamespace(pid=42, executable="test.exe", alive=lambda: True, close=Mock())
+        app = SimpleNamespace(Visible=True, CommandInProgress=False, StartupProcessCompleted=False)
+        binder = Mock(return_value=app)
+        session = CadSession(process=process, binder=binder, startup_timeout=0)
+
+        with self.assertRaises(EnvironmentError_) as caught:
+            session.connect(threading.Event())
+        self.assertEqual(caught.exception.code, "cad_startup_failed")
+        self.assertIsNone(session.app)
+        self.assertTrue(app.Visible)
+        self.assertFalse(app.CommandInProgress)
+        binder.assert_called_once_with(42)
+        session.close()
+
+    def test_startup_read_failure_is_preserved_and_never_retried(self):
+        failure = RuntimeError("RPC_S_UNKNOWN_IF")
+
+        class UnreadableApplication:
+            @property
+            def StartupProcessCompleted(self):
+                raise failure
+
+        process = SimpleNamespace(pid=42, executable="test.exe", alive=lambda: True, close=Mock())
+        binder = Mock(return_value=UnreadableApplication())
+        cancelled = Mock(is_set=Mock(return_value=False), wait=Mock())
+        session = CadSession(process=process, binder=binder)
+
+        with self.assertRaises(EnvironmentError_) as caught:
+            session.connect(cancelled)
+        self.assertEqual(caught.exception.code, "cad_startup_unreadable")
+        self.assertIs(caught.exception.__cause__, failure)
+        self.assertIsNone(session.app)
+        binder.assert_called_once_with(42)
+        cancelled.wait.assert_not_called()
+        session.close()
+
+    def test_missing_startup_readiness_cannot_be_assumed_ready(self):
+        process = SimpleNamespace(pid=42, executable="test.exe", alive=lambda: True, close=Mock())
+        binder = Mock(return_value=SimpleNamespace())
+        session = CadSession(process=process, binder=binder)
+
+        with self.assertRaises(EnvironmentError_) as caught:
+            session.connect(threading.Event())
+        self.assertEqual(caught.exception.code, "cad_startup_unreadable")
+        self.assertIsInstance(caught.exception.__cause__, AttributeError)
+        self.assertIsNone(session.app)
+        binder.assert_called_once_with(42)
+        session.close()
+
+    def test_non_boolean_startup_readiness_cannot_enable_automation(self):
+        for value in (1, "True", None):
+            with self.subTest(value=value):
+                process = SimpleNamespace(pid=42, executable="test.exe", alive=lambda: True, close=Mock())
+                app = SimpleNamespace(Visible=True, CommandInProgress=False, StartupProcessCompleted=value)
+                binder = Mock(return_value=app)
+                session = CadSession(process=process, binder=binder)
+
+                with self.assertRaises(EnvironmentError_) as caught:
+                    session.connect(threading.Event())
+                self.assertEqual(caught.exception.code, "cad_startup_unreadable")
+                self.assertIsNone(session.app)
+                self.assertTrue(app.Visible)
+                self.assertFalse(app.CommandInProgress)
+                binder.assert_called_once_with(42)
+                session.close()
+
+    def test_cancellation_during_startup_does_not_enable_automation(self):
+        process = SimpleNamespace(pid=42, executable="test.exe", alive=lambda: True, close=Mock())
+        app = SimpleNamespace(Visible=True, CommandInProgress=False, StartupProcessCompleted=False)
+        binder = Mock(return_value=app)
+        cancelled = threading.Event()
+        cancelled.wait = Mock(side_effect=lambda _: cancelled.set())
+        session = CadSession(process=process, binder=binder)
+
+        with self.assertRaises(EnvironmentError_) as caught:
+            session.connect(cancelled)
+        self.assertEqual(caught.exception.code, "cad_session_cancelled")
+        self.assertIsNone(session.app)
+        self.assertTrue(app.Visible)
+        self.assertFalse(app.CommandInProgress)
+        binder.assert_called_once_with(42)
+        session.close()
+
+    def test_process_exit_at_readiness_cannot_return_a_session(self):
+        alive = True
+
+        class ExitingApplication:
+            @property
+            def StartupProcessCompleted(self):
+                nonlocal alive
+                alive = False
+                return True
+
+        process = SimpleNamespace(pid=42, executable="test.exe", alive=lambda: alive, close=Mock())
+        binder = Mock(return_value=ExitingApplication())
+        session = CadSession(process=process, binder=binder, startup_timeout=0)
+
+        with self.assertRaises(EnvironmentError_) as caught:
+            session.connect(threading.Event())
+        self.assertEqual(caught.exception.code, "cad_startup_failed")
+        self.assertIsNone(session.app)
+        binder.assert_called_once_with(42)
+        session.close()
+
+    def test_startup_registration_polling_still_checks_readiness(self):
+        process = SimpleNamespace(pid=42, executable="test.exe", alive=lambda: True, close=Mock())
+        app = SimpleNamespace(Visible=True, CommandInProgress=False, StartupProcessCompleted=True)
+        binder = Mock(side_effect=[None, app])
+        cancelled = Mock(is_set=Mock(return_value=False), wait=Mock())
+        session = CadSession(process=process, binder=binder)
+
+        self.assertIs(session.connect(cancelled), app)
+        self.assertEqual([call.args for call in binder.call_args_list], [(42,), (42,)])
+        cancelled.wait.assert_called_once_with(0.2)
+        session.close()
+
+    def test_current_application_uses_a_fresh_interface_for_the_same_owned_pid(self):
+        process = SimpleNamespace(pid=42, executable="test.exe", alive=lambda: True, close=Mock())
+        first = SimpleNamespace(Visible=True, CommandInProgress=False, StartupProcessCompleted=True)
+        current = SimpleNamespace()
+        binder = Mock(side_effect=[first, current])
+        session = CadSession(process=process, binder=binder)
+        session.connect(threading.Event())
+
+        self.assertIs(session.current_application(), current)
+        self.assertIs(session.app, current)
+        self.assertEqual([call.args for call in binder.call_args_list], [(42,), (42,)])
+        process.close.assert_not_called()
+        session.close()
+
+    def test_current_application_does_not_rebind_a_dead_owned_process(self):
+        alive = True
+        process = SimpleNamespace(pid=42, executable="test.exe", alive=lambda: alive, close=Mock())
+        binder = Mock(return_value=SimpleNamespace(Visible=True, CommandInProgress=False, StartupProcessCompleted=True))
+        session = CadSession(process=process, binder=binder)
+        session.connect(threading.Event())
+        alive = False
+
+        with self.assertRaises(EnvironmentError_) as caught:
+            session.current_application()
+        self.assertEqual(caught.exception.code, "cad_application_unreadable")
+        binder.assert_called_once_with(42)
+        process.close.assert_not_called()
+        session.close()
+
+    def test_current_application_does_not_wait_or_retry_a_missing_binding(self):
+        process = SimpleNamespace(pid=42, executable="test.exe", alive=lambda: True, close=Mock())
+        original = SimpleNamespace(Visible=True, CommandInProgress=False, StartupProcessCompleted=True)
+        binder = Mock(side_effect=[original, None])
+        session = CadSession(process=process, binder=binder)
+        session.connect(threading.Event())
+
+        with self.assertRaises(EnvironmentError_) as caught:
+            session.current_application()
+        self.assertEqual(caught.exception.code, "cad_application_unreadable")
+        self.assertIs(session.app, original)
+        self.assertEqual(binder.call_count, 2)
+        process.close.assert_not_called()
+        session.close()
+
+    def test_current_application_retains_the_binding_failure_as_its_cause(self):
+        process = SimpleNamespace(pid=42, executable="test.exe", alive=lambda: True, close=Mock())
+        failure = RuntimeError("RPC_S_UNKNOWN_IF")
+        original = SimpleNamespace(Visible=True, CommandInProgress=False, StartupProcessCompleted=True)
+        binder = Mock(side_effect=[original, failure])
+        session = CadSession(process=process, binder=binder)
+        session.connect(threading.Event())
+
+        with self.assertRaises(EnvironmentError_) as caught:
+            session.current_application()
+        self.assertEqual(caught.exception.code, "cad_application_unreadable")
+        self.assertIs(caught.exception.__cause__, failure)
+        self.assertEqual(binder.call_count, 2)
+        self.assertIs(session.app, original)
+        session.close()
+
+    def test_current_application_refuses_an_owner_that_died_during_binding(self):
+        alive = True
+        process = SimpleNamespace(pid=42, executable="test.exe", alive=lambda: alive, close=Mock())
+        original = SimpleNamespace(Visible=True, CommandInProgress=False, StartupProcessCompleted=True)
+        replacement = SimpleNamespace()
+
+        def bind(pid):
+            nonlocal alive
+            self.assertEqual(pid, 42)
+            if not hasattr(bind, "connected"):
+                bind.connected = True
+                return original
+            alive = False
+            return replacement
+
+        session = CadSession(process=process, binder=bind)
+        session.connect(threading.Event())
+        with self.assertRaises(EnvironmentError_) as caught:
+            session.current_application()
+        self.assertEqual(caught.exception.code, "cad_application_unreadable")
+        self.assertIs(session.app, original)
+        session.close()
+
+    def test_current_application_cannot_cross_the_owning_sta_thread(self):
+        process = SimpleNamespace(pid=42, executable="test.exe", alive=lambda: True, close=Mock())
+        binder = Mock(return_value=SimpleNamespace(Visible=True, CommandInProgress=False, StartupProcessCompleted=True))
+        session = CadSession(process=process, binder=binder)
+        session.connect(threading.Event())
+        failures = []
+
+        def read_elsewhere():
+            try:
+                session.current_application()
+            except Exception as error:
+                failures.append(error)
+
+        thread = threading.Thread(target=read_elsewhere)
+        thread.start()
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], EnvironmentError_)
+        self.assertEqual(failures[0].code, "cad_thread_mismatch")
+        binder.assert_called_once_with(42)
+        session.close()
 
     def test_cancelled_startup_never_binds_an_application(self):
         process = SimpleNamespace(pid=42, executable="test.exe", alive=lambda: True, close=Mock())
@@ -215,7 +489,11 @@ class SessionTests(unittest.TestCase):
         sessions = []
 
         def factory():
-            session = SimpleNamespace(app=object(), connect=Mock(), close=Mock(), terminate=Mock())
+            session = SimpleNamespace(app=object(), connect=Mock(), close=Mock(), terminate=Mock(), closed=False)
+            session.close.side_effect = lambda: setattr(session, "closed", True)
+            session.identity = lambda: {"ownership": "test"}
+            session.connect.return_value = session.app
+            session.current_application = lambda: session.app
             sessions.append(session)
             return session
 
@@ -229,9 +507,11 @@ class SessionTests(unittest.TestCase):
             copied = backend._app_for_path(os.path.join(copy_root, "robot.SLDASM"))
             self.assertIsNot(source, copied)
             with backend.session():
-                self.assertIs(backend._app_for_path("/source/robot.SLDASM"), source)
+                with self.assertRaises(EnvironmentError_) as retired:
+                    backend._app_for_path("/source/robot.SLDASM")
+                self.assertEqual(retired.exception.code, "cad_session_retired")
             raise RuntimeError("failed")
         self.assertEqual(len(sessions), 2)
-        for session in sessions:
-            session.close.assert_called_once()
+        sessions[0].close.assert_called_once()
+        sessions[1].close.assert_called_once()
         self.assertEqual(backend._sessions, {})

@@ -13,7 +13,7 @@ import contextlib
 import math
 from pathlib import Path
 from collections.abc import Sequence
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 
@@ -124,8 +124,6 @@ def _model_root(snapshot_root: Path) -> Path | None:
 
 #: Advisory thresholds for the capture-time mass closure (not gates).
 CLOSURE_MASS_RTOL = 1e-6
-CLOSURE_COM_ATOL_M = 1e-6
-CLOSURE_INERTIA_RTOL = 1e-4
 
 
 def _finite_positive(value: Any, what: str) -> float:
@@ -152,17 +150,6 @@ def _finite_vector(value: Any, what: str) -> np.ndarray:
     array = np.asarray([float(item) for item in value], dtype=float)
     if array.shape != (3,):
         raise ValueError(f"{what} is not a 3-vector")
-    if not np.isfinite(array).all():
-        raise ValueError(f"{what} is not finite")
-    return array
-
-
-def _finite_tensor(value: Any, what: str) -> np.ndarray:
-    """A finite 3x3 tensor, or a ``ValueError`` naming the field."""
-
-    array = np.asarray([[float(item) for item in row] for row in value], dtype=float)
-    if array.shape != (3, 3):
-        raise ValueError(f"{what} is not a 3x3 tensor")
     if not np.isfinite(array).all():
         raise ValueError(f"{what} is not finite")
     return array
@@ -444,41 +431,6 @@ def _component_context_findings(
     return details, None
 
 
-def _scene_leaf_masses(snapshot: Path) -> dict[str, float] | None:
-    """Leaf instance name to raw document mass, from the snapshot's own readings.
-
-    The context guard recomputes every node's document basis from these values; it never uses a
-    recorded sum.  A snapshot without both raw files cannot support the source-equivalence claim.
-    """
-
-    scene_path = Path(snapshot) / "raw" / "scene_raw.json"
-    masses_path = Path(snapshot) / "raw" / "mass_properties.json"
-    if not scene_path.is_file() or not masses_path.is_file():
-        return None
-    try:
-        scene_raw = read_json(scene_path)
-        masses = read_json(masses_path)
-    except (OSError, ValueError, PipelineError):
-        return None
-    components = scene_raw.get("components") if isinstance(scene_raw, dict) else None
-    if not isinstance(components, list) or not isinstance(masses, dict):
-        return None
-    found: dict[str, float] = {}
-    for entry in components:
-        if not isinstance(entry, dict) or not entry.get("name"):
-            return None
-        name = str(entry["name"])
-        payload = masses.get(name)
-        if not isinstance(payload, dict):
-            return None
-        try:
-            mass = _finite_positive(payload["mass"], f"scene leaf mass for {name}")
-        except (KeyError, TypeError, ValueError):
-            return None
-        found[name] = mass
-    return found or None
-
-
 def _expected_instance_nodes(scene_masses: dict[str, float]) -> set[str]:
     """Every ancestor prefix of every scene leaf instance, the full expected node coverage."""
 
@@ -493,156 +445,6 @@ def _mass_close(first: float, second: float) -> bool:
     """Source-equivalence tolerance for an effective mass against its document basis."""
 
     return abs(first - second) <= max(1e-12, CLOSURE_MASS_RTOL * max(abs(first), abs(second)))
-
-
-def _mass_only_closure_check(
-    path: Path, payload: dict[str, Any], material_source: str, scene_masses: dict[str, float] | None
-) -> dict:
-    """Evaluate the mass-only closure the legacy assembly API produced.
-
-    ``Extension.GetMassProperties2`` answers with a vector whose mass the M3.0 recovery reports and
-    the 2026-09-29 native pairing both corroborate; its COM and inertia are not trusted per
-    document, so the capture marks them ``not_inferred`` and this check reads nothing but the two
-    masses (the recorded volumes stay visible as context).  The comparison is therefore an advisory
-    on the mass ratio only — but a mass that is absent, non-numeric or not finite is corrupt
-    evidence, exactly like a malformed full record, and fails.
-    """
-
-    try:
-        top = payload.get("top_level")
-        leaf = payload.get("leaf_total")
-        if not isinstance(top, dict) or not isinstance(leaf, dict):
-            raise ValueError("mass closure readings are not objects")
-        top_mass = _finite_positive(cast("dict[str, Any]", top)["mass"], "mass closure top mass")
-        leaf_mass = _finite_positive(cast("dict[str, Any]", leaf)["mass"], "mass closure leaf mass")
-    except (KeyError, TypeError, ValueError, OSError, PipelineError) as exc:
-        return _result(
-            "source.normalization.mass_closure",
-            False,
-            details={"error": str(exc), "record": str(path), "mode": "mass_only"},
-        )
-    mass_rel = abs(top_mass - leaf_mass) / max(abs(top_mass), abs(leaf_mass), 1e-12)
-    details: dict[str, Any] = {
-        "mode": "mass_only",
-        "top_level_mass_kg": top_mass,
-        "leaf_total_mass_kg": leaf_mass,
-        "delta": {"mass_rel": mass_rel},
-    }
-    for name, source in (("top_level_volume_m3", top), ("leaf_total_volume_m3", leaf)):
-        with contextlib.suppress(KeyError, TypeError, ValueError):
-            volume = float(source["volume_m3"])
-            if math.isfinite(volume):
-                details[name] = volume
-    if mass_rel > CLOSURE_MASS_RTOL:
-        details["advisory"] = (
-            "the assembly document's own mass disagrees with the recombined leaf readings "
-            f"(mass {top_mass:.9g} kg vs {leaf_mass:.9g} kg, {mass_rel:.3g} relative); no cause is "
-            "inferred here — review the CAD and any declared masses (this capture's legacy API "
-            "reported mass only, so COM and inertia were not compared)"
-        )
-    context_details, context_error = _component_context_findings(payload, material_source, top_mass, scene_masses)
-    details.update(context_details)
-    if context_error is not None:
-        return _result(
-            "source.normalization.mass_closure",
-            False,
-            details={**details, "error": context_error, "mode": "mass_only"},
-        )
-    return _result("source.normalization.mass_closure", True, details=details)
-
-
-def _mass_closure_check(snapshot: Path, material_source: str = "cad") -> dict:
-    """Assembly-versus-leaf mass closure, plus the component-context source guard.
-
-    The record is capture-time evidence: the assembly document's own mass properties next to the
-    parallel-axis combination of the leaf readings.  The whole-assembly delta is an *advisory*:
-    a mismatch lands in ``details.advisory`` and the model still qualifies, and snapshots without
-    the record are ``not_applicable``.  Invalid or unsupported *source policy* is a blocker: a
-    recorded component instance override, or an effective mass the selected part documents cannot
-    explain under ``material_source: cad``, or malformed/incomplete evidence, fails the check.  A
-    ``mass_only`` record (from a build whose legacy assembly API reports mass alone) is evaluated
-    by :func:`_mass_only_closure_check` on that mass only, with the same source guard.
-    """
-
-    path = Path(snapshot) / "raw" / "mass_closure.json"
-    if not path.is_file():
-        return _result(
-            "source.normalization.mass_closure",
-            True,
-            status="not_applicable",
-            details={"reason": "snapshot carries no assembly mass closure record"},
-        )
-    try:
-        payload = read_json(path)
-        if not isinstance(payload, dict):
-            raise ValueError("mass closure record is not an object")
-        scene_masses = _scene_leaf_masses(snapshot)
-        if payload.get("status") == "unavailable":
-            evidence: dict[str, Any] = {
-                "reason": "the capture could not read the assembly mass properties",
-                "unavailable": str(payload.get("reason") or "unknown"),
-                "message": str(payload.get("message") or ""),
-            }
-            # The override evidence stands on its own: an unavailable assembly reading must not
-            # let a pure-CAD model earn equivalence by omission.
-            context_details, context_error = _component_context_findings(payload, material_source, None, scene_masses)
-            evidence.update(context_details)
-            if context_error is not None:
-                return _result(
-                    "source.normalization.mass_closure",
-                    False,
-                    details={**evidence, "error": context_error},
-                )
-            return _result(
-                "source.normalization.mass_closure",
-                True,
-                status="not_applicable",
-                details=evidence,
-            )
-        if str(payload.get("mode") or "full") == "mass_only":
-            return _mass_only_closure_check(path, payload, material_source, scene_masses)
-        top = payload.get("top_level")
-        leaf = payload.get("leaf_total")
-        if not isinstance(top, dict) or not isinstance(leaf, dict):
-            raise ValueError("mass closure readings are not objects")
-        top = cast("dict[str, Any]", top)
-        leaf = cast("dict[str, Any]", leaf)
-        top_mass = _finite_positive(top["mass"], "mass closure top mass")
-        leaf_mass = _finite_positive(leaf["mass"], "mass closure leaf mass")
-        top_com = _finite_vector(top["com"], "mass closure top COM")
-        leaf_com = _finite_vector(leaf["com"], "mass closure leaf COM")
-        top_inertia = _finite_tensor(top["inertia"], "mass closure top inertia")
-        leaf_inertia = _finite_tensor(leaf["inertia"], "mass closure leaf inertia")
-    except (KeyError, TypeError, ValueError, OSError, PipelineError) as exc:
-        return _result(
-            "source.normalization.mass_closure",
-            False,
-            details={"error": str(exc), "record": str(path)},
-        )
-    mass_rel = abs(top_mass - leaf_mass) / max(abs(top_mass), abs(leaf_mass), 1e-12)
-    com_abs = float(np.max(np.abs(top_com - leaf_com)))
-    scale = max(float(np.max(np.abs(top_inertia))), 1e-12)
-    inertia_rel = float(np.max(np.abs(top_inertia - leaf_inertia))) / scale
-    details = {
-        "top_level_mass_kg": top_mass,
-        "leaf_total_mass_kg": leaf_mass,
-        "delta": {"mass_rel": mass_rel, "com_abs_max_m": com_abs, "inertia_rel": inertia_rel},
-    }
-    if mass_rel > CLOSURE_MASS_RTOL or com_abs > CLOSURE_COM_ATOL_M or inertia_rel > CLOSURE_INERTIA_RTOL:
-        details["advisory"] = (
-            "the assembly document's own mass properties disagree with the recombined leaf readings "
-            f"(mass {top_mass:.9g} kg vs {leaf_mass:.9g} kg, {mass_rel:.3g} relative); no cause is "
-            "inferred here — review the CAD and any declared masses"
-        )
-    context_details, context_error = _component_context_findings(payload, material_source, top_mass, scene_masses)
-    details.update(context_details)
-    if context_error is not None:
-        return _result(
-            "source.normalization.mass_closure",
-            False,
-            details={**details, "error": context_error},
-        )
-    return _result("source.normalization.mass_closure", True, details=details)
 
 
 def _mass_evidence_check(
@@ -750,23 +552,19 @@ def _raw_inputs(snapshot_root: Path) -> tuple[dict, dict]:
     return scene_raw, masses
 
 
-def _link_frame(body: dict) -> tuple[np.ndarray, np.ndarray]:
-    frame = body.get("frame") or {}
-    if not frame:
-        return np.eye(3), np.zeros(3)
-    xyz = np.array([float(value) for value in frame.get("xyz", (0.0, 0.0, 0.0))], dtype=float)
-    rpy = np.array([float(value) for value in frame.get("rpy", (0.0, 0.0, 0.0))], dtype=float)
-    return _rpy_matrix(rpy), xyz
+def _link_frame(body: dict, raw_scene: dict) -> tuple[np.ndarray, np.ndarray]:
+    frame = body.get("frame")
+    if not isinstance(frame, dict) or set(frame) != {"coordinate_system"}:
+        raise ValueError(f"body {body.get('name')!r} has no native datum binding")
+    datums = raw_scene.get("coordinate_systems") or {}
+    reference = frame["coordinate_system"]
+    if reference not in datums:
+        raise ValueError(f"raw native datum {reference!r} is missing")
+    return _transform(datums[reference])
 
 
 def _raw_tensor(component: str, payload: dict) -> np.ndarray:
-    """Reconstruct a standard tensor independently of the generation code.
-
-    Qualified native part, group and whole-assembly scopes declare standard
-    signed tensors. Legacy positive-product records invert cross terms only
-    when explicitly declared. The v1 delivery gate separately refuses legacy
-    and unqualified APIs; absent native conventions are never guessed.
-    """
+    """Read the signed native tensor independently of the generator."""
 
     matrix = np.array([[float(value) for value in row] for row in payload["inertia"]], dtype=float)
     if matrix.shape != (3, 3):
@@ -780,30 +578,15 @@ def _raw_tensor(component: str, payload: dict) -> np.ndarray:
     if scope is not None:
         expected = _SCOPE_CONVENTIONS.get(str(scope))
         if expected is None:
-            raise ValueError(
-                f"component {component} has an unknown inertia measurement scope: {scope!r}"
-            )
+            raise ValueError(f"component {component} has an unknown inertia measurement scope: {scope!r}")
         if convention is not None and str(convention) != expected:
             raise ValueError(
-                f"component {component} inertia scope and product_convention disagree: "
-                f"{scope!r} vs {convention!r}"
+                f"component {component} inertia scope and product_convention disagree: {scope!r} vs {convention!r}"
             )
         convention = expected
-    if convention == "solidworks_positive":
-        tensor = matrix.copy()
-        off_diagonal = ~np.eye(3, dtype=bool)
-        tensor[off_diagonal] = -matrix[off_diagonal]
-        return tensor
-    if convention == "solidworks_standard":
-        return matrix
-    if convention is None:
-        used_api = str(reference.get("used_api") or "")
-        if used_api == "fixture":
-            return matrix
-        raise ValueError(
-            f"component {component} has no product_convention; refusing to guess the inertia sign convention"
-        )
-    raise ValueError(f"component {component} has an unsupported product_convention: {convention!r}")
+    if convention != "solidworks_standard":
+        raise ValueError(f"component {component} has an unsupported product_convention: {convention!r}")
+    return matrix
 
 
 def _component_mass(
@@ -831,7 +614,7 @@ def _component_mass(
 
 def _recompute_link(body: dict, components: dict[str, dict], raw_scene: dict, masses: dict, declared: dict) -> dict:
     placements = {entry["name"]: entry["transform"] for entry in raw_scene.get("components") or []}
-    rotation_link, translation_link = _link_frame(body)
+    rotation_link, translation_link = _link_frame(body, raw_scene)
     total_mass = 0.0
     weighted = np.zeros(3)
     per_component = []
@@ -928,25 +711,23 @@ def _root_pose(definition: dict, snapshot_root: Path) -> dict | None:
     roots = [body for body in bodies if str(body.get("name") or body.get("id")) not in children]
     if len(roots) != 1:
         return None
-    frame = roots[0].get("frame") or {}
-    reference = frame.get("coordinate_system")
-    if reference:
-        path = Path(snapshot_root) / "raw" / "coordinate_systems.json"
-        if not path.is_file():
-            raise ValueError("snapshot has no raw/coordinate_systems.json for the root frame")
-        payload = read_json(path)
-        matrix = (payload or {}).get(str(reference)) if isinstance(payload, dict) else None
-        if matrix is None:
-            raise ValueError(f"raw coordinate system {reference!r} is missing from the snapshot")
-        rotation, translation = _transform(matrix)
-        return {
-            "xyz": translation,
-            "rpy": np.array(_rpy_to_rpy_list(rotation), dtype=float),
-            "source": f"cad_coordinate_system:{reference}",
-        }
-    xyz = np.array([float(value) for value in frame.get("xyz") or (0.0, 0.0, 0.0)], dtype=float)
-    rpy = np.array([float(value) for value in frame.get("rpy") or (0.0, 0.0, 0.0)], dtype=float)
-    return {"xyz": xyz, "rpy": rpy, "source": "author_declared" if frame else "identity"}
+    frame = roots[0].get("frame")
+    if not isinstance(frame, dict) or set(frame) != {"coordinate_system"}:
+        raise ValueError("the root must be bound to one native CAD datum")
+    reference = frame["coordinate_system"]
+    path = Path(snapshot_root) / "raw" / "coordinate_systems.json"
+    if not path.is_file():
+        raise ValueError("snapshot has no raw/coordinate_systems.json for the root frame")
+    payload = read_json(path)
+    matrix = (payload or {}).get(str(reference)) if isinstance(payload, dict) else None
+    if matrix is None:
+        raise ValueError(f"raw coordinate system {reference!r} is missing from the snapshot")
+    rotation, translation = _transform(matrix)
+    return {
+        "xyz": translation,
+        "rpy": np.array(_rpy_to_rpy_list(rotation), dtype=float),
+        "source": f"cad_coordinate_system:{reference}",
+    }
 
 
 def _rpy_to_rpy_list(rotation: np.ndarray) -> list[float]:
@@ -1174,7 +955,6 @@ def verify_normalization(
     evidence_check = _mass_evidence_check(definition, snapshot, included, declared)
     if evidence_check is not None:
         results.append(evidence_check)
-    results.append(_mass_closure_check(snapshot, material_source))
 
     # F4: reconcile the raw assembly-frame quantities with the canonical chain at
     # q=0.  This is what catches a body frame that disagrees with the joint

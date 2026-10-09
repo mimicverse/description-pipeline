@@ -58,7 +58,8 @@ class RenderConfigTest(unittest.TestCase):
             self.assertIn("# managed-by: description-airflow", text)
             self.assertIn(f"sql_alchemy_conn = {DSN}", text)
             self.assertIn(f"dags_folder = {DEPLOY / 'dags'}", text)
-            self.assertIn("simple_auth_manager_users = operator:admin", text)
+            self.assertIn("auth_manager = description_pipeline.orchestration.feishu_auth.FeishuAuthManager", text)
+            self.assertNotIn("simple_auth_manager_users", text)
             first_keys = re.findall(r"^(?:fernet_key|jwt_secret) = (\S+)$", text, re.M)
             self.assertEqual(len(first_keys), 2)
             # Rerun with a different socket: secrets must survive byte-for-byte.
@@ -132,6 +133,7 @@ class ServicesRenderTest(unittest.TestCase):
                 ],
             )
             postgres = (target / "description-postgres.service").read_text(encoding="utf-8")
+            self.assertIn("/usr/lib/postgresql/14/bin/postgres", postgres)
             self.assertIn(f"-D {Path(tmp) / 'pg'}/data", postgres)
             self.assertIn("listen_addresses=", postgres)
             self.assertNotIn("127.0.0.1", postgres)
@@ -142,6 +144,8 @@ class ServicesRenderTest(unittest.TestCase):
             self.assertNotIn("@", scheduler)
             api_server = (target / "description-airflow-api-server.service").read_text(encoding="utf-8")
             self.assertIn("api-server --host 127.0.0.1 --port 8791", api_server)
+            self.assertIn(f"EnvironmentFile=-{Path(tmp) / 'home' / 'feishu.env'}", api_server)
+            self.assertNotIn("@", api_server)
             untouched = (target / "unrelated.service").read_text(encoding="utf-8")
             self.assertEqual(untouched, "[Unit]\nDescription=keep me\n")
 
@@ -174,6 +178,16 @@ class ServicesRenderTest(unittest.TestCase):
             unit = Path(tmp) / "config/systemd/user/description-solidworks-tunnel.service"
             self.assertIn("127.0.0.1:18765:127.0.0.1:8765 windows-worker", unit.read_text())
             before = unit.read_bytes()
+            custom = run(["bash", str(DEPLOY / "services.sh"), "render"], {**env, "SOLIDWORKS_ENDPOINT_PORT": "9999"})
+            self.assertEqual(custom.returncode, 0, custom.stderr)
+            self.assertIn("127.0.0.1:18765:127.0.0.1:9999 windows-worker", unit.read_text())
+            bad_port = run(
+                ["bash", str(DEPLOY / "services.sh"), "render"], {**env, "SOLIDWORKS_ENDPOINT_PORT": "87;65"}
+            )
+            self.assertNotEqual(bad_port.returncode, 0)
+            self.assertIn("127.0.0.1:18765:127.0.0.1:9999 windows-worker", unit.read_text())
+            run(["bash", str(DEPLOY / "services.sh"), "render"], env)
+            self.assertEqual(before, unit.read_bytes())
             result = run(
                 ["bash", str(DEPLOY / "services.sh"), "render"],
                 {**env, "SOLIDWORKS_SSH_HOST": "windows-worker; arbitrary-command"},
@@ -192,6 +206,43 @@ class InstallGuardsTest(unittest.TestCase):
         }
         base.update(env)
         return run(["bash", str(DEPLOY / "install.sh")], base)
+
+    def test_reinstall_preserves_open_and_closed_admission(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bindir = root / "venv/bin"
+            bindir.mkdir(parents=True)
+            wheel = root / "wheels/mimicverse_description-1.0.1-py3-none-any.whl"
+            wheel.parent.mkdir()
+            wheel.write_bytes(b"fixture")
+            python = bindir / "python"
+            python.write_text('#!/bin/bash\n[ "${1:-}" != "-c" ] || echo 3.12\nexit 0\n')
+            python.chmod(0o755)
+            airflow = bindir / "airflow"
+            airflow.write_text(
+                '#!/bin/bash\necho "$*" >> "$CALLS"\n'
+                'case "$*" in\n'
+                '  "db migrate") ;;\n'
+                '  "dags unpause solidworks_to_urdf") echo false > "$ADMISSION" ;;\n'
+                '  "version") echo 3.3.2 ;;\n'
+                "  *) exit 1 ;;\n"
+                "esac\n"
+            )
+            airflow.chmod(0o755)
+            admission, calls = root / "admission", root / "calls"
+            for initial in ("true", "false"):
+                with self.subTest(initial=initial):
+                    admission.write_text(initial)
+                    result = self._install(
+                        tmp,
+                        AIRFLOW_PYTHON=str(python),
+                        PIPELINE_WHEEL=str(wheel),
+                        ADMISSION=str(admission),
+                        CALLS=str(calls),
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(admission.read_text(), initial)
+            self.assertEqual(calls.read_text().splitlines(), ["db migrate", "version"] * 2)
 
     def test_rejects_relative_forbidden_and_missing_wheel(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -280,8 +331,13 @@ class LockAndScriptsTest(unittest.TestCase):
                     if keyword.arg == "default":
                         defaults[node.args[0].value] = ast.literal_eval(keyword.value)
         self.assertEqual(defaults.get("--conn-id"), "solidworks_windows")
+        self.assertIn("--handoff-root", defaults)
+        source = (DEPLOY / "scripts" / "add_connection.py").read_text(encoding="utf-8")
+        self.assertIn("handoff_roots", source)
         dag = (DEPLOY / "dags" / "solidworks_to_urdf.py").read_text(encoding="utf-8")
-        self.assertIn('"conn_id": Param("solidworks_windows"', dag)
+        self.assertIn('CONN_ID = os.environ.get("SOLIDWORKS_ENDPOINT_CONN_ID", "solidworks_windows")', dag)
+        self.assertNotIn('"conn_id": Param(', dag)
+        self.assertIn("native_run_id(", dag)
 
 
 if __name__ == "__main__":

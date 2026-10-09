@@ -8,7 +8,9 @@ whole assembly and component-context readings must close independently.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 import numpy as np
 
@@ -16,6 +18,7 @@ from ..io import PipelineError, confined, read_data
 from ..sources.solidworks import verify as oracle
 
 MASS_RTOL = 1e-6
+MASS_CLOSURE_ATOL = 1e-12
 COM_ATOL_M = 5e-5
 TENSOR_RTOL = 1e-4
 
@@ -23,6 +26,74 @@ TENSOR_RTOL = 1e-4
 def _require(passed, message):
     if not bool(passed):
         raise PipelineError(message)
+
+
+def verify_urdf_mass_equality(bundle_root: Path) -> dict:
+    """Mandatory whole-CAD equality for the delivered URDF.
+
+    The actual delivered URDF XML inertial mass sum must equal the bound
+    ``evidence/raw/mass_closure.json`` whole-assembly mass with an absolute
+    tolerance of 1e-12 kg and no relative tolerance. Missing, malformed or
+    non-recorded whole evidence fails; masses are never normalized or adjusted.
+    This gate is independent of the broader per-link mass/COM/tensor accuracy
+    checks, which keep their own relative tolerances.
+    """
+
+    root = Path(bundle_root)
+    try:
+        payload = read_data(confined(root / "evidence", "raw/mass_closure.json"))
+    except (OSError, PipelineError) as error:
+        raise PipelineError(f"Whole-CAD mass evidence is unreadable: {error}") from error
+    _require(
+        isinstance(payload, dict) and payload.get("status") == "recorded" and payload.get("mode") == "full",
+        "Whole-CAD mass evidence is not a full recorded reading",
+    )
+    top = payload.get("top_level")
+    _require(isinstance(top, dict), "Whole-CAD mass evidence has no top-level reading")
+    whole = top.get("mass")
+    _require(
+        isinstance(whole, (int, float)) and not isinstance(whole, bool),
+        "Whole-CAD mass evidence is missing a numeric mass",
+    )
+    whole = float(whole)
+    _require(math.isfinite(whole) and whole > 0.0, "Whole-CAD mass is not a finite positive value")
+    try:
+        tree = ET.parse(confined(root, "urdf/robot.urdf")).getroot()
+    except (OSError, ET.ParseError) as error:
+        raise PipelineError(f"Delivered URDF is unreadable: {error}") from error
+    _require(tree.tag == "robot", "Delivered URDF has no robot root")
+    values = []
+    for link in tree.findall("link"):
+        inertials = link.findall("inertial")
+        _require(len(inertials) <= 1, "URDF link carries multiple inertial definitions")
+        if not inertials:  # Fixed reference frames may be massless.
+            continue
+        masses = inertials[0].findall("mass")
+        _require(
+            len(masses) == 1 and masses[0].get("value") is not None,
+            "URDF inertial element is missing its mass value",
+        )
+        try:
+            value = float(masses[0].get("value"))
+        except (ValueError, OverflowError) as error:
+            raise PipelineError("URDF inertial mass is not numeric") from error
+        _require(math.isfinite(value) and value > 0.0, "URDF inertial mass is not a finite positive value")
+        values.append(value)
+    _require(values, "Delivered URDF carries no inertial masses")
+    total = math.fsum(values)
+    delta = total - whole
+    _require(
+        abs(delta) <= MASS_CLOSURE_ATOL,
+        f"URDF mass sum {total!r} differs from the whole-CAD reading {whole!r} (delta {delta!r} kg)",
+    )
+    return {
+        "urdf_mass_kg": total,
+        "whole_cad_mass_kg": whole,
+        "delta_kg": delta,
+        "atol_kg": MASS_CLOSURE_ATOL,
+        "rtol": 0.0,
+        "inertials": len(values),
+    }
 
 
 def _reading(name, record, scope):
@@ -157,8 +228,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
         raw_masses = {name: float(row["mass"]) for name, row in masses.items()}
         details, error = oracle._component_context_findings(payload, "cad", top[0], raw_masses)
         _require(error is None, "Component context: " + str(error))
-        # v1 refuses effective mass/COM/tensor overrides even when a table is supplied.
-        # A later input contract must explicitly model them before they can qualify.
+        # Effective native mass/COM/tensor overrides cannot qualify.
         for row in context["instances"]:
             _require(not any(row["overrides"].values()), "Unsupported native instance override: " + row["name"])
         return {"assembly_mass_kg": top[0], "independent_mass_kg": expected[0], "component_context": details}

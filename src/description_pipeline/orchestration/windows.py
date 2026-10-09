@@ -1,7 +1,8 @@
 """Authenticated, persistent, serial Windows execution endpoint for Airflow.
 
-The API selects configured packages and repository targets. It cannot execute
-shell commands or accept arbitrary output/repository paths. Job identity is
+The API freezes native engineering folders and routes their discovered hardware
+identity through platform configuration. It cannot execute shell commands or
+accept arbitrary output/repository paths. Job identity is
 stable across network retries; an interrupted native run fails explicitly and
 is never silently replayed after a process restart.
 """
@@ -10,34 +11,38 @@ from __future__ import annotations
 
 import contextlib
 import hmac
+import hashlib
 import json
 import os
 import queue
 import re
-import ssl
 import sys
 import threading
+import tempfile
 import uuid
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import unquote
 
-from ..delivery import PIPELINE_ID
+from ..delivery import PIPELINE_ID, subject_inventory
 from ..io import (
     PipelineError,
     acquire_process_lock,
     artifact_path_parts,
     confined,
-    file_digest,
+    digest,
     inventory,
     read_data,
     write_json,
 )
 from ..sources.solidworks.revision import package_inventory, read_revision
 from ..repository.urdf_pr import _origin_slug, _slug_hardware
+from ..stages import stage_view
+from ..sources.solidworks.handoff import HANDOFF_SCHEMA, MAX_HANDOFF_BYTES, freeze_handoff, import_archive
 
-_ALIAS = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _SHA = re.compile(r"^[0-9a-f]{64}$")
+_HARDWARE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
 JOB_SCHEMA = "solidworks-to-urdf.job/v1"
 CONFIG_SCHEMA = "solidworks-to-urdf.endpoint/v1"
 
@@ -81,27 +86,46 @@ def read_config(path):
         <= {
             "schema_version",
             "package_root",
+            "handoff_roots",
             "output_root",
             "state_root",
             "targets",
             "token_file",
             "host",
             "port",
-            "tls_cert",
-            "tls_key",
+            "discovery",
         },
         "Unknown endpoint configuration key",
     )
     for key in ("package_root", "output_root", "state_root"):
         config[key] = _root(config[key])
     _require(config["package_root"].is_dir(), "Package root does not exist")
+    from ..sources.solidworks.handoff import validate_handoff_roots
+
+    config["handoff_roots"] = validate_handoff_roots(config.get("handoff_roots"))
+    settings = config.get("discovery", {})
+    _require(
+        isinstance(settings, dict) and set(settings) <= {"record_roots", "frozen_names_file"},
+        "Unknown native discovery setting",
+    )
+    records = settings.get("record_roots", [])
+    _require(isinstance(records, list), "Native record_roots must be a list")
+    settings["record_roots"] = [_root(value) for value in records]
+    _require(all(path.is_dir() for path in settings["record_roots"]), "Native record root does not exist")
+    if "frozen_names_file" in settings:
+        settings["frozen_names_file"] = _root(settings["frozen_names_file"])
+        _require(settings["frozen_names_file"].is_file(), "Missing frozen-name registry")
+    config["discovery"] = settings
     targets = config["targets"]
     _require(isinstance(targets, dict) and bool(targets), "Configure at least one model repository target")
     roots = [config[key] for key in ("package_root", "output_root", "state_root")]
-    for name, target in targets.items():
+    for hardware, target in targets.items():
         _require(
-            _ALIAS.fullmatch(name) is not None and isinstance(target, dict) and set(target) == {"repository", "base"},
-            "Each target needs an alias, repository and base",
+            isinstance(hardware, str)
+            and _HARDWARE.fullmatch(hardware) is not None
+            and isinstance(target, dict)
+            and set(target) == {"repository", "base"},
+            "Each hardware identity needs a repository and base",
         )
         target["repository"] = _root(target["repository"])
         _require(target["repository"].is_dir(), "Target repository does not exist")
@@ -115,6 +139,12 @@ def read_config(path):
             _require(
                 not first.is_relative_to(second) and not second.is_relative_to(first),
                 "Endpoint package, output, state and repository roots must be separate",
+            )
+    for source in config["handoff_roots"]:
+        for managed in roots:
+            _require(
+                not source.is_relative_to(managed) and not managed.is_relative_to(source),
+                "Engineering source roots must be separate from managed inputs, state, outputs and repositories",
             )
     token_file = _root(config["token_file"])
     _require(token_file.is_file(), "Missing endpoint token file")
@@ -131,11 +161,9 @@ def read_config(path):
         isinstance(config["port"], int) and not isinstance(config["port"], bool) and 1 <= config["port"] <= 65535,
         "Invalid endpoint port",
     )
-    tls = bool(config.get("tls_cert")) and bool(config.get("tls_key"))
-    _require(bool(config.get("tls_cert")) == bool(config.get("tls_key")), "TLS needs both certificate and key")
     _require(
-        config["host"] in {"127.0.0.1", "::1", "localhost"} or tls,
-        "Remote endpoint binding requires TLS; use an SSH tunnel for loopback HTTP",
+        config["host"] in {"127.0.0.1", "::1", "localhost"},
+        "The Windows endpoint must bind to loopback and use the authenticated SSH tunnel",
     )
     return config
 
@@ -151,11 +179,12 @@ def _owner_lock(path):
 class Jobs:
     """One persistent queue, one CAD runner, one endpoint process owner."""
 
-    def __init__(self, config, *, runner=None):
+    def __init__(self, config, *, runner=None, native_preparer=None):
         from ..solidworks import run
 
         self.config = config
         self.runner = runner or run
+        self.native_preparer = native_preparer
         self.directory = config["state_root"] / "jobs"
         self.directory.mkdir(parents=True, exist_ok=True)
         inventory(self.directory)
@@ -189,29 +218,108 @@ class Jobs:
     def _save(self, job):
         write_json(self.directory / (job["run_id"] + ".json"), job)
 
+    def _handoff(self, package, identity):
+        return {
+            "schema_version": HANDOFF_SCHEMA,
+            "pipeline_id": PIPELINE_ID,
+            "package": package.relative_to(self.config["package_root"]).as_posix(),
+            "handoff_sha256": identity["handoff_sha256"],
+        }
+
+    def resolve_handoff(self, request):
+        _require(isinstance(request, dict) and set(request) == {"handoff_path"}, "Expected a mechanical handoff folder")
+        path = request["handoff_path"]
+        _require(
+            isinstance(path, str) and bool(path.strip()) and not any(ord(c) < 32 for c in path),
+            "Mechanical handoff folder is required",
+        )
+        source = Path(path)
+        if not source.is_absolute():
+            _require(
+                len(self.config["handoff_roots"]) == 1, "Use an absolute engineering path with multiple source roots"
+            )
+            source = confined(
+                self.config["handoff_roots"][0], path.rstrip("/") + "/.handoff-folder", exists=False
+            ).parent
+        from ..sources.solidworks.handoff import authorize_handoff
+
+        source = authorize_handoff(source, self.config["handoff_roots"])
+        package, identity = freeze_handoff(source, self.config["package_root"] / "imports")
+        return self._handoff(package, identity)
+
+    def import_handoff(self, archive):
+        package, identity = import_archive(archive, self.config["package_root"] / "imports")
+        return self._handoff(package, identity)
+
     def validate(self, request):
         _require(
-            isinstance(request, dict) and set(request) == {"run_id", "package", "revision_sha256", "target"},
-            "Expected run_id, package, revision_sha256 and target",
+            isinstance(request, dict) and set(request) == {"run_id", "package", "handoff_sha256"},
+            "Expected run_id, package and handoff_sha256",
         )
         _job_id(request["run_id"])
         _require(
             isinstance(request["package"], str) and bool(artifact_path_parts(request["package"])),
-            "Invalid package path",
+            "Invalid native package path",
         )
         _require(
-            isinstance(request["revision_sha256"], str) and _SHA.fullmatch(request["revision_sha256"]) is not None,
-            "Invalid CAD revision manifest digest",
+            isinstance(request["handoff_sha256"], str) and _SHA.fullmatch(request["handoff_sha256"]) is not None,
+            "Invalid native handoff digest",
         )
-        _require(request["target"] in self.config["targets"], "Unknown configured repository target")
-        # Resolve a file inside the package so every parent is checked for links.
-        manifest = confined(self.config["package_root"], request["package"] + "/cad-revision.json")
+        package = confined(self.config["package_root"], request["package"] + "/.handoff-folder", exists=False).parent
+        from ..sources.solidworks.handoff import describe_handoff
+
+        identity = describe_handoff(package)
         _require(
-            file_digest(manifest) == request["revision_sha256"],
-            "CAD revision manifest differs from the requested handoff",
+            identity["handoff_sha256"] == request["handoff_sha256"],
+            "Native engineering files changed after selection; start a new run",
         )
-        read_revision(manifest.parent)
-        return manifest.parent
+        return package
+
+    def preview(self, identifier):
+        """Expose only artifact bytes bound to a successful independently verified run."""
+        job = self.snapshot(identifier)
+        _require(job["status"] in {"passed", "failed"}, "URDF preview is available after verification")
+        output = self.config["output_root"] / identifier
+        files = subject_inventory(output)
+        result = job.get("result") or {}
+        quality = result.get("quality") or {}
+        _require(
+            quality.get("passed") is True and quality.get("subject_sha256") == result.get("subject_sha256"),
+            "Unverified models cannot be previewed",
+        )
+        _require(
+            any(
+                check.get("id") == "source.native_discovery" and check.get("passed") is True
+                for check in quality.get("checks", [])
+            ),
+            "Native-derived models require independent discovery verification before preview",
+        )
+        _require(digest(files) == result.get("subject_sha256"), "Delivered model differs from its verified subject")
+        assets = {name: checksum for name, checksum in files.items() if name.startswith(("urdf/", "meshes/"))}
+        _require("urdf/robot.urdf" in assets, "Verified delivery has no URDF preview")
+        return {
+            "pipeline_id": PIPELINE_ID,
+            "run_id": identifier,
+            "subject_sha256": result["subject_sha256"],
+            "urdf": "urdf/robot.urdf",
+            "files": assets,
+        }
+
+    def artifact(self, identifier, name):
+        preview = self.preview(identifier)
+        _require(name in preview["files"], "Only verified URDF and mesh assets are available")
+        path = confined(self.config["output_root"] / identifier, name)
+        stream = path.open("rb")
+        try:
+            _require(
+                hashlib.file_digest(stream, "sha256").hexdigest() == preview["files"][name],
+                "Preview artifact differs from its verified bytes",
+            )
+            stream.seek(0)
+            return stream, path.stat().st_size
+        except BaseException:
+            stream.close()
+            raise
 
     def create(self, request):
         _require(isinstance(request, dict), "Expected a JSON object")
@@ -235,8 +343,6 @@ class Jobs:
                 "created_at": datetime.now(UTC).isoformat(),
             }
             job["package_files"] = package_inventory(package)
-            job["repository_slug"] = _origin_slug(self.config["targets"][request["target"]]["repository"])
-            job["repository_base"] = self.config["targets"][request["target"]]["base"]
             self._save(job)
             self.jobs[identifier] = job
             self.queue.put(identifier)
@@ -247,13 +353,45 @@ class Jobs:
         with self.mutex:
             if identifier not in self.jobs:
                 raise RequestError("Unknown run_id", 404)
-            return json.loads(json.dumps(self.jobs[identifier]))
+            job = json.loads(json.dumps(self.jobs[identifier]))
+            job["stages"] = stage_view(job)
+            return job
 
     def _event(self, identifier, event):
         with self.mutex:
             job = self.jobs[identifier]
-            job["events"].append(dict(event))
+            entry = dict(event)
+            entry.setdefault("at", datetime.now(UTC).isoformat())
+            job["events"].append(entry)
+            if isinstance(entry.get("discovery"), dict):
+                job["discovery"] = entry["discovery"]
             self._save(job)
+
+    def _prepare_native(self, identifier, frozen):
+        from ..steps import discover_structure
+
+        job = self.jobs[identifier]
+        package, target, prepared, files = discover_structure(
+            frozen,
+            self.config["state_root"] / "prepared" / identifier,
+            identifier,
+            expected_digest=job["request"]["handoff_sha256"],
+            expected_files=job["package_files"],
+            configuration=self.config.get("discovery", {}),
+            targets=self.config["targets"],
+            preparer=self.native_preparer,
+            on_event=lambda item: self._event(identifier, item),
+        )
+        with self.mutex:
+            job.update(
+                hardware_id=prepared.hardware_id,
+                revision=prepared.revision,
+                repository_slug=_origin_slug(target["repository"]),
+                repository_base=target["base"],
+                prepared_files=files,
+            )
+            self._save(job)
+        return package, target
 
     def _work(self):
         while True:
@@ -266,11 +404,18 @@ class Jobs:
                 with self.mutex:
                     job.update(status="running", started_at=datetime.now(UTC).isoformat())
                     self._save(job)
-                package = self.validate(job["request"])
-                _require(
-                    package_inventory(package) == job["package_files"], "Author inputs changed while the job was queued"
+                from ..steps import freeze_inputs
+
+                package = confined(
+                    self.config["package_root"], job["request"]["package"] + "/.handoff-folder", exists=False
+                ).parent
+                freeze_inputs(
+                    package,
+                    job["request"]["handoff_sha256"],
+                    job["package_files"],
+                    on_event=lambda item, identifier=identifier: self._event(identifier, item),
                 )
-                target = self.config["targets"][job["request"]["target"]]
+                package, target = self._prepare_native(identifier, package)
                 _require(
                     isinstance(job.get("repository_slug"), str)
                     and bool(job["repository_slug"])
@@ -288,6 +433,9 @@ class Jobs:
                     base=target["base"],
                     run_id=identifier,
                     on_event=lambda event, identifier=identifier: self._event(identifier, event),
+                    prior_events=list(job["events"]),
+                    expected_inputs=job["prepared_files"],
+                    handoff_sha256=job["request"]["handoff_sha256"],
                 )
                 with self.mutex:
                     job["result"] = result
@@ -315,7 +463,15 @@ class Jobs:
                         )
                         is not None
                         and _origin_slug(target["repository"]) == job["repository_slug"]
+                        and any(
+                            check.get("id") == "source.native_discovery" and check.get("passed") is True
+                            for check in quality.get("checks", [])
+                        )
                     )
+                    if passed:
+                        from ..stages import require_complete
+
+                        require_complete(stage_view(job))
                     job.update(
                         status="passed" if passed else "failed",
                         error=None if passed else result.get("error") or "Incomplete or mismatched publication receipt",
@@ -323,8 +479,15 @@ class Jobs:
             except Exception as error:
                 with self.mutex:
                     job.update(status="failed", error=f"{type(error).__name__}: {error}")
+                    if getattr(error, "detail", None) is not None:
+                        job["detail"] = error.detail
+                    elif isinstance(getattr(error, "details", None), dict):
+                        job["detail"] = error.details
             finally:
                 with self.mutex:
+                    if job["status"] == "failed" and (not job["events"] or job["events"][-1]["state"] != "failed"):
+                        phase = (job["events"][-1] if job["events"] else {}).get("stage", "freeze")
+                        self._event(identifier, {"stage": phase, "state": "failed", "error": job.get("error")})
                     job["completed_at"] = datetime.now(UTC).isoformat()
                     self._save(job)
                 self.queue.task_done()
@@ -377,19 +540,63 @@ def handler(jobs, token):
                         },
                     )
                 elif self.path.startswith("/v1/jobs/"):
-                    self._reply(200, jobs.snapshot(self.path[len("/v1/jobs/") :]))
+                    suffix = self.path[len("/v1/jobs/") :]
+                    if "/artifacts/" in suffix:
+                        identifier, name = suffix.split("/artifacts/", 1)
+                        stream, size = jobs.artifact(identifier, unquote(name))
+                        with stream:
+                            self.send_response(200)
+                            self.send_header(
+                                "Content-Type",
+                                "application/xml" if name.endswith(".urdf") else "application/octet-stream",
+                            )
+                            self.send_header("Content-Length", str(size))
+                            self.send_header("Cache-Control", "private, no-store")
+                            self.send_header("X-Content-Type-Options", "nosniff")
+                            self.send_header("Connection", "close")
+                            self.end_headers()
+                            import shutil
+
+                            shutil.copyfileobj(stream, self.wfile, length=1024 * 1024)
+                            self.close_connection = True
+                    elif suffix.endswith("/preview"):
+                        self._reply(200, jobs.preview(suffix[: -len("/preview")]))
+                    else:
+                        self._reply(200, jobs.snapshot(suffix))
                 else:
                     self._reply(404, {"error": "Unknown API route"})
-            except RequestError as error:
-                self._reply(error.status, {"error": str(error)})
+            except (PipelineError, OSError, ValueError, TypeError) as error:
+                self._reply(getattr(error, "status", 400), {"error": str(error)})
 
         def do_POST(self):
             if not self._authorized():
                 return
-            if self.path != "/v1/jobs":
+            if self.path not in {"/v1/jobs", "/v1/handoffs/resolve", "/v1/handoffs/import"}:
                 self._reply(404, {"error": "Unknown API route"})
                 return
             try:
+                if self.path == "/v1/handoffs/import":
+                    _require(
+                        self.headers.get("Content-Type", "").split(";")[0] == "application/zip",
+                        "Content-Type must be application/zip",
+                    )
+                    size = int(self.headers.get("Content-Length", "0"))
+                    _require(
+                        0 < size <= MAX_HANDOFF_BYTES and not self.headers.get("Transfer-Encoding"),
+                        "Invalid handoff size",
+                    )
+                    self.connection.settimeout(60)
+                    with tempfile.TemporaryDirectory(prefix=".transport-", dir=jobs.config["state_root"]) as temporary:
+                        archive = Path(temporary) / "handoff.zip"
+                        with archive.open("xb") as output:
+                            remaining = size
+                            while remaining:
+                                chunk = self.rfile.read(min(remaining, 1024 * 1024))
+                                _require(bool(chunk), "Incomplete handoff transport; no job was started")
+                                output.write(chunk)
+                                remaining -= len(chunk)
+                        self._reply(200, jobs.import_handoff(archive))
+                    return
                 _require(
                     self.headers.get("Content-Type", "").split(";")[0] == "application/json",
                     "Content-Type must be application/json",
@@ -398,8 +605,11 @@ def handler(jobs, token):
                 _require(0 < size <= 16384 and not self.headers.get("Transfer-Encoding"), "Invalid request size")
                 self.connection.settimeout(10)
                 request = json.loads(self.rfile.read(size))
-                result, created = jobs.create(request)
-                self._reply(202 if created else 200, result)
+                if self.path == "/v1/handoffs/resolve":
+                    self._reply(200, jobs.resolve_handoff(request))
+                else:
+                    result, created = jobs.create(request)
+                    self._reply(202 if created else 200, result)
             except (PipelineError, ValueError, OSError, TypeError) as error:
                 self._reply(getattr(error, "status", 400), {"error": str(error)})
 
@@ -414,11 +624,6 @@ def serve(config_path):
         stack.callback(jobs.close)
         server = ThreadingHTTPServer((config["host"], config["port"]), handler(jobs, config["token"]))
         stack.callback(server.server_close)
-        if config.get("tls_cert"):
-            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            context.minimum_version = ssl.TLSVersion.TLSv1_2
-            context.load_cert_chain(config["tls_cert"], config["tls_key"])
-            server.socket = context.wrap_socket(server.socket, server_side=True)
         print(
             json.dumps({"pipeline_id": PIPELINE_ID, "endpoint": f"{config['host']}:{config['port']}", "ready": True}),
             flush=True,

@@ -6,98 +6,75 @@ import json
 import copy
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import unittest
 import urllib.error
 import urllib.request
-import uuid
+from datetime import datetime
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-from description_pipeline.io import PipelineError, file_digest, write_json
+from description_pipeline.io import PipelineError, write_json
+from description_pipeline.orchestration.airflow_client import EndpointConfig, HandoffResolution, WindowsEndpoint
 from description_pipeline.orchestration.windows import Jobs, RequestError, handler, read_config
-from description_pipeline.sources.solidworks.revision import seal_revision
+from .endpoint_support import EndpointFixture
 
 
-class EndpointTests(unittest.TestCase):
-    def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
-        self.packages = self.root / "packages"
-        self.package = self.packages / "arm/r1"
-        self.package.mkdir(parents=True)
-        (self.package / "assembly.SLDASM").write_bytes(b"non-native request control fixture")
-        (self.package / "robot.yaml").write_text("author control fixture")
-        seal_revision(
-            self.package,
-            hardware_id="arm",
-            revision="r1",
-            owner="mechanical",
-            system="handoff",
-            reference="arm/r1",
-            summary="Test queue",
+class EndpointTests(EndpointFixture, unittest.TestCase):
+    def test_airflow_client_can_poll_native_discovery_and_completed_events(self):
+        preparing, release = threading.Event(), threading.Event()
+        captured = {"stage": "capture", "state": "completed", "at": "2026-01-01T00:00:00+00:00"}
+
+        def prepare(*args, **kwargs):
+            preparing.set()
+            if not release.wait(5):
+                raise RuntimeError("Discovery control was not released")
+            return self.prepare(*args, **kwargs)
+
+        def runner(*args, **kwargs):
+            kwargs["on_event"](captured)
+            return self.passing_result(on_event=kwargs["on_event"])
+
+        jobs = self.jobs(runner, preparer=prepare)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler(jobs, self.config["token"]))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(release.set)
+        client = WindowsEndpoint(
+            EndpointConfig(f"http://127.0.0.1:{server.server_port}", self.config["token"], timeout=2)
         )
-        (self.root / "repository").mkdir()
-        subprocess.run(["git", "init", "-q", str(self.root / "repository")], check=True)
-        subprocess.run(
-            ["git", "-C", str(self.root / "repository"), "remote", "add", "origin", "https://github.com/a/b.git"],
-            check=True,
+        request = self.request()
+        client.start_job(
+            run_id=request["run_id"],
+            resolution=HandoffResolution(request["package"], request["handoff_sha256"]),
         )
-        (self.root / "token.txt").write_text("t" * 64)
-        self.path = self.root / "config.json"
-        self.config_data = {
-            "schema_version": "solidworks-to-urdf.endpoint/v1",
-            "package_root": str(self.packages),
-            "output_root": str(self.root / "outputs"),
-            "state_root": str(self.root / "state"),
-            "token_file": str(self.root / "token.txt"),
-            "targets": {"arm": {"repository": str(self.root / "repository"), "base": "feature/arm"}},
-        }
-        write_json(self.path, self.config_data)
-        self.config = read_config(self.path)
-
-    def request(self):
-        return {
-            "run_id": str(uuid.uuid4()),
-            "package": "arm/r1",
-            "target": "arm",
-            "revision_sha256": file_digest(self.package / "cad-revision.json"),
-        }
-
-    def jobs(self, runner):
-        jobs = Jobs(self.config, runner=runner)
-        self.addCleanup(jobs.close)
-        return jobs
-
-    def passing_result(self):
-        subject = "a" * 64
-        return {
-            "passed": True,
-            "subject_sha256": subject,
-            "quality": {"passed": True, "subject_sha256": subject},
-            "submission": {
-                "passed": True,
-                "subject_sha256": subject,
-                "url": "https://github.com/a/b/pull/1",
-                "repository_slug": "a/b",
-                "base": "feature/arm",
-                "branch": "work/solidworks/arm",
-                "state": "published",
-                "commit": "b" * 40,
-            },
-        }
+        self.assertTrue(preparing.wait(2))
+        try:
+            running = client.get_job(request["run_id"])
+            self.assertEqual("running", running["status"])
+            self.assertEqual(("freeze", "running"), (running["events"][0]["stage"], running["events"][0]["state"]))
+            stage_states = {stage["id"]: stage["state"] for stage in running["stages"]["stages"]}
+            self.assertEqual(stage_states["freeze"], "completed")
+            self.assertEqual(stage_states["discover"], "running")
+            self.assertIsNotNone(datetime.fromisoformat(running["events"][0]["at"]).tzinfo)
+        finally:
+            release.set()
+        jobs.queue.join()
+        completed = client.get_job(request["run_id"])
+        self.assertEqual("passed", completed["status"])
+        self.assertIn(captured, completed["events"])
+        self.assertTrue(all(datetime.fromisoformat(event["at"]).tzinfo is not None for event in completed["events"]))
 
     def test_idempotent_retry_is_bound_to_exact_request_and_survives_restart(self):
         calls = []
 
         def runner(package, output, **kwargs):
             calls.append(kwargs["run_id"])
-            return self.passing_result()
+            return self.passing_result(on_event=kwargs["on_event"])
 
-        jobs = Jobs(self.config, runner=runner)
+        jobs = Jobs(self.config, runner=runner, native_preparer=self.prepare)
         request = self.request()
         jobs.create(request)
         jobs.queue.join()
@@ -106,7 +83,7 @@ class EndpointTests(unittest.TestCase):
         self.assertEqual("passed", result["status"])
         self.assertEqual(1, len(calls))
         with self.assertRaises(RequestError) as error:
-            jobs.create({**request, "target": "another"})
+            jobs.create({**request, "handoff_sha256": "f" * 64})
         self.assertEqual(409, error.exception.status)
         jobs.close()
         resumed = self.jobs(runner)
@@ -120,6 +97,57 @@ class EndpointTests(unittest.TestCase):
         jobs.create(request)
         jobs.queue.join()
         self.assertEqual("failed", jobs.snapshot(request["run_id"])["status"])
+
+    def test_green_publication_without_recorded_boundary_checks_is_rejected(self):
+        jobs = self.jobs(lambda *args, **kwargs: self.passing_result())
+        request = self.request()
+        jobs.create(request)
+        jobs.queue.join()
+        result = jobs.snapshot(request["run_id"])
+        self.assertEqual("failed", result["status"])
+        self.assertIn("Engineering stages are incomplete", result["error"])
+
+    def test_discovery_failure_retains_diagnostics_across_endpoint_restart(self):
+        from description_pipeline.sources.solidworks.errors import CadError
+        from description_pipeline.verification.consumer import ConsumerError
+
+        def runner(*args, **kwargs):
+            self.fail("Capture or publication ran after discovery failed")
+
+        for error, detail in (
+            (
+                ConsumerError(
+                    "Consumer loading failed", returncode=1, stderr="ImportError: native library unavailable"
+                ),
+                {"returncode": 1, "stderr": "ImportError: native library unavailable"},
+            ),
+            (
+                CadError("cad_read_failed", "Native read failed", detail={"phase": "read", "cause": "lost binding"}),
+                {"phase": "read", "cause": "lost binding"},
+            ),
+        ):
+            with self.subTest(error=type(error).__name__):
+
+                def prepare(*args, error=error, **kwargs):
+                    raise error
+
+                jobs = Jobs(self.config, runner=runner, native_preparer=prepare)
+                try:
+                    request = self.request()
+                    jobs.create(request)
+                    jobs.queue.join()
+                    result = jobs.snapshot(request["run_id"])
+                    self.assertEqual("failed", result["status"])
+                    self.assertEqual(f"{type(error).__name__}: {error}", result["error"])
+                    self.assertEqual(detail, result["detail"])
+                finally:
+                    jobs.close()
+                recovered = Jobs(self.config, runner=runner, native_preparer=self.prepare)
+                try:
+                    self.assertEqual(result, recovered.snapshot(request["run_id"]))
+                    self.assertFalse(recovered.create(request)[1])
+                finally:
+                    recovered.close()
 
     def test_wrong_repository_base_subject_or_quality_cannot_pass(self):
         responses = []
@@ -145,30 +173,44 @@ class EndpointTests(unittest.TestCase):
             self.assertEqual("failed", result["status"])
             self.assertTrue(result["error"])
 
-    def test_queued_restart_and_incompatible_metadata_fail_once(self):
-        jobs = Jobs(self.config, runner=lambda *args, **kwargs: self.passing_result())
-        request = self.request()
-        jobs.create(request)
-        jobs.queue.join()
-        saved = jobs.snapshot(request["run_id"])
+    def test_queued_restart_rechecks_frozen_native_bytes(self):
+        jobs = Jobs(self.config, runner=lambda *a, **k: self.fail("Unexpected job"), native_preparer=self.prepare)
         jobs.close()
-        saved.update(status="queued", result=None)
-        state = self.config["state_root"] / "jobs" / (request["run_id"] + ".json")
-        write_json(state, saved)
-        resumed = Jobs(self.config, runner=lambda *args, **kwargs: self.passing_result())
-        resumed.queue.join()
-        self.assertEqual("passed", resumed.snapshot(request["run_id"])["status"])
-        resumed.close()
-        saved.pop("repository_slug")
-        write_json(state, saved)
-        broken = Jobs(self.config, runner=lambda *args, **kwargs: self.fail("Incompatible job ran"))
-        broken.queue.join()
-        result = broken.snapshot(request["run_id"])
-        self.assertEqual("failed", result["status"])
-        self.assertIn("Persisted job lacks matching repository metadata", result["error"])
-        broken.close()
-        recovered = self.jobs(lambda *args, **kwargs: self.fail("Failed job reran"))
-        self.assertEqual(result["error"], recovered.snapshot(request["run_id"])["error"])
+        for changed in (False, True):
+            request = self.request()
+            package = self.packages / request["package"]
+            from description_pipeline.sources.solidworks.revision import package_inventory
+
+            saved = {
+                "schema_version": "solidworks-to-urdf.job/v1",
+                "pipeline_id": "solidworks-to-urdf",
+                "run_id": request["run_id"],
+                "request": request,
+                "package_files": package_inventory(package),
+                "status": "queued",
+                "events": [],
+                "result": None,
+                "error": None,
+            }
+            if changed:
+                (package / "总装.SLDASM").write_bytes(b"Changed while offline")
+            state = self.config["state_root"] / "jobs" / (request["run_id"] + ".json")
+            write_json(state, saved)
+            calls = []
+
+            def runner(*a, calls=calls, **k):
+                calls.append(k["run_id"])
+                return self.passing_result(on_event=k["on_event"])
+
+            resumed = Jobs(self.config, runner=runner, native_preparer=self.prepare)
+            resumed.queue.join()
+            result = resumed.snapshot(request["run_id"])
+            self.assertEqual("failed" if changed else "passed", result["status"])
+            self.assertEqual([] if changed else [request["run_id"]], calls)
+            resumed.close()
+            recovered = Jobs(self.config, runner=lambda *a, **k: self.fail("Completed job reran"))
+            self.assertEqual(result["status"], recovered.snapshot(request["run_id"])["status"])
+            recovered.close()
 
     def test_native_jobs_are_serial(self):
         active, peak = 0, 0
@@ -187,12 +229,12 @@ class EndpointTests(unittest.TestCase):
         jobs.queue.join()
         self.assertEqual(1, peak)
 
-    def test_unknown_target_path_escape_and_revision_changes_are_rejected(self):
+    def test_extra_fields_path_escape_and_changed_handoff_are_rejected(self):
         jobs = self.jobs(lambda *args, **kwargs: self.fail("Unvalidated request ran"))
         for mutation in (
             {"target": "unknown"},
             {"package": "../arm"},
-            {"revision_sha256": "0" * 64},
+            {"handoff_sha256": "0" * 64},
             {"command": "anything"},
         ):
             with self.subTest(mutation=mutation), self.assertRaises(PipelineError):
@@ -234,8 +276,10 @@ class EndpointTests(unittest.TestCase):
         script = (
             "import os,sys;from pathlib import Path;"
             f"sys.path.insert(0,{str(Path(__file__).resolve().parents[2] / 'src')!r});"
+            f"sys.path.insert(0,{str(Path(__file__).resolve().parents[2])!r});"
+            "from tests.v1.endpoint_support import prepare_control;"
             "from description_pipeline.orchestration.windows import Jobs,read_config;"
-            "j=Jobs(read_config(Path(sys.argv[1])),runner=lambda *a,**k:os._exit(17));"
+            "j=Jobs(read_config(Path(sys.argv[1])),native_preparer=prepare_control,runner=lambda *a,**k:os._exit(17));"
             f"j.create({request!r});j.queue.join()"
         )
         stopped = subprocess.run([sys.executable, "-I", "-c", script, str(self.path)], capture_output=True, timeout=10)
@@ -248,7 +292,14 @@ class EndpointTests(unittest.TestCase):
         self.assertFalse(resumed.create(request)[1])
 
     def test_plaintext_remote_binding_and_overlapping_roots_are_rejected(self):
-        for change in ({"host": "0.0.0.0"}, {"output_root": str(self.packages / "output")}):
+        for change in (
+            {"host": "0.0.0.0"},
+            {"output_root": str(self.packages / "output")},
+            {"handoff_roots": []},
+            {"handoff_roots": [str(self.root.anchor)]},
+            {"handoff_roots": [str(self.packages)]},
+            {"handoff_roots": [str(self.root)]},
+        ):
             write_json(self.path, {**self.config_data, **change})
             with self.assertRaises(PipelineError):
                 read_config(self.path)

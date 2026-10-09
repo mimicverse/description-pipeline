@@ -1,57 +1,64 @@
 # Release procedure
 
-A tool release contains the implementation, specifications and distributions.
-Native robot/CAD history remains in the private model repository. GitHub CI
-is not a release gate; maintainers retain the following acceptance evidence.
+A release contains one complete operator workflow, its specifications and
+source-bound distributions. Native robot and CAD history stays in the private
+model repository. Retain local acceptance evidence; GitHub CI is not required.
 
-## Acceptance sequence
+## Acceptance
 
-1. **Verify the change.** Run the maintained regression suite and static checks
-   in the [pinned development environment](CONTRIBUTING.md). Exercise malformed
-   inputs and semantic mutations after resealing; digest rejection alone does
-   not prove a semantic quality rule.
-2. **Qualify native behavior.** Capture the neutral moving-joint analytic CAD
-   fixture on Windows. Check transforms, shaft identity, off-diagonal inertia
-   and assembly closure. Retain actual API scope, SolidWorks build and error evidence.
-3. **Build and verify distributions.** Build from a clean committed checkout,
-   bind source/code identity, compare two builds, and verify the installed CLI
-   and package outside that checkout.
-4. **Rehearse delivery.** On Windows, execute capture → verify → PR. On Linux,
-   execute frozen check → rebuild → submit. Repeated submission must update one
-   PR; rejected input or artifacts must produce no publication.
-5. **Accept deployment.** Run the actual Airflow DAG against the native endpoint,
-   including retries and failures, under [deployment acceptance](docs/deployment.md#deployment-acceptance).
-   A release claiming the CAD-only interface must also pass automatic definition,
-   transfer/routing, login, verified preview and per-item engineering-report acceptance.
-6. **Review documentation.** Match instructions and claims to command help,
-   schemas, tests and measured behavior. State unsupported features and the
-   limits of physical and control qualification.
-7. **Publish and verify.** Merge the reviewed change into public `main`, create
-   a new version tag, and publish distributions, SHA-256 manifest and acceptance
-   evidence. Verify the remote commit, tag, asset bytes and installed version.
+1. Run the regression suite and static checks in the
+   [pinned development environment](CONTRIBUTING.md). Test semantic mutations
+   after resealing evidence, as well as malformed inputs and digest changes.
+2. Capture the neutral moving-joint analytic fixture on licensed Windows
+   SolidWorks. Verify native discovery, occurrence transforms, shaft identity,
+   off-diagonal inertia and full assembly closure. Retain the native API/build
+   and independent verification report. Include repeated part occurrences with
+   distinct saved configurations and a nested rigid assembly to verify context,
+   geometry and mass coverage.
+3. Build twice from one clean committed checkout. Compare distribution hashes
+   and verify installation outside that checkout on Linux and Windows.
+4. Accept the deployed workflow: HTTPS login → native folder → Airflow run →
+   detailed checks → actual verified URDF and joint limits → review PR.
+   Exercise retry, changed input, quality failure, service restart and
+   publication failure under the [deployment criteria](docs/deployment.md#acceptance).
+5. Review code, command help, schemas and all documentation together. Keep
+   `main` the smallest complete current system. Remove intermediate workflows,
+   compatibility paths, duplicate entry points and transitional instructions.
+   Regenerate contract-derived tables from `contract_markdown()` and confirm the
+   six-stage contract still matches the code before merging.
+6. Merge the reviewed result into public `main`, create the release tag as
+   `v<package version>` from the distribution's `__version__` (currently
+   `1.0.1`) and publish distributions, their SHA-256 manifest and acceptance
+   evidence. Never reuse or rewrite a published tag or asset. Verify the remote
+   commit, tag, downloaded bytes and installed identity.
 
-All seven steps are required. Synthetic tests, native capture alone or a
-successful PR do not establish complete release acceptance.
+All steps are required. Mocks do not qualify native behavior, and a passing
+neutral fixture does not qualify a hardware model. Each model needs reviewed
+inputs and evidence for its intended use.
 
-## Distribution commands
+## Distribution
 
-Activate the environment in [CONTRIBUTING.md](CONTRIBUTING.md). From a clean,
-committed repository, build into two empty directories outside the checkout:
+Activate the environment in [CONTRIBUTING.md](CONTRIBUTING.md), then build
+into two empty directories outside the clean checkout:
 
 ```sh
 python tools/build_release.py --output /path/to/release-a --offline
 python tools/build_release.py --output /path/to/release-b --offline
 diff /path/to/release-a/SHA256SUMS.json /path/to/release-b/SHA256SUMS.json
-python tools/verify_distribution.py /path/to/release-a/mimicverse_description-1.0.0-py3-none-any.whl --runtime-lock requirements/linux-py312.lock --bundle /path/to/native-passing-delivery --report /path/to/installed-linux.json
 ```
 
-The builder archives the source commit, embeds package-file identity and
-normalizes distribution metadata. It emits wheel, source, deployment and
-Linux/Windows offline runtime archives; it does not publish. Offline archives
-contain runtime wheels and a hash-locked installation file. Exercise the
-Windows archive on the CAD computer and the Linux archive independently.
-Installed code checks its embedded inventory before use.
+Verify the resulting wheel with its complete passing native delivery. Replace
+`<version>` with the version embedded in that wheel:
 
-`v1.0.0` is already published. Substitute the new version in asset examples
-for a subsequent release. Never move an existing release tag or replace its
-published assets. Documentation changes alone do not create a new tool release.
+```sh
+python tools/verify_distribution.py /path/to/release-a/mimicverse_description-<version>-py3-none-any.whl --runtime-lock requirements/linux-py312.lock --bundle /path/to/native-passing-delivery --report /path/to/installed-linux.json
+```
+
+The builder binds the source commit and package files, normalizes distribution
+metadata, and emits the wheel, source, deployment and Linux/Windows offline
+runtime archives. Each offline archive contains exact runtime wheels and a
+hash-locked installation file. Installed code checks its embedded inventory.
+Exercise both runtime archives and deploy the same tool identity on both hosts.
+
+Published tags and assets are immutable. A changed implementation uses a new
+version; release status comes from retained acceptance evidence.

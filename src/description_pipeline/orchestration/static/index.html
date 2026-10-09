@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SolidWorks 交付操作台</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>SolidWorks 交付操作台</h1>
+    <div id="account" class="account" hidden>
+      <span id="account-user"></span>
+      <button id="logout" type="button" class="ghost">退出</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="login-card" class="card narrow">
+      <h2>登录</h2>
+      <p class="muted">使用企业飞书账号登录。</p>
+      <a id="feishu-login" class="button" href="/auth/feishu/login">使用飞书登录</a>
+      <p id="login-error" class="error" hidden></p>
+    </section>
+
+    <section id="workspace" hidden>
+      <section class="card">
+        <h2>新建交付运行</h2>
+        <form id="run-form">
+          <label for="handoff-path">工程文件夹</label>
+          <input id="handoff-path" name="handoff_path" placeholder="/共享目录/机器人工程 或 D:\\CAD\\机器人工程" required>
+          <p class="muted">填写平台可访问的 SolidWorks 工程文件夹，其余信息自动读取。</p>
+          <button type="submit" id="start-button">开始</button>
+          <p id="run-error" class="error" hidden></p>
+        </form>
+      </section>
+
+      <section class="card">
+        <h2>最近运行</h2>
+        <ul id="runs" class="runs"><li class="muted">暂无运行</li></ul>
+      </section>
+
+      <section id="detail-card" class="card" hidden>
+        <h2>运行状态</h2>
+        <dl class="meta" id="run-meta"></dl>
+        <div id="task-progress" class="progress"></div>
+        <div id="retry-panel" class="run-actions" hidden>
+          <button id="retry-button" type="button" hidden>重试</button>
+          <p id="retry-note" class="muted"></p>
+          <p id="retry-error" class="error" role="alert" hidden></p>
+        </div>
+        <h3>六个工程阶段</h3>
+        <p class="muted">每阶段分别显示输入、输入质检、输出与输出质检。未执行、未支持项和待工程确认不代表通过；仅已验证且摘要绑定的 URDF／网格资产提供下载，其余文件为引用与明细。</p>
+        <div id="stages" class="stages"></div>
+        <h3>自动检查</h3>
+        <div id="automatic" class="automatic"></div>
+        <h3>工程确认</h3>
+        <div id="confirmations" class="confirmations"></div>
+        <h3>问题与发现</h3>
+        <ul id="findings" class="findings"></ul>
+        <div id="pr" class="pr" hidden></div>
+      </section>
+
+      <section id="viewer-card" class="card" hidden>
+        <h2>已验证 URDF</h2>
+        <p class="muted" id="preview-meta"></p>
+        <p class="viewer-note" id="viewer-note" hidden></p>
+        <div id="viewer" class="viewer"></div>
+        <div class="viewer-footer">
+          <div id="joint-controls" class="joint-controls"></div>
+          <button id="reset-joints" type="button" class="ghost">回到零位</button>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

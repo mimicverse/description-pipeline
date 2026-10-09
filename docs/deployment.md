@@ -1,230 +1,332 @@
 # Deployment
 
-This guide defines platform responsibilities, configures the released Windows
-worker and Linux orchestration, and records acceptance requirements for the
-target interface. The [operations guide](operations.md) owns the engineering
-workflow; the [Airflow installation guide](../deploy/airflow/README.md) owns Linux commands.
+One Linux server hosts the HTTPS operator page, Airflow and PostgreSQL. One
+logged-in Windows computer with licensed SolidWorks executes native jobs
+serially. Operators use **Feishu login → engineering folder → Start → checks,
+URDF preview and review PR**.
 
-## Release and deployment status
+Use the same source-bound tool release on both hosts. This guide owns installation
+and maintenance; [operations](operations.md) owns the engineering workflow.
 
-| Capability | Status |
+## Prerequisites
+
+| Host or service | Required preparation |
 |---|---|
-| Published v1.0.0 | Prepared-package native capture, verified URDF, model PR submission, frozen replay and Airflow orchestration are released |
-| CAD-only input and automatic definition | Required target; native semantic discovery and generated-input verification are not released |
-| One-folder transfer and hardware routing | Under development; prepared-package transport does not establish CAD-only operation |
-| Operator page and embedded URDF viewer | Planned; not commissioned |
-| Detailed engineering-check display | Required target; per-item automatic results and engineer confirmations are not implemented in Airflow |
-| RTX 4080 server and shared operator URL | Not commissioned; no live address is asserted here |
+| Linux | Ubuntu 22.04 x86_64, user-level systemd, network access to the Windows worker, GitHub and Feishu |
+| Windows | SolidWorks 2026 (native major 34; other versions require platform acceptance first), Python 3.12 x86_64, Git, GitHub CLI and OpenSSH Server; an interactive desktop session |
+| Model repository | Private repository, an existing `feature/<hardware>` base and a dedicated clean Windows clone |
+| Feishu | Enterprise app, approved tenant keys, registered OAuth callback and access to basic user identity/profile |
+| Storage | Dedicated CAD intake directories; separate frozen inputs, outputs, state, secrets and model clones |
 
-The installation sections below configure v1.0.0. It requires a prepared package
-containing `robot.yaml` and `cad-revision.json`, maintained by the platform team.
-These are not mechanical-team delivery requirements. Existing v1.0.0 assets
-and their tag remain unchanged.
+Choose one operator address through `OPERATOR_HOST` and the HTTPS port, for
+example `https://operator.example.com:8443/`. Register that address followed by
+`/auth/feishu/callback` as the app callback.
+The browser must trust the server certificate and be able to reach this address.
 
-## Windows endpoint
+Operators use their existing enterprise Feishu accounts; the platform has no
+account-registration step. Create a dedicated enterprise custom app, enable
+the **Web app** feature and set its desktop homepage to the operator address.
+Register the exact callback under **Security Settings → Redirect URLs**.
+Publish a version with the intended users in its availability scope; new
+configuration takes effect after publication. A creator-only release is
+sufficient for commissioning that user's sign-in.
 
-### Install the runtime
+SolidWorks is required for fresh native discovery and capture. Verification and
+rebuild of a complete frozen delivery run on Linux or Windows without opening
+CAD. Both hosts require Python 3.12 x86_64 and the pinned runtime wheels.
+Consumer checks load models without rendering; they require no display, GPU or
+graphics-driver setup. `description doctor` exercises the actual consumer loader
+in an isolated process, and native jobs check readiness before opening CAD.
+Windows jobs must run as the logged-in execution user, outside Session 0.
 
-Use Windows x86_64 with licensed SolidWorks 2026 (revision 34), Python 3.12,
-Git and GitHub CLI. Download `description-1.0.0-windows-cp312-x86_64.zip`, verify
-it against the release SHA-256 manifest, and extract it. From that directory:
+## 1. Install the Windows worker
+
+Download the Windows offline runtime archive and verify its SHA-256 against the
+release manifest. Extract it, then run from the extracted directory:
 
 ```powershell
-py -3.12 -m venv C:\description\.venv
-C:\description\.venv\Scripts\python.exe -m pip install --no-index --require-hashes --find-links wheels -r requirements.lock
-C:\description\.venv\Scripts\description.exe doctor
+py -3.12 -m venv C:\description-runtime
+C:\description-runtime\Scripts\python.exe -m pip install --no-index --require-hashes --find-links wheels -r requirements.lock
+C:\description-runtime\Scripts\description.exe doctor
 ```
 
-Use the same recorded pipeline release on both platforms. `doctor` checks
-runtime availability without opening CAD; it does not qualify an engineering model.
+Configure Git identity and GitHub authentication for that execution user. Create
+a dedicated clone of the private model repository:
 
-### Configure and start
+```powershell
+gh auth login
+gh auth setup-git
+git clone https://github.com/<owner>/<model-repository> C:\description-models\arm
+```
 
-Create separate input, output, state and model-clone directories. Complete
-[model repository setup](#model-repository-setup) before running jobs.
-Generate a random token of at least 32 ASCII characters and keep it in a
-private file outside the repositories. Configuration holds its path, not its value.
-Save the following as `C:\description\endpoint.json`:
+Create the directories below. `C:\cad-handoffs` contains engineering sources;
+the worker collects immutable copies into `C:\description-packages`. Source
+roots must be narrow, real directories and separate from managed storage.
+
+```powershell
+New-Item -ItemType Directory -Force C:\cad-handoffs, C:\cad-records, C:\description-packages, C:\description-deliveries, C:\description-state, C:\description-secrets | Out-Null
+$account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+icacls C:\description-secrets /inheritance:r /grant:r "${account}:(OI)(CI)F"
+C:\description-runtime\Scripts\python.exe -c "import secrets; from pathlib import Path; Path('C:/description-secrets/endpoint.token').write_text(secrets.token_hex(32), encoding='ascii')"
+```
+
+Keep the token private. Transfer it securely to the Linux host for the tunnel's
+Airflow Connection and portal; do not put its value in source code or logs.
+Save `C:\description-state\endpoint.json`:
 
 ```json
 {
   "schema_version": "solidworks-to-urdf.endpoint/v1",
-  "package_root": "C:/handoffs",
-  "output_root": "C:/deliveries",
-  "state_root": "C:/description/state",
-  "token_file": "C:/description/secrets/endpoint-token.txt",
+  "handoff_roots": ["C:/cad-handoffs"],
+  "package_root": "C:/description-packages",
+  "output_root": "C:/description-deliveries",
+  "state_root": "C:/description-state/jobs",
+  "token_file": "C:/description-secrets/endpoint.token",
   "host": "127.0.0.1",
   "port": 8765,
+  "discovery": {
+    "record_roots": ["C:/cad-records"]
+  },
   "targets": {
     "arm": {
-      "repository": "C:/description/models-arm",
+      "repository": "C:/description-models/arm",
       "base": "feature/arm"
     }
   }
 }
 ```
 
-Start it as the logged-in SolidWorks execution user:
+Replace `arm` with the CAD's `dp.hardware_id` and configure its model base.
+The endpoint rejects unconfigured hardware. Configure `discovery.record_roots`
+for the controlled specification library, for example `["C:/cad-records"]`.
+Populate the library with approved records before admitting jobs.
+CAD references include the approved record version, such as
+`arm/r2/budget.json#robot`, resolved as `C:/cad-records/arm/r2/budget.json`.
+Keep versions immutable and available together; do not replace a shared file
+between runs. Use real directories and files, without symbolic links or junctions.
+Each reference must match one file across the configured roots;
+duplicate matches block discovery even when their bytes agree. Files included
+with an operator's handoff are archived, but do not supply this authority.
+Optional `discovery.frozen_names_file` validates approved interface names.
+Neither setting is an operator input.
+
+Start the endpoint in the logged-in desktop:
 
 ```powershell
-C:\description\.venv\Scripts\description.exe serve --config C:\description\endpoint.json
+C:\description-runtime\Scripts\description.exe serve --config C:\description-state\endpoint.json
 ```
 
-Keep that desktop logged in and the computer awake during processing. Native
-jobs run serially in owned CAD sessions; do not deploy capture as a Session 0
-Windows service. The endpoint does not manage unrelated applications.
+Keep Windows awake during processing. After foreground acceptance, an
+interactive Scheduled Task may start this same command at login under the same
+user. Do not create a second worker or run concurrent native CAD jobs.
 
-Loopback HTTP reaches Linux through an authenticated SSH tunnel. A remote
-bind requires `tls_cert` and `tls_key`; plaintext remote binding is rejected.
-Store the bearer token in the Airflow connection, outside DAGs and model bundles.
+## 2. Configure Linux and Feishu
 
-### Optional startup at login
+Extract the deployment archive matching the worker release. Keep deployment
+configuration and secrets outside the checkout. Copy
+[`operator.env.example`](../deploy/operator/operator.env.example) to a private
+file, then set its actual paths and host:
 
-After verifying foreground operation, register an interactive task under the
-same account. Its Git/GitHub credentials and executable paths must be available:
-
-```powershell
-$account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-$action = New-ScheduledTaskAction -Execute C:\description\.venv\Scripts\description.exe -Argument 'serve --config C:\description\endpoint.json'
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $account
-$principal = New-ScheduledTaskPrincipal -UserId $account -LogonType Interactive -RunLevel Limited
-$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-Register-ScheduledTask -TaskName description-solidworks-endpoint -Action $action -Trigger $trigger -Principal $principal -Settings $settings
-Start-ScheduledTask -TaskName description-solidworks-endpoint
+```sh
+description_base="$HOME/description"
+description_env="$description_base/operator.env"
+mkdir -p "$description_base/secrets"
+chmod 700 "$description_base" "$description_base/secrets"
+cp deploy/operator/operator.env.example "$description_env"
+chmod 600 "$description_env"
 ```
 
-## Model repository setup
+Replace the example `/srv/description` paths with your chosen service directory.
+Complete these configuration groups once:
 
-Configure Git identity and GitHub authentication for the Windows execution user,
-then create a dedicated clean model clone. Replace `<owner>/<model-repository>`
-with the private model repository, separate from the tool repository:
+| Settings | Purpose |
+|---|---|
+| `OPERATOR_HOST`, `OPERATOR_HTTPS_PORT`, `OPERATOR_TLS_CERT`, `OPERATOR_TLS_KEY` | One operator address and its trusted HTTPS identity |
+| `OPERATOR_STATE`, `AIRFLOW_VENV`, `AIRFLOW_HOME`, `POSTGRES_ROOT` | Separate runtime, database and managed state |
+| `PIPELINE_WHEEL`, `AIRFLOW_DB_URL` | Matching release wheel and dedicated PostgreSQL connection |
+| `SOLIDWORKS_SSH_HOST`, `SOLIDWORKS_ENDPOINT_PORT` | Key-authenticated SSH alias to Windows and its loopback endpoint |
+| `ENDPOINT_TOKEN_FILE` | Private copy of the Windows endpoint token, mode `0600` |
+| `SOLIDWORKS_HANDOFF_ROOT` | Dedicated Linux intake, such as `/srv/description/cad-handoffs`, outside runtime and state |
+| `FEISHU_APP_SECRET_FILE`, `FEISHU_TENANT_KEYS` | App credentials and mandatory tenant allowlist |
+| `FEISHU_ADMIN_OPEN_IDS` | Explicit administrator identities; optional, no automatic administrator |
 
-```powershell
-gh auth login
-gh auth setup-git
-git clone https://github.com/<owner>/<model-repository>.git C:\description\models-arm
-```
+Use comma-separated tenant and administrator lists without spaces.
+The configuration example defines the remaining service and transport defaults.
 
-Existing hardware branches need no initialization. For a new hardware, the
-model owner creates its branch once in this dedicated clean clone:
+Set `OPERATOR_TLS_CERT` and `OPERATOR_TLS_KEY` to the absolute paths of the
+approved certificate chain and its private key. The certificate must cover
+`OPERATOR_HOST`; the service user must be able to read both files, and the key
+must have mode `0600`. Reinstall and restart the services after replacing either
+file. Leaving both settings empty generates a self-signed certificate for a LAN
+rehearsal; shared use requires browser trust in the approved certificate.
 
-```powershell
-git -C C:\description\models-arm switch --orphan feature/arm
-Set-Content -Encoding utf8 C:\description\models-arm\README.md "# arm model"
-git -C C:\description\models-arm add README.md
-git -C C:\description\models-arm commit -m "Initialize arm model branch"
-git -C C:\description\models-arm push origin feature/arm
-```
-
-A passing delivery creates or updates `work/solidworks/<hardware>` and its PR
-against `feature/<hardware>`. Approval and model release remain separate from
-candidate submission. Native CAD and model history stay private.
-
-## Linux scheduler
-
-Follow the [Airflow installation guide](../deploy/airflow/README.md) in order:
-prepare PostgreSQL, install the isolated runtime, configure the Windows
-connection, start services, log in and trigger a delivery. The released DAG
-uses six explicit fields and expects the prepared package under Windows
-`package_root`; it does not transfer a Linux directory or infer hardware routing.
-
-The DAG validates the request, starts the native job, waits for completion and
-requires a passing quality report, submission receipt and PR URL. Diagnostics
-are in `wait_for_job`; `confirm_job` returns the verified subject, commit and PR.
-Retries preserve the UUID derived from the Airflow run ID. Reusing that UUID
-with changed content returns HTTP 409. Restart marks an interrupted running
-job failed; corrected inputs start a new run.
-
-## Deployment contract
-
-The following requirements define the target deployment; they are not installed
-by the v1.0.0 procedures above.
-
-One RTX 4080 Linux server hosts the operator page, Airflow and private PostgreSQL.
-An HTTPS reverse proxy exposes one authenticated operator URL. The page uses
-Airflow's DAG and login; platform administration remains restricted. One
-reachable Windows worker serializes licensed SolidWorks execution.
-
-### Folder resolution
-
-The target request contains one field:
+Store the app credentials in the mode-`0600` JSON file named by
+`FEISHU_APP_SECRET_FILE`:
 
 ```json
-{"handoff_path": "/srv/handoffs/arm/r2"}
+{"app_id": "<enterprise-app-id>", "app_secret": "<enterprise-app-secret>"}
 ```
 
-| Engineering-directory location | Required handling |
-|---|---|
-| Absolute Linux path | Read on the server, archive and transfer to Windows; verify the received native inventory |
-| Absolute Windows path | Read on the configured worker and copy into the managed input store |
-| Relative path | Resolve under `package_root` and copy into the managed input store |
+Obtain the company identifier with the app's **Tenant token** permission
+`tenant:tenant:readonly` (**Obtain tenant information**). Exchange the app
+credentials for a tenant access token, then call
+[Obtain company information](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/tenant-v2/tenant/query).
+Set `FEISHU_TENANT_KEYS` from `data.tenant.tenant_key` after confirming the
+company name. The company name and `display_id` are not tenant keys.
 
-A path on another computer must first become accessible to the platform.
-Pasting it into a browser does not grant access. Transport preserves native
-contents and relative references; input directories contain engineering files,
-not authored YAML or manifests.
+Feishu API authentication is required for the workflow. The server reads the
+authenticated user's Feishu username and keeps credentials server-side.
+The enterprise app is used for sign-in only. The
+[current authorization API](https://open.feishu.cn/document/common-capabilities/sso/api/obtain-oauth-code)
+uses an S256 challenge; the server exchanges the code at the
+[OAuth token API](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/authentication-management/access-token/get-user-access-token)
+with a JSON request containing the PKCE verifier.
+The [basic profile API](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/authen-v1/user_info/get)
+requires no additional contact-directory, email, phone or employment permissions.
+The workflow does not request offline access or retain Feishu refresh tokens.
 
-```mermaid
-sequenceDiagram
-  participant O as Operator page
-  participant A as Linux Airflow
-  participant W as Windows endpoint
-  participant G as Model repository
-  O->>A: Engineering-directory path
-  opt Directory on Linux
-    A->>W: Authenticated archive and inventory digest
-  end
-  A->>W: Locate and freeze native files
-  W-->>A: Frozen input identity
-  A->>W: Job request with stable UUID
-  W->>W: Read CAD and resolve hardware/specifications
-  W->>W: Derive, build and independently verify
-  W->>G: Push verified delivery and create/update PR
-  W-->>A: Stages, quality, verified assets and receipt
-  A-->>O: Check details, URDF preview and PR
+After an approved administrator signs in, obtain that person's app-scoped
+`open_id` from `/auth/feishu/profile` and add it to `FEISHU_ADMIN_OPEN_IDS`.
+Keep the list empty until an administrator is explicitly selected. User IDs
+from another app cannot be reused. Apply configuration through the supported
+installation and restart steps below.
+
+Membership in an approved tenant grants workflow operator access; administrators
+must also appear in the explicit admin list. Operator access covers starting new
+runs and viewing shared results; the run's initiator (stable authenticated
+identity) and platform administrators can retry that run through the single
+contextual Retry action for positively classified transport recovery, which
+continues the same DAG run and native job without recapturing or editing frozen
+inputs or artifacts. Native terminal failures require a new run after correcting
+inputs or configuration. The owner check ships with the platform package; no
+separate credential or install-time flag is required, and operator run changes
+are refused when that guard is absent. Each run's history and details show the
+original submitter's Feishu username from the authenticated API response.
+The app, tenant and `open_id` remain the internal audit identity; users do not
+supply the submitter name. Feishu does not supply CAD, drive specifications or
+engineering approval merely through login.
+
+Configure the SSH alias on Linux using a dedicated execution key and verified
+Windows host key. Confirm it works without a password prompt:
+
+```sh
+ssh -o BatchMode=yes solidworks-worker whoami
 ```
 
-Hardware identity and structural revision come from native engineering records.
-The worker must resolve exactly one configured destination after reading CAD;
-unknown or ambiguous identity blocks publication. Platform configuration owns
-clones, branches and the Airflow connection selected by
-`SOLIDWORKS_ENDPOINT_CONN_ID` (default `solidworks_windows`). Unsafe paths and
-malformed transport are rejected before native execution.
+The endpoint binds only to Windows loopback. The managed SSH tunnel exposes it
+on Linux loopback port `18765`; operators never configure transport or tokens.
 
-All native files are frozen and bound to an inventory digest. Queued jobs
-recheck that identity before capture. Retries preserve frozen inputs and the
-native UUID; changes require a new run.
+## 3. Install and start Linux services
 
-### Verified preview and check display
+From the deployment archive:
 
-The viewer must load the passing delivery's actual URDF and meshes with joint
-position and limit controls. Planned server-side access uses authenticated
-`GET /v1/jobs/<uuid>/preview` and `GET /v1/jobs/<uuid>/artifacts/<relative>`.
-Only verified viewer assets may be served; CAD, evidence and worker paths are
-excluded. Tokens remain server-side and viewer dependencies are bundled.
+```sh
+bash deploy/operator/operatorctl.sh install --env-file "$description_env"
+bash deploy/operator/operatorctl.sh start --env-file "$description_env"
+bash deploy/operator/operatorctl.sh health --env-file "$description_env"
+```
 
-Each engineering check must show its ID, automatic result, engineer confirmation,
-evidence, affected objects and corrective guidance, bound to the run and
-structural version. Unsupported, unexecuted or unconfirmed items remain visible.
-The [mechanical specification](mechanical-handoff-spec.md#112-检查报告与-airflow-展示)
-defines these result states. A viewer does not make an independent quality decision.
+Installation provisions the pinned Python toolchain, PostgreSQL 14, Airflow
+3.3.2, the matching tool wheel, proxy and service configuration. It starts the
+managed database before migration; `start` launches the remaining services.
+Installation creates the sole `solidworks_windows` Connection with the endpoint
+token and Linux source allowlist. Operators need no Connection or DAG setup.
 
-## Deployment acceptance
+`install` writes configuration, secrets and service units while preserving the
+DAG's admission state. `start` opens and verifies DAG admission before starting
+the operator page and HTTPS proxy; `stop` closes ingress and pauses the DAG before
+stopping the core services. Start and health check installed configuration for
+drift. Reinstall after a configuration change;
+existing signing and encryption keys are preserved. For services to survive a
+Linux user logout, the host administrator runs the following command with the
+actual service account:
 
-Accept the released foundation only after demonstrating:
+```sh
+sudo loginctl enable-linger <service-user>
+```
 
-- Authenticated Linux-to-Windows connectivity and an actual native passing delivery and PR.
-- Retry without duplicate capture, rejection of a changed revision digest and path escape.
-- Quality failure without publication and recovery after a worker restart.
-- Successful DAG import and execution in the pinned Airflow environment.
+Before Feishu configuration, health exits with failure for missing SSO
+credentials and unavailable SSO commissioning (`HTTP 503`). These identify an
+incomplete installation. Any additional failure requires investigation. A
+self-signed rehearsal certificate also requires browser trust before use;
+service liveness does not establish that trust. Commissioning requires zero
+health failures, trusted HTTPS and a successful live Feishu sign-in.
 
-Acceptance of the target interface additionally requires:
+## Acceptance
 
-- All three folder locations, verified transfer and rejection of changed inventories.
-- CAD-only identity, body/joint recognition, specification resolution and generated definitions.
-- Independent checking against native evidence; no guessed facts or routing on ambiguous identity.
-- Single-page login, submission, progress and complete per-item check/confirmation display.
-- Preview of actual verified URDF motion and limits; rejection of failed, changed or non-viewer assets.
+Commission the complete workflow with actual native CAD and live Feishu:
 
-Retain measured end-to-end results. A mocked endpoint can test orchestration,
-but it cannot replace native rehearsal or commission a deployment.
+1. Run `description doctor` in each installed runtime and require all checks to
+   pass. Confirm HTTPS trust, all services, authenticated Windows endpoint health
+   and the installed Airflow Connection.
+2. Sign in with Feishu. Verify the displayed Feishu username, approved tenant,
+   explicit admin assignment and denied unauthorized users. Confirm an approved
+   operator can start new pipeline runs and view shared results from other
+   operators.
+3. As the run's initiator, confirm the Retry action appears only for a
+   positively classified transport failure and continues the same DAG run and
+   native job without recapturing or editing frozen inputs or artifacts, and is
+   absent for native terminal failures. Confirm a platform administrator can
+   also retry that run, that another approved user can view the run but cannot
+   retry it, and that the Retry request
+   (`POST /api/v2/dags/{dag_id}/dagRuns/{dag_run_id}/clear` with
+   `dry_run`, `only_failed: true`, `only_new: false`,
+   `run_on_latest_version: false`) is accepted for the initiator and refused
+   for another approved user.
+4. Supply a compliant native folder from an approved Linux or Windows source
+   root. Start without YAML, branch, hardware or credential fields.
+5. Verify the UUID, frozen inventory and all six engineering steps. Inspect
+   input/input QC/output/output QC in the page, the DAG contract table,
+   terminal task logs and `engineering_stages` XCom. Confirm failed, blocked,
+   not-run and pending-confirmation states, and the hashed `reports/stages.json`.
+   Verify the actual native discovery and every independent quality result.
+   Confirm history and details show the original submitter's Feishu username
+   after reload and when viewed by another authorized operator.
+6. Inspect the delivered URDF and actual meshes in the page. Exercise individual
+   joint controls and limits; confirm preview binds to the passing file subject.
+7. Check the resulting private-model PR's exact base, head, structural revision
+   and verified commit. Candidate submission does not grant engineering approval.
+8. Exercise a transport-recovery Retry together with automatic polling, plus
+   changed inputs, quality failure, service restart and PR failure. Retain
+   diagnostics; a PR-service failure preserves verified preview.
+
+Mocks, server liveness and an unconfigured OAuth callback do not establish this
+acceptance. Retain reports for the exact tool and native source revision.
+
+## Maintenance
+
+In a new shell, set `description_env` to the installed configuration file:
+
+```sh
+description_env="$HOME/description/operator.env"
+bash deploy/operator/operatorctl.sh status --env-file "$description_env"
+bash deploy/operator/operatorctl.sh health --env-file "$description_env"
+bash deploy/operator/operatorctl.sh stop --env-file "$description_env"
+```
+
+Service logs use `journalctl --user -u <service>`. Airflow logs, endpoint state
+and bound job diagnostics identify failed operations. Transport retries reconnect
+to the existing native job. A terminal native failure requires a new run; an
+endpoint restart during capture marks that job failed. Preserve its partial
+evidence for diagnosis. Recover a publication failure from the complete verified
+delivery using [the operations procedure](operations.md#6-independent-review-and-recovery).
+Engineering corrections require a new source revision and run.
+
+After code or deployment changes, run the
+[development checks](../CONTRIBUTING.md#verification), validate shell syntax and
+repeat affected native and deployed acceptance. For an upgrade, let the current
+native job finish and stop new submissions. Retain the previous release archives,
+runtime directories and private configuration, including `operator.env`, its
+`PIPELINE_WHEEL` path and the Windows endpoint configuration. Stop the endpoint
+and Linux services, install the same new release on both hosts, then restart the
+endpoint and Linux services and run health. `install` updates files; it does not
+restart an already running process.
+
+If acceptance fails, drain native work and stop both hosts' services. Restore the
+previous tool installations and private configuration, run `install` from the
+previous deployment archive, then start the endpoint and Linux services. Verify
+both installed source identities and run health before reopening submissions.
+Preserve every frozen input, delivery, diagnostic, signing key, job and ledger
+row created during the upgrade. Do not restore an older database or state snapshot;
+code rollback requires compatible persisted schemas. Published tags and assets
+remain immutable.

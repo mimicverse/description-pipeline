@@ -1,0 +1,13 @@
+{
+  "airflow": {
+    "url": "http://127.0.0.1:8791"
+  },
+  "endpoint": {
+    "url": "http://127.0.0.1:18765",
+    "token_file": "/srv/description/secrets/endpoint.token"
+  },
+  "portal": {
+    "host": "127.0.0.1",
+    "port": 8788
+  }
+}

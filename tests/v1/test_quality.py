@@ -14,7 +14,7 @@ import numpy as np
 from description_pipeline.io import PipelineError, canonical, write_json
 from description_pipeline.sources.solidworks.freeze import _component_context_record
 from description_pipeline.verification import solidworks_urdf as quality
-from description_pipeline.verification.solidworks_physics import verify_physics
+from description_pipeline.verification.solidworks_physics import verify_physics, verify_urdf_mass_equality
 
 
 class PhysicsTests(unittest.TestCase):
@@ -284,3 +284,89 @@ class StructuralQualityTests(unittest.TestCase):
             canonical(report)
             self.assertEqual(report["subject_status"], "unavailable")
             self.assertNotIn(str(root).encode(), canonical(report))
+
+
+class UrdfMassEqualityTests(unittest.TestCase):
+    """The delivered URDF must equal the bound whole-CAD mass exactly (atol 1e-12, rtol 0)."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        (self.root / "urdf").mkdir()
+        (self.root / "evidence/raw").mkdir(parents=True)
+        self.masses = [1.0, 2.0]
+        self.write()
+
+    def write(self, whole=3.0, status="recorded", mode="full", top=True, write_closure=True):
+        body = "".join(
+            f'<link name="link_{index}"><inertial><origin xyz="0 0 0" rpy="0 0 0"/>'
+            f'<mass value="{mass}"/>'
+            '<inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>'
+            "</inertial></link>"
+            for index, mass in enumerate(self.masses)
+        )
+        (self.root / "urdf/robot.urdf").write_text(f'<robot name="unit">{body}</robot>', encoding="utf-8")
+        closure = self.root / "evidence/raw/mass_closure.json"
+        if write_closure:
+            payload = {"status": status, "mode": mode}
+            if top:
+                payload["top_level"] = {"mass": whole}
+            write_json(closure, payload)
+        elif closure.exists():
+            closure.unlink()
+
+    def test_exact_whole_cad_mass_passes(self):
+        details = verify_urdf_mass_equality(self.root)
+        self.assertEqual(3.0, details["urdf_mass_kg"])
+        self.assertEqual(3.0, details["whole_cad_mass_kg"])
+        self.assertEqual(0.0, details["delta_kg"])
+        self.assertEqual(1e-12, details["atol_kg"])
+        self.assertEqual(0.0, details["rtol"])
+        self.assertEqual(2, details["inertials"])
+
+    def test_mismatch_previously_hidden_by_relative_tolerance_fails(self):
+        self.masses = [1.000001, 2.0]
+        self.write(whole=3.0)
+        # The broader accuracy comparison would have accepted this with rtol 1e-6.
+        self.assertTrue(np.isclose(3.000001, 3.0, atol=1e-12, rtol=1e-6))
+        with self.assertRaises(PipelineError):
+            verify_urdf_mass_equality(self.root)
+
+    def test_missing_or_malformed_whole_evidence_fails(self):
+        for label, kwargs in (
+            ("missing_file", {"write_closure": False}),
+            ("failed_status", {"status": "failed"}),
+            ("partial_mode", {"mode": "partial"}),
+            ("no_top_level", {"top": False}),
+            ("non_numeric_mass", {"whole": None}),
+            ("non_positive_mass", {"whole": 0.0}),
+        ):
+            with self.subTest(label=label):
+                self.masses = [1.0, 2.0]
+                self.write(**kwargs)
+                with self.assertRaises(PipelineError):
+                    verify_urdf_mass_equality(self.root)
+
+    def test_urdf_without_inertial_masses_fails(self):
+        (self.root / "urdf/robot.urdf").write_text('<robot name="unit"><link name="link_0"/></robot>', encoding="utf-8")
+        with self.assertRaises(PipelineError):
+            verify_urdf_mass_equality(self.root)
+
+    def test_only_actual_link_masses_count_and_fixed_reference_frames_are_allowed(self):
+        path = self.root / "urdf/robot.urdf"
+        xml = path.read_text().replace(
+            "</robot>",
+            '<link name="sensor_frame"/><extension><inertial><mass value="100"/></inertial></extension></robot>',
+        )
+        path.write_text(xml)
+        self.assertEqual(3.0, verify_urdf_mass_equality(self.root)["urdf_mass_kg"])
+
+    def test_malformed_or_ambiguous_link_mass_fails_with_a_pipeline_error(self):
+        path = self.root / "urdf/robot.urdf"
+        original = path.read_text()
+        for replacement in ('<mass value="not-a-number"/>', '<mass value="1.0"/><mass value="2.0"/>'):
+            with self.subTest(replacement=replacement):
+                path.write_text(original.replace('<mass value="1.0"/>', replacement, 1))
+                with self.assertRaises(PipelineError):
+                    verify_urdf_mass_equality(self.root)

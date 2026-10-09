@@ -3,15 +3,47 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+from tests.v1._airflow_env import pinned_airflow_home
 
 ROOT = Path(__file__).resolve().parents[2]
 DAG_DIR = ROOT / "deploy/airflow/dags"
-AIRFLOW_HOME = Path(os.environ.get("AIRFLOW_HOME", ROOT / "deploy/airflow/home"))
+#: Absolute and outside the checkout, fixed before Airflow is imported.
+AIRFLOW_HOME = pinned_airflow_home()
+
+_MIGRATED = False
+
+
+def migrated_airflow_home(venv: Path) -> Path:
+    """Migrate the isolated home once so the pinned Airflow CLI runs for real."""
+    global _MIGRATED
+    if not _MIGRATED:
+        env = dict(
+            os.environ,
+            AIRFLOW_HOME=str(AIRFLOW_HOME),
+            PYTHONPATH=str(ROOT / "src"),
+            AIRFLOW__CORE__LOAD_EXAMPLES="false",
+        )
+        migrated = subprocess.run(
+            [str(venv / "bin/airflow"), "db", "migrate"],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        if migrated.returncode != 0:
+            raise AssertionError("airflow db migrate failed:\n" + (migrated.stdout + migrated.stderr)[-3000:])
+        _MIGRATED = True
+    return AIRFLOW_HOME
+
 
 try:
     from airflow.models import DagBag
@@ -28,7 +60,82 @@ class DagTests(unittest.TestCase):
         self.assertEqual(bag.import_errors, {})
         dag = bag.dags["solidworks_to_urdf"]
         self.assertIsNone(dag.schedule)
-        self.assertEqual(set(dag.task_ids), {"validate_request", "start_job", "wait_for_job", "confirm_job"})
+        self.assertEqual(set(dag.task_ids), {"resolve_handoff", "start_job", "wait_for_job", "confirm_job"})
+        self.assertEqual(set(dag.params), {"handoff_path"})
+        handoff_param = dict(dag.params.items())["handoff_path"]
+        self.assertEqual(handoff_param.schema["title"], "Engineering folder path")
+        self.assertEqual(handoff_param.schema["type"], "string")
+        from description_pipeline.stages import contract_markdown
+
+        self.assertIn(contract_markdown(), dag.doc_md)
+        self.assertTrue(all(task.doc_md for task in dag.tasks))
+
+    def _module(self):
+        spec = importlib.util.spec_from_file_location("test_solidworks_dag", DAG_DIR / "solidworks_to_urdf.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        self.addCleanup(sys.modules.pop, spec.name, None)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_failure_stores_terminal_checks_before_raising_and_progress_logs_only_changes(self):
+        from types import SimpleNamespace
+        from airflow.sdk.exceptions import AirflowFailException
+        from tests.v1.protocol_support import protocol_events
+
+        module = self._module()
+        request = {"run_id": "protocol-control", "package": "control", "handoff_sha256": "b" * 64, "conn_id": "test"}
+        job = {
+            "request": {key: request[key] for key in ("run_id", "package", "handoff_sha256")},
+            "run_id": request["run_id"],
+            "status": "running",
+            "events": protocol_events(stages=("freeze",)),
+        }
+
+        class TaskInstance:
+            def __init__(self):
+                self.values = {}
+
+            def xcom_pull(self, *, task_ids, key):
+                return self.values.get(key)
+
+            def xcom_push(self, *, key, value):
+                self.values[key] = value
+
+        ti = TaskInstance()
+        with patch.object(module, "_endpoint", return_value=SimpleNamespace(get_job=lambda _: job)):
+            with self.assertLogs(module.log.name, level="INFO") as first:
+                self.assertFalse(module._poke(request, ti=ti))
+            with self.assertLogs(module.log.name, level="INFO") as unchanged:
+                self.assertFalse(module._poke(request, ti=ti))
+            self.assertEqual(sum("engineering stage=" in line for line in first.output), 6)
+            self.assertFalse(any("engineering stage=" in line for line in unchanged.output))
+            job.update(status="failed", error="Native control failed", events=protocol_events(failed_stage="capture"))
+            with self.assertLogs(module.log.name, level="INFO") as terminal, self.assertRaises(AirflowFailException):
+                module._poke(request, ti=ti)
+            stages = {row["id"]: row["state"] for row in ti.values["engineering_stages"]["stages"]}
+            self.assertEqual(stages["capture"], "failed")
+            self.assertEqual(stages["generate"], "blocked")
+            self.assertEqual(sum("engineering result=" in line for line in terminal.output), 6)
+
+    def test_terminal_summary_without_task_instance_warns_and_never_crashes(self):
+        from types import SimpleNamespace
+        from tests.v1.protocol_support import protocol_events
+
+        module = self._module()
+        request = {"run_id": "protocol-control", "package": "control", "handoff_sha256": "b" * 64, "conn_id": "test"}
+        job = {
+            "request": {key: request[key] for key in ("run_id", "package", "handoff_sha256")},
+            "run_id": request["run_id"],
+            "status": "passed",
+            "events": protocol_events(subject="c" * 64),
+        }
+        with (
+            patch.object(module, "_endpoint", return_value=SimpleNamespace(get_job=lambda _: job)),
+            self.assertLogs(module.log.name, level="WARNING") as captured,
+        ):
+            self.assertTrue(module._poke(request, ti=None))
+        self.assertTrue(any("XCom was not stored" in line for line in captured.output))
 
     def test_dag_run_against_mock_endpoint(self) -> None:
         from tests.v1.test_airflow_client import MockEndpoint
@@ -47,7 +154,8 @@ class DagTests(unittest.TestCase):
             )
             env = dict(
                 os.environ,
-                AIRFLOW_HOME=str(AIRFLOW_HOME),
+                AIRFLOW_HOME=str(migrated_airflow_home(venv)),
+                AIRFLOW__CORE__DAGS_FOLDER=str(DAG_DIR),
                 PYTHONPATH=str(ROOT / "src"),
                 AIRFLOW_CONN_SOLIDWORKS_WINDOWS=connection,
                 SOLIDWORKS_SENSOR_MODE="poke",
@@ -56,11 +164,7 @@ class DagTests(unittest.TestCase):
             )
             conf = json.dumps(
                 {
-                    "package": "handoff/m3.0",
-                    "revision_sha256": "a" * 64,
-                    "target": "local",
-                    "repository_slug": "example/m3.0",
-                    "base": "feature/m3.0",
+                    "handoff_path": "handoff/m3.0",
                 }
             )
             result = subprocess.run(
@@ -75,7 +179,14 @@ class DagTests(unittest.TestCase):
             self.assertEqual(len(server.jobs), 1)
             job = next(iter(server.jobs.values()))
             self.assertEqual(job["status"], "passed")
-            self.assertEqual(job["request"]["package"], "handoff/m3.0")
+            self.assertEqual(
+                job["request"],
+                {"run_id": job["run_id"], "package": "handoff/m3.0", "handoff_sha256": "b" * 64},
+            )
+            self.assertEqual(job["hardware_id"], "m3.0")
+            self.assertEqual(job["repository_slug"], "example/m3.0")
+            self.assertEqual(job["repository_base"], "feature/m3.0")
+            self.assertEqual(server.resolved_paths, ["handoff/m3.0"])
 
 
 if __name__ == "__main__":

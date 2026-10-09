@@ -74,8 +74,13 @@ class EvidenceBindingTests(unittest.TestCase):
                 "arm-1": {"mass_kg": 0.5, "reason": "printed part", "evidence": "arm-1"},
             },
             "bodies": [
-                {"id": "base", "name": "base_link", "components": ["base-1"]},
-                {"id": "arm", "name": "arm_link", "components": ["arm-1"]},
+                {
+                    "id": "base",
+                    "name": "base_link",
+                    "components": ["base-1"],
+                    "frame": {"coordinate_system": "base_datum"},
+                },
+                {"id": "arm", "name": "arm_link", "components": ["arm-1"], "frame": {"coordinate_system": "arm_datum"}},
             ],
             "joints": [],
         }
@@ -88,7 +93,7 @@ class EvidenceBindingTests(unittest.TestCase):
 
     def _binding(self, **overrides) -> dict:
         binding = {
-            "reference": "Microban material spec (fixture)",
+            "reference": "Neutral component material spec",
             "file": "docs/provenance/mass-spec.json",
             "sha256": file_digest(self.spec),
         }

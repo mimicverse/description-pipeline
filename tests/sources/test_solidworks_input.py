@@ -342,6 +342,7 @@ class InputPackageTests(unittest.TestCase):
     def test_assembly_must_stay_inside_the_package(self):
         for value in ("/abs/robot.SLDASM", "../robot.SLDASM", "cad/robot.txt"):
             with self.subTest(value=value):
+
                 def mutate(document, value=value):
                     document["source"]["assembly"] = value
 
@@ -361,9 +362,7 @@ class InputPackageTests(unittest.TestCase):
             document["source"]["bodies"] = [document["source"]["bodies"][0]]
             document["source"]["joints"] = []
             document["source"]["frames"] = []
-            document["source"]["documented_masses"] = {
-                "base-1": document["source"]["documented_masses"]["base-1"]
-            }
+            document["source"]["documented_masses"] = {"base-1": document["source"]["documented_masses"]["base-1"]}
 
         inspection = inspect_package(self._package(single))
         self.assertTrue(inspection["passed"], inspection["errors"])
@@ -510,6 +509,7 @@ class InputPackageTests(unittest.TestCase):
             {"component": "upper-1", "face_index": 0, "extra": True},
         ):
             with self.subTest(value=value):
+
                 def mutate(document, value=value):
                     document["source"]["joints"][0]["axis_reference"] = value
 

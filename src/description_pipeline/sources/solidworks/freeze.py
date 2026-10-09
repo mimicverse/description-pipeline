@@ -949,8 +949,9 @@ def _retain_failure(
         "schema_version": "description-pipeline.solidworks-freeze-failure/v1",
         "stage": stage,
         "code": getattr(error, "code", type(error).__name__),
-        "message": str(error),
+        "message": _redact(str(error)),
         "detail": _redact(getattr(error, "detail", None), "detail"),
+        "exceptions": _redact(_exception_trace(error)),
         "exit_code": getattr(error, "exit_code", None),
         "destination": str(destination),
         "request": _redact(request),
@@ -975,15 +976,33 @@ def _retain_failure(
     return None
 
 
-def _leaf_volume(mass_properties: dict[str, Any], name: Any) -> float:
-    """A leaf's own volume when the capture recorded one; absent or unusable context counts as zero."""
+def _exception_trace(error: BaseException) -> list[dict[str, Any]]:
+    """Retain native call sites without inspecting or calling any COM object."""
 
-    payload = mass_properties.get(str(name)) or {}
-    reference = payload.get("reference") or {}
-    try:
-        return float(reference.get("volume_m3") or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
+    chain: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        frames = []
+        trace = error.__traceback__
+        while trace is not None:
+            frame = trace.tb_frame
+            module = frame.f_globals.get("__name__", "")
+            if isinstance(module, str) and module.startswith("description_pipeline.sources.solidworks."):
+                site = {"module": module, "function": frame.f_code.co_name, "line": trace.tb_lineno}
+                if module.endswith(".native") and frame.f_code.co_name in ("_member", "_method"):
+                    member = frame.f_locals.get("name")
+                    if isinstance(member, str):
+                        site["member"] = member
+                frames.append(site)
+            trace = trace.tb_next
+        record = {"type": type(error).__name__, "message": str(error), "frames": frames}
+        hresult = getattr(error, "hresult", None)
+        if isinstance(hresult, int):
+            record["hresult"] = hresult
+        chain.append(record)
+        error = error.__cause__ or (None if error.__suppress_context__ else error.__context__)
+    return chain
 
 
 def _component_context_record(reading: dict[str, Any], scene: Any, assembly_mass: float | None) -> dict[str, Any]:
@@ -1134,16 +1153,14 @@ def _component_mass_context(
         }
 
 
-def _mass_closure(
-    backend: Any, cfg: dict[str, Any], scene: Any, document: str | None = None
-) -> dict[str, Any] | None:
+def _mass_closure(backend: Any, cfg: dict[str, Any], scene: Any, document: str | None = None) -> dict[str, Any] | None:
     """The assembly's own reading next to the recombined leaf readings, as capture evidence.
 
     Capture retains full readings, closure deltas and explicit unavailable/error
     receipts for diagnosis. The v1 delivery verifier requires full whole-assembly
     closure and complete component-context evidence; a missing or inconsistent
     receipt blocks publication. Keeping a failed probe in the snapshot does not
-    qualify the delivery or substitute a mass-only fallback for a full tensor.
+    qualify the delivery.
     """
 
     closure_reader = getattr(backend, "assembly_mass_properties", None)
@@ -1193,45 +1210,20 @@ def _mass_closure(
             unavailable_record["component_context"] = component_context
         return unavailable_record
     leaf_total = assembly_leaf_total(scene.components, scene.mass_properties)
-    record: dict[str, Any]
-    if str(top_level.get("mode") or "") == "mass_only":
-        # The legacy API gives a corroborated mass only; volume travels as context.  The 2026-09-29
-        # native pairing matched COM and the inertia group too, but one document is not a layout
-        # guarantee, so nothing else is taken from the vector here.
-        volumes = sum(_leaf_volume(scene.mass_properties, component.name) for component in scene.components)
-        leaf_mass = float(leaf_total["mass"])
-        record = {
-            "schema_version": "description-pipeline.solidworks-mass-closure/v1",
-            "status": "recorded",
-            "mode": "mass_only",
-            "top_level": {
-                "mass": top_mass,
-                "volume_m3": top_level.get("volume_m3"),
-                "reference": dict(top_level.get("reference") or {}),
-            },
-            "leaf_total": {"mass": leaf_mass, "volume_m3": volumes},
-            "leaf_components": len(list(scene.components)),
-            "not_inferred": ["com", "inertia"],
-            "delta": {
-                "mass_abs": abs(top_mass - leaf_mass),
-                "mass_rel": abs(top_mass - leaf_mass) / max(abs(top_mass), abs(leaf_mass), 1e-12),
-            },
-        }
-    else:
-        record = {
-            "schema_version": "description-pipeline.solidworks-mass-closure/v1",
-            "status": "recorded",
-            "mode": "full",
-            "top_level": {
-                "mass": top_mass,
-                "com": [float(value) for value in top_level["com"]],
-                "inertia": [[float(value) for value in row] for row in top_level["inertia"]],
-                "reference": dict(top_level.get("reference") or {}),
-            },
-            "leaf_total": leaf_total,
-            "leaf_components": len(list(scene.components)),
-            "delta": closure_delta(top_level, leaf_total),
-        }
+    record = {
+        "schema_version": "description-pipeline.solidworks-mass-closure/v1",
+        "status": "recorded",
+        "mode": "full",
+        "top_level": {
+            "mass": top_mass,
+            "com": [float(value) for value in top_level["com"]],
+            "inertia": [[float(value) for value in row] for row in top_level["inertia"]],
+            "reference": dict(top_level.get("reference") or {}),
+        },
+        "leaf_total": leaf_total,
+        "leaf_components": len(list(scene.components)),
+        "delta": closure_delta(top_level, leaf_total),
+    }
     if component_context is not None:
         record["component_context"] = component_context
     return record
@@ -1291,21 +1283,16 @@ def _capture_readings(
     return scene, raw
 
 
-def _verify_originals_unchanged(backend: Any, closure: dict[str, Any]) -> dict[str, Any]:
-    """Re-check the working-tree documents the snapshot was collected from.
+def _verify_originals_unchanged(closure: dict[str, Any]) -> dict[str, Any]:
+    """Rehash saved inputs without reopening the retired source application.
 
-    The readings come from the copy, so the working tree still has to hold the bytes
-    the copy was made from: the file digests catch a source written while the capture
-    ran, and the per-document active configuration catches a document that was
-    switched to another configuration while we read it.  ``GetSaveFlag`` is recorded
-    but never compared - it answers "would SolidWorks prompt to save?", which many
-    operations set and which says nothing about the revision on disk.
+    Original configuration/save observations describe the initial source session,
+    not current state. The disk revision supplied the copy; all live configuration
+    and occurrence guards apply to that copy, which supplies the measurements.
     """
 
     recorded = dict(closure.get("original_files") or {})
-    states = dict(closure.get("original_states") or {})
     changed: list[dict[str, Any]] = []
-    drifted: list[dict[str, Any]] = []
     for path, digest in recorded.items():
         try:
             current = sha256_file(Path(path))
@@ -1313,26 +1300,18 @@ def _verify_originals_unchanged(backend: Any, closure: dict[str, Any]) -> dict[s
             current = ""
         if current != digest:
             changed.append({"path": path, "before": digest, "after": current or None})
-    checked_states = 0
-    for path, before in states.items():
-        checked_states += 1
-        try:
-            state = _document_state(backend, {"assembly": path})
-        except Exception as exc:  # noqa: BLE001 - unreadable after the fact is a change
-            drifted.append({"path": path, "problem": "unreadable", "error": f"{type(exc).__name__}: {exc}"})
-            continue
-        after = {"active_configuration": state["active_configuration"]}
-        expected = {"active_configuration": before["active_configuration"]}
-        if after != expected:
-            drifted.append({"path": path, "before": expected, "after": after})
-    if changed or drifted:
+    if changed:
         raise BridgeError(
             "cad_source_changed",
             "a working-tree document changed while the snapshot was being captured",
-            {"changed": changed[:20], "state_drift": drifted[:20], "count": len(changed) + len(drifted)},
+            {"changed": changed[:20], "count": len(changed)},
             exit_code=3,
         )
-    return {"files_checked": len(recorded), "states_checked": checked_states}
+    return {
+        "files_checked": len(recorded),
+        "states_recorded": len(closure.get("original_states") or {}),
+        "state_scope": "initial_source_observation",
+    }
 
 
 def _capture_axis_references(backend: Any, cfg: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1340,8 +1319,7 @@ def _capture_axis_references(backend: Any, cfg: dict[str, Any]) -> list[dict[str
 
     A joint that names a native component/face must yield numeric evidence
     (point + direction + identity); a backend that cannot resolve it is a
-    capture failure, never a silently skipped record.  Legacy free-text axis
-    references carry no numeric capture and are left to the author.
+    capture failure, never a silently skipped record.
     """
 
     reader = getattr(backend, "capture_axis_reference", None)
@@ -1366,12 +1344,28 @@ def _export_geometry(
     backend: Any, cfg: dict[str, Any], geometry_dir: Path, components: list[str]
 ) -> list[dict[str, Any]]:
     geometry_dir.mkdir(parents=True, exist_ok=True)
+    # Keep one native geometry phase alive across all occurrence reads.
+    # Instance identities stay in the evidence; filenames remain bounded.
+    destinations = {
+        component: str(geometry_dir / f"{index:04d}_{digest_json(component)[:24]}.stl")
+        for index, component in enumerate(sorted(components), start=1)
+    }
+    if len(destinations) != len(components):
+        raise BridgeError("cad_mesh_export_failed", "geometry contains duplicate occurrence identities", exit_code=3)
+    entries = backend.export_component_meshes(destinations)
+    if not isinstance(entries, dict) or set(entries) != set(destinations):
+        raise BridgeError("cad_mesh_export_failed", "geometry export returned a different occurrence set", exit_code=3)
     exported: list[dict[str, Any]] = []
-    for index, component in enumerate(components, start=1):
-        # Assembly instance paths can exceed filesystem filename limits. The
-        # evidence record retains the full identity; filenames stay bounded.
-        target = geometry_dir / f"{index:04d}_{digest_json(component)[:24]}.stl"
-        info = backend.export_component_mesh(component, str(target))
+    for component, destination in destinations.items():
+        target = Path(destination)
+        info = entries[component]
+        if not isinstance(info, dict) or info.get("component") != component or str(info.get("written")) != destination:
+            raise BridgeError(
+                "cad_mesh_export_failed",
+                "geometry export returned a different occurrence or path",
+                {"component": component},
+                exit_code=3,
+            )
         stats = read_stl(target)
         exported.append(
             {
@@ -1451,6 +1445,11 @@ def _freeze_local(
 
         stage = "dependency_closure"
         closure = _dependency_closure(backend, cfg, staging / "source")
+        # The source is retired and the copy is active. Persist their identities before
+        # native reads so a failed geometry capture retains its environment.
+        stage = "environment"
+        environment = capture_environment(backend, worker_version)
+        write_json(staging / "evidence" / "environment.json", environment)
         stage = "readings"
         scene, raw = _capture_readings(backend, cfg, closure, staging / "source")
         write_json(staging / "raw" / "scene_raw.json", raw)
@@ -1483,10 +1482,9 @@ def _freeze_local(
             write_json(staging / "raw" / "geometry.json", geometry_entries)
 
         stage = "verify_sources"
-        # The readings came from the copy; both the reading session and the working tree
-        # still have to hold what they held when the copy was made.
+        # Verify the live copy state and saved original bytes independently.
         backend.verify_sources_unchanged()
-        originals = _verify_originals_unchanged(backend, closure)
+        originals = _verify_originals_unchanged(closure)
         copied = _copy_inventory(staging / "source")
         if copied != closure["copy_files"]:
             changed = sorted(
@@ -1505,7 +1503,6 @@ def _freeze_local(
         write_json(staging / "scene.json", scene_payload)
 
         source_inputs = _source_inputs(cfg, closure)
-        environment = capture_environment(backend, worker_version)
         identity = {
             "provider": SOURCE_KIND,
             "assembly": cfg["assembly"],
@@ -1546,7 +1543,6 @@ def _freeze_local(
             },
         )
         write_json(staging / "evidence" / "collection.json", evidence)
-        write_json(staging / "evidence" / "environment.json", environment)
 
         # Windows cannot rename a directory while CAD owns file handles inside
         # it. Release the owned applications before atomically publishing.

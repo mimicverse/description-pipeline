@@ -1,10 +1,7 @@
-"""惯性积符号约定：``solidworks_positive`` 原始读数必须先转标准张量再旋转/缩放。
+"""Analytic cuboids retain signed cross terms in generation and independent verification.
 
-基准来自 `solidworks-bridge/docs/native-acceptance-20260917.md` 的解析长方体：
-base 0.08×0.06×0.04 m / 1.4976 kg / RPY (0.2,-0.3,0.4)，
-arm 0.025×0.04×0.10 m / 0.78 kg / RPY (-0.25,0.15,-0.35)。
-SolidWorks 的正惯性积记法下，交叉项是 ``∫xy dm`` 等，标准张量要求取相反数；
-生成端与独立校验端各自转换（互不引用），raw 原始读数保持不变。
+The explicit synthetic native protocol exercises arithmetic only; it cannot
+qualify a SolidWorks API or a hardware model.
 """
 
 from __future__ import annotations
@@ -78,15 +75,6 @@ def _cuboid_tensor(mass: float, dims: tuple[float, float, float], rpy: tuple[flo
     return rotation @ principal @ rotation.T
 
 
-def _products_matrix(tensor: np.ndarray) -> list[list[float]]:
-    """标准张量 → SolidWorks 正惯性积记法的原始 9 个数（交叉项取反）。"""
-
-    raw = tensor.copy()
-    off_diagonal = ~np.eye(3, dtype=bool)
-    raw[off_diagonal] = -tensor[off_diagonal]
-    return [[float(value) for value in row] for row in raw]
-
-
 class ProductConventionTests(unittest.TestCase):
     tmp: Path
     backend: support.FixtureCadBackend
@@ -109,19 +97,26 @@ class ProductConventionTests(unittest.TestCase):
             "configuration": "Default",
             "allowed_roots": [str(self.tmp / "cad")],
             "geometry": {"enabled": False},
-            "bodies": [{"id": "base", "name": "base_link", "components": ["base-1"]}],
+            "bodies": [
+                {
+                    "id": "base",
+                    "name": "base_link",
+                    "components": ["base-1"],
+                    "frame": {"coordinate_system": "base_datum"},
+                }
+            ],
             "joints": [],
         }
 
     def tearDown(self) -> None:
         support.cleanup(self.tmp)
 
-    def _benchmark_payload(self, component: str, *, convention: str | None = "solidworks_positive") -> dict:
+    def _benchmark_payload(self, component: str, *, convention: str | None = "solidworks_standard") -> dict:
         entry = BENCHMARK[component]
         payload = support.mass_payload(
             entry["mass"],
             (0.01, -0.02, 0.03) if component == "base-1" else (0.015, 0.005, 0.055),
-            _products_matrix(entry["tensor"]),
+            entry["tensor"].tolist(),
         )
         reference: dict = {"used_api": "IMassProperty2.GetMomentOfInertia(0)"}
         if convention is not None:
@@ -154,7 +149,7 @@ class ProductConventionTests(unittest.TestCase):
 
     # --- 生成端 -------------------------------------------------------
 
-    def test_scene_converts_positive_products_to_the_standard_tensor(self) -> None:
+    def test_scene_preserves_the_standard_signed_tensor(self) -> None:
         snapshot = self._freeze()
         scene = load_scene(snapshot)
         link = scene["links"][0]
@@ -163,12 +158,12 @@ class ProductConventionTests(unittest.TestCase):
         # 场景里是 6 分量（ixx, ixy, ixz, iyy, iyz, izz）
         six = np.array([expected[0, 0], expected[0, 1], expected[0, 2], expected[1, 1], expected[1, 2], expected[2, 2]])
         self.assertLess(float(np.abs(inertia - six).max()), 1e-15)
-        self.assertEqual(link["provenance"]["parts"][0]["product_convention"], "solidworks_positive")
+        self.assertEqual(link["provenance"]["parts"][0]["product_convention"], "solidworks_standard")
 
         raw = json.loads((snapshot / "raw" / "mass_properties.json").read_text(encoding="utf-8"))
-        self.assertGreater(raw["base-1"]["inertia"][0][1], 0.0)  # 原始正惯性积没有被改写
+        self.assertLess(raw["base-1"]["inertia"][0][1], 0.0)  # Signed raw cross terms remain unchanged
 
-    def test_declared_mass_scales_the_converted_tensor_once(self) -> None:
+    def test_declared_mass_scales_the_tensor_once(self) -> None:
         evidence = self.tmp / "spec.json"
         evidence.write_text(json.dumps({"components": {"base-1": {"material": "steel"}}}), encoding="utf-8")
         config = dict(
@@ -198,18 +193,21 @@ class ProductConventionTests(unittest.TestCase):
             self._freeze("no-convention")
         self.assertIn("product_convention", str(raised.exception))
 
-    def test_fixture_reading_without_a_convention_is_treated_as_a_tensor(self) -> None:
-        tensor = BENCHMARK["base-1"]["tensor"]
-        payload = support.mass_payload(1.2, (0.0, 0.0, 0.0), [[float(v) for v in row] for row in tensor])
+    def test_fixture_readings_also_require_an_explicit_convention(self) -> None:
+        payload = support.mass_payload(1.2, inertia=BENCHMARK["base-1"]["tensor"].tolist())
+        payload["reference"].pop("product_convention")
         self.backend.components[0]["mass"] = payload
-        snapshot = self._freeze("fixture-no-convention")
-        scene = load_scene(snapshot)
-        six = np.array([tensor[0, 0], tensor[0, 1], tensor[0, 2], tensor[1, 1], tensor[1, 2], tensor[2, 2]])
-        self.assertLess(float(np.abs(np.array(scene["links"][0]["inertial"]["inertia"]) - six).max()), 1e-18)
+        with self.assertRaises(ConfigError):
+            self._freeze("no-convention")
+
+    def test_positive_product_convention_is_rejected(self) -> None:
+        self.backend.components[0]["mass"] = self._benchmark_payload("base-1", convention="solidworks_positive")
+        with self.assertRaises(ConfigError):
+            self._freeze("unsupported-convention")
 
     # --- 独立校验端 ---------------------------------------------------
 
-    def test_verifier_agrees_with_the_converted_tensor(self) -> None:
+    def test_verifier_agrees_with_the_signed_tensor(self) -> None:
         snapshot = self._freeze("oracle-ok")
         raw_scene = support.read_scene(snapshot)
         definition = self._definition()
@@ -218,14 +216,14 @@ class ProductConventionTests(unittest.TestCase):
         link = next(entry for entry in results if entry["id"].endswith("base_link"))
         self.assertEqual(link["status"], "passed", link["details"])
 
-    def test_verifier_rejects_a_model_with_the_unconverted_sign(self) -> None:
+    def test_verifier_rejects_a_model_with_flipped_cross_terms(self) -> None:
         snapshot = self._freeze("oracle-tamper")
         raw_scene = support.read_scene(snapshot)
         definition = self._definition()
         canonical = canonical_for(raw_scene, definition, snapshot)
         tampered = copy.deepcopy(canonical)
         inertia = tampered["links"][0]["inertial"]["inertia"]
-        for index in (1, 2, 4):  # ixy / ixz / iyz：旧实现漏取反时的符号
+        for index in (1, 2, 4):  # ixy / ixz / iyz
             inertia[index] = -inertia[index]
         results = verify_normalization(raw_scene, definition, snapshot, tampered)
         link = next(entry for entry in results if entry["id"].endswith("base_link"))

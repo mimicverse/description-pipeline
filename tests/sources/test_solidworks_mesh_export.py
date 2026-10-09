@@ -1,18 +1,13 @@
-"""Geometry export must never drop a part's bodies.
-
-SolidWorks answers ``IPartDoc.GetTessTriangles`` from *solid* bodies only, so a
-sheet-body part (the PCB) once exported as "invalid tessellation".  These tests
-drive the adapter with duck-typed COM objects: sheet bodies are tessellated per
-face, mixed parts export both, and a part whose bodies yield no display mesh
-fails instead of writing an empty file.
-"""
+"""Occurrence meshes preserve solids and sheets without shared document reads."""
 
 from __future__ import annotations
 
 import shutil
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
@@ -24,16 +19,20 @@ TRIANGLE = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
 
 
 class FakeFace:
-    def __init__(self, triangles, surface=None):
+    def __init__(self, triangles, surface=None, feature="shaft"):
         self._triangles = triangles
         self._surface = surface
         self.Name = "Face3"
+        self._feature = feature
 
     def GetTessTriangles(self, flag):  # noqa: N802 - SolidWorks API name
         return list(self._triangles)
 
     def GetSurface(self):  # noqa: N802 - SolidWorks API name
         return self._surface
+
+    def GetFeature(self):  # noqa: N802 - SolidWorks API name
+        return SimpleNamespace(Name=self._feature)
 
 
 class FakeSurface:
@@ -52,34 +51,62 @@ class FakeBody:
 class FakeDocument:
     def __init__(self, values):
         self._values = values
+        self.ConfigurationManager = SimpleNamespace(ActiveConfiguration=SimpleNamespace(Name="Default"))
 
     def GetTessTriangles(self, flag):  # noqa: N802 - SolidWorks API name
-        return list(self._values)
+        raise AssertionError("mesh export must not read the shared part document")
 
 
 class FakeComponent:
     def __init__(self, document, bodies):
         self._document = document
         self._bodies = bodies
+        self.ReferencedConfiguration = "Default"
+        self.IsSuppressed = False
+        self.body_calls = []
 
     def GetModelDoc2(self):  # noqa: N802 - SolidWorks API name
-        return self._document
+        raise AssertionError("mesh export must not acquire the shared part document")
 
-    def GetBodies2(self, body_type, visible_only):  # noqa: N802 - SolidWorks API name
-        return list(self._bodies.get(body_type, ()))
+    def GetPathName(self):  # noqa: N802 - SolidWorks API name
+        return "C:/neutral/pcb.SLDPRT"
+
+    def GetBodies2(self, *arguments):  # noqa: N802 - SolidWorks API name
+        self.body_calls.append(arguments)
+        if len(arguments) != 1:
+            raise TypeError("IComponent2.GetBodies2 takes one body type")
+        return list(self._bodies.get(arguments[0], ()))
+
+    def GetChildren(self):  # noqa: N802 - SolidWorks API name
+        return []
 
 
-class FakeComponentOneArg(FakeComponent):
-    """IComponent2 answers GetBodies2 with the body type only."""
-
-    def GetBodies2(self, body_type):  # noqa: N802 - SolidWorks API name
-        return list(self._bodies.get(body_type, ()))
-
-
-def _backend(component) -> SolidWorksBackend:
-    backend = object.__new__(SolidWorksBackend)
-    backend._components = {"pcb-1": component}
-    backend.notes = {}
+def _backend(component, name="pcb-1") -> SolidWorksBackend:
+    backend = SolidWorksBackend()
+    component.Name2 = name
+    path = "C:/neutral/robot.SLDASM"
+    doc = SimpleNamespace(
+        ConfigurationManager=SimpleNamespace(
+            ActiveConfiguration=SimpleNamespace(
+                Name="Default",
+                GetRootComponent3=lambda _resolve: SimpleNamespace(GetChildren=lambda: [component]),
+            )
+        ),
+        IsOpenedReadOnly=True,
+        GetPathName=lambda: path,
+    )
+    backend._sessions["source"] = SimpleNamespace(
+        app=SimpleNamespace(GetOpenDocumentByName=lambda _path: doc),
+        process=SimpleNamespace(alive=lambda: True),
+        closed=False,
+    )
+    session = backend._sessions["source"]
+    session.current_application = lambda: session.app
+    backend._owner_thread = threading.current_thread()
+    backend._scene_document_key = backend._record_source_document(path, "Default")
+    part_key = backend._record_source_document(component.GetPathName(), "Default")
+    backend._source_components = {name: (part_key, "Default")}
+    backend._components = {name}
     return backend
 
 
@@ -94,7 +121,7 @@ class ComponentMeshExportTests(unittest.TestCase):
             FakeDocument([]),
             {0: [], 1: [FakeBody([FakeFace(TRIANGLE)])]},
         )
-        entry = _backend(component).export_component_mesh("pcb-1", self.dest)
+        entry = _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
         self.assertEqual(entry["triangles"], 1)
         self.assertEqual(entry["tessellation_sources"], ["sheet_body_faces"])
         self.assertEqual(entry["bodies"], {"solid": 0, "sheet": 1})
@@ -106,41 +133,77 @@ class ComponentMeshExportTests(unittest.TestCase):
             FakeDocument(list(TRIANGLE)),
             {0: [FakeBody([FakeFace(TRIANGLE)])], 1: [FakeBody([FakeFace(TRIANGLE)])]},
         )
-        entry = _backend(component).export_component_mesh("pcb-1", self.dest)
+        entry = _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
         self.assertEqual(entry["triangles"], 2)
-        self.assertEqual(entry["tessellation_sources"], ["part_document", "sheet_body_faces"])
+        self.assertEqual(entry["tessellation_sources"], ["solid_body_faces", "sheet_body_faces"])
 
-    def test_solid_part_keeps_the_document_tessellation(self):
-        component = FakeComponent(FakeDocument(list(TRIANGLE) * 2), {0: [FakeBody([FakeFace(TRIANGLE)])]})
-        entry = _backend(component).export_component_mesh("pcb-1", self.dest)
+    def test_solid_part_exports_every_occurrence_body(self):
+        component = FakeComponent(
+            FakeDocument([]),
+            {0: [FakeBody([FakeFace(TRIANGLE)]), FakeBody([FakeFace(TRIANGLE)])]},
+        )
+        entry = _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
         self.assertEqual(entry["triangles"], 2)
-        self.assertEqual(entry["tessellation_sources"], ["part_document"])
-        self.assertEqual(entry["bodies"], {"solid": 1, "sheet": 0})
+        self.assertEqual(entry["tessellation_sources"], ["solid_body_faces"])
+        self.assertEqual(entry["bodies"], {"solid": 2, "sheet": 0})
         self.assertIn("GetTessTriangles", entry["used_api"])
+        self.assertEqual(component.body_calls, [(0,), (1,)])
 
-    def test_solid_fallback_uses_body_faces_when_document_is_empty(self):
+    def test_solid_geometry_does_not_need_document_tessellation(self):
         component = FakeComponent(FakeDocument([]), {0: [FakeBody([FakeFace(TRIANGLE)])], 1: []})
-        entry = _backend(component).export_component_mesh("pcb-1", self.dest)
+        entry = _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
         self.assertEqual(entry["tessellation_sources"], ["solid_body_faces"])
         self.assertEqual(read_stl(self.dest).triangles, 1)
+
+    def test_unreadable_body_blocks_instead_of_being_omitted(self):
+        component = FakeComponent(
+            FakeDocument([]),
+            {0: [FakeBody([FakeFace(TRIANGLE)]), FakeBody([FakeFace([])])]},
+        )
+        with self.assertRaises(CadError) as caught:
+            _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
+        self.assertEqual(caught.exception.detail["body_index"], 1)
+        self.assertFalse(self.dest.exists())
+
+    def test_unreadable_occurrence_bodies_block_without_signature_retry(self):
+        class UnreadableComponent(FakeComponent):
+            def GetBodies2(self, *arguments):
+                self.body_calls.append(arguments)
+                raise RuntimeError("component interface unavailable")
+
+        component = UnreadableComponent(FakeDocument(TRIANGLE), {})
+        with self.assertRaises(CadError) as caught:
+            _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        self.assertEqual(caught.exception.code, "cad_component_bodies_unreadable")
+        self.assertEqual(component.body_calls, [(0,)])
+        self.assertFalse(self.dest.exists())
+
+    def test_missing_face_blocks_even_when_other_faces_have_triangles(self):
+        component = FakeComponent(FakeDocument([]), {0: [FakeBody([FakeFace(TRIANGLE), FakeFace([])])]})
+        with self.assertRaises(CadError) as caught:
+            _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
+        self.assertEqual(caught.exception.detail["face_index"], 1)
+        self.assertFalse(self.dest.exists())
 
     def test_bodies_without_display_mesh_fail_instead_of_exporting_nothing(self):
         component = FakeComponent(FakeDocument([]), {0: [], 1: [FakeBody([FakeFace([])])]})
         with self.assertRaises(CadError) as caught:
-            _backend(component).export_component_mesh("pcb-1", self.dest)
+            _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
         self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
         self.assertFalse(self.dest.exists())
 
     def test_empty_part_fails(self):
         component = FakeComponent(FakeDocument([]), {0: [], 1: []})
         with self.assertRaises(CadError) as caught:
-            _backend(component).export_component_mesh("pcb-1", self.dest)
+            _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
         self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
 
     def test_unknown_component_fails(self):
         component = FakeComponent(FakeDocument([]), {})
         with self.assertRaises(CadError) as caught:
-            _backend(component).export_component_mesh("missing-1", self.dest)
+            _backend(component).export_component_meshes({"missing-1": self.dest})
         self.assertEqual(caught.exception.code, "cad_missing_component")
 
 
@@ -150,16 +213,31 @@ class AxisReferenceTests(unittest.TestCase):
 
     def test_cylinder_face_resolves_to_a_native_line(self):
         face = FakeFace(TRIANGLE, FakeSurface([0.01, 0.02, 0.03, 0.0, 0.0, 1.0, 0.005]))
-        record = _backend(self._component_with(face)).capture_axis_reference(
-            {"component": "pcb-1", "face_index": 0}
-        )
+        record = _backend(self._component_with(face)).capture_axis_reference({"component": "pcb-1", "face_index": 0})
         self.assertEqual(record["surface"], "cylinder")
         self.assertEqual(record["axis_point_m"], [0.01, 0.02, 0.03])
         self.assertEqual(record["axis_direction"], [0.0, 0.0, 1.0])
         self.assertEqual(record["radius_m"], 0.005)
-        self.assertEqual(record["face_name"], "Face3")
         self.assertEqual(record["component"], "pcb-1")
+        self.assertEqual(record["selector"], {"component": "pcb-1", "face_index": 0})
+        self.assertEqual(record["face_index"], 0)
+        self.assertNotIn("face_name", record)
         self.assertIn("CylinderParams", record["used_api"])
+
+    def test_named_feature_uses_occurrence_faces_without_shared_document_reads(self):
+        face = FakeFace(TRIANGLE, FakeSurface([0.01, 0.02, 0.03, 0.0, 0.0, 1.0, 0.005]))
+        record = _backend(self._component_with(face)).capture_axis_reference(
+            {"component": "pcb-1", "feature_name": "shaft"}
+        )
+        self.assertEqual(record["radius_m"], 0.005)
+        self.assertEqual(record["axis_point_m"], [0.01, 0.02, 0.03])
+
+    def test_named_feature_ambiguous_cylindrical_faces_block(self):
+        face = FakeFace(TRIANGLE, FakeSurface([0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.005]))
+        component = FakeComponent(FakeDocument([]), {0: [FakeBody([face, face])], 1: []})
+        with self.assertRaises(CadError) as caught:
+            _backend(component).capture_axis_reference({"component": "pcb-1", "feature_name": "shaft"})
+        self.assertEqual(caught.exception.code, "cad_axis_reference_ambiguous")
 
     def test_non_cylindrical_face_fails(self):
         face = FakeFace(TRIANGLE, FakeSurface([0.0, 0.0, 0.0, 0.0, 0.0, 1.0]))
@@ -187,15 +265,14 @@ class AxisReferenceTests(unittest.TestCase):
             _backend(self._component_with(face)).capture_axis_reference({"component": "ghost-1", "face_index": 0})
         self.assertEqual(caught.exception.code, "cad_missing_component")
 
-    def test_component_arity_fallback_is_supported(self):
+    def test_component_body_query_uses_its_native_signature_once(self):
         face = FakeFace(TRIANGLE, FakeSurface([0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.006]))
-        component = FakeComponentOneArg(FakeDocument([]), {0: [FakeBody([face])], 1: []})
-        backend = object.__new__(SolidWorksBackend)
-        backend._components = {"arm-1": component}
-        backend.notes = {}
+        component = FakeComponent(FakeDocument([]), {0: [FakeBody([face])], 1: []})
+        backend = _backend(component, "arm-1")
         record = backend.capture_axis_reference({"component": "arm-1", "face_index": 0})
         self.assertEqual(record["radius_m"], 0.006)
         self.assertIn("IComponent2.GetBodies2(type)", backend.notes["bodies_api:arm-1:0"])
+        self.assertEqual(component.body_calls, [(0,)])
 
 
 if __name__ == "__main__":

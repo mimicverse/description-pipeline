@@ -1,78 +1,67 @@
 # SolidWorks to URDF
 
-`solidworks-to-urdf` captures SolidWorks engineering, builds a self-contained
-URDF delivery, independently verifies it, and submits a model pull request.
-Apache Airflow orchestrates the workflow; a licensed Windows worker performs
-native CAD capture and publication.
+One engineering folder, one operator page, one verified model PR.
 
-## Availability
+`solidworks-to-urdf` freezes native SolidWorks engineering, derives the robot
+model, generates URDF and meshes, independently verifies the delivery, and
+creates or updates its review PR. Airflow coordinates execution on a licensed
+Windows SolidWorks worker.
 
-Published **v1.0.0** supports native capture from a prepared package, verified
-URDF generation, PR submission and frozen replay on Linux or Windows. It still
-requires platform-maintained `robot.yaml` and `cad-revision.json` inputs and a
-six-field Airflow trigger.
+## Use
 
-The **target workflow** accepts only a SolidWorks engineering directory and
-generates those definitions and records automatically. CAD-only definition
-discovery, the one-folder operator page, the embedded viewer and detailed
-engineering-check display are not yet released. The RTX 4080 deployment is
-not commissioned. See [deployment status](docs/deployment.md#release-and-deployment-status).
+Open the single HTTPS address provided by the platform maintainer.
 
-## Target workflow
+1. Prepare saved native engineering under the
+   [mechanical specification](docs/mechanical-handoff-spec.md).
+2. Sign in with Feishu, select its accessible engineering-folder path,
+   and start the run.
+3. Review the six steps and their input/output checks (pending confirmations and
+   per-stage unsupported items stay visible), inspect the verified URDF and joint
+   limits, and open the PR for engineering approval.
 
-Mechanical engineers prepare saved native files under the
-[SolidWorks engineering specification](docs/mechanical-handoff-spec.md).
-They do not author pipeline YAML, manifests, evidence reports or exported models.
+Run history and details show the original submitter's Feishu username, obtained
+automatically through Feishu's authentication API.
 
-```text
-SolidWorks engineering directory
-  → freeze → read CAD → derive definition → build URDF
-  → independently verify → submit review PR
-```
+Mechanical engineers provide SolidWorks files and engineering facts. Robot
+YAML, version manifests, model artifacts and reports are generated. Corrections
+return to CAD or controlled specifications, followed by a new run.
 
-Once the target interface is commissioned, operators use one authenticated page:
+If a check fails, use the affected object and correction report to repair the
+engineering source, then submit a new version. Platform or PR failures retain
+diagnostics for the maintainer to recover the same frozen delivery.
 
-1. Select the engineering directory accessible to the platform.
-2. Start the run and inspect progress, findings and engineering confirmations.
-3. Review the verified URDF, joint motion, quality report and PR.
+See [operations](docs/operations.md) for the full design-to-release workflow
+and [deployment](docs/deployment.md) for installing the Linux server and
+Windows endpoint. Repository routing and credentials are configured once by
+the platform maintainer.
 
-Platform configuration supplies repository routing and worker access. Corrections
-return to CAD or controlled specifications, followed by a new run. The
-[operations guide](docs/operations.md) covers preparation through model release.
+## Delivery
 
-## Runtime and delivery
-
-Fresh capture requires Windows, licensed SolidWorks 2026 (revision 34), Python
-3.12, Git and GitHub CLI. Linux hosts Airflow and can check, rebuild and submit
-a frozen delivery without SolidWorks. Follow the
-[deployment guide](docs/deployment.md) for installation and commissioning.
-
-The delivery contains `urdf/robot.urdf`, local `meshes/`, original inputs,
-collected CAD, raw observations, the canonical model and bound quality reports.
-After installing the recorded tool release and activating its environment,
-check a copied delivery with:
+The self-contained delivery contains `urdf/robot.urdf`, `meshes/`, frozen
+engineering, raw evidence, the canonical model and bound quality reports.
+`reports/stages.json` records each step's inputs, checks, outputs and evidence,
+and which steps actually ran.
+With the recorded tool environment installed, recheck it on Linux or Windows:
 
 ```sh
 description check /path/to/delivery
 ```
 
-A pass establishes the checks in the [quality specification](docs/quality.md).
-Simulation, training and hardware control require separate acceptance. v1.0.0
-exports visual geometry; it does not construct a collision model or control interfaces.
+A pass establishes the [verification gates](docs/quality.md). Model approval,
+simulation, training and hardware control require their own evidence. Release
+1.0 exports visual geometry and physical properties; it does not generate
+collision models or control interfaces.
 
 ## Documentation
 
 | Document | Purpose |
 |---|---|
-| [Design](docs/design.md) | Principles, architecture, organization and workflow |
-| [SolidWorks engineering specification](docs/mechanical-handoff-spec.md) | Requirements for the mechanical team, including automatic checks and engineer confirmations |
-| [Operations](docs/operations.md) | Preparation, execution, correction, review and model release |
-| [Quality](docs/quality.md) | Implemented gates, tolerances, evidence and acceptance limits |
-| [Deployment](docs/deployment.md) | Availability, Windows worker and Linux orchestration |
-| [Airflow installation](deploy/airflow/README.md) | Executable setup and released trigger instructions |
-| [Contributing](CONTRIBUTING.md) | Tool development and verification |
-| [Release procedure](RELEASING.md) | Tool acceptance, packaging and publication |
-| [Changelog](CHANGELOG.md) | Release history |
+| [Design](docs/design.md) | Principles, workflow and engineering organization |
+| [Mechanical specification](docs/mechanical-handoff-spec.md) | SolidWorks requirements, naming and engineering confirmations |
+| [Operations](docs/operations.md) | Prepare, execute, correct, review and release a model |
+| [Deployment](docs/deployment.md) | Install and commission the platform |
+| [Quality](docs/quality.md) | Verification, evidence and acceptance limits |
+| [Contributing](CONTRIBUTING.md) | Development and testing |
+| [Release procedure](RELEASING.md) | Tool acceptance and publication |
 
-The project uses the [Apache License 2.0](LICENSE) and
-[Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md).
+[Apache License 2.0](LICENSE) · [Code of Conduct](CODE_OF_CONDUCT.md)

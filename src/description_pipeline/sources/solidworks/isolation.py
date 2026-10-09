@@ -10,6 +10,9 @@ from pathlib import Path
 
 from .errors import EnvironmentError_
 
+# Published ISldWorks dual-interface IID in the SolidWorks type library.
+ISLDWORKS_IID = "{83A33D22-27C5-11CE-BFD4-00400513BB57}"
+
 
 def registered_executable() -> str:
     if os.name != "nt":
@@ -110,6 +113,7 @@ class WindowsCadProcess:
 def application_for_pid(pid: int):
     """Find the server launched by us, without activating another COM server."""
     import pythoncom
+    import pywintypes
     import win32com.client.dynamic
 
     rot = pythoncom.GetRunningObjectTable()
@@ -122,12 +126,15 @@ def application_for_pid(pid: int):
             continue  # unrelated ROT entries need not support display names
         if display_name != expected:
             continue
-        dispatch = rot.GetObject(moniker).QueryInterface(pythoncom.IID_IDispatch)
-        app = win32com.client.dynamic.DumbDispatch(dispatch)
-        app._FlagAsMethod("GetProcessID")
-        if app.GetProcessID() != pid:
+        # ISldWorks is the vendor's dual application interface. Its generic
+        # IDispatch view can stop serving RPC while this interface remains live.
+        # useIID selects only the Python wrapper; calls use the queried interface.
+        dispatch = rot.GetObject(moniker).QueryInterface(pywintypes.IID(ISLDWORKS_IID), pythoncom.IID_IDispatch)
+        # Vendor DISPID166: GetProcessID() -> VT_I4, a method (not a property).
+        actual = dispatch.InvokeTypes(166, 0, pythoncom.DISPATCH_METHOD, (pythoncom.VT_I4, 0), ())
+        if type(actual) is not int or actual != pid:
             raise EnvironmentError_("cad_process_identity_mismatch", "COM server does not match the owned process")
-        return app
+        return win32com.client.dynamic.DumbDispatch(dispatch)
     return None
 
 
@@ -139,35 +146,91 @@ class CadSession:
         self._binder = binder or application_for_pid
         self.startup_timeout = startup_timeout
         self.app = None
+        self._owner_thread = None
+        self.closed = False
 
     def connect(self, cancelled: threading.Event):
+        if self.closed:
+            raise EnvironmentError_("cad_session_retired", "A closed CAD session cannot reconnect", self.identity())
+        self._owner_thread = threading.current_thread()
         deadline = time.monotonic() + self.startup_timeout
+        app = None
         while not cancelled.is_set() and self.process.alive():
-            app = self._binder(self.process.pid)
-            if app is not None:
+            try:
+                if app is None:
+                    app = self._binder(self.process.pid)
+                # ROT registration precedes completion of startup and add-ins.
+                # SolidWorks requires this gate before external document/API work.
+                ready = app is not None and app.StartupProcessCompleted
+                if type(ready) is not bool:
+                    raise ValueError("StartupProcessCompleted did not return a Boolean")
+            except EnvironmentError_:
+                raise
+            except Exception as error:
+                raise EnvironmentError_(
+                    "cad_startup_unreadable", "Owned SolidWorks startup state could not be read", self.identity()
+                ) from error
+            if time.monotonic() >= deadline:
+                break
+            if ready and not cancelled.is_set() and self.process.alive():
                 self.app = app
                 # The dedicated process serves an external automation command
                 # throughout this session, including gaps between COM calls.
                 app.CommandInProgress = True
                 app.Visible = False
                 return app
-            if time.monotonic() >= deadline:
-                break
             if os.name == "nt":
                 import pythoncom
 
                 pythoncom.PumpWaitingMessages()
             cancelled.wait(0.2)
         reason = "cad_session_cancelled" if cancelled.is_set() else "cad_startup_failed"
-        raise EnvironmentError_(reason, "Owned SolidWorks instance did not become available", self.identity())
+        raise EnvironmentError_(reason, "Owned SolidWorks instance did not complete startup", self.identity())
+
+    def current_application(self):
+        """Acquire this process's current dispatch once at a native boundary.
+
+        The Windows job and process stay unchanged. A revoked application
+        interface is never reused, and losing the owned binding cannot start
+        another server or retry a native call.
+        """
+        if self._owner_thread is not threading.current_thread():
+            raise EnvironmentError_("cad_thread_mismatch", "Acquire CAD interfaces on their owning STA thread")
+        try:
+            if self.app is None or not self.process.alive():
+                raise ValueError("the original owned SolidWorks process is unavailable")
+            app = self._binder(self.process.pid)
+            if app is None:
+                raise ValueError("the owned SolidWorks process has no registered application binding")
+            if not self.process.alive():
+                raise ValueError("the owned SolidWorks process exited during application acquisition")
+        except EnvironmentError_:
+            raise
+        except Exception as error:
+            raise EnvironmentError_(
+                "cad_application_unreadable",
+                "the owned SolidWorks application could not be acquired",
+                self.identity(),
+            ) from error
+        self.app = app
+        return app
 
     def identity(self) -> dict:
-        return {"pid": self.process.pid, "executable": self.process.executable, "ownership": "windows_job"}
+        return {
+            "pid": self.process.pid,
+            "executable": self.process.executable,
+            "ownership": "windows_job",
+            "state": "closed" if self.closed else "active",
+        }
 
     def terminate(self) -> None:
         # Safe from a watchdog thread: no COM reference is touched here.
         self.process.close()
 
     def close(self) -> None:
+        if self.closed:
+            return
         self.app = None
+        self._owner_thread = None
         self.terminate()
+        self.closed = True

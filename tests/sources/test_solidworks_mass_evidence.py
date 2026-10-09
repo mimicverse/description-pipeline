@@ -70,8 +70,13 @@ class MassEvidenceContractTests(unittest.TestCase):
             "allowed_roots": [str(self.tmp / "cad")],
             "geometry": {"enabled": False},
             "bodies": [
-                {"id": "base", "name": "base_link", "components": ["base-1"]},
-                {"id": "arm", "name": "arm_link", "components": ["arm-1"]},
+                {
+                    "id": "base",
+                    "name": "base_link",
+                    "components": ["base-1"],
+                    "frame": {"coordinate_system": "base_datum"},
+                },
+                {"id": "arm", "name": "arm_link", "components": ["arm-1"], "frame": {"coordinate_system": "arm_datum"}},
             ],
             "joints": [],
         }

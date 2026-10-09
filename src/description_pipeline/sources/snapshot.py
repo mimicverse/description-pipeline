@@ -1,4 +1,4 @@
-"""One integrity boundary for every source provider."""
+"""Immutable native SolidWorks evidence and neutral test snapshots."""
 
 from __future__ import annotations
 
@@ -33,8 +33,8 @@ def verify_snapshot(root: Path) -> dict:
         raise PipelineError("Unsupported source manifest schema")
     if manifest.get("evidence_class") not in {"cad", "fixture", "imported"}:
         raise PipelineError("Snapshot evidence class is missing or invalid")
-    if manifest.get("evidence_class") == "cad" and manifest.get("kind") not in {"onshape", "solidworks"}:
-        raise PipelineError("CAD evidence requires a supported native source kind")
+    if manifest.get("evidence_class") == "cad" and manifest.get("kind") != "solidworks":
+        raise PipelineError("CAD evidence requires the native SolidWorks source kind")
     if not manifest.get("kind") or not isinstance(manifest.get("identity"), dict) or not manifest["identity"]:
         raise PipelineError("Snapshot source identity is missing")
     declared = manifest.get("files")

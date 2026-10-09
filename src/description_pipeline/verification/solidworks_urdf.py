@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import math
 import re
-import shutil
-import tempfile
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -23,6 +21,7 @@ from ..io import PipelineError, confined, file_digest, inventory, read_data
 from ..sources.snapshot import verify_snapshot
 from ..sources.solidworks.input import inspect_package
 from ..sources.solidworks.revision import package_inventory, read_revision
+from .consumer import load as load_consumer
 
 QUALITY_SCHEMA = "solidworks-to-urdf.quality/v1"
 POSITION_TOL_M = 5e-5
@@ -110,14 +109,83 @@ class _Gates:
     def add(self, identifier, callback):
         try:
             details = callback() or {}
-            self.checks.append({"id": identifier, "passed": True, "details": details})
+            self.checks.append({"id": identifier, "state": "passed", "passed": True, "details": details})
             return details
         except Exception as error:
             details = {"error": f"{type(error).__name__}: {error}"}
             if isinstance(getattr(error, "details", None), dict):
                 details.update(error.details)
-            self.checks.append({"id": identifier, "passed": False, "details": details})
+            self.checks.append({"id": identifier, "state": "failed", "passed": False, "details": details})
             return None
+
+
+def required_checks(definition=None):
+    """Required independent gates, including every declared body, joint and frame."""
+    identifiers = {
+        "bundle.subject",
+        "input.valid",
+        "source.native_discovery",
+        "tool.identity",
+        "source.integrity",
+        "source.native",
+        "model.schema",
+        "source.raw",
+        "physics.mass_closure_equality",
+        "source.dependencies",
+        "source.coverage",
+        "verification.complete",
+        "model.policy",
+        "physics.independent",
+        "frames.native",
+        "frames.components",
+        "frames.references",
+        "urdf.syntax_names",
+        "urdf.topology",
+        "geometry.coverage",
+        "geometry.assets",
+        "geometry.expected_extent",
+        "physics.expected_mass",
+        "consumer.urdf",
+    }
+    source = (definition or {}).get("source") or {}
+    for body in source.get("bodies", []):
+        identifiers.update(("inertia." + body["name"], "geometry." + body["name"]))
+    for joint in source.get("joints", []):
+        identifiers.add("joints." + joint["name"])
+        if joint["type"] != "fixed":
+            identifiers.add("shafts." + joint["name"])
+    identifiers.update("frames." + frame["name"] for frame in source.get("frames", []))
+    return sorted(identifiers)
+
+
+def require_qualified_report(report):
+    """Reject an incomplete/forged green flag before it can become a boundary pass."""
+    try:
+        _require(isinstance(report, dict), "Quality report must be an object")
+        rows = report.get("checks") or []
+        expected = report.get("required_checks") or []
+        _require(
+            isinstance(rows, list)
+            and isinstance(expected, list)
+            and all(isinstance(row, dict) and isinstance(row.get("id"), str) for row in rows)
+            and all(isinstance(name, str) for name in expected),
+            "Quality gate inventory is malformed",
+        )
+        identifiers = {row["id"] for row in rows}
+        _require(
+            report.get("passed") is True
+            and bool(expected)
+            and len(set(expected)) == len(expected)
+            and set(required_checks()) <= set(expected)
+            and set(expected) <= identifiers
+            and len(identifiers) == len(rows)
+            and all(row.get("state") == "passed" and row.get("passed") is True for row in rows),
+            "URDF verification failed or required checks were not executed; see reports/quality.json",
+        )
+    except PipelineError as error:
+        error.details = report
+        raise
+    return report
 
 
 def _input(root):
@@ -149,6 +217,36 @@ def _native(root, manifest):
     _require(revision.split(".")[0] == "34", "Native inertia API qualification currently covers SolidWorks 34 only")
     _require(collection["limits"]["native_cad"] is True, "Native capture was not recorded")
     return {"solidworks_revision": revision, "configuration": manifest["identity"]["configuration"]}
+
+
+def _native_discovery(package):
+    """Mandatory native-discovery gate: an authored or stripped package fails.
+
+    Every current v1 delivery carries the generated provenance block and the
+    bound raw discovery record; deleting either must fail before publication,
+    so deleting either blocks publication.
+    """
+
+    from .native_discovery import verify_discovery
+
+    report = verify_discovery(Path(package))
+    if report.get("passed") is not True:
+        failures = report.get("errors") or [{"code": "discovery.missing", "message": "no native discovery record"}]
+        summary = "; ".join(f"{item.get('code')}: {item.get('message')}" for item in failures[:5])
+        error = PipelineError(f"native discovery verification failed: {summary}")
+        error.details = {
+            "failures": [
+                {"code": item.get("code"), "message": item.get("message"), "detail": item.get("detail")}
+                for item in failures[:8]
+            ]
+        }
+        raise error
+    return {
+        "contract": report.get("contract"),
+        "discovery_sha256": report.get("discovery_sha256"),
+        "bodies": report.get("bodies"),
+        "joints": report.get("joints"),
+    }
 
 
 def _dependencies(root, definition):
@@ -425,55 +523,38 @@ def _geometry(root, body, node, model_link, geometry, components, body_pose, urd
     return used, world_points
 
 
-def _consumer(root, document):
-    import mujoco
-
-    with tempfile.TemporaryDirectory(prefix="description-consumer-") as directory:
-        temporary = Path(directory)
-        shutil.copytree(root / "meshes", temporary / "meshes")
-        (temporary / "urdf").mkdir()
-        # Explicit reader options retain visuals and fixed reference frames.
-        tree = ET.fromstring(ET.tostring(document))
-        compiler = ET.SubElement(ET.SubElement(tree, "mujoco"), "compiler")
-        compiler.attrib.update(discardvisual="false", fusestatic="false", strippath="false")
-        path = temporary / "urdf/robot.urdf"
-        ET.ElementTree(tree).write(path, encoding="utf-8", xml_declaration=True)
-        loaded = mujoco.MjModel.from_xml_path(str(path))
-        moving = [joint for joint in document.findall("joint") if joint.attrib["type"] != "fixed"]
-        _require(loaded.njnt == len(moving), "Consumer loaded another movable joint set")
-        _require(loaded.nbody == len(document.findall("link")) + 1, "Consumer dropped a link")
-        for joint in moving:
-            _require(
-                mujoco.mj_name2id(loaded, mujoco.mjtObj.mjOBJ_JOINT, joint.attrib["name"]) >= 0,
-                "Consumer lost a joint name",
-            )
-        return {
-            "reader": "mujoco",
-            "version": mujoco.__version__,
-            "bodies": loaded.nbody,
-            "joints": loaded.njnt,
-            "scope": "URDF loading only; no simulation qualification",
-        }
-
-
 def evaluate_bundle(root: Path) -> dict:
     """Recompute the quality report without reading the saved quality decision."""
     root = Path(root)
     gates = _Gates()
     subject = gates.add("bundle.subject", lambda: {"sha256": subject_digest(root)})
     definition = gates.add("input.valid", lambda: _input(root))
+    gates.add("source.native_discovery", lambda: _native_discovery(root / "input"))
     gates.add("tool.identity", lambda: _tool(root))
     manifest = gates.add("source.integrity", lambda: verify_snapshot(root / "evidence"))
     if manifest is not None:
         gates.add("source.native", lambda: _native(root, manifest))
     model = gates.add("model.schema", lambda: _model(root))
     raw = gates.add("source.raw", lambda: read_data(confined(root / "evidence", "raw/scene_raw.json")))
+    gates.add("physics.mass_closure_equality", lambda: _mass_closure_equality(root))
     if definition is not None:
         gates.add("source.dependencies", lambda: _dependencies(root, definition))
     if definition is not None and model is not None and raw is not None:
         source = definition["source"]
         gates.add("source.coverage", lambda: _entities(source, raw, model))
         gates.add("verification.complete", lambda: _verify_model(root, gates, definition, model, raw))
+    required = required_checks(definition)
+    observed = {check["id"] for check in gates.checks}
+    for identifier in required:
+        if identifier not in observed:
+            gates.checks.append(
+                {
+                    "id": identifier,
+                    "state": "not_run",
+                    "passed": False,
+                    "details": {"reason": "A required prerequisite failed; this check was not executed"},
+                }
+            )
     # Large internal inputs are read by later gates, not copied into the report.
     internal = {
         "input.valid",
@@ -496,6 +577,7 @@ def evaluate_bundle(root: Path) -> dict:
         "subject_status": "bound" if subject else "unavailable",
         "passed": bool(gates.checks) and all(check["passed"] for check in gates.checks),
         "checks": gates.checks,
+        "required_checks": required,
     }
 
 
@@ -516,6 +598,12 @@ def _model(root):
     from ..model import Robot
 
     return Robot.from_dict(read_data(confined(root, "model/robot.json"))).to_dict()
+
+
+def _mass_closure_equality(root):
+    from .solidworks_physics import verify_urdf_mass_equality
+
+    return verify_urdf_mass_equality(root)
 
 
 def _verify_model(root, gates, definition, model, raw):
@@ -604,7 +692,7 @@ def _verify_model(root, gates, definition, model, raw):
     gates.add("geometry.assets", lambda: _assets(root, used))
     gates.add("geometry.expected_extent", lambda: _extent(points, definition["checks"]["expected_extent_m"]))
     gates.add("physics.expected_mass", lambda: _mass(model, definition["checks"]["expected_mass_kg"]))
-    gates.add("consumer.urdf", lambda: _consumer(root, document))
+    gates.add("consumer.urdf", lambda: load_consumer(root))
 
 
 def _physics(root, source, model, verifier):
@@ -679,6 +767,8 @@ def check_bundle(root: Path) -> dict:
         saved = read_data(confined(Path(root), "reports/quality.json"))
         _require(saved == report, "Saved quality report differs from recomputation")
     except (OSError, ValueError) as error:
-        report["checks"].append({"id": "report.binding", "passed": False, "details": {"error": str(error)}})
+        report["checks"].append(
+            {"id": "report.binding", "state": "failed", "passed": False, "details": {"error": str(error)}}
+        )
         report["passed"] = False
     return report

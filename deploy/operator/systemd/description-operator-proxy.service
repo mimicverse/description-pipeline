@@ -1,0 +1,17 @@
+[Unit]
+Description=Authenticated HTTPS reverse proxy for the operator URL
+After=network-online.target description-portal.service
+Wants=network-online.target description-portal.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=OPERATOR_STATE=@OPERATOR_STATE@
+ExecStartPre=@NGINX_BIN@ -t -c @OPERATOR_NGINX_CONF@ -p @OPERATOR_STATE@/nginx
+ExecStart=@NGINX_BIN@ -c @OPERATOR_NGINX_CONF@ -p @OPERATOR_STATE@/nginx
+UMask=0077
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

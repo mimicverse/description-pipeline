@@ -23,21 +23,22 @@ def run(*args: str, cwd: Path | None = None) -> str:
 
 class Fixture:
     def __init__(self) -> None:
-        self.tmp = Path(tempfile.mkdtemp(prefix="urdf-pr-test-"))
+        self.temp = tempfile.TemporaryDirectory(prefix="urdf-pr-test-")
+        self.tmp = Path(self.temp.name)
         self.remote = self.tmp / "remote.git"
         run("git", "init", "--bare", "-b", "feature/m3.0", str(self.remote))
         self.seed = self.tmp / "seed"
         self.seed.mkdir()
         run("git", "init", "-b", "feature/m3.0", cwd=self.seed)
-        for key, value in (("user.email", "t@example.com"), ("user.name", "T")):
+        for key, value in (("user.email", "t@example.com"), ("user.name", "T"), ("core.autocrlf", "false")):
             run("git", "config", key, value, cwd=self.seed)
-        (self.seed / "README.md").write_text("base\n", encoding="utf-8")
+        (self.seed / "README.md").write_bytes(b"base\n")
         run("git", "add", "-A", cwd=self.seed)
         run("git", "commit", "-m", "base", cwd=self.seed)
         run("git", "remote", "add", "origin", str(self.remote), cwd=self.seed)
         run("git", "push", "-u", "origin", "feature/m3.0", cwd=self.seed)
         self.repo = self.tmp / "repo"
-        run("git", "clone", str(self.remote), str(self.repo))
+        run("git", "clone", "-c", "core.autocrlf=false", str(self.remote), str(self.repo))
         for key, value in (("user.email", "t@example.com"), ("user.name", "T")):
             run("git", "config", key, value, cwd=self.repo)
         self.bundle = self.tmp / "bundle"
@@ -98,6 +99,7 @@ class Fixture:
 class PublishTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fx = Fixture()
+        self.addCleanup(self.fx.temp.cleanup)
         self.gh_calls: list[tuple[str, ...]] = []
         self.rest_payloads: list[dict] = []
         self.gh_mode = "ok"
@@ -123,8 +125,6 @@ class PublishTests(unittest.TestCase):
             if args[:2] == ("pr", "create"):
                 self.pr_exists = True
                 return "https://github.com/example/m3.0/pull/1\n"
-            if args[:2] == ("pr", "edit"):
-                raise subprocess.CalledProcessError(1, ["gh", *args], stderr="retired Projects classic GraphQL")
             if args[0] == "api":
                 self.assertEqual(args[:4], ("api", "--method", "PATCH", "repos/example/m3.0/pulls/1"))
                 self.rest_payloads.append(json.loads(Path(args[args.index("--input") + 1]).read_text(encoding="utf-8")))
@@ -201,7 +201,111 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(len([c for c in self.gh_calls if c[:2] == ("pr", "create")]), 1)
         self.assertGreaterEqual(len(self.rest_payloads), 2)
 
-    def test_existing_pr_update_survives_legacy_cli_and_preserves_utf8_metadata(self):
+    def test_original_record_bytes_survive_git_and_fresh_checkout(self):
+        name = "input/records/specification.txt"
+        payload = b'\xef\xbb\xbf{"drive": {\r\n  "effort": 12,\r\n  "velocity": 2\r\n}}\r\n'
+        path = self.fx.bundle / name
+        path.parent.mkdir(parents=True)
+        path.write_bytes(payload)
+        for setting in ("true", "false", "input"):
+            with self.subTest(core_autocrlf=setting):
+                run("git", "config", "core.autocrlf", setting, cwd=self.fx.repo)
+                before = subject_digest(self.fx.bundle)
+                result = self.submit()
+                self.assertIn(result["state"], {"published", "noop"})
+                self.assertEqual(result["subject"], before)
+                run("git", "fetch", "--quiet", "origin", BRANCH, cwd=self.fx.repo)
+                committed = subprocess.check_output(["git", "show", f"FETCH_HEAD:{name}"], cwd=self.fx.repo)
+                self.assertEqual(committed, payload)
+                clone = self.fx.tmp / f"checkout-{setting}"
+                run(
+                    "git",
+                    "clone",
+                    "-q",
+                    "-c",
+                    f"core.autocrlf={setting}",
+                    "--branch",
+                    BRANCH,
+                    str(self.fx.remote),
+                    str(clone),
+                )
+                self.assertEqual((clone / name).read_bytes(), payload)
+                self.assertEqual(subject_digest(clone), before)
+                self.assertEqual((clone / ".gitattributes").read_bytes(), urdf_pr.GIT_ATTRIBUTES)
+
+    def test_global_filters_and_encoding_do_not_transform_delivery(self):
+        attributes = self.fx.tmp / "global-attributes"
+        attributes.write_text("input/** text filter=must_not_run working-tree-encoding=UTF-16\n", encoding="ascii")
+        run("git", "config", "core.attributesfile", str(attributes), cwd=self.fx.repo)
+        run("git", "config", "filter.must_not_run.clean", "description-filter-must-not-run", cwd=self.fx.repo)
+        run("git", "config", "filter.must_not_run.required", "true", cwd=self.fx.repo)
+        result = self.submit()
+        self.assertEqual(result["state"], "published")
+        self.assertEqual(self.fx.remote_head(), result["commit"])
+
+    def test_deeper_attributes_block_before_commit_or_push(self):
+        self.fx.write_bundle("one\n", extra={"input/.gitattributes": "* text=auto\n"})
+        result = self.submit()
+        self.assertEqual(result["error"], "git_attributes_conflict")
+        self.assertEqual(result["detail"]["attribute"], "text")
+        self.assertTrue(result["detail"]["file"].startswith("input/"))
+        self.assertEqual(self.fx.remote_head(), "")
+
+    def test_info_attribute_overrides_block_before_commit_or_push(self):
+        attributes = self.fx.repo / ".git/info/attributes"
+        for rule in ("text=auto", "filter=external", "working-tree-encoding=UTF-16"):
+            with self.subTest(attribute=rule):
+                attributes.write_text(f"README.md {rule}\n", encoding="ascii")
+                result = self.submit()
+                self.assertEqual(result["error"], "git_attributes_conflict")
+                self.assertEqual(result["detail"]["file"], "README.md")
+                self.assertEqual(result["detail"]["attribute"], rule.split("=", 1)[0])
+                self.assertEqual(self.fx.remote_head(), "")
+
+    def test_bundle_cannot_replace_generated_git_policy(self):
+        self.fx.write_bundle("one\n", extra={".gitattributes": "* text\n"})
+        events = []
+        result = self.submit(on_event=events.append)
+        self.assertEqual(result["state"], "published")
+        run("git", "fetch", "--quiet", "origin", BRANCH, cwd=self.fx.repo)
+        actual = subprocess.check_output(["git", "show", "FETCH_HEAD:.gitattributes"], cwd=self.fx.repo)
+        self.assertEqual(actual, urdf_pr.GIT_ATTRIBUTES)
+        boundary = next(event["check"] for event in events if event.get("check", {}).get("id") == "publication.git")
+        self.assertEqual(len(boundary["details"]["git_attributes_sha256"]), 64)
+
+    def test_native_filenames_with_unicode_and_spaces_publish_unchanged(self):
+        name = "input/结构 零件.SLDPRT"
+        self.fx.write_bundle("one\n", extra={name: "neutral engineering fixture\n"})
+        self.fx.seal("r1", None, fresh=True)
+        result = self.submit()
+        self.assertEqual(result["state"], "published")
+        run("git", "fetch", "--quiet", "origin", BRANCH, cwd=self.fx.repo)
+        actual = subprocess.check_output(["git", "show", f"FETCH_HEAD:{name}"], cwd=self.fx.repo)
+        self.assertEqual(actual, (self.fx.bundle / name).read_bytes())
+
+    def test_nonregular_git_policy_does_not_write_outside_worktree(self):
+        outside = self.fx.tmp / "outside-policy"
+        outside.write_bytes(b"original\n")
+        worktree = self.fx.tmp / "policy-symlink"
+        worktree.mkdir()
+        try:
+            (worktree / ".gitattributes").symlink_to(outside)
+        except OSError:
+            self.skipTest("symlink creation requires platform privileges")
+        with self.assertRaises(urdf_pr.PrError) as caught:
+            urdf_pr._preserve_git_bytes(worktree)
+        self.assertEqual(caught.exception.code, "git_metadata_nonregular")
+        self.assertEqual(outside.read_bytes(), b"original\n")
+
+    def test_committed_policy_tampering_still_blocks_push(self):
+        hook = self.fx.repo / ".git/hooks/pre-commit"
+        hook.write_text("#!/bin/sh\nprintf '* text\\n' > .gitattributes\ngit add .gitattributes\n", encoding="ascii")
+        hook.chmod(0o755)
+        result = self.submit()
+        self.assertIn(result["error"], {"committed_git_metadata_mismatch", "commit_left_dirty"})
+        self.assertEqual(self.fx.remote_head(), "")
+
+    def test_existing_pr_update_preserves_utf8_metadata(self):
         self.submit()
         message = 'Update left wrist — 左腕 "$literal" `text`\nDetailed review'
         result = self.submit(message=message)
@@ -319,6 +423,8 @@ class PublishTests(unittest.TestCase):
 
     def test_case_duplicate_paths_rejected(self) -> None:
         (self.fx.bundle / "readme.md").write_text("dup\n", encoding="utf-8")
+        if (self.fx.bundle / "readme.md").samefile(self.fx.bundle / "README.md"):
+            self.skipTest("Case-distinct files require a case-sensitive filesystem")
         self.assertEqual(self.submit()["error"], "duplicate_path")
         self.assertEqual(self.fx.remote_head(), "")
 
@@ -326,7 +432,10 @@ class PublishTests(unittest.TestCase):
         outside = self.fx.tmp / "outside"
         outside.mkdir()
         (outside / "keep.txt").write_text("keep\n", encoding="utf-8")
-        os.symlink(outside, self.fx.seed / "input")
+        try:
+            os.symlink(outside, self.fx.seed / "input", target_is_directory=True)
+        except OSError:
+            self.skipTest("Symlink creation requires platform privileges")
         run("git", "add", "-A", cwd=self.fx.seed)
         run("git", "commit", "-m", "symlinked input", cwd=self.fx.seed)
         run("git", "push", "origin", "feature/m3.0", cwd=self.fx.seed)

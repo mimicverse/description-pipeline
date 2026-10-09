@@ -1,143 +1,158 @@
 # Operations
 
-This guide follows the target workflow from engineering preparation to model
-release: **one URL → login → one SolidWorks directory → verification → review PR**.
-The mechanical team supplies native engineering; the pipeline generates model
-definitions, manifests and reports.
+Operators use one authenticated page: **SolidWorks folder → run → checks,
+URDF preview and review PR**. Installation belongs to
+[deployment](deployment.md).
 
-This interface is not yet released. v1.0.0 requires a prepared package and
-six-field Airflow trigger maintained by the platform team. See
-[deployment status](deployment.md#release-and-deployment-status) and the
-[released trigger procedure](../deploy/airflow/README.md#run-and-inspect-a-delivery).
+## 1. Complete the engineering model
 
-## 1. Prepare the SolidWorks engineering model
+Follow the [mechanical specification](mechanical-handoff-spec.md). Establish
+scope, names, rigid connections, motion, datums, zero, signed directions,
+limits, materials and component identities in the native engineering model.
 
-Follow the [SolidWorks engineering specification](mechanical-handoff-spec.md).
-Confirm assembly organization and dependencies, rigid connections and motion,
-root/body/interface datums, mechanical zero, signed directions, limits,
-materials and the real component identities used for controlled specifications.
-Its responsibility matrix distinguishes automatic consistency checks from the
-engineering facts that the responsible engineers must inspect and confirm.
+Resolve drive specifications and independent mass/dimension budgets through
+CAD references to approved, versioned records in the platform's controlled library.
+Mechanical engineers maintain these references in SolidWorks; copying a record
+into the submitted folder does not override the library. Responsible engineers confirm
+facts that automatic consistency checks cannot establish, including actual
+assembly behavior, full-range clearance and applicability of specifications.
 
-Complete native engineering properties or platform-provided CAD annotations
-only where standard assembly contents cannot express a necessary fact. Do not
-create `robot.yaml`, revision JSON, pipeline evidence texts or a separate
-manual joint/body mapping file.
+Do not prepare pipeline YAML, revision manifests or exported URDF files.
+The pipeline derives those artifacts from the saved engineering facts.
+Missing or ambiguous facts produce findings requiring correction at their source.
 
-Review every mechanism's actual connection order, axis relationships, positive
-motion, interface attachment and clearance throughout its working range.
-For coupled mechanisms, preserve and check the actual coupling.
+## 2. Collect and save a controlled version
 
-## 2. Save and collect the engineering directory
+Save the designated delivery configuration and collect its native dependencies
+with Pack and Go or an equivalent method. Reopen the collected assembly without
+relying on the original directory and confirm the intended configuration.
 
-Select the declared delivery configuration in SolidWorks. Confirm its zero or
-reference pose and any declared zero offsets, force-rebuild, resolve errors
-and save all referenced documents. Collect dependencies with
-Pack and Go or an equivalent native mechanism. Reopen the collected copy and
-verify that it resolves without the original workstation paths.
+Retain the product identity, structural revision, owner and change record in
+native engineering properties or linked controlled records. A submitted version
+must remain retrievable and unchanged. Engineering corrections create a new
+structural version.
 
-Retain the controlled structural version. Changed engineering contents create
-a new version; the previous input remains available.
+For an existing model, `dp.parent_revision` names the structural revision in its
+current review-branch delivery, or in the configured base if no review delivery
+exists. Each new delivery continues that baseline. Reusing a revision requires
+identical revision content.
 
-The directory must be readable by the Linux server or Windows worker. A path
-on a different laptop is not accessible merely because it is pasted into a
-browser. Platform maintainers establish shared/drop locations once; operators
-need no per-run SSH or transfer command sequence.
+Make the folder accessible to the platform. The path may name a directory on
+the Linux server or the configured Windows worker. Linux folders must be within
+`SOLIDWORKS_HANDOFF_ROOT`; Windows folders must be within the endpoint's
+`handoff_roots`. A browser cannot read an arbitrary folder on another computer
+merely from its path.
 
-## 3. Run from the single operator page
+## 3. Start and inspect the run
 
-Once commissioned, open the operator URL, log in, select or paste the engineering
-directory path and start. Access, routing and run identity are managed by the platform.
+Sign in to the operator page with Feishu. Select the engineering
+folder and click **Start**. Hardware, revision, repository and branch are derived
+or configured by the platform; they are not operator form fields.
 
-The target interface accepts an absolute Linux folder, an absolute folder on
-the configured Windows worker, or a path relative to its configured package
-root (`package_root`).
-Linux inputs are transported automatically; all inputs become a fixed native
-inventory before execution.
+Approved Feishu users may start new pipeline runs and view shared results. A run
+records its initiator's stable authenticated identity and shows that operator's
+original Feishu username.
 
-Follow these stages:
+If a run fails in a transport step that the platform positively classifies as
+recoverable, its initiator and platform administrators can use the page's Retry
+action. Retry continues the same DAG run and native job with the frozen inputs,
+so no capture is repeated and captured evidence and delivered artifacts are
+never edited. Native terminal failures are not retried; their diagnostics
+require corrected inputs or configuration and a new run. Other approved users
+can view shared results but cannot operate the run, and administrators retain
+broader platform administration.
 
-| Stage | Expected result |
-|---|---|
-| Collect and freeze | Main assembly, source version, configuration and native file inventory recorded |
-| Read CAD | Actual instances, mates, datums, materials and engineering annotations captured |
-| Derive definition | Robot semantics and applicable specifications resolved; `robot.yaml` or equivalent model generated |
-| Build | Canonical model, URDF and local meshes generated |
-| Verify | Independent native, physical, XML, mesh and loading gates evaluated |
-| Submit | Passing delivery bound to its Git commit and review PR |
+Run history and details show the original submitter's verified Feishu username,
+including when viewed by another operator. The platform reads the name through
+Feishu's authentication API and fills it in automatically.
 
-The platform resolves the hardware destination from native identity. Missing
-or ambiguous identity blocks publication; missing mechanical facts produce
-findings at the corresponding CAD object. Parameters are never invented to
-make a stage pass.
+The page shows the [six engineering steps](design.md#2-how-the-system-works):
+freeze inputs, discover structure, capture evidence, generate URDF, verify and
+publish the review PR. Open each step's **Input**, **Input QC**, **Output** and
+**Output QC** to inspect checks, affected objects, recorded values and file hashes.
+Generation-input inspection belongs to capture; it is not another operator step.
 
-The required check view separates automatic results from engineering
-confirmations. Each item shows its evidence, affected CAD objects and corrective
-guidance. Failed, unexecuted, unsupported and unconfirmed items remain visible;
-automatic success does not complete an outstanding engineering review.
+A completed step requires its boundary checks to pass. Failed checks retain their
+diagnostics, and later steps show blocked. Checks whose prerequisites failed show
+not run. Each run records which steps actually ran; steps outside the run are
+shown as not executed. Engineering confirmations stay pending under the relevant
+step, and unsupported items never become implicit passes.
+Airflow's DAG documentation shows the contract; `wait_for_job` logs and its
+`engineering_stages` XCom retain terminal results even when `confirm_job` is blocked.
+The detailed local receipt is `reports/stages.json`.
 
-Retries within one Airflow run reuse its frozen input and native UUID. Starting
-a new run creates a new job; changing source contents never silently changes
-an already frozen run.
+Automatic Airflow transport retries retain the frozen input and native job UUID;
+they reconnect to the existing job without repeating capture. A terminal native
+failure, including an endpoint restart during capture, requires a new run.
+Changed inputs also require a new run. Automatic checks and engineering
+confirmations remain separate; pending or unsupported items never become
+implicit passes.
 
-## 4. Resolve findings
+## 4. Correct findings
 
-The page reports the failed stage and relevant CAD object, property, mate,
-configuration or specification source. Diagnostic records remain available to
-platform maintainers.
+Use the affected CAD object, mate, configuration, property or specification
+reference shown in the result to locate the problem.
 
 | Finding | Correction |
 |---|---|
-| Missing dependency or wrong configuration | Repair and save the native engineering package |
-| Ambiguous rigid body or joint | Repair hierarchy, mates or the approved native CAD annotation |
-| Missing/incorrect datum, zero or positive direction | Repair reference geometry and the declared CAD state |
-| Limit or drive specification missing | Correct native limit definitions, component identity or the controlled specification record |
-| Material or mass inconsistency | Correct actual material, configuration, physical authority or model simplification |
-| Verification disagreement | Trace the finding to CAD evidence, the resolved specification or a generation rule |
-| Repository/PR failure | Platform maintainer restores publication; retain the verified delivery |
+| Dependency, configuration or saved-state error | Repair and save the native engineering package |
+| Ambiguous body, joint, name or frame | Correct native connections, approved names and reference geometry |
+| Zero, direction, limit or drive disagreement | Correct its mechanical definition or controlled specification |
+| Material, mass or inertia disagreement | Correct material assignments, scope or the documented physical source |
+| Independent verification disagreement | Trace the native evidence and generation rule; preserve the failed diagnostics |
+| Infrastructure error | Restore the service; inspect diagnostics and start a new run if the native job failed |
+| PR error | Restore publication access and submit the retained verified delivery |
 
-Correct the source and run a new version. Do not hand-edit generated YAML, XML,
-meshes, inertia or reports. A failed quality gate prevents publication. A PR
-service failure after a verified push retains the commit/receipt and does not
-require recapturing CAD merely to retry publication.
+Return corrections to CAD, controlled records or tool rules, then submit a new
+version. Do not edit generated definitions, XML, meshes or reports. A failed
+required quality gate prevents publication. A publication-service failure
+retains the verified delivery and any available commit/PR receipt for recovery.
 
 ## 5. Review and release the model
 
-Inspect the actual verified URDF on the same operator page. Check root/body
-placement, individual positive motions, mirrored-instance differences, ranges,
-endpoint poses and interface motion. Compare with the native engineering
-state and the independent report, not just the overall silhouette.
+On the same page, inspect the actual verified URDF. Check body placement,
+individual positive motions, limits, endpoint poses, mirrored occurrences and
+tool/sensor frames against the native engineering state and reports.
 
-Confirm the source version, frozen identity, tool identity, quality subject and
-PR commit, and that necessary engineering confirmations apply to that version.
-The model reviewer approves mechanical meanings and accepted uses;
-a candidate PR is not automatic model release.
-
-A portable copied delivery can be independently rechecked after installing the
-recorded tool release and activating its environment:
-
-```sh
-description check /path/to/reviewed/delivery
-```
+Confirm that input revision, tool identity, verified subject, commit and
+engineering confirmations refer to the same version. Review the PR and approve
+the intended uses before freezing the model release. Automatic PR creation is
+candidate submission; model release requires engineering approval.
+Record approvals in the subject-bound PR or controlled engineering records.
 
 URDF loading, kinematic consistency, simulation, training and hardware control
-are separate acceptance results. Keep native inputs, generated provenance and
-reports with the approved model.
+have separate acceptance criteria. Retain native inputs and bound evidence
+with the approved model.
 
-## 6. Platform diagnostics and frozen replay
+## 6. Independent review and recovery
 
-Platform maintainers use the following commands in the recorded tool environment.
-Fresh native reading requires the licensed Windows worker. A complete frozen
-delivery can be checked and rebuilt on Linux or Windows without opening CAD:
+Platform maintainers use the recorded tool environment to verify or rebuild a
+complete frozen delivery on Linux or Windows without opening SolidWorks:
 
 ```sh
-description check /path/to/frozen-delivery
-description rebuild /path/to/frozen-delivery --output /path/to/rebuilt-delivery
-description submit /path/to/rebuilt-delivery --repository /path/to/model-clone --base feature/arm
+description check /path/to/delivery
+description rebuild /path/to/delivery --output /path/to/rebuilt-delivery
 ```
 
-The final command publishes a candidate PR after verification; use a dedicated,
-clean model clone with GitHub authentication. Rebuild preserves the
-archived native evidence and generated definitions; it does not turn generated
-YAML into a human authoring input. Infrastructure, authentication and worker
-commissioning belong to [deployment.md](deployment.md).
+These commands require a complete delivery. A failed or interrupted capture
+cannot be rebuilt from partial evidence; preserve its diagnostics and start a new
+run after resolving the cause.
+
+Maintenance runs declare a narrower `execution_scope`: `description rebuild`
+executes generation and verification (plus publication when a repository is
+given) against the frozen evidence, and `description submit` executes publication
+only. They do not reopen or re-qualify the native stages freeze, discover or
+capture; their `reports/stages.json` marks those stages as out of scope. The
+detailed six-stage completeness belongs to a complete endpoint job.
+
+For publication recovery, use the retained verified delivery and a dedicated
+clean model clone with GitHub access. Work on a copy of the delivery so the
+failed run and its diagnostic receipts remain intact:
+
+```sh
+description submit /path/to/verified-delivery --repository /path/to/model-clone --base feature/arm
+```
+
+Rebuild preserves native evidence and generated definitions. Submission
+reverifies the copied delivery and committed Git blobs before updating its PR.
+These maintenance commands do not create an alternative engineering input path.
