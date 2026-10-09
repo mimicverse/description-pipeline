@@ -181,8 +181,12 @@ def receive_folder(
             raise UploadRejected(500, "无法创建上传暂存目录") from error
         try:
             receiver = _Receiver(staging, root)
-            _parse_body(environ["wsgi.input"], boundary, receiver, declared)
-            receipt = receiver.finish()
+            try:
+                _parse_body(environ["wsgi.input"], boundary, receiver, declared)
+                receipt = receiver.finish()
+            except BaseException:
+                receiver.close()
+                raise
             os.rename(staging, final)
         except BaseException:
             _remove_tree(staging)
@@ -229,7 +233,7 @@ class _Receiver:
         self.intake_root = intake_root
         self.top: str | None = None
         self.files: dict[str, str] = {}
-        self.directories: set[str] = set()
+        self.directories: dict[str, str] = {}
         self.count = 0
         self.total = 0
         self._last_disk_check = 0
@@ -299,10 +303,15 @@ class _Receiver:
         if key in self.directories:
             raise UploadRejected(400, "上传包含文件与目录同名冲突")
         for index in range(1, len(parts)):
-            prefix = "/".join(parts[:index]).casefold()
-            if prefix in self.files:
+            prefix = "/".join(parts[:index])
+            prefix_key = prefix.casefold()
+            if prefix_key in self.files:
                 raise UploadRejected(400, "上传包含文件与目录同名冲突")
-            self.directories.add(prefix)
+            prior = self.directories.get(prefix_key)
+            if prior is None:
+                self.directories[prefix_key] = prefix
+            elif prior != prefix:
+                raise UploadRejected(400, "目录名称大小写不一致")
         if self.count >= MAX_FILES:
             raise UploadRejected(413, "上传文件数量超过 4096 个上限")
         target = self.staging.joinpath(*parts)
@@ -345,15 +354,14 @@ class _Receiver:
             raise UploadRejected(500, "写入上传文件失败") from error
 
     def _on_part_end(self) -> None:
-        if self._handle is not None:
-            os.close(self._handle)
-            self._handle = None
+        self.close()
 
     def _on_end(self) -> None:
         self._on_part_end()
         self.ended = True
 
     def finish(self) -> UploadReceipt:
+        self.close()
         if self.top is None or self.count == 0:
             raise UploadRejected(400, "未收到任何文件，请选择工程文件夹后重试")
         source = self.staging / self.top
@@ -367,6 +375,14 @@ class _Receiver:
             bytes=self.total,
             handoff_sha256=str(identity["handoff_sha256"]),
         )
+
+    def close(self) -> None:
+        """Idempotent: release the part file handle on every exit path (no fd leaks)."""
+        if self._handle is not None:
+            try:
+                os.close(self._handle)
+            finally:
+                self._handle = None
 
 
 def _seal_tree(root: Path) -> None:

@@ -751,6 +751,7 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(status, 502, body)
         payload = json.loads(body)
         self.assertEqual(payload["trigger"], "absent")
+        self.assertIn("不要重复提交", payload["error"])
         unresolved = payload["dag_run_id"]
         self.assertNotIn(unresolved, self.airflow.dag_runs)
         self.assertTrue((self.upload_root / unresolved / "机器人工程" / "model.SLDASM").is_file())
@@ -763,8 +764,12 @@ class PortalTests(unittest.TestCase):
             "127.0.0.1", 0, PortalApp(config), server_class=_ThreadingWSGIServer, handler_class=_QuietHandler
         )
         threading.Thread(target=server.serve_forever, daemon=True).start()
-        self.addCleanup(server.shutdown)
-        self.addCleanup(server.server_close)
+
+        def stop() -> None:
+            server.shutdown()
+            server.server_close()
+
+        self.addCleanup(stop)
         client = PortalClient(f"http://127.0.0.1:{server.server_address[1]}")
         client.login()
         status, _, _ = client.request_raw(

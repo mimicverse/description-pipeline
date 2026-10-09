@@ -945,18 +945,17 @@ class PortalApp:
                 start_response,
                 HTTPStatus.BAD_GATEWAY,
                 {
-                    "error": "运行未能确认启动；上传已保留，请稍后重试或联系管理员",
+                    "error": "运行启动状态尚未确认；上传已保留，请检查运行列表或联系管理员，不要重复提交",
                     "dag_run_id": dag_run_id,
                     "trigger": outcome,
                 },
                 self.config,
             )
         log.info(
-            "portal started dag_run_id=%s user=%s principal=%s folder=%s files=%d bytes=%d digest=%s",
+            "portal started dag_run_id=%s user=%s principal=%s files=%d bytes=%d digest=%s",
             dag_run_id,
             session.user,
             session.principal,
-            receipt.folder,
             receipt.files,
             receipt.bytes,
             receipt.handoff_sha256,

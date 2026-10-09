@@ -104,6 +104,35 @@ class UploadTests(unittest.TestCase):
         self.assert_rejected(multipart([("top/a.SLDASM", b"x"), ("TOP/b.SLDASM", b"x")]), 400)
         self.assert_rejected(multipart([("top/a.SLDASM", b"x"), ("other/b.SLDASM", b"x")]), 400)
 
+    def test_directory_case_aliases_are_rejected(self) -> None:
+        error = self.assert_rejected(multipart([("top/Foo/a.SLDASM", b"x"), ("top/foo/b.SLDPRT", b"x")]), 400)
+        self.assertIn("目录名称大小写不一致", str(error))
+        receipt = self.receive(multipart([("top/子目录/model.SLDASM", b"x"), ("top/子目录/part.SLDPRT", b"y")]))
+        self.assertEqual(receipt.folder, "top")
+
+    def test_failed_uploads_do_not_leak_file_descriptors(self) -> None:
+        payload = multipart(FOLDER)
+        opened: list[int] = []
+        real_open = os.open
+
+        def recording_open(path, flags, mode=0o777, **kwargs):
+            descriptor = real_open(path, flags, mode, **kwargs)
+            opened.append(descriptor)
+            return descriptor
+
+        with mock.patch.object(uploads.os, "open", side_effect=recording_open):
+            for index in range(5):
+                self.assert_rejected(
+                    payload,
+                    400,
+                    run_id=f"portal-truncated-{index}",
+                    environ={"CONTENT_LENGTH": str(len(payload) + 64)},
+                )
+        self.assertTrue(opened)
+        for descriptor in opened:
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
     def test_nonportable_member_names_are_rejected(self) -> None:
         for name in (
             "/absolute/model.SLDASM",
