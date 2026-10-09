@@ -168,7 +168,10 @@ def _boundary_summary(identifier: object, details: dict) -> dict | None:
             passed = sum(
                 1
                 for row in rows
-                if isinstance(row, dict) and row.get("state") == "passed" and row.get("passed") is True
+                if isinstance(row, dict)
+                and row.get("id") in required
+                and row.get("state") == "passed"
+                and row.get("passed") is True
             )
             return {
                 "scope_zh": "全部必需独立校验",
@@ -228,13 +231,15 @@ def _boundary_summary(identifier: object, details: dict) -> dict | None:
             actual += f"，{count} 个准备文件"
         return {"scope_zh": "结构定义与目标仓库绑定", "expected": "绑定摘要与目标一致", "actual": actual}
     if name == "input.valid":
+        revision = details.get("cad_revision")
+        if isinstance(revision, dict):
+            revision = revision.get("revision")
         files = details.get("files")
         count = len(files) if isinstance(files, dict) else None
         return {
             "scope_zh": "CAD 包输入规范",
             "expected": "CAD 包通过输入规范并归档一致",
-            "actual": f"CAD 修订 {details.get('cad_revision') or '未记录'}"
-            + (f"，{count} 个文件" if count is not None else ""),
+            "actual": f"CAD 修订 {revision or '未记录'}" + (f"，{count} 个文件" if count is not None else ""),
         }
     if name == "runtime.ready":
         return {

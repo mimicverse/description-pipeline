@@ -254,6 +254,18 @@ class ReportViewTests(unittest.TestCase):
         job["status"] = "failed"
         self.assertEqual(build_report(job)["overall"]["state"], "failed")
 
+    def test_revision_summary_does_not_dump_the_full_revision_record(self) -> None:
+        job = passed_job()
+        for event in job["events"]:
+            check = event.get("check") or {}
+            if check.get("id") == "input.valid":
+                check["details"] = {"cad_revision": {"revision": "r3", "owner": "private-owner", "files": {"a": SHA}}}
+        report = build_report(job)
+        capture = next(stage for stage in report["stages"] if stage["id"] == "capture")
+        row = next(row for row in capture["boundary"] if row["id"] == "input.valid")
+        self.assertEqual(row["summary"]["actual"], "CAD 修订 r3")
+        self.assertIn("owner", row["raw_details"]["cad_revision"])
+
     def test_reused_stage_retains_provenance_without_claiming_new_execution(self) -> None:
         job = passed_job()
         parent = "original-native-run"
