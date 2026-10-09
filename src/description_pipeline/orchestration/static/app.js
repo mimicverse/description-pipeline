@@ -20,6 +20,7 @@ const state = {
   controls: null,
   timer: null,
   retryingRunId: null,
+  tabsInitializedFor: null,
 };
 
 const RUN_STATES = {
@@ -277,6 +278,8 @@ function clearPreview() {
   $("preview-meta").textContent = "";
   $("viewer-note").hidden = true;
   $("joint-controls").textContent = "";
+  setError($("preview-note"), "");
+  updatePreviewLayout();
 }
 
 function clearSession() {
@@ -285,6 +288,7 @@ function clearSession() {
   state.user = null;
   state.dagRunId = null;
   state.lastRun = null;
+  state.tabsInitializedFor = null;
   if (state.timer) window.clearInterval(state.timer);
   state.timer = null;
   $("workspace").hidden = true;
@@ -332,8 +336,9 @@ async function refreshRuns() {
 
 function stageDotState(state) {
   if (state === "completed") return "ok";
-  if (state === "failed" || state === "blocked") return "bad";
+  if (state === "failed") return "bad";
   if (state === "running") return "run";
+  // Upstream-blocked and not-run stages stay neutral: nothing failed here.
   return "idle";
 }
 
@@ -370,6 +375,366 @@ function selectInspectTab(name) {
   }
 }
 
+function boundedJson(value, limit = 1400) {
+  let text;
+  try {
+    text = JSON.stringify(value, null, 2);
+  } catch {
+    text = String(value);
+  }
+  if (typeof text !== "string") text = String(text);
+  return text.length > limit ? `${text.slice(0, limit)}\n…（内容过长，已截断）` : text;
+}
+
+function appendEvidence(parent, title, value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value === "object" && !Array.isArray(value) && !Object.keys(value).length) return null;
+  const details = expandable(parent, title);
+  const pre = document.createElement("pre");
+  pre.className = "raw";
+  pre.textContent = boundedJson(value);
+  details.append(pre);
+  return details;
+}
+
+function inlineValue(value) {
+  if (value === undefined || value === null || value === "") return "";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value);
+  let text;
+  try {
+    text = JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+  return text.length > 240 ? `${text.slice(0, 240)}…` : text;
+}
+
+function stateKind(state) {
+  if (state === "completed" || state === "passed" || state === "success") return "ok";
+  if (state === "failed") return "bad";
+  if (state === "running") return "run";
+  return "";
+}
+
+function stageSelectionKey(runId) {
+  return `portal.stage.${runId}`;
+}
+
+function chooseStageIndex(stages, runId) {
+  if (!stages.length) return 0;
+  let remembered = null;
+  try {
+    remembered = localStorage.getItem(stageSelectionKey(runId));
+  } catch {
+    remembered = null;
+  }
+  if (remembered) {
+    const index = stages.findIndex((stage) => stage.id === remembered);
+    if (index !== -1) return index;
+  }
+  const failed = stages.findIndex((stage) => stage.state === "failed");
+  if (failed !== -1) return failed;
+  const running = stages.findIndex((stage) => stage.state === "running");
+  return running !== -1 ? running : 0;
+}
+
+function countChecks(rows) {
+  let passed = 0;
+  let executed = 0;
+  for (const row of rows) {
+    if (row.state === "passed") passed += 1;
+    const ran = row.executed === true || (row.executed === undefined && (row.state === "passed" || row.state === "failed"));
+    if (ran) executed += 1;
+  }
+  return `通过 ${passed}/${rows.length} · 已执行 ${executed}/${rows.length}`;
+}
+
+function reportRow(row, boundary) {
+  const summary = row.summary && typeof row.summary === "object" ? row.summary : {};
+  return {
+    id: String(row.id || ""),
+    boundary,
+    label: row.label_zh || row.label || String(row.id || ""),
+    state: row.state || "not_run",
+    stateZh: row.state_zh || CHECK_STATES[row.state] || "未执行",
+    executed: typeof row.executed === "boolean" ? row.executed : undefined,
+    scope: summary.scope_zh || "",
+    expected: summary.expected,
+    actual: summary.actual,
+    details: row.raw_details,
+  };
+}
+
+function legacyRow(row, boundary) {
+  return {
+    id: String(row.id || ""),
+    boundary,
+    label: row.label || String(row.id || ""),
+    state: row.state || "not_run",
+    stateZh: CHECK_STATES[row.state] || row.state || "未执行",
+    executed: undefined,
+    scope: "",
+    expected: undefined,
+    actual: undefined,
+    details: row.details || {},
+  };
+}
+
+function stageList(run) {
+  const report = run.report && Array.isArray(run.report.stages) ? run.report : null;
+  if (report) {
+    return report.stages.map((stage) => ({
+      id: stage.id,
+      nameZh: stage.name_zh || stage.id,
+      state: stage.state || "not_run",
+      stateZh: stage.state_zh || STAGE_STATES[stage.state] || "未执行",
+      at: stage.at,
+      passed: stage.checks_passed,
+      total: stage.checks_total,
+      executed: stage.checks_executed,
+      boundary: (Array.isArray(stage.boundary) ? stage.boundary : []).map((row) =>
+        reportRow(row, row.boundary === "output" ? "output" : "input")),
+      independent: (Array.isArray(stage.independent) ? stage.independent : []).map((row) => reportRow(row, "independent")),
+      files: Array.isArray(stage.files) ? stage.files : [],
+      unsupported: Array.isArray(stage.unsupported_zh) ? stage.unsupported_zh : [],
+      confirmations: Array.isArray(stage.confirmations_zh) ? stage.confirmations_zh : [],
+    }));
+  }
+  const legacy = (run.stage_view && run.stage_view.stages) || [];
+  return legacy.map((stage) => ({
+    id: stage.id,
+    nameZh: stage.name_zh || stage.name || stage.id,
+    state: stage.state || "not_run",
+    stateZh: STAGE_STATES[stage.state] || stage.state || "未执行",
+    at: stage.at,
+    passed: stage.checks_passed,
+    total: stage.checks_total,
+    boundary: [
+      ...(stage.input_qc || []).map((row) => legacyRow(row, "input")),
+      ...(stage.output_qc || []).map((row) => legacyRow(row, "output")),
+    ],
+    independent: [],
+    files: [],
+    unsupported: (stage.unsupported || []).map((item) => item.label).filter(Boolean),
+    confirmations: (stage.confirmations || []).map((item) => item.label).filter(Boolean),
+  }));
+}
+
+function reviewFacts(report) {
+  const facts = [];
+  const seen = new Set();
+  const push = (item) => {
+    const fact = typeof item === "string"
+      ? { id: "", label: item, scope: "", exclusion: "" }
+      : item && typeof item === "object"
+        ? {
+            id: String(item.id || ""),
+            label: item.label_zh || item.label || String(item.id || ""),
+            scope: item.scope_zh || item.scope || "",
+            exclusion: item.exclusion_zh || item.automatic_exclusion || "",
+          }
+        : null;
+    if (!fact || !fact.label) return;
+    const key = fact.id || fact.label;
+    if (seen.has(key)) return;
+    seen.add(key);
+    facts.push(fact);
+  };
+  if (Array.isArray(report.review_scope)) {
+    for (const item of report.review_scope) push(item);
+    return facts;
+  }
+  for (const stage of Array.isArray(report.stages) ? report.stages : []) {
+    for (const item of stage.confirmations_zh || []) push(item);
+  }
+  return facts;
+}
+
+function checkRow(parent, row) {
+  const item = document.createElement("div");
+  item.className = `check-row state-${row.state || "none"}`;
+  const head = document.createElement("div");
+  head.className = "check-head";
+  const name = document.createElement("span");
+  name.className = "check-name";
+  name.textContent = row.label || row.id || "检查";
+  const chip = document.createElement("span");
+  chip.className = `chip ${stateKind(row.state)}`.trim();
+  chip.textContent = row.stateZh;
+  head.append(name, chip);
+  item.append(head);
+  if (row.scope) {
+    const scope = document.createElement("p");
+    scope.className = "check-scope";
+    scope.textContent = `检查内容：${row.scope}`;
+    item.append(scope);
+  }
+  const expected = inlineValue(row.expected);
+  const actual = inlineValue(row.actual);
+  if (expected || actual) {
+    const kv = document.createElement("p");
+    kv.className = "check-kv";
+    if (expected) kv.append(`预期：${expected}`);
+    if (expected && actual) kv.append("；");
+    if (actual) kv.append(`实际：${actual}`);
+    item.append(kv);
+  }
+  appendEvidence(item, "原始证据", row.details);
+  parent.append(item);
+  return item;
+}
+
+function buildFailureCard(failure) {
+  const card = document.createElement("div");
+  card.className = "fail-card";
+  const title = document.createElement("strong");
+  title.textContent = failure.title_zh || "运行失败";
+  card.append(title);
+  if (failure.meaning_zh) {
+    const meaning = document.createElement("p");
+    meaning.textContent = failure.meaning_zh;
+    card.append(meaning);
+  }
+  if (failure.stage_name_zh) {
+    const stage = document.createElement("p");
+    stage.className = "muted small";
+    stage.textContent = `涉及阶段：${failure.stage_name_zh}`;
+    card.append(stage);
+  }
+  const raw = {};
+  for (const key of ["raw_type", "raw_error", "raw_detail"]) {
+    if (failure[key] !== undefined && failure[key] !== null) raw[key] = failure[key];
+  }
+  if (Object.keys(raw).length) appendEvidence(card, "原始错误（供排查）", raw);
+  return card;
+}
+
+function renderStageDetail(run) {
+  const root = $("stage-detail");
+  root.textContent = "";
+  const stage = state.stages[state.selectedStage];
+  if (!stage) return;
+  const legacyStage = ((run.stage_view && run.stage_view.stages) || []).find((item) => item.id === stage.id) || null;
+
+  const summary = document.createElement("div");
+  summary.className = "stage-summary";
+  const head = document.createElement("div");
+  head.className = "stage-summary-head";
+  const title = document.createElement("strong");
+  title.textContent = stage.nameZh;
+  const chip = document.createElement("span");
+  chip.className = `chip ${stateKind(stage.state)}`.trim();
+  chip.textContent = stage.stateZh;
+  head.append(title, chip);
+  summary.append(head);
+  const counts = document.createElement("p");
+  counts.className = "stage-counts muted small";
+  const pieces = [];
+  if (stage.boundary.length) pieces.push(`边界检查：${countChecks(stage.boundary)}`);
+  if (stage.independent.length) pieces.push(`独立检查：${countChecks(stage.independent)}`);
+  if (!pieces.length && Number.isFinite(stage.total) && stage.total > 0) {
+    const executed = Number.isFinite(stage.executed) ? stage.executed : "—";
+    pieces.push(`检查：通过 ${Number.isFinite(stage.passed) ? stage.passed : 0} · 已执行 ${executed} · 共 ${stage.total}`);
+  }
+  counts.textContent = pieces.join("　•　") || "无检查记录";
+  summary.append(counts);
+  if (stage.at) {
+    const at = document.createElement("p");
+    at.className = "muted small";
+    at.textContent = `记录时间：${formatTime(stage.at)}`;
+    summary.append(at);
+  }
+  root.append(summary);
+
+  const groups = [
+    ["输入检查", stage.boundary.filter((row) => row.boundary === "input")],
+    ["输出检查", stage.boundary.filter((row) => row.boundary === "output")],
+    ["独立检查", stage.independent],
+  ];
+  for (const [heading, rows] of groups) {
+    if (!rows.length) continue;
+    const group = document.createElement("div");
+    group.className = "check-group";
+    const titleRow = document.createElement("h4");
+    titleRow.textContent = `${heading}（${countChecks(rows)}）`;
+    group.append(titleRow);
+    for (const row of rows) checkRow(group, row);
+    root.append(group);
+  }
+
+  const hashByPath = new Map();
+  if (legacyStage) {
+    for (const item of [...(legacyStage.inputs || []), ...(legacyStage.outputs || [])]) {
+      for (const [path, hash] of Object.entries(item.files || {})) hashByPath.set(path, hash);
+    }
+  }
+  const fileRows = [];
+  if (stage.files.length) {
+    for (const file of stage.files) {
+      fileRows.push({
+        label: file.label || file.path || "文件",
+        path: file.path || "",
+        availability: file.availability || "",
+        hash: hashByPath.get(file.path) || null,
+      });
+    }
+  } else if (legacyStage) {
+    for (const item of [...(legacyStage.inputs || []), ...(legacyStage.outputs || [])]) {
+      const files = Object.entries(item.files || {});
+      if (files.length) {
+        for (const [path, hash] of files) {
+          fileRows.push({ label: item.label || path, path, availability: item.availability || "", hash });
+        }
+      } else {
+        fileRows.push({ label: item.label || "", path: item.path || "", availability: item.availability || "", hash: null });
+      }
+    }
+  }
+  if (fileRows.length) {
+    const details = expandable(root, `产出与记录（${fileRows.length} 项）`);
+    const list = document.createElement("div");
+    list.className = "stage-files";
+    for (const row of fileRows) {
+      const line = document.createElement("p");
+      line.className = "file-line";
+      if (row.hash && state.reference) {
+        if (row.label && row.label !== row.path) line.append(`${row.label} · `);
+        line.append(state.reference(row.path, row.hash));
+      } else {
+        line.textContent = [row.label, row.path].filter(Boolean).join(" · ") || "—";
+        if (row.availability) {
+          const tag = document.createElement("code");
+          tag.textContent = row.availability;
+          line.append(" ", tag);
+        }
+      }
+      list.append(line);
+    }
+    details.append(list);
+  }
+
+  if (stage.unsupported.length) {
+    const row = document.createElement("p");
+    row.className = "stage-note muted small";
+    row.append("不支持项（待工程确认，不代表通过）：");
+    for (const text of stage.unsupported) {
+      const tag = document.createElement("span");
+      tag.className = "chip";
+      tag.textContent = text;
+      row.append(" ", tag);
+    }
+    root.append(row);
+  }
+}
+
+function updatePreviewLayout() {
+  const workspace = document.querySelector(".run-workspace");
+  if (!workspace) return;
+  const has = Boolean(state.previewSubject);
+  workspace.classList.toggle("has-preview", has);
+  workspace.classList.toggle("no-preview", !has);
+}
+
 function renderStepper() {
   const stepper = $("stages");
   stepper.textContent = "";
@@ -382,12 +747,23 @@ function renderStepper() {
     dot.className = `dot ${stageDotState(stage.state)}`;
     const label = document.createElement("span");
     label.className = "step-label";
-    label.textContent = stage.name_zh || stage.name;
+    label.textContent = stage.nameZh || stage.id;
     const meta = document.createElement("span");
     meta.className = "step-meta";
-    meta.textContent = `${stage.checks_passed}/${stage.checks_total}`;
+    if (stage.state === "blocked" || stage.state === "not_run" || !Number.isFinite(stage.total) || stage.total <= 0) {
+      // Nothing ran here: state text stays neutral instead of implying a failed percentage.
+      meta.textContent = stage.stateZh;
+    } else {
+      meta.textContent = `${Number.isFinite(stage.passed) ? stage.passed : 0}/${stage.total} 通过`;
+    }
     step.append(dot, label, meta);
     step.addEventListener("click", () => {
+      const runId = state.dagRunId;
+      try {
+        localStorage.setItem(stageSelectionKey(runId), stage.id);
+      } catch {
+        // Remembering the chosen stage is best-effort only.
+      }
       state.selectedStage = index;
       if (state.lastRun) renderRun(state.lastRun);
       selectInspectTab("stage");
@@ -411,7 +787,8 @@ function renderRun(run) {
   const authorizedDigest = (path, hash) =>
     Boolean(hash) && Object.prototype.hasOwnProperty.call(authorized, path) && authorized[path] === hash;
   const reference = (path, hash) => {
-    const line = document.createElement("p");
+    const line = document.createElement("span");
+    line.className = "file-ref";
     if (authorizedDigest(path, hash)) {
       const link = document.createElement("a");
       link.href = artifactUrl(path);
@@ -433,12 +810,27 @@ function renderRun(run) {
   const meta = $("run-meta");
   meta.textContent = "";
   state.reference = reference;
+  const report = run.report && Array.isArray(run.report.stages) ? run.report : null;
+  const coverage = run.coverage || {};
+  const structure = coverage.structure || {};
   const rows = [
     ["工程文件夹", folderLabel(run.handoff_path) || "—"],
     ["状态", RUN_STATES[run.state] || run.state || "—"],
     ["开始时间", formatTime(run.started_at)],
     ["结束时间", formatTime(run.ended_at)],
   ];
+  const measured = report && report.measured ? report.measured : null;
+  if (measured) {
+    if (measured.subject_sha256) rows.push(["交付摘要", `${String(measured.subject_sha256).slice(0, 12)}…`]);
+    const mass = measured.mass;
+    if (mass && Number.isFinite(mass.mass_kg)) {
+      const range = Array.isArray(mass.expected_kg) && mass.expected_kg.length === 2
+        ? `[${mass.expected_kg[0]}，${mass.expected_kg[1]}] kg`
+        : "—";
+      const delta = Number.isFinite(mass.delta_kg) ? `，偏差 ${mass.delta_kg} kg` : "";
+      rows.push(["质量", `实测 ${mass.mass_kg} kg，预期 ${range}${delta}`]);
+    }
+  }
   const ident = $("run-ident");
   if (ident) ident.textContent = runId;
   for (const [label, value] of rows) {
@@ -447,6 +839,23 @@ function renderRun(run) {
     const dd = document.createElement("dd");
     dd.textContent = value;
     meta.append(dt, dd);
+  }
+
+  const headline = $("run-headline");
+  const headlineText = report && report.overall ? report.overall.headline_zh : "";
+  headline.textContent = headlineText || "";
+  headline.hidden = !headlineText;
+  const failureCard = $("failure-card");
+  failureCard.textContent = "";
+  if (report && report.failure) {
+    failureCard.append(buildFailureCard(report.failure));
+    failureCard.hidden = false;
+  } else {
+    failureCard.hidden = true;
+  }
+  if (state.tabsInitializedFor !== runId) {
+    state.tabsInitializedFor = runId;
+    selectInspectTab(run.state === "failed" ? "stage" : "overview");
   }
 
   const retry = run.retry || {};
@@ -469,160 +878,133 @@ function renderRun(run) {
     progress.append(chip);
   }
 
-  state.stages = (run.stage_view && run.stage_view.stages) || [];
-  const attention = state.stages.findIndex((stage) => stage.state === "failed" || stage.state === "blocked" || stage.state === "running");
-  state.selectedStage = Number.isInteger(state.selectedStage) && state.selectedStage >= 0 && state.selectedStage < state.stages.length
-    ? state.selectedStage
-    : attention === -1 ? 0 : attention;
+  state.stages = stageList(run);
+  state.selectedStage = chooseStageIndex(state.stages, runId);
   renderStepper();
-  const detailRoot = $("stage-detail");
-  detailRoot.textContent = "";
-  for (const stage of state.stages.slice(state.selectedStage, state.selectedStage + 1)) {
-    const item = document.createElement("div");
-    item.className = "stage-body";
-    const body = item;
-    const heading = document.createElement("p");
-    heading.className = "muted small";
-    heading.textContent = `${stage.name_zh || stage.name} · ${STAGE_STATES[stage.state] || stage.state} · ${stage.checks_passed}/${stage.checks_total} 项`;
-    item.append(heading);
-    if (stage.error) {
-      const error = document.createElement("p");
-      error.className = "error";
-      error.textContent = stage.error;
-      body.append(error);
-      if (stage.diagnostic) {
-        const evidence = document.createElement("pre");
-        evidence.textContent = JSON.stringify(stage.diagnostic, null, 2);
-        expandable(body, "失败诊断").append(evidence);
-      }
-    }
-    const grid = document.createElement("div");
-    grid.className = "stage-boundaries";
-    for (const [key, title] of [["inputs", "输入"], ["input_qc", "输入质检"], ["outputs", "输出"], ["output_qc", "输出质检"]]) {
-      const column = document.createElement("div");
-      const label = document.createElement("strong");
-      label.textContent = title;
-      column.append(label);
-      for (const row of stage[key]) {
-        const line = document.createElement("p");
-        line.textContent = row.label;
-        column.append(line);
-        if (row.state) {
-          line.append(" ", badge(CHECK_STATES[row.state] || row.state, row.state === "passed" ? "ok" : row.state === "failed" ? "bad" : "pending"));
-          const detail = expandable(column, `${row.id} · 结果与证据`);
-          const checks = row.details && (row.details.checks || (row.details.diagnostic && row.details.diagnostic.checks));
-          if (checks) {
-            for (const check of checks) {
-              const child = expandable(detail, `${check.id} · ${CHECK_STATES[check.state] || "未报告"}`);
-              const evidence = document.createElement("pre");
-              evidence.textContent = JSON.stringify(check.details || {}, null, 2);
-              child.append(evidence);
-            }
-          } else {
-            const evidence = document.createElement("pre");
-            evidence.textContent = JSON.stringify(row.details || {}, null, 2);
-            detail.append(evidence);
-          }
-        } else {
-          const files = Object.entries(row.files || {});
-          const info = document.createElement("p");
-          info.className = "muted";
-          info.textContent = `${row.path} · ${row.class} · ${files.length ? `${files.length} 个文件` : "尚无文件记录"}`;
-          column.append(info);
-          if (files.length) {
-            const detail = expandable(column, "文件与 SHA-256");
-            const list = document.createElement("div");
-            list.className = "stage-files";
-            for (const [path, hash] of files) list.append(reference(path, hash));
-            detail.append(list);
-          }
-        }
-      }
-      grid.append(column);
-    }
-    body.append(grid);
-    const evidencePaths = (stage.evidence || []).filter((path) => typeof path === "string" && path);
-    if (evidencePaths.length) {
-      const evidenceRow = document.createElement("div");
-      evidenceRow.className = "stage-evidence muted";
-      evidenceRow.append("契约证据引用：");
-      evidencePaths.forEach((path, position) => {
-        if (position) evidenceRow.append("、");
-        evidenceRow.append(reference(path, authorized[path]));
-      });
-      body.append(evidenceRow);
-    }
-    const unsupported = (stage.unsupported || []).filter((item) => item && item.label);
-    if (unsupported.length) {
-      const row = document.createElement("div");
-      row.className = "stage-unsupported muted";
-      row.append("未支持项（工程确认后才能关闭，不代表通过）：");
-      for (const item of unsupported) {
-        const chip = document.createElement("span");
-        chip.className = "chip pending";
-        chip.textContent = `${item.label} · 不支持/待工程确认`;
-        row.append(" ", chip);
-      }
-      body.append(row);
-    }
-    if (stage.confirmations.length) {
-      const pending = document.createElement("p");
-      pending.className = "muted";
-      pending.textContent = `工程确认（在本版本 PR／受控记录中完成）：${stage.confirmations.map((row) => row.label).join("、")} · 待确认`;
-      body.append(pending);
-    }
-    detailRoot.append(item);
-  }
+  renderStageDetail(run);
 
   const automatic = $("automatic");
   automatic.textContent = "";
   const automaticState = (run.automatic && run.automatic.state) || "pending";
   const automaticKind = automaticState === "passed" ? "ok" : automaticState === "failed" || automaticState === "unverified" ? "bad" : "pending";
-  automatic.append(badge(AUTOMATIC_STATES[automaticState] || automaticState, automaticKind));
+  const chipRow = document.createElement("div");
+  chipRow.className = "chip-row";
+  chipRow.append(badge(AUTOMATIC_STATES[automaticState] || automaticState, automaticKind));
   if (run.automatic && run.automatic.message) {
     const note = document.createElement("p");
     note.className = "muted";
     note.textContent = run.automatic.message;
-    automatic.append(note);
+    chipRow.append(note);
   }
-  const checks = (run.automatic && run.automatic.checks) || [];
-  const allChecks = checks.length ? expandable(automatic, `查看全部 ${checks.length} 项检查`) : automatic;
-  for (const check of checks) {
+  for (const text of (coverage.automatic && coverage.automatic.unsupported) || []) {
     const chip = document.createElement("span");
-    chip.className = `chip ${check.passed === false ? "failed" : check.passed === true ? "success" : ""}`.trim();
-    chip.textContent = `${check.id || "检查"}：${CHECK_STATES[check.state] || "未报告"}`;
-    allChecks.append(chip);
+    chip.className = "chip";
+    chip.textContent = `未自动覆盖：${text}`;
+    chipRow.append(chip);
+  }
+  automatic.append(chipRow);
+  if (report) {
+    for (const stage of state.stages) {
+      const rows = [...stage.boundary, ...stage.independent];
+      if (!rows.length) continue;
+      const group = document.createElement("div");
+      group.className = "check-group";
+      const titleRow = document.createElement("h4");
+      titleRow.textContent = `${stage.nameZh}（${countChecks(rows)}）`;
+      group.append(titleRow);
+      for (const row of rows) checkRow(group, row);
+      automatic.append(group);
+    }
+  } else {
+    const checks = (run.automatic && run.automatic.checks) || [];
+    const allChecks = checks.length ? expandable(chipRow, `查看全部 ${checks.length} 项检查`) : chipRow;
+    for (const check of checks) {
+      const chip = document.createElement("span");
+      chip.className = `chip ${check.passed === false ? "failed" : check.passed === true ? "success" : ""}`.trim();
+      chip.textContent = `${check.id || "检查"}：${CHECK_STATES[check.state] || "未报告"}`;
+      allChecks.append(chip);
+    }
   }
 
   const confirmations = $("confirmations");
   confirmations.textContent = "";
-  const coverage = run.coverage || {};
-  const structure = coverage.structure || {};
-  const identity = document.createElement("p");
-  identity.className = "muted";
-  identity.textContent = `结构身份：${structure.hardware_id || "待解析"} · 版本 ${structure.revision || "—"} · 交付摘要 ${
-    String(structure.subject_sha256 || "").slice(0, 12) || "—"
-  }`;
-  confirmations.append(identity, badge("工程确认：待确认", "pending"));
-  const items = (coverage.engineering && coverage.engineering.items) || [];
-  const allConfirmations = items.length ? expandable(confirmations, `查看 ${items.length} 项工程确认`) : confirmations;
-  for (const item of items) {
-    const chip = document.createElement("span");
-    chip.className = "chip";
-    chip.textContent = `${item.id}：待确认`;
-    allConfirmations.append(chip);
-  }
-  if (coverage.engineering && coverage.engineering.message) {
-    const note = document.createElement("p");
-    note.className = "muted";
-    note.textContent = coverage.engineering.message;
-    confirmations.append(note);
-  }
-  for (const text of (coverage.automatic && coverage.automatic.unsupported) || []) {
-    const chip = document.createElement("span");
-    chip.className = "chip failed";
-    chip.textContent = `未自动覆盖：${text}`;
-    automatic.append(chip);
+  if (report) {
+    // Canonical review scope: only the external facts automatic checks cannot
+    // cover, and only once a verified model exists. The platform neither claims
+    // pending counts nor syncs external review state.
+    const facts = reviewFacts(report);
+    if (automaticState !== "passed") {
+      const note = document.createElement("p");
+      note.className = "muted small";
+      note.textContent = "工程评审范围未就绪：独立验证通过后，这里显示需要人工确认的外部事实。";
+      confirmations.append(note);
+    } else if (facts.length) {
+      const lead = document.createElement("p");
+      lead.className = "muted small";
+      lead.textContent = "工程评审范围（自动检查无法核验的事实；已通过的自动检查不需要人工重复确认）：";
+      confirmations.append(lead);
+      for (const fact of facts) {
+        const item = document.createElement("div");
+        item.className = "review-fact";
+        const label = document.createElement("strong");
+        label.textContent = fact.label;
+        item.append(label);
+        if (fact.scope) {
+          const scope = document.createElement("p");
+          scope.textContent = `确认内容：${fact.scope}`;
+          item.append(scope);
+        }
+        if (fact.exclusion) {
+          const exclusion = document.createElement("p");
+          exclusion.className = "muted small";
+          exclusion.textContent = `不重复检查：${fact.exclusion}`;
+          item.append(exclusion);
+        }
+        confirmations.append(item);
+      }
+      const reuse = document.createElement("p");
+      reuse.className = "muted small";
+      reuse.textContent = "已有且适用的评审结论可以复用；平台不同步外部评审状态，请以受控记录为准。";
+      confirmations.append(reuse);
+    } else {
+      const note = document.createElement("p");
+      note.className = "muted small";
+      note.textContent = "报告未列出需要人工确认的外部事实。";
+      confirmations.append(note);
+    }
+  } else {
+    const identity = document.createElement("p");
+    identity.className = "muted";
+    identity.textContent = `结构身份：${structure.hardware_id || "待解析"} · 版本 ${structure.revision || "—"} · 交付摘要 ${
+      String(structure.subject_sha256 || "").slice(0, 12) || "—"
+    }`;
+    confirmations.append(identity);
+    const items = (coverage.engineering && coverage.engineering.items) || [];
+    if (run.automatic && run.automatic.state === "passed" && items.length) {
+      const lead = document.createElement("p");
+      lead.className = "muted small";
+      lead.textContent = "待人工确认项：";
+      confirmations.append(lead);
+      const row = document.createElement("p");
+      for (const item of items) {
+        const chip = document.createElement("span");
+        chip.className = "chip";
+        chip.textContent = String(item.id);
+        row.append(" ", chip);
+      }
+      confirmations.append(row);
+    } else {
+      const note = document.createElement("p");
+      note.className = "muted small";
+      note.textContent = "自动分析尚未完成：待人工确认的范围尚未确定。";
+      confirmations.append(note);
+    }
+    if (coverage.engineering && coverage.engineering.message) {
+      const note = document.createElement("p");
+      note.className = "muted";
+      note.textContent = coverage.engineering.message;
+      confirmations.append(note);
+    }
   }
 
   const findings = $("findings");
@@ -672,6 +1054,7 @@ function renderRun(run) {
   } else {
     pr.hidden = true;
   }
+  updatePreviewLayout();
 }
 
 async function loadPreview(dagRunId) {
@@ -685,6 +1068,7 @@ async function loadPreview(dagRunId) {
     if (state.previewSubject === preview.subject_sha256) return;
     $("preview-meta").textContent = `交付摘要 ${String(preview.subject_sha256).slice(0, 12)}… · URDF ${preview.urdf}`;
     note.hidden = true;
+    setError($("preview-note"), "");
     if (!state.viewer) state.viewer = createViewer($("viewer"));
     const artifactUrl = (name) =>
       `/api/runs/${encodeURIComponent(dagRunId)}/artifacts/${String(name)
@@ -711,6 +1095,7 @@ async function loadPreview(dagRunId) {
     $("viewer-card").hidden = false;
     $("viewer-placeholder").hidden = true;
     state.viewer.frame();
+    updatePreviewLayout();
   } catch (error) {
     if (request.signal.aborted || state.dagRunId !== dagRunId) return;
     if (state.viewer) disposeRobot(state.viewer);
@@ -719,15 +1104,12 @@ async function loadPreview(dagRunId) {
     state.previewFiles = null;
     if (state.lastRun) renderRun(state.lastRun);
     $("joint-controls").textContent = "";
-    $("viewer-card").hidden = false;
-    $("viewer-placeholder").hidden = true;
+    updatePreviewLayout();
     if (error.status === 404 || error.status === 409) {
-      note.textContent = `尚未提供已验证交付：${error.message}`;
-      note.hidden = false;
+      setError($("preview-note"), `尚未提供已验证交付：${error.message}`);
       return;
     }
-    note.textContent = `交付预览不可用：${error.message}`;
-    note.hidden = false;
+    setError($("preview-note"), `交付预览不可用：${error.message}`);
   } finally {
     if (state.previewRequest === request) state.previewRequest = null;
   }
@@ -770,6 +1152,7 @@ async function poll() {
       state.lastRun = null;
       state.dagRunId = null;
       state.selectedStage = null;
+      state.tabsInitializedFor = null;
       if (state.timer) window.clearInterval(state.timer);
       state.timer = null;
       $("retry-panel").hidden = true;
@@ -789,6 +1172,7 @@ async function selectRun(dagRunId) {
   state.dagRunId = dagRunId;
   state.lastRun = null;
   state.selectedStage = null;
+  state.tabsInitializedFor = null;
   $("retry-panel").hidden = true;
   setError($("run-error-detail"), "");
   setError($("retry-error"), "");
