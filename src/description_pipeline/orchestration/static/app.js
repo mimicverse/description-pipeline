@@ -788,12 +788,12 @@ function renderRerunPanel(run) {
   host.textContent = "";
   const rows = Array.isArray(run.stage_reruns) ? run.stage_reruns : null;
   const stage = state.stages[state.selectedStage];
-  if (!rows || !stage) {
+  if (!stage) {
     host.hidden = true;
     return;
   }
   host.hidden = false;
-  const row = rows.find((item) => item && item.stage === stage.id) || null;
+  const row = rows && rows.find((item) => item && item.stage === stage.id) || null;
   const runId = String(run.dag_run_id || "");
   const canManage = run.can_manage === true;
   const eligible = Boolean(row && row.eligible === true);
@@ -821,6 +821,8 @@ function renderRerunPanel(run) {
     note.textContent = row.reason_zh;
   } else if (eligible) {
     note.textContent = "将重算该步骤及其后续阶段；原始运行与证据保留，重跑为新关联运行。";
+  } else {
+    note.textContent = "暂时无法确认此步骤的重跑条件，请稍后刷新。";
   }
   line.append(note);
   host.append(line);
