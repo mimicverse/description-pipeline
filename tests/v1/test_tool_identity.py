@@ -62,6 +62,8 @@ class ToolIdentityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "Foo").mkdir()
+            if (root / "foo").exists():
+                self.skipTest("Directory aliases require a case-sensitive filesystem")
             (root / "Foo" / "a.txt").write_text("a\n", encoding="utf-8")
             (root / "foo").mkdir()
             (root / "foo" / "b.txt").write_text("b\n", encoding="utf-8")
