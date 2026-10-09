@@ -332,8 +332,11 @@ def _independent_summary(identifier: object, details: dict) -> dict | None:
             delta = details.get("delta_kg")
             return {
                 "scope_zh": "URDF 质量与整机 CAD 质量一致",
-                "expected": "差值 = 0",
-                "actual": f"URDF {urdf} kg / CAD {whole} kg（差值 {delta} kg）",
+                "expected": f"绝对误差 ≤ {details['atol_kg']} kg"
+                if isinstance(details.get("atol_kg"), (int, float)) and details.get("rtol") == 0
+                else "与整机 CAD 质量一致（按记录的数值容差）",
+                "actual": f"URDF {urdf} kg / CAD {whole} kg"
+                + (f"（差值 {delta} kg）" if isinstance(delta, (int, float)) else "（差值未记录）"),
             }
         return None
     if name == "consumer.urdf":
@@ -343,14 +346,14 @@ def _independent_summary(identifier: object, details: dict) -> dict | None:
             return {
                 "scope_zh": "消费端（MuJoCo）可加载",
                 "expected": "可加载且刚体完整",
-                "actual": f"{bodies} 个刚体，版本 {version}",
+                "actual": f"{bodies} 个消费端刚体（含世界坐标体），版本 {version or '未记录'}",
             }
         return None
     if name == "geometry.expected_extent":
         extent = details.get("extent_m")
         expected = details.get("expected_largest_m")
         if isinstance(extent, list) and isinstance(expected, list):
-            return {"scope_zh": "外形尺寸", "expected": f"最大边 {expected}", "actual": f"{extent}"}
+            return {"scope_zh": "外形尺寸", "expected": f"最大边 {expected} m", "actual": f"三轴尺寸 {extent} m"}
         return None
     if name == "bundle.subject":
         return {
@@ -362,14 +365,50 @@ def _independent_summary(identifier: object, details: dict) -> dict | None:
         return {
             "scope_zh": "工具身份",
             "expected": "版本与来源摘要记录",
-            "actual": f"版本 {details.get('version')}，来源 {_short(details.get('source_sha256'))}",
+            "actual": f"版本 {details.get('version') or '未记录'}，来源 {_short(details.get('source_sha256'))}",
         }
     if name == "source.native":
         return {
             "scope_zh": "原生源信息",
             "expected": "记录 SolidWorks 修订与配置",
-            "actual": f"SolidWorks {details.get('solidworks_revision')}，配置 {details.get('configuration')}",
+            "actual": f"SolidWorks {details.get('solidworks_revision') or '未记录'}，"
+            f"配置 {details.get('configuration') or '未记录'}",
         }
+    if name == "source.dependencies" and isinstance(details.get("native_documents"), int):
+        return {
+            "scope_zh": "原生依赖与采集副本覆盖",
+            "expected": "每个原生文档均有完整、可追溯的采集副本",
+            "actual": f"原生 {details['native_documents']} 个文档，"
+            f"副本 {details.get('collected_documents', '未记录')} 个，"
+            f"抑制实例 {details.get('suppressed_instances', '未记录')} 个",
+        }
+    if name in {"source.coverage", "source.native_discovery"} and isinstance(details.get("bodies"), int):
+        field, label = ("occurrences", "实例") if name == "source.coverage" else ("joints", "关节")
+        return {
+            "scope_zh": "实例与刚体覆盖" if name == "source.coverage" else "原生结构定义",
+            "expected": "独立重建结果与定义一致",
+            "actual": f"{details['bodies']} 个刚体，{details.get(field, '未记录')} 个{label}",
+        }
+    if name.startswith("shafts.") and isinstance(details.get("angle_deg"), (int, float)):
+        return {
+            "scope_zh": "关节轴与原生圆柱轴对齐",
+            "expected": "轴线共线、原点在轴线上；按质量规范的数值容差验收",
+            "actual": f"夹角 {details['angle_deg']}°，轴线偏距 {details.get('offset_m', '未记录')} m",
+        }
+    if name.startswith("inertia.") and isinstance(details.get("mass_kg"), (int, float)):
+        return {
+            "scope_zh": "刚体质量与惯量",
+            "expected": "质量及主惯量为正，惯量满足三角关系并与独立计算一致",
+            "actual": f"质量 {details['mass_kg']} kg；主惯量 {details.get('principal_inertia_kg_m2', '未记录')} kg·m²",
+        }
+    if name.startswith("joints.") and isinstance(details.get("type"), str):
+        kind = details["type"]
+        limits = details.get("limits") or {}
+        unit = "m" if kind == "prismatic" else "rad"
+        actual = f"类型 {kind}，有符号轴 {details.get('axis', '未记录')}"
+        if isinstance(limits, dict) and "lower" in limits and "upper" in limits:
+            actual += f"，范围 [{limits['lower']}, {limits['upper']}] {unit}"
+        return {"scope_zh": "关节类型、轴向与限位", "expected": "输出与原生结构定义一致", "actual": actual}
     if name == "urdf.syntax_names":
         if details.get("validated") is True:
             return {"scope_zh": "URDF 语法与命名", "expected": "语法与命名校验通过", "actual": "校验通过"}
@@ -385,7 +424,7 @@ def _independent_summary(identifier: object, details: dict) -> dict | None:
             return {"scope_zh": "几何网格", "expected": "全部刚体网格存在", "actual": f"{meshes} 个网格"}
         return None
     if name == "input.valid":
-        if details.get("passed") is True:
+        if details.get("passed") is True or details.get("validated") is True:
             return {"scope_zh": "输入规范", "expected": "输入包符合规范", "actual": "规范校验通过"}
         return None
     return None

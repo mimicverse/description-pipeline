@@ -32,6 +32,8 @@ def quality_rows() -> dict:
                 "urdf_mass_kg": 3.3948682203507135,
                 "whole_cad_mass_kg": 3.3948682203507135,
                 "delta_kg": 0.0,
+                "atol_kg": 1e-12,
+                "rtol": 0.0,
             },
         },
         {
@@ -111,7 +113,7 @@ class ReportViewTests(unittest.TestCase):
         self.assertEqual(window["summary"]["expected"], "2.0–4.5 kg")
         self.assertIn("3.3948682203507135", window["summary"]["actual"])
         closure = independent["physics.mass_closure_equality"]
-        self.assertEqual(closure["summary"]["expected"], "差值 = 0")
+        self.assertEqual(closure["summary"]["expected"], "绝对误差 ≤ 1e-12 kg")
         self.assertIn("URDF", closure["summary"]["actual"])
         self.assertEqual(independent["joints.shoulder_pitch_joint"]["label_zh"], "关节：shoulder_pitch_joint")
         self.assertEqual(independent["custom.unknown"]["label_zh"], "custom.unknown")
