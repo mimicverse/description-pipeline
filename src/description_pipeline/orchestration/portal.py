@@ -64,6 +64,7 @@ from .run_ownership import (
     classify_transport_retry,
     recorded_actor_principal,
 )
+from .run_metadata import RunMetadataError, RunMetadataStore, TitleError
 from .report_view import build_report
 from .uploads import (
     MAX_FILE_BYTES,
@@ -89,6 +90,12 @@ _STAGE_NAMES_ZH = {stage["id"]: stage.get("name_zh") or stage["id"] for stage in
 _RERUN_PAGE = 100
 _RERUN_PAGE_CAP = 10
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+#: Row overlay when a run has no ledger entry (treated read-only).
+_EMPTY_OVERLAY = {"title": None, "deleted": False, "deleted_at": None, "deleted_by": None}
+#: Task states that still own execution; an unknown (None) state stays a refusal too.
+_ACTIVE_TASK_STATES = {"running", "queued", "scheduled", "up_for_retry", "up_for_reschedule", "deferred"}
+#: Task states that are terminal; anything else (including new Airflow states) fails closed.
+_TERMINAL_TASK_STATES = {"success", "failed", "upstream_failed", "skipped"}
 _ARTIFACT_TYPES = {
     ".urdf": "application/xml",
     ".xml": "application/xml",
@@ -505,6 +512,20 @@ def _stage_name_zh(value: object) -> str | None:
     return _STAGE_NAMES_ZH.get(stage) if stage is not None else None
 
 
+def _page_integer(query: dict, name: str, *, default: int, minimum: int, maximum: int) -> int:
+    """One bounded integer list parameter; invalid values are refused, never clamped silently."""
+    raw = str((query.get(name) or [""])[0])
+    if raw == "":
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as error:
+        raise PortalError(HTTPStatus.BAD_REQUEST, f"分页参数 {name} 不合法") from error
+    if value < minimum or value > maximum:
+        raise PortalError(HTTPStatus.BAD_REQUEST, f"分页参数 {name} 超出范围")
+    return value
+
+
 def _discovery_evidence(detail: object, digest: str) -> dict:
     """One finding's diagnostic payload, always bound to the raw discovery record digest."""
     evidence: dict = {}
@@ -692,6 +713,9 @@ class PortalApp:
         self._previews: dict[str, tuple[float, dict]] = {}
         self._upload_gate = UploadGate(config.upload_concurrency)
         self._rerun_lock = threading.Lock()
+        self.run_metadata = RunMetadataStore(
+            config.upload_root / ".run-metadata.json" if config.upload_root is not None else None
+        )
 
     # ------------------------------------------------------------------ WSGI
     def __call__(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
@@ -723,8 +747,16 @@ class PortalApp:
             if method == "POST":
                 return self._start_run(environ, start_response)
         match = re.fullmatch(r"/api/runs/([^/]+)", path)
-        if match and method == "GET":
-            return self._run_status(environ, start_response, match.group(1))
+        if match:
+            if method == "GET":
+                return self._run_status(environ, start_response, match.group(1))
+            if method == "PATCH":
+                return self._rename_run(environ, start_response, match.group(1))
+            if method == "DELETE":
+                return self._delete_run(environ, start_response, match.group(1))
+        match = re.fullmatch(r"/api/runs/([^/]+)/restore", path)
+        if match and method == "POST":
+            return self._restore_run(environ, start_response, match.group(1))
         match = re.fullmatch(r"/api/runs/([^/]+)/retry", path)
         if match and method == "POST":
             return self._retry_run(environ, start_response, match.group(1))
@@ -788,8 +820,8 @@ class PortalApp:
             principal=principal.strip(),
         )
 
-    def _can_manage(self, session: PortalSession, run: dict) -> bool:
-        """Recheck the caller's current profile and the authoritative run actor."""
+    def _viewer_identity(self, session: PortalSession) -> tuple[str, bool]:
+        """One live profile recheck for a whole request: (principal, is_admin)."""
         try:
             profile = self.config.airflow.profile(session.token)
         except AirflowAuthError as error:
@@ -810,7 +842,12 @@ class PortalApp:
         ):
             self.sessions.drop(session.session_id)
             raise PortalError(HTTPStatus.UNAUTHORIZED, "飞书身份已变更，请重新登录")
-        return profile.get("role") == "ADMIN" or recorded_actor_principal(run.get("triggering_user_name")) == principal
+        return principal, profile.get("role") == "ADMIN"
+
+    def _can_manage(self, session: PortalSession, run: dict) -> bool:
+        """Recheck the caller's current profile and the authoritative run actor."""
+        principal, is_admin = self._viewer_identity(session)
+        return is_admin or recorded_actor_principal(run.get("triggering_user_name")) == principal
 
     def _session_info(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
         cookies = _parse_cookies(environ.get("HTTP_COOKIE"))
@@ -853,42 +890,74 @@ class PortalApp:
     # ------------------------------------------------------------------ runs
     def _list_runs(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
         session = self._session(environ)
+        query = urlparse.parse_qs(str(environ.get("QUERY_STRING") or ""), keep_blank_values=True)
+        limit = _page_integer(query, "limit", default=20, minimum=1, maximum=100)
+        offset = _page_integer(query, "offset", default=0, minimum=0, maximum=100_000)
+        include_deleted = str((query.get("include_deleted") or [""])[0]).lower() in {"1", "true"}
+        metadata = self._metadata_snapshot()
+        principal, is_admin = self._viewer_identity(session)
         with self._lock:
             local = {run.dag_run_id: run for run in self._runs.values()}
-        try:
-            airflow_runs = self.config.airflow.list_dag_runs(session.token, self.config.dag_id, limit=20)
-        except AirflowAuthError as error:
-            raise PortalError(HTTPStatus.UNAUTHORIZED, str(error)) from error
-        except AirflowApiError:
-            airflow_runs = []
-        runs = []
-        seen = set()
-        for item in airflow_runs:
-            dag_run_id = str(item.get("dag_run_id") or "")
-            if not dag_run_id or dag_run_id in seen:
-                continue
-            seen.add(dag_run_id)
-            record = local.get(dag_run_id)
-            conf = item.get("conf") if isinstance(item.get("conf"), dict) else {}
-            principal, name = _run_identity(item.get("triggering_user_name"), record)
-            runs.append(
-                {
-                    "dag_run_id": dag_run_id,
-                    "handoff_path": conf.get("handoff_path") or (record.handoff_path if record else None),
-                    # The recorded initiator, never the current viewer; missing names stay null.
-                    "user": name,
-                    # Airflow's own record outlives any portal restart.
-                    "principal": principal,
-                    "state": item.get("state"),
-                    "started_at": item.get("start_date"),
-                    # Linked rerun lineage: derived from the child run's own conf only.
-                    "parent_dag_run_id": _optional_str(conf.get("parent_dag_run_id")),
-                    "resume_from": _optional_str(conf.get("resume_from")),
-                    "resume_from_name_zh": _stage_name_zh(conf.get("resume_from")),
-                }
-            )
+        runs: list[dict] = []
+        seen: set[str] = set()
+        # Scan past recently deleted runs so tombstones never push older runs off the page.
+        # The budget scales with the requested offset and a bounded extra scan; when the budget
+        # runs out before the end of the history is proven, the list fails closed instead of
+        # presenting a truncated result as the complete one.
+        page_size = 100
+        required = offset + limit + 1
+        scan_budget = ((required + page_size - 1) // page_size) + 10
+        pages = 0
+        while True:
+            if pages >= scan_budget:
+                raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "运行历史过长，暂时无法定位更多记录，请稍后重试")
+            try:
+                items = self.config.airflow.list_dag_runs(
+                    session.token, self.config.dag_id, limit=page_size, offset=pages * page_size
+                )
+            except AirflowAuthError as error:
+                raise PortalError(HTTPStatus.UNAUTHORIZED, str(error)) from error
+            except AirflowApiError as error:
+                # Never present a partial history as the complete one.
+                raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "暂时无法读取运行列表，请稍后重试") from error
+            pages += 1
+            for item in items:
+                dag_run_id = str(item.get("dag_run_id") or "")
+                if not dag_run_id or dag_run_id in seen:
+                    continue
+                seen.add(dag_run_id)
+                record = local.get(dag_run_id)
+                conf = item.get("conf") if isinstance(item.get("conf"), dict) else {}
+                owner, name = _run_identity(item.get("triggering_user_name"), record)
+                overlay = metadata.get(dag_run_id) or _EMPTY_OVERLAY
+                if overlay["deleted"] and not include_deleted:
+                    continue
+                runs.append(
+                    {
+                        "dag_run_id": dag_run_id,
+                        "handoff_path": conf.get("handoff_path") or (record.handoff_path if record else None),
+                        # The recorded initiator, never the current viewer; missing names stay null.
+                        "user": name,
+                        # Airflow's own record outlives any portal restart.
+                        "principal": owner,
+                        "state": item.get("state"),
+                        "started_at": item.get("start_date"),
+                        # Linked rerun lineage: derived from the child run's own conf only.
+                        "parent_dag_run_id": _optional_str(conf.get("parent_dag_run_id")),
+                        "resume_from": _optional_str(conf.get("resume_from")),
+                        "resume_from_name_zh": _stage_name_zh(conf.get("resume_from")),
+                        # Row-level action gate for the operator page (one profile check per list).
+                        "can_manage": is_admin or owner == principal,
+                        **overlay,
+                    }
+                )
+            if len(runs) >= required or len(items) < page_size:
+                break
         for record in sorted(local.values(), key=lambda item: item.started_at, reverse=True):
             if record.dag_run_id not in seen:
+                overlay = metadata.get(record.dag_run_id) or _EMPTY_OVERLAY
+                if overlay["deleted"] and not include_deleted:
+                    continue
                 runs.append(
                     {
                         "dag_run_id": record.dag_run_id,
@@ -902,12 +971,18 @@ class PortalApp:
                         "parent_dag_run_id": None,
                         "resume_from": None,
                         "resume_from_name_zh": None,
+                        "can_manage": is_admin or record.principal == principal,
+                        **overlay,
                     }
                 )
+        page_runs = runs[offset : offset + limit]
         return _json_response(
             start_response,
             200,
-            {"runs": runs[:20]},
+            {
+                "runs": page_runs,
+                "next_offset": offset + limit if len(runs) > offset + limit else None,
+            },
             self.config,
         )
 
@@ -1027,6 +1102,140 @@ class PortalApp:
         except (AirflowApiError, AirflowAuthError):
             return False
 
+    # ------------------------------------------------------- run metadata
+    def _metadata_snapshot(self) -> dict[str, dict]:
+        """All overlays with one ledger read; an unreadable ledger fails closed."""
+        try:
+            return self.run_metadata.snapshot()
+        except RunMetadataError as error:
+            log.error("run metadata unavailable: %s", error)
+            raise PortalError(
+                HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用；为避免显示错误请稍后重试"
+            ) from error
+
+    def _metadata_overlay(self, dag_run_id: str) -> dict:
+        try:
+            return self.run_metadata.overlay(dag_run_id)
+        except RunMetadataError as error:
+            log.error("run metadata unavailable: %s", error)
+            raise PortalError(
+                HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用；为避免显示错误请稍后重试"
+            ) from error
+
+    def _require_run(self, session: PortalSession, dag_run_id: str) -> dict:
+        """One authoritative Airflow run, or the existing 401/404/502 mapping."""
+        try:
+            return self.config.airflow.dag_run(session.token, self.config.dag_id, dag_run_id)
+        except AirflowAuthError as error:
+            raise PortalError(HTTPStatus.UNAUTHORIZED, str(error)) from error
+        except AirflowApiError as error:
+            missing = isinstance(error.__cause__, urlerror.HTTPError) and error.__cause__.code == 404
+            raise PortalError(HTTPStatus.NOT_FOUND if missing else HTTPStatus.BAD_GATEWAY, str(error)) from error
+
+    def _actor_label(self, session: PortalSession, dag_run_id: str, run: dict) -> str:
+        with self._lock:
+            record = self._runs.get(dag_run_id)
+        principal, name = _run_identity(run.get("triggering_user_name"), record)
+        return name or principal or session.principal
+
+    def _rename_run(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
+        """Display-only rename; works for deleted runs and never touches native state."""
+        session = self._session(environ, csrf=True)
+        if _RUN_ID.fullmatch(dag_run_id) is None:
+            raise PortalError(HTTPStatus.BAD_REQUEST, "运行标识不合法")
+        body = self._body(environ)
+        if set(body) != {"title"}:
+            raise PortalError(HTTPStatus.BAD_REQUEST, "重命名只接受 title 参数；传入 null 恢复默认名称")
+        run = self._require_run(session, dag_run_id)
+        if not self._can_manage(session, run):
+            raise PortalError(HTTPStatus.FORBIDDEN, "只有发起人或平台管理员可重命名此运行")
+        try:
+            overlay = self.run_metadata.rename(
+                dag_run_id, body["title"], actor=self._actor_label(session, dag_run_id, run)
+            )
+        except TitleError as error:
+            raise PortalError(HTTPStatus.BAD_REQUEST, str(error)) from error
+        except RunMetadataError as error:
+            log.error("run metadata rename failed: %s", error)
+            raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用，请稍后重试") from error
+        return _json_response(start_response, 200, {"dag_run_id": dag_run_id, **overlay}, self.config)
+
+    def _delete_run(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
+        """Reversible tombstone: the record moves to the shared Deleted view, nothing else changes."""
+        session = self._session(environ, csrf=True)
+        if _RUN_ID.fullmatch(dag_run_id) is None:
+            raise PortalError(HTTPStatus.BAD_REQUEST, "运行标识不合法")
+        run = self._require_run(session, dag_run_id)
+        if not self._can_manage(session, run):
+            raise PortalError(HTTPStatus.FORBIDDEN, "只有发起人或平台管理员可删除此运行")
+        # Deleting must serialize with retry/rerun so a tombstone can never hide active work:
+        # whoever holds this lock completes its state change before the other checks it.
+        with self._rerun_lock:
+            overlay = self._metadata_overlay(dag_run_id)
+            if overlay["deleted"]:
+                return _json_response(start_response, 200, {"dag_run_id": dag_run_id, **overlay}, self.config)
+            refusal = self._delete_refusal(session, run, dag_run_id)
+            if refusal is not None:
+                reason, message = refusal
+                return _json_response(
+                    start_response, HTTPStatus.CONFLICT, {"error": message, "reason": reason}, self.config
+                )
+            try:
+                overlay = self.run_metadata.delete(dag_run_id, actor=self._actor_label(session, dag_run_id, run))
+            except RunMetadataError as error:
+                log.error("run metadata delete failed: %s", error)
+                raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用，请稍后重试") from error
+        log.info("portal deleted dag_run_id=%s principal=%s", dag_run_id, session.principal)
+        return _json_response(start_response, 200, {"dag_run_id": dag_run_id, **overlay}, self.config)
+
+    def _delete_refusal(self, session: PortalSession, run: dict, dag_run_id: str) -> tuple[str, str] | None:
+        """Any active or unknown execution state refuses deletion (fail closed)."""
+        state = str(run.get("state") or "")
+        if state in {"queued", "running"}:
+            return "run_active", "运行仍在执行，结束后才能删除"
+        if state not in {"success", "failed"}:
+            return "unconfirmed", "无法确认运行已经结束，请稍后重试"
+        try:
+            tasks = self.config.airflow.task_instances(session.token, self.config.dag_id, dag_run_id)
+        except AirflowAuthError as error:
+            raise PortalError(HTTPStatus.UNAUTHORIZED, str(error)) from error
+        except AirflowApiError:
+            return "unconfirmed", "无法确认运行中的任务状态，请稍后重试"
+        for task in tasks:
+            task_state = task.get("state")
+            if task_state in _ACTIVE_TASK_STATES:
+                return "run_active", "运行仍有未结束的任务，结束后才能删除"
+            if task_state not in _TERMINAL_TASK_STATES:
+                return "unconfirmed", "无法确认任务状态，请稍后重试"
+        try:
+            job = self._endpoint().get_job(native_run_id(dag_run_id))
+        except EndpointNotFound:
+            job = None
+        except EndpointError:
+            return "unconfirmed", "暂时无法确认原生作业状态，请稍后重试"
+        if isinstance(job, dict):
+            job_state = str(job.get("status") or "")
+            if job_state in {"queued", "running"}:
+                return "run_active", "原生作业仍在执行，结束后才能删除"
+            if job_state not in {"passed", "failed"}:
+                return "unconfirmed", "无法确认原生作业状态，请稍后重试"
+        return None
+
+    def _restore_run(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
+        session = self._session(environ, csrf=True)
+        if _RUN_ID.fullmatch(dag_run_id) is None:
+            raise PortalError(HTTPStatus.BAD_REQUEST, "运行标识不合法")
+        run = self._require_run(session, dag_run_id)
+        if not self._can_manage(session, run):
+            raise PortalError(HTTPStatus.FORBIDDEN, "只有发起人或平台管理员可恢复此运行")
+        try:
+            overlay = self.run_metadata.restore(dag_run_id)
+        except RunMetadataError as error:
+            log.error("run metadata restore failed: %s", error)
+            raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用，请稍后重试") from error
+        log.info("portal restored dag_run_id=%s principal=%s", dag_run_id, session.principal)
+        return _json_response(start_response, 200, {"dag_run_id": dag_run_id, **overlay}, self.config)
+
     def _run_status(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
         session = self._session(environ)
         if _RUN_ID.fullmatch(dag_run_id) is None:
@@ -1081,6 +1290,10 @@ class PortalApp:
             "operator": operator,
             "principal": principal,
             "can_manage": can_manage,
+            # Linked rerun lineage from the child run's own conf, same fields as the list rows.
+            "parent_dag_run_id": _optional_str(conf.get("parent_dag_run_id")),
+            "resume_from": _optional_str(conf.get("resume_from")),
+            "resume_from_name_zh": _stage_name_zh(conf.get("resume_from")),
             "retry": {"eligible": retry.eligible, "reason": retry.reason},
             "started_at": airflow_run.get("start_date"),
             "ended_at": airflow_run.get("end_date"),
@@ -1109,6 +1322,8 @@ class PortalApp:
             "coverage": _coverage_report(job, report),
             "pr": pr,
             "endpoint_error": endpoint_error,
+            # Display rename / reversible tombstone; an unreadable ledger fails closed above.
+            **self._metadata_overlay(dag_run_id),
         }
         rerun_rows = self._rerun_rows(run_id)
         if rerun_rows is not None:
@@ -1125,50 +1340,59 @@ class PortalApp:
             run = self.config.airflow.dag_run(session.token, self.config.dag_id, dag_run_id)
             if not self._can_manage(session, run):
                 raise PortalError(HTTPStatus.FORBIDDEN, "只有发起人或平台管理员可重试此运行")
-            tasks = self.config.airflow.task_instances(session.token, self.config.dag_id, dag_run_id)
-            job = None
-            try:
-                job = self._endpoint().get_job(native_run_id(dag_run_id))
-            except EndpointNotFound:
-                pass
-            except EndpointError as error:
-                raise PortalError(HTTPStatus.CONFLICT, "无法确认原作业状态，请稍后重试") from error
-            assessment = _retry_assessment(run, tasks, job, None)
-            if not assessment.eligible:
-                raise PortalError(HTTPStatus.CONFLICT, "此运行无法重试，请查看检查结果并按需新建运行")
-            preview = self.config.airflow.clear_dag_run(session.token, self.config.dag_id, dag_run_id, dry_run=True)
-            selected = preview.get("task_instances")
-            if (
-                not isinstance(selected, list)
-                or type(preview.get("total_entries")) is not int
-                or preview.get("total_entries") != len(selected)
-                or any(not isinstance(task, dict) for task in selected)
-            ):
-                raise PortalError(HTTPStatus.CONFLICT, "Airflow 未提供有效的重试任务检查结果")
-            selected_states = {}
-            for task in selected:
-                name = task.get("task_id")
+            # Deleted-record refusal and the retry state change are atomic against deletion.
+            with self._rerun_lock:
+                if self._metadata_overlay(dag_run_id)["deleted"]:
+                    return _json_response(
+                        start_response,
+                        HTTPStatus.CONFLICT,
+                        {"error": "已删除的运行不能重试，请先恢复", "reason": "deleted"},
+                        self.config,
+                    )
+                tasks = self.config.airflow.task_instances(session.token, self.config.dag_id, dag_run_id)
+                job = None
+                try:
+                    job = self._endpoint().get_job(native_run_id(dag_run_id))
+                except EndpointNotFound:
+                    pass
+                except EndpointError as error:
+                    raise PortalError(HTTPStatus.CONFLICT, "无法确认原作业状态，请稍后重试") from error
+                assessment = _retry_assessment(run, tasks, job, None)
+                if not assessment.eligible:
+                    raise PortalError(HTTPStatus.CONFLICT, "此运行无法重试，请查看检查结果并按需新建运行")
+                preview = self.config.airflow.clear_dag_run(session.token, self.config.dag_id, dag_run_id, dry_run=True)
+                selected = preview.get("task_instances")
                 if (
-                    not isinstance(name, str)
-                    or name in selected_states
-                    or task.get("map_index", -1) != -1
-                    or task.get("state") not in {"failed", "upstream_failed"}
-                    or task.get("dag_id", self.config.dag_id) != self.config.dag_id
-                    or task.get("dag_run_id", dag_run_id) != dag_run_id
+                    not isinstance(selected, list)
+                    or type(preview.get("total_entries")) is not int
+                    or preview.get("total_entries") != len(selected)
+                    or any(not isinstance(task, dict) for task in selected)
                 ):
-                    raise PortalError(HTTPStatus.CONFLICT, "重试任务与原运行不一致")
-                selected_states[name] = task.get("state")
-            if tuple(sorted(selected_states)) != assessment.cleared_tasks:
-                raise PortalError(HTTPStatus.CONFLICT, "运行状态已变化，请刷新后重试")
-            if any(
-                selected_states[task["task_id"]] != task.get("state")
-                for task in tasks
-                if task.get("task_id") in selected_states
-            ):
-                raise PortalError(HTTPStatus.CONFLICT, "运行状态已变化，请刷新后重试")
-            result = self.config.airflow.clear_dag_run(session.token, self.config.dag_id, dag_run_id, dry_run=False)
-            if result.get("dag_run_id") != dag_run_id or result.get("dag_id") != self.config.dag_id:
-                raise PortalError(HTTPStatus.BAD_GATEWAY, "Airflow 返回的重试运行身份不一致")
+                    raise PortalError(HTTPStatus.CONFLICT, "Airflow 未提供有效的重试任务检查结果")
+                selected_states = {}
+                for task in selected:
+                    name = task.get("task_id")
+                    if (
+                        not isinstance(name, str)
+                        or name in selected_states
+                        or task.get("map_index", -1) != -1
+                        or task.get("state") not in {"failed", "upstream_failed"}
+                        or task.get("dag_id", self.config.dag_id) != self.config.dag_id
+                        or task.get("dag_run_id", dag_run_id) != dag_run_id
+                    ):
+                        raise PortalError(HTTPStatus.CONFLICT, "重试任务与原运行不一致")
+                    selected_states[name] = task.get("state")
+                if tuple(sorted(selected_states)) != assessment.cleared_tasks:
+                    raise PortalError(HTTPStatus.CONFLICT, "运行状态已变化，请刷新后重试")
+                if any(
+                    selected_states[task["task_id"]] != task.get("state")
+                    for task in tasks
+                    if task.get("task_id") in selected_states
+                ):
+                    raise PortalError(HTTPStatus.CONFLICT, "运行状态已变化，请刷新后重试")
+                result = self.config.airflow.clear_dag_run(session.token, self.config.dag_id, dag_run_id, dry_run=False)
+                if result.get("dag_run_id") != dag_run_id or result.get("dag_id") != self.config.dag_id:
+                    raise PortalError(HTTPStatus.BAD_GATEWAY, "Airflow 返回的重试运行身份不一致")
         except AirflowAuthError as error:
             forbidden = isinstance(error.__cause__, urlerror.HTTPError) and error.__cause__.code == 403
             raise PortalError(HTTPStatus.FORBIDDEN if forbidden else HTTPStatus.UNAUTHORIZED, str(error)) from error
@@ -1397,6 +1621,9 @@ class PortalApp:
                     None,
                 )
             with self._rerun_lock:
+                if self._metadata_overlay(dag_run_id)["deleted"]:
+                    # Readable evidence, but not a valid starting point until restored.
+                    return self._rerun_refusal(start_response, "deleted", "已删除的运行不能重新运行，请先恢复", None)
                 journal = self._read_rerun_journal(dag_run_id)
                 reserved_id = _optional_str(journal.get("attempt_id")) if journal is not None else None
                 reserved_stage = _optional_str(journal.get("stage")) if journal is not None else None

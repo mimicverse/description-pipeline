@@ -188,7 +188,7 @@ import description_pipeline
 
 root = Path(description_pipeline.__file__).resolve().parent / "orchestration" / "static"
 try:
-    for name in ("app.js", "viewer.js", "vendor/three.module.min.js", "vendor/three.core.min.js"):
+    for name in ("app.js", "run_history.js", "viewer.js", "vendor/three.module.min.js", "vendor/three.core.min.js"):
         expected = (root / name).read_bytes()
         with urlopen(f"http://127.0.0.1:{sys.argv[1]}/static/{name}", timeout=10) as response:
             if response.status != 200 or response.headers.get_content_type() not in {

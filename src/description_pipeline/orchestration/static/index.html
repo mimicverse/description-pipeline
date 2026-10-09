@@ -3,14 +3,14 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SolidWorks 交付操作台</title>
+  <title>SolidWorks2URDF 交付操作台</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
       <span class="brand-mark" aria-hidden="true"></span>
-      <h1>SolidWorks 交付操作台</h1>
+      <h1>SolidWorks2URDF 交付操作台</h1>
     </div>
     <div id="account" class="account" hidden>
       <span id="account-user"></span>
@@ -31,8 +31,19 @@
     <section id="workspace" class="workspace" hidden>
       <aside class="sidebar" aria-label="运行">
         <button type="button" id="new-run-button" class="button primary sidebar-action">＋ 新建交付</button>
-        <h2 class="sidebar-title">最近运行</h2>
+        <div class="runs-views" role="group" aria-label="运行视图">
+          <button type="button" id="runs-view-active" class="runs-view active" aria-pressed="true">最近运行</button>
+          <button type="button" id="runs-view-deleted" class="runs-view" aria-pressed="false">已删除</button>
+        </div>
         <ul id="runs" class="runs"><li class="muted">暂无运行</li></ul>
+        <p id="runs-error" class="error small" role="alert" hidden></p>
+        <details class="runs-help">
+          <summary>关于运行历史</summary>
+          <p class="muted small">
+            名称默认为工程文件夹名；重命名只影响列表显示，留空可恢复默认。「删除」会把运行移到「已删除」视图，
+            可随时恢复；模型、证据与 PR 均保留。早期联调产生的运行也会保留在列表中。
+          </p>
+        </details>
       </aside>
 
       <div class="content">
@@ -74,6 +85,8 @@
             <div class="run-header-side">
               <span id="run-initiator" class="muted small"></span>
               <span id="run-origin" class="run-origin muted small" hidden></span>
+              <span id="run-deleted" class="tombstone" hidden></span>
+              <span id="run-actions" class="run-actions-host"></span>
               <div id="pr" class="pr" hidden></div>
               <div id="retry-panel" class="run-actions" hidden>
                 <button id="retry-button" type="button" hidden>重试</button>

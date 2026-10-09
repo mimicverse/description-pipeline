@@ -54,6 +54,28 @@ Approved Feishu users may start new pipeline runs and view shared results. A run
 records its initiator's stable authenticated identity and shows that operator's
 original Feishu username.
 
+### Manage run history
+
+Each record represents one run. The list shows its project name, start time,
+status and initiator. A rerun keeps the project name and identifies its starting
+step; the detail view links to the original run. A display name is a label for
+the record, not a structural revision or a qualification claim.
+
+The initiator and platform administrators can manage a record:
+
+| Action | Effect |
+|---|---|
+| Rename | Change the display name; the original engineering folder and model identity remain unchanged |
+| Delete | Move a completed record to **已删除** for all operators |
+| Restore | Return the record from **已删除** to the run list |
+
+Deletion is reversible and does not remove Airflow jobs, native inputs, model
+files, verification evidence or PRs. Running jobs and jobs whose execution state
+cannot be established cannot be deleted. Deleted records remain readable from
+linked runs; restore them before retrying or starting another rerun.
+
+### Rerun from a step
+
 A run's initiator and platform administrators may select any engineering step
 and choose **从此步骤重新运行**. The selected step and every downstream step run
 in a new linked run; the original run and its diagnostics remain unchanged.
@@ -83,6 +105,8 @@ when available. A partial capture cannot serve as complete evidence for generati
 **继续原作业** is a separate action for recoverable transport failures. It
 reconnects the same Airflow run to the same native job without repeating CAD work.
 It does not rerun an engineering step.
+
+### Inspect results
 
 Run history and details show the original submitter's verified Feishu username,
 including when viewed by another operator. The platform reads the name through
