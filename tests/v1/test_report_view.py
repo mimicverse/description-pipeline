@@ -254,6 +254,34 @@ class ReportViewTests(unittest.TestCase):
         job["status"] = "failed"
         self.assertEqual(build_report(job)["overall"]["state"], "failed")
 
+    def test_reused_stage_retains_provenance_without_claiming_new_execution(self) -> None:
+        job = passed_job()
+        parent = "original-native-run"
+        for event in job["events"]:
+            if event["stage"] == "freeze":
+                event["reuse"] = {"parent_run": parent, "reused": True}
+                event["at"] = "2026-10-09T08:00:00Z"
+        report = build_report(job)
+        freeze = report["stages"][0]
+        self.assertEqual(freeze["reuse"]["parent_run"], parent)
+        self.assertEqual(freeze["at"], "2026-10-09T08:00:00Z")
+        self.assertTrue(all(row["reuse"]["reused"] for row in freeze["boundary"]))
+        self.assertNotIn("reuse", report["stages"][1])
+        job["events"].append({"stage": "freeze", "state": "running"})
+        self.assertNotIn("reuse", build_report(job)["stages"][0])
+
+    def test_main_assembly_ambiguity_is_not_reported_as_unreadable_cad(self) -> None:
+        job = passed_job()
+        job.update(
+            status="failed",
+            events=protocol_events(subject=SHA, failed_stage="discover"),
+            error="CadError: no unique delivered assembly",
+            error_code="native_discovery_main_assembly_ambiguous",
+        )
+        failure = build_report(job)["failure"]
+        self.assertEqual(failure["title_zh"], "无法唯一确定主装配")
+        self.assertIn("dp.delivery_configuration", failure["meaning_zh"])
+
     def test_external_review_passes_scope_and_automatic_exclusion_through(self) -> None:
         view = {
             "stages": [

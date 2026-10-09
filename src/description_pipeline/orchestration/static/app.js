@@ -517,6 +517,7 @@ function stageList(run) {
       state: stage.state || "not_run",
       stateZh: stage.state_zh || "未执行",
       at: stage.at,
+      reuse: stage.reuse || null,
       counts,
       passed: sum("passed"),
       executed: sum("executed"),
@@ -638,6 +639,13 @@ function renderStageDetail() {
     at.className = "muted small";
     at.textContent = `记录时间：${formatTime(stage.at)}`;
     summary.append(at);
+  }
+  if (stage.reuse && stage.reuse.reused === true) {
+    const reused = document.createElement("p");
+    reused.className = "muted small";
+    reused.textContent = "复用已验证结果；上方时间为原检查时间。";
+    summary.append(reused);
+    appendEvidence(summary, "复用来源", stage.reuse);
   }
   root.append(summary);
 

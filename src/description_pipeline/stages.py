@@ -121,6 +121,15 @@ def stage_view(job=None):
         stage = copy.deepcopy(definition)
         observed = [event for event in events if event.get("stage") == stage["id"]]
         latest = observed[-1] if observed else {}
+        reuse = latest.get("reuse")
+        if (
+            isinstance(reuse, dict)
+            and reuse.get("reused") is True
+            and isinstance(reuse.get("parent_run"), str)
+            and reuse["parent_run"]
+            and all(event.get("reuse") == reuse for event in observed)
+        ):
+            stage["reuse"] = {"parent_run": reuse["parent_run"], "reused": True}
         for boundary in ("input", "output"):
             for item in stage[f"{boundary}_qc"]:
                 matches = [
@@ -179,6 +188,7 @@ def stage_view(job=None):
         if state == "failed":
             stage["error"] = job.get("error") or result.get("error") or "Required stage checks failed or were not run"
             stage["diagnostic"] = job.get("detail") or result.get("detail") or latest.get("detail")
+            stage["error_code"] = job.get("error_code") or result.get("error_code")
             blocked = True
         stage["confirmations"] = [
             {**item, "state": "not_ready", "subject_sha256": subject, "approval_tracking": "external"}
@@ -261,9 +271,8 @@ def compact_view(view):
                     for key in ("input_qc", "output_qc")
                 },
                 "evidence": stage["evidence"],
-                "confirmations": [
-                    {"id": item["id"], "state": item["state"]} for item in stage["confirmations"]
-                ],
+                **({"reuse": stage["reuse"]} if stage.get("reuse") else {}),
+                "confirmations": [{"id": item["id"], "state": item["state"]} for item in stage["confirmations"]],
             }
             for stage in view["stages"]
         ],

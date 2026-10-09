@@ -57,6 +57,14 @@ this external review scope; approvals remain in the matching PR or controlled
 records and are not inferred by the portal. Unsupported capabilities stay visible
 on their responsible step.
 
+Any engineering step can start a new linked run. Upstream results are reused
+only after checking their frozen inputs, tool and dependency identities, and
+checkpoint integrity. The selected step and all downstream steps execute again;
+prior runs remain immutable. Reports identify reused evidence and retain its
+original timestamps. A missing or invalid prerequisite points to the earliest
+safe restart step. Transport recovery reconnects an existing job and remains
+separate from engineering reruns.
+
 Native input and collected evidence remain immutable. The canonical model contains
 topology, transforms, geometry and full physical properties. Verification reconstructs
 expectations from native observations and inspects the actual XML, mesh bytes and

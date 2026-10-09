@@ -393,7 +393,13 @@ def _failure(job: dict, stage: dict) -> dict:
     diagnostic = stage.get("diagnostic")
     raw_detail = diagnostic if isinstance(diagnostic, dict) and diagnostic else None
     codes = None
-    if raw_type == "CadError" and raw_detail and {"errors", "warnings"} <= set(raw_detail):
+    if stage.get("error_code") == "native_discovery_main_assembly_ambiguous":
+        title = "无法唯一确定主装配"
+        meaning = (
+            "请在交付主装配中保存 dp.hardware_id 和 dp.delivery_configuration；"
+            "多个装配声明交付身份时须明确唯一入口，流水线不会按文件名或大小猜测。"
+        )
+    elif raw_type == "CadError" and raw_detail and {"errors", "warnings"} <= set(raw_detail):
         codes = {"errors": raw_detail.get("errors"), "warnings": raw_detail.get("warnings")}
         if raw_detail.get("errors") == 2:
             title = "原生 CAD 打开失败"
@@ -425,6 +431,7 @@ def _failure(job: dict, stage: dict) -> dict:
         "title_zh": title,
         "meaning_zh": meaning,
         "raw_type": raw_type or None,
+        "error_code": stage.get("error_code"),
         "raw_error": raw_error or None,
         "raw_detail": raw_detail,
     }
@@ -517,6 +524,7 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
                     "state_zh": _CHECK_STATE_ZH[state],
                     "executed": state != "not_run",
                     "raw_details": details,
+                    **({"reuse": stage["reuse"]} if stage.get("reuse") else {}),
                 }
                 summary = _boundary_summary(item.get("id"), details)
                 if state == "failed":
@@ -548,6 +556,7 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
                     "state_zh": _CHECK_STATE_ZH[state],
                     "executed": state != "not_run",
                     "raw_details": details,
+                    **({"reuse": stage["reuse"]} if stage.get("reuse") else {}),
                 }
                 summary = _independent_summary(item.get("id"), details)
                 if state == "failed":
@@ -573,6 +582,7 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
             "state": stage.get("state", "not_run"),
             "state_zh": _STAGE_STATE_ZH.get(stage.get("state"), str(stage.get("state") or "未执行")),
             "at": stage.get("at"),
+            **({"reuse": stage["reuse"]} if stage.get("reuse") else {}),
             "in_scope": stage.get("in_scope"),
             "counts": {
                 "boundary": _counts(boundary_rows),
