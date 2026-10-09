@@ -62,6 +62,37 @@ def _owned_output(path: Path) -> bool:
         return False
 
 
+def _seed_resume(staging: Path, seed_dir: Path | None, resume_from: str) -> None:
+    """Copy reusable upstream checkpoints from a prior owned delivery (read-only)."""
+    if seed_dir is None or not Path(seed_dir).is_dir():
+        raise PipelineError("Resume checkpoints are unavailable")
+    seed = Path(seed_dir)
+    parts = {
+        "generate": ("input", "evidence", "reports/input.json"),
+        "verify": (
+            "README.md",
+            "input",
+            "evidence",
+            "model",
+            "urdf",
+            "meshes",
+            "reports/input.json",
+            "reports/tool.json",
+        ),
+        "publish": ("README.md", "input", "evidence", "model", "urdf", "meshes", "reports"),
+    }[resume_from]
+    for part in parts:
+        source = seed / part
+        target = staging / part
+        if source.is_dir():
+            shutil.copytree(source, target)
+        elif source.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+        else:
+            raise PipelineError(f"Resume checkpoint is missing: {part}")
+
+
 def _install(staging: Path, target: Path) -> None:
     """Replace only a marked pipeline output; roll back a failed directory swap."""
 
@@ -159,6 +190,10 @@ def run(
     prior_events=None,
     expected_inputs=None,
     handoff_sha256=None,
+    resume_from: str | None = None,
+    seed_dir: Path | None = None,
+    expected_subject: str | None = None,
+    resume: dict | None = None,
 ) -> dict:
     """Continue a prepared native job through capture, generation, verification and publication.
 
@@ -183,35 +218,73 @@ def run(
         if not _owned_output(output):
             raise PipelineError(f"Output contains unrelated files: {output}")
         staging = Path(tempfile.mkdtemp(prefix=f".{output.name}-capture-", dir=output.parent))
+        prior = [event for event in (prior_events or []) if isinstance(event, dict)]
+        restart = STAGE_IDS.index(resume_from) if resume_from in STAGE_IDS else STAGE_IDS.index("capture")
         receipt = {
             "schema_version": BUNDLE_SCHEMA,
             "pipeline_id": PIPELINE_ID,
             "run_id": run_id or str(uuid.uuid4()),
             "handoff_sha256": handoff_sha256,
             "state": "failed",
-            "events": list(prior_events or []),
-            "execution_scope": [
-                stage for stage in STAGE_IDS[:2] if any(event["stage"] == stage for event in prior_events or [])
-            ]
-            + ["capture", "generate", "verify"]
+            "events": prior,
+            "execution_scope": [stage for stage in STAGE_IDS if any(event.get("stage") == stage for event in prior)]
+            + [stage for stage in ("capture", "generate", "verify") if STAGE_IDS.index(stage) >= restart]
             + (["publish"] if repository else []),
         }
+        if isinstance(resume, dict) and resume:
+            receipt["resume"] = {"parent_run": resume.get("parent_run"), "from_stage": resume.get("from_stage")}
         event = _event_sink(receipt, on_event)
 
         try:
+            from .sources.solidworks.input import resolve_package
             from .steps import capture_evidence, generate_model, publish_model, verify_delivery
 
-            definition, input_report = capture_evidence(
-                package,
-                staging,
-                backend=backend,
-                on_event=event,
-                expected_inputs=expected_inputs,
-                handoff_sha256=handoff_sha256,
-            )
-            receipt["cad_revision"] = input_report["cad_revision"]["revision"]
-            generated_subject = generate_model(staging, definition, input_report, on_event=event)
-            report = verify_delivery(staging, generated_subject, on_event=event)
+            if resume_from is not None and resume_from not in {"capture", "generate", "verify", "publish"}:
+                raise PipelineError(f"Resume is not supported from {resume_from!r}")
+            if resume_from in (None, "capture"):
+                definition, input_report = capture_evidence(
+                    package,
+                    staging,
+                    backend=backend,
+                    on_event=event,
+                    expected_inputs=expected_inputs,
+                    handoff_sha256=handoff_sha256,
+                )
+                receipt["cad_revision"] = input_report["cad_revision"]["revision"]
+            else:
+                _seed_resume(staging, seed_dir, resume_from)
+                input_report = read_data(staging / "reports/input.json")
+                from .steps import inspect_prepared_input
+
+                replayed = inspect_prepared_input(staging / "input")
+                if replayed.get("passed") is not True:
+                    raise PipelineError("Retained native inputs no longer pass static validation")
+                if inventory(staging / "input") != input_report.get("package_files"):
+                    raise PipelineError("Retained input bytes do not match the recorded inspection receipt")
+                for key in ("input", "cad_revision"):
+                    if replayed.get(key) != input_report.get(key):
+                        raise PipelineError("Retained input report does not match its archived native inputs")
+                receipt_rows = (input_report.get("input_receipt") or {}).get("inventory")
+                if receipt_rows and (replayed.get("input_receipt") or {}).get("inventory") != receipt_rows:
+                    raise PipelineError("Retained input inspection receipt does not match its archived native inputs")
+                definition = resolve_package(input_report)
+                receipt["cad_revision"] = input_report["cad_revision"]["revision"]
+            if resume_from in (None, "capture", "generate"):
+                generated_subject = generate_model(staging, definition, input_report, on_event=event)
+            else:
+                if not expected_subject:
+                    raise PipelineError("Resumed verification requires the recorded subject")
+                generated_subject = digest(subject_inventory(staging))
+                if generated_subject != expected_subject:
+                    raise PipelineError("Generated subject does not match the recorded delivery")
+            if resume_from in (None, "capture", "generate", "verify"):
+                report = verify_delivery(staging, generated_subject, on_event=event)
+            else:
+                from .verification.solidworks_urdf import check_bundle, require_qualified_report
+
+                report = require_qualified_report(check_bundle(staging))
+                if expected_subject and report.get("subject_sha256") != expected_subject:
+                    raise PipelineError("Verified report is bound to a different subject")
             receipt.update(
                 hardware_id=definition["hardware_id"], subject_sha256=report.get("subject_sha256"), quality=report
             )

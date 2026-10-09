@@ -39,6 +39,7 @@ from urllib import request as urlrequest
 from ..delivery import PIPELINE_ID
 from ..io import PipelineError, artifact_path_parts
 from ..sources.solidworks.handoff import HANDOFF_SCHEMA
+from ..stages import STAGE_IDS
 
 JOB_SCHEMA = "solidworks-to-urdf.job/v1"
 NATIVE_RUN_NAMESPACE = "solidworks_to_urdf"
@@ -102,6 +103,19 @@ def native_run_id(dag_run_id: str) -> str:
     if not isinstance(dag_run_id, str) or not dag_run_id.strip():
         raise EndpointProtocolError("dag_run_id must be a non-empty string")
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{NATIVE_RUN_NAMESPACE}:{dag_run_id}"))
+
+
+def validate_resume(value: object, *, run_id: str | None = None) -> dict:
+    """One linked-run binding: the parent native UUID and the canonical restart stage."""
+    if not isinstance(value, dict) or set(value) != {"parent_run", "from_stage"}:
+        raise EndpointProtocolError("resume must carry exactly parent_run and from_stage")
+    parent = validate_run_id(value.get("parent_run"))
+    stage = value.get("from_stage")
+    if stage not in STAGE_IDS:
+        raise EndpointProtocolError(f"from_stage is not a canonical engineering stage: {stage!r}")
+    if run_id is not None and parent == run_id:
+        raise EndpointProtocolError("a linked run cannot reuse itself")
+    return {"parent_run": parent, "from_stage": stage}
 
 
 def _validate_relative_path(value: str, field: str) -> str:
@@ -357,8 +371,13 @@ class WindowsEndpoint:
             raise EndpointProtocolError("health response must include readiness")
         return payload
 
-    def start_job(self, *, run_id: str, resolution: HandoffResolution) -> dict:
-        """Start one native run with exactly the resolved package and its handoff digest."""
+    def start_job(self, *, run_id: str, resolution: HandoffResolution, resume: dict | None = None) -> dict:
+        """Start one native run with exactly the resolved package and its handoff digest.
+
+        ``resume`` links the new job to a terminal parent (``parent_run`` native UUID and the
+        canonical ``from_stage``); the endpoint revalidates the parent, its checkpoints and
+        the retained upload before accepting it.
+        """
         if not isinstance(resolution, HandoffResolution):
             raise EndpointProtocolError("start_job requires a resolved handoff")
         payload = {
@@ -366,6 +385,8 @@ class WindowsEndpoint:
             "package": resolution.package,
             "handoff_sha256": resolution.handoff_sha256,
         }
+        if resume is not None:
+            payload["resume"] = validate_resume(resume, run_id=payload["run_id"])
         response = self._request("POST", "/v1/jobs", payload)
         if response.get("run_id") != payload["run_id"]:
             raise EndpointProtocolError("endpoint returned a different run_id")
@@ -374,6 +395,41 @@ class WindowsEndpoint:
         if response.get("request") != payload:
             raise EndpointProtocolError("Endpoint accepted a different mechanical handoff")
         return response
+
+    def rerun_plan(self, run_id: str) -> dict:
+        """Authoritative per-stage restart plan of one terminal native job.
+
+        The endpoint probes its own retained checkpoints, dependency snapshot and
+        publication target; the portal must not recompute eligibility locally.
+        """
+        canonical = validate_run_id(run_id)
+        payload = self._request("GET", f"/v1/jobs/{canonical}/reruns")
+        if payload.get("run_id") != canonical:
+            raise EndpointProtocolError("rerun plan returned a different run_id")
+        if payload.get("status") not in RUN_STATES:
+            raise EndpointProtocolError(f"unexpected rerun plan status: {payload.get('status')!r}")
+        rows = payload.get("stage_reruns")
+        if not isinstance(rows, list) or [row.get("stage") for row in rows if isinstance(row, dict)] != list(STAGE_IDS):
+            raise EndpointProtocolError("rerun plan must cover every engineering stage exactly once")
+        for row in rows:
+            if not isinstance(row, dict) or any(
+                key not in row
+                for key in (
+                    "stage",
+                    "name_zh",
+                    "eligible",
+                    "reason",
+                    "reason_zh",
+                    "recomputes",
+                    "retains",
+                    "prerequisites",
+                    "target_changed",
+                )
+            ):
+                raise EndpointProtocolError("rerun plan row is incomplete")
+            if not isinstance(row["eligible"], bool) or not isinstance(row["recomputes"], list):
+                raise EndpointProtocolError("rerun plan row carries invalid eligibility or recompute stages")
+        return payload
 
     def get_job(self, run_id: str) -> dict:
         job = self._request("GET", f"/v1/jobs/{validate_run_id(run_id)}")
