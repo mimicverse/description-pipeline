@@ -121,7 +121,7 @@ main { max-width: 1320px; margin: 0 auto; padding: 18px 22px 40px; }
 .runs li .run-open:hover { background: #f2f5fa; }
 .runs li.selected .run-item { border-color: var(--accent); background: var(--accent-soft); }
 .run-heading { display: block; font-weight: 600; font-size: 13px; overflow-wrap: anywhere; }
-.run-meta-line { color: var(--muted); font-size: 11.5px; }
+.run-meta-line { color: var(--muted); font-size: 11.5px; white-space: pre-line; }
 .run-chip {
   display: block; width: fit-content; margin-top: 4px;
   font-size: 10.5px; font-weight: 500; padding: 1px 6px;

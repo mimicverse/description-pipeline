@@ -466,9 +466,7 @@ function buildRunItem(run) {
   const meta = document.createElement("span");
   meta.className = "run-meta-line";
   const stateText = RUN_STATES[run.state] || run.state || "状态待确认";
-  meta.textContent = [formatRunTime(run.started_at), stateText, `发起人：${run.user || "未记录"}`]
-    .filter(Boolean)
-    .join(" · ");
+  meta.textContent = `${[formatRunTime(run.started_at), stateText].filter(Boolean).join(" · ")}\n发起人：${run.user || "未记录"}`;
   open.append(heading, meta);
   open.title = [
     runDisplayTitle(run),
