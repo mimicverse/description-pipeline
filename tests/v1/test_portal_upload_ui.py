@@ -145,6 +145,13 @@ class UploadRenderTests(unittest.TestCase):
             self.assertIn("location ^~ /api/runs", nginx)
             self.assertIn("proxy_request_buffering off;", nginx)
             self.assertIn("proxy_read_timeout 3600s;", nginx)
+            # The login must land on the canonical origin before a state cookie is minted, and
+            # callbacks on another origin are re-pointed there with their query preserved.
+            self.assertIn("location = /auth/feishu/login", nginx)
+            self.assertIn("location = /auth/feishu/callback", nginx)
+            self.assertIn('if ($host != "rehearsal.local")', nginx)
+            self.assertIn("return 302 https://rehearsal.local:18443/auth/feishu/login;", nginx)
+            self.assertIn("https://rehearsal.local:18443$uri$is_args$args;", nginx)
 
 
 class RerunUiContractTests(unittest.TestCase):
