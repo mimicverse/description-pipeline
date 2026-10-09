@@ -49,9 +49,18 @@ Sign in to the operator page with Feishu. Select the engineering
 folder and click **Start**. Hardware, revision, repository and branch are derived
 or configured by the platform; they are not operator form fields.
 
-Approved Feishu users may start new pipeline runs and view shared results.
-Modifying an existing run, including manually retrying or deleting it, requires
-an administrator.
+Approved Feishu users may start new pipeline runs and view shared results. A run
+records its initiator's stable authenticated identity and shows that operator's
+original Feishu username.
+
+If a run fails in a transport step that the platform positively classifies as
+recoverable, its initiator and platform administrators can use the page's Retry
+action. Retry continues the same DAG run and native job with the frozen inputs,
+so no capture is repeated and captured evidence and delivered artifacts are
+never edited. Native terminal failures are not retried; their diagnostics
+require corrected inputs or configuration and a new run. Other approved users
+can view shared results but cannot operate the run, and administrators retain
+broader platform administration.
 
 Run history and details show the original submitter's verified Feishu username,
 including when viewed by another operator. The platform reads the name through

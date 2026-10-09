@@ -175,8 +175,16 @@ requires no additional contact-directory, email, phone or employment permissions
 The workflow does not request offline access or retain Feishu refresh tokens.
 
 Membership in an approved tenant grants workflow operator access; administrators
-must also appear in the explicit admin list. Each run's history and details show
-the original submitter's Feishu username from the authenticated API response.
+must also appear in the explicit admin list. Operator access covers starting new
+runs and viewing shared results; the run's initiator (stable authenticated
+identity) and platform administrators can retry that run through the single
+contextual Retry action for positively classified transport recovery, which
+continues the same DAG run and native job without recapturing or editing frozen
+inputs or artifacts. Native terminal failures require a new run after correcting
+inputs or configuration. The owner check ships with the platform package; no
+separate credential or install-time flag is required. Each run's history and
+details show the original submitter's Feishu username from the authenticated API
+response.
 The app, tenant and `open_id` remain the internal audit identity; users do not
 supply the submitter name. Feishu does not supply CAD, drive specifications or
 engineering approval merely through login.
@@ -237,24 +245,30 @@ Commission the complete workflow with actual native CAD and live Feishu:
 2. Sign in with Feishu. Verify the displayed Feishu username, approved tenant,
    explicit admin assignment and denied unauthorized users. Confirm an approved
    operator can start new pipeline runs and view shared results from other
-   operators. Confirm only administrators can modify existing runs, including
-   manual retries and deletion.
-3. Supply a compliant native folder from an approved Linux or Windows source
+   operators.
+3. As the run's initiator, confirm the Retry action appears only for a
+   positively classified transport failure and continues the same DAG run and
+   native job without recapturing or editing frozen inputs or artifacts, and is
+   absent for native terminal failures. Confirm a platform administrator can
+   also retry that run, that another approved user can view the run but cannot
+   retry it, and that the retry request is accepted for the initiator and
+   refused for another approved user.
+4. Supply a compliant native folder from an approved Linux or Windows source
    root. Start without YAML, branch, hardware or credential fields.
-4. Verify the UUID, frozen inventory and all six engineering steps. Inspect
+5. Verify the UUID, frozen inventory and all six engineering steps. Inspect
    input/input QC/output/output QC in the page, the DAG contract table,
    terminal task logs and `engineering_stages` XCom. Confirm failed, blocked,
    not-run and pending-confirmation states, and the hashed `reports/stages.json`.
    Verify the actual native discovery and every independent quality result.
    Confirm history and details show the original submitter's Feishu username
    after reload and when viewed by another authorized operator.
-5. Inspect the delivered URDF and actual meshes in the page. Exercise individual
+6. Inspect the delivered URDF and actual meshes in the page. Exercise individual
    joint controls and limits; confirm preview binds to the passing file subject.
-6. Check the resulting private-model PR's exact base, head, structural revision
+7. Check the resulting private-model PR's exact base, head, structural revision
    and verified commit. Candidate submission does not grant engineering approval.
-7. Exercise automatic transport retries, changed inputs, quality failure, service
-   restart and PR failure. Retain diagnostics; a PR-service failure preserves
-   verified preview.
+8. Exercise a transport-recovery Retry together with automatic polling, plus
+   changed inputs, quality failure, service restart and PR failure. Retain
+   diagnostics; a PR-service failure preserves verified preview.
 
 Mocks, server liveness and an unconfigured OAuth callback do not establish this
 acceptance. Retain reports for the exact tool and native source revision.

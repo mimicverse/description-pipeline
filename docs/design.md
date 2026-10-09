@@ -131,9 +131,15 @@ and details show each run's original submitter by that name. The authenticated
 app, tenant and `open_id` remain the internal audit identity. The platform
 restricts tenant and workflow permissions and keeps credentials server-side.
 
-Approved Feishu users may start new pipeline runs and view shared results. Only
-administrators may modify existing runs, including manually retrying or deleting
-them.
+Approved Feishu users may start new pipeline runs and view shared results. Each
+run records its initiator's stable authenticated identity and displays that
+operator's original Feishu username. The run's initiator and platform
+administrators can retry that run through one contextual Retry action for
+positively classified transport recovery; retrying continues the same DAG run
+and native job with the frozen inputs, and captured evidence and delivered
+artifacts are never edited. Every terminal native failure requires a new run
+after correcting the inputs or configuration. Administrators retain broader
+platform administration beyond this action.
 
 Maintainers configure storage roots and hardware routing once; operators provide
 one accessible folder path. Deployment settings and model facts remain outside
