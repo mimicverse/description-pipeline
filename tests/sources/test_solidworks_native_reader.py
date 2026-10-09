@@ -2594,5 +2594,60 @@ class MateFailureTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "cad_mate_unreadable")
 
 
+class ExplicitSelectionTests(unittest.TestCase):
+    """One explicit main assembly opens exactly that entry; decoys are never scanned."""
+
+    def _scene(self, root: Path):
+        base = _write(root, "base.SLDPRT")
+        component = _Component("base-1", base)
+        seat = _mate("seat", 5, [_MateEntity(component, "Plane1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0)))])
+        group = _Feature("MateGroup", "MateGroup", first_sub=seat)
+        assembly = _write(root, "robot.SLDASM")
+        decoy = _write(root, "decoy.SLDASM")
+        doc = _Doc(assembly, first_feature=group, children=[component])
+        return _App({assembly: doc}), assembly, decoy
+
+    def test_explicit_selection_opens_only_the_named_entry(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app, _assembly, _decoy = self._scene(root)
+            record = _read(root, app, {"main_assembly": "robot.SLDASM"})
+            self.assertEqual("robot.SLDASM", record["identity"]["main_assembly"])
+            self.assertEqual({"mode": "explicit", "main_assembly": "robot.SLDASM"}, record["selection"])
+            self.assertIn("robot.SLDASM", record["files"])
+
+    def test_explicit_selection_of_an_unreadable_decoy_fails(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app, _assembly, _decoy = self._scene(root)
+            with self.assertRaises(CadError) as caught:
+                _read(root, app, {"main_assembly": "decoy.SLDASM"})
+            self.assertIn("decoy.SLDASM", str(caught.exception))
+            self.assertNotEqual("native_discovery_main_assembly_ambiguous", caught.exception.code)
+
+    def test_without_selection_the_decoy_still_blocks_as_ambiguous(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app, _assembly, _decoy = self._scene(root)
+            with self.assertRaises(CadError) as caught:
+                _read(root, app)
+            self.assertEqual("native_discovery_main_assembly_ambiguous", caught.exception.code)
+
+    def test_invalid_and_missing_selections_fail_before_any_session(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "robot.SLDASM").write_bytes(b"assembly")
+            backend = SolidWorksBackend()  # no session factory: a CAD session must not be reached
+            with self.assertRaises(CadError) as invalid:
+                backend.discover_native(root, {"main_assembly": "..\\x.SLDASM"})
+            self.assertEqual("native_discovery_selection_invalid", invalid.exception.code)
+            with self.assertRaises(CadError) as foreign:
+                backend.discover_native(root, {"main_assembly": "notes.txt"})
+            self.assertEqual("native_discovery_selection_invalid", foreign.exception.code)
+            with self.assertRaises(CadError) as missing:
+                backend.discover_native(root, {"main_assembly": "missing.SLDASM"})
+            self.assertEqual("native_discovery_selection_missing", missing.exception.code)
+
+
 if __name__ == "__main__":
     unittest.main()

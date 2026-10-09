@@ -2593,6 +2593,7 @@ class SolidWorksBackend(CadBackend):
             if (
                 not parts
                 or "/".join(parts) != selection
+                or "\\" in selection
                 or not selection.casefold().endswith(".sldasm")
                 or Path(selection).name.startswith("~$")
             ):
@@ -2602,7 +2603,7 @@ class SolidWorksBackend(CadBackend):
                     {"main_assembly": selection},
                 )
             try:
-                selected_path = Path(confined(source_root, selection))
+                selected_path = Path(confined(source_root, selection, exists=False))
             except Exception as error:  # noqa: BLE001 - reported as the structured selection failure
                 raise CadError(
                     "native_discovery_selection_invalid",

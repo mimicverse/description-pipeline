@@ -1,9 +1,10 @@
 """Submit one engineering folder to the Windows SolidWorks execution endpoint.
 
-The DAG carries one operator value, ``handoff_path``. A linked attempt (``parent_dag_run_id``
-and ``resume_from``) derives the retained package and digest from the parent native job itself.
-Hardware, revision and repository routing resolve inside the serialized Windows job after CAD
-discovery and are confirmed here before publication.
+The DAG carries ``handoff_path`` and an optional ``main_assembly`` (the explicit delivered
+assembly). A linked attempt (``parent_dag_run_id`` and ``resume_from``) derives the retained
+package, digest and selection from the parent native job itself. Hardware, revision and
+repository routing resolve inside the serialized Windows job after CAD discovery and are
+confirmed here before publication.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from description_pipeline.orchestration.airflow_client import (
     config_from_airflow_connection,
     native_run_id,
     resolved_routing,
+    validate_main_assembly,
 )
 from description_pipeline.stages import (
     STAGE_IDS,
@@ -113,6 +115,8 @@ def _same_request(job: dict, request: dict) -> None:
     expected = {key: request[key] for key in ("run_id", "package", "handoff_sha256")}
     if request.get("resume") is not None:
         expected["resume"] = request["resume"]
+    if request.get("main_assembly") is not None:
+        expected["main_assembly"] = request["main_assembly"]
     if job.get("request") != expected:
         raise AirflowFailException("Endpoint job differs from the requested mechanical handoff")
 
@@ -143,6 +147,16 @@ def _same_request(job: dict, request: dict) -> None:
                 "imported before the run starts)"
             ),
         ),
+        "main_assembly": Param(
+            "",
+            type="string",
+            title="Delivered main assembly",
+            description=(
+                "Optional explicit delivered assembly: a .SLDASM relative path inside the "
+                "engineering folder (top folder excluded). Authoritative for entry selection "
+                "when provided."
+            ),
+        ),
     },
 )
 def solidworks_to_urdf():
@@ -164,16 +178,26 @@ def solidworks_to_urdf():
                 package,
                 CONN_ID,
             )
-            return {
+            request = {
                 "run_id": _run_uuid(context),
                 "package": package,
                 "handoff_sha256": digest_value,
                 "conn_id": CONN_ID,
                 "resume": linked,
             }
+            selection = retained.get("main_assembly")
+            if isinstance(selection, str) and selection:
+                request["main_assembly"] = validate_main_assembly(selection)
+                log.info("linked attempt main_assembly=%s", request["main_assembly"])
+            return request
         handoff_path = str(context["params"]["handoff_path"]).strip()
         if not handoff_path:
             raise AirflowFailException("handoff_path is required")
+        selection = context["params"].get("main_assembly")
+        if selection == "":
+            selection = None
+        if selection is not None:
+            selection = validate_main_assembly(selection)
         resolved = _endpoint(CONN_ID).resolve_handoff(handoff_path)
         run_id = _run_uuid(context)
         log.info(
@@ -183,12 +207,16 @@ def solidworks_to_urdf():
             resolved.handoff_sha256,
             CONN_ID,
         )
-        return {
+        request = {
             "run_id": run_id,
             "package": resolved.package,
             "handoff_sha256": resolved.handoff_sha256,
             "conn_id": CONN_ID,
         }
+        if selection is not None:
+            request["main_assembly"] = selection
+            log.info("resolved main_assembly=%s", selection)
+        return request
 
     @task(doc_md="Submit the same UUID and frozen handoff to the serial Windows queue; retries never replay CAD.")
     def start_job(request: dict) -> dict:
@@ -196,6 +224,7 @@ def solidworks_to_urdf():
             run_id=request["run_id"],
             resolution=_resolution(request),
             resume=request.get("resume"),
+            main_assembly=request.get("main_assembly"),
         )
         log.info("started run_id=%s status=%s", job["run_id"], job["status"])
         return {**request, "status": job["status"]}

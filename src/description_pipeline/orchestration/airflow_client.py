@@ -130,7 +130,7 @@ def _validate_relative_path(value: str, field: str) -> str:
     path = PurePosixPath(value)
     if path.is_absolute() or any(segment in {"", ".", ".."} for segment in value.split("/")):
         raise EndpointProtocolError(f"{field} must stay inside the delivery: {value!r}")
-    return value
+    return path.as_posix()
 
 
 #: One explicit delivered-assembly selection shares the member-path bound.
@@ -155,7 +155,6 @@ def validate_main_assembly(value: object) -> str:
     if not value.casefold().endswith(".sldasm"):
         raise EndpointProtocolError("main_assembly must name a saved SolidWorks assembly (.SLDASM)")
     return value
-    return path.as_posix()
 
 
 def validate_package(value: str) -> str:
