@@ -34,9 +34,11 @@ Mechanical engineers provide SolidWorks files and engineering facts. Robot
 YAML, version manifests, model artifacts and reports are generated. Corrections
 return to CAD or controlled specifications, followed by a new run.
 
-If a check fails, use the affected object and correction report to repair the
-engineering source, then submit a new version. Platform or PR failures retain
-diagnostics for the maintainer to recover the same frozen delivery.
+To repeat work, select any step, including a completed one, and choose
+**从此步骤重新运行**. A new linked run reuses validated upstream results and
+reruns that step and everything after it. Changed CAD requires a new folder
+upload. For recoverable transport failures, **继续原作业** reconnects to the
+existing job.
 
 See [operations](docs/operations.md) for the full design-to-release workflow
 and [deployment](docs/deployment.md) for installing the Linux server and
@@ -56,8 +58,8 @@ description check /path/to/delivery
 ```
 
 A pass establishes the [verification gates](docs/quality.md). Model approval,
-simulation, training and hardware control require their own evidence. Release
-1.0 exports visual geometry and physical properties; it does not generate
+simulation, training and hardware control require their own evidence. The pipeline
+exports visual geometry and physical properties; it does not generate
 collision models or control interfaces.
 
 ## Documentation

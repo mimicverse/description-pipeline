@@ -292,6 +292,15 @@ Commission the complete workflow with actual native CAD and live Feishu:
 8. Exercise a transport-recovery Retry together with automatic polling, plus
    changed inputs, quality failure, service restart and PR failure. Retain
    diagnostics; a PR-service failure preserves verified preview.
+9. After the complete service restart described below, select a completed run
+   and choose **从此步骤重新运行** from verification or publication. Require a
+   new linked run with the selected starting step recorded in the endpoint
+   request. Upstream results must show **复用已验证结果**, retain their original
+   timestamps and producing-run identity, and trigger no new CAD capture.
+   Confirm that only the selected step and its downstream steps execute again,
+   and that the original run and evidence remain unchanged. Verify access for
+   the initiator and administrators, refusal for other operators, and an
+   actionable refusal when upstream evidence or tool identity is invalid.
 
 Mocks, server liveness and an unconfigured OAuth callback do not establish this
 acceptance. Retain reports for the exact tool and native source revision.
@@ -307,8 +316,10 @@ bash deploy/operator/operatorctl.sh health --env-file "$description_env"
 bash deploy/operator/operatorctl.sh stop --env-file "$description_env"
 ```
 
-Service logs use `journalctl --user -u <service>`. Airflow logs, endpoint state
-and bound job diagnostics identify failed operations. Transport retries reconnect
+Service logs use `journalctl --user -u <service>`. Maintainers read Airflow task
+logs under the configured `AIRFLOW_HOME/logs` on Linux; no separate Airflow UI
+is exposed to operators. Task logs, endpoint state and bound job diagnostics
+identify failed operations. Transport retries reconnect
 to the existing native job. A terminal native failure requires a new run; an
 endpoint restart during capture marks that job failed. Preserve its partial
 evidence for diagnosis. Recover a publication failure from the complete verified
