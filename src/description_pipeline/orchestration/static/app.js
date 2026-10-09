@@ -25,6 +25,9 @@ const state = {
   rerunNotice: null,
   rerunError: null,
   runsList: [],
+  runView: "active",
+  runsNextOffset: null,
+  runsLoadingMore: false,
 };
 
 const RUN_STATES = {
@@ -75,6 +78,7 @@ const RETRY_REASONS = {
   unknown_failed_task: "无法确认可恢复的任务，请联系平台维护人员。",
   resolution_or_capture_failed: "请修正工程目录或采集问题，再新建运行。",
   publication_failed: "发布失败，请修正问题后新建运行。",
+  deleted: "此运行已删除：请先恢复后再重试或重跑。",
   native_terminal_failure: "原作业已终止；可在阶段页选择重新运行。",
   no_failed_transport_task: "没有可恢复的任务，请查看问题与发现。",
   endpoint_evidence_unavailable: "无法确认原作业状态，稍后再试。",
@@ -310,6 +314,8 @@ function clearSession() {
   state.rerunNotice = "";
   state.rerunError = "";
   state.runsList = [];
+  state.runsNextOffset = null;
+  state.runsLoadingMore = false;
   $("stage-rerun").hidden = true;
   if (state.timer) window.clearInterval(state.timer);
   state.timer = null;
@@ -322,41 +328,305 @@ function clearSession() {
   setError($("retry-error"), "");
 }
 
+function runDisplayTitle(run) {
+  const custom = String(run.title || "").trim();
+  return custom || folderLabel(run.handoff_path) || "工程交付";
+}
+
+function pad2(value) {
+  return String(value).padStart(2, "0");
+}
+
+// Row timestamp stays short (MM-DD HH:mm in the current year); the full stamp stays in the tooltip.
+function formatRunTime(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  const stamp = `${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+  return date.getFullYear() === new Date().getFullYear() ? stamp : `${date.getFullYear()}-${stamp}`;
+}
+
+function deleteBlockedReason(run) {
+  if (run.state === "success" || run.state === "failed") return "";
+  if (run.state === "queued" || run.state === "running") return "运行结束前不能删除。";
+  return "运行状态未知，暂不能删除。";
+}
+
+function runsForView(runs, view) {
+  return runs.filter((run) => (view === "deleted" ? run.deleted === true : run.deleted !== true));
+}
+
+function setRunView(view) {
+  state.runView = view === "deleted" ? "deleted" : "active";
+  const active = $("runs-view-active");
+  const deleted = $("runs-view-deleted");
+  active.classList.toggle("active", state.runView === "active");
+  deleted.classList.toggle("active", state.runView === "deleted");
+  active.setAttribute("aria-pressed", String(state.runView === "active"));
+  deleted.setAttribute("aria-pressed", String(state.runView === "deleted"));
+  renderRunsList();
+}
+
+function ghostButton(label) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "ghost";
+  button.textContent = label;
+  return button;
+}
+
 async function refreshRuns() {
   const list = $("runs");
   try {
-    const payload = await api("/api/runs");
+    const payload = await api("/api/runs?include_deleted=1&limit=30");
     state.runsList = Array.isArray(payload.runs) ? payload.runs : [];
-    list.textContent = "";
-    if (!payload.runs.length) {
-      const item = document.createElement("li");
-      item.className = "muted";
-      item.textContent = "暂无运行";
-      list.append(item);
-      return;
-    }
-    for (const run of payload.runs) {
-      const item = document.createElement("li");
-      if (run.dag_run_id === state.dagRunId) item.className = "selected";
-      const button = document.createElement("button");
-      button.type = "button";
-      const folder = folderLabel(run.handoff_path) || "工程交付";
-      const heading = document.createElement("span");
-      const stateText = RUN_STATES[run.state] || run.state || "待执行";
-      heading.textContent = run.resume_from_name_zh
-        ? `自${run.resume_from_name_zh}重新运行 · 来源 ${shortRunId(run.parent_dag_run_id)} · ${stateText}`
-        : `${folder} · ${stateText}`;
-      const submitter = document.createElement("span");
-      submitter.className = "run-submitter";
-      submitter.textContent = `发起人：${run.user || "未记录"}`;
-      button.append(heading, submitter);
-      button.title = `${folder}\n${run.dag_run_id}`;
-      button.addEventListener("click", () => selectRun(run.dag_run_id));
-      item.append(button);
-      list.append(item);
-    }
+    state.runsNextOffset = typeof payload.next_offset === "number" ? payload.next_offset : null;
+    setError($("runs-error"), "");
+    renderRunsList();
   } catch (error) {
-    list.textContent = `运行列表不可用：${error.message}`;
+    state.runsNextOffset = null;
+    list.textContent = "";
+    const item = document.createElement("li");
+    item.className = "muted";
+    item.textContent = `运行列表不可用：${error.message}`;
+    list.append(item);
+  }
+}
+
+// next_offset paging: a view is never declared empty from the first page alone.
+async function loadMoreRuns() {
+  if (state.runsLoadingMore || state.runsNextOffset === null) return;
+  state.runsLoadingMore = true;
+  renderRunsList();
+  try {
+    const payload = await api(`/api/runs?include_deleted=1&limit=30&offset=${state.runsNextOffset}`);
+    state.runsList = state.runsList.concat(Array.isArray(payload.runs) ? payload.runs : []);
+    state.runsNextOffset = typeof payload.next_offset === "number" ? payload.next_offset : null;
+    setError($("runs-error"), "");
+  } catch (error) {
+    setError($("runs-error"), error.message || "加载更多失败，请重试。");
+  } finally {
+    state.runsLoadingMore = false;
+    renderRunsList();
+  }
+}
+
+function renderRunsList() {
+  const list = $("runs");
+  list.textContent = "";
+  const rows = runsForView(state.runsList || [], state.runView);
+  if (!rows.length) {
+    const empty = document.createElement("li");
+    empty.className = "muted";
+    empty.textContent = state.runsNextOffset !== null
+      ? "当前已加载记录中没有可显示的运行，可继续加载更多。"
+      : state.runView === "deleted" ? "暂无已删除运行" : "暂无运行";
+    list.append(empty);
+  }
+  for (const run of rows) list.append(buildRunItem(run));
+  if (state.runsNextOffset !== null) {
+    const footer = document.createElement("li");
+    footer.className = "runs-footer";
+    const more = ghostButton(state.runsLoadingMore ? "正在加载…" : "加载更多");
+    more.disabled = state.runsLoadingMore;
+    more.addEventListener("click", () => {
+      void loadMoreRuns();
+    });
+    footer.append(more);
+    list.append(footer);
+  } else if (rows.length) {
+    const footer = document.createElement("li");
+    footer.className = "muted small runs-footer";
+    footer.textContent = "已显示全部";
+    list.append(footer);
+  }
+}
+
+function buildRunItem(run) {
+  const item = document.createElement("li");
+  if (run.dag_run_id === state.dagRunId) item.className = "selected";
+  const box = document.createElement("div");
+  box.className = "run-item";
+  const open = document.createElement("button");
+  open.type = "button";
+  open.className = "run-open";
+  const heading = document.createElement("span");
+  heading.className = "run-heading";
+  heading.textContent = runDisplayTitle(run);
+  if (run.resume_from_name_zh) {
+    const chip = document.createElement("span");
+    chip.className = "run-chip";
+    chip.textContent = `从${run.resume_from_name_zh}重跑`;
+    chip.title = `重跑来源：${run.parent_dag_run_id || "未记录"}`;
+    heading.append(chip);
+  }
+  const meta = document.createElement("span");
+  meta.className = "run-meta-line";
+  const stateText = RUN_STATES[run.state] || run.state || "状态待确认";
+  meta.textContent = [formatRunTime(run.started_at), stateText, `发起人：${run.user || "未记录"}`]
+    .filter(Boolean)
+    .join(" · ");
+  open.append(heading, meta);
+  open.title = [
+    runDisplayTitle(run),
+    folderLabel(run.handoff_path) || "工程文件夹",
+    formatTime(run.started_at),
+    run.dag_run_id,
+  ].join("\n");
+  open.addEventListener("click", () => selectRun(run.dag_run_id));
+  box.append(open);
+  if (run.deleted === true) {
+    const tombstone = document.createElement("span");
+    tombstone.className = "run-tombstone";
+    tombstone.textContent =
+      `已删除 · ${formatRunTime(run.deleted_at) || "时间未记录"} · 删除人：${run.deleted_by || "未记录"}`;
+    box.append(tombstone);
+  }
+  if (run.can_manage === true) box.append(buildRunMenu(run));
+  item.append(box);
+  return item;
+}
+
+// One compact per-run menu keeps the sidebar short: it is the only place row actions live,
+// and the selected run shows the same menu in the detail header.
+function buildRunMenu(run) {
+  const wrap = document.createElement("span");
+  wrap.className = "run-menu";
+  const trigger = document.createElement("button");
+  trigger.type = "button";
+  trigger.className = "ghost run-menu-trigger";
+  trigger.textContent = "⋯";
+  trigger.setAttribute("aria-label", `操作：${runDisplayTitle(run)}`);
+  trigger.setAttribute("aria-haspopup", "true");
+  trigger.setAttribute("aria-expanded", "false");
+  const pop = document.createElement("div");
+  pop.className = "run-menu-pop";
+  pop.setAttribute("role", "menu");
+  pop.hidden = true;
+  const close = (refocus) => {
+    pop.hidden = true;
+    trigger.setAttribute("aria-expanded", "false");
+    if (refocus) trigger.focus();
+  };
+  const showMenu = () => {
+    pop.textContent = "";
+    const rename = ghostButton("重命名");
+    rename.setAttribute("role", "menuitem");
+    rename.addEventListener("click", showRename);
+    pop.append(rename);
+    if (run.deleted === true) {
+      const restore = ghostButton("恢复");
+      restore.setAttribute("role", "menuitem");
+      restore.addEventListener("click", () => {
+        close(false);
+        void mutateRun(run, "POST");
+      });
+      pop.append(restore);
+    } else {
+      const remove = ghostButton("删除");
+      remove.setAttribute("role", "menuitem");
+      const blocked = deleteBlockedReason(run);
+      if (blocked) {
+        remove.disabled = true;
+        remove.title = blocked;
+      } else {
+        remove.addEventListener("click", showDeleteConfirm);
+      }
+      pop.append(remove);
+    }
+    pop.hidden = false;
+    trigger.setAttribute("aria-expanded", "true");
+    const first = pop.querySelector("button:not(:disabled)");
+    if (first) first.focus();
+  };
+  const showRename = () => {
+    pop.textContent = "";
+    const form = document.createElement("form");
+    form.className = "run-rename-form";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.maxLength = 120;
+    input.value = String(run.title || "");
+    input.placeholder = folderLabel(run.handoff_path) || "工程交付";
+    input.title = "留空并保存可恢复为工程文件夹名称；名称仅影响列表显示。";
+    input.setAttribute("aria-label", `重命名「${runDisplayTitle(run)}」`);
+    const buttons = document.createElement("div");
+    buttons.className = "run-menu-buttons";
+    const save = document.createElement("button");
+    save.type = "submit";
+    save.className = "ghost";
+    save.textContent = "保存";
+    const cancel = ghostButton("取消");
+    cancel.addEventListener("click", showMenu);
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      close(false);
+      void mutateRun(run, "PATCH", input.value.trim() || null);
+    });
+    buttons.append(save, cancel);
+    form.append(input, buttons);
+    pop.append(form);
+    queueMicrotask(() => {
+      input.focus();
+      input.select();
+    });
+  };
+  const showDeleteConfirm = () => {
+    pop.textContent = "";
+    const note = document.createElement("p");
+    note.className = "muted small";
+    note.textContent = "从运行列表移除，可在「已删除」中恢复；模型、证据和 PR 保留。";
+    const buttons = document.createElement("div");
+    buttons.className = "run-menu-buttons";
+    const confirm = ghostButton("移入已删除");
+    const cancel = ghostButton("取消");
+    cancel.addEventListener("click", showMenu);
+    confirm.addEventListener("click", () => {
+      close(false);
+      void mutateRun(run, "DELETE");
+    });
+    buttons.append(confirm, cancel);
+    pop.append(note, buttons);
+    queueMicrotask(() => confirm.focus());
+  };
+  trigger.addEventListener("click", () => {
+    if (pop.hidden) showMenu();
+    else close(true);
+  });
+  wrap.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !pop.hidden) {
+      event.preventDefault();
+      close(true);
+    }
+  });
+  wrap.append(trigger, pop);
+  return wrap;
+}
+
+// One mutation path for rename/delete/restore; the list updates in place so paging and the
+// selected run survive, and the open detail refreshes its own deleted gating.
+async function mutateRun(run, method, title) {
+  const id = encodeURIComponent(run.dag_run_id);
+  try {
+    if (method === "PATCH") {
+      const payload = await api(`/api/runs/${id}`, { method: "PATCH", body: { title } });
+      run.title = payload.title === null || typeof payload.title === "string" ? payload.title : title;
+    } else if (method === "DELETE") {
+      await api(`/api/runs/${id}`, { method: "DELETE" });
+      // The backend actor is authoritative for the tombstone: re-read the list so the
+      // recorded deleter (never the current viewer) shows up.
+      await refreshRuns();
+    } else {
+      await api(`/api/runs/${id}/restore`, { method: "POST", body: {} });
+      run.deleted = false;
+      run.deleted_at = null;
+      run.deleted_by = null;
+    }
+    setError($("runs-error"), "");
+    renderRunsList();
+    if (state.dagRunId === run.dag_run_id) await selectRun(run.dag_run_id);
+  } catch (error) {
+    setError($("runs-error"), error.message || "操作未完成，请重试。");
   }
 }
 
@@ -798,13 +1068,14 @@ function renderRerunPanel(run) {
   const canManage = run.can_manage === true;
   const eligible = Boolean(row && row.eligible === true);
   const busy = state.rerunningRunId === runId;
+  const deleted = run.deleted === true;
 
   const line = document.createElement("div");
   line.className = "rerun-row";
   const button = document.createElement("button");
   button.type = "button";
   button.textContent = busy ? "正在创建尝试…" : "从此步骤重新运行";
-  button.disabled = busy || !canManage || !eligible;
+  button.disabled = busy || !canManage || !eligible || deleted;
   button.addEventListener("click", () => {
     void rerunFromStage(stage.id);
   });
@@ -814,6 +1085,8 @@ function renderRerunPanel(run) {
   note.className = "muted small";
   if (state.rerunNotice) {
     note.textContent = state.rerunNotice;
+  } else if (deleted) {
+    note.textContent = "此运行已删除：请先恢复后再重跑。";
   } else if (!canManage) {
     note.textContent = "仅发起人或平台管理员可重新运行。";
   } else if (row && row.reason_zh) {
@@ -945,11 +1218,23 @@ async function rerunFromStage(stageId) {
 
 function renderRun(run) {
   const runId = String(run.dag_run_id || "");
-  $("run-heading").textContent = folderLabel(run.handoff_path) || "工程文件夹";
-  $("run-state-label").textContent = RUN_STATES[run.state] || run.state || "";
+  const listEntry = (state.runsList || []).find((item) => item && item.dag_run_id === runId) || null;
+  const deleted = run.deleted === true || Boolean(listEntry && listEntry.deleted === true);
+  $("run-heading").textContent =
+    (listEntry && String(listEntry.title || "").trim()) || folderLabel(run.handoff_path) || "工程文件夹";
+  $("run-state-label").textContent = RUN_STATES[run.state] || run.state || "状态待确认";
   $("run-dot").className = `dot ${runDotState(run.state)}`;
   $("run-initiator").textContent = `发起人：${run.operator || run.user || "未记录"}`;
-  const listEntry = (state.runsList || []).find((item) => item && item.dag_run_id === runId) || null;
+  const deletedTag = $("run-deleted");
+  const deletedAt = run.deleted_at || (listEntry && listEntry.deleted_at) || null;
+  const deletedBy = run.deleted_by || (listEntry && listEntry.deleted_by) || null;
+  deletedTag.textContent = deleted
+    ? `已删除 · ${formatRunTime(deletedAt) || "时间未记录"} · 删除人：${deletedBy || "未记录"}`
+    : "";
+  deletedTag.hidden = !deleted;
+  const actionsHost = $("run-actions");
+  actionsHost.textContent = "";
+  if (run.can_manage === true) actionsHost.append(buildRunMenu(listEntry || run));
   const origin = $("run-origin");
   origin.textContent = "";
   if (listEntry && listEntry.parent_dag_run_id) {
@@ -1024,15 +1309,17 @@ function renderRun(run) {
   }
 
   const retry = run.retry || {};
-  const canRetry = run.can_manage === true && retry.eligible === true;
+  const canRetry = !deleted && run.can_manage === true && retry.eligible === true;
   const retryReason = typeof retry.reason === "string" ?
     RETRY_REASONS[retry.reason] || "暂不可重试，请查看检查结果。" : "";
-  $("retry-panel").hidden = !canRetry && !(run.state === "failed" && retryReason);
+  $("retry-panel").hidden = !deleted && !canRetry && !(run.state === "failed" && retryReason);
   $("retry-button").hidden = !canRetry;
   $("retry-button").disabled = state.retryingRunId !== null;
   $("retry-button").textContent = state.retryingRunId === runId ? "正在重试…" : "继续原作业";
-  $("retry-note").textContent = retry.eligible === true && run.can_manage !== true ?
-    "该运行可由发起人或平台管理员重试。" : retryReason;
+  $("retry-note").textContent = deleted ?
+    RETRY_REASONS.deleted :
+    retry.eligible === true && run.can_manage !== true ?
+      "该运行可由发起人或平台管理员重试。" : retryReason;
 
   const progress = $("task-progress");
   progress.textContent = "";
@@ -1325,7 +1612,7 @@ async function selectRun(dagRunId) {
   setError($("run-error-detail"), "");
   setError($("retry-error"), "");
   showRunView();
-  await refreshRuns();
+  renderRunsList();
   if (state.dagRunId !== dagRunId) return;
   state.timer = window.setInterval(() => {
     void poll();
@@ -1378,6 +1665,8 @@ function wire() {
   }
   selectInspectTab("overview");
 
+  $("runs-view-active").addEventListener("click", () => setRunView("active"));
+  $("runs-view-deleted").addEventListener("click", () => setRunView("deleted"));
   $("retry-button").addEventListener("click", retryRun);
   $("logout").addEventListener("click", async () => {
     try {
