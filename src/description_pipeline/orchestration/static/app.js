@@ -1,6 +1,7 @@
 // Operator page logic. All Airflow and Windows endpoint credentials stay on the server; this
 // module only talks to the portal's own JSON API and the digest-verified artifact routes.
 import { buildJointControls, createViewer, disposeRobot, loadRobot } from "/static/viewer.js";
+import { menuAction, overlayRun, resolveDeleted, resolveTitle } from "/static/run_history.js";
 
 const state = {
   csrf: null,
@@ -28,6 +29,7 @@ const state = {
   runView: "active",
   runsNextOffset: null,
   runsLoadingMore: false,
+  runActionsFor: null,
 };
 
 const RUN_STATES = {
@@ -316,6 +318,7 @@ function clearSession() {
   state.runsList = [];
   state.runsNextOffset = null;
   state.runsLoadingMore = false;
+  state.runActionsFor = null;
   $("stage-rerun").hidden = true;
   if (state.timer) window.clearInterval(state.timer);
   state.timer = null;
@@ -603,24 +606,26 @@ function buildRunMenu(run) {
   return wrap;
 }
 
-// One mutation path for rename/delete/restore; the list updates in place so paging and the
-// selected run survive, and the open detail refreshes its own deleted gating.
+// One mutation path for rename/delete/restore: the response overlay lands in place, so the
+// loaded pages, the selection and any open menu survive, and the deleter stays server-recorded.
 async function mutateRun(run, method, title) {
   const id = encodeURIComponent(run.dag_run_id);
   try {
     if (method === "PATCH") {
       const payload = await api(`/api/runs/${id}`, { method: "PATCH", body: { title } });
-      run.title = payload.title === null || typeof payload.title === "string" ? payload.title : title;
+      overlayRun(state.runsList, run, {
+        title: payload.title === null || typeof payload.title === "string" ? payload.title : title,
+      });
     } else if (method === "DELETE") {
-      await api(`/api/runs/${id}`, { method: "DELETE" });
-      // The backend actor is authoritative for the tombstone: re-read the list so the
-      // recorded deleter (never the current viewer) shows up.
-      await refreshRuns();
+      const payload = await api(`/api/runs/${id}`, { method: "DELETE" });
+      overlayRun(state.runsList, run, {
+        deleted: payload.deleted !== false,
+        deleted_at: payload.deleted_at || null,
+        deleted_by: typeof payload.deleted_by === "string" ? payload.deleted_by : null,
+      });
     } else {
       await api(`/api/runs/${id}/restore`, { method: "POST", body: {} });
-      run.deleted = false;
-      run.deleted_at = null;
-      run.deleted_by = null;
+      overlayRun(state.runsList, run, { deleted: false, deleted_at: null, deleted_by: null });
     }
     setError($("runs-error"), "");
     renderRunsList();
@@ -1219,9 +1224,9 @@ async function rerunFromStage(stageId) {
 function renderRun(run) {
   const runId = String(run.dag_run_id || "");
   const listEntry = (state.runsList || []).find((item) => item && item.dag_run_id === runId) || null;
-  const deleted = run.deleted === true || Boolean(listEntry && listEntry.deleted === true);
-  $("run-heading").textContent =
-    (listEntry && String(listEntry.title || "").trim()) || folderLabel(run.handoff_path) || "工程文件夹";
+  const deleted = resolveDeleted(run, listEntry);
+  const customTitle = resolveTitle(run, listEntry);
+  $("run-heading").textContent = customTitle || folderLabel(run.handoff_path) || "工程文件夹";
   $("run-state-label").textContent = RUN_STATES[run.state] || run.state || "状态待确认";
   $("run-dot").className = `dot ${runDotState(run.state)}`;
   $("run-initiator").textContent = `发起人：${run.operator || run.user || "未记录"}`;
@@ -1233,19 +1238,30 @@ function renderRun(run) {
     : "";
   deletedTag.hidden = !deleted;
   const actionsHost = $("run-actions");
-  actionsHost.textContent = "";
-  if (run.can_manage === true) actionsHost.append(buildRunMenu(listEntry || run));
+  const canManage = run.can_manage === true;
+  const action = menuAction(state.runActionsFor, runId, canManage);
+  if (action !== "keep") {
+    // Rebuild or clear only when the selected run changes (or actions vanish); the 3s poll
+    // must never destroy an open rename form or steal focus from it.
+    actionsHost.textContent = "";
+    if (action === "rebuild") actionsHost.append(buildRunMenu(listEntry || run));
+    state.runActionsFor = action === "rebuild" ? runId : null;
+  }
   const origin = $("run-origin");
   origin.textContent = "";
-  if (listEntry && listEntry.parent_dag_run_id) {
-    origin.append(`自「${listEntry.resume_from_name_zh || "上游阶段"}」重新运行 · 来源 `);
+  // Parent lineage prefers the detail payload; the cached row is only a fallback, so a parent
+  // link never depends on that row being on a loaded page.
+  const parentId = run.parent_dag_run_id || (listEntry && listEntry.parent_dag_run_id) || null;
+  if (parentId) {
+    const parentStage = run.resume_from_name_zh || (listEntry && listEntry.resume_from_name_zh) || "上游阶段";
+    origin.append(`自「${parentStage}」重新运行 · 来源 `);
     const link = document.createElement("button");
     link.type = "button";
     link.className = "ghost";
-    link.textContent = shortRunId(listEntry.parent_dag_run_id);
-    link.title = String(listEntry.parent_dag_run_id);
+    link.textContent = shortRunId(parentId);
+    link.title = String(parentId);
     link.addEventListener("click", () => {
-      void selectRun(listEntry.parent_dag_run_id);
+      void selectRun(parentId);
     });
     origin.append(link);
     origin.hidden = false;
