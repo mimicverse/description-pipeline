@@ -40,6 +40,31 @@ http {
             return 200 "ok\n";
         }
 
+        # Canonical origin: the login must move to the canonical origin BEFORE any state cookie
+        # is minted, and a callback arriving on another origin (corporate entry) is sent to the
+        # canonical callback with its query preserved. Requests on the canonical host proxy on.
+        location = /auth/feishu/login {
+            if ($host != "@OPERATOR_HOST@") {
+                return 302 https://@OPERATOR_HOST@:@OPERATOR_HTTPS_PORT@/auth/feishu/login;
+            }
+            proxy_pass http://127.0.0.1:8791;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        location = /auth/feishu/callback {
+            if ($host != "@OPERATOR_HOST@") {
+                return 302 https://@OPERATOR_HOST@:@OPERATOR_HTTPS_PORT@$uri$is_args$args;
+            }
+            proxy_pass http://127.0.0.1:8791;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
         # Feishu SSO callback goes to the Airflow api-server; the operator page stays on the portal.
         location ^~ /auth/feishu/ {
             proxy_pass http://127.0.0.1:8791;

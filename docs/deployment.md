@@ -22,6 +22,11 @@ Choose one operator address through `OPERATOR_HOST` and the HTTPS port, for
 example `https://operator.example.com:8443/`. Register that address followed by
 `/auth/feishu/callback` as the app callback.
 The browser must trust the server certificate and be able to reach this address.
+Use the same origin for the app homepage, login and callback. Feishu's redirect
+URL list permits callbacks; its order does not select the address. The platform
+derives the callback from `OPERATOR_HOST` and the HTTPS port. Avoid environment
+overrides that point it elsewhere. The proxy redirects login and callback
+requests with a different hostname to the configured origin before authentication.
 
 Operators use their existing enterprise Feishu accounts; the platform has no
 account-registration step. Create a dedicated enterprise custom app, enable
