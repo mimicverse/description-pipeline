@@ -149,7 +149,8 @@ class _SameOriginRedirect(urlrequest.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-_AIRFLOW_OPENER = urlrequest.build_opener(_SameOriginRedirect())
+# Internal service calls use direct connections, independent of ambient proxy settings.
+_AIRFLOW_OPENER = urlrequest.build_opener(urlrequest.ProxyHandler({}), _SameOriginRedirect())
 
 
 @dataclass

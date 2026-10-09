@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import hashlib
 import io
+import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -737,6 +739,21 @@ class ClientTests(unittest.TestCase):
         ):
             with self.subTest(bad=bad), self.assertRaises(ResultNotPublishable):
                 verified_result(bad)
+
+    def test_internal_opener_ignores_ambient_proxies(self) -> None:
+        # A child process imports the opener under a hostile proxy environment (fake proxy that
+        # answers 502 and counts hits); only a direct connection passes.
+        root = Path(__file__).resolve().parents[2]
+        environment = {**os.environ, "PYTHONPATH": str(root / "src")}
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parent / "proxy_probe.py"), "airflow_client"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=environment,
+            cwd=str(root),
+        )
+        self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
 
     def test_failed_job_raises(self) -> None:
         with MockEndpoint(fail_job=True) as server:

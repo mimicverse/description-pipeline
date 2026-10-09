@@ -578,7 +578,8 @@ class _SameHostRedirect(urlrequest.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-_OPENER = urlrequest.build_opener(_SameHostRedirect())
+# Internal service calls use direct connections, independent of ambient proxy settings.
+_OPENER = urlrequest.build_opener(urlrequest.ProxyHandler({}), _SameHostRedirect())
 
 
 def _opener(request: urlrequest.Request, timeout: float):

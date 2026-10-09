@@ -1262,6 +1262,21 @@ class PortalTests(unittest.TestCase):
                 AirflowApi(redirector.url).profile("airflow-session-token")
             self.assertEqual(target.hits, 0)
 
+    def test_internal_airflow_calls_ignore_ambient_proxies(self) -> None:
+        # The child imports the Airflow opener under a hostile proxy environment; only a
+        # direct connection passes and no request may reach the fake proxy.
+        root = Path(__file__).resolve().parents[2]
+        environment = {**os.environ, "PYTHONPATH": str(root / "src")}
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parent / "proxy_probe.py"), "portal"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=environment,
+            cwd=str(root),
+        )
+        self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
+
     def test_no_password_path_survives(self) -> None:
         self.assertFalse(hasattr(AirflowApi, "login"))
         page = (self.static_dir / "index.html").read_text(encoding="utf-8")
