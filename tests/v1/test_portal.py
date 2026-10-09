@@ -1476,7 +1476,8 @@ class PortalTests(unittest.TestCase):
     def test_rerun_attempt_without_planner_refuses_without_creating(self) -> None:
         self._seed_retryable_run()
         self.client.login()
-        status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
+        with patch.object(self.endpoint, "rerun_plan", create=True, side_effect=EndpointError("planner offline")):
+            status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
         self.assertEqual(status, 409, body)
         self.assertEqual(json.loads(body)["reason"], "endpoint_evidence_unavailable")
         self.assertEqual(self.airflow.trigger_payloads, [])
@@ -1524,7 +1525,8 @@ class PortalTests(unittest.TestCase):
     def test_run_detail_stage_reruns_passthrough_and_omission(self) -> None:
         self._seed_retryable_run()
         self.client.login()
-        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        with patch.object(self.endpoint, "rerun_plan", create=True, side_effect=EndpointError("planner offline")):
+            status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 200, body)
         self.assertNotIn("stage_reruns", json.loads(body))
         rows = self._rerun_rows()
