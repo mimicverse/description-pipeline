@@ -89,6 +89,7 @@ button:disabled { opacity: 0.55; cursor: progress; }
 
 .runs { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
 .runs button { margin: 0; width: 100%; text-align: left; background: #f6f9fc; color: var(--ink); border: 1px solid var(--line); }
+.run-submitter { display: block; margin-top: 3px; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
 .runs .selected button { border-color: var(--accent); }
 
 .meta { display: grid; grid-template-columns: 150px 1fr; gap: 4px 12px; margin: 0; }

@@ -164,7 +164,12 @@ async function refreshRuns() {
       const button = document.createElement("button");
       button.type = "button";
       const folder = String(run.handoff_path || "工程交付").replace(/[\\/]+$/, "").split(/[\\/]/).pop();
-      button.textContent = `${folder} · ${RUN_STATES[run.state] || run.state || "待执行"}`;
+      const heading = document.createElement("span");
+      heading.textContent = `${folder} · ${RUN_STATES[run.state] || run.state || "待执行"}`;
+      const submitter = document.createElement("span");
+      submitter.className = "run-submitter";
+      submitter.textContent = `发起人：${run.user || "未记录"}`;
+      button.append(heading, submitter);
       button.title = `${run.handoff_path || ""}\n${run.dag_run_id}`;
       button.addEventListener("click", () => selectRun(run.dag_run_id));
       item.append(button);
@@ -209,6 +214,7 @@ function renderRun(run) {
   meta.textContent = "";
   const rows = [
     ["运行标识", run.dag_run_id],
+    ["发起人", run.operator || "未记录"],
     ["工程文件夹", run.handoff_path || "—"],
     ["状态", RUN_STATES[run.state] || run.state || "—"],
     ["开始时间", formatTime(run.started_at)],
