@@ -626,12 +626,11 @@ def _retry_assessment(run: dict, tasks: list[dict], job: dict | None, endpoint_e
     return assessment
 
 
-def _coverage_report(job: dict | None) -> dict:
+def _coverage_report(job: dict | None, report: dict) -> dict:
     """Canonical check state plus the external review scope bound to this run's identity."""
     job = job if isinstance(job, dict) else {}
     result = job.get("result") if isinstance(job.get("result"), dict) else {}
     discovery = job.get("discovery") if isinstance(job.get("discovery"), dict) else {}
-    report = build_report(job)
     verified = report["overall"]["engineering_state"] == "external_review"
     return {
         "structure": {
@@ -1047,6 +1046,7 @@ class PortalApp:
             except ResultNotPublishable:
                 pr = None
         stage_view_payload = stage_view(job)
+        report = build_report(job, view=stage_view_payload)
         return _json_response(
             start_response,
             200,
@@ -1079,10 +1079,10 @@ class PortalApp:
                     "discovery_sha256": job["discovery"].get("discovery_sha256"),
                 },
                 "stage_view": stage_view_payload,
-                "report": build_report(job, view=stage_view_payload),
+                "report": report,
                 "findings": _findings(job),
                 "automatic": _automatic_summary(job),
-                "coverage": _coverage_report(job),
+                "coverage": _coverage_report(job, report),
                 "pr": pr,
                 "endpoint_error": endpoint_error,
             },

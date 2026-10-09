@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from pathlib import PureWindowsPath
 
-from ..stages import CONTRACT, stage_view
+from ..stages import stage_view
 
 REPORT_SCHEMA = "solidworks-to-urdf.report/v1"
 
@@ -165,7 +165,11 @@ def _boundary_summary(identifier: object, details: dict) -> dict | None:
         required = details.get("required_checks")
         rows = details.get("checks")
         if isinstance(required, list) and isinstance(rows, list):
-            passed = sum(1 for row in rows if isinstance(row, dict) and row.get("state") == "passed")
+            passed = sum(
+                1
+                for row in rows
+                if isinstance(row, dict) and row.get("state") == "passed" and row.get("passed") is True
+            )
             return {
                 "scope_zh": "全部必需独立校验",
                 "expected": f"{len(required)} 项必需校验全部通过",
@@ -202,11 +206,15 @@ def _boundary_summary(identifier: object, details: dict) -> dict | None:
         }
     if name == "discovery.definition":
         findings = details.get("findings")
-        blocked = len(findings) if isinstance(findings, list) else None
+        blocked = (
+            sum(item.get("blocking", True) for item in findings if isinstance(item, dict))
+            if isinstance(findings, list)
+            else None
+        )
         return {
             "scope_zh": "原生结构定义",
             "expected": "生成通过的原生结构定义",
-            "actual": f"型号 {details.get('hardware_id')}，修订 {details.get('revision')}，"
+            "actual": f"型号 {details.get('hardware_id') or '未记录'}，修订 {details.get('revision') or '未记录'}，"
             f"阻塞发现 {blocked if blocked is not None else '未记录'} 项",
         }
     if name == "discovery.binding":
@@ -228,7 +236,8 @@ def _boundary_summary(identifier: object, details: dict) -> dict | None:
         return {
             "scope_zh": "原生运行环境",
             "expected": "读取器与原生平台就绪",
-            "actual": f"{details.get('reader')} 就绪：{details.get('bodies')} 个刚体、{details.get('joints')} 个关节",
+            "actual": f"{details.get('reader') or '读取器未记录'} 环境自检模型："
+            f"{details.get('bodies', '未记录')} 个刚体、{details.get('joints', '未记录')} 个关节",
         }
     if name == "capture.integrity":
         files = details.get("files")
@@ -478,48 +487,6 @@ def _failed_summary(label: str, summary: dict | None, details: dict) -> dict:
     return row
 
 
-def _confirmations(stage: dict) -> list[dict]:
-    """Contract definitions merged with recorded states; compact views keep their labels."""
-    recorded = {
-        str(item.get("id")): item
-        for item in stage.get("confirmations", [])
-        if isinstance(item, dict) and item.get("id")
-    }
-    rows = []
-    for definition in CONTRACT.get("confirmations", []):
-        if definition.get("review_stage") != stage.get("id"):
-            continue
-        record = recorded.pop(str(definition.get("id")), {})
-        row = {
-            "id": definition.get("id"),
-            "label": definition.get("label"),
-            "reference": definition.get("reference"),
-            "review_stage": definition.get("review_stage"),
-            "scope": definition.get("scope"),
-            "automatic_exclusion": definition.get("automatic_exclusion"),
-            "state": record.get("state"),
-            "approval_tracking": record.get("approval_tracking"),
-        }
-        for key in ("label", "reference", "scope", "automatic_exclusion"):
-            if record.get(key):
-                row[key] = record[key]
-        rows.append(row)
-    for orphan in recorded.values():
-        rows.append(
-            {
-                "id": orphan.get("id"),
-                "label": orphan.get("label"),
-                "reference": orphan.get("reference"),
-                "review_stage": orphan.get("review_stage") or stage.get("id"),
-                "scope": orphan.get("scope"),
-                "automatic_exclusion": orphan.get("automatic_exclusion"),
-                "state": orphan.get("state"),
-                "approval_tracking": orphan.get("approval_tracking"),
-            }
-        )
-    return rows
-
-
 def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
     """Readable report projection; pure display mapping over recorded evidence."""
     job = job if isinstance(job, dict) else {}
@@ -549,6 +516,8 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
                 summary = _boundary_summary(item.get("id"), details)
                 if state == "failed":
                     summary = _failed_summary(row["label_zh"], summary, details)
+                elif state == "not_run":
+                    summary = {**(summary or {}), "actual": "未执行，尚无检查结果"}
                 if summary is not None:
                     row["summary"] = summary
                 boundary_rows.append(row)
@@ -578,6 +547,8 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
                 summary = _independent_summary(item.get("id"), details)
                 if state == "failed":
                     summary = _failed_summary(row["label_zh"], summary, details)
+                elif state == "not_run":
+                    summary = {**(summary or {}), "actual": "未执行，尚无检查结果"}
                 if summary is not None:
                     row["summary"] = summary
                 independent_rows.append(row)
@@ -606,7 +577,9 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
             "files": [
                 {
                     "boundary": boundary,
-                    "label_zh": _FILE_PATH_LABELS_ZH.get(
+                    "label_zh": "冻结交接包与清单"
+                    if stage.get("id") == "freeze" and boundary == "output"
+                    else _FILE_PATH_LABELS_ZH.get(
                         str(record.get("path") or ""), str(record.get("label") or record.get("path") or "")
                     ),
                     "path": record.get("path"),
@@ -629,7 +602,22 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
             "unsupported": [
                 {"id": item.get("id"), "label": item.get("label")} for item in stage.get("unsupported", [])
             ],
-            "confirmations": _confirmations(stage),
+            "confirmations": [
+                {
+                    key: item.get(key)
+                    for key in (
+                        "id",
+                        "label",
+                        "reference",
+                        "review_stage",
+                        "scope",
+                        "automatic_exclusion",
+                        "state",
+                        "approval_tracking",
+                    )
+                }
+                for item in stage.get("confirmations", [])
+            ],
         }
         if stage.get("state") in {"completed", "running"}:
             stage_out["manual_scope_note_zh"] = (

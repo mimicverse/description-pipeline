@@ -161,7 +161,7 @@ class ReportViewTests(unittest.TestCase):
         self.assertIn("型号 nd_cfg_gap", definition["summary"]["actual"])
         self.assertIn("阻塞发现 0 项", definition["summary"]["actual"])
         runtime = next(row for row in stages["capture"]["boundary"] if row["id"] == "runtime.ready")
-        self.assertIn("mujoco 就绪：4 个刚体、2 个关节", runtime["summary"]["actual"])
+        self.assertIn("mujoco 环境自检模型：4 个刚体、2 个关节", runtime["summary"]["actual"])
         publish_rows = {row["id"]: row for row in stages["publish"]["boundary"]}
         self.assertEqual(publish_rows["publication.git"]["label_zh"], "发布提交字节一致性（复制/暂存/提交）")
         self.assertIn("字节一致性", publish_rows["publication.git"]["summary"]["scope_zh"])
