@@ -132,8 +132,8 @@ app, tenant and `open_id` remain the internal audit identity. The platform
 restricts tenant and workflow permissions and keeps credentials server-side.
 
 Approved Feishu users may start new pipeline runs and view shared results. Only
-administrators may modify existing runs, including manually retrying, cancelling
-or deleting them.
+administrators may modify existing runs, including manually retrying or deleting
+them.
 
 Maintainers configure storage roots and hardware routing once; operators provide
 one accessible folder path. Deployment settings and model facts remain outside

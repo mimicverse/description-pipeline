@@ -238,7 +238,7 @@ Commission the complete workflow with actual native CAD and live Feishu:
    explicit admin assignment and denied unauthorized users. Confirm an approved
    operator can start new pipeline runs and view shared results from other
    operators. Confirm only administrators can modify existing runs, including
-   manual retries, cancellation and deletion.
+   manual retries and deletion.
 3. Supply a compliant native folder from an approved Linux or Windows source
    root. Start without YAML, branch, hardware or credential fields.
 4. Verify the UUID, frozen inventory and all six engineering steps. Inspect

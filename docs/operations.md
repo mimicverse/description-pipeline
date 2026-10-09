@@ -50,8 +50,8 @@ folder and click **Start**. Hardware, revision, repository and branch are derive
 or configured by the platform; they are not operator form fields.
 
 Approved Feishu users may start new pipeline runs and view shared results.
-Modifying an existing run, including manually retrying, cancelling or deleting
-it, requires an administrator.
+Modifying an existing run, including manually retrying or deleting it, requires
+an administrator.
 
 Run history and details show the original submitter's verified Feishu username,
 including when viewed by another operator. The platform reads the name through
