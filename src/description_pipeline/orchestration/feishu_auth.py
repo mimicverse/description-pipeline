@@ -4,9 +4,11 @@ This module is imported only inside the Linux Airflow runtime (``[core] auth_man
 toolkit runtime never imports Airflow and keeps its OAuth/PKCE core in
 ``description_pipeline.orchestration.feishu_oauth``. One enterprise app signs operators in at
 ``/auth/feishu/login``; the callback mints the standard Airflow JWT cookie, and the manager's
-``get_name()`` is the stable compound principal ``app_id:tenant_key:open_id``, so every Airflow
-run record carries a durable audit identity. The Feishu display name stays a separate claim and is
-served only through ``/auth/feishu/profile`` for the operator page.
+``get_name()`` stamps the stable compound principal ``app_id:tenant_key:open_id`` together with
+the Feishu-verified display name into Airflow's ``triggering_user_name``
+(``<principal>|<json name>``), so every Airflow run record carries both a durable audit identity
+and the authenticated submitter name. The friendly name stays a separate claim and is also
+served through ``/auth/feishu/profile`` for the operator page.
 
 Authorization is deliberately one workflow wide: every allowlisted-tenant user is an operator who
 may read and trigger ``solidworks_to_urdf`` only, and only the explicit
@@ -36,14 +38,18 @@ from airflow.api_fastapi.common.types import MenuItem
 
 from description_pipeline.orchestration.feishu_oauth import (
     STATE_COOKIE,
+    TRIGGERING_USER_NAME_DELIMITER,
+    TRIGGERING_USER_NAME_LIMIT,
     FeishuAuthError,
     FeishuConfigError,
     FeishuIdentity,
     FeishuSettings,
+    build_actor_name,
     build_authorize_url,
     exchange_code,
     fetch_identity,
     pkce_pair,
+    recorded_display_name,
     state_cookie_header,
     state_cookie_matches,
     state_digest,
@@ -102,8 +108,14 @@ class FeishuUser(BaseUser):
         return f"{self.app_id}:{self.tenant_key}:{self.open_id}"
 
     def get_name(self) -> str:
-        """Airflow's durable audit identity for every run this principal triggers."""
-        return self.get_id()
+        """Airflow's durable actor value for every run this principal triggers.
+
+        It is minted only from the signed JWT claims: the stable principal plus the
+        Feishu-verified display name. A direct API caller therefore can never stamp a name they
+        did not authenticate as; a claim without a usable name raises instead of recording a run
+        whose submitter is unnamed.
+        """
+        return build_actor_name(self.get_id(), self.name)
 
 
 class MetadataStateStore:
@@ -207,13 +219,18 @@ class FeishuAuthManager(BaseAuthManager[FeishuUser]):
             raise ValueError("token was issued for a different Feishu enterprise app")
         if tenant_key not in settings.tenant_keys:
             raise ValueError("Feishu tenant is no longer approved")
-        return FeishuUser(
+        user = FeishuUser(
             app_id=app_id,
             open_id=open_id,
-            name=str(token.get("name") or open_id).strip(),
+            # The original claim is validated as-is: a non-string claim is never cast into a
+            # display name, and the stored value is the normalized recorded one.
+            name=recorded_display_name(token.get("name")),
             avatar_url=str(token.get("avatar_url") or "").strip(),
             tenant_key=tenant_key,
         )
+        # Fail closed here, not at trigger time, when the actor value cannot be recorded.
+        user.get_name()
+        return user
 
     def role_of(self, user: FeishuUser) -> str:
         """Administration is an explicit open_id allowlist; everyone else is an operator."""
@@ -279,10 +296,10 @@ class FeishuAuthManager(BaseAuthManager[FeishuUser]):
             try:
                 token = exchange_code(self.settings, code, consumed)
                 identity = fetch_identity(self.settings, token)
+                user = self._user(identity)
             except FeishuAuthError as failure:
                 log.warning("Feishu sign-in refused: %s", failure)
                 return _login_page("飞书登录未通过，请联系管理员核对企业应用配置。", status.HTTP_403_FORBIDDEN)
-            user = self._user(identity)
             response = RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
             response.set_cookie(
                 COOKIE_NAME_JWT_TOKEN,
@@ -322,13 +339,19 @@ class FeishuAuthManager(BaseAuthManager[FeishuUser]):
         return app
 
     def _user(self, identity: FeishuIdentity) -> FeishuUser:
-        return FeishuUser(
-            app_id=self.settings.app_id if self.settings else "",
-            open_id=identity.open_id,
-            name=identity.name,
-            avatar_url=identity.avatar_url,
-            tenant_key=identity.tenant_key,
-        )
+        try:
+            user = FeishuUser(
+                app_id=self.settings.app_id if self.settings else "",
+                open_id=identity.open_id,
+                name=recorded_display_name(identity.name),
+                avatar_url=identity.avatar_url,
+                tenant_key=identity.tenant_key,
+            )
+            # Fail closed at sign-in when the actor value cannot be recorded for this principal.
+            user.get_name()
+        except ValueError as error:
+            raise FeishuAuthError(str(error)) from error
+        return user
 
     # -- authorization ----------------------------------------------------
 

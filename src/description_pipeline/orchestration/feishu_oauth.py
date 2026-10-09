@@ -27,7 +27,9 @@ Official references (read 2026-10-07):
 Sign-in reads only ``open_id``, ``tenant_key``, ``name``/``en_name`` and the avatar from the v1
 profile; no sensitive field (user_id, email, mobile, employment) is requested, so this enterprise
 app needs no additional contact-directory permission. The authorize request omits ``scope`` and
-``offline_access`` entirely: it is a sign-in-only app, not a generic OIDC client.
+``offline_access`` entirely: it is a sign-in-only app, not a generic OIDC client. A display name
+is required: it is NFC-normalized and must be free of control, format, surrogate and separator
+characters, and the open_id is never substituted where a username would be shown.
 """
 
 from __future__ import annotations
@@ -39,6 +41,7 @@ import json
 import os
 import secrets
 import stat
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib import error as urlerror
@@ -50,6 +53,49 @@ FEISHU_TOKEN_URL = "https://accounts.feishu.cn/oauth/v3/token"
 FEISHU_USERINFO_URL = "https://open.feishu.cn/open-apis/authen/v1/user_info"
 DEFAULT_STATE_TTL = 300.0
 STATE_COOKIE = "feishu_oauth_state"
+#: Unicode categories that may not appear in a display name: control, format (for example the
+#: bidi overrides), surrogate and line/paragraph separators.
+UNSAFE_NAME_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+
+
+def sanitize_display_name(value: object) -> str:
+    """One usable Feishu display name, NFC-normalized; empty when the value cannot be shown."""
+    if not isinstance(value, str):
+        return ""
+    name = unicodedata.normalize("NFC", value).strip()
+    if not name or any(unicodedata.category(character) in UNSAFE_NAME_CATEGORIES for character in name):
+        return ""
+    return name
+
+
+#: Delimiter between the stable principal and the JSON-recorded display name stamped into
+#: ``DagRun.triggering_user_name``; the JSON quoting keeps a name containing it unambiguous.
+TRIGGERING_USER_NAME_DELIMITER = "|"
+#: ``DagRun.triggering_user_name`` column length in the pinned Airflow metadata schema (the
+#: pinned columns count characters, so any accepted Unicode name fits).
+TRIGGERING_USER_NAME_LIMIT = 512
+
+
+def recorded_display_name(value: object) -> str:
+    """Validate one Feishu display name before it is recorded; raises ``ValueError`` otherwise."""
+    name = sanitize_display_name(value)
+    if not name:
+        raise ValueError("Feishu display name is missing or contains unsafe control, format or separator characters")
+    return name
+
+
+def build_actor_name(principal: str, name: str) -> str:
+    """The auth-owned actor value: stable principal plus recorded display name.
+
+    Only a genuine, control-free display name is accepted; anything else raises instead of
+    silently recording a run without its submitter named, or an actor value the pinned metadata
+    column cannot hold.
+    """
+    recorded = recorded_display_name(name)
+    envelope = f"{principal}{TRIGGERING_USER_NAME_DELIMITER}{json.dumps(recorded, ensure_ascii=False)}"
+    if len(envelope) > TRIGGERING_USER_NAME_LIMIT:
+        raise ValueError("the recorded actor identity exceeds the DagRun.triggering_user_name column")
+    return envelope
 
 
 class FeishuConfigError(RuntimeError):
@@ -225,8 +271,18 @@ def fetch_identity(settings: FeishuSettings, access_token: str, *, opener=None) 
         raise FeishuAuthError("Feishu profile must carry one explicit open_id and tenant_key")
     if tenant_key not in settings.tenant_keys:
         raise FeishuAuthError("Feishu tenant is not approved for this Airflow deployment")
-    name_field = body.get("name") if isinstance(body.get("name"), str) else body.get("en_name")
-    name = name_field.strip() if isinstance(name_field, str) and name_field.strip() else open_id
+    # A display name is required and the open_id is never substituted: an identifier must not be
+    # shown where a username belongs, and a new run must not silently lack its recorded submitter.
+    name = next(
+        (
+            candidate
+            for candidate in (sanitize_display_name(body.get("name")), sanitize_display_name(body.get("en_name")))
+            if candidate
+        ),
+        "",
+    )
+    if not name:
+        raise FeishuAuthError("Feishu profile carries no usable display name (name or en_name)")
     avatar_field = body.get("avatar_url") if isinstance(body.get("avatar_url"), str) else body.get("avatar_thumb")
     avatar = avatar_field.strip() if isinstance(avatar_field, str) else ""
     return FeishuIdentity(open_id=open_id, name=name, avatar_url=avatar, tenant_key=tenant_key)

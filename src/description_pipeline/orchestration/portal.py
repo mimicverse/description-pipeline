@@ -49,6 +49,12 @@ from .airflow_client import (
     validate_handoff_path,
     verified_result,
 )
+from .feishu_oauth import (
+    TRIGGERING_USER_NAME_LIMIT,
+    build_actor_name,
+    recorded_display_name,
+    sanitize_display_name,
+)
 
 log = logging.getLogger(__name__)
 
@@ -60,6 +66,15 @@ AIRFLOW_TOKEN_COOKIE = "_token"
 _AIRFLOW_TIMEOUT = 20.0
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _RUN_ID = re.compile(r"[A-Za-z0-9_.:-]{1,250}\Z")
+#: The Feishu auth manager stamps ``<principal>|<json name>`` into
+#: ``DagRun.triggering_user_name``; kept in sync with
+#: ``feishu_auth.TRIGGERING_USER_NAME_DELIMITER``. Only the delimiter is structural; the JSON
+#: quoting keeps names containing it or any Unicode round-tripping losslessly.
+_ACTOR_DELIMITER = "|"
+#: Exactly three non-empty colon-separated parts, matching the compound principal the Feishu
+#: auth manager builds. No invented identifier charset: whatever the auth source accepted is
+#: parsed consistently, so a recorded name is never discarded over formatting guesswork.
+_COMPOUND_PRINCIPAL = re.compile(r"[^:\s|]+(?::[^:\s|]+){2}\Z")
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 _ARTIFACT_TYPES = {
     ".urdf": "application/xml",
@@ -387,6 +402,47 @@ class PortalRun:
     started_at: float
 
 
+def _actor_identity(actor: object) -> tuple[str | None, str | None]:
+    """Split one Airflow actor value into its stable principal and recorded display name.
+
+    The Feishu auth manager mints ``<principal>|<json name>`` in ``FeishuUser.get_name()``, so
+    ``triggering_user_name`` carries both the durable identity and the Feishu-verified display
+    name as one unforgeable, server-derived value. A value that is not that shape (legacy rows,
+    other trigger sources, a damaged name) yields no name; a value whose principal part is not a
+    compound identity keeps that raw value as the principal, so the operator page honestly says
+    the name was not recorded.
+    """
+    if not isinstance(actor, str):
+        return None, None
+    text = actor.strip()
+    if not text:
+        return None, None
+    if len(text) > TRIGGERING_USER_NAME_LIMIT:
+        # An actor value the metadata column could never hold is damaged, not a name source.
+        return text, None
+    principal, delimiter, encoded = text.partition(_ACTOR_DELIMITER)
+    if delimiter and _COMPOUND_PRINCIPAL.fullmatch(principal):
+        try:
+            name = sanitize_display_name(json.loads(encoded))
+        except ValueError:
+            name = ""
+        # A well-formed principal plus a damaged name keeps the principal and records no name.
+        return principal, name or None
+    return text, None
+
+
+def _run_identity(actor: object, record: PortalRun | None) -> tuple[str | None, str | None]:
+    """One run's stable principal and recorded Feishu name, from Airflow's own record only.
+
+    The in-memory record may only supply a missing principal for a run this process just
+    started; a display name is never taken from portal memory.
+    """
+    principal, name = _actor_identity(actor)
+    if principal is None and record is not None:
+        return record.principal, None
+    return principal, name
+
+
 def _discovery_evidence(detail: object, digest: str) -> dict:
     """One finding's diagnostic payload, always bound to the raw discovery record digest."""
     evidence: dict = {}
@@ -614,14 +670,22 @@ class PortalApp:
             raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
         open_id = profile.get("open_id")
         name = profile.get("name")
-        if not isinstance(open_id, str) or not open_id.strip() or not isinstance(name, str) or not name.strip():
-            raise PortalError(HTTPStatus.BAD_GATEWAY, "Airflow 未返回有效的飞书身份")
         principal = profile.get("principal")
+        # The auth manager only mints sessions with a verified, recordable display name (and the
+        # actor value must fit the metadata column); anything else is refused rather than shown
+        # as an identifier or the viewing operator.
+        if not isinstance(open_id, str) or not open_id.strip():
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "Airflow 未返回有效的飞书身份")
         if not isinstance(principal, str) or not principal.strip():
             raise PortalError(HTTPStatus.BAD_GATEWAY, "Airflow 未返回稳定的飞书身份")
+        try:
+            recorded = recorded_display_name(name)
+            build_actor_name(principal.strip(), recorded)
+        except ValueError as error:
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "Airflow 未返回可记录的飞书身份") from error
         avatar = profile.get("avatar_url")
         return self.sessions.create(
-            name.strip(),
+            recorded,
             token,
             avatar_url=avatar.strip() if isinstance(avatar, str) else "",
             principal=principal.strip(),
@@ -680,13 +744,15 @@ class PortalApp:
             seen.add(dag_run_id)
             record = local.get(dag_run_id)
             conf = item.get("conf") if isinstance(item.get("conf"), dict) else {}
+            principal, name = _run_identity(item.get("triggering_user_name"), record)
             runs.append(
                 {
                     "dag_run_id": dag_run_id,
                     "handoff_path": conf.get("handoff_path") or (record.handoff_path if record else None),
-                    "user": record.user if record else None,
+                    # The recorded initiator, never the current viewer; missing names stay null.
+                    "user": name,
                     # Airflow's own record outlives any portal restart.
-                    "principal": str(item.get("triggering_user_name") or "") or (record.principal if record else None),
+                    "principal": principal,
                     "state": item.get("state"),
                     "started_at": item.get("start_date"),
                 }
@@ -697,7 +763,9 @@ class PortalApp:
                     {
                         "dag_run_id": record.dag_run_id,
                         "handoff_path": record.handoff_path,
-                        "user": record.user,
+                        # No in-memory name fallback: the authoritative run record is the only
+                        # source for a displayed submitter.
+                        "user": None,
                         "principal": record.principal,
                         "state": None,
                         "started_at": datetime.fromtimestamp(record.started_at, UTC).isoformat(),
@@ -766,6 +834,7 @@ class PortalApp:
         conf = airflow_run.get("conf") if isinstance(airflow_run.get("conf"), dict) else {}
         with self._lock:
             record = self._runs.get(dag_run_id)
+        principal, operator = _run_identity(airflow_run.get("triggering_user_name"), record)
         pr = None
         if isinstance(job, dict):
             result = job.get("result") if isinstance(job.get("result"), dict) else {}
@@ -790,9 +859,8 @@ class PortalApp:
                 "dag_run_id": dag_run_id,
                 "state": airflow_run.get("state"),
                 "handoff_path": conf.get("handoff_path"),
-                "operator": record.user if record else None,
-                "principal": str(airflow_run.get("triggering_user_name") or "")
-                or (record.principal if record else None),
+                "operator": operator,
+                "principal": principal,
                 "started_at": airflow_run.get("start_date"),
                 "ended_at": airflow_run.get("end_date"),
                 "tasks": [

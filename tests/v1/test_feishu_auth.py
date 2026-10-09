@@ -273,8 +273,13 @@ class FeishuAuthManagerTests(unittest.TestCase):
         )
         self.assertEqual(manager.deserialize_user(token).open_id, "ou_worker")
         self.assertEqual(manager.deserialize_user(token).get_id(), "cli_app:tenant-a:ou_worker")
-        # Airflow records get_name() as triggering_user_name: the durable audit identity.
-        self.assertEqual(manager.deserialize_user(token).get_name(), "cli_app:tenant-a:ou_worker")
+        # Airflow records get_name() as triggering_user_name: the stable principal plus the
+        # Feishu-verified display name, as the auth-owned delimiter+JSON envelope.
+        envelope = manager.deserialize_user(token).get_name()
+        principal, delimiter, encoded = envelope.partition(auth.TRIGGERING_USER_NAME_DELIMITER)
+        self.assertEqual(principal, "cli_app:tenant-a:ou_worker")
+        self.assertEqual(delimiter, auth.TRIGGERING_USER_NAME_DELIMITER)
+        self.assertEqual(json.loads(encoded), "崔工")
         with self.assertRaises(ValueError):
             manager.deserialize_user({**token, "tenant_key": "tenant-b"})
         # A token minted by a replaced enterprise app must not stay valid.
@@ -285,6 +290,93 @@ class FeishuAuthManagerTests(unittest.TestCase):
         # A role claim in the token is ignored; administration is the configured allowlist only.
         impersonation = {**token, "role": "ADMIN"}
         self.assertEqual(manager.role_of(manager.deserialize_user(impersonation)), auth.ROLE_OPERATOR)
+        # A token whose claims carry no usable display name is rejected, never shown as an id.
+        with self.assertRaises(ValueError):
+            manager.deserialize_user({**token, "name": ""})
+        with self.assertRaises(ValueError):
+            manager.deserialize_user({**token, "name": "evil\u202egniht"})
+        # A genuine name equal to the open_id is preserved and an unrecordable one fails here.
+        same = manager.deserialize_user({**token, "name": "ou_worker"})
+        self.assertEqual(same.get_name(), 'cli_app:tenant-a:ou_worker|"ou_worker"')
+        # A malformed, non-string claim is refused instead of being cast into a display name.
+        for bad_claim in (123, ["崔工"], {"name": "崔工"}, True, None):
+            with self.subTest(claim=bad_claim), self.assertRaises(ValueError):
+                manager.deserialize_user({**token, "name": bad_claim})
+        # The stored name is the normalized recorded value, always consistent with the profile.
+        normalized = manager.deserialize_user({**token, "name": "e\u0301"})
+        self.assertEqual(normalized.name, "é")
+        self.assertEqual(normalized.get_name(), 'cli_app:tenant-a:ou_worker|"é"')
+        # The exact metadata-column boundary: 512 characters accepted, 513 refused.
+        boundary = auth.TRIGGERING_USER_NAME_LIMIT - len("cli_app:tenant-a:ou_worker") - 1 - 2
+        self.assertEqual(
+            len(manager.deserialize_user({**token, "name": "A" * boundary}).get_name()),
+            auth.TRIGGERING_USER_NAME_LIMIT,
+        )
+        with self.assertRaises(ValueError):
+            manager.deserialize_user({**token, "name": "A" * (boundary + 1)})
+
+    def test_triggering_user_name_is_an_auth_owned_principal_name_envelope(self) -> None:
+        manager = self.manager(_environment(self.root))
+        worker = auth.FeishuUser(
+            app_id="cli_app", open_id="ou_worker", name="崔工", avatar_url="", tenant_key="tenant-a"
+        )
+        token = manager.serialize_user(worker)
+
+        def decode(value: str) -> str:
+            principal, delimiter, encoded = value.partition(auth.TRIGGERING_USER_NAME_DELIMITER)
+            self.assertEqual(principal, "cli_app:tenant-a:ou_worker")
+            self.assertEqual(delimiter, auth.TRIGGERING_USER_NAME_DELIMITER)
+            return json.loads(encoded)
+
+        envelope = manager.deserialize_user(token).get_name()
+        self.assertEqual(decode(envelope), "崔工")
+        self.assertLessEqual(len(envelope), auth.TRIGGERING_USER_NAME_LIMIT)
+        # Long Unicode names fit the character-based column un-truncated.
+        for name in ("A" * 128, "崔" * 128, "🙂" * 128, "崔|工🙂"):
+            with self.subTest(name=name[:8]):
+                long_user = dataclasses.replace(worker, name=name)
+                long_envelope = long_user.get_name()
+                self.assertLessEqual(len(long_envelope), auth.TRIGGERING_USER_NAME_LIMIT)
+                self.assertEqual(decode(long_envelope), name)
+        # NFC normalization keeps canonically equivalent names in one recorded form.
+        self.assertEqual(decode(dataclasses.replace(worker, name="e\u0301").get_name()), "é")
+        # A genuine name equal to the open_id is preserved like any other.
+        self.assertEqual(decode(dataclasses.replace(worker, name="ou_worker").get_name()), "ou_worker")
+        # The exact column boundary: a 512-character actor value is accepted, 513 is refused.
+        boundary = auth.TRIGGERING_USER_NAME_LIMIT - len(worker.get_id()) - 1 - 2
+        exact = dataclasses.replace(worker, name="A" * boundary).get_name()
+        self.assertEqual(len(exact), auth.TRIGGERING_USER_NAME_LIMIT)
+        self.assertEqual(decode(exact), "A" * boundary)
+        with self.assertRaises(ValueError):
+            dataclasses.replace(worker, name="A" * (boundary + 1)).get_name()
+        # Missing, control, bidi and surrogate names are rejected.
+        for name in ("", "bad\nname", "evil\u202egniht", "bad\ud800name"):
+            with self.subTest(name=repr(name[:12])):
+                with self.assertRaises(ValueError):
+                    dataclasses.replace(worker, name=name).get_name()
+        # Sign-in fails closed for the same reasons instead of deferring to trigger time.
+        from description_pipeline.orchestration.feishu_oauth import FeishuIdentity
+
+        for name in ("", "A" * (boundary + 1)):
+            with self.subTest(sign_in=repr(name[:12])), self.assertRaises(auth.FeishuAuthError):
+                manager._user(
+                    FeishuIdentity(open_id="ou_worker", name=name, avatar_url="", tenant_key="tenant-a")
+                )
+        self.assertEqual(
+            len(
+                manager._user(
+                    FeishuIdentity(
+                        open_id="ou_worker", name="A" * boundary, avatar_url="", tenant_key="tenant-a"
+                    )
+                ).get_name()
+            ),
+            auth.TRIGGERING_USER_NAME_LIMIT,
+        )
+        # A genuine name equal to the open_id still signs in.
+        same_identity = manager._user(
+            FeishuIdentity(open_id="ou_worker", name="ou_worker", avatar_url="", tenant_key="tenant-a")
+        )
+        self.assertEqual(same_identity.get_name(), 'cli_app:tenant-a:ou_worker|"ou_worker"')
 
     def test_real_rest_dependencies_authorize_only_the_one_dag(self) -> None:
         """The pinned REST dependencies, not the helper alone, gate the operator's routes."""

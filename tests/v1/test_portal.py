@@ -28,6 +28,7 @@ from description_pipeline.orchestration.airflow_client import (
     WindowsEndpoint,
     native_run_id,
 )
+from description_pipeline.orchestration.feishu_oauth import TRIGGERING_USER_NAME_LIMIT
 from description_pipeline.orchestration.portal import (
     AirflowApi,
     AirflowApiError,
@@ -40,7 +41,31 @@ from tests.v1.test_airflow_client import RUN_ID, MockEndpoint
 AIRFLOW_TOKEN = "airflow-session-token"
 FEISHU_NAME = "崔工"
 FEISHU_PRINCIPAL = "cli_app:tenant-a:ou_worker"
+VIEWER_TOKEN = "airflow-viewer-token"
+VIEWER_NAME = "李工"
+VIEWER_PRINCIPAL = "cli_app:tenant-a:ou_viewer"
+NO_NAME_TOKEN = "airflow-no-name-token"
+NO_NAME_PRINCIPAL = "cli_app:tenant-a:ou_noname"
 DAG_RUN_ID = "portal-20261007T000000-abcdef01"
+_DEFAULT_ACTOR = object()
+
+
+def _feishu_profile(name: str, principal: str, open_id: str) -> dict:
+    app_id, tenant_key, _ = principal.split(":")
+    return {
+        "open_id": open_id,
+        "app_id": app_id,
+        "name": name,
+        "avatar_url": "https://avatar/u",
+        "tenant_key": tenant_key,
+        "principal": principal,
+        "role": "OPERATOR",
+    }
+
+
+def _actor_envelope(name: str, principal: str) -> str:
+    """The auth-owned ``triggering_user_name`` envelope the Feishu auth manager stamps."""
+    return f"{principal}|{json.dumps(name, ensure_ascii=False)}"
 
 
 class MockAirflow:
@@ -48,6 +73,12 @@ class MockAirflow:
 
     def __init__(self) -> None:
         self.dag_runs: dict[str, dict] = {}
+        self.profiles: dict[str, dict] = {
+            AIRFLOW_TOKEN: _feishu_profile(FEISHU_NAME, FEISHU_PRINCIPAL, "ou_worker"),
+            VIEWER_TOKEN: _feishu_profile(VIEWER_NAME, VIEWER_PRINCIPAL, "ou_viewer"),
+            # Simulates a stale/foreign token: the auth manager would refuse to mint one.
+            NO_NAME_TOKEN: _feishu_profile("", NO_NAME_PRINCIPAL, "ou_noname"),
+        }
         self.conf: dict | None = None
         self.trigger_payloads: list[dict] = []
         self.hits = 0
@@ -67,8 +98,12 @@ class MockAirflow:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _token(self) -> str:
+                header = self.headers.get("Authorization") or ""
+                return header[len("Bearer ") :] if header.startswith("Bearer ") else ""
+
             def _authorized(self) -> bool:
-                if outer.revoked or self.headers.get("Authorization") != f"Bearer {AIRFLOW_TOKEN}":
+                if outer.revoked or self._token() not in outer.profiles:
                     self._reply(401, {"detail": "unauthorized"})
                     return False
                 return True
@@ -101,7 +136,10 @@ class MockAirflow:
                         "dag_id": "solidworks_to_urdf",
                         "state": "running",
                         "conf": payload.get("conf"),
-                        "triggering_user_name": FEISHU_PRINCIPAL,
+                        "triggering_user_name": _actor_envelope(
+                            outer.profiles[self._token()]["name"],
+                            outer.profiles[self._token()]["principal"],
+                        ),
                         "start_date": "2026-10-07T00:00:00Z",
                         "end_date": None,
                     }
@@ -112,21 +150,13 @@ class MockAirflow:
             def do_GET(self) -> None:
                 outer.hits += 1
                 if self.path == "/auth/feishu/profile":
-                    if self.headers.get("Cookie") != f"_token={AIRFLOW_TOKEN}":
+                    cookie = self.headers.get("Cookie") or ""
+                    token = cookie[len("_token=") :] if cookie.startswith("_token=") else ""
+                    profile = outer.profiles.get(token)
+                    if profile is None:
                         self._reply(401, {"detail": "not_signed_in"})
                         return
-                    self._reply(
-                        200,
-                        {
-                            "open_id": "ou_worker",
-                            "app_id": "cli_app",
-                            "name": FEISHU_NAME,
-                            "avatar_url": "https://avatar/u",
-                            "tenant_key": "tenant-a",
-                            "principal": FEISHU_PRINCIPAL,
-                            "role": "OPERATOR",
-                        },
-                    )
+                    self._reply(200, dict(profile))
                     return
                 if not self._authorized():
                     return
@@ -278,9 +308,9 @@ class PortalClient:
             self.last_set_cookies = list(error.headers.get_all("Set-Cookie") or [])
             return error.code, dict(error.headers), error.read()
 
-    def login(self) -> None:
+    def login(self, token: str = AIRFLOW_TOKEN) -> None:
         """The browser already holds the Feishu SSO cookie; the portal adopts it server-side."""
-        self.jar.set_cookie(_airflow_token_cookie(AIRFLOW_TOKEN))
+        self.jar.set_cookie(_airflow_token_cookie(token))
         status, _, body = self.request("GET", "/api/session")
         assert status == 200, body
         self.login_response = body
@@ -337,6 +367,22 @@ class PortalTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
 
+    def _start_extra_portal(self):
+        """A restarted portal process: same Airflow, brand-new (empty) session store."""
+        config = PortalConfig(
+            airflow=AirflowApi(self.airflow.url), endpoint=lambda: self.endpoint, static_dir=self.static_dir
+        )
+        server = make_server(
+            "127.0.0.1", 0, PortalApp(config), server_class=_ThreadingWSGIServer, handler_class=_QuietHandler
+        )
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(self._stop_extra_portal, server)
+        return server
+
+    def _stop_extra_portal(self, server) -> None:
+        server.shutdown()
+        server.server_close()
+
     def _seed_passed_job(self, dag_run_id: str = DAG_RUN_ID) -> str:
         self._seed_airflow_run(dag_run_id, state="success")
         run_id = native_run_id(dag_run_id)
@@ -345,13 +391,24 @@ class PortalTests(unittest.TestCase):
         self.endpoint.get_job(run_id)
         return dag_run_id
 
-    def _seed_airflow_run(self, dag_run_id: str = DAG_RUN_ID, *, state: str = "running") -> None:
+    def _seed_airflow_run(
+        self,
+        dag_run_id: str = DAG_RUN_ID,
+        *,
+        state: str = "running",
+        conf: dict | None = None,
+        triggering_user_name: object = _DEFAULT_ACTOR,
+    ) -> None:
         self.airflow.dag_runs[dag_run_id] = {
             "dag_run_id": dag_run_id,
             "dag_id": "solidworks_to_urdf",
             "state": state,
-            "conf": {"handoff_path": "/srv/robot-cell"},
-            "triggering_user_name": FEISHU_PRINCIPAL,
+            "conf": {"handoff_path": "/srv/robot-cell"} if conf is None else conf,
+            "triggering_user_name": (
+                _actor_envelope(FEISHU_NAME, FEISHU_PRINCIPAL)
+                if triggering_user_name is _DEFAULT_ACTOR
+                else triggering_user_name
+            ),
             "start_date": "2026-10-07T00:00:00Z",
             "end_date": "2026-10-07T00:05:00Z" if state != "running" else None,
         }
@@ -407,6 +464,172 @@ class PortalTests(unittest.TestCase):
         listed = json.loads(body)["runs"][0]
         self.assertEqual(listed["dag_run_id"], "portal-20261007T010000-abcdefff")
         self.assertEqual(listed["principal"], FEISHU_PRINCIPAL)
+        self.assertEqual(listed["user"], FEISHU_NAME)
+
+    def test_submitter_name_survives_restart_and_another_viewer(self) -> None:
+        """The displayed submitter is the original initiator, never the current viewer."""
+        self.client.login()
+        status, _, body = self.client.request("POST", "/api/runs", {"handoff_path": "/srv/robot-cell"})
+        self.assertEqual(status, 201, body)
+        dag_run_id = json.loads(body)["dag_run_id"]
+        # Restart the portal (new process, empty session store); a different operator signs in.
+        restarted = self._start_extra_portal()
+        viewer = PortalClient(f"http://127.0.0.1:{restarted.server_address[1]}")
+        viewer.login(VIEWER_TOKEN)
+        status, _, body = viewer.request("GET", "/api/runs")
+        self.assertEqual(status, 200, body)
+        listed = next(run for run in json.loads(body)["runs"] if run["dag_run_id"] == dag_run_id)
+        self.assertEqual(listed["user"], FEISHU_NAME)
+        self.assertEqual(listed["principal"], FEISHU_PRINCIPAL)
+        status, _, body = viewer.request("GET", f"/api/runs/{dag_run_id}")
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(payload["operator"], FEISHU_NAME)
+        self.assertEqual(payload["principal"], FEISHU_PRINCIPAL)
+        self.assertNotEqual(payload["operator"], VIEWER_NAME)
+
+    def test_browser_supplied_identity_fields_are_refused(self) -> None:
+        self.client.login()
+        for field in ("initiator", "user", "operator", "principal", "open_id", "name"):
+            status, _, _ = self.client.request(
+                "POST",
+                "/api/runs",
+                {"handoff_path": "/srv/robot-cell", field: {"principal": "cli_forged", "name": "冒充"}},
+            )
+            self.assertEqual(status, 400, field)
+        self.assertEqual(self.airflow.trigger_payloads, [])
+
+    def test_direct_airflow_trigger_cannot_forge_a_display_name(self) -> None:
+        """Airflow's auth-owned actor envelope is the only name source; conf is ignored."""
+        forged = "portal-20261007T040000-forged"
+        self._seed_airflow_run(
+            forged,
+            conf={
+                "handoff_path": "/srv/robot-cell",
+                # A direct API triggerer echoing their own real principal with an arbitrary name.
+                "initiator": {"principal": FEISHU_PRINCIPAL, "name": "冒名者"},
+            },
+        )
+        self.client.login()
+        status, _, body = self.client.request("GET", f"/api/runs/{forged}")
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(payload["operator"], FEISHU_NAME)
+        self.assertEqual(payload["principal"], FEISHU_PRINCIPAL)
+        self.assertNotIn("冒名者", body.decode("utf-8"))
+        status, _, body = self.client.request("GET", "/api/runs")
+        self.assertEqual(status, 200, body)
+        listed = next(run for run in json.loads(body)["runs"] if run["dag_run_id"] == forged)
+        self.assertEqual(listed["user"], FEISHU_NAME)
+
+    def test_unrecorded_or_damaged_names_never_guess(self) -> None:
+        raw_damaged = f"{FEISHU_PRINCIPAL}|not-json"
+        self._seed_airflow_run("portal-20261007T050000-legacy", triggering_user_name=FEISHU_PRINCIPAL)
+        self._seed_airflow_run("portal-20261007T050001-damaged", triggering_user_name=raw_damaged)
+        self._seed_airflow_run(
+            "portal-20261007T050002-control",
+            triggering_user_name=f"{FEISHU_PRINCIPAL}|{json.dumps('bad\nname')}",
+        )
+        self._seed_airflow_run(
+            "portal-20261007T050003-bidi",
+            triggering_user_name=f"{FEISHU_PRINCIPAL}|{json.dumps('evil\u202egniht')}",
+        )
+        self._seed_airflow_run("portal-20261007T050004-nouser", triggering_user_name=None)
+        self._seed_airflow_run(
+            "portal-20261007T050005-structural",
+            triggering_user_name=f"cli:租户:ou|{json.dumps('名字', ensure_ascii=False)}",
+        )
+        self._seed_airflow_run(
+            "portal-20261007T050006-twopart",
+            triggering_user_name=f"cli:ou|{json.dumps('名字', ensure_ascii=False)}",
+        )
+        self._seed_airflow_run(
+            "portal-20261007T050007-overlong",
+            triggering_user_name=f"{FEISHU_PRINCIPAL}|{json.dumps('A' * 600)}",
+        )
+        self.client.login()
+        status, _, body = self.client.request("GET", "/api/runs")
+        self.assertEqual(status, 200, body)
+        runs = {run["dag_run_id"]: run for run in json.loads(body)["runs"]}
+        legacy = runs["portal-20261007T050000-legacy"]
+        self.assertIsNone(legacy["user"])
+        self.assertEqual(legacy["principal"], FEISHU_PRINCIPAL)
+        damaged = runs["portal-20261007T050001-damaged"]
+        self.assertIsNone(damaged["user"])
+        self.assertEqual(damaged["principal"], FEISHU_PRINCIPAL)
+        self.assertIsNone(runs["portal-20261007T050002-control"]["user"])
+        self.assertEqual(runs["portal-20261007T050002-control"]["principal"], FEISHU_PRINCIPAL)
+        self.assertIsNone(runs["portal-20261007T050003-bidi"]["user"])
+        # Compound structure is validated without invented identifier charsets.
+        structural = runs["portal-20261007T050005-structural"]
+        self.assertEqual(structural["user"], "名字")
+        self.assertEqual(structural["principal"], "cli:租户:ou")
+        two_part = runs["portal-20261007T050006-twopart"]
+        self.assertIsNone(two_part["user"])
+        self.assertEqual(two_part["principal"], f"cli:ou|{json.dumps('名字', ensure_ascii=False)}")
+        overlong = runs["portal-20261007T050007-overlong"]
+        self.assertIsNone(overlong["user"])
+        self.assertGreater(len(overlong["principal"]), TRIGGERING_USER_NAME_LIMIT)
+        missing = runs["portal-20261007T050004-nouser"]
+        self.assertIsNone(missing["user"])
+        self.assertIsNone(missing["principal"])
+
+    def test_session_adoption_enforces_the_recorded_name_budget(self) -> None:
+        principal = "cli_app:tenant-a:ou_boundary"
+        boundary = TRIGGERING_USER_NAME_LIMIT - len(principal) - 1 - 2
+        for token, name, expected in (
+            ("airflow-boundary-ok", "A" * boundary, 200),
+            ("airflow-boundary-over", "A" * (boundary + 1), 502),
+            ("airflow-boundary-type", 123, 502),
+        ):
+            with self.subTest(token=token):
+                self.airflow.profiles[token] = _feishu_profile(name, principal, "ou_boundary")
+                client = PortalClient(self.client.base)
+                client.jar.set_cookie(_airflow_token_cookie(token))
+                status, _, body = client.request("GET", "/api/session")
+                self.assertEqual(status, expected, body)
+                if expected == 200:
+                    self.assertEqual(json.loads(body)["user"], "A" * boundary)
+
+    def test_recorded_name_round_trips_unicode_and_delimiter(self) -> None:
+        name = "崔|工🙂"
+        self._seed_airflow_run(
+            "portal-20261007T070000-unicode",
+            triggering_user_name=_actor_envelope(name, FEISHU_PRINCIPAL),
+        )
+        self.client.login()
+        status, _, body = self.client.request("GET", "/api/runs")
+        self.assertEqual(status, 200, body)
+        listed = next(run for run in json.loads(body)["runs"] if run["dag_run_id"] == "portal-20261007T070000-unicode")
+        self.assertEqual(listed["user"], name)
+        status, _, body = self.client.request("GET", "/api/runs/portal-20261007T070000-unicode")
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(payload["operator"], name)
+        self.assertEqual(payload["principal"], FEISHU_PRINCIPAL)
+
+    def test_session_without_a_verified_name_is_refused(self) -> None:
+        """The auth manager only mints named sessions; anything else fails closed."""
+        client = PortalClient(self.client.base)
+        client.jar.set_cookie(_airflow_token_cookie(NO_NAME_TOKEN))
+        status, _, body = client.request("GET", "/api/session")
+        self.assertEqual(status, 502, body)
+        self.assertNotIn("ou_noname", body.decode("utf-8"))
+
+    def test_revoked_session_cannot_read_run_identity(self) -> None:
+        self._seed_airflow_run("portal-20261007T060000-secret")
+        self.client.login()
+        self.airflow.revoked = True
+        status, _, body = self.client.request("GET", "/api/runs")
+        self.assertEqual(status, 401)
+        self.assertNotIn(FEISHU_NAME.encode("utf-8"), body)
+        status, _, body = self.client.request("GET", "/api/runs/portal-20261007T060000-secret")
+        self.assertEqual(status, 401)
+        self.assertNotIn(FEISHU_NAME.encode("utf-8"), body)
+        fresh = PortalClient(self.client.base)
+        status, _, body = fresh.request("GET", "/api/session")
+        self.assertEqual(status, 401)
+        self.assertNotIn(FEISHU_NAME.encode("utf-8"), body)
 
     def test_preview_and_artifacts_reauthorize_against_airflow(self) -> None:
         """A revoked session or a denied run must never be served from the preview cache."""

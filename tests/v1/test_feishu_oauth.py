@@ -196,6 +196,30 @@ class FeishuCoreTests(unittest.TestCase):
         self.assertEqual(identity.name, "崔工")
         self.assertEqual(good.requests[0]["headers"]["authorization"], "Bearer u-token")
         self.assertEqual(good.requests[0]["headers"]["content-type"], "application/json; charset=utf-8")
+        # en_name is honored and the name is NFC-normalized.
+        en_only = _Recorder(
+            {"code": 0, "data": {"open_id": "ou_x", "tenant_key": "tenant-a", "en_name": "Cui"}}
+        )
+        self.assertEqual(fetch_identity(settings, "u-token", opener=en_only).name, "Cui")
+        combining = _Recorder(
+            {"code": 0, "data": {"open_id": "ou_x", "tenant_key": "tenant-a", "name": "e\u0301"}}
+        )
+        self.assertEqual(fetch_identity(settings, "u-token", opener=combining).name, "é")
+        # A genuine display name is preserved even when it equals the open_id (no heuristic).
+        equals = _Recorder(
+            {"code": 0, "data": {"open_id": "ou_x", "tenant_key": "tenant-a", "name": "ou_x"}}
+        )
+        self.assertEqual(fetch_identity(settings, "u-token", opener=equals).name, "ou_x")
+        # A missing, control, format or bidi name is refused; the open_id is never substituted.
+        for bad_name in (
+            {"open_id": "ou_x", "tenant_key": "tenant-a"},
+            {"open_id": "ou_x", "tenant_key": "tenant-a", "name": ""},
+            {"open_id": "ou_x", "tenant_key": "tenant-a", "name": 123},
+            {"open_id": "ou_x", "tenant_key": "tenant-a", "name": "bad\nname"},
+            {"open_id": "ou_x", "tenant_key": "tenant-a", "name": "evil\u202egniht"},
+        ):
+            with self.subTest(bad_name=bad_name.get("name")), self.assertRaises(FeishuAuthError):
+                fetch_identity(settings, "u-token", opener=_Recorder({"code": 0, "data": bad_name}))
         for payload in (
             {"code": 0, "data": {"tenant_key": "tenant-a"}},
             {"code": 0, "data": {"open_id": "ou_x", "tenant_key": "other"}},
