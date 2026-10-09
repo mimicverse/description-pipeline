@@ -180,6 +180,10 @@ class RerunUiContractTests(unittest.TestCase):
             "将重算：",
             "最早可重新运行：",
             "复用既有输入/结果",
+            "nextRunId",
+            "stageToShow",
+            "stageSelectionKey(nextRunId)",
+            "run-origin",
         ):
             self.assertIn(token, app)
         # The superseded picker design and its parameter name are gone.
