@@ -2,8 +2,8 @@
 
 The plugin ships inside this distribution (``airflow.plugins`` entry point), so the api-server
 binds the request scope for every route of the root application, including ``/api/v2``. Without
-the middleware the auth manager keeps the existing operator capabilities (shared read, start new
-runs) but never grants run ownership, and health surfaces the missing middleware.
+the middleware ordinary operators retain shared read access but cannot create or change runs;
+health surfaces the missing middleware.
 """
 
 from __future__ import annotations
