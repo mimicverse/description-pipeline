@@ -182,9 +182,9 @@ contextual Retry action for positively classified transport recovery, which
 continues the same DAG run and native job without recapturing or editing frozen
 inputs or artifacts. Native terminal failures require a new run after correcting
 inputs or configuration. The owner check ships with the platform package; no
-separate credential or install-time flag is required. Each run's history and
-details show the original submitter's Feishu username from the authenticated API
-response.
+separate credential or install-time flag is required, and operator run changes
+are refused when that guard is absent. Each run's history and details show the
+original submitter's Feishu username from the authenticated API response.
 The app, tenant and `open_id` remain the internal audit identity; users do not
 supply the submitter name. Feishu does not supply CAD, drive specifications or
 engineering approval merely through login.
@@ -251,8 +251,11 @@ Commission the complete workflow with actual native CAD and live Feishu:
    native job without recapturing or editing frozen inputs or artifacts, and is
    absent for native terminal failures. Confirm a platform administrator can
    also retry that run, that another approved user can view the run but cannot
-   retry it, and that the retry request is accepted for the initiator and
-   refused for another approved user.
+   retry it, and that the Retry request
+   (`POST /api/v2/dags/{dag_id}/dagRuns/{dag_run_id}/clear` with
+   `dry_run`, `only_failed: true`, `only_new: false`,
+   `run_on_latest_version: false`) is accepted for the initiator and refused
+   for another approved user.
 4. Supply a compliant native folder from an approved Linux or Windows source
    root. Start without YAML, branch, hardware or credential fields.
 5. Verify the UUID, frozen inventory and all six engineering steps. Inspect
