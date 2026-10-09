@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -144,7 +145,13 @@ class RenderTests(unittest.TestCase):
             state = Path(tmp) / "state"
             self.assertEqual(render(state).returncode, 0)
             config = (state / "nginx/nginx.conf").read_text(encoding="utf-8")
-            self.assertIn("$request_method $uri $server_protocol", config)
+            # Redirects must preserve OAuth parameters; only logging must exclude them.
+            logging = "\n".join(re.findall(r"\b(?:log_format|access_log)\s+[^;]*;", config))
+            self.assertIn("$request_method $uri $server_protocol", logging)
+            access_logs = re.findall(r"\baccess_log\s+[^;]*;", config)
+            self.assertTrue(access_logs)
+            for directive in access_logs:
+                self.assertTrue(directive.endswith(" operator_uri_only;") or directive == "access_log off;")
             for sensitive in (
                 "$request_uri",
                 "$args",
@@ -153,8 +160,8 @@ class RenderTests(unittest.TestCase):
                 "$http_cookie",
                 "$http_authorization",
             ):
-                self.assertNotIn(sensitive, config)
-            self.assertNotIn('"$request"', config)
+                self.assertNotIn(sensitive, logging)
+            self.assertNotIn('"$request"', logging)
             airflow = (ROOT / "deploy/airflow/airflow.cfg.template").read_text(encoding="utf-8")
             self.assertIn("namespace_levels = http.access=WARNING", airflow)
 
