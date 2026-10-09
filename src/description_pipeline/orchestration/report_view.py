@@ -127,7 +127,7 @@ def independent_label(identifier: object) -> str:
 
 
 def _short(value: object, length: int = 12) -> str:
-    text = str(value or "")
+    text = str(value or "未记录")
     return text[:length] + "…" if len(text) > length else text
 
 
@@ -207,7 +207,7 @@ def _boundary_summary(identifier: object, details: dict) -> dict | None:
     if name == "discovery.definition":
         findings = details.get("findings")
         blocked = (
-            sum(item.get("blocking", True) for item in findings if isinstance(item, dict))
+            sum(1 for item in findings if isinstance(item, dict) and item.get("blocking") is not False)
             if isinstance(findings, list)
             else None
         )
@@ -220,7 +220,10 @@ def _boundary_summary(identifier: object, details: dict) -> dict | None:
     if name == "discovery.binding":
         files = details.get("files")
         count = len(files) if isinstance(files, dict) else None
-        actual = f"型号 {details.get('hardware_id')} → {details.get('repository_slug')}@{details.get('base')}"
+        actual = (
+            f"型号 {details.get('hardware_id') or '未记录'} → "
+            f"{details.get('repository_slug') or '未记录'}@{details.get('base') or '未记录'}"
+        )
         if count is not None:
             actual += f"，{count} 个准备文件"
         return {"scope_zh": "结构定义与目标仓库绑定", "expected": "绑定摘要与目标一致", "actual": actual}
@@ -230,7 +233,8 @@ def _boundary_summary(identifier: object, details: dict) -> dict | None:
         return {
             "scope_zh": "CAD 包输入规范",
             "expected": "CAD 包通过输入规范并归档一致",
-            "actual": f"CAD 修订 {details.get('cad_revision')}" + (f"，{count} 个文件" if count is not None else ""),
+            "actual": f"CAD 修订 {details.get('cad_revision') or '未记录'}"
+            + (f"，{count} 个文件" if count is not None else ""),
         }
     if name == "runtime.ready":
         return {
@@ -289,20 +293,21 @@ def _boundary_summary(identifier: object, details: dict) -> dict | None:
         return {
             "scope_zh": "评审基线与确定性分支",
             "expected": "基线与确定分支校验通过",
-            "actual": f"{details.get('repository_slug')}: {details.get('base')} ← {details.get('branch')}",
+            "actual": f"{details.get('repository_slug') or '未记录'}: "
+            f"{details.get('base') or '未记录'} ← {details.get('branch') or '未记录'}",
         }
     if name == "publication.git":
         return {
             "scope_zh": "复制、暂存与提交的字节一致性",
             "expected": "提交与交付字节一致",
             "actual": f"提交 {_short(details.get('commit'))}，"
-            f"字节复核 {details.get('copied_staged_committed') or '已记录'}",
+            f"字节复核 {details.get('copied_staged_committed') or '未记录'}",
         }
     if name == "publication.receipt":
         return {
             "scope_zh": "评审分支回执",
             "expected": "回执状态与提交一致",
-            "actual": f"状态 {details.get('state') or '已记录'}，提交 {_short(details.get('commit'))}",
+            "actual": f"状态 {details.get('state') or '未记录'}，提交 {_short(details.get('commit'))}",
         }
     return None
 
@@ -633,6 +638,8 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
     states = {stage["state"] for stage in stages_out}
     if "failed" in states:
         overall_state, headline = "failed", f"{first_failed['name_zh']}阶段失败，后续阶段未执行"
+    elif job.get("status") == "failed":
+        overall_state, headline = "failed", "作业失败，请查看原始诊断"
     elif "running" in states:
         overall_state, headline = "running", "运行进行中，尚未完成全部阶段"
     elif stages_out and states == {"completed"}:

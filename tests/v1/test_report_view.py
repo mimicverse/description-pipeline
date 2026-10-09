@@ -236,6 +236,24 @@ class ReportViewTests(unittest.TestCase):
         self.assertIn("尚未证明", generic["meaning_zh"])
         self.assertEqual(generic["applicability"], "unproven")
 
+    def test_missing_details_are_explicit_and_terminal_failure_cannot_pass(self) -> None:
+        job = passed_job()
+        for event in job["events"]:
+            check = event.get("check") or {}
+            if check.get("id") == "publication.git":
+                check["details"] = {"commit": "f" * 40}
+            elif check.get("id") == "discovery.inputs":
+                check["details"] = {}
+            elif check.get("id") == "discovery.definition":
+                check["details"] = {"findings": [{"blocking": None}, {"blocking": False}]}
+        report = build_report(job)
+        rows = {row["id"]: row for stage in report["stages"] for row in stage["boundary"]}
+        self.assertIn("字节复核 未记录", rows["publication.git"]["summary"]["actual"])
+        self.assertEqual(rows["discovery.inputs"]["summary"]["actual"], "清单 未记录、命名 未记录")
+        self.assertIn("阻塞发现 1 项", rows["discovery.definition"]["summary"]["actual"])
+        job["status"] = "failed"
+        self.assertEqual(build_report(job)["overall"]["state"], "failed")
+
     def test_external_review_passes_scope_and_automatic_exclusion_through(self) -> None:
         view = {
             "stages": [

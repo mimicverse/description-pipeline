@@ -634,19 +634,21 @@ function renderStageDetail() {
   }
 
   const fileRows = (stage.files || []).map((file) => ({
-    label: file.name_zh || file.label || file.path || "文件",
+    label: file.label_zh || file.path || "文件",
+    boundary: file.boundary === "output" ? "输出" : file.boundary === "input" ? "输入" : "",
     path: file.path || "",
     availability: file.availability || "",
     count: Number.isFinite(file.files) ? file.files : null,
   }));
   if (fileRows.length) {
-    const details = expandable(root, `产出与记录（${fileRows.length} 项）`);
+    const details = expandable(root, `输入与输出记录（${fileRows.length} 项）`);
     const list = document.createElement("div");
     list.className = "stage-files";
     const authorized = state.previewFiles || {};
     for (const row of fileRows) {
       const line = document.createElement("p");
       line.className = "file-line";
+      const title = [row.boundary, row.label, row.path].filter(Boolean).join(" · ") || "—";
       if (row.path && Object.prototype.hasOwnProperty.call(authorized, row.path)) {
         const link = document.createElement("a");
         link.href = `/api/runs/${encodeURIComponent(state.dagRunId)}/artifacts/${String(row.path)
@@ -655,10 +657,10 @@ function renderStageDetail() {
           .join("/")}`;
         link.target = "_blank";
         link.rel = "noopener";
-        link.textContent = [row.label, row.path].filter(Boolean).join(" · ");
+        link.textContent = title;
         line.append(link);
       } else {
-        line.textContent = [row.label, row.path].filter(Boolean).join(" · ") || "—";
+        line.textContent = title;
       }
       if (Number.isFinite(row.count) && row.count > 0) {
         const tag = document.createElement("code");
@@ -683,7 +685,7 @@ function renderStageDetail() {
   if (stage.unsupported.length) {
     const row = document.createElement("p");
     row.className = "stage-note muted small";
-    row.append("不支持项（待工程确认，不代表通过）：");
+    row.append("尚未自动覆盖：");
     for (const text of stage.unsupported) {
       const tag = document.createElement("span");
       tag.className = "chip";
