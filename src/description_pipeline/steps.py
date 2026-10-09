@@ -35,7 +35,14 @@ def _require(passed, message):
         raise PipelineError(message)
 
 
-def freeze_inputs(package: Path, expected_digest: str, expected_files: dict, *, on_event=None) -> dict:
+def freeze_inputs(
+    package: Path,
+    expected_digest: str,
+    expected_files: dict,
+    *,
+    main_assembly: str | None = None,
+    on_event=None,
+) -> dict:
     """Admit the frozen native bytes before the queue consumes them."""
     from .sources.solidworks.handoff import describe_handoff
 
@@ -51,10 +58,24 @@ def freeze_inputs(package: Path, expected_digest: str, expected_files: dict, *, 
     def bound():
         files = package_inventory(package)
         _require(files == expected_files, "Native inputs changed while the job was queued")
-        return {
+        detail = {
             "handoff_sha256": expected_digest,
             "files": {"handoff/" + path: checksum for path, checksum in files.items()},
         }
+        if main_assembly is not None:
+            if main_assembly not in files:
+                mismatched = sorted(name for name in files if name.casefold() == main_assembly.casefold())
+                if mismatched:
+                    raise PipelineError(
+                        "The selected main assembly case does not match the frozen handoff file: "
+                        f"{main_assembly!r} vs {mismatched[0]!r}"
+                    )
+                raise PipelineError(
+                    f"The selected main assembly is not part of the frozen handoff: {main_assembly!r}"
+                )
+            detail["main_assembly"] = main_assembly
+            detail["main_assembly_sha256"] = files[main_assembly]
+        return detail
 
     identity = checked(on_event, "freeze", "output", "handoff.integrity", bound)
     _state(on_event, "freeze", "completed")
@@ -68,6 +89,7 @@ def discover_structure(
     *,
     expected_digest: str,
     expected_files: dict,
+    main_assembly: str | None = None,
     configuration: dict,
     targets: dict,
     preparer=None,
@@ -87,7 +109,21 @@ def discover_structure(
             and all(isinstance(key, str) and isinstance(value, str) for key, value in names.items()),
             "Frozen-name registry must map native identities to interface names",
         )
-        return DiscoverySettings(record_roots=tuple(configuration.get("record_roots", [])), frozen_names=names)
+        return DiscoverySettings(
+            record_roots=tuple(configuration.get("record_roots", [])),
+            frozen_names=names,
+            main_assembly=main_assembly,
+        )
+
+    def describe_settings(value):
+        described = {
+            "handoff_sha256": expected_digest,
+            "files_sha256": digest(expected_files),
+            "frozen_names_sha256": digest(value.frozen_names),
+        }
+        if main_assembly is not None:
+            described["main_assembly"] = main_assembly
+        return described
 
     settings = checked(
         on_event,
@@ -95,11 +131,7 @@ def discover_structure(
         "input",
         "discovery.inputs",
         discovery_inputs,
-        describe=lambda value: {
-            "handoff_sha256": expected_digest,
-            "files_sha256": digest(expected_files),
-            "frozen_names_sha256": digest(value.frozen_names),
-        },
+        describe=describe_settings,
     )
     prepared = (preparer or prepare_native_package)(frozen, output, run_id, settings=settings, on_event=on_event)
     discovery = {

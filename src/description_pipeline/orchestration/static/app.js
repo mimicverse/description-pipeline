@@ -12,6 +12,7 @@ const state = {
   previewFiles: null,
   lastRun: null,
   folderPick: null,
+  assemblyChoice: null,
   uploading: false,
   uploadAbort: null,
   blockedPick: false,
@@ -169,13 +170,72 @@ function folderPick(files) {
   if (bytes > uploadLimits.maxTotalBytes) return { error: `文件夹总大小超出上限（${formatBytes(uploadLimits.maxTotalBytes)}）。` };
   const oversized = records.find((item) => item.file.size > uploadLimits.maxFileBytes);
   if (oversized) return { error: `单个文件超出上限（${formatBytes(uploadLimits.maxFileBytes)}）：${oversized.path.slice(0, 120)}` };
-  return { records, top, count: records.length, bytes };
+  const prefix = `${top}/`;
+  const assemblies = records
+    .map((item) => item.path.slice(prefix.length))
+    .filter((relative) => relative.toLowerCase().endsWith(".sldasm"))
+    .sort();
+  return { records, top, count: records.length, bytes, assemblies };
+}
+
+function resetAssemblyRow() {
+  state.assemblyChoice = null;
+  $("assembly-row").hidden = true;
+  $("assembly-select").textContent = "";
+  $("assembly-select").hidden = true;
+  $("assembly-note").hidden = true;
+  $("assembly-note").textContent = "";
+}
+
+// One delivered assembly must be provable: auto-select a sole candidate, require an explicit
+// choice when several exist, and refuse folders without any .SLDASM (platform admission requires
+// at least one assembly, so such an upload would be rejected anyway).
+function applyAssemblies(pick) {
+  const row = $("assembly-row");
+  const select = $("assembly-select");
+  const note = $("assembly-note");
+  const assemblies = pick.assemblies || [];
+  state.assemblyChoice = null;
+  select.textContent = "";
+  row.hidden = false;
+  if (!assemblies.length) {
+    select.hidden = true;
+    note.hidden = false;
+    note.textContent = "所选文件夹中没有 .SLDASM，无法提交：请选择包含主装配的工程文件夹。";
+    return;
+  }
+  if (assemblies.length === 1) {
+    state.assemblyChoice = assemblies[0];
+    select.hidden = true;
+    note.hidden = false;
+    note.textContent = `主装配（自动）：${assemblies[0]}`;
+    return;
+  }
+  select.hidden = false;
+  note.hidden = true;
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = "请选择主装配…";
+  placeholder.disabled = true;
+  placeholder.selected = true;
+  select.append(placeholder);
+  for (const relative of assemblies) {
+    const option = document.createElement("option");
+    option.value = relative;
+    option.textContent = relative;
+    select.append(option);
+  }
+}
+
+function updateStartEnabled() {
+  $("start-button").disabled = !(state.folderPick && !state.blockedPick && state.assemblyChoice);
 }
 
 function submitRun(pick, { onProgress } = {}) {
   return new Promise((resolve, reject) => {
     const form = new FormData();
     for (const item of pick.records) form.append("files", item.file, item.path);
+    if (state.assemblyChoice) form.append("main_assembly", state.assemblyChoice);
     const request = new XMLHttpRequest();
     request.open("POST", "/api/runs");
     request.withCredentials = true;
@@ -221,6 +281,7 @@ function resetPick() {
   $("folder-input").value = "";
   $("folder-summary").hidden = true;
   $("upload-status").hidden = true;
+  resetAssemblyRow();
   $("start-button").disabled = true;
 }
 
@@ -1276,6 +1337,9 @@ function renderRun(run) {
     ["开始时间", formatTime(run.started_at)],
     ["结束时间", formatTime(run.ended_at)],
   ];
+  if (typeof run.main_assembly === "string" && run.main_assembly) {
+    rows.splice(1, 0, ["主装配", run.main_assembly]);
+  }
   const measured = report && report.measured ? report.measured : null;
   if (measured) {
     if (measured.subject_sha256) rows.push(["交付摘要", `${String(measured.subject_sha256).slice(0, 12)}…`]);
@@ -1701,6 +1765,7 @@ function wire() {
       state.folderPick = null;
       summary.hidden = true;
       setError($("run-error"), picked.error);
+      resetAssemblyRow();
       $("start-button").disabled = true;
       return;
     }
@@ -1708,7 +1773,13 @@ function wire() {
     summary.hidden = false;
     summary.textContent = `${picked.top} · ${picked.count} 个文件 · ${formatBytes(picked.bytes)}`;
     setError($("run-error"), "");
-    $("start-button").disabled = false;
+    applyAssemblies(picked);
+    updateStartEnabled();
+  });
+
+  $("assembly-select").addEventListener("change", () => {
+    state.assemblyChoice = $("assembly-select").value || null;
+    updateStartEnabled();
   });
 
   $("cancel-button").addEventListener("click", () => {
@@ -1780,7 +1851,7 @@ function wire() {
       $("folder-input").disabled = false;
       $("cancel-button").hidden = true;
       if (state.folderPick && !state.blockedPick) {
-        start.disabled = false;
+        updateStartEnabled();
       } else {
         start.disabled = true;
         status.hidden = true;

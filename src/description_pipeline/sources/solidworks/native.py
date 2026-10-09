@@ -2471,6 +2471,14 @@ class SolidWorksBackend(CadBackend):
             return {"hardware_id": str(hardware).strip(), "delivery_configuration": str(delivery).strip()}, False
         return None, False
 
+    def _candidate_entry(self, path):
+        """One candidate entry: opened document plus its declared-identity reading."""
+
+        entry = self._probe_document(str(path))
+        entry["path"] = path
+        entry["marker"], entry["identity_unreadable"] = self._identity_marker(entry.get("doc"))
+        return entry
+
     @staticmethod
     def _select_main_assembly(entries, referenced):
         """Choose the delivered assembly: declared marker first, else unique root.
@@ -2506,8 +2514,10 @@ class SolidWorksBackend(CadBackend):
                         "unreadable_identity": [str(entry["path"]) for entry in unreadable],
                     },
                 )
+            marked[0]["selection_mode"] = "marker"
             return marked[0]
         if len(entries) == 1:
+            entries[0]["selection_mode"] = "sole_candidate"
             return entries[0]
         if unreadable:
             raise CadError(
@@ -2530,6 +2540,7 @@ class SolidWorksBackend(CadBackend):
             )
         roots = [entry for entry in entries if normalize_document_path(str(entry["path"])) not in referenced]
         if len(roots) == 1:
+            roots[0]["selection_mode"] = "unique_root"
             return roots[0]
         raise CadError(
             "native_discovery_main_assembly_ambiguous",
@@ -2553,39 +2564,90 @@ class SolidWorksBackend(CadBackend):
         assembly is selected by a declared ``dp`` identity marker first and
         otherwise by a unique unreferenced graph root; per-candidate open
         errors are collected per document, and only the selected assembly
-        gates the run.
+        gates the run.  An explicit ``main_assembly`` in ``settings`` is
+        authoritative: exactly that frozen entry is opened (without scanning
+        unrelated candidates) and the default marker/unique-root selection is
+        skipped.
         """
 
         source_root = Path(frozen_source).resolve()
-        candidates = sorted(
-            path
-            for path in source_root.rglob("*")
-            if path.suffix.lower() == ".sldasm" and not path.name.startswith("~$") and path.is_file()
-        )
-        if not candidates:
-            raise CadError("native_discovery_assembly_missing", "no SolidWorks assembly in the engineering directory")
+        selection = settings.get("main_assembly") if isinstance(settings, dict) else None
+        if selection is not None and (not isinstance(selection, str) or not selection.strip()):
+            raise CadError(
+                "native_discovery_selection_invalid",
+                "the selected main assembly is not a canonical relative path",
+                {"main_assembly": repr(selection)},
+            )
+        selected_path = None
+        if selection is not None:
+            from ...io import artifact_path_parts, confined
+
+            try:
+                parts = artifact_path_parts(selection)
+            except Exception as error:  # noqa: BLE001 - reported as the structured selection failure
+                raise CadError(
+                    "native_discovery_selection_invalid",
+                    "the selected main assembly is not a portable relative path",
+                    {"main_assembly": selection, "error": str(error)},
+                ) from error
+            if (
+                not parts
+                or "/".join(parts) != selection
+                or not selection.casefold().endswith(".sldasm")
+                or Path(selection).name.startswith("~$")
+            ):
+                raise CadError(
+                    "native_discovery_selection_invalid",
+                    "the selected main assembly is not a canonical .SLDASM path inside the handoff",
+                    {"main_assembly": selection},
+                )
+            try:
+                selected_path = Path(confined(source_root, selection))
+            except Exception as error:  # noqa: BLE001 - reported as the structured selection failure
+                raise CadError(
+                    "native_discovery_selection_invalid",
+                    "the selected main assembly is not contained in the frozen engineering directory",
+                    {"main_assembly": selection, "error": str(error)},
+                ) from error
+            if not selected_path.is_file():
+                raise CadError(
+                    "native_discovery_selection_missing",
+                    "the selected main assembly is not present in the frozen engineering directory",
+                    {"main_assembly": selection},
+                )
         with self.session():
-            entries = []
-            for candidate in candidates:
-                entry = self._probe_document(str(candidate))
-                entry["path"] = candidate
-                entry["marker"], entry["identity_unreadable"] = self._identity_marker(entry.get("doc"))
-                entries.append(entry)
-            referenced = set()
-            for entry in entries:
-                doc = entry.get("doc")
-                entry["graph_readable"] = doc is not None
-                if doc is None:
-                    continue
-                try:
-                    for component in _assembly_components(doc):
-                        path = _method(_component(component), "GetPathName")
-                        if _is_text_name(path):
-                            referenced.add(normalize_document_path(str(path)))
-                except Exception:  # noqa: BLE001 - a partial candidate graph is tracked, not defaulted
-                    entry["graph_readable"] = False
-                    continue
-            main_entry = self._select_main_assembly(entries, referenced)
+            if selected_path is not None:
+                # The operator named the delivered assembly: open exactly that frozen
+                # entry (no unrelated candidate scan); every engineering check below
+                # is unchanged.
+                main_entry = self._candidate_entry(selected_path)
+                main_entry["selection_mode"] = "explicit"
+            else:
+                candidates = sorted(
+                    path
+                    for path in source_root.rglob("*")
+                    if path.suffix.lower() == ".sldasm" and not path.name.startswith("~$") and path.is_file()
+                )
+                if not candidates:
+                    raise CadError(
+                        "native_discovery_assembly_missing", "no SolidWorks assembly in the engineering directory"
+                    )
+                entries = [self._candidate_entry(candidate) for candidate in candidates]
+                referenced = set()
+                for entry in entries:
+                    doc = entry.get("doc")
+                    entry["graph_readable"] = doc is not None
+                    if doc is None:
+                        continue
+                    try:
+                        for component in _assembly_components(doc):
+                            path = _method(_component(component), "GetPathName")
+                            if _is_text_name(path):
+                                referenced.add(normalize_document_path(str(path)))
+                    except Exception:  # noqa: BLE001 - a partial candidate graph is tracked, not defaulted
+                        entry["graph_readable"] = False
+                        continue
+                main_entry = self._select_main_assembly(entries, referenced)
             main_path = main_entry["path"]
             errors = main_entry.get("errors")
             warnings = main_entry.get("warnings")
@@ -2953,6 +3015,10 @@ class SolidWorksBackend(CadBackend):
                 "masses": masses,
                 "properties": property_buckets,
                 "files": files,
+                "selection": {
+                    "mode": main_entry.get("selection_mode"),
+                    "main_assembly": _relative_document(main_path, source_root),
+                },
                 "notes": notes,
             }
 

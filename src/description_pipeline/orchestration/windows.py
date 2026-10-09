@@ -5,6 +5,10 @@ identity through platform configuration. It cannot execute shell commands or
 accept arbitrary output/repository paths. Job identity is
 stable across network retries; an interrupted native run fails explicitly and
 is never silently replayed after a process restart.
+
+One run may name its delivered assembly explicitly (``main_assembly``); the
+endpoint verifies the value against the frozen upload and binds it to the run's
+checkpoints, so a linked attempt can never reuse a different selection.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ import sys
 import threading
 import time
 import tempfile
+import unicodedata
 import uuid
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -77,6 +82,37 @@ def _resume_spec(request):
     if stage not in STAGE_IDS:
         raise RequestError("from_stage must be a canonical engineering stage")
     return {"parent_run": parent, "from_stage": stage}
+
+
+#: One explicit delivered-assembly selection shares the member-path bound.
+MAX_MAIN_ASSEMBLY = 1024
+
+
+def _main_assembly_spec(value):
+    """Optional explicit delivered assembly: canonical POSIX path inside the frozen root."""
+
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value or len(value) > MAX_MAIN_ASSEMBLY:
+        raise RequestError("主装配必须是工程文件夹内的一个 .SLDASM 相对路径")
+    if value != value.strip():
+        raise RequestError("主装配路径不能包含首尾空白")
+    if unicodedata.normalize("NFC", value) != value:
+        raise RequestError("主装配路径必须使用 NFC 规范形式")
+    try:
+        parts = artifact_path_parts(value)
+    except PipelineError as error:
+        raise RequestError("主装配路径必须是可移植的相对路径") from error
+    if (
+        not parts
+        or "/".join(parts) != value
+        or value.startswith("/")
+        or any(segment in {"", ".", ".."} for segment in value.split("/"))
+    ):
+        raise RequestError("主装配必须是工程文件夹内的一个 .SLDASM 相对路径")
+    if not value.casefold().endswith(".sldasm"):
+        raise RequestError("主装配必须指向一个已保存的 SolidWorks 装配（.SLDASM）")
+    return value
 
 
 def _refusal(reason, message, *, earliest=None, **extra):
@@ -291,11 +327,15 @@ class Jobs:
             in (
                 {"run_id", "package", "handoff_sha256"},
                 {"run_id", "package", "handoff_sha256", "resume"},
+                {"run_id", "package", "handoff_sha256", "main_assembly"},
+                {"run_id", "package", "handoff_sha256", "resume", "main_assembly"},
             ),
-            "Expected run_id, package, handoff_sha256 and an optional resume",
+            "Expected run_id, package, handoff_sha256, an optional resume and an optional "
+            "main_assembly",
         )
         _job_id(request["run_id"])
         _resume_spec(request)
+        _main_assembly_spec(request.get("main_assembly"))
         _require(
             isinstance(request["package"], str) and bool(artifact_path_parts(request["package"])),
             "Invalid native package path",
@@ -704,6 +744,15 @@ class Jobs:
                         "原始上传不可复用，请重新上传后开始新运行",
                         earliest=None,
                     )
+                if (
+                    request.get("main_assembly") is not None
+                    and request["main_assembly"] != parent_request.get("main_assembly")
+                ):
+                    raise _refusal(
+                        "selection_changed",
+                        "所选主装配与原运行不一致，无法复用其检查点；请保持同一主装配或重新开始新运行",
+                        earliest=None,
+                    )
                 if spec["from_stage"] in {"verify", "publish"} and self._recorded_subject(parent) is None:
                     raise _refusal(
                         "prerequisite_invalid",
@@ -712,11 +761,20 @@ class Jobs:
                     )
                 events = self._reuse_events(parent, spec["from_stage"])
                 inherited = self._inherited_metadata(parent, spec["from_stage"])
+            selection = request.get("main_assembly")
+            if selection is None and spec is not None:
+                parent_request = (
+                    self.jobs.get(spec["parent_run"], {}).get("request")
+                    if isinstance(self.jobs.get(spec["parent_run"]), dict)
+                    else None
+                )
+                selection = parent_request.get("main_assembly") if isinstance(parent_request, dict) else None
             job = {
                 "schema_version": JOB_SCHEMA,
                 "pipeline_id": PIPELINE_ID,
                 "run_id": identifier,
                 "request": dict(request),
+                "main_assembly": selection,
                 "status": "queued",
                 "events": events,
                 "result": None,
@@ -751,7 +809,7 @@ class Jobs:
                 job["discovery"] = entry["discovery"]
             self._save(job)
 
-    def _prepare_native(self, identifier, frozen):
+    def _prepare_native(self, identifier, frozen, selection=None):
         from ..steps import discover_structure
 
         job = self.jobs[identifier]
@@ -761,6 +819,7 @@ class Jobs:
             identifier,
             expected_digest=job["request"]["handoff_sha256"],
             expected_files=job["package_files"],
+            main_assembly=selection,
             configuration=self.config.get("discovery", {}),
             targets=self.config["targets"],
             preparer=self.native_preparer,
@@ -797,6 +856,11 @@ class Jobs:
                     self.config["package_root"], job["request"]["package"] + "/.handoff-folder", exists=False
                 ).parent
                 from_stage = spec["from_stage"] if spec is not None else None
+                selection = job.get("main_assembly")
+                if selection is None and spec is not None:
+                    parent = self.jobs.get(spec["parent_run"]) or {}
+                    parent_request = parent.get("request") if isinstance(parent, dict) else None
+                    selection = parent_request.get("main_assembly") if isinstance(parent_request, dict) else None
                 resume_kwargs = {"resume": spec} if spec is not None else {}
                 if spec is not None and from_stage != "freeze":
                     # Revalidate the retained checkpoints at execution time; enqueue-time
@@ -821,10 +885,11 @@ class Jobs:
                         package,
                         job["request"]["handoff_sha256"],
                         job["package_files"],
+                        main_assembly=selection,
                         on_event=lambda item, identifier=identifier: self._event(identifier, item),
                     )
                 if from_stage in {None, "freeze", "discover"}:
-                    package, target = self._prepare_native(identifier, package)
+                    package, target = self._prepare_native(identifier, package, selection)
                 else:
                     # capture..publish reuse the parent's retained freeze+discover
                     # checkpoints; the plan already proved them intact.
