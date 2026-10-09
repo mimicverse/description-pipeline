@@ -62,6 +62,7 @@ from .run_ownership import (
     classify_transport_retry,
     recorded_actor_principal,
 )
+from .report_view import build_report
 from .uploads import (
     MAX_FILE_BYTES,
     MAX_FILES,
@@ -1040,6 +1041,7 @@ class PortalApp:
                 }
             except ResultNotPublishable:
                 pr = None
+        stage_view_payload = stage_view(job)
         return _json_response(
             start_response,
             200,
@@ -1071,7 +1073,8 @@ class PortalApp:
                     "revision": job["discovery"].get("revision"),
                     "discovery_sha256": job["discovery"].get("discovery_sha256"),
                 },
-                "stage_view": stage_view(job),
+                "stage_view": stage_view_payload,
+                "report": build_report(job, view=stage_view_payload),
                 "findings": _findings(job),
                 "automatic": _automatic_summary(job),
                 "coverage": _coverage_report(job),
