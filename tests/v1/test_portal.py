@@ -1533,6 +1533,119 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(status, 200, body)
         self.assertEqual(json.loads(body)["stage_reruns"], rows)
 
+    def _write_rerun_reservation(self, attempt_id: str, stage: str) -> Path:
+        folder = self.upload_root / ".rerun-attempts"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{DAG_RUN_ID}.json"
+        path.write_text(
+            json.dumps({"attempt_id": attempt_id, "stage": stage, "state": "attempting"}),
+            encoding="utf-8",
+        )
+        return path
+
+    def test_rerun_attempt_scan_covers_runs_beyond_the_old_page_limit(self) -> None:
+        self._seed_retryable_run()
+        child = "portal-20261005T000000-11112222"
+        self._seed_airflow_run(
+            child,
+            state="queued",
+            conf={"handoff_path": "/srv/robot-cell", "parent_dag_run_id": DAG_RUN_ID, "resume_from": "verify"},
+        )
+        self.airflow.dag_runs[child]["start_date"] = "2026-10-05T00:00:00Z"
+        for index in range(25):
+            newer = f"portal-20261008T0000{index:02d}-bbbb{index:04d}"
+            self._seed_airflow_run(newer, state="success", conf={})
+            self.airflow.dag_runs[newer]["start_date"] = f"2026-10-08T00:{index:02d}:00Z"
+        self.client.login()
+        status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
+        self.assertEqual(status, 409, body)
+        payload = json.loads(body)
+        self.assertEqual(payload["reason"], "already_active")
+        self.assertEqual(payload["active_dag_run_id"], child)
+        status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "verify"})
+        self.assertEqual(status, 202, body)
+        self.assertEqual(json.loads(body)["dag_run_id"], child)
+
+    def test_rerun_attempt_refuses_when_active_scan_fails(self) -> None:
+        self._seed_retryable_run()
+        self.client.login()
+        with patch.object(AirflowApi, "list_dag_runs", side_effect=AirflowApiError("scan down")):
+            status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(json.loads(body)["reason"], "unresolved_outcome")
+        self.assertEqual(self.airflow.trigger_payloads, [])
+
+    def test_rerun_attempt_scan_cap_refuses_instead_of_failing_open(self) -> None:
+        self._seed_retryable_run()
+        self.client.login()
+        filler = [{"dag_run_id": f"filler-{index}", "conf": {}, "state": "success"} for index in range(100)]
+        with patch.object(AirflowApi, "list_dag_runs", return_value=filler):
+            status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(json.loads(body)["reason"], "unresolved_outcome")
+        self.assertEqual(self.airflow.trigger_payloads, [])
+
+    def test_rerun_attempt_concurrent_clicks_create_one_child(self) -> None:
+        self._seed_retryable_run()
+        rows = self._rerun_rows()
+        clients = [PortalClient(self.client.base), PortalClient(self.client.base)]
+        for client in clients:
+            client.login()
+        barrier = threading.Barrier(2)
+        results: dict[int, tuple[int, dict, bytes]] = {}
+
+        def click(index: int) -> None:
+            barrier.wait()
+            results[index] = clients[index].request(
+                "POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"}
+            )
+
+        with patch.object(self.endpoint, "rerun_plan", create=True, return_value={"stage_reruns": rows}):
+            threads = [threading.Thread(target=click, args=(index,)) for index in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        statuses = sorted(status for status, _, _ in results.values())
+        self.assertEqual(statuses, [202, 202])
+        child_ids = {json.loads(body)["dag_run_id"] for _, _, body in results.values()}
+        self.assertEqual(len(child_ids), 1)
+        child = child_ids.pop()
+        self.assertNotEqual(child, DAG_RUN_ID)
+        self.assertEqual(len(self.airflow.trigger_payloads), 1)
+        self.assertEqual(self.airflow.trigger_payloads[0]["dag_run_id"], child)
+
+    def test_rerun_attempt_reuses_persisted_reservation_after_restart(self) -> None:
+        self._seed_retryable_run()
+        self.client.login()
+        rows = self._rerun_rows()
+        reserved = "portal-20261009T000000-aaaabbbb"
+        path = self._write_rerun_reservation(reserved, "generate")
+        with patch.object(self.endpoint, "rerun_plan", create=True, return_value={"stage_reruns": rows}):
+            status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
+        self.assertEqual(status, 202, body)
+        self.assertEqual(json.loads(body)["dag_run_id"], reserved)
+        self.assertEqual(self.airflow.trigger_payloads[-1]["dag_run_id"], reserved)
+        self.assertFalse(path.exists())
+        self.assertIn(reserved, self.airflow.dag_runs)
+
+    def test_rerun_attempt_reservation_sees_child_created_before_restart(self) -> None:
+        self._seed_retryable_run()
+        reserved = "portal-20261009T000000-ccccdddd"
+        self._seed_airflow_run(
+            reserved,
+            state="queued",
+            conf={"handoff_path": "/srv/robot-cell", "parent_dag_run_id": DAG_RUN_ID, "resume_from": "generate"},
+        )
+        path = self._write_rerun_reservation(reserved, "generate")
+        self.client.login()
+        before = len(self.airflow.trigger_payloads)
+        status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
+        self.assertEqual(status, 202, body)
+        self.assertEqual(json.loads(body)["dag_run_id"], reserved)
+        self.assertEqual(len(self.airflow.trigger_payloads), before)
+        self.assertFalse(path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
