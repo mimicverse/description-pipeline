@@ -275,7 +275,7 @@ class ReportUiContractTests(unittest.TestCase):
         self.assertIn("工程评审范围", app)
         self.assertIn("未就绪", app)
         self.assertIn("自动检查无法核验", app)
-        self.assertIn("不重复检查", app)
+        self.assertIn("text.textContent = scope.automatic_exclusion", app)
         self.assertNotIn("项待确认", app)
 
     def test_stepper_keeps_names_and_shows_affected_object(self) -> None:
