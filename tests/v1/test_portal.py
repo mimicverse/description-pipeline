@@ -40,6 +40,7 @@ from description_pipeline.orchestration.portal import (
     load_portal_config,
 )
 from description_pipeline.orchestration.uploads import MAX_FILE_BYTES, MAX_FILES, MAX_TOTAL_BYTES
+from description_pipeline.stages import CONTRACT
 from tests.v1.test_airflow_client import RUN_ID, MockEndpoint
 
 AIRFLOW_TOKEN = "airflow-session-token"
@@ -1010,9 +1011,13 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(payload["report"]["schema_version"], "solidworks-to-urdf.report/v1")
         self.assertEqual(payload["report"]["overall"]["state"], "passed")
         coverage = payload["coverage"]
-        self.assertEqual(coverage["engineering"]["state"], "pending")
-        self.assertEqual(len(coverage["engineering"]["items"]), 16)
-        self.assertTrue(all(item["state"] == "pending" for item in coverage["engineering"]["items"]))
+        self.assertEqual(coverage["engineering"]["state"], "external_review")
+        self.assertEqual(coverage["engineering"]["tracking"], "external")
+        self.assertEqual(len(coverage["engineering"]["items"]), len(CONTRACT["confirmations"]))
+        self.assertTrue(
+            all("scope" in item and "automatic_exclusion" in item for item in coverage["engineering"]["items"])
+        )
+        self.assertEqual(coverage["automatic"]["state"], "passed")
         self.assertEqual(coverage["structure"]["hardware_id"], "m3.0")
         self.assertEqual(coverage["structure"]["revision"], "r1")
         self.assertTrue(any("干涉与间隙" in text for text in coverage["automatic"]["unsupported"]))
@@ -1056,7 +1061,7 @@ class PortalTests(unittest.TestCase):
             status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
             self.assertEqual(status, 409)
 
-    def test_engineer_items_stay_pending_even_if_a_job_claims_confirmations(self) -> None:
+    def test_coverage_external_scope_ignores_job_confirmation_claims(self) -> None:
         self.client.login()
         self._seed_passed_job()
         run_id = native_run_id(DAG_RUN_ID)
@@ -1064,7 +1069,10 @@ class PortalTests(unittest.TestCase):
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 200, body)
         coverage = json.loads(body)["coverage"]
-        self.assertTrue(all(item["state"] == "pending" for item in coverage["engineering"]["items"]))
+        self.assertEqual(coverage["engineering"]["state"], "external_review")
+        self.assertEqual(coverage["engineering"]["tracking"], "external")
+        self.assertTrue(all("state" not in item for item in coverage["engineering"]["items"]))
+        self.assertFalse(any("confirmed" in str(item.get("id", "")) for item in coverage["engineering"]["items"]))
 
     def test_preview_and_artifacts_are_digest_bound(self) -> None:
         self.client.login()

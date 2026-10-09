@@ -11,7 +11,9 @@ recorded contract hashes.
 
 from __future__ import annotations
 
-from ..stages import stage_view
+from pathlib import PureWindowsPath
+
+from ..stages import CONTRACT, stage_view
 
 REPORT_SCHEMA = "solidworks-to-urdf.report/v1"
 
@@ -50,8 +52,24 @@ _BOUNDARY_LABELS_ZH = {
     "verification.gates": "独立校验门（聚合）",
     "verification.report_binding": "校验报告与主体绑定",
     "publication.inputs": "发布输入（分支与基线）",
-    "publication.git": "发布推送（Git）",
-    "publication.receipt": "发布回执确认",
+    "publication.git": "发布提交字节一致性（复制/暂存/提交）",
+    "publication.receipt": "评审分支回执确认",
+}
+
+#: Chinese descriptions for the contract's declared input/output records (by path string).
+_FILE_PATH_LABELS_ZH = {
+    "handoff/": "已保存的 SolidWorks 工程文件夹",
+    "input/discovery/": "原生观察与发现记录",
+    "input/robot.yaml + input/cad-revision.json": "派生定义与结构修订",
+    "input/": "准备后的输入定义与保存的 CAD",
+    "evidence/": "采集的 CAD 证据、原始测量与清单",
+    "model/robot.json": "规范化模型",
+    "urdf/ + meshes/": "URDF 与本地网格",
+    "reports/tool.json": "工具身份与文件主体",
+    "input/ + evidence/ + model/ + urdf/ + meshes/": "原始证据与生成产物",
+    "reports/quality.json": "确定性逐对象质量报告",
+    "urdf/ + meshes/ + reports/quality.json": "已验证交付与配置的模型仓库",
+    "reports/pr.json": "候选提交与评审回执",
 }
 
 _INDEPENDENT_LABELS_ZH = {
@@ -113,6 +131,23 @@ def _short(value: object, length: int = 12) -> str:
     return text[:length] + "…" if len(text) > length else text
 
 
+def _failure_object(raw_type: str, message: str, raw_detail: dict | None) -> str | None:
+    """Basename of the failing document, only when safely parsed; never invented."""
+    if isinstance(raw_detail, dict):
+        candidate = raw_detail.get("document") or raw_detail.get("object")
+        if isinstance(candidate, str) and candidate.strip():
+            name = PureWindowsPath(candidate.strip()).name
+            if name:
+                return name
+    if raw_type == "CadError":
+        text = message.strip().strip('"')
+        if ("\\" in text or "/" in text) and not text.startswith("{"):
+            name = PureWindowsPath(text).name
+            if name:
+                return name
+    return None
+
+
 def _range_text(values: object) -> str | None:
     if (
         isinstance(values, (list, tuple))
@@ -133,43 +168,133 @@ def _boundary_summary(identifier: object, details: dict) -> dict | None:
             passed = sum(1 for row in rows if isinstance(row, dict) and row.get("state") == "passed")
             return {
                 "scope_zh": "全部必需独立校验",
-                "expected": f"{len(required)} 项必需校验",
+                "expected": f"{len(required)} 项必需校验全部通过",
                 "actual": f"{passed}/{len(required)} 通过（已记录 {len(rows)} 项）",
             }
+        subject = details.get("subject_sha256")
+        status = details.get("subject_status")
+        if isinstance(subject, str) or status:
+            return {
+                "scope_zh": "独立校验报告",
+                "expected": "必需校验全部通过且主体绑定",
+                "actual": f"主体 {_short(subject)}（{status or '未标注'}）",
+            }
         return None
-    if name.startswith("handoff."):
-        return {"scope_zh": "交接包", "expected": "与申请一致", "actual": _short(details.get("handoff_sha256"))}
+    if name == "handoff.admission":
+        return {
+            "scope_zh": "交接包导入",
+            "expected": "记录导入包与摘要",
+            "actual": f"摘要 {_short(details.get('handoff_sha256'))}，已冻结导入包",
+        }
+    if name == "handoff.integrity":
+        files = details.get("files")
+        count = len(files) if isinstance(files, dict) else None
+        return {
+            "scope_zh": "交接包文件清单",
+            "expected": "清单与交接摘要一致",
+            "actual": f"{count} 个文件，清单校验通过" if count is not None else _short(details.get("handoff_sha256")),
+        }
+    if name == "discovery.inputs":
+        return {
+            "scope_zh": "冻结文件与命名注册",
+            "expected": "冻结清单与命名注册表一致",
+            "actual": f"清单 {_short(details.get('files_sha256'))}、命名 {_short(details.get('frozen_names_sha256'))}",
+        }
+    if name == "discovery.definition":
+        findings = details.get("findings")
+        blocked = len(findings) if isinstance(findings, list) else None
+        return {
+            "scope_zh": "原生结构定义",
+            "expected": "生成通过的原生结构定义",
+            "actual": f"型号 {details.get('hardware_id')}，修订 {details.get('revision')}，"
+            f"阻塞发现 {blocked if blocked is not None else '未记录'} 项",
+        }
+    if name == "discovery.binding":
+        files = details.get("files")
+        count = len(files) if isinstance(files, dict) else None
+        actual = f"型号 {details.get('hardware_id')} → {details.get('repository_slug')}@{details.get('base')}"
+        if count is not None:
+            actual += f"，{count} 个准备文件"
+        return {"scope_zh": "结构定义与目标仓库绑定", "expected": "绑定摘要与目标一致", "actual": actual}
+    if name == "input.valid":
+        files = details.get("files")
+        count = len(files) if isinstance(files, dict) else None
+        return {
+            "scope_zh": "CAD 包输入规范",
+            "expected": "CAD 包通过输入规范并归档一致",
+            "actual": f"CAD 修订 {details.get('cad_revision')}" + (f"，{count} 个文件" if count is not None else ""),
+        }
+    if name == "runtime.ready":
+        return {
+            "scope_zh": "原生运行环境",
+            "expected": "读取器与原生平台就绪",
+            "actual": f"{details.get('reader')} 就绪：{details.get('bodies')} 个刚体、{details.get('joints')} 个关节",
+        }
+    if name == "capture.integrity":
+        files = details.get("files")
+        count = len(files) if isinstance(files, dict) else None
+        return {
+            "scope_zh": "证据快照",
+            "expected": "快照与清单逐字节一致",
+            "actual": f"{count if count is not None else '未记录'} 个证据文件，"
+            f"清单 {_short(details.get('manifest_sha256'))}",
+        }
+    if name == "capture.input_stability":
+        files = details.get("files")
+        count = len(files) if isinstance(files, dict) else None
+        return {
+            "scope_zh": "输入稳定性",
+            "expected": "采集期间输入文件未变化",
+            "actual": f"{count if count is not None else '未记录'} 个输入文件保持不变",
+        }
+    if name == "generation.inputs":
+        files = details.get("files")
+        count = len(files) if isinstance(files, dict) else None
+        return {
+            "scope_zh": "生成前证据快照",
+            "expected": "快照有效且未变化",
+            "actual": f"证据快照 {count if count is not None else '未记录'} 个文件",
+        }
+    if name == "generation.artifacts":
+        files = details.get("files")
+        count = len(files) if isinstance(files, dict) else None
+        return {
+            "scope_zh": "生成产物",
+            "expected": "产物完整并绑定交付主体",
+            "actual": f"{count if count is not None else '未记录'} 个产物文件，"
+            f"主体 {_short(details.get('subject_sha256'))}",
+        }
     if name == "verification.subject":
-        return {"scope_zh": "交付主体", "expected": "绑定交付文件摘要", "actual": _short(details.get("subject_sha256"))}
+        return {
+            "scope_zh": "交付主体",
+            "expected": "主体与生成结果一致",
+            "actual": _short(details.get("subject_sha256")),
+        }
     if name == "verification.report_binding":
-        return {"scope_zh": "校验报告", "expected": "与交付主体绑定", "actual": _short(details.get("report_sha256"))}
+        return {
+            "scope_zh": "质量报告绑定",
+            "expected": "报告摘要与交付主体绑定",
+            "actual": f"报告 {_short(details.get('report_sha256'))} 绑定主体 {_short(details.get('subject_sha256'))}",
+        }
+    if name == "publication.inputs":
+        return {
+            "scope_zh": "评审基线与确定性分支",
+            "expected": "基线与确定分支校验通过",
+            "actual": f"{details.get('repository_slug')}: {details.get('base')} ← {details.get('branch')}",
+        }
     if name == "publication.git":
         return {
-            "scope_zh": "评审分支推送",
-            "expected": "推送成功",
-            "actual": _short(details.get("commit") or details.get("result")),
+            "scope_zh": "复制、暂存与提交的字节一致性",
+            "expected": "提交与交付字节一致",
+            "actual": f"提交 {_short(details.get('commit'))}，"
+            f"字节复核 {details.get('copied_staged_committed') or '已记录'}",
         }
     if name == "publication.receipt":
-        state = details.get("state")
-        return {"scope_zh": "发布回执", "expected": "回执完整", "actual": str(state or "已记录")}
-    if name in {"discovery.inputs", "discovery.definition", "discovery.binding"}:
         return {
-            "scope_zh": "原生解析",
-            "expected": "生成可绑定的结构定义",
-            "actual": _short(details.get("discovery_sha256") or details.get("definition_sha256")),
+            "scope_zh": "评审分支回执",
+            "expected": "回执状态与提交一致",
+            "actual": f"状态 {details.get('state') or '已记录'}，提交 {_short(details.get('commit'))}",
         }
-    if name in {
-        "input.valid",
-        "runtime.ready",
-        "capture.integrity",
-        "capture.input_stability",
-        "generation.inputs",
-        "generation.artifacts",
-    }:
-        actual = details.get("subject_sha256") or details.get("files") or details.get("output_files")
-        if isinstance(actual, dict):
-            actual = f"{len(actual)} 个文件"
-        return {"scope_zh": "阶段输入/产物", "expected": "校验通过", "actual": _short(actual) or "已记录"}
     return None
 
 
@@ -208,6 +333,42 @@ def _independent_summary(identifier: object, details: dict) -> dict | None:
         if isinstance(extent, list) and isinstance(expected, list):
             return {"scope_zh": "外形尺寸", "expected": f"最大边 {expected}", "actual": f"{extent}"}
         return None
+    if name == "bundle.subject":
+        return {
+            "scope_zh": "交付包主体摘要",
+            "expected": "主体摘要与交付一致",
+            "actual": _short(details.get("sha256")),
+        }
+    if name == "tool.identity":
+        return {
+            "scope_zh": "工具身份",
+            "expected": "版本与来源摘要记录",
+            "actual": f"版本 {details.get('version')}，来源 {_short(details.get('source_sha256'))}",
+        }
+    if name == "source.native":
+        return {
+            "scope_zh": "原生源信息",
+            "expected": "记录 SolidWorks 修订与配置",
+            "actual": f"SolidWorks {details.get('solidworks_revision')}，配置 {details.get('configuration')}",
+        }
+    if name == "urdf.syntax_names":
+        if details.get("validated") is True:
+            return {"scope_zh": "URDF 语法与命名", "expected": "语法与命名校验通过", "actual": "校验通过"}
+        return None
+    if name == "urdf.topology":
+        links, root = details.get("links"), details.get("root")
+        if isinstance(links, int):
+            return {"scope_zh": "URDF 拓扑", "expected": "单一根链接且连通", "actual": f"{links} 个链接，根 {root}"}
+        return None
+    if name in {"geometry.coverage", "geometry.assets"}:
+        meshes = details.get("meshes")
+        if isinstance(meshes, int):
+            return {"scope_zh": "几何网格", "expected": "全部刚体网格存在", "actual": f"{meshes} 个网格"}
+        return None
+    if name == "input.valid":
+        if details.get("passed") is True:
+            return {"scope_zh": "输入规范", "expected": "输入包符合规范", "actual": "规范校验通过"}
+        return None
     return None
 
 
@@ -220,11 +381,18 @@ def _failure(job: dict, stage: dict) -> dict:
     codes = None
     if raw_type == "CadError" and raw_detail and {"errors", "warnings"} <= set(raw_detail):
         codes = {"errors": raw_detail.get("errors"), "warnings": raw_detail.get("warnings")}
-        title = "原生 CAD 打开失败"
-        meaning = (
-            "文件或其引用的文档无法定位；影响范围尚未证明，"
-            "请由平台维护人员核实该文档及其引用对本次交付的必要性后再处理。"
-        )
+        if raw_detail.get("errors") == 2:
+            title = "原生 CAD 打开失败"
+            meaning = (
+                "文件或其引用的文档无法定位；影响范围尚未证明，"
+                "请由平台维护人员核实该文档及其引用对本次交付的必要性后再处理。"
+            )
+        else:
+            title = "原生 CAD 打开错误"
+            meaning = (
+                f"原生会话返回错误码 {raw_detail.get('errors')}（警告 {raw_detail.get('warnings')}）；"
+                "无法据此判定文件缺失，请由平台维护人员核实后处理。"
+            )
     elif raw_type == "CadError":
         title = "原生 CAD 阶段失败"
         meaning = "当前文档或其依赖无法被读取，阶段未完成；请按诊断信息核查后重试。"
@@ -246,6 +414,9 @@ def _failure(job: dict, stage: dict) -> dict:
         "raw_error": raw_error or None,
         "raw_detail": raw_detail,
     }
+    failed_object = _failure_object(raw_type, message, raw_detail)
+    if failed_object:
+        failure["object"] = failed_object
     if codes is not None:
         failure["solidworks_codes"] = codes
     unresolved = _unresolved_dependencies(raw_detail)
@@ -293,6 +464,62 @@ def _counts(rows: list[dict]) -> dict:
     }
 
 
+def _failed_summary(label: str, summary: dict | None, details: dict) -> dict:
+    """Failed rows must carry the recorded reason, never a blank or digest-only actual."""
+    reason = details.get("error") or details.get("message") or details.get("reason")
+    errors = details.get("errors")
+    if not isinstance(reason, str) and isinstance(errors, list) and errors:
+        first = errors[0]
+        if isinstance(first, dict):
+            reason = first.get("message") or first.get("code")
+    row = dict(summary) if summary else {"scope_zh": f"{label}未通过"}
+    row.setdefault("expected", "检查通过")
+    row["actual"] = f"未通过：{str(reason)[:160]}" if reason else "未通过（未提供原因）"
+    return row
+
+
+def _confirmations(stage: dict) -> list[dict]:
+    """Contract definitions merged with recorded states; compact views keep their labels."""
+    recorded = {
+        str(item.get("id")): item
+        for item in stage.get("confirmations", [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    rows = []
+    for definition in CONTRACT.get("confirmations", []):
+        if definition.get("review_stage") != stage.get("id"):
+            continue
+        record = recorded.pop(str(definition.get("id")), {})
+        row = {
+            "id": definition.get("id"),
+            "label": definition.get("label"),
+            "reference": definition.get("reference"),
+            "review_stage": definition.get("review_stage"),
+            "scope": definition.get("scope"),
+            "automatic_exclusion": definition.get("automatic_exclusion"),
+            "state": record.get("state"),
+            "approval_tracking": record.get("approval_tracking"),
+        }
+        for key in ("label", "reference", "scope", "automatic_exclusion"):
+            if record.get(key):
+                row[key] = record[key]
+        rows.append(row)
+    for orphan in recorded.values():
+        rows.append(
+            {
+                "id": orphan.get("id"),
+                "label": orphan.get("label"),
+                "reference": orphan.get("reference"),
+                "review_stage": orphan.get("review_stage") or stage.get("id"),
+                "scope": orphan.get("scope"),
+                "automatic_exclusion": orphan.get("automatic_exclusion"),
+                "state": orphan.get("state"),
+                "approval_tracking": orphan.get("approval_tracking"),
+            }
+        )
+    return rows
+
+
 def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
     """Readable report projection; pure display mapping over recorded evidence."""
     job = job if isinstance(job, dict) else {}
@@ -320,6 +547,8 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
                     "raw_details": details,
                 }
                 summary = _boundary_summary(item.get("id"), details)
+                if state == "failed":
+                    summary = _failed_summary(row["label_zh"], summary, details)
                 if summary is not None:
                     row["summary"] = summary
                 boundary_rows.append(row)
@@ -327,17 +556,17 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
         if stage.get("id") == "verify":
             for item in quality_rows:
                 details = item.get("details") if isinstance(item.get("details"), dict) else {}
-                state = (
-                    item.get("state")
-                    if item.get("state") in {"passed", "failed"}
-                    else (
-                        "passed"
-                        if item.get("passed") is True
-                        else "failed"
-                        if item.get("passed") is False
-                        else "not_run"
-                    )
-                )
+                declared = item.get("state")
+                if declared in {"passed", "failed", "not_run"}:
+                    state = declared
+                    if state == "passed" and item.get("passed") is False:
+                        state = "failed"
+                elif item.get("passed") is True:
+                    state = "passed"
+                elif item.get("passed") is False:
+                    state = "failed"
+                else:
+                    state = "not_run"
                 row = {
                     "id": item.get("id"),
                     "label_zh": independent_label(item.get("id")),
@@ -347,6 +576,8 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
                     "raw_details": details,
                 }
                 summary = _independent_summary(item.get("id"), details)
+                if state == "failed":
+                    summary = _failed_summary(row["label_zh"], summary, details)
                 if summary is not None:
                     row["summary"] = summary
                 independent_rows.append(row)
@@ -374,12 +605,16 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
             "boundary": boundary_rows,
             "files": [
                 {
-                    "label": record.get("label"),
+                    "boundary": boundary,
+                    "label_zh": _FILE_PATH_LABELS_ZH.get(
+                        str(record.get("path") or ""), str(record.get("label") or record.get("path") or "")
+                    ),
                     "path": record.get("path"),
                     "availability": record.get("availability"),
                     "files": len(record.get("files") or {}),
                 }
-                for record in (stage.get("inputs", []) + stage.get("outputs", []))
+                for boundary, records in (("input", stage.get("inputs", [])), ("output", stage.get("outputs", [])))
+                for record in records
             ],
             "automatic": {
                 "passed_labels": [
@@ -394,18 +629,7 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
             "unsupported": [
                 {"id": item.get("id"), "label": item.get("label")} for item in stage.get("unsupported", [])
             ],
-            "confirmations": [
-                {
-                    "id": item.get("id"),
-                    "label": item.get("label"),
-                    "reference": item.get("reference"),
-                    "review_stage": item.get("review_stage"),
-                    "scope": item.get("scope"),
-                    "automatic_exclusion": item.get("automatic_exclusion"),
-                    "state": item.get("state"),
-                }
-                for item in stage.get("confirmations", [])
-            ],
+            "confirmations": _confirmations(stage),
         }
         if stage.get("state") in {"completed", "running"}:
             stage_out["manual_scope_note_zh"] = (

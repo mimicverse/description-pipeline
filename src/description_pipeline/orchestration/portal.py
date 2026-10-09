@@ -627,10 +627,12 @@ def _retry_assessment(run: dict, tasks: list[dict], job: dict | None, endpoint_e
 
 
 def _coverage_report(job: dict | None) -> dict:
-    """Per-item canonical check state bound to the native structural identity of this run."""
+    """Canonical check state plus the external review scope bound to this run's identity."""
     job = job if isinstance(job, dict) else {}
     result = job.get("result") if isinstance(job.get("result"), dict) else {}
     discovery = job.get("discovery") if isinstance(job.get("discovery"), dict) else {}
+    report = build_report(job)
+    verified = report["overall"]["engineering_state"] == "external_review"
     return {
         "structure": {
             "dag_run_id": str(job.get("dag_run_id") or ""),
@@ -640,23 +642,26 @@ def _coverage_report(job: dict | None) -> dict:
             "discovery_sha256": str(discovery.get("discovery_sha256") or ""),
         },
         "automatic": {
-            "state": "unsupported-present",
+            "state": report["overall"]["state"],
             "unsupported": [item["label"] for item in CONTRACT["unsupported"]],
-            "message": "其余检查项按已发布的自动校验执行；未覆盖项必须由工程师确认。",
+            "message": "自动校验状态见逐阶段报告；未覆盖类别属于外部评审范围。",
         },
         "engineering": {
-            "state": "pending",
+            "state": "external_review" if verified else "not_ready",
+            "tracking": "external",
             "items": [
                 {
-                    "id": item["label"],
-                    "review_stage": item["review_stage"],
-                    "state": "pending",
+                    "id": item.get("id"),
+                    "label": item.get("label"),
+                    "scope": item.get("scope"),
+                    "automatic_exclusion": item.get("automatic_exclusion"),
+                    "review_stage": item.get("review_stage"),
+                    "reference": item.get("reference"),
                     "subject_sha256": result.get("subject_sha256"),
-                    "reference": item["reference"],
                 }
                 for item in CONTRACT["confirmations"]
             ],
-            "message": "工程确认由结构负责人在本版本原生工程及评审 PR 中完成，本页只显示逐项待确认状态。",
+            "message": "外部评审跟踪：平台不读取或代管评审批准；重跑时未变化事实可沿用既有批准，仅变化项需重新确认。",
         },
     }
 
