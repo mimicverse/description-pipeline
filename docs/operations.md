@@ -49,6 +49,10 @@ Sign in to the operator page with Feishu. Select the engineering
 folder and click **Start**. Hardware, revision, repository and branch are derived
 or configured by the platform; they are not operator form fields.
 
+Run history and details show the original submitter's verified Feishu username,
+including when viewed by another operator. The platform reads the name through
+Feishu's authentication API and fills it in automatically.
+
 The page shows the [six engineering steps](design.md#2-how-the-system-works):
 freeze inputs, discover structure, capture evidence, generate URDF, verify and
 publish the review PR. Open each step's **Input**, **Input QC**, **Output** and

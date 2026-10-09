@@ -19,6 +19,9 @@ Open the single HTTPS address provided by the platform maintainer.
    per-stage unsupported items stay visible), inspect the verified URDF and joint
    limits, and open the PR for engineering approval.
 
+Run history and details show the original submitter's Feishu username, obtained
+automatically through Feishu's authentication API.
+
 Mechanical engineers provide SolidWorks files and engineering facts. Robot
 YAML, version manifests, model artifacts and reports are generated. Corrections
 return to CAD or controlled specifications, followed by a new run.

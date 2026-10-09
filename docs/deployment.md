@@ -164,6 +164,8 @@ Store the app credentials in the mode-`0600` JSON file named by
 {"app_id": "<enterprise-app-id>", "app_secret": "<enterprise-app-secret>"}
 ```
 
+Feishu API authentication is required for the workflow. The server reads the
+authenticated user's Feishu username and keeps credentials server-side.
 The enterprise app is used for sign-in only. The
 [current authorization API](https://open.feishu.cn/document/common-capabilities/sso/api/obtain-oauth-code)
 uses an S256 challenge; the server exchanges the code at the
@@ -172,11 +174,12 @@ The [basic profile API](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/re
 requires no additional contact-directory, email, phone or employment permissions.
 The workflow does not request offline access or retain Feishu refresh tokens.
 
-Membership in an
-approved tenant grants workflow operator access; administrators must also appear
-in the explicit admin list. Identity is bound to the app, tenant and `open_id`,
-and recorded with the Airflow execution. Feishu does not supply CAD, drive
-specifications or engineering approval merely through login.
+Membership in an approved tenant grants workflow operator access; administrators
+must also appear in the explicit admin list. Each run's history and details show
+the original submitter's Feishu username from the authenticated API response.
+The app, tenant and `open_id` remain the internal audit identity; users do not
+supply the submitter name. Feishu does not supply CAD, drive specifications or
+engineering approval merely through login.
 
 Configure the SSH alias on Linux using a dedicated execution key and verified
 Windows host key. Confirm it works without a password prompt:
@@ -224,6 +227,9 @@ self-signed rehearsal certificate also requires browser trust before use;
 service liveness does not establish that trust. Commissioning requires zero
 health failures, trusted HTTPS and a successful live Feishu sign-in.
 
+Live Feishu authentication and trusted HTTPS have not yet been commissioned.
+Complete the acceptance below before shared use.
+
 ## Acceptance
 
 Commission the complete workflow with actual native CAD and live Feishu:
@@ -231,7 +237,7 @@ Commission the complete workflow with actual native CAD and live Feishu:
 1. Run `description doctor` in each installed runtime and require all checks to
    pass. Confirm HTTPS trust, all services, authenticated Windows endpoint health
    and the installed Airflow Connection.
-2. Sign in with Feishu. Verify the displayed identity, approved tenant,
+2. Sign in with Feishu. Verify the displayed Feishu username, approved tenant,
    workflow permissions, explicit admin assignment and denied unauthorized users.
 3. Supply a compliant native folder from an approved Linux or Windows source
    root. Start without YAML, branch, hardware or credential fields.
@@ -240,6 +246,8 @@ Commission the complete workflow with actual native CAD and live Feishu:
    terminal task logs and `engineering_stages` XCom. Confirm failed, blocked,
    not-run and pending-confirmation states, and the hashed `reports/stages.json`.
    Verify the actual native discovery and every independent quality result.
+   Confirm history and details show the original submitter's Feishu username
+   after reload and when viewed by another authorized operator.
 5. Inspect the delivered URDF and actual meshes in the page. Exercise individual
    joint controls and limits; confirm preview binds to the passing file subject.
 6. Check the resulting private-model PR's exact base, head, structural revision

@@ -126,11 +126,13 @@ bind their documented interfaces; each rebuild refreshes and verifies the owned
 document once before continuation. Lost bindings or unavailable capabilities
 stop execution, retain diagnostics and release owned resources.
 
-Feishu supplies operator identity and profile. The platform restricts tenant and
-workflow permissions, records the operator with the run, and keeps credentials
-server-side. Maintainers configure storage roots and hardware routing once;
-operators provide one accessible folder path. Deployment settings and model facts
-remain outside tool code.
+Feishu API authentication supplies the operator's verified username. Run history
+and details show each run's original submitter by that name. The authenticated
+app, tenant and `open_id` remain the internal audit identity. The platform
+restricts tenant and workflow permissions and keeps credentials server-side.
+Maintainers configure storage roots and hardware routing once; operators provide
+one accessible folder path. Deployment settings and model facts remain outside
+tool code.
 
 ## 4. How to operate
 
