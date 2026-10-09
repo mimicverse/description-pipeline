@@ -26,9 +26,11 @@ model repository. Retain local acceptance evidence; GitHub CI is not required.
    compatibility paths, duplicate entry points and transitional instructions.
    Regenerate contract-derived tables from `contract_markdown()` and confirm the
    six-stage contract still matches the code before merging.
-6. Merge the reviewed result into public `main`, create a new version tag and
-   publish distributions, their SHA-256 manifest and acceptance evidence.
-   Verify the remote commit, tag, downloaded bytes and installed identity.
+6. Merge the reviewed result into public `main`, create the release tag as
+   `v<package version>` from the distribution's `__version__` (currently
+   `1.0.1`) and publish distributions, their SHA-256 manifest and acceptance
+   evidence. Never reuse or rewrite a published tag or asset. Verify the remote
+   commit, tag, downloaded bytes and installed identity.
 
 All steps are required. Mocks do not qualify native behavior, and a passing
 neutral fixture does not qualify a hardware model. Each model needs reviewed
