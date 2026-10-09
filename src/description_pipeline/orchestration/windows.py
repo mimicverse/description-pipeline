@@ -106,6 +106,7 @@ def _main_assembly_spec(value):
     if (
         not parts
         or "/".join(parts) != value
+        or "\\" in value
         or value.startswith("/")
         or any(segment in {"", ".", ".."} for segment in value.split("/"))
     ):
