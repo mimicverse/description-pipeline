@@ -51,6 +51,8 @@ const TRANSPORT = {
 };
 const CHECK_STATES = { passed: "通过", failed: "失败", not_run: "未执行", unsupported: "不支持" };
 const STAGE_STATES = { not_run: "未执行", running: "执行中", completed: "完成", failed: "失败", blocked: "上游阻断" };
+// Compact state words for the stepper; the full reason stays in the tooltip.
+const STEP_STATE_SHORT = { completed: "已完成", running: "进行中", failed: "失败", blocked: "已阻断", not_run: "未执行" };
 const AUTOMATIC_STATES = {
   passed: "自动校验通过",
   failed: "自动校验失败",
@@ -558,6 +560,19 @@ function buildFailureCard(failure) {
     stage.textContent = `涉及阶段：${failure.stage_name_zh}`;
     card.append(stage);
   }
+  const affected = failure.object
+    ? String(failure.object)
+    : Array.isArray(failure.unresolved_dependencies)
+      ? failure.unresolved_dependencies
+          .map((item) => (item && (item.name || item.path)) || "")
+          .filter(Boolean)
+          .join("、")
+      : "";
+  if (affected) {
+    const object = document.createElement("p");
+    object.textContent = `涉及对象：${affected}`;
+    card.append(object);
+  }
   const raw = {};
   for (const key of ["raw_type", "raw_error", "raw_detail"]) {
     if (failure[key] !== undefined && failure[key] !== null) raw[key] = failure[key];
@@ -702,12 +717,21 @@ function renderStepper() {
     label.textContent = stage.nameZh || stage.id;
     const meta = document.createElement("span");
     meta.className = "step-meta";
-    if (stage.state === "blocked" || stage.state === "not_run" || !Number.isFinite(stage.total) || stage.total <= 0) {
-      // Nothing ran here: state text stays neutral instead of implying a failed percentage.
-      meta.textContent = stage.stateZh;
+    if (!Number.isFinite(stage.total) || stage.total <= 0) {
+      // No recorded checks: a short neutral state word instead of a failed percentage.
+      meta.textContent = STEP_STATE_SHORT[stage.state] || stage.stateZh;
     } else {
       meta.textContent = `${Number.isFinite(stage.passed) ? stage.passed : 0}/${stage.total} 通过`;
     }
+    const tooltip = `${stage.nameZh} · ${stage.stateZh}${
+      Number.isFinite(stage.total) && stage.total > 0
+        ? ` · 通过 ${Number.isFinite(stage.passed) ? stage.passed : 0}/${stage.total} · 已执行 ${
+            Number.isFinite(stage.executed) ? stage.executed : 0
+          }/${stage.total}`
+        : ""
+    }`;
+    step.title = tooltip;
+    step.setAttribute("aria-label", tooltip);
     step.append(dot, label, meta);
     step.addEventListener("click", () => {
       const runId = state.dagRunId;
@@ -911,13 +935,19 @@ function renderRun(run) {
 
   const findings = $("findings");
   findings.textContent = "";
-  if (!(run.findings || []).length) {
+  const failure = report && report.failure ? report.failure : null;
+  // The auto finding repeating the failure card's raw error would be a second
+  // red container for the same fact; show each failure once.
+  const visibleFindings = (run.findings || []).filter(
+    (finding) => !(failure && !finding.id && finding.message === failure.raw_error),
+  );
+  if (!visibleFindings.length) {
     const item = document.createElement("li");
     item.className = "muted";
     item.textContent = "暂无问题";
     findings.append(item);
   }
-  for (const finding of run.findings || []) {
+  for (const finding of visibleFindings) {
     const item = document.createElement("li");
     if (finding.severity && finding.severity !== "error") item.className = "warn";
     const message = document.createElement("div");

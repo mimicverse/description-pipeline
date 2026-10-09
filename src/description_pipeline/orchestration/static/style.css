@@ -160,14 +160,17 @@ input, select, textarea { font: inherit; }
 .stepper { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 2px; }
 .step {
   flex: 1 1 0; min-width: 128px;
-  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px;
+  display: grid; grid-template-columns: auto minmax(3.5em, 1fr) auto; align-items: center; gap: 8px;
   padding: 8px 10px; background: var(--panel); color: inherit;
   border: 1px solid var(--line); border-radius: var(--radius-sm); cursor: pointer;
 }
 .step:hover { border-color: var(--line-strong); background: #f2f5fa; }
 .step.selected { border-color: var(--accent); background: var(--accent-soft); }
 .step-label { font-size: 12.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.step-meta { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.step-meta {
+  font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums;
+  max-width: 5.5em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .step.failed { border-color: #f3c1c1; }
 .step.blocked { border-color: var(--line-strong); }
 .step.completed .step-meta { color: var(--ok); }
