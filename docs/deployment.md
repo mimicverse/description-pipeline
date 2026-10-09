@@ -24,9 +24,12 @@ example `https://operator.example.com:8443/`. Register that address followed by
 The browser must trust the server certificate and be able to reach this address.
 
 Operators use their existing enterprise Feishu accounts; the platform has no
-account-registration step. The enterprise app administrator enables the app
-for its intended users, registers the callback above and provides its App ID,
-private secret file and approved tenant keys to the platform maintainer.
+account-registration step. Create a dedicated enterprise custom app, enable
+the **Web app** feature and set its desktop homepage to the operator address.
+Register the exact callback under **Security Settings → Redirect URLs**.
+Publish a version with the intended users in its availability scope; new
+configuration takes effect after publication. A creator-only release is
+sufficient for commissioning that user's sign-in.
 
 SolidWorks is required for fresh native discovery and capture. Verification and
 rebuild of a complete frozen delivery run on Linux or Windows without opening
@@ -164,6 +167,13 @@ Store the app credentials in the mode-`0600` JSON file named by
 {"app_id": "<enterprise-app-id>", "app_secret": "<enterprise-app-secret>"}
 ```
 
+Obtain the company identifier with the app's **Tenant token** permission
+`tenant:tenant:readonly` (**Obtain tenant information**). Exchange the app
+credentials for a tenant access token, then call
+[Obtain company information](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/tenant-v2/tenant/query).
+Set `FEISHU_TENANT_KEYS` from `data.tenant.tenant_key` after confirming the
+company name. The company name and `display_id` are not tenant keys.
+
 Feishu API authentication is required for the workflow. The server reads the
 authenticated user's Feishu username and keeps credentials server-side.
 The enterprise app is used for sign-in only. The
@@ -173,6 +183,12 @@ uses an S256 challenge; the server exchanges the code at the
 The [basic profile API](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/authen-v1/user_info/get)
 requires no additional contact-directory, email, phone or employment permissions.
 The workflow does not request offline access or retain Feishu refresh tokens.
+
+After an approved administrator signs in, obtain that person's app-scoped
+`open_id` from `/auth/feishu/profile` and add it to `FEISHU_ADMIN_OPEN_IDS`.
+Keep the list empty until an administrator is explicitly selected. User IDs
+from another app cannot be reused. Apply configuration through the supported
+installation and restart steps below.
 
 Membership in an approved tenant grants workflow operator access; administrators
 must also appear in the explicit admin list. Operator access covers starting new
