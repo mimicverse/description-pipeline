@@ -1317,7 +1317,7 @@ class PortalApp:
             if rows is None:
                 return self._rerun_refusal(
                     start_response,
-                    "unresolved_outcome",
+                    "endpoint_evidence_unavailable",
                     "暂时无法确认可复用的检查点，请稍后重试",
                     None,
                 )

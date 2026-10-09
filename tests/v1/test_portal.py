@@ -1478,7 +1478,7 @@ class PortalTests(unittest.TestCase):
         self.client.login()
         status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
         self.assertEqual(status, 409, body)
-        self.assertEqual(json.loads(body)["reason"], "unresolved_outcome")
+        self.assertEqual(json.loads(body)["reason"], "endpoint_evidence_unavailable")
         self.assertEqual(self.airflow.trigger_payloads, [])
 
     def test_rerun_attempt_reconciles_ambiguous_trigger(self) -> None:
