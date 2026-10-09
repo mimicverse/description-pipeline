@@ -10,6 +10,7 @@ Windows SolidWorks worker.
 ## Use
 
 Open the single HTTPS address provided by the platform maintainer.
+The page is **SolidWorks2URDF 交付操作台**.
 
 1. Prepare saved native engineering on your own computer under the
    [mechanical specification](docs/mechanical-handoff-spec.md).
@@ -39,6 +40,10 @@ To repeat work, select any step, including a completed one, and choose
 reruns that step and everything after it. Changed CAD requires a new folder
 upload. For recoverable transport failures, **继续原作业** reconnects to the
 existing job.
+
+Run history shows the project name, time, status and initiator. Initiators and
+administrators can rename records or move completed runs to **已删除**, then
+restore them. These actions preserve engineering files, evidence and PRs.
 
 See [operations](docs/operations.md) for the full design-to-release workflow
 and [deployment](docs/deployment.md) for installing the Linux server and
