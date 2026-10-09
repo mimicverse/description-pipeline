@@ -5,8 +5,8 @@ The portal is a dependency-free WSGI application:
 * the operator signs in once with Feishu SSO at ``/auth/feishu/login``; the Airflow ``_token``
   cookie that Airflow issues is validated server-side through ``/auth/feishu/profile`` and its
   value is kept in a portal session, never echoed to the browser;
-* the portal triggers the ``solidworks_to_urdf`` DAG with exactly one value, ``handoff_path``, and
-  reports the Airflow stage progress, native findings and the published pull request;
+* the portal triggers the ``solidworks_to_urdf`` DAG with ``handoff_path`` and ``main_assembly``,
+  and reports the Airflow stage progress, native findings and the published pull request;
 * the Windows endpoint bearer token also stays server-side; the portal proxies the delivery
   preview and only serves URDF/mesh artifacts whose bytes match the digest-bound preview;
 * the bundled viewer renders the actual verified URDF with joint and limit controls.
