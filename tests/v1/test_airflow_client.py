@@ -144,9 +144,7 @@ class MockEndpoint:
                         job = outer.jobs.get(run_id)
                         # The deployed endpoint retains a digest-bound preview for a verified
                         # delivery even when the publish stage failed afterwards.
-                        retained_failure = (
-                            outer.publish_failed and job is not None and job.get("status") == "failed"
-                        )
+                        retained_failure = outer.publish_failed and job is not None and job.get("status") == "failed"
                         if job is None or (job.get("status") != "passed" and not retained_failure):
                             self._send(404, {"error": "no passed delivery"})
                             return

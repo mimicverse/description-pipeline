@@ -146,7 +146,12 @@ class RenderTests(unittest.TestCase):
             config = (state / "nginx/nginx.conf").read_text(encoding="utf-8")
             self.assertIn("$request_method $uri $server_protocol", config)
             for sensitive in (
-                "$request_uri", "$args", "$query_string", "$http_referer", "$http_cookie", "$http_authorization"
+                "$request_uri",
+                "$args",
+                "$query_string",
+                "$http_referer",
+                "$http_cookie",
+                "$http_authorization",
             ):
                 self.assertNotIn(sensitive, config)
             self.assertNotIn('"$request"', config)

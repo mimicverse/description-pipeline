@@ -491,7 +491,7 @@ def verified_result(result: dict | None) -> dict:
     delivery, and a failed or unverified model must never be shown.
     """
     if not isinstance(result, dict):
-        raise ResultNotPublishable("passed job has no result payload")
+        raise ResultNotPublishable("job has no model result payload")
     if result.get("pipeline_id") != PIPELINE_ID:
         raise ResultNotPublishable(f"result.pipeline_id must be {PIPELINE_ID}")
     subject = result.get("subject_sha256")

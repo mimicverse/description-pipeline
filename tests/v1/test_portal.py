@@ -990,9 +990,7 @@ class PortalTests(unittest.TestCase):
     def test_publication_failure_with_mismatched_quality_is_still_blocked(self) -> None:
         self.client.login()
         self._seed_airflow_run(state="failed")
-        with MockEndpoint(
-            publish_failed=True, quality_mismatch=True, preview_payload=_preview_payload()
-        ) as server:
+        with MockEndpoint(publish_failed=True, quality_mismatch=True, preview_payload=_preview_payload()) as server:
             endpoint = WindowsEndpoint(EndpointConfig(base_url=server.url, token="test-token"))
             run_id = native_run_id(DAG_RUN_ID)
             endpoint.start_job(run_id=run_id, resolution=endpoint.resolve_handoff("handoff/m3.0"))
