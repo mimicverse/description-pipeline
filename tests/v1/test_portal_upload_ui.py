@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -374,7 +375,7 @@ class RunHistoryUiContractTests(unittest.TestCase):
             "从运行列表移除，可在「已删除」中恢复；模型、证据和 PR 保留。",
             "已删除 · ",
             "删除人：",
-            "backend actor is authoritative",
+            "overlayRun",
         ):
             self.assertIn(token, app)
         # No permanently visible row actions and no viewer-guessed deleter.
@@ -382,6 +383,23 @@ class RunHistoryUiContractTests(unittest.TestCase):
         self.assertNotIn(".run-row-actions", css)
         self.assertNotIn("buildRunActions", app)
         self.assertNotIn("run.deleted_by = state.user", app)
+
+    def test_followup_regressions_are_pinned(self) -> None:
+        app = self.app()
+        for token in (
+            'from "/static/run_history.js"',
+            "resolveDeleted",
+            "resolveTitle",
+            "menuAction(state.runActionsFor, runId, canManage)",
+            "overlayRun(state.runsList, run,",
+            "deleted: payload.deleted !== false,",
+            'deleted_by: typeof payload.deleted_by === "string" ? payload.deleted_by : null',
+            "run.parent_dag_run_id || (listEntry && listEntry.parent_dag_run_id)",
+            "runActionsFor: null,",
+        ):
+            self.assertIn(token, app)
+        # The temporary delete flow re-read the list and lost the loaded pages.
+        self.assertNotIn("The backend actor is authoritative", app)
 
     def test_deleted_runs_stay_readable_with_restore_first(self) -> None:
         app = self.app()
@@ -400,6 +418,21 @@ class RunHistoryUiContractTests(unittest.TestCase):
             "trigger.focus()",
         ):
             self.assertIn(token, app)
+
+
+class RunHistoryJsLogicTests(unittest.TestCase):
+    """Focused Node regression for the pure run-history list helpers."""
+
+    @unittest.skipUnless(shutil.which("node"), "node is required to run the JS logic regression")
+    def test_run_history_logic_regression(self) -> None:
+        script = ROOT / "tests" / "js" / "run_history_logic_test.mjs"
+        result = subprocess.run(
+            [shutil.which("node"), str(script)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
 
 
 if __name__ == "__main__":
