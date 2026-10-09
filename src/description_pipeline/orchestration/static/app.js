@@ -228,7 +228,7 @@ function applyAssemblies(pick) {
 }
 
 function updateStartEnabled() {
-  $("start-button").disabled = !(state.folderPick && !state.blockedPick && state.assemblyChoice);
+  $("start-button").disabled = !(state.folderPick && !state.blockedPick && !state.uploading && state.assemblyChoice);
 }
 
 function submitRun(pick, { onProgress } = {}) {
@@ -1798,12 +1798,17 @@ function wire() {
       setError($("run-error"), "上一提交状态尚未确认；请在上方运行列表中确认，或重新选择文件夹后再提交。");
       return;
     }
+    if (!state.assemblyChoice || !picked.assemblies.includes(state.assemblyChoice)) {
+      setError($("run-error"), "请先选择主装配。");
+      return;
+    }
     const start = $("start-button");
     const status = $("upload-status");
     state.uploading = true;
     start.disabled = true;
     $("choose-button").disabled = true;
     $("folder-input").disabled = true;
+    $("assembly-select").disabled = true;
     $("cancel-button").hidden = false;
     status.hidden = false;
     status.textContent = "正在上传工程文件夹…";
@@ -1849,6 +1854,7 @@ function wire() {
       state.uploadAbort = null;
       $("choose-button").disabled = false;
       $("folder-input").disabled = false;
+      $("assembly-select").disabled = false;
       $("cancel-button").hidden = true;
       if (state.folderPick && !state.blockedPick) {
         updateStartEnabled();

@@ -677,10 +677,14 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(payload["bytes"], sum(len(data) for _, data in files))
         stored = self.upload_root / dag_run_id / "机器人工程"
         self.assertTrue((stored / "model.SLDASM").is_file())
-        self.assertEqual(self.airflow.conf, {"handoff_path": str(stored)})
+        self.assertEqual(self.airflow.conf, {"handoff_path": str(stored), "main_assembly": "model.SLDASM"})
         self.assertEqual(
             self.airflow.trigger_payloads[-1],
-            {"dag_run_id": dag_run_id, "logical_date": None, "conf": {"handoff_path": str(stored)}},
+            {
+                "dag_run_id": dag_run_id,
+                "logical_date": None,
+                "conf": {"handoff_path": str(stored), "main_assembly": "model.SLDASM"},
+            },
         )
         status, _, body = self.client.request("GET", "/api/runs")
         self.assertEqual(status, 200)
@@ -746,6 +750,31 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(len(self.airflow.trigger_payloads), 1)
         staging = self.upload_root / ".staging"
         self.assertTrue(not staging.exists() or not any(staging.iterdir()))
+
+    def test_multiple_assemblies_require_a_choice_before_any_trigger(self) -> None:
+        self.client.login()
+        files = [("left/model.SLDASM", b"left"), ("right/model.SLDASM", b"right")]
+        status, _, body = self.client.request_raw(
+            "POST", "/api/runs", _upload_body(files=files), "multipart/form-data; boundary=portal-boundary"
+        )
+        self.assertEqual(status, 400, body)
+        self.assertEqual(self.airflow.trigger_payloads, [])
+        staging = self.upload_root / ".staging"
+        self.assertTrue(not staging.exists() or not any(staging.iterdir()))
+
+    def test_unicode_selection_matches_normalized_uploaded_path(self) -> None:
+        self.client.login()
+        chosen = "子装配/re\u0301vision.SLDASM"
+        files = [("main.SLDASM", b"main"), (chosen, b"selected")]
+        status, _, body = self.client.request_raw(
+            "POST",
+            "/api/runs",
+            _upload_body(files=files, fields=[("main_assembly", chosen)]),
+            "multipart/form-data; boundary=portal-boundary",
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(json.loads(body)["main_assembly"], "子装配/révision.SLDASM")
+        self.assertEqual(self.airflow.conf["main_assembly"], "子装配/révision.SLDASM")
 
     def test_manual_paths_and_unconfirmed_sessions_are_refused_before_writes(self) -> None:
         self.client.login()

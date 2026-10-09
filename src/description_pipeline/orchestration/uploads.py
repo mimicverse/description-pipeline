@@ -13,9 +13,8 @@ Admission rules (any violation rejects the whole upload and removes staging):
 * explicit duplicate and casefold-alias rejection including file/directory collisions, so the
   upload cannot alias differently on a case-insensitive Windows extraction;
 * SolidWorks lock transients (``~$*``) are rejected rather than silently dropped;
-* an optional ``main_assembly`` text part selects the delivered assembly: a canonical POSIX
-  path inside the selected top folder (top folder excluded), case-exact against the admitted
-  files, ``.sldasm`` only; absent keeps the current native marker / unique-root discovery;
+* ``main_assembly`` selects an admitted ``.sldasm`` by its canonical POSIX path inside the
+  selected folder (top folder excluded); only a sole assembly may be selected automatically;
 * 4096 files / 2 GiB aggregate / 512 MiB per file / path and component length caps, enforced
   incrementally while streaming (never after buffering the whole body).
 
@@ -401,11 +400,16 @@ class _Receiver:
 
     def _validate_main_assembly(self) -> str | None:
         """One canonical, case-exact selection inside the uploaded top folder."""
+        prefix = f"{self.top}/"
+        relative = {name[len(prefix):]: name for name in self.files.values() if name.startswith(prefix)}
+        assemblies = [name for name in relative if Path(name).suffix.casefold() == ".sldasm"]
         raw = self._assembly
         if raw is None:
-            return None
+            if len(assemblies) == 1:
+                return assemblies[0]
+            raise UploadRejected(400, "请在页面上选择主装配后再提交")
         value = unicodedata.normalize("NFC", raw)
-        if value != raw.strip():
+        if raw != raw.strip():
             raise UploadRejected(400, "主装配路径不能包含首尾空白")
         if not value:
             raise UploadRejected(400, "主装配选择为空")
@@ -417,8 +421,6 @@ class _Receiver:
             raise UploadRejected(400, "主装配路径规范化结果不一致")
         if Path(value).suffix.casefold() != ".sldasm":
             raise UploadRejected(400, "主装配必须是 .SLDASM 文件")
-        prefix = f"{self.top}/"
-        relative = {name[len(prefix):]: name for name in self.files.values() if name.startswith(prefix)}
         if value in relative:
             return value
         if any(key.casefold() == value.casefold() for key in relative):
