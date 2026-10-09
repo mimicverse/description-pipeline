@@ -296,5 +296,111 @@ class ReportUiContractTests(unittest.TestCase):
         self.assertIn("visibleFindings", app)
 
 
+class RunHistoryUiContractTests(unittest.TestCase):
+    """Readable run history with rename and explicit reversible delete/restore.
+
+    The list shows the engineering folder (or the custom display title), a human timestamp,
+    the state and the recorded initiator; rerun lineage stays a secondary chip. Delete moves a
+    run into the explicit 已删除 view (never a one-way hide), rename only changes the displayed
+    name, and deleted runs stay readable while retry/rerun wait for a restore.
+    """
+
+    def page(self) -> str:
+        return (STATIC / "index.html").read_text(encoding="utf-8")
+
+    def app(self) -> str:
+        return (STATIC / "app.js").read_text(encoding="utf-8")
+
+    def test_page_title_is_exact(self) -> None:
+        page = self.page()
+        self.assertIn("<title>SolidWorks2URDF 交付操作台</title>", page)
+        self.assertIn("<h1>SolidWorks2URDF 交付操作台</h1>", page)
+
+    def test_rows_render_name_time_state_actor_and_secondary_rerun_chip(self) -> None:
+        app = self.app()
+        for token in (
+            "runDisplayTitle",
+            "formatRunTime",
+            "RUN_STATES[run.state]",
+            "状态待确认",
+            '发起人：${run.user || "未记录"}',
+            "从${run.resume_from_name_zh}重跑",
+            "重跑来源：",
+            "open.title",
+            "formatTime(run.started_at)",
+        ):
+            self.assertIn(token, app)
+        # The rerun-dominated list title is gone; the parent id only lives in secondary detail.
+        self.assertNotIn("自${run.resume_from_name_zh}重新运行", app)
+
+    def test_explicit_views_with_real_paging(self) -> None:
+        page = self.page()
+        app = self.app()
+        self.assertIn('id="runs-view-active"', page)
+        self.assertIn('id="runs-view-deleted"', page)
+        for token in (
+            "include_deleted=1",
+            "next_offset",
+            "loadMoreRuns",
+            "加载更多",
+            "当前已加载记录中没有可显示的运行，可继续加载更多。",
+            "已显示全部",
+            "state.runView",
+            "state.runsNextOffset",
+        ):
+            self.assertIn(token, app)
+
+    def test_rename_delete_restore_contract_and_delete_confirmation(self) -> None:
+        app = self.app()
+        page = self.page()
+        css = (STATIC / "style.css").read_text(encoding="utf-8")
+        self.assertIn('id="run-actions"', page)
+        for token in (
+            'method: "PATCH"',
+            "body: { title }",
+            'method: "DELETE"',
+            "/restore",
+            "run.can_manage === true",
+            "run-menu",
+            "run-menu-trigger",
+            "run-menu-pop",
+            'aria-haspopup',
+            'aria-expanded',
+            "操作：",
+            "重命名「",
+            "run-menu-buttons",
+            "运行结束前不能删除。",
+            "运行状态未知，暂不能删除。",
+            "从运行列表移除，可在「已删除」中恢复；模型、证据和 PR 保留。",
+            "已删除 · ",
+            "删除人：",
+            "backend actor is authoritative",
+        ):
+            self.assertIn(token, app)
+        # No permanently visible row actions and no viewer-guessed deleter.
+        self.assertNotIn("run-row-actions", app)
+        self.assertNotIn(".run-row-actions", css)
+        self.assertNotIn("buildRunActions", app)
+        self.assertNotIn("run.deleted_by = state.user", app)
+
+    def test_deleted_runs_stay_readable_with_restore_first(self) -> None:
+        app = self.app()
+        page = self.page()
+        self.assertIn('id="run-deleted"', page)
+        self.assertIn("此运行已删除：请先恢复后再重试或重跑。", app)
+        self.assertIn("此运行已删除：请先恢复后再重跑。", app)
+        self.assertIn("RETRY_REASONS.deleted", app)
+
+    def test_keyboard_and_focus_contract(self) -> None:
+        app = self.app()
+        for token in (
+            'event.key === "Escape"',
+            "input.focus()",
+            "confirm.focus()",
+            "trigger.focus()",
+        ):
+            self.assertIn(token, app)
+
+
 if __name__ == "__main__":
     unittest.main()
