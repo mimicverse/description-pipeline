@@ -83,10 +83,13 @@
           </header>
 
           <p id="run-error-detail" class="error" role="alert" hidden></p>
+          <p id="run-headline" class="headline" hidden></p>
+          <div id="failure-card" class="fail-card" hidden></div>
 
           <nav id="stages" class="stepper" aria-label="工程阶段"></nav>
+          <p id="preview-note" class="viewer-note" hidden></p>
 
-          <div class="run-workspace">
+          <div class="run-workspace no-preview">
             <div class="pane pane-preview">
               <div id="viewer-card" hidden>
                 <div id="viewer" class="viewer"></div>
@@ -123,7 +126,7 @@
               </section>
 
               <section id="tab-stage" class="tab-pane" hidden>
-                <p class="muted small">点击上方阶段查看其输入 / 输入质检 / 输出 / 输出质检；证据默认折叠。</p>
+                <p class="muted small">点击上方阶段查看该阶段的检查摘要与结果；原始证据与文件摘要默认折叠。</p>
                 <div id="stage-detail"></div>
               </section>
 

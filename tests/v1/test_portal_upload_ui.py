@@ -147,5 +147,73 @@ class UploadRenderTests(unittest.TestCase):
             self.assertIn("proxy_read_timeout 3600s;", nginx)
 
 
+class ReportUiContractTests(unittest.TestCase):
+    """The run detail renders C's canonical report payload without local copies."""
+
+    def app(self) -> str:
+        return (STATIC / "app.js").read_text(encoding="utf-8")
+
+    def test_report_payload_fields_are_rendered(self) -> None:
+        app = self.app()
+        for token in (
+            "run.report",
+            "report.overall",
+            "headline_zh",
+            "report.failure",
+            "title_zh",
+            "meaning_zh",
+            "raw_error",
+            "raw_detail",
+            "report.measured",
+            "mass_kg",
+            "expected_kg",
+            "label_zh",
+            "state_zh",
+            "scope_zh",
+            "raw_details",
+            "checks_executed",
+            "executed",
+            "unsupported_zh",
+            "confirmations_zh",
+            "review_scope",
+            "independent",
+            "boundary",
+        ):
+            self.assertIn(token, app)
+
+    def test_failed_stage_is_auto_selected_and_selection_persists(self) -> None:
+        app = self.app()
+        self.assertIn("localStorage.getItem", app)
+        self.assertIn("localStorage.setItem", app)
+        self.assertIn("portal.stage.", app)
+        self.assertIn('stage.state === "failed"', app)
+
+    def test_blocked_stages_are_neutral_not_failed(self) -> None:
+        app = self.app()
+        self.assertNotIn('state === "failed" || state === "blocked") return "bad"', app)
+        self.assertIn('if (state === "failed") return "bad"', app)
+        css = (STATIC / "style.css").read_text(encoding="utf-8")
+        self.assertNotIn(".step.blocked .step-meta { color: var(--bad); }", css)
+        self.assertNotIn(".chip.failed, .chip.blocked", css)
+        self.assertIn(".step.blocked .step-meta { color: var(--muted); }", css)
+
+    def test_preview_uses_full_width_when_absent(self) -> None:
+        app = self.app()
+        css = (STATIC / "style.css").read_text(encoding="utf-8")
+        self.assertIn("no-preview", app)
+        self.assertIn("updatePreviewLayout", app)
+        self.assertIn(".run-workspace.no-preview", css)
+        self.assertNotIn("repeat(4, minmax(0, 1fr))", css)
+        self.assertNotIn("stage-boundaries", app)
+        self.assertNotIn("stage-boundaries", css)
+
+    def test_manual_scope_is_gated_and_honest(self) -> None:
+        app = self.app()
+        self.assertIn("工程评审范围", app)
+        self.assertIn("未就绪", app)
+        self.assertIn("平台不同步外部评审状态", app)
+        self.assertNotIn("项待确认", app)
+
+
 if __name__ == "__main__":
     unittest.main()
