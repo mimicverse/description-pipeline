@@ -71,12 +71,13 @@ const RETRY_REASONS = {
 
 const $ = (id) => document.getElementById(id);
 
-const UPLOAD_LIMITS = {
+const UPLOAD_LIMITS_DEFAULT = {
   maxFiles: 4096,
   maxTotalBytes: 2 * 1024 * 1024 * 1024,
   maxFileBytes: 512 * 1024 * 1024,
   maxPathLength: 1024,
 };
+const uploadLimits = { ...UPLOAD_LIMITS_DEFAULT };
 
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes) || bytes < 0) return "—";
@@ -101,22 +102,35 @@ function normalizeRelativePath(raw) {
     parts.push(part);
   }
   const normalized = parts.join("/");
-  if (!normalized || normalized.length > UPLOAD_LIMITS.maxPathLength) return null;
+  if (!normalized || normalized.length > uploadLimits.maxPathLength) return null;
   return normalized;
+}
+
+function applyUploadLimits(advertised) {
+  const limits = advertised && typeof advertised === "object" ? advertised : {};
+  const files = Number(limits.files);
+  const bytes = Number(limits.bytes);
+  const fileBytes = Number(limits.file_bytes);
+  if (Number.isFinite(files) && files > 0) uploadLimits.maxFiles = Math.floor(files);
+  if (Number.isFinite(bytes) && bytes > 0) uploadLimits.maxTotalBytes = Math.floor(bytes);
+  if (Number.isFinite(fileBytes) && fileBytes > 0) uploadLimits.maxFileBytes = Math.floor(fileBytes);
+  const label = $("upload-limits");
+  if (label) {
+    label.textContent = `总大小 ${formatBytes(uploadLimits.maxTotalBytes)}、文件数 ${uploadLimits.maxFiles}、单个文件 ${formatBytes(uploadLimits.maxFileBytes)}`;
+  }
 }
 
 function folderPick(files) {
   const records = [];
-  const skipped = [];
   let top = null;
   let bytes = 0;
+  let locks = 0;
   for (const file of files) {
     const path = normalizeRelativePath(file.webkitRelativePath || file.name);
     if (!path) return { error: `存在不受支持的文件名：${String(file.name || "").slice(0, 120)}` };
     const name = path.split("/").pop() || "";
     if (name.startsWith("~$")) {
-      skipped.push(path);
-      continue;
+      locks += 1;
     }
     const first = path.split("/")[0];
     if (top === null) top = first;
@@ -125,11 +139,11 @@ function folderPick(files) {
     bytes += file.size;
   }
   if (!records.length || !top) return { error: "所选文件夹中没有可上传的文件。" };
-  if (records.length > UPLOAD_LIMITS.maxFiles) return { error: `文件数量超出上限（${UPLOAD_LIMITS.maxFiles}）。` };
-  if (bytes > UPLOAD_LIMITS.maxTotalBytes) return { error: "文件夹总大小超出上限（2 GB）。" };
-  const oversized = records.find((item) => item.file.size > UPLOAD_LIMITS.maxFileBytes);
-  if (oversized) return { error: `单个文件超出上限（512 MB）：${oversized.path.slice(0, 120)}` };
-  return { records, top, count: records.length, bytes, skipped };
+  if (records.length > uploadLimits.maxFiles) return { error: `文件数量超出上限（${uploadLimits.maxFiles}）。` };
+  if (bytes > uploadLimits.maxTotalBytes) return { error: `文件夹总大小超出上限（${formatBytes(uploadLimits.maxTotalBytes)}）。` };
+  const oversized = records.find((item) => item.file.size > uploadLimits.maxFileBytes);
+  if (oversized) return { error: `单个文件超出上限（${formatBytes(uploadLimits.maxFileBytes)}）：${oversized.path.slice(0, 120)}` };
+  return { records, top, count: records.length, bytes, locks };
 }
 
 function submitRun(pick, { onProgress } = {}) {
@@ -159,7 +173,11 @@ function submitRun(pick, { onProgress } = {}) {
       error.status = request.status;
       reject(error);
     });
-    request.addEventListener("error", () => reject(new Error("网络中断，上传未完成；请检查网络后重试。")));
+    request.addEventListener("error", () => {
+      const error = new Error("网络中断，上传响应未收到；如已提交成功，请在运行列表中确认，系统不会自动重试。");
+      error.network = true;
+      reject(error);
+    });
     request.addEventListener("abort", () => {
       const error = new Error("已取消上传。");
       error.aborted = true;
@@ -236,6 +254,7 @@ function formatTime(value) {
 function showSession(session) {
   state.user = session.user;
   state.csrf = session.csrf_token;
+  applyUploadLimits(session.upload_limits);
   $("login-card").hidden = true;
   $("workspace").hidden = false;
   $("account").hidden = false;
@@ -754,8 +773,8 @@ function wire() {
     }
     state.folderPick = picked;
     summary.hidden = false;
-    const skipped = picked.skipped.length ? ` · 已忽略 ${picked.skipped.length} 个临时锁文件` : "";
-    summary.textContent = `${picked.top} · ${picked.count} 个文件 · ${formatBytes(picked.bytes)}${skipped}`;
+    const locks = picked.locks ? ` · 含 ${picked.locks} 个临时锁文件（~$…），由平台按既有规则处理` : "";
+    summary.textContent = `${picked.top} · ${picked.count} 个文件 · ${formatBytes(picked.bytes)}${locks}`;
     setError($("run-error"), "");
     $("start-button").disabled = false;
   });
@@ -785,6 +804,7 @@ function wire() {
       const payload = await submitRun(picked, {
         onProgress: (ratio) => {
           status.textContent = `正在上传工程文件夹… ${Math.round(ratio * 100)}%`;
+          if (ratio >= 1) $("cancel-button").hidden = true;
         },
       });
       status.textContent = "上传完成，正在创建运行…";
@@ -792,7 +812,11 @@ function wire() {
       resetPick();
     } catch (error) {
       if (error.aborted) {
-        status.textContent = "已取消上传；平台未创建任何运行。";
+        status.textContent = "已取消上传；正在刷新运行列表，如无新运行则表示未提交。";
+        await refreshRuns().catch(() => {});
+      } else if (error.network) {
+        status.textContent = error.message;
+        await refreshRuns().catch(() => {});
       } else if (error.status === 401) {
         setError($("run-error"), "会话已失效，请重新登录后再试。");
       } else {

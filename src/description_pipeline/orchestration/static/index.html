@@ -42,8 +42,8 @@
           <form id="run-form">
             <p class="muted small">
               选择本机完整的 SolidWorks 工程文件夹（Chrome / Edge）。文件夹会先上传到平台，
-              再冻结并执行六个工程阶段，无需填写任何平台路径。上限：总大小 2 GB、文件数
-              4096、单个文件 512 MB。空子文件夹与临时锁文件（~$…）不会上传；请勿包含平台
+              再冻结并执行六个工程阶段，无需填写任何平台路径。上限：<span id="upload-limits">总大小
+              2 GB、文件数 4096、单个文件 512 MB</span>（以平台设置为准）。空子文件夹不会上传；临时锁文件（~$…）按平台既有规则处理；请勿包含平台
               生成的 robot.yaml / cad-revision.json。
             </p>
             <input id="folder-input" type="file" webkitdirectory directory multiple class="hidden-input">

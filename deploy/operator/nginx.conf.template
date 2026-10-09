@@ -19,8 +19,9 @@ http {
     fastcgi_temp_path @OPERATOR_STATE@/nginx/tmp/fastcgi;
     uwsgi_temp_path @OPERATOR_STATE@/nginx/tmp/uwsgi;
     scgi_temp_path @OPERATOR_STATE@/nginx/tmp/scgi;
-    # Folder uploads stream through the portal; bound the multipart body here.
-    client_max_body_size 17g;
+    # Folder uploads stream through the portal. Envelope = 2 GiB payload cap + 64 MiB of
+    # multipart headers/boundaries; the portal enforces the exact cap itself.
+    client_max_body_size 2112m;
     client_body_timeout 600s;
     server_tokens off;
 

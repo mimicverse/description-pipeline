@@ -67,8 +67,13 @@ class UploadUiContractTests(unittest.TestCase):
         self.assertIn("maxTotalBytes: 2 * 1024 * 1024 * 1024", app)
         self.assertIn("maxFiles: 4096", app)
         self.assertIn("maxFileBytes: 512 * 1024 * 1024", app)
+        self.assertIn("session.upload_limits", app)
+        self.assertIn('id="upload-limits"', (STATIC / "index.html").read_text(encoding="utf-8"))
         self.assertIn('startsWith("~$")', app)
-        self.assertIn("已忽略", app)
+        self.assertIn("临时锁文件", app)
+        self.assertIn("ratio >= 1", app)
+        self.assertIn("不会自动重试", app)
+        self.assertNotIn("UPLOAD_LIMITS.", app)
 
     def test_every_static_id_used_by_app_exists_in_page(self) -> None:
         html = (STATIC / "index.html").read_text(encoding="utf-8")
@@ -103,7 +108,7 @@ class UploadRenderTests(unittest.TestCase):
             portal = json.loads((state / "portal.json").read_text(encoding="utf-8"))
             self.assertEqual(portal["portal"]["upload_root"], str(state.parent / "handoffs"))
             nginx = (state / "nginx" / "nginx.conf").read_text(encoding="utf-8")
-            self.assertIn("client_max_body_size 17g;", nginx)
+            self.assertIn("client_max_body_size 2112m;", nginx)
             self.assertIn("client_body_timeout 600s;", nginx)
             self.assertIn("location ^~ /api/runs", nginx)
             self.assertIn("proxy_request_buffering off;", nginx)
