@@ -56,6 +56,7 @@ const CHECK_STATES = { passed: "通过", failed: "失败", not_run: "未执行",
 const STAGE_STATES = { not_run: "未执行", running: "执行中", completed: "完成", failed: "失败", blocked: "上游阻断" };
 // Compact state words for the stepper; the full reason stays in the tooltip.
 const STEP_STATE_SHORT = { completed: "已完成", running: "进行中", failed: "失败", blocked: "已阻断", not_run: "未执行" };
+const PREREQ_STATE_ZH = { ok: "就绪", invalid: "不可用", absent: "缺失", changed: "已变更", unknown: "未知" };
 const AUTOMATIC_STATES = {
   passed: "自动校验通过",
   failed: "自动校验失败",
@@ -104,6 +105,11 @@ function folderLabel(value) {
 function shortRunId(value) {
   const text = String(value || "");
   return text.split("-").pop() || text;
+}
+
+function rerunStageName(rows, stageId) {
+  const row = rows.find((item) => item && item.stage === stageId);
+  return row ? row.name_zh || row.stage : String(stageId || "");
 }
 
 function normalizeRelativePath(raw) {
@@ -805,6 +811,49 @@ function renderRerunPanel(run) {
   }
   line.append(note);
   host.append(line);
+
+  if (row) {
+    const meta = document.createElement("p");
+    meta.className = "muted small rerun-meta";
+    const pieces = [];
+    const prereq = row.prerequisites && typeof row.prerequisites === "object" ? row.prerequisites : null;
+    if (prereq) {
+      const parts = [];
+      for (const [key, label] of [["inputs", "输入"], ["tool", "工具"], ["receipt", "回执"]]) {
+        const value = prereq[key];
+        if (typeof value === "string" && value) parts.push(`${label}〈${PREREQ_STATE_ZH[value] || value}〉`);
+      }
+      if (parts.length) pieces.push(`前置条件：${parts.join(" · ")}`);
+    }
+    const recomputes = Array.isArray(row.recomputes) ? row.recomputes : [];
+    if (recomputes.length) {
+      pieces.push(`将重算：${recomputes.map((id) => rerunStageName(rows, id)).join(" → ")}`);
+    }
+    if (prereq && prereq.earliest_required && prereq.earliest_required !== stage.id) {
+      pieces.push(`最早可重新运行：${rerunStageName(rows, prereq.earliest_required)}`);
+    }
+    if (pieces.length) {
+      meta.textContent = pieces.join("；");
+      host.append(meta);
+    }
+    const retains = Array.isArray(row.retains) ? row.retains : [];
+    if (retains.length) {
+      const details = document.createElement("details");
+      const summary = document.createElement("summary");
+      summary.textContent = `复用既有输入/结果（${retains.length} 项）`;
+      details.append(summary);
+      const list = document.createElement("div");
+      list.className = "rerun-retains";
+      for (const item of retains) {
+        if (!item || typeof item !== "object") continue;
+        const entry = document.createElement("p");
+        entry.textContent = [item.label_zh || item.path || "", item.availability || ""].filter(Boolean).join(" · ");
+        list.append(entry);
+      }
+      details.append(list);
+      host.append(details);
+    }
+  }
 
   if (state.rerunError) {
     const error = document.createElement("p");

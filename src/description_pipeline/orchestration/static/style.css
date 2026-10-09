@@ -260,6 +260,8 @@ input, select, textarea { font: inherit; }
   border-top: 1px solid var(--line);
 }
 .rerun-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.rerun-meta { margin: 0; }
+.rerun-retains p { margin: 4px 0; font-size: 12.5px; overflow-wrap: anywhere; }
 .stage-files p { margin: 4px 0; overflow-wrap: anywhere; }
 .stage-files .file-line { display: block; }
 .stage-files .file-ref { display: inline; overflow-wrap: anywhere; }

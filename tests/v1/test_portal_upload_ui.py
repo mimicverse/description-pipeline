@@ -171,6 +171,15 @@ class RerunUiContractTests(unittest.TestCase):
             "仅发起人或平台管理员可重新运行。",
             "将重算该步骤及其后续阶段；原始运行与证据保留，重跑为新关联运行。",
             "重新运行 · 来源",
+            "prerequisites",
+            "recomputes",
+            "retains",
+            "PREREQ_STATE_ZH",
+            "rerunStageName",
+            "前置条件：",
+            "将重算：",
+            "最早可重新运行：",
+            "复用既有输入/结果",
         ):
             self.assertIn(token, app)
         # The superseded picker design and its parameter name are gone.
