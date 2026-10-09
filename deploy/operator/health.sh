@@ -139,6 +139,9 @@ PY
   else
     report FAIL "run-ownership request-context plugin is missing (operator run writes stay closed)"
   fi
+else
+  # Fail explicitly: an unverifiable guard leaves operator run writes closed.
+  report FAIL "run-ownership request-context plugin cannot be verified: AIRFLOW_VENV is not executable"
 fi
 
 command -v systemctl >/dev/null 2>&1 || { report FAIL "systemctl unavailable"; exit 1; }
