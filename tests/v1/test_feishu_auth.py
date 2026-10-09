@@ -10,6 +10,7 @@ production code keeps exactly one storage path.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import importlib.util
 import json
@@ -37,9 +38,22 @@ if AIRFLOW_AVAILABLE:
     from sqlalchemy.orm import sessionmaker
 
     from airflow.configuration import conf
+    from airflow.api_fastapi.core_api.routes.public.dag_run import (
+        bulk_dag_runs,
+        clear_dag_run,
+        clear_dag_run_partitions,
+        delete_dag_run,
+        patch_dag_run,
+        trigger_dag_run,
+    )
+    from airflow.models.dagrun import DagRun
     from airflow.models.revoked_token import RevokedToken
+    from airflow.models.tasklog import LogTemplate
+    from airflow.models.taskinstance import TaskInstance
 
     from description_pipeline.orchestration import feishu_auth as auth
+    from description_pipeline.orchestration import request_context
+    from description_pipeline.orchestration import run_ownership
     from description_pipeline.orchestration.feishu_oauth import (
         STATE_COOKIE,
         TRIGGERING_USER_NAME_DELIMITER,
@@ -48,6 +62,25 @@ if AIRFLOW_AVAILABLE:
     )
 
 JWT_SECRET = "feishu-auth-manager-tests-" + "0" * 40
+
+
+class _RoutedRequest:
+    """Minimal stand-in for the Request the root middleware binds: scope plus path params."""
+
+    def __init__(
+        self,
+        endpoint,
+        dag_id: str,
+        dag_run_id: str | None = None,
+        http_method: str = "POST",
+        clear_body_safe: bool | None = None,
+    ) -> None:
+        self.scope = {"type": "http", "endpoint": endpoint, "method": http_method}
+        if clear_body_safe is not None:
+            self.scope[request_context.CLEAR_BODY_SCOPE_KEY] = {"safe": clear_body_safe}
+        self.path_params = {"dag_id": dag_id}
+        if dag_run_id is not None:
+            self.path_params["dag_run_id"] = dag_run_id
 
 
 def _environment(secret_dir: Path, **overrides: str) -> dict[str, str]:
@@ -73,6 +106,9 @@ class FeishuAuthManagerTests(unittest.TestCase):
         cls.sessions = sessionmaker(bind=cls.engine)
         # Real Airflow tables this suite touches, created from the real models.
         RevokedToken.__table__.create(cls.engine, checkfirst=True)
+        LogTemplate.__table__.create(cls.engine, checkfirst=True)
+        DagRun.__table__.create(cls.engine, checkfirst=True)
+        TaskInstance.__table__.create(cls.engine, checkfirst=True)
         # One isolated metadata database for the whole class: the manager's own state table and
         # Airflow's revocation lookup both run against it through the real Session.
         cls._settings = mock.patch.multiple(
@@ -147,7 +183,10 @@ class FeishuAuthManagerTests(unittest.TestCase):
     def test_login_sends_pkce_state_cookie_without_the_secret(self) -> None:
         manager = self.manager(_environment(self.root))
         client = self.client(manager)
-        self.assertEqual(client.get("/feishu/health").json(), {"configured": True})
+        health = client.get("/feishu/health").json()
+        self.assertTrue(health["configured"])
+        # The standalone auth app has no root middleware; the field must still be reported.
+        self.assertIn("request_context", health)
         response = client.get("/feishu/login?next=https://evil.example/")
         self.assertEqual(response.status_code, 302)
         location = response.headers["location"]
@@ -252,11 +291,18 @@ class FeishuAuthManagerTests(unittest.TestCase):
         allowed = auth.DagDetails(id=auth.ALLOWED_DAG_ID)
         other = auth.DagDetails(id="some_other_dag")
         self.assertTrue(manager.is_authorized_dag(method="GET", user=operator, details=allowed))
-        self.assertTrue(
+        # Without the packaged request context every operator RUN write fails closed.
+        self.assertFalse(
             manager.is_authorized_dag(
                 method="POST", user=operator, details=allowed, access_entity=auth.DagAccessEntity.RUN
             )
         )
+        with request_context.use_request(_RoutedRequest(trigger_dag_run, auth.ALLOWED_DAG_ID)):
+            self.assertTrue(
+                manager.is_authorized_dag(
+                    method="POST", user=operator, details=allowed, access_entity=auth.DagAccessEntity.RUN
+                )
+            )
         self.assertFalse(manager.is_authorized_dag(method="POST", user=operator, details=allowed))
         self.assertFalse(
             manager.is_authorized_dag(
@@ -331,6 +377,434 @@ class FeishuAuthManagerTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             manager.deserialize_user({**token, "name": "A" * (boundary + 1)})
+
+    # -- run ownership ----------------------------------------------------
+
+    def _record_run(
+        self,
+        run_id: str,
+        actor: object,
+        *,
+        state: str = "failed",
+        tasks: dict[str, str] | None = None,
+    ) -> None:
+        with self.sessions() as session:
+            session.add(
+                DagRun(
+                    dag_id=auth.ALLOWED_DAG_ID,
+                    run_id=run_id,
+                    run_type="manual",
+                    state=state,
+                    triggering_user_name=actor,
+                )
+            )
+            for task_id, task_state in (tasks or {}).items():
+                session.execute(
+                    TaskInstance.__table__.insert().values(
+                        dag_id=auth.ALLOWED_DAG_ID,
+                        run_id=run_id,
+                        task_id=task_id,
+                        map_index=-1,
+                        state=task_state,
+                        pool="default_pool",
+                        pool_slots=1,
+                    )
+                )
+            session.commit()
+
+    def test_run_ownership_grants_only_the_routed_single_run_clear(self) -> None:
+        manager = self.manager(_environment(self.root))
+        owner = auth.FeishuUser(
+            app_id="cli_app", open_id="ou_owner", name="崔工", avatar_url="", tenant_key="tenant-a"
+        )
+        other = auth.FeishuUser(
+            app_id="cli_app", open_id="ou_other", name="李工", avatar_url="", tenant_key="tenant-a"
+        )
+        admin = auth.FeishuUser(
+            app_id="cli_app", open_id="ou_admin", name="管理员", avatar_url="", tenant_key="tenant-a"
+        )
+        allowed = auth.DagDetails(id=auth.ALLOWED_DAG_ID)
+        transport_failure = {
+            "resolve_handoff": "success",
+            "start_job": "success",
+            "wait_for_job": "failed",
+            "confirm_job": "upstream_failed",
+        }
+        self._record_run(
+            "run-own",
+            auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
+            tasks=transport_failure,
+        )
+        self._record_run(
+            "run-other",
+            auth.build_actor_name("cli_app:tenant-a:ou_other", "李工"),
+            tasks=transport_failure,
+        )
+        self._record_run("run-legacy", "cli_app:tenant-a:ou_owner")
+        self._record_run("run-damaged", 'cli_app:tenant-a:ou_owner|"bad\\nname"')
+        self._record_run(
+            "run-resolve-failed",
+            auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
+            tasks={"resolve_handoff": "failed", "start_job": "upstream_failed"},
+        )
+        self._record_run(
+            "run-start-failed",
+            auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
+            tasks={"resolve_handoff": "success", "start_job": "failed"},
+        )
+        self._record_run(
+            "run-start-unproven",
+            auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
+            tasks={"start_job": "failed"},
+        )
+        self._record_run(
+            "run-mapped",
+            auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
+            tasks={"resolve_handoff": "success", "wait_for_job": "failed"},
+        )
+        with self.sessions() as session:
+            session.execute(
+                TaskInstance.__table__.insert().values(
+                    dag_id=auth.ALLOWED_DAG_ID,
+                    run_id="run-mapped",
+                    task_id="wait_for_job",
+                    map_index=0,
+                    state="success",
+                    pool="default_pool",
+                    pool_slots=1,
+                )
+            )
+            session.commit()
+        self._record_run(
+            "run-success",
+            auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
+            state="success",
+            tasks=transport_failure,
+        )
+        self._record_run(
+            "run-running",
+            auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
+            state="running",
+            tasks={"wait_for_job": "failed"},
+        )
+        self._record_run(
+            "run-no-failed",
+            auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
+            tasks={"resolve_handoff": "success"},
+        )
+
+        def decide(
+            method: str,
+            entity,
+            endpoint,
+            *,
+            dag_id: str = auth.ALLOWED_DAG_ID,
+            run_id: str | None = None,
+            user=owner,
+            clear_body_safe: bool | None = True,
+        ) -> bool:
+            with request_context.use_request(
+                _RoutedRequest(endpoint, dag_id, run_id, clear_body_safe=clear_body_safe)
+            ):
+                return manager.is_authorized_dag(
+                    method=method, access_entity=entity, details=allowed, user=user
+                )
+
+        run = auth.DagAccessEntity.RUN
+        # The one owner mutation: the caller's own run through the routed clear endpoint.
+        self.assertTrue(decide("PUT", run, clear_dag_run, run_id="run-own"))
+        self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-own", user=other))
+        self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-other"))
+        self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-legacy"))
+        self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-damaged"))
+        self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-resolve-failed"))
+        # A failed start_job is retryable only with a positively successful resolution.
+        self.assertTrue(decide("PUT", run, clear_dag_run, run_id="run-start-failed"))
+        self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-start-unproven"))
+        self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-mapped"))
+        self.assertEqual(
+            run_ownership.retry_assessment_for_run(auth.ALLOWED_DAG_ID, "missing-run").reason,
+            "run_missing",
+        )
+        self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-success"))
+        self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-running"))
+        self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-no-failed"))
+        # The exact immutable-retry body is part of the owner grant; admins are exempt.
+        self.assertFalse(
+            decide("PUT", run, clear_dag_run, run_id="run-own", clear_body_safe=False)
+        )
+        self.assertFalse(
+            decide("PUT", run, clear_dag_run, run_id="run-own", clear_body_safe=None)
+        )
+        self.assertTrue(decide("PUT", run, clear_dag_run, run_id="run-own", user=admin))
+        self.assertTrue(
+            decide("PUT", run, clear_dag_run, run_id="run-own", user=admin, clear_body_safe=False)
+        )
+        # Same (method, entity) but any other route stays administrator-only.
+        self.assertFalse(decide("PUT", run, patch_dag_run, run_id="run-own"))
+        self.assertFalse(decide("PUT", run, clear_dag_run_partitions, run_id="run-own"))
+        self.assertFalse(decide("PUT", run, bulk_dag_runs, run_id="run-own"))
+        self.assertFalse(decide("DELETE", run, delete_dag_run, run_id="run-own"))
+        # Manual create is the only proven POST route; no run context never grants ownership.
+        self.assertTrue(decide("POST", run, trigger_dag_run))
+        self.assertTrue(decide("POST", run, trigger_dag_run, clear_body_safe=None))
+        self.assertFalse(decide("POST", run, bulk_dag_runs))
+        self.assertFalse(decide("PUT", run, clear_dag_run, run_id=None))
+        self.assertFalse(decide("PUT", run, clear_dag_run, run_id="~"))
+        # The exact HTTP method is part of the grant: same endpoint with another verb denies.
+        with request_context.use_request(
+            _RoutedRequest(clear_dag_run, auth.ALLOWED_DAG_ID, "run-own", http_method="PATCH")
+        ):
+            self.assertFalse(
+                manager.is_authorized_dag(method="PUT", access_entity=run, details=allowed, user=owner)
+            )
+        with request_context.use_request(
+            _RoutedRequest(trigger_dag_run, auth.ALLOWED_DAG_ID, None, http_method="PATCH")
+        ):
+            self.assertFalse(
+                manager.is_authorized_dag(method="POST", access_entity=run, details=allowed, user=owner)
+            )
+        self.assertFalse(decide("POST", run, trigger_dag_run, dag_id="some_other_dag"))
+        # Middleware absent: every operator RUN grant fails closed; GET and admin stay allowed.
+        self.assertFalse(
+            manager.is_authorized_dag(method="POST", access_entity=run, details=allowed, user=owner)
+        )
+        self.assertFalse(
+            manager.is_authorized_dag(method="PUT", access_entity=run, details=allowed, user=owner)
+        )
+        self.assertTrue(manager.is_authorized_dag(method="GET", details=allowed, user=owner))
+        self.assertTrue(manager.is_authorized_dag(method="POST", access_entity=run, details=allowed, user=admin))
+
+    def test_request_context_middleware_binds_and_resets_the_scope(self) -> None:
+        seen: list[bool] = []
+
+        async def app(scope, receive, send) -> None:
+            seen.append(request_context.bound_request() is not None)
+
+        middleware = request_context.BindRequestMiddleware(app)
+        asyncio.run(middleware({"type": "http", "path": "/api/v2", "method": "GET"}, None, None))
+        asyncio.run(middleware({"type": "lifespan"}, None, None))
+        self.assertEqual(seen, [True, False])
+        self.assertIsNone(request_context.bound_request())
+
+    def test_transport_retry_classification_matrix(self) -> None:
+        classify = run_ownership.classify_transport_retry
+
+        eligible = classify(
+            "failed",
+            {
+                "resolve_handoff": "success",
+                "start_job": "success",
+                "wait_for_job": "failed",
+                "confirm_job": "upstream_failed",
+            },
+        )
+        self.assertTrue(eligible.eligible)
+        self.assertEqual(eligible.reason, "transport_recovery")
+        self.assertEqual(eligible.cleared_tasks, ("confirm_job", "wait_for_job"))
+        for state, tasks, reason in (
+            ("running", {"wait_for_job": "failed"}, "run_active"),
+            ("success", {"wait_for_job": "failed"}, "run_succeeded"),
+            ("failed", {}, "no_failed_transport_task"),
+            ("failed", {"resolve_handoff": "failed"}, "resolution_or_capture_failed"),
+            ("failed", {"start_job": "failed"}, "resolution_not_success"),
+            (
+                "failed",
+                {"resolve_handoff": "success", "confirm_job": "failed"},
+                "publication_failed",
+            ),
+            (
+                "failed",
+                {"resolve_handoff": "success", "other_task": "failed"},
+                "unknown_failed_task",
+            ),
+            (
+                "failed",
+                {"resolve_handoff": "success", "confirm_job": "upstream_failed"},
+                "no_failed_transport_task",
+            ),
+            (
+                "failed",
+                {
+                    "resolve_handoff": "success",
+                    "wait_for_job": run_ownership.AMBIGUOUS_TASK_STATE,
+                },
+                "unknown_failed_task",
+            ),
+        ):
+            with self.subTest(state=state, tasks=tasks):
+                assessment = classify(state, tasks)
+                self.assertFalse(assessment.eligible)
+                self.assertEqual(assessment.reason, reason)
+        start_retry = classify(
+            "failed", {"resolve_handoff": "success", "start_job": "failed", "wait_for_job": "upstream_failed"}
+        )
+        self.assertTrue(start_retry.eligible)
+        self.assertEqual(start_retry.cleared_tasks, ("start_job", "wait_for_job"))
+
+    def test_clear_body_candidate_matrix_and_replay(self) -> None:
+        evaluate = request_context.evaluate_clear_candidate
+        safe = (
+            b'{"dry_run": false, "only_failed": true, "only_new": false, '
+            b'"run_on_latest_version": false}'
+        )
+        self.assertEqual(evaluate(safe, oversize=False), {"safe": True, "dry_run": False})
+        precheck = (
+            b'{"dry_run": true, "only_failed": true, "only_new": false, '
+            b'"run_on_latest_version": false}'
+        )
+        self.assertEqual(evaluate(precheck, oversize=False), {"safe": True, "dry_run": True})
+        for raw, label in (
+            (b'{"dry_run": false}', "missing fields"),
+            (
+                b'{"dry_run": false, "only_failed": false, "only_new": false, '
+                b'"run_on_latest_version": false}',
+                "only_failed false",
+            ),
+            (
+                b'{"dry_run": false, "only_failed": true, "only_new": true, '
+                b'"run_on_latest_version": false}',
+                "only_new true",
+            ),
+            (
+                b'{"dry_run": false, "only_failed": true, "only_new": false, '
+                b'"run_on_latest_version": true}',
+                "latest version true",
+            ),
+            (b'{"dry_run": false, "only_failed": true, "only_new": false}', "latest missing"),
+            (
+                b'{"dry_run": false, "only_failed": true, "only_new": false, '
+                b'"run_on_latest_version": false, "note": "x"}',
+                "unknown field",
+            ),
+            (
+                b'{"dry_run": false, "only_failed": true, "only_failed": true, '
+                b'"only_new": false, "run_on_latest_version": false}',
+                "duplicate key",
+            ),
+            (
+                b'{"dry_run": 1, "only_failed": true, "only_new": false, '
+                b'"run_on_latest_version": false}',
+                "non-bool",
+            ),
+            (b"not json", "malformed"),
+        ):
+            with self.subTest(case=label):
+                self.assertEqual(evaluate(raw, oversize=False), {"safe": False})
+        self.assertEqual(evaluate(safe, oversize=True), {"safe": False})
+
+        observed: dict = {}
+
+        async def app(scope, receive, send) -> None:
+            chunks = []
+            while True:
+                message = await receive()
+                if message.get("type") != "http.request":
+                    break
+                chunks.append(message.get("body", b""))
+                if not message.get("more_body", False):
+                    break
+            observed["body"] = b"".join(chunks)
+            observed["candidate"] = scope.get(request_context.CLEAR_BODY_SCOPE_KEY)
+
+        middleware = request_context.BindRequestMiddleware(app)
+        scope = {"type": "http", "method": "POST", "path": "/dags/x/dagRuns/run-1/clear"}
+        messages = [
+            {"type": "http.request", "body": safe[:20], "more_body": True},
+            {"type": "http.request", "body": safe[20:], "more_body": False},
+        ]
+
+        async def receive() -> dict:
+            return messages.pop(0) if messages else {"type": "http.disconnect"}
+
+        asyncio.run(middleware(scope, receive, None))
+        self.assertEqual(observed["body"], safe)
+        self.assertEqual(observed["candidate"], {"safe": True, "dry_run": False})
+
+        calls: list = []
+
+        async def other_app(scope, receive, send) -> None:
+            calls.append(scope.get(request_context.CLEAR_BODY_SCOPE_KEY))
+
+        async def no_body() -> dict:
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        asyncio.run(
+            request_context.BindRequestMiddleware(other_app)(
+                {"type": "http", "method": "POST", "path": "/dags/x/dagRuns"}, no_body, None
+            )
+        )
+        self.assertEqual(calls, [None])
+
+        # The real root scope carries the stable API prefix; capture must still select the route.
+        prefixed: list = []
+
+        async def prefixed_app(scope, receive, send) -> None:
+            prefixed.append(scope.get(request_context.CLEAR_BODY_SCOPE_KEY))
+
+        for scope_variant in (
+            {"type": "http", "method": "POST", "path": "/api/v2/dags/x/dagRuns/r1/clear"},
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/dags/x/dagRuns/r1/clear",
+                "root_path": "/api/v2",
+            },
+        ):
+            with self.subTest(scope=scope_variant):
+                asyncio.run(
+                    request_context.BindRequestMiddleware(prefixed_app)(
+                        dict(scope_variant), no_body, None
+                    )
+                )
+        self.assertEqual(prefixed, [{"safe": False}, {"safe": False}])
+
+    def test_clear_body_oversize_is_refused_promptly(self) -> None:
+        invoked: list = []
+
+        async def app(scope, receive, send) -> None:
+            invoked.append(True)
+
+        middleware = request_context.BindRequestMiddleware(app)
+        scope = {"type": "http", "method": "POST", "path": "/api/v2/dags/x/dagRuns/r1/clear"}
+
+        async def run_case(messages: list) -> tuple[int, list]:
+            sent: list = []
+            pending = list(messages)
+
+            async def receive() -> dict:
+                return pending.pop(0) if pending else {"type": "http.disconnect"}
+
+            async def send(message: dict) -> None:
+                sent.append(message)
+
+            await middleware(scope, receive, send)
+            status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+            return status, pending
+
+        one_large = [{"type": "http.request", "body": b"x" * 5000, "more_body": False}]
+        status, _ = asyncio.run(run_case(one_large))
+        self.assertEqual(status, 413)
+        chunked = [
+            {"type": "http.request", "body": b"x" * 3000, "more_body": True},
+            {"type": "http.request", "body": b"x" * 2000, "more_body": True},
+            {"type": "http.request", "body": b"x" * 10, "more_body": False},
+        ]
+        status, remaining = asyncio.run(run_case(chunked))
+        self.assertEqual(status, 413)
+        # Reading stopped at the limit; the untouched remainder was never consumed.
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(invoked, [])
+
+    def test_ownership_actor_parser_rejects_damaged_envelopes(self) -> None:
+        parse = run_ownership.recorded_actor_principal
+        canonical = auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工")
+        self.assertEqual(parse(canonical), "cli_app:tenant-a:ou_owner")
+        self.assertIsNone(parse(f"cli_app:tenant-a:ou_owner|{json.dumps('e\u0301', ensure_ascii=False)}"))
+        self.assertIsNone(parse(f'cli_app:tenant-a:ou_owner|{json.dumps(" 崔工")}'))
+        self.assertIsNone(parse(canonical + "A" * 600))
+        self.assertIsNone(parse("cli_app:tenant-a:ou_owner"))
+        self.assertIsNone(parse(None))
 
     def test_triggering_user_name_is_an_auth_owned_principal_name_envelope(self) -> None:
         manager = self.manager(_environment(self.root))
@@ -418,7 +892,10 @@ class FeishuAuthManagerTests(unittest.TestCase):
             }
         )
         with mock.patch.object(DagModel, "get_team_name", return_value=None):
-            core_security.requires_access_dag("POST", auth.DagAccessEntity.RUN, auth.ALLOWED_DAG_ID)(request, operator)
+            with request_context.use_request(_RoutedRequest(trigger_dag_run, auth.ALLOWED_DAG_ID)):
+                core_security.requires_access_dag("POST", auth.DagAccessEntity.RUN, auth.ALLOWED_DAG_ID)(
+                    request, operator
+                )
             for entity in (auth.DagAccessEntity.TASK_INSTANCE, auth.DagAccessEntity.XCOM, None):
                 core_security.requires_access_dag("GET", entity, auth.ALLOWED_DAG_ID)(request, operator)
             for method, entity in (

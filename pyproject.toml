@@ -37,6 +37,9 @@ dev = ["ruff==0.16.8", "build==1.6.1"]
 [project.scripts]
 description = "description_pipeline.cli:main"
 
+[project.entry-points."airflow.plugins"]
+description_pipeline = "description_pipeline.orchestration.airflow_plugin:DescriptionPipelinePlugin"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

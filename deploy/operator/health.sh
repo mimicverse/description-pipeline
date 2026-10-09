@@ -115,6 +115,32 @@ PY
   fi
 fi
 
+# The packaged request-context plugin must be discoverable: without it every operator run write
+# fails closed, so a missing entry point is a deployment failure, not a warning. Only the plugin
+# and middleware names are reported; nothing secret is read or printed.
+if [ -x "${AIRFLOW_VENV:-}/bin/python" ]; then
+  if AIRFLOW_HOME="${AIRFLOW_HOME:-}" "$AIRFLOW_VENV/bin/python" - <<'PY'
+import importlib.metadata as metadata
+
+from airflow import plugins_manager
+
+entries = [
+    entry
+    for entry in metadata.entry_points(group="airflow.plugins")
+    if entry.value.endswith("airflow_plugin:DescriptionPipelinePlugin")
+]
+middlewares = [item.get("name") for item in plugins_manager.get_fastapi_plugins()[1]]
+raise SystemExit(
+    0 if entries and "description-pipeline-request-context" in middlewares else 1
+)
+PY
+  then
+    report PASS "run-ownership request-context plugin is installed"
+  else
+    report FAIL "run-ownership request-context plugin is missing (operator run writes stay closed)"
+  fi
+fi
+
 command -v systemctl >/dev/null 2>&1 || { report FAIL "systemctl unavailable"; exit 1; }
 for unit in description-postgres description-airflow-dag-processor description-airflow-scheduler \
             description-airflow-api-server description-portal description-operator-proxy; do

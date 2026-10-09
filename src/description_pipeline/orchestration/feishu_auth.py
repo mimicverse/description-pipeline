@@ -52,6 +52,13 @@ from description_pipeline.orchestration.feishu_oauth import (
     state_cookie_matches,
     state_digest,
 )
+from description_pipeline.orchestration.request_context import bound_request
+from description_pipeline.orchestration.run_ownership import (
+    MANUAL_CREATE_ENDPOINT,
+    SINGLE_RUN_CLEAR_ENDPOINT,
+    owner_retry_allowed,
+    routed_route,
+)
 
 if TYPE_CHECKING:
     from airflow.api_fastapi.auth.managers.base_auth_manager import ResourceMethod
@@ -248,16 +255,18 @@ class FeishuAuthManager(BaseAuthManager[FeishuUser]):
 
         @router.get("/feishu/health")
         def health() -> JSONResponse:
+            guarded = bound_request() is not None
             if self.settings is None:
                 return JSONResponse(
                     {
                         "configured": False,
                         "reason": "feishu_sso_unconfigured",
                         "detail": self.configuration_problem,
+                        "request_context": guarded,
                     },
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 )
-            return JSONResponse({"configured": True})
+            return JSONResponse({"configured": True, "request_context": guarded})
 
         @router.get("/feishu/login")
         def login() -> RedirectResponse:
@@ -369,8 +378,35 @@ class FeishuAuthManager(BaseAuthManager[FeishuUser]):
             return False
         if method == "GET":
             return True
-        # Operators may create runs; changes to existing runs remain administrator-only.
-        return method == "POST" and access_entity is DagAccessEntity.RUN
+        if access_entity is not DagAccessEntity.RUN:
+            return False
+        if bound_request() is None:
+            # The packaged request-context middleware is not active: every operator RUN grant
+            # fails closed. Without routed context a POST cannot be distinguished from backfill
+            # or bulk creation, so even manual creation is refused until the guard is installed.
+            return False
+        route = routed_route()
+        if route is None or route.dag_id != ALLOWED_DAG_ID:
+            return False
+        if (
+            method == "POST"
+            and route.endpoint == MANUAL_CREATE_ENDPOINT
+            and route.http_method == "POST"
+            and route.dag_run_id is None
+        ):
+            # The one create path with canonically proven context: the manual trigger route.
+            return True
+        if (
+            method == "PUT"
+            and route.endpoint == SINGLE_RUN_CLEAR_ENDPOINT
+            and route.http_method == "POST"
+            and route.dag_run_id
+            and route.clear_body_safe
+        ):
+            # The one owner mutation: retrying the caller's own run. Note/state patches,
+            # partitions, bulk, wildcard, backfills and deletion stay administrator-only.
+            return owner_retry_allowed(user, route.dag_id, route.dag_run_id)
+        return False
 
     def is_authorized_configuration(
         self, *, method: ResourceMethod, user: FeishuUser, details: ConfigurationDetails | None = None
