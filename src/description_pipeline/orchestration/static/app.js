@@ -13,6 +13,8 @@ const state = {
   folderPick: null,
   uploading: false,
   uploadAbort: null,
+  stages: [],
+  selectedStage: null,
   viewer: null,
   controls: null,
   timer: null,
@@ -269,6 +271,7 @@ function clearPreview() {
   state.controls = null;
   if (state.viewer) disposeRobot(state.viewer);
   $("viewer-card").hidden = true;
+  $("viewer-placeholder").hidden = false;
   $("preview-meta").textContent = "";
   $("viewer-note").hidden = true;
   $("joint-controls").textContent = "";
@@ -325,9 +328,72 @@ async function refreshRuns() {
   }
 }
 
+function stageDotState(state) {
+  if (state === "completed") return "ok";
+  if (state === "failed" || state === "blocked") return "bad";
+  if (state === "running") return "run";
+  return "idle";
+}
+
+function runDotState(state) {
+  if (state === "success") return "ok";
+  if (state === "failed") return "bad";
+  if (state === "running") return "run";
+  return "idle";
+}
+
+function showUploadView() {
+  $("upload-view").hidden = false;
+  $("detail-card").hidden = true;
+}
+
+function showRunView() {
+  $("upload-view").hidden = true;
+  $("detail-card").hidden = false;
+}
+
+function selectInspectTab(name) {
+  for (const tab of ["overview", "stage", "checks", "engineering"]) {
+    const pane = $(`tab-${tab}`);
+    if (pane) pane.hidden = tab !== name;
+  }
+  for (const button of document.querySelectorAll("#inspect-tabs .tab")) {
+    button.classList.toggle("active", button.dataset.tab === name);
+  }
+}
+
+function renderStepper() {
+  const stepper = $("stages");
+  stepper.textContent = "";
+  state.stages.forEach((stage, index) => {
+    const step = document.createElement("button");
+    step.type = "button";
+    step.className = `step ${stage.state || ""}${index === state.selectedStage ? " selected" : ""}`.trim();
+    step.setAttribute("aria-pressed", index === state.selectedStage ? "true" : "false");
+    const dot = document.createElement("span");
+    dot.className = `dot ${stageDotState(stage.state)}`;
+    const label = document.createElement("span");
+    label.className = "step-label";
+    label.textContent = stage.name_zh || stage.name;
+    const meta = document.createElement("span");
+    meta.className = "step-meta";
+    meta.textContent = `${stage.checks_passed}/${stage.checks_total}`;
+    step.append(dot, label, meta);
+    step.addEventListener("click", () => {
+      state.selectedStage = index;
+      if (state.lastRun) renderRun(state.lastRun);
+      selectInspectTab("stage");
+    });
+    stepper.append(step);
+  });
+}
+
 function renderRun(run) {
   const runId = String(run.dag_run_id || "");
-  $("run-heading").textContent = `${folderLabel(run.handoff_path) || "工程文件夹"} · ${RUN_STATES[run.state] || run.state || "—"}`;
+  $("run-heading").textContent = folderLabel(run.handoff_path) || "工程文件夹";
+  $("run-state-label").textContent = RUN_STATES[run.state] || run.state || "";
+  $("run-dot").className = `dot ${runDotState(run.state)}`;
+  $("run-initiator").textContent = `发起人：${run.operator || run.user || "未记录"}`;
   const authorized = state.previewFiles || {};
   const artifactUrl = (name) =>
     `/api/runs/${encodeURIComponent(runId)}/artifacts/${String(name)
@@ -358,14 +424,15 @@ function renderRun(run) {
   };
   const meta = $("run-meta");
   meta.textContent = "";
+  state.reference = reference;
   const rows = [
-    ["运行标识", run.dag_run_id],
-    ["发起人", run.operator || "未记录"],
     ["工程文件夹", folderLabel(run.handoff_path) || "—"],
     ["状态", RUN_STATES[run.state] || run.state || "—"],
     ["开始时间", formatTime(run.started_at)],
     ["结束时间", formatTime(run.ended_at)],
   ];
+  const ident = $("run-ident");
+  if (ident) ident.textContent = runId;
   for (const [label, value] of rows) {
     const dt = document.createElement("dt");
     dt.textContent = label;
@@ -394,22 +461,22 @@ function renderRun(run) {
     progress.append(chip);
   }
 
-  const stages = $("stages");
-  stages.textContent = "";
-  let openedStage = false;
-  for (const stage of ((run.stage_view && run.stage_view.stages) || [])) {
-    const item = document.createElement("details");
-    item.className = `stage-card ${stage.state}`;
-    const summary = document.createElement("summary");
-    summary.textContent = `${stage.name_zh || stage.name} · ${STAGE_STATES[stage.state] || stage.state} · ${stage.checks_passed}/${stage.checks_total} 项`;
-    item.append(summary);
-    if (!openedStage && (stage.state === "failed" || stage.state === "blocked" || stage.state === "running")) {
-      item.open = true;
-      openedStage = true;
-    }
-    const body = document.createElement("div");
-    body.className = "stage-body";
-    item.append(body);
+  state.stages = (run.stage_view && run.stage_view.stages) || [];
+  const attention = state.stages.findIndex((stage) => stage.state === "failed" || stage.state === "blocked" || stage.state === "running");
+  state.selectedStage = Number.isInteger(state.selectedStage) && state.selectedStage >= 0 && state.selectedStage < state.stages.length
+    ? state.selectedStage
+    : attention === -1 ? 0 : attention;
+  renderStepper();
+  const detailRoot = $("stage-detail");
+  detailRoot.textContent = "";
+  for (const stage of state.stages.slice(state.selectedStage, state.selectedStage + 1)) {
+    const item = document.createElement("div");
+    item.className = "stage-body";
+    const body = item;
+    const heading = document.createElement("p");
+    heading.className = "muted small";
+    heading.textContent = `${stage.name_zh || stage.name} · ${STAGE_STATES[stage.state] || stage.state} · ${stage.checks_passed}/${stage.checks_total} 项`;
+    item.append(heading);
     if (stage.error) {
       const error = document.createElement("p");
       error.className = "error";
@@ -496,9 +563,8 @@ function renderRun(run) {
       pending.textContent = `工程确认（在本版本 PR／受控记录中完成）：${stage.confirmations.map((row) => row.label).join("、")} · 待确认`;
       body.append(pending);
     }
-    stages.append(item);
+    detailRoot.append(item);
   }
-  if (!openedStage && stages.firstElementChild) stages.firstElementChild.open = true;
 
   const automatic = $("automatic");
   automatic.textContent = "";
@@ -584,15 +650,16 @@ function renderRun(run) {
     link.href = run.pr.url;
     link.target = "_blank";
     link.rel = "noreferrer noopener";
-    link.textContent = `PR：${run.pr.url}`;
+    link.textContent = "查看 PR";
+    link.title = String(run.pr.url || "");
     pr.append(link);
     const stateText = document.createElement("span");
-    stateText.className = "muted";
-    stateText.textContent = ` · ${run.pr.state || ""} · ${String(run.pr.commit || "").slice(0, 12)}`;
+    stateText.className = "muted small";
+    stateText.textContent = run.pr.state || "";
     pr.append(stateText);
     pr.hidden = false;
   } else if (automaticState === "passed") {
-    pr.textContent = "模型已通过独立校验；PR 尚未创建或发布服务失败，可先查看下方已验证 URDF。";
+    pr.textContent = "模型已通过独立校验；PR 尚未创建或发布服务失败，可先查看左侧已验证 URDF。";
     pr.hidden = false;
   } else {
     pr.hidden = true;
@@ -634,6 +701,7 @@ async function loadPreview(dagRunId) {
     state.previewFiles = preview.files || {};
     if (state.lastRun) renderRun(state.lastRun);
     $("viewer-card").hidden = false;
+    $("viewer-placeholder").hidden = true;
     state.viewer.frame();
   } catch (error) {
     if (request.signal.aborted || state.dagRunId !== dagRunId) return;
@@ -644,6 +712,7 @@ async function loadPreview(dagRunId) {
     if (state.lastRun) renderRun(state.lastRun);
     $("joint-controls").textContent = "";
     $("viewer-card").hidden = false;
+    $("viewer-placeholder").hidden = true;
     if (error.status === 404 || error.status === 409) {
       note.textContent = `尚未提供已验证交付：${error.message}`;
       note.hidden = false;
@@ -703,9 +772,10 @@ async function selectRun(dagRunId) {
   clearPreview();
   state.dagRunId = dagRunId;
   state.lastRun = null;
+  state.selectedStage = null;
   $("retry-panel").hidden = true;
   setError($("retry-error"), "");
-  $("detail-card").hidden = false;
+  showRunView();
   await refreshRuns();
   if (state.dagRunId !== dagRunId) return;
   state.timer = window.setInterval(() => {
@@ -749,6 +819,16 @@ async function retryRun() {
 }
 
 function wire() {
+  $("new-run-button").addEventListener("click", () => {
+    showUploadView();
+    setError($("run-error"), "");
+    void refreshRuns();
+  });
+  for (const button of document.querySelectorAll("#inspect-tabs .tab")) {
+    button.addEventListener("click", () => selectInspectTab(button.dataset.tab));
+  }
+  selectInspectTab("overview");
+
   $("retry-button").addEventListener("click", retryRun);
   $("logout").addEventListener("click", async () => {
     try {

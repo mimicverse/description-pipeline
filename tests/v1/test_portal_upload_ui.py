@@ -82,6 +82,27 @@ class UploadUiContractTests(unittest.TestCase):
         missing = [name for name in used if f'id="{name}"' not in html]
         self.assertEqual(missing, [], f"ids referenced by app.js but missing in index.html: {missing}")
 
+    def test_layout_switches_between_upload_and_run_views(self) -> None:
+        html = (STATIC / "index.html").read_text(encoding="utf-8")
+        for element in (
+            "upload-view",
+            "detail-card",
+            "new-run-button",
+            "stage-detail",
+            "inspect-tabs",
+            "run-dot",
+            "run-state-label",
+            "run-initiator",
+            "run-ident",
+            "task-progress",
+        ):
+            self.assertIn(f'id="{element}"', html)
+        app = (STATIC / "app.js").read_text(encoding="utf-8")
+        for name in ("showUploadView", "showRunView", "renderStepper", "selectInspectTab"):
+            self.assertIn(f"function {name}(", app)
+        self.assertIn('$("upload-view").hidden = true', app)
+        self.assertIn('$("detail-card").hidden = true', app)
+
 
 class UploadRenderTests(unittest.TestCase):
     def _render(self, state: Path) -> subprocess.CompletedProcess[str]:
