@@ -17,9 +17,7 @@ from typing import Any
 
 #: The one shared binding object; every consumer imports this module, so two import paths can
 #: never end up writing into different context variables.
-_DESCRIPTION_PIPELINE_REQUEST: ContextVar[Any] = ContextVar(
-    "description_pipeline_airflow_request", default=None
-)
+_DESCRIPTION_PIPELINE_REQUEST: ContextVar[Any] = ContextVar("description_pipeline_airflow_request", default=None)
 
 #: Trusted scope key holding the evaluated candidate body of the one owner-granted clear route.
 CLEAR_BODY_SCOPE_KEY = "description_pipeline_clear_body"
@@ -138,9 +136,7 @@ async def _buffer_clear_candidate(receive: Any) -> tuple[Any, dict, bool]:
         total += len(body)
         if not message.get("more_body", False):
             break
-    raw = b"".join(
-        message.get("body", b"") for message in messages if message.get("type") == "http.request"
-    )
+    raw = b"".join(message.get("body", b"") for message in messages if message.get("type") == "http.request")
     candidate = evaluate_clear_candidate(raw, oversize=oversize)
     index = 0
 

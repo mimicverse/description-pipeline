@@ -97,10 +97,7 @@ def recorded_actor_principal(actor: object) -> str | None:
 
 
 def _endpoint_named(endpoint: object, name: str) -> bool:
-    return (
-        getattr(endpoint, "__module__", "") == DAG_RUN_ROUTES_MODULE
-        and getattr(endpoint, "__name__", "") == name
-    )
+    return getattr(endpoint, "__module__", "") == DAG_RUN_ROUTES_MODULE and getattr(endpoint, "__name__", "") == name
 
 
 def routed_route() -> RoutedRoute | None:
@@ -137,10 +134,9 @@ def _state_value(state: object) -> str | None:
 def classify_transport_retry(run_state: object, task_states: dict[str, object]) -> RetryAssessment:
     """Classify one run as positive transport recovery, or name the reason it is not.
 
-    The only eligible shape is a failed run whose real failure is ``wait_for_job`` and whose
-    remaining failed instances are merely upstream-failed; every resolution/capture, ambiguous
-    start, publication or unknown-task failure, a successful/active run and an empty failed set
-    all refuse.
+    Resolution must be successful. Only submission or polling may fail; confirmation may be
+    upstream-failed. Missing or ambiguous tasks, failed resolution or confirmation, active or
+    successful runs and an empty failed set refuse. The portal additionally checks native status.
     """
     state = _state_value(run_state)
     if state != "failed":
@@ -181,9 +177,7 @@ def recorded_run_facts(dag_id: str, run_id: str) -> tuple[str | None, object, di
     from sqlalchemy import select  # noqa: PLC0415
 
     with Session() as session:
-        run = session.scalar(
-            select(DagRun).where(DagRun.dag_id == dag_id, DagRun.run_id == run_id)
-        )
+        run = session.scalar(select(DagRun).where(DagRun.dag_id == dag_id, DagRun.run_id == run_id))
         if run is None:
             return None
         rows = session.execute(
@@ -194,9 +188,7 @@ def recorded_run_facts(dag_id: str, run_id: str) -> tuple[str | None, object, di
         task_states: dict[str, object] = {}
         for task_id, state in rows:
             key = str(task_id)
-            task_states[key] = (
-                AMBIGUOUS_TASK_STATE if key in task_states else state
-            )
+            task_states[key] = AMBIGUOUS_TASK_STATE if key in task_states else state
     return recorded_actor_principal(run.triggering_user_name), run.state, task_states
 
 

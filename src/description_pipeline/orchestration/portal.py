@@ -57,6 +57,12 @@ from .feishu_oauth import (
     sanitize_display_name,
     valid_actor_principal,
 )
+from .run_ownership import (
+    AMBIGUOUS_TASK_STATE,
+    RetryAssessment,
+    classify_transport_retry,
+    recorded_actor_principal,
+)
 
 log = logging.getLogger(__name__)
 
@@ -285,6 +291,15 @@ class AirflowApi:
         if not isinstance(instances, list):
             raise AirflowApiError("Airflow returned no task instance list")
         return [item for item in instances if isinstance(item, dict)]
+
+    def clear_dag_run(self, token: str, dag_id: str, dag_run_id: str, *, dry_run: bool) -> dict:
+        """Retry failed transport tasks on the original DAG version and frozen input."""
+        return self._request(
+            "POST",
+            f"{self.api_root}/dags/{urlparse.quote(dag_id)}/dagRuns/{urlparse.quote(dag_run_id)}/clear",
+            {"dry_run": dry_run, "only_failed": True, "only_new": False, "run_on_latest_version": False},
+            token=token,
+        )
 
     def list_dag_runs(self, token: str, dag_id: str, *, limit: int = 20) -> list[dict]:
         """Recent runs of one DAG, so the operator page survives portal restarts.
@@ -549,6 +564,32 @@ def _automatic_summary(job: dict | None) -> dict:
 #: Canonical responsibility rows of docs/mechanical-handoff-spec.md §11.1. The automatic column
 #: below mirrors only the spec's explicit coverage statements; every engineering item stays
 #: pending until the review PR/native controlled records carry the confirmation for this version.
+def _retry_assessment(run: dict, tasks: list[dict], job: dict | None, endpoint_error: str | None) -> RetryAssessment:
+    states: dict[str, object] = {}
+    for task in tasks:
+        name = task.get("task_id")
+        if not isinstance(name, str) or not name:
+            return RetryAssessment(False, "unknown_failed_task", ())
+        states[name] = AMBIGUOUS_TASK_STATE if name in states or task.get("map_index", -1) != -1 else task.get("state")
+    assessment = classify_transport_retry(run.get("state"), states)
+    if not assessment.eligible:
+        return assessment
+    if endpoint_error:
+        return RetryAssessment(False, "endpoint_evidence_unavailable", ())
+    if job is None:
+        # An authoritative 404 permits the first submission to resume from the saved resolution.
+        return (
+            assessment
+            if states.get("start_job") == "failed"
+            else RetryAssessment(False, "endpoint_evidence_unavailable", ())
+        )
+    if job.get("status") == "failed":
+        return RetryAssessment(False, "native_terminal_failure", ())
+    if job.get("status") not in {"queued", "running", "passed"}:
+        return RetryAssessment(False, "endpoint_evidence_unavailable", ())
+    return assessment
+
+
 def _coverage_report(job: dict | None) -> dict:
     """Per-item canonical check state bound to the native structural identity of this run."""
     job = job if isinstance(job, dict) else {}
@@ -626,6 +667,9 @@ class PortalApp:
         match = re.fullmatch(r"/api/runs/([^/]+)", path)
         if match and method == "GET":
             return self._run_status(environ, start_response, match.group(1))
+        match = re.fullmatch(r"/api/runs/([^/]+)/retry", path)
+        if match and method == "POST":
+            return self._retry_run(environ, start_response, match.group(1))
         match = re.fullmatch(r"/api/runs/([^/]+)/preview", path)
         if match and method == "GET":
             return self._preview(environ, start_response, match.group(1))
@@ -682,6 +726,30 @@ class PortalApp:
             avatar_url=avatar.strip() if isinstance(avatar, str) else "",
             principal=principal.strip(),
         )
+
+    def _can_manage(self, session: PortalSession, run: dict) -> bool:
+        """Recheck the caller's current profile and the authoritative run actor."""
+        try:
+            profile = self.config.airflow.profile(session.token)
+        except AirflowAuthError as error:
+            self.sessions.drop(session.session_id)
+            raise PortalError(HTTPStatus.UNAUTHORIZED, "飞书登录已过期，请重新登录") from error
+        except AirflowApiError as error:
+            raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
+        principal = profile.get("principal")
+        try:
+            build_actor_name(principal, recorded_display_name(profile.get("name")))
+        except ValueError as error:
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "Airflow 未返回可记录的飞书身份") from error
+        components = [profile.get(key) for key in ("app_id", "tenant_key", "open_id")]
+        if (
+            not all(isinstance(value, str) and value for value in components)
+            or principal != ":".join(components)
+            or principal != session.principal
+        ):
+            self.sessions.drop(session.session_id)
+            raise PortalError(HTTPStatus.UNAUTHORIZED, "飞书身份已变更，请重新登录")
+        return profile.get("role") == "ADMIN" or recorded_actor_principal(run.get("triggering_user_name")) == principal
 
     def _session_info(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
         cookies = _parse_cookies(environ.get("HTTP_COOKIE"))
@@ -811,7 +879,9 @@ class PortalApp:
         except AirflowAuthError as error:
             raise PortalError(HTTPStatus.UNAUTHORIZED, str(error)) from error
         except AirflowApiError as error:
-            raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
+            missing = isinstance(error.__cause__, urlerror.HTTPError) and error.__cause__.code == 404
+            raise PortalError(HTTPStatus.NOT_FOUND if missing else HTTPStatus.BAD_GATEWAY, str(error)) from error
+        can_manage = self._can_manage(session, airflow_run)
         endpoint = self._endpoint()
         run_id = native_run_id(dag_run_id)
         job: dict | None = None
@@ -826,6 +896,7 @@ class PortalApp:
         with self._lock:
             record = self._runs.get(dag_run_id)
         principal, operator = _run_identity(airflow_run.get("triggering_user_name"), record)
+        retry = _retry_assessment(airflow_run, tasks, job, endpoint_error)
         pr = None
         if isinstance(job, dict):
             result = job.get("result") if isinstance(job.get("result"), dict) else {}
@@ -852,6 +923,8 @@ class PortalApp:
                 "handoff_path": conf.get("handoff_path"),
                 "operator": operator,
                 "principal": principal,
+                "can_manage": can_manage,
+                "retry": {"eligible": retry.eligible, "reason": retry.reason},
                 "started_at": airflow_run.get("start_date"),
                 "ended_at": airflow_run.get("end_date"),
                 "tasks": [
@@ -878,6 +951,84 @@ class PortalApp:
                 "coverage": _coverage_report(job),
                 "pr": pr,
                 "endpoint_error": endpoint_error,
+            },
+            self.config,
+        )
+
+    def _retry_run(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
+        session = self._session(environ, csrf=True)
+        if _RUN_ID.fullmatch(dag_run_id) is None:
+            raise PortalError(HTTPStatus.BAD_REQUEST, "运行标识不合法")
+        if self._body(environ):
+            raise PortalError(HTTPStatus.BAD_REQUEST, "重试不接受运行参数")
+        try:
+            run = self.config.airflow.dag_run(session.token, self.config.dag_id, dag_run_id)
+            if not self._can_manage(session, run):
+                raise PortalError(HTTPStatus.FORBIDDEN, "只有发起人或平台管理员可重试此运行")
+            tasks = self.config.airflow.task_instances(session.token, self.config.dag_id, dag_run_id)
+            job = None
+            try:
+                job = self._endpoint().get_job(native_run_id(dag_run_id))
+            except EndpointNotFound:
+                pass
+            except EndpointError as error:
+                raise PortalError(HTTPStatus.CONFLICT, "无法确认原作业状态，请稍后重试") from error
+            assessment = _retry_assessment(run, tasks, job, None)
+            if not assessment.eligible:
+                raise PortalError(HTTPStatus.CONFLICT, "此运行无法重试，请查看检查结果并按需新建运行")
+            preview = self.config.airflow.clear_dag_run(session.token, self.config.dag_id, dag_run_id, dry_run=True)
+            selected = preview.get("task_instances")
+            if (
+                not isinstance(selected, list)
+                or type(preview.get("total_entries")) is not int
+                or preview.get("total_entries") != len(selected)
+                or any(not isinstance(task, dict) for task in selected)
+            ):
+                raise PortalError(HTTPStatus.CONFLICT, "Airflow 未提供有效的重试任务检查结果")
+            selected_states = {}
+            for task in selected:
+                name = task.get("task_id")
+                if (
+                    not isinstance(name, str)
+                    or name in selected_states
+                    or task.get("map_index", -1) != -1
+                    or task.get("state") not in {"failed", "upstream_failed"}
+                    or task.get("dag_id", self.config.dag_id) != self.config.dag_id
+                    or task.get("dag_run_id", dag_run_id) != dag_run_id
+                ):
+                    raise PortalError(HTTPStatus.CONFLICT, "重试任务与原运行不一致")
+                selected_states[name] = task.get("state")
+            if tuple(sorted(selected_states)) != assessment.cleared_tasks:
+                raise PortalError(HTTPStatus.CONFLICT, "运行状态已变化，请刷新后重试")
+            if any(
+                selected_states[task["task_id"]] != task.get("state")
+                for task in tasks
+                if task.get("task_id") in selected_states
+            ):
+                raise PortalError(HTTPStatus.CONFLICT, "运行状态已变化，请刷新后重试")
+            result = self.config.airflow.clear_dag_run(session.token, self.config.dag_id, dag_run_id, dry_run=False)
+            if result.get("dag_run_id") != dag_run_id or result.get("dag_id") != self.config.dag_id:
+                raise PortalError(HTTPStatus.BAD_GATEWAY, "Airflow 返回的重试运行身份不一致")
+        except AirflowAuthError as error:
+            forbidden = isinstance(error.__cause__, urlerror.HTTPError) and error.__cause__.code == 403
+            raise PortalError(HTTPStatus.FORBIDDEN if forbidden else HTTPStatus.UNAUTHORIZED, str(error)) from error
+        except AirflowApiError as error:
+            code = error.__cause__.code if isinstance(error.__cause__, urlerror.HTTPError) else None
+            status = code if code in {404, 409} else HTTPStatus.BAD_GATEWAY
+            raise PortalError(status, str(error)) from error
+        log.info(
+            "portal retried dag_run_id=%s principal=%s tasks=%s",
+            dag_run_id,
+            session.principal,
+            assessment.cleared_tasks,
+        )
+        return _json_response(
+            start_response,
+            200,
+            {
+                "dag_run_id": dag_run_id,
+                "state": result.get("state"),
+                "cleared_tasks": list(assessment.cleared_tasks),
             },
             self.config,
         )

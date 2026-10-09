@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookiejar import Cookie, CookieJar
 from pathlib import Path
@@ -26,6 +27,7 @@ from description_pipeline.orchestration.airflow_client import (
     EndpointConfig,
     PIPELINE_ID,
     WindowsEndpoint,
+    EndpointError,
     native_run_id,
 )
 from description_pipeline.orchestration.feishu_oauth import TRIGGERING_USER_NAME_LIMIT
@@ -44,6 +46,7 @@ FEISHU_PRINCIPAL = "cli_app:tenant-a:ou_worker"
 VIEWER_TOKEN = "airflow-viewer-token"
 VIEWER_NAME = "李工"
 VIEWER_PRINCIPAL = "cli_app:tenant-a:ou_viewer"
+ADMIN_TOKEN = "airflow-admin-token"
 NO_NAME_TOKEN = "airflow-no-name-token"
 NO_NAME_PRINCIPAL = "cli_app:tenant-a:ou_noname"
 DAG_RUN_ID = "portal-20261007T000000-abcdef01"
@@ -79,6 +82,13 @@ class MockAirflow:
             # Simulates a stale/foreign token: the auth manager would refuse to mint one.
             NO_NAME_TOKEN: _feishu_profile("", NO_NAME_PRINCIPAL, "ou_noname"),
         }
+        self.profiles[ADMIN_TOKEN] = {
+            **_feishu_profile("平台管理员", "cli_app:tenant-a:ou_admin", "ou_admin"),
+            "role": "ADMIN",
+        }
+        self.task_states: dict[str, list[dict]] = {}
+        self.clear_requests: list[tuple[str, dict]] = []
+        self.clear_selection: list[dict] | None = None
         self.conf: dict | None = None
         self.trigger_payloads: list[dict] = []
         self.hits = 0
@@ -145,6 +155,27 @@ class MockAirflow:
                     }
                     self._reply(201, dict(outer.dag_runs[dag_run_id]))
                     return
+                match = re.fullmatch(r"/api/v2/dags/solidworks_to_urdf/dagRuns/([^/]+)/clear", self.path)
+                if match:
+                    run_id = match.group(1)
+                    payload = json.loads(body or b"{}")
+                    outer.clear_requests.append((self._token(), payload))
+                    selected = outer.clear_selection
+                    if selected is None:
+                        selected = [
+                            row
+                            for row in outer.task_states.get(run_id, [])
+                            if row["state"] in {"failed", "upstream_failed"}
+                        ]
+                    if payload.get("dry_run"):
+                        self._reply(200, {"task_instances": selected, "total_entries": len(selected)})
+                    else:
+                        outer.dag_runs[run_id]["state"] = "queued"
+                        for row in outer.task_states[run_id]:
+                            if row["state"] in {"failed", "upstream_failed"}:
+                                row["state"] = None
+                        self._reply(200, dict(outer.dag_runs[run_id]))
+                    return
                 self._reply(404, {"detail": "not found"})
 
             def do_GET(self) -> None:
@@ -153,7 +184,7 @@ class MockAirflow:
                     cookie = self.headers.get("Cookie") or ""
                     token = cookie[len("_token=") :] if cookie.startswith("_token=") else ""
                     profile = outer.profiles.get(token)
-                    if profile is None:
+                    if profile is None or outer.revoked:
                         self._reply(401, {"detail": "not_signed_in"})
                         return
                     self._reply(200, dict(profile))
@@ -182,12 +213,15 @@ class MockAirflow:
                         self._reply(
                             200,
                             {
-                                "task_instances": [
-                                    {"task_id": "resolve_handoff", "state": "success"},
-                                    {"task_id": "start_job", "state": "success"},
-                                    {"task_id": "wait_for_job", "state": "success"},
-                                    {"task_id": "confirm_job", "state": "success"},
-                                ],
+                                "task_instances": outer.task_states.get(
+                                    dag_run_id,
+                                    [
+                                        {"task_id": "resolve_handoff", "state": "success"},
+                                        {"task_id": "start_job", "state": "success"},
+                                        {"task_id": "wait_for_job", "state": "success"},
+                                        {"task_id": "confirm_job", "state": "success"},
+                                    ],
+                                ),
                                 "total_entries": 4,
                             },
                         )
@@ -412,6 +446,135 @@ class PortalTests(unittest.TestCase):
             "start_date": "2026-10-07T00:00:00Z",
             "end_date": "2026-10-07T00:05:00Z" if state != "running" else None,
         }
+
+    def _seed_retryable_run(self) -> None:
+        self._seed_passed_job()
+        self.airflow.dag_runs[DAG_RUN_ID]["state"] = "failed"
+        self.airflow.task_states[DAG_RUN_ID] = [
+            {"task_id": "resolve_handoff", "state": "success"},
+            {"task_id": "start_job", "state": "success"},
+            {"task_id": "wait_for_job", "state": "failed"},
+            {"task_id": "confirm_job", "state": "upstream_failed"},
+        ]
+
+    def test_retry_capability_uses_current_profile_and_recorded_actor(self) -> None:
+        self._seed_retryable_run()
+        for token, can_manage in [(AIRFLOW_TOKEN, True), (ADMIN_TOKEN, True), (VIEWER_TOKEN, False)]:
+            with self.subTest(token=token):
+                client = PortalClient(self.client.base)
+                client.login(token)
+                status, _, body = client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+                self.assertEqual(status, 200, body)
+                detail = json.loads(body)
+                self.assertIs(detail["can_manage"], can_manage)
+                self.assertEqual(detail["retry"], {"eligible": True, "reason": "transport_recovery"})
+        self.client.login()
+        self.airflow.dag_runs[DAG_RUN_ID]["triggering_user_name"] = f"{FEISHU_PRINCIPAL}|broken"
+        self.assertFalse(json.loads(self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")[2])["can_manage"])
+
+    def test_owner_and_admin_retry_preserve_frozen_job_and_successful_tasks(self) -> None:
+        for token in [AIRFLOW_TOKEN, ADMIN_TOKEN]:
+            with self.subTest(token=token):
+                self._seed_retryable_run()
+                client = PortalClient(self.client.base)
+                client.login(token)
+                jobs_before = set(self.endpoint_server.jobs)
+                request_before = dict(self.endpoint_server.jobs[native_run_id(DAG_RUN_ID)]["request"])
+                conf_before = dict(self.airflow.dag_runs[DAG_RUN_ID]["conf"])
+                status, _, body = client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})
+                self.assertEqual(status, 200, body)
+                self.assertEqual(
+                    json.loads(body),
+                    {"dag_run_id": DAG_RUN_ID, "state": "queued", "cleared_tasks": ["confirm_job", "wait_for_job"]},
+                )
+                self.assertEqual(self.airflow.dag_runs[DAG_RUN_ID]["conf"], conf_before)
+                self.assertEqual(set(self.endpoint_server.jobs), jobs_before)
+                self.assertEqual(self.endpoint_server.jobs[native_run_id(DAG_RUN_ID)]["request"], request_before)
+                self.assertEqual(
+                    [row["state"] for row in self.airflow.task_states[DAG_RUN_ID][:2]], ["success", "success"]
+                )
+                for dry_run, (caller, payload) in zip([True, False], self.airflow.clear_requests[-2:], strict=True):
+                    self.assertEqual(caller, token)
+                    self.assertEqual(
+                        payload,
+                        {"dry_run": dry_run, "only_failed": True, "only_new": False, "run_on_latest_version": False},
+                    )
+
+    def test_retry_denies_other_users_missing_csrf_and_request_parameters(self) -> None:
+        self._seed_retryable_run()
+        viewer = PortalClient(self.client.base)
+        viewer.login(VIEWER_TOKEN)
+        self.assertEqual(viewer.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})[0], 403)
+        self.client.login()
+        self.client.csrf = None
+        self.assertEqual(self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})[0], 403)
+        self.client.login()
+        self.assertEqual(self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {"only_failed": False})[0], 400)
+        self.assertEqual(self.airflow.clear_requests, [])
+
+    def test_retry_rechecks_admin_role_and_expired_identity(self) -> None:
+        self._seed_retryable_run()
+        self.client.login(ADMIN_TOKEN)
+        self.airflow.profiles[ADMIN_TOKEN]["role"] = "OPERATOR"
+        self.assertEqual(self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})[0], 403)
+        self.airflow.revoked = True
+        self.assertEqual(self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})[0], 401)
+        self.assertEqual(self.airflow.clear_requests, [])
+
+    def test_retry_native_failure_and_unavailable_evidence_are_diagnostics(self) -> None:
+        self._seed_retryable_run()
+        self.client.login()
+        self.endpoint_server.fail_job = True
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["retry"], {"eligible": False, "reason": "native_terminal_failure"})
+        self.assertEqual(self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})[0], 409)
+        with patch.object(self.endpoint, "get_job", side_effect=EndpointError("offline")):
+            status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+            self.assertEqual(status, 200, body)
+            self.assertEqual(json.loads(body)["retry"], {"eligible": False, "reason": "endpoint_evidence_unavailable"})
+            self.assertEqual(self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})[0], 409)
+        self.assertEqual(self.airflow.clear_requests, [])
+
+    def test_retry_refuses_unsafe_or_changed_dry_run_task_selection(self) -> None:
+        self._seed_retryable_run()
+        self.client.login()
+        for selected in [
+            [{"task_id": "resolve_handoff", "state": "failed"}],
+            [{"task_id": "wait_for_job", "state": "success"}],
+            [{"task_id": "wait_for_job", "state": "failed"}],
+            [{"task_id": "wait_for_job", "state": "failed", "dag_run_id": "another-run"}],
+            [{"task_id": "wait_for_job", "state": "failed", "map_index": 0}],
+            [{"task_id": "wait_for_job", "state": "failed"}] * 2,
+        ]:
+            with self.subTest(selected=selected):
+                self.airflow.clear_selection = selected
+                status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})
+                self.assertEqual(status, 409, body)
+        self.assertTrue(all(payload["dry_run"] for _, payload in self.airflow.clear_requests))
+
+    def test_retry_classifies_missing_jobs_and_failed_resolution_conservatively(self) -> None:
+        self._seed_retryable_run()
+        self.client.login()
+        self.endpoint_server.jobs.clear()
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["retry"], {"eligible": False, "reason": "endpoint_evidence_unavailable"})
+        self.airflow.task_states[DAG_RUN_ID][1]["state"] = "failed"
+        self.airflow.task_states[DAG_RUN_ID][2]["state"] = "upstream_failed"
+        status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["cleared_tasks"], ["confirm_job", "start_job", "wait_for_job"])
+        self._seed_retryable_run()
+        self.airflow.task_states[DAG_RUN_ID][0]["state"] = "failed"
+        self.assertEqual(self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})[0], 409)
+
+    def test_retry_rejects_changed_profile_identity(self) -> None:
+        self._seed_retryable_run()
+        self.client.login()
+        self.airflow.profiles[AIRFLOW_TOKEN]["principal"] = VIEWER_PRINCIPAL
+        self.assertEqual(self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})[0], 401)
+        self.assertEqual(self.airflow.clear_requests, [])
 
     def test_login_is_required_and_tokens_stay_server_side(self) -> None:
         status, _, _ = self.client.request("GET", "/api/session")

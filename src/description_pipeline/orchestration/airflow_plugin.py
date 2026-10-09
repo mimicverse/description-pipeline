@@ -9,6 +9,7 @@ runs) but never grants run ownership, and health surfaces the missing middleware
 from __future__ import annotations
 
 import logging
+from typing import ClassVar
 
 from airflow.plugins_manager import AirflowPlugin
 
@@ -24,7 +25,7 @@ class DescriptionPipelinePlugin(AirflowPlugin):
     """Registers exactly one root middleware; no views, no routes, no settings."""
 
     name = "description_pipeline"
-    fastapi_root_middlewares = [{"name": MIDDLEWARE_NAME, "middleware": BindRequestMiddleware}]
+    fastapi_root_middlewares: ClassVar[list[dict]] = [{"name": MIDDLEWARE_NAME, "middleware": BindRequestMiddleware}]
 
 
 log.info("description-pipeline request-context middleware registered for the Airflow API")

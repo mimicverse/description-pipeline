@@ -414,12 +414,8 @@ class FeishuAuthManagerTests(unittest.TestCase):
 
     def test_run_ownership_grants_only_the_routed_single_run_clear(self) -> None:
         manager = self.manager(_environment(self.root))
-        owner = auth.FeishuUser(
-            app_id="cli_app", open_id="ou_owner", name="崔工", avatar_url="", tenant_key="tenant-a"
-        )
-        other = auth.FeishuUser(
-            app_id="cli_app", open_id="ou_other", name="李工", avatar_url="", tenant_key="tenant-a"
-        )
+        owner = auth.FeishuUser(app_id="cli_app", open_id="ou_owner", name="崔工", avatar_url="", tenant_key="tenant-a")
+        other = auth.FeishuUser(app_id="cli_app", open_id="ou_other", name="李工", avatar_url="", tenant_key="tenant-a")
         admin = auth.FeishuUser(
             app_id="cli_app", open_id="ou_admin", name="管理员", avatar_url="", tenant_key="tenant-a"
         )
@@ -503,12 +499,8 @@ class FeishuAuthManagerTests(unittest.TestCase):
             user=owner,
             clear_body_safe: bool | None = True,
         ) -> bool:
-            with request_context.use_request(
-                _RoutedRequest(endpoint, dag_id, run_id, clear_body_safe=clear_body_safe)
-            ):
-                return manager.is_authorized_dag(
-                    method=method, access_entity=entity, details=allowed, user=user
-                )
+            with request_context.use_request(_RoutedRequest(endpoint, dag_id, run_id, clear_body_safe=clear_body_safe)):
+                return manager.is_authorized_dag(method=method, access_entity=entity, details=allowed, user=user)
 
         run = auth.DagAccessEntity.RUN
         # The one owner mutation: the caller's own run through the routed clear endpoint.
@@ -530,16 +522,10 @@ class FeishuAuthManagerTests(unittest.TestCase):
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-running"))
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-no-failed"))
         # The exact immutable-retry body is part of the owner grant; admins are exempt.
-        self.assertFalse(
-            decide("PUT", run, clear_dag_run, run_id="run-own", clear_body_safe=False)
-        )
-        self.assertFalse(
-            decide("PUT", run, clear_dag_run, run_id="run-own", clear_body_safe=None)
-        )
+        self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-own", clear_body_safe=False))
+        self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-own", clear_body_safe=None))
         self.assertTrue(decide("PUT", run, clear_dag_run, run_id="run-own", user=admin))
-        self.assertTrue(
-            decide("PUT", run, clear_dag_run, run_id="run-own", user=admin, clear_body_safe=False)
-        )
+        self.assertTrue(decide("PUT", run, clear_dag_run, run_id="run-own", user=admin, clear_body_safe=False))
         # Same (method, entity) but any other route stays administrator-only.
         self.assertFalse(decide("PUT", run, patch_dag_run, run_id="run-own"))
         self.assertFalse(decide("PUT", run, clear_dag_run_partitions, run_id="run-own"))
@@ -555,23 +541,15 @@ class FeishuAuthManagerTests(unittest.TestCase):
         with request_context.use_request(
             _RoutedRequest(clear_dag_run, auth.ALLOWED_DAG_ID, "run-own", http_method="PATCH")
         ):
-            self.assertFalse(
-                manager.is_authorized_dag(method="PUT", access_entity=run, details=allowed, user=owner)
-            )
+            self.assertFalse(manager.is_authorized_dag(method="PUT", access_entity=run, details=allowed, user=owner))
         with request_context.use_request(
             _RoutedRequest(trigger_dag_run, auth.ALLOWED_DAG_ID, None, http_method="PATCH")
         ):
-            self.assertFalse(
-                manager.is_authorized_dag(method="POST", access_entity=run, details=allowed, user=owner)
-            )
+            self.assertFalse(manager.is_authorized_dag(method="POST", access_entity=run, details=allowed, user=owner))
         self.assertFalse(decide("POST", run, trigger_dag_run, dag_id="some_other_dag"))
         # Middleware absent: every operator RUN grant fails closed; GET and admin stay allowed.
-        self.assertFalse(
-            manager.is_authorized_dag(method="POST", access_entity=run, details=allowed, user=owner)
-        )
-        self.assertFalse(
-            manager.is_authorized_dag(method="PUT", access_entity=run, details=allowed, user=owner)
-        )
+        self.assertFalse(manager.is_authorized_dag(method="POST", access_entity=run, details=allowed, user=owner))
+        self.assertFalse(manager.is_authorized_dag(method="PUT", access_entity=run, details=allowed, user=owner))
         self.assertTrue(manager.is_authorized_dag(method="GET", details=allowed, user=owner))
         self.assertTrue(manager.is_authorized_dag(method="POST", access_entity=run, details=allowed, user=admin))
 
@@ -644,31 +622,22 @@ class FeishuAuthManagerTests(unittest.TestCase):
 
     def test_clear_body_candidate_matrix_and_replay(self) -> None:
         evaluate = request_context.evaluate_clear_candidate
-        safe = (
-            b'{"dry_run": false, "only_failed": true, "only_new": false, '
-            b'"run_on_latest_version": false}'
-        )
+        safe = b'{"dry_run": false, "only_failed": true, "only_new": false, "run_on_latest_version": false}'
         self.assertEqual(evaluate(safe, oversize=False), {"safe": True, "dry_run": False})
-        precheck = (
-            b'{"dry_run": true, "only_failed": true, "only_new": false, '
-            b'"run_on_latest_version": false}'
-        )
+        precheck = b'{"dry_run": true, "only_failed": true, "only_new": false, "run_on_latest_version": false}'
         self.assertEqual(evaluate(precheck, oversize=False), {"safe": True, "dry_run": True})
         for raw, label in (
             (b'{"dry_run": false}', "missing fields"),
             (
-                b'{"dry_run": false, "only_failed": false, "only_new": false, '
-                b'"run_on_latest_version": false}',
+                b'{"dry_run": false, "only_failed": false, "only_new": false, "run_on_latest_version": false}',
                 "only_failed false",
             ),
             (
-                b'{"dry_run": false, "only_failed": true, "only_new": true, '
-                b'"run_on_latest_version": false}',
+                b'{"dry_run": false, "only_failed": true, "only_new": true, "run_on_latest_version": false}',
                 "only_new true",
             ),
             (
-                b'{"dry_run": false, "only_failed": true, "only_new": false, '
-                b'"run_on_latest_version": true}',
+                b'{"dry_run": false, "only_failed": true, "only_new": false, "run_on_latest_version": true}',
                 "latest version true",
             ),
             (b'{"dry_run": false, "only_failed": true, "only_new": false}', "latest missing"),
@@ -683,8 +652,7 @@ class FeishuAuthManagerTests(unittest.TestCase):
                 "duplicate key",
             ),
             (
-                b'{"dry_run": 1, "only_failed": true, "only_new": false, '
-                b'"run_on_latest_version": false}',
+                b'{"dry_run": 1, "only_failed": true, "only_new": false, "run_on_latest_version": false}',
                 "non-bool",
             ),
             (b"not json", "malformed"),
@@ -752,11 +720,7 @@ class FeishuAuthManagerTests(unittest.TestCase):
             },
         ):
             with self.subTest(scope=scope_variant):
-                asyncio.run(
-                    request_context.BindRequestMiddleware(prefixed_app)(
-                        dict(scope_variant), no_body, None
-                    )
-                )
+                asyncio.run(request_context.BindRequestMiddleware(prefixed_app)(dict(scope_variant), no_body, None))
         self.assertEqual(prefixed, [{"safe": False}, {"safe": False}])
 
     def test_clear_body_oversize_is_refused_promptly(self) -> None:
@@ -801,7 +765,7 @@ class FeishuAuthManagerTests(unittest.TestCase):
         canonical = auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工")
         self.assertEqual(parse(canonical), "cli_app:tenant-a:ou_owner")
         self.assertIsNone(parse(f"cli_app:tenant-a:ou_owner|{json.dumps('e\u0301', ensure_ascii=False)}"))
-        self.assertIsNone(parse(f'cli_app:tenant-a:ou_owner|{json.dumps(" 崔工")}'))
+        self.assertIsNone(parse(f"cli_app:tenant-a:ou_owner|{json.dumps(' 崔工')}"))
         self.assertIsNone(parse(canonical + "A" * 600))
         self.assertIsNone(parse("cli_app:tenant-a:ou_owner"))
         self.assertIsNone(parse(None))
