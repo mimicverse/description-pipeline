@@ -70,7 +70,9 @@ class UploadUiContractTests(unittest.TestCase):
         self.assertIn("session.upload_limits", app)
         self.assertIn('id="upload-limits"', (STATIC / "index.html").read_text(encoding="utf-8"))
         self.assertIn('startsWith("~$")', app)
-        self.assertIn("临时锁文件", app)
+        self.assertIn("将拒绝上传", app)
+        self.assertIn("state.viewer.resize", app)
+        self.assertIn("limits.max_files", app)
         self.assertIn("ratio >= 1", app)
         self.assertIn("不会自动重试", app)
         self.assertNotIn("UPLOAD_LIMITS.", app)
@@ -95,6 +97,7 @@ class UploadUiContractTests(unittest.TestCase):
             "run-initiator",
             "run-ident",
             "task-progress",
+            "run-error-detail",
         ):
             self.assertIn(f'id="{element}"', html)
         app = (STATIC / "app.js").read_text(encoding="utf-8")
@@ -102,6 +105,8 @@ class UploadUiContractTests(unittest.TestCase):
             self.assertIn(f"function {name}(", app)
         self.assertIn('$("upload-view").hidden = true', app)
         self.assertIn('$("detail-card").hidden = true', app)
+        self.assertGreaterEqual(app.count("run-error-detail"), 3)
+        self.assertIn("terminalNow", app)
 
 
 class UploadRenderTests(unittest.TestCase):

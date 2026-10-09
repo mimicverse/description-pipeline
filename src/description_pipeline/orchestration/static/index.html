@@ -57,7 +57,7 @@
               <summary>文件要求</summary>
               <p class="muted small">
                 上限：<span id="upload-limits">总大小 2 GB、文件数 4096、单个文件 512 MB</span>（以平台设置为准）。
-                空子文件夹不会上传；临时锁文件（~$…）按平台既有规则处理；请勿包含平台生成的
+                空子文件夹不会上传；包含 ~$ 临时锁文件将被拒绝上传，请先关闭 SolidWorks 或删除后重试；请勿包含平台生成的
                 robot.yaml / cad-revision.json。
               </p>
             </details>
@@ -81,6 +81,8 @@
               </div>
             </div>
           </header>
+
+          <p id="run-error-detail" class="error" role="alert" hidden></p>
 
           <nav id="stages" class="stepper" aria-label="工程阶段"></nav>
 

@@ -22,8 +22,8 @@ Open the single HTTPS address provided by the platform maintainer.
 
 The picker uploads only the chosen folder; the page shows the platform's current
 upload limits (default 2 GB total, 4 096 files, 512 MB per file). Empty
-subfolders are not representable; temporary SolidWorks lock files follow the
-same admission rules as any managed handoff. Generated platform inputs such as `robot.yaml` and
+subfolders are not representable; temporary SolidWorks lock files (`~$…`) must
+be removed first — the platform rejects any selection containing them. Generated platform inputs such as `robot.yaml` and
 `cad-revision.json` must not be included — the platform generates them.
 
 Run history and details show the original submitter's Feishu username, obtained

@@ -110,9 +110,9 @@ function normalizeRelativePath(raw) {
 
 function applyUploadLimits(advertised) {
   const limits = advertised && typeof advertised === "object" ? advertised : {};
-  const files = Number(limits.files);
-  const bytes = Number(limits.bytes);
-  const fileBytes = Number(limits.file_bytes);
+  const files = Number(limits.max_files);
+  const bytes = Number(limits.max_bytes);
+  const fileBytes = Number(limits.max_file_bytes);
   if (Number.isFinite(files) && files > 0) uploadLimits.maxFiles = Math.floor(files);
   if (Number.isFinite(bytes) && bytes > 0) uploadLimits.maxTotalBytes = Math.floor(bytes);
   if (Number.isFinite(fileBytes) && fileBytes > 0) uploadLimits.maxFileBytes = Math.floor(fileBytes);
@@ -126,13 +126,12 @@ function folderPick(files) {
   const records = [];
   let top = null;
   let bytes = 0;
-  let locks = 0;
   for (const file of files) {
     const path = normalizeRelativePath(file.webkitRelativePath || file.name);
     if (!path) return { error: `存在不受支持的文件名：${String(file.name || "").slice(0, 120)}` };
     const name = path.split("/").pop() || "";
     if (name.startsWith("~$")) {
-      locks += 1;
+      return { error: "包含 ~$ 临时锁文件将拒绝上传：请关闭 SolidWorks 或删除这些文件后重试。" };
     }
     const first = path.split("/")[0];
     if (top === null) top = first;
@@ -145,7 +144,7 @@ function folderPick(files) {
   if (bytes > uploadLimits.maxTotalBytes) return { error: `文件夹总大小超出上限（${formatBytes(uploadLimits.maxTotalBytes)}）。` };
   const oversized = records.find((item) => item.file.size > uploadLimits.maxFileBytes);
   if (oversized) return { error: `单个文件超出上限（${formatBytes(uploadLimits.maxFileBytes)}）：${oversized.path.slice(0, 120)}` };
-  return { records, top, count: records.length, bytes, locks };
+  return { records, top, count: records.length, bytes };
 }
 
 function submitRun(pick, { onProgress } = {}) {
@@ -350,6 +349,12 @@ function showUploadView() {
 function showRunView() {
   $("upload-view").hidden = true;
   $("detail-card").hidden = false;
+  if (state.viewer) {
+    requestAnimationFrame(() => {
+      state.viewer.resize?.();
+      state.viewer.frame();
+    });
+  }
 }
 
 function selectInspectTab(name) {
@@ -731,9 +736,10 @@ async function poll() {
   try {
     const run = await api(`/api/runs/${encodeURIComponent(dagRunId)}`);
     if (state.dagRunId !== dagRunId) return;
-    setError($("run-error"), "");
+    setError($("run-error-detail"), "");
     const verified = run.automatic && run.automatic.state === "passed";
     if (!verified) clearPreview();
+    const previous = state.lastRun;
     state.lastRun = run;
     renderRun(run);
     if (verified) {
@@ -744,6 +750,10 @@ async function poll() {
     if ((run.state === "success" || run.state === "failed") && jobDone && (!verified || state.previewSubject)) {
       if (state.timer) window.clearInterval(state.timer);
       state.timer = null;
+    }
+    const terminalNow = run.state === "success" || run.state === "failed";
+    if (terminalNow && !(previous && (previous.state === "success" || previous.state === "failed"))) {
+      await refreshRuns();
     }
   } catch (error) {
     if (state.dagRunId !== dagRunId) return;
@@ -756,13 +766,16 @@ async function poll() {
       clearPreview();
       state.lastRun = null;
       state.dagRunId = null;
+      state.selectedStage = null;
       if (state.timer) window.clearInterval(state.timer);
       state.timer = null;
-      $("detail-card").hidden = true;
       $("retry-panel").hidden = true;
+      showUploadView();
       await refreshRuns();
+      setError($("run-error"), error.message);
+      return;
     }
-    setError($("run-error"), error.message);
+    setError($("run-error-detail"), error.message);
   }
 }
 
@@ -774,6 +787,7 @@ async function selectRun(dagRunId) {
   state.lastRun = null;
   state.selectedStage = null;
   $("retry-panel").hidden = true;
+  setError($("run-error-detail"), "");
   setError($("retry-error"), "");
   showRunView();
   await refreshRuns();
@@ -853,8 +867,7 @@ function wire() {
     }
     state.folderPick = picked;
     summary.hidden = false;
-    const locks = picked.locks ? ` · 含 ${picked.locks} 个临时锁文件（~$…），由平台按既有规则处理` : "";
-    summary.textContent = `${picked.top} · ${picked.count} 个文件 · ${formatBytes(picked.bytes)}${locks}`;
+    summary.textContent = `${picked.top} · ${picked.count} 个文件 · ${formatBytes(picked.bytes)}`;
     setError($("run-error"), "");
     $("start-button").disabled = false;
   });
