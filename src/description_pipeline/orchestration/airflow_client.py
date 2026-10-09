@@ -7,8 +7,9 @@ The endpoint contract is fixed and carries no shell or local paths:
   and sent to ``POST /v1/handoffs/import`` (``application/zip``) only when it is link-free and
   inside the platform ``handoff_roots`` allowlist from the Airflow connection;
 * ``POST /v1/jobs`` with ``{run_id, package, handoff_sha256}`` starts one run (idempotent per
-  run_id; a different payload for the same run_id is HTTP 409). Hardware, revision and repository
-  routing resolve inside the serialized Windows job after CAD discovery;
+  run_id; a different payload for the same run_id is HTTP 409); an optional ``main_assembly``
+  names the delivered assembly explicitly. Hardware, revision and repository routing resolve
+  inside the serialized Windows job after CAD discovery;
 * ``GET /v1/jobs/<uuid>`` returns status/events/result/error and, for native runs, the routing the
   job resolved after discovery;
 * ``GET /v1/jobs/<uuid>/preview`` and ``GET /v1/jobs/<uuid>/artifacts/<name>`` expose the verified
@@ -27,6 +28,7 @@ import os
 import re
 import tempfile
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from collections.abc import Callable
@@ -129,6 +131,30 @@ def _validate_relative_path(value: str, field: str) -> str:
     if path.is_absolute() or any(segment in {"", ".", ".."} for segment in value.split("/")):
         raise EndpointProtocolError(f"{field} must stay inside the delivery: {value!r}")
     return path.as_posix()
+
+
+#: One explicit delivered-assembly selection shares the member-path bound.
+MAX_MAIN_ASSEMBLY = 1024
+
+
+def validate_main_assembly(value: object) -> str:
+    """One explicit delivered assembly: canonical POSIX path inside the handoff root.
+
+    The value is the operator's authoritative entry selection (the top engineering
+    folder is excluded). It names a saved SolidWorks assembly and must match a
+    frozen file exactly; the endpoint re-verifies that before any CAD runs.
+    """
+
+    if not isinstance(value, str) or not value or len(value) > MAX_MAIN_ASSEMBLY:
+        raise EndpointProtocolError("main_assembly must be a non-empty relative path")
+    if value != value.strip():
+        raise EndpointProtocolError("main_assembly must not carry leading or trailing whitespace")
+    if unicodedata.normalize("NFC", value) != value:
+        raise EndpointProtocolError("main_assembly must be NFC-normalized")
+    _validate_relative_path(value, "main_assembly")
+    if not value.casefold().endswith(".sldasm"):
+        raise EndpointProtocolError("main_assembly must name a saved SolidWorks assembly (.SLDASM)")
+    return value
 
 
 def validate_package(value: str) -> str:
@@ -371,12 +397,20 @@ class WindowsEndpoint:
             raise EndpointProtocolError("health response must include readiness")
         return payload
 
-    def start_job(self, *, run_id: str, resolution: HandoffResolution, resume: dict | None = None) -> dict:
+    def start_job(
+        self,
+        *,
+        run_id: str,
+        resolution: HandoffResolution,
+        resume: dict | None = None,
+        main_assembly: str | None = None,
+    ) -> dict:
         """Start one native run with exactly the resolved package and its handoff digest.
 
         ``resume`` links the new job to a terminal parent (``parent_run`` native UUID and the
         canonical ``from_stage``); the endpoint revalidates the parent, its checkpoints and
-        the retained upload before accepting it.
+        the retained upload before accepting it.  ``main_assembly`` names the delivered
+        assembly explicitly; the endpoint verifies it against the frozen handoff.
         """
         if not isinstance(resolution, HandoffResolution):
             raise EndpointProtocolError("start_job requires a resolved handoff")
@@ -387,6 +421,8 @@ class WindowsEndpoint:
         }
         if resume is not None:
             payload["resume"] = validate_resume(resume, run_id=payload["run_id"])
+        if main_assembly is not None:
+            payload["main_assembly"] = validate_main_assembly(main_assembly)
         response = self._request("POST", "/v1/jobs", payload)
         if response.get("run_id") != payload["run_id"]:
             raise EndpointProtocolError("endpoint returned a different run_id")

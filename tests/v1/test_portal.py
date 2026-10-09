@@ -406,6 +406,7 @@ def _preview_payload() -> dict:
 def _upload_body(
     folder: str = "机器人工程",
     files: list[tuple[str, bytes]] | None = None,
+    fields: list[tuple[str, str]] | None = None,
 ) -> bytes:
     """One browser-shaped multipart folder body (top folder included, ``/`` separators)."""
     entries = files or [("model.SLDASM", b"<assembly/>"), ("parts/p1.SLDPRT", b"<part1/>")]
@@ -417,6 +418,10 @@ def _upload_body(
         )
         chunks.append(b"Content-Type: application/octet-stream\r\n\r\n")
         chunks.append(data + b"\r\n")
+    for name, value in fields or ():
+        chunks.append(b"--portal-boundary\r\n")
+        chunks.append(b'Content-Disposition: form-data; name="' + name.encode() + b'"\r\n\r\n')
+        chunks.append(value.encode() + b"\r\n")
     chunks.append(b"--portal-boundary--\r\n")
     return b"".join(chunks)
 
@@ -672,10 +677,14 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(payload["bytes"], sum(len(data) for _, data in files))
         stored = self.upload_root / dag_run_id / "机器人工程"
         self.assertTrue((stored / "model.SLDASM").is_file())
-        self.assertEqual(self.airflow.conf, {"handoff_path": str(stored)})
+        self.assertEqual(self.airflow.conf, {"handoff_path": str(stored), "main_assembly": "model.SLDASM"})
         self.assertEqual(
             self.airflow.trigger_payloads[-1],
-            {"dag_run_id": dag_run_id, "logical_date": None, "conf": {"handoff_path": str(stored)}},
+            {
+                "dag_run_id": dag_run_id,
+                "logical_date": None,
+                "conf": {"handoff_path": str(stored), "main_assembly": "model.SLDASM"},
+            },
         )
         status, _, body = self.client.request("GET", "/api/runs")
         self.assertEqual(status, 200)
@@ -687,6 +696,85 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(listed["principal"], FEISHU_PRINCIPAL)
         staging = self.upload_root / ".staging"
         self.assertTrue(not staging.exists() or not any(staging.iterdir()))
+
+    def test_main_assembly_selection_is_validated_and_persisted(self) -> None:
+        self.client.login()
+        files = [
+            ("model.SLDASM", b"<assembly/>"),
+            ("parts/arm.SLDASM", b"<arm/>"),
+            ("parts/p1.SLDPRT", b"<p1/>"),
+        ]
+        status, _, body = self.client.request_raw(
+            "POST",
+            "/api/runs",
+            _upload_body(files=files, fields=[("main_assembly", "parts/arm.SLDASM")]),
+            "multipart/form-data; boundary=portal-boundary",
+        )
+        self.assertEqual(status, 201, body)
+        payload = json.loads(body)
+        dag_run_id = payload["dag_run_id"]
+        self.assertEqual(payload["main_assembly"], "parts/arm.SLDASM")
+        stored = self.upload_root / dag_run_id / "机器人工程"
+        self.assertEqual(
+            self.airflow.conf,
+            {"handoff_path": str(stored), "main_assembly": "parts/arm.SLDASM"},
+        )
+        status, _, body = self.client.request("GET", f"/api/runs/{dag_run_id}")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["main_assembly"], "parts/arm.SLDASM")
+        cases = (
+            ("unknown", "nope.SLDASM"),
+            ("traversal", "../arm.SLDASM"),
+            ("not_assembly", "parts/p1.SLDPRT"),
+            ("case_variant", "Parts/Arm.SLDASM"),
+            ("empty", ""),
+            ("padded", " parts/arm.SLDASM"),
+        )
+        for label, value in cases:
+            with self.subTest(case=label):
+                status, _, response = self.client.request_raw(
+                    "POST",
+                    "/api/runs",
+                    _upload_body(files=files, fields=[("main_assembly", value)]),
+                    "multipart/form-data; boundary=portal-boundary",
+                )
+                self.assertEqual(status, 400, response)
+        duplicated = _upload_body(
+            files=files,
+            fields=[("main_assembly", "model.SLDASM"), ("main_assembly", "model.SLDASM")],
+        )
+        status, _, response = self.client.request_raw(
+            "POST", "/api/runs", duplicated, "multipart/form-data; boundary=portal-boundary"
+        )
+        self.assertEqual(status, 400, response)
+        self.assertEqual(len(self.airflow.trigger_payloads), 1)
+        staging = self.upload_root / ".staging"
+        self.assertTrue(not staging.exists() or not any(staging.iterdir()))
+
+    def test_multiple_assemblies_require_a_choice_before_any_trigger(self) -> None:
+        self.client.login()
+        files = [("left/model.SLDASM", b"left"), ("right/model.SLDASM", b"right")]
+        status, _, body = self.client.request_raw(
+            "POST", "/api/runs", _upload_body(files=files), "multipart/form-data; boundary=portal-boundary"
+        )
+        self.assertEqual(status, 400, body)
+        self.assertEqual(self.airflow.trigger_payloads, [])
+        staging = self.upload_root / ".staging"
+        self.assertTrue(not staging.exists() or not any(staging.iterdir()))
+
+    def test_unicode_selection_matches_normalized_uploaded_path(self) -> None:
+        self.client.login()
+        chosen = "子装配/re\u0301vision.SLDASM"
+        files = [("main.SLDASM", b"main"), (chosen, b"selected")]
+        status, _, body = self.client.request_raw(
+            "POST",
+            "/api/runs",
+            _upload_body(files=files, fields=[("main_assembly", chosen)]),
+            "multipart/form-data; boundary=portal-boundary",
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(json.loads(body)["main_assembly"], "子装配/révision.SLDASM")
+        self.assertEqual(self.airflow.conf["main_assembly"], "子装配/révision.SLDASM")
 
     def test_manual_paths_and_unconfirmed_sessions_are_refused_before_writes(self) -> None:
         self.client.login()
@@ -1422,6 +1510,7 @@ class PortalTests(unittest.TestCase):
         self._seed_retryable_run()
         self.client.login()
         rows = self._rerun_rows()
+        self.airflow.dag_runs[DAG_RUN_ID]["conf"]["main_assembly"] = "parts/arm.SLDASM"
         parent_conf = dict(self.airflow.dag_runs[DAG_RUN_ID]["conf"])
         jobs_before = set(self.endpoint_server.jobs)
         with patch.object(self.endpoint, "rerun_plan", create=True, return_value={"stage_reruns": rows}):
@@ -1437,7 +1526,12 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(self.airflow.trigger_payloads[-1]["dag_run_id"], child)
         self.assertEqual(
             self.airflow.trigger_payloads[-1]["conf"],
-            {"handoff_path": "/srv/robot-cell", "parent_dag_run_id": DAG_RUN_ID, "resume_from": "generate"},
+            {
+                "handoff_path": "/srv/robot-cell",
+                "parent_dag_run_id": DAG_RUN_ID,
+                "resume_from": "generate",
+                "main_assembly": "parts/arm.SLDASM",
+            },
         )
         # The original run, its conf and the native job stay immutable.
         self.assertEqual(self.airflow.dag_runs[DAG_RUN_ID]["conf"], parent_conf)

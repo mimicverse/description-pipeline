@@ -5,8 +5,8 @@ The portal is a dependency-free WSGI application:
 * the operator signs in once with Feishu SSO at ``/auth/feishu/login``; the Airflow ``_token``
   cookie that Airflow issues is validated server-side through ``/auth/feishu/profile`` and its
   value is kept in a portal session, never echoed to the browser;
-* the portal triggers the ``solidworks_to_urdf`` DAG with exactly one value, ``handoff_path``, and
-  reports the Airflow stage progress, native findings and the published pull request;
+* the portal triggers the ``solidworks_to_urdf`` DAG with ``handoff_path`` and ``main_assembly``,
+  and reports the Airflow stage progress, native findings and the published pull request;
 * the Windows endpoint bearer token also stays server-side; the portal proxies the delivery
   preview and only serves URDF/mesh artifacts whose bytes match the digest-bound preview;
 * the bundled viewer renders the actual verified URDF with joint and limit controls.
@@ -1039,7 +1039,7 @@ class PortalApp:
                 principal=session.principal,
                 started_at=time.time(),
             )
-        outcome = self._trigger_uploaded_run(session, dag_run_id, handoff_path)
+        outcome = self._trigger_uploaded_run(session, dag_run_id, handoff_path, receipt.main_assembly)
         if outcome == "auth":
             return _json_response(
                 start_response,
@@ -1068,16 +1068,27 @@ class PortalApp:
             receipt.bytes,
             receipt.handoff_sha256,
         )
-        return _json_response(
-            start_response,
-            201,
-            {"dag_run_id": dag_run_id, "folder": receipt.folder, "files": receipt.files, "bytes": receipt.bytes},
-            self.config,
-        )
+        payload = {
+            "dag_run_id": dag_run_id,
+            "folder": receipt.folder,
+            "files": receipt.files,
+            "bytes": receipt.bytes,
+        }
+        if receipt.main_assembly is not None:
+            payload["main_assembly"] = receipt.main_assembly
+        return _json_response(start_response, 201, payload, self.config)
 
-    def _trigger_uploaded_run(self, session: PortalSession, dag_run_id: str, handoff_path: str) -> str:
+    def _trigger_uploaded_run(
+        self,
+        session: PortalSession,
+        dag_run_id: str,
+        handoff_path: str,
+        main_assembly: str | None = None,
+    ) -> str:
         """Trigger once; an ambiguous failure is reconciled on the exact run id, never blind-retried."""
         conf = {"handoff_path": handoff_path}
+        if main_assembly is not None:
+            conf["main_assembly"] = main_assembly
         try:
             self.config.airflow.trigger_dag_run(session.token, self.config.dag_id, dag_run_id, conf)
             return "created"
@@ -1287,6 +1298,7 @@ class PortalApp:
             "dag_run_id": dag_run_id,
             "state": airflow_run.get("state"),
             "handoff_path": conf.get("handoff_path"),
+            "main_assembly": _optional_str(conf.get("main_assembly")),
             "operator": operator,
             "principal": principal,
             "can_manage": can_manage,
@@ -1694,6 +1706,9 @@ class PortalApp:
                 if reserved_id is None:
                     self._write_rerun_journal(dag_run_id, new_run_id, stage)
                 conf = {"handoff_path": handoff_path, "parent_dag_run_id": dag_run_id, "resume_from": stage}
+                parent_assembly = _optional_str(parent_conf.get("main_assembly"))
+                if parent_assembly is not None:
+                    conf["main_assembly"] = parent_assembly
                 outcome = self._trigger_linked_attempt(session, new_run_id, conf)
                 if outcome == "auth":
                     raise PortalError(HTTPStatus.UNAUTHORIZED, "飞书登录已失效，请重新登录")

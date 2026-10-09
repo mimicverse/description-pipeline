@@ -1,9 +1,11 @@
 """Submit one engineering folder to the Windows SolidWorks execution endpoint.
 
-The DAG carries one operator value, ``handoff_path``. A linked attempt (``parent_dag_run_id``
-and ``resume_from``) derives the retained package and digest from the parent native job itself.
-Hardware, revision and repository routing resolve inside the serialized Windows job after CAD
-discovery and are confirmed here before publication.
+The DAG carries ``handoff_path`` and an optional ``main_assembly`` (the explicit delivered
+assembly). A linked attempt (``parent_dag_run_id`` and ``resume_from``) derives the retained
+package, digest and selection from the parent native job itself; a supplied selection that
+differs from the parent's is refused instead of being silently discarded. Hardware, revision
+and repository routing resolve inside the serialized Windows job after CAD discovery and are
+confirmed here before publication.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from description_pipeline.orchestration.airflow_client import (
     config_from_airflow_connection,
     native_run_id,
     resolved_routing,
+    validate_main_assembly,
 )
 from description_pipeline.stages import (
     STAGE_IDS,
@@ -61,6 +64,35 @@ def _linked_conf(context) -> dict | None:
     if not (isinstance(parent, str) and parent.strip() and isinstance(stage, str) and stage in STAGE_IDS):
         raise AirflowFailException("A linked attempt requires parent_dag_run_id and a canonical resume_from stage")
     return {"parent_run": native_run_id(parent.strip()), "from_stage": stage}
+
+
+def _param_selection(context) -> str | None:
+    """The explicit main assembly of this trigger, validated, or None when absent."""
+
+    value = context["params"].get("main_assembly")
+    if value is None or value == "":
+        return None
+    return validate_main_assembly(value)
+
+
+def _linked_selection(parent_value, supplied) -> str | None:
+    """A linked attempt's effective selection: inherit the parent, or an explicitly equal value.
+
+    The parent job remains the single authority for its checkpoints; a supplied different
+    selection would describe a run the retained discovery cannot serve, so it is refused
+    rather than replaced by the parent's value (which would let the stored conf lie).
+    """
+
+    parent_selection = parent_value if isinstance(parent_value, str) and parent_value else None
+    if supplied is None or supplied == "":
+        return parent_selection
+    supplied = validate_main_assembly(supplied)
+    if supplied != parent_selection:
+        raise AirflowFailException(
+            "A linked attempt must keep the parent's main assembly selection "
+            f"({parent_selection!r} != {supplied!r}); restore it or start a new run"
+        )
+    return supplied
 
 
 def _resolution(request: dict) -> HandoffResolution:
@@ -113,6 +145,8 @@ def _same_request(job: dict, request: dict) -> None:
     expected = {key: request[key] for key in ("run_id", "package", "handoff_sha256")}
     if request.get("resume") is not None:
         expected["resume"] = request["resume"]
+    if request.get("main_assembly") is not None:
+        expected["main_assembly"] = request["main_assembly"]
     if job.get("request") != expected:
         raise AirflowFailException("Endpoint job differs from the requested mechanical handoff")
 
@@ -143,6 +177,16 @@ def _same_request(job: dict, request: dict) -> None:
                 "imported before the run starts)"
             ),
         ),
+        "main_assembly": Param(
+            "",
+            type="string",
+            title="Delivered main assembly",
+            description=(
+                "Optional explicit delivered assembly: a .SLDASM relative path inside the "
+                "engineering folder (top folder excluded). Authoritative for entry selection "
+                "when provided."
+            ),
+        ),
     },
 )
 def solidworks_to_urdf():
@@ -164,16 +208,22 @@ def solidworks_to_urdf():
                 package,
                 CONN_ID,
             )
-            return {
+            request = {
                 "run_id": _run_uuid(context),
                 "package": package,
                 "handoff_sha256": digest_value,
                 "conn_id": CONN_ID,
                 "resume": linked,
             }
+            selection = _linked_selection(retained.get("main_assembly"), context["params"].get("main_assembly"))
+            if selection is not None:
+                request["main_assembly"] = selection
+                log.info("linked attempt main_assembly=%s", selection)
+            return request
         handoff_path = str(context["params"]["handoff_path"]).strip()
         if not handoff_path:
             raise AirflowFailException("handoff_path is required")
+        selection = _param_selection(context)
         resolved = _endpoint(CONN_ID).resolve_handoff(handoff_path)
         run_id = _run_uuid(context)
         log.info(
@@ -183,12 +233,16 @@ def solidworks_to_urdf():
             resolved.handoff_sha256,
             CONN_ID,
         )
-        return {
+        request = {
             "run_id": run_id,
             "package": resolved.package,
             "handoff_sha256": resolved.handoff_sha256,
             "conn_id": CONN_ID,
         }
+        if selection is not None:
+            request["main_assembly"] = selection
+            log.info("resolved main_assembly=%s", selection)
+        return request
 
     @task(doc_md="Submit the same UUID and frozen handoff to the serial Windows queue; retries never replay CAD.")
     def start_job(request: dict) -> dict:
@@ -196,6 +250,7 @@ def solidworks_to_urdf():
             run_id=request["run_id"],
             resolution=_resolution(request),
             resume=request.get("resume"),
+            main_assembly=request.get("main_assembly"),
         )
         log.info("started run_id=%s status=%s", job["run_id"], job["status"])
         return {**request, "status": job["status"]}

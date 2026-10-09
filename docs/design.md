@@ -89,6 +89,13 @@ shows the six-step contract; task logs show live states and terminal QC details;
 operator page shows each step's inputs, input QC, outputs, output QC and evidence.
 `reports/stages.json` retains the detailed run receipt.
 
+When a folder contains more than one saved `.SLDASM`, the page always lists their
+relative paths and requires the operator to choose the main assembly before the run
+starts (a single assembly is selected automatically). The choice travels with the
+frozen handoff and its evidence, is reused by retries and reruns, and resolves only
+which assembly is the entry — every identity, dependency and physical check still
+applies to the native data.
+
 ## 3. How engineering is organized
 
 | Repository or system | Responsibility |
@@ -163,7 +170,8 @@ and model facts remain outside tool code.
 2. Save the delivery configuration and collect a controlled version with its dependencies.
 3. Sign in, choose the complete engineering folder in the page (Chrome or Edge)
    and start the run; the browser uploads it to the platform before anything is
-   frozen.
+   frozen. If the folder contains several assemblies, choose the main one when the
+   page asks.
 4. Inspect all six steps and their checks; correct engineering findings at their source.
 5. Review the verified URDF, evidence and PR, and complete engineering confirmations.
 6. Approve the intended uses and freeze the model release.
