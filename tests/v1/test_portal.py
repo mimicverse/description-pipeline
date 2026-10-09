@@ -590,6 +590,14 @@ class PortalTests(unittest.TestCase):
                 self.assertEqual(status, expected, body)
                 if expected == 200:
                     self.assertEqual(json.loads(body)["user"], "A" * boundary)
+        for malformed in ("cli:tenant:ou:worker", "cli:tenant:ou worker", "not-a-principal"):
+            with self.subTest(principal=malformed):
+                token = "airflow-malformed-principal"
+                self.airflow.profiles[token] = _feishu_profile("崔工", malformed, "ou_boundary")
+                client = PortalClient(self.client.base)
+                client.jar.set_cookie(_airflow_token_cookie(token))
+                status, _, body = client.request("GET", "/api/session")
+                self.assertEqual(status, 502, body)
 
     def test_recorded_name_round_trips_unicode_and_delimiter(self) -> None:
         name = "崔|工🙂"

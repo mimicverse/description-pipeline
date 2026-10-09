@@ -40,7 +40,12 @@ if AIRFLOW_AVAILABLE:
     from airflow.models.revoked_token import RevokedToken
 
     from description_pipeline.orchestration import feishu_auth as auth
-    from description_pipeline.orchestration.feishu_oauth import STATE_COOKIE, state_digest
+    from description_pipeline.orchestration.feishu_oauth import (
+        STATE_COOKIE,
+        TRIGGERING_USER_NAME_DELIMITER,
+        TRIGGERING_USER_NAME_LIMIT,
+        state_digest,
+    )
 
 JWT_SECRET = "feishu-auth-manager-tests-" + "0" * 40
 
@@ -247,7 +252,12 @@ class FeishuAuthManagerTests(unittest.TestCase):
         allowed = auth.DagDetails(id=auth.ALLOWED_DAG_ID)
         other = auth.DagDetails(id="some_other_dag")
         self.assertTrue(manager.is_authorized_dag(method="GET", user=operator, details=allowed))
-        self.assertTrue(manager.is_authorized_dag(method="POST", user=operator, details=allowed))
+        self.assertTrue(
+            manager.is_authorized_dag(
+                method="POST", user=operator, details=allowed, access_entity=auth.DagAccessEntity.RUN
+            )
+        )
+        self.assertFalse(manager.is_authorized_dag(method="POST", user=operator, details=allowed))
         self.assertFalse(
             manager.is_authorized_dag(
                 method="POST", user=operator, details=allowed, access_entity=auth.DagAccessEntity.TASK_INSTANCE
@@ -276,9 +286,9 @@ class FeishuAuthManagerTests(unittest.TestCase):
         # Airflow records get_name() as triggering_user_name: the stable principal plus the
         # Feishu-verified display name, as the auth-owned delimiter+JSON envelope.
         envelope = manager.deserialize_user(token).get_name()
-        principal, delimiter, encoded = envelope.partition(auth.TRIGGERING_USER_NAME_DELIMITER)
+        principal, delimiter, encoded = envelope.partition(TRIGGERING_USER_NAME_DELIMITER)
         self.assertEqual(principal, "cli_app:tenant-a:ou_worker")
-        self.assertEqual(delimiter, auth.TRIGGERING_USER_NAME_DELIMITER)
+        self.assertEqual(delimiter, TRIGGERING_USER_NAME_DELIMITER)
         self.assertEqual(json.loads(encoded), "崔工")
         with self.assertRaises(ValueError):
             manager.deserialize_user({**token, "tenant_key": "tenant-b"})
@@ -287,6 +297,13 @@ class FeishuAuthManagerTests(unittest.TestCase):
             manager.deserialize_user({**token, "app_id": "cli_replaced"})
         with self.assertRaises(ValueError):
             manager.deserialize_user({"sub": "ou_worker", "app_id": "cli_app", "tenant_key": ""})
+        for field in ("sub", "app_id", "tenant_key"):
+            for value in (None, 123, True, [], {}):
+                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                    manager.deserialize_user({**token, field: value})
+        for open_id in ("ou:worker", "ou worker", "ou|worker", "ou\x00worker"):
+            with self.subTest(open_id=open_id), self.assertRaises(ValueError):
+                manager.deserialize_user({**token, "sub": open_id})
         # A role claim in the token is ignored; administration is the configured allowlist only.
         impersonation = {**token, "role": "ADMIN"}
         self.assertEqual(manager.role_of(manager.deserialize_user(impersonation)), auth.ROLE_OPERATOR)
@@ -307,10 +324,10 @@ class FeishuAuthManagerTests(unittest.TestCase):
         self.assertEqual(normalized.name, "é")
         self.assertEqual(normalized.get_name(), 'cli_app:tenant-a:ou_worker|"é"')
         # The exact metadata-column boundary: 512 characters accepted, 513 refused.
-        boundary = auth.TRIGGERING_USER_NAME_LIMIT - len("cli_app:tenant-a:ou_worker") - 1 - 2
+        boundary = TRIGGERING_USER_NAME_LIMIT - len("cli_app:tenant-a:ou_worker") - 1 - 2
         self.assertEqual(
             len(manager.deserialize_user({**token, "name": "A" * boundary}).get_name()),
-            auth.TRIGGERING_USER_NAME_LIMIT,
+            TRIGGERING_USER_NAME_LIMIT,
         )
         with self.assertRaises(ValueError):
             manager.deserialize_user({**token, "name": "A" * (boundary + 1)})
@@ -323,54 +340,49 @@ class FeishuAuthManagerTests(unittest.TestCase):
         token = manager.serialize_user(worker)
 
         def decode(value: str) -> str:
-            principal, delimiter, encoded = value.partition(auth.TRIGGERING_USER_NAME_DELIMITER)
+            principal, delimiter, encoded = value.partition(TRIGGERING_USER_NAME_DELIMITER)
             self.assertEqual(principal, "cli_app:tenant-a:ou_worker")
-            self.assertEqual(delimiter, auth.TRIGGERING_USER_NAME_DELIMITER)
+            self.assertEqual(delimiter, TRIGGERING_USER_NAME_DELIMITER)
             return json.loads(encoded)
 
         envelope = manager.deserialize_user(token).get_name()
         self.assertEqual(decode(envelope), "崔工")
-        self.assertLessEqual(len(envelope), auth.TRIGGERING_USER_NAME_LIMIT)
+        self.assertLessEqual(len(envelope), TRIGGERING_USER_NAME_LIMIT)
         # Long Unicode names fit the character-based column un-truncated.
         for name in ("A" * 128, "崔" * 128, "🙂" * 128, "崔|工🙂"):
             with self.subTest(name=name[:8]):
                 long_user = dataclasses.replace(worker, name=name)
                 long_envelope = long_user.get_name()
-                self.assertLessEqual(len(long_envelope), auth.TRIGGERING_USER_NAME_LIMIT)
+                self.assertLessEqual(len(long_envelope), TRIGGERING_USER_NAME_LIMIT)
                 self.assertEqual(decode(long_envelope), name)
         # NFC normalization keeps canonically equivalent names in one recorded form.
         self.assertEqual(decode(dataclasses.replace(worker, name="e\u0301").get_name()), "é")
         # A genuine name equal to the open_id is preserved like any other.
         self.assertEqual(decode(dataclasses.replace(worker, name="ou_worker").get_name()), "ou_worker")
         # The exact column boundary: a 512-character actor value is accepted, 513 is refused.
-        boundary = auth.TRIGGERING_USER_NAME_LIMIT - len(worker.get_id()) - 1 - 2
+        boundary = TRIGGERING_USER_NAME_LIMIT - len(worker.get_id()) - 1 - 2
         exact = dataclasses.replace(worker, name="A" * boundary).get_name()
-        self.assertEqual(len(exact), auth.TRIGGERING_USER_NAME_LIMIT)
+        self.assertEqual(len(exact), TRIGGERING_USER_NAME_LIMIT)
         self.assertEqual(decode(exact), "A" * boundary)
         with self.assertRaises(ValueError):
             dataclasses.replace(worker, name="A" * (boundary + 1)).get_name()
         # Missing, control, bidi and surrogate names are rejected.
         for name in ("", "bad\nname", "evil\u202egniht", "bad\ud800name"):
-            with self.subTest(name=repr(name[:12])):
-                with self.assertRaises(ValueError):
-                    dataclasses.replace(worker, name=name).get_name()
+            with self.subTest(name=repr(name[:12])), self.assertRaises(ValueError):
+                dataclasses.replace(worker, name=name).get_name()
         # Sign-in fails closed for the same reasons instead of deferring to trigger time.
         from description_pipeline.orchestration.feishu_oauth import FeishuIdentity
 
         for name in ("", "A" * (boundary + 1)):
             with self.subTest(sign_in=repr(name[:12])), self.assertRaises(auth.FeishuAuthError):
-                manager._user(
-                    FeishuIdentity(open_id="ou_worker", name=name, avatar_url="", tenant_key="tenant-a")
-                )
+                manager._user(FeishuIdentity(open_id="ou_worker", name=name, avatar_url="", tenant_key="tenant-a"))
         self.assertEqual(
             len(
                 manager._user(
-                    FeishuIdentity(
-                        open_id="ou_worker", name="A" * boundary, avatar_url="", tenant_key="tenant-a"
-                    )
+                    FeishuIdentity(open_id="ou_worker", name="A" * boundary, avatar_url="", tenant_key="tenant-a")
                 ).get_name()
             ),
-            auth.TRIGGERING_USER_NAME_LIMIT,
+            TRIGGERING_USER_NAME_LIMIT,
         )
         # A genuine name equal to the open_id still signs in.
         same_identity = manager._user(
@@ -409,7 +421,13 @@ class FeishuAuthManagerTests(unittest.TestCase):
             core_security.requires_access_dag("POST", auth.DagAccessEntity.RUN, auth.ALLOWED_DAG_ID)(request, operator)
             for entity in (auth.DagAccessEntity.TASK_INSTANCE, auth.DagAccessEntity.XCOM, None):
                 core_security.requires_access_dag("GET", entity, auth.ALLOWED_DAG_ID)(request, operator)
-            for method, entity in (("DELETE", None), ("POST", auth.DagAccessEntity.TASK_INSTANCE)):
+            for method, entity in (
+                ("DELETE", None),
+                ("POST", auth.DagAccessEntity.TASK_INSTANCE),
+                ("PUT", auth.DagAccessEntity.RUN),
+                ("DELETE", auth.DagAccessEntity.RUN),
+                ("POST", None),
+            ):
                 with self.assertRaises(HTTPException) as caught:
                     core_security.requires_access_dag(method, entity, auth.ALLOWED_DAG_ID)(request, operator)
                 self.assertEqual(caught.exception.status_code, 403)

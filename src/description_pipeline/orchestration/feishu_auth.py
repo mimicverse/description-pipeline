@@ -38,8 +38,6 @@ from airflow.api_fastapi.common.types import MenuItem
 
 from description_pipeline.orchestration.feishu_oauth import (
     STATE_COOKIE,
-    TRIGGERING_USER_NAME_DELIMITER,
-    TRIGGERING_USER_NAME_LIMIT,
     FeishuAuthError,
     FeishuConfigError,
     FeishuIdentity,
@@ -210,11 +208,10 @@ class FeishuAuthManager(BaseAuthManager[FeishuUser]):
         settings = self.settings
         if settings is None:
             raise ValueError("Feishu SSO is not configured")
-        open_id = str(token.get("sub") or "").strip()
-        app_id = str(token.get("app_id") or "").strip()
-        tenant_key = str(token.get("tenant_key") or "").strip()
-        if not open_id or not app_id or not tenant_key:
+        identity = (token.get("sub"), token.get("app_id"), token.get("tenant_key"))
+        if any(not isinstance(value, str) or not value.strip() for value in identity):
             raise ValueError("token carries no Feishu identity")
+        open_id, app_id, tenant_key = (value.strip() for value in identity)
         if app_id != settings.app_id:
             raise ValueError("token was issued for a different Feishu enterprise app")
         if tenant_key not in settings.tenant_keys:
@@ -372,10 +369,8 @@ class FeishuAuthManager(BaseAuthManager[FeishuUser]):
             return False
         if method == "GET":
             return True
-        # Every read of this one DAG is allowed, and so is the DagAccessEntity.RUN write path the
-        # pinned REST uses for both manual triggers and backfill creation of this DAG; every other
-        # write stays admin-only.
-        return method == "POST" and access_entity in (None, DagAccessEntity.RUN)
+        # Operators may create runs; changes to existing runs remain administrator-only.
+        return method == "POST" and access_entity is DagAccessEntity.RUN
 
     def is_authorized_configuration(
         self, *, method: ResourceMethod, user: FeishuUser, details: ConfigurationDetails | None = None

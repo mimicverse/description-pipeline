@@ -39,6 +39,7 @@ import hmac
 import hashlib
 import json
 import os
+import re
 import secrets
 import stat
 import unicodedata
@@ -53,6 +54,7 @@ FEISHU_TOKEN_URL = "https://accounts.feishu.cn/oauth/v3/token"
 FEISHU_USERINFO_URL = "https://open.feishu.cn/open-apis/authen/v1/user_info"
 DEFAULT_STATE_TTL = 300.0
 STATE_COOKIE = "feishu_oauth_state"
+_COMPOUND_PRINCIPAL = re.compile(r"[^:\s|]+(?::[^:\s|]+){2}\Z")
 #: Unicode categories that may not appear in a display name: control, format (for example the
 #: bidi overrides), surrogate and line/paragraph separators.
 UNSAFE_NAME_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
@@ -84,6 +86,15 @@ def recorded_display_name(value: object) -> str:
     return name
 
 
+def valid_actor_principal(value: object) -> bool:
+    """A printable, opaque app/tenant/user identity with exactly three components."""
+    return (
+        isinstance(value, str)
+        and _COMPOUND_PRINCIPAL.fullmatch(value) is not None
+        and not any(unicodedata.category(character) in UNSAFE_NAME_CATEGORIES for character in value)
+    )
+
+
 def build_actor_name(principal: str, name: str) -> str:
     """The auth-owned actor value: stable principal plus recorded display name.
 
@@ -91,6 +102,8 @@ def build_actor_name(principal: str, name: str) -> str:
     silently recording a run without its submitter named, or an actor value the pinned metadata
     column cannot hold.
     """
+    if not valid_actor_principal(principal):
+        raise ValueError("Feishu actor requires a valid app, tenant and user identity")
     recorded = recorded_display_name(name)
     envelope = f"{principal}{TRIGGERING_USER_NAME_DELIMITER}{json.dumps(recorded, ensure_ascii=False)}"
     if len(envelope) > TRIGGERING_USER_NAME_LIMIT:

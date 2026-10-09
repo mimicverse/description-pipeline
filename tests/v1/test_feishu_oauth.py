@@ -20,6 +20,7 @@ from description_pipeline.orchestration.feishu_oauth import (
     FeishuAuthError,
     FeishuConfigError,
     FeishuSettings,
+    build_actor_name,
     build_authorize_url,
     exchange_code,
     fetch_identity,
@@ -62,6 +63,25 @@ class _Recorder:
 
 
 class FeishuCoreTests(unittest.TestCase):
+    def test_actor_identity_rejects_malformed_principals_without_restricting_opaque_ids(self) -> None:
+        for principal in ("cli_app:tenant-a:ou_worker", "cli.app:租户:opaque.user"):
+            with self.subTest(principal=principal):
+                self.assertEqual(build_actor_name(principal, "崔工"), f'{principal}|"崔工"')
+        for principal in (
+            None,
+            123,
+            "",
+            "not-a-principal",
+            "cli:ou",
+            "cli:tenant:ou:worker",
+            "cli:tenant:ou worker",
+            "cli:tenant:ou|worker",
+            "cli:tenant:ou\x00worker",
+            "cli:tenant:ou\u202eworker",
+        ):
+            with self.subTest(principal=repr(principal)), self.assertRaises(ValueError):
+                build_actor_name(principal, "崔工")
+
     def settings(self, tmp: str, **overrides) -> FeishuSettings:
         secret = Path(tmp) / "feishu.json"
         secret.write_text(json.dumps({"app_id": "cli_app", "app_secret": "s3cret"}), encoding="utf-8")
@@ -197,18 +217,12 @@ class FeishuCoreTests(unittest.TestCase):
         self.assertEqual(good.requests[0]["headers"]["authorization"], "Bearer u-token")
         self.assertEqual(good.requests[0]["headers"]["content-type"], "application/json; charset=utf-8")
         # en_name is honored and the name is NFC-normalized.
-        en_only = _Recorder(
-            {"code": 0, "data": {"open_id": "ou_x", "tenant_key": "tenant-a", "en_name": "Cui"}}
-        )
+        en_only = _Recorder({"code": 0, "data": {"open_id": "ou_x", "tenant_key": "tenant-a", "en_name": "Cui"}})
         self.assertEqual(fetch_identity(settings, "u-token", opener=en_only).name, "Cui")
-        combining = _Recorder(
-            {"code": 0, "data": {"open_id": "ou_x", "tenant_key": "tenant-a", "name": "e\u0301"}}
-        )
+        combining = _Recorder({"code": 0, "data": {"open_id": "ou_x", "tenant_key": "tenant-a", "name": "e\u0301"}})
         self.assertEqual(fetch_identity(settings, "u-token", opener=combining).name, "é")
         # A genuine display name is preserved even when it equals the open_id (no heuristic).
-        equals = _Recorder(
-            {"code": 0, "data": {"open_id": "ou_x", "tenant_key": "tenant-a", "name": "ou_x"}}
-        )
+        equals = _Recorder({"code": 0, "data": {"open_id": "ou_x", "tenant_key": "tenant-a", "name": "ou_x"}})
         self.assertEqual(fetch_identity(settings, "u-token", opener=equals).name, "ou_x")
         # A missing, control, format or bidi name is refused; the open_id is never substituted.
         for bad_name in (

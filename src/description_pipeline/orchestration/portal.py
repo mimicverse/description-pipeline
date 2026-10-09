@@ -50,10 +50,12 @@ from .airflow_client import (
     verified_result,
 )
 from .feishu_oauth import (
+    TRIGGERING_USER_NAME_DELIMITER,
     TRIGGERING_USER_NAME_LIMIT,
     build_actor_name,
     recorded_display_name,
     sanitize_display_name,
+    valid_actor_principal,
 )
 
 log = logging.getLogger(__name__)
@@ -66,15 +68,6 @@ AIRFLOW_TOKEN_COOKIE = "_token"
 _AIRFLOW_TIMEOUT = 20.0
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _RUN_ID = re.compile(r"[A-Za-z0-9_.:-]{1,250}\Z")
-#: The Feishu auth manager stamps ``<principal>|<json name>`` into
-#: ``DagRun.triggering_user_name``; kept in sync with
-#: ``feishu_auth.TRIGGERING_USER_NAME_DELIMITER``. Only the delimiter is structural; the JSON
-#: quoting keeps names containing it or any Unicode round-tripping losslessly.
-_ACTOR_DELIMITER = "|"
-#: Exactly three non-empty colon-separated parts, matching the compound principal the Feishu
-#: auth manager builds. No invented identifier charset: whatever the auth source accepted is
-#: parsed consistently, so a recorded name is never discarded over formatting guesswork.
-_COMPOUND_PRINCIPAL = re.compile(r"[^:\s|]+(?::[^:\s|]+){2}\Z")
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 _ARTIFACT_TYPES = {
     ".urdf": "application/xml",
@@ -397,7 +390,6 @@ def load_portal_config(path: Path) -> PortalConfig:
 class PortalRun:
     dag_run_id: str
     handoff_path: str
-    user: str
     principal: str
     started_at: float
 
@@ -420,8 +412,8 @@ def _actor_identity(actor: object) -> tuple[str | None, str | None]:
     if len(text) > TRIGGERING_USER_NAME_LIMIT:
         # An actor value the metadata column could never hold is damaged, not a name source.
         return text, None
-    principal, delimiter, encoded = text.partition(_ACTOR_DELIMITER)
-    if delimiter and _COMPOUND_PRINCIPAL.fullmatch(principal):
+    principal, delimiter, encoded = text.partition(TRIGGERING_USER_NAME_DELIMITER)
+    if delimiter and valid_actor_principal(principal):
         try:
             name = sanitize_display_name(json.loads(encoded))
         except ValueError:
@@ -803,7 +795,6 @@ class PortalApp:
             self._runs[dag_run_id] = PortalRun(
                 dag_run_id=dag_run_id,
                 handoff_path=handoff_path,
-                user=session.user,
                 principal=session.principal,
                 started_at=time.time(),
             )
