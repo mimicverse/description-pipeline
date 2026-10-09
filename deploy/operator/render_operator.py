@@ -204,6 +204,7 @@ def ensure_portal_config(state: Path, resolved: dict[str, str]) -> Path:
         ("@OPERATOR_UPSTREAM_HOST@", resolved["PORTAL_HOST"]),
         ("@OPERATOR_UPSTREAM_PORT@", resolved["PORTAL_PORT"]),
         ("@ENDPOINT_TOKEN_FILE@", resolved["ENDPOINT_TOKEN_FILE"]),
+        ("@OPERATOR_UPLOAD_ROOT@", resolved["SOLIDWORKS_HANDOFF_ROOT"]),
     ):
         rendered = rendered.replace(token, value)
     write_private(target, rendered)

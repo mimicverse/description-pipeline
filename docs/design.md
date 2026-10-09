@@ -141,16 +141,19 @@ artifacts are never edited. Every terminal native failure requires a new run
 after correcting the inputs or configuration. Administrators retain broader
 platform administration beyond this action.
 
-Maintainers configure storage roots and hardware routing once; operators provide
-one accessible folder path. Deployment settings and model facts remain outside
-tool code.
+Maintainers configure storage roots and hardware routing once; operators choose
+one complete engineering folder on their own computer in the page, and the
+platform uploads it to its managed intake before freezing. Deployment settings
+and model facts remain outside tool code.
 
 ## 4. How to operate
 
 1. Complete the native design and engineering checks under the
    [mechanical specification](mechanical-handoff-spec.md).
 2. Save the delivery configuration and collect a controlled version with its dependencies.
-3. Sign in, select the engineering directory and start the run.
+3. Sign in, choose the complete engineering folder in the page (Chrome or Edge)
+   and start the run; the browser uploads it to the platform before anything is
+   frozen.
 4. Inspect all six steps and their checks; correct engineering findings at their source.
 5. Review the verified URDF, evidence and PR, and complete engineering confirmations.
 6. Approve the intended uses and freeze the model release.

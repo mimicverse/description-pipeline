@@ -22,7 +22,14 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering",
 ]
-dependencies = ["numpy==2.5.3", "PyYAML==6.0.3", "jsonschema==4.26.0", "packaging==26.3", "mujoco==3.13.0"]
+dependencies = [
+    "numpy==2.5.3",
+    "PyYAML==6.0.3",
+    "jsonschema==4.26.0",
+    "packaging==26.3",
+    "mujoco==3.13.0",
+    "python-multipart==0.0.32",
+]
 
 [project.urls]
 Homepage = "https://github.com/mimicverse/description-pipeline"

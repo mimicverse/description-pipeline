@@ -222,6 +222,7 @@ def inventory(root: Path, *, exclude: tuple[str, ...] = ()) -> dict[str, str]:
         raise PipelineError(f"Symlink in artifact: {root}")
     files = {}
     names = set()
+    directories_seen: dict[str, str] = {}
 
     def scan_error(error: OSError) -> None:
         raise PipelineError(f"Cannot scan artifact directory {error.filename}: {error}") from error
@@ -241,6 +242,15 @@ def inventory(root: Path, *, exclude: tuple[str, ...] = ()) -> dict[str, str]:
             if relative.casefold() in names:
                 raise PipelineError(f"Case-colliding artifact paths: {relative}")
             names.add(relative.casefold())
+            parent_parts = Path(relative).parts[:-1]
+            for index in range(len(parent_parts)):
+                prefix = "/".join(parent_parts[: index + 1])
+                prefix_key = prefix.casefold()
+                prior = directories_seen.get(prefix_key)
+                if prior is None:
+                    directories_seen[prefix_key] = prefix
+                elif prior != prefix:
+                    raise PipelineError(f"Case-colliding artifact paths: {relative}")
             if path.is_symlink() or path.is_junction():
                 raise PipelineError(f"Symlink in artifact: {relative}")
             if not path.is_file():

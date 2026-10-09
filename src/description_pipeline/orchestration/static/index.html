@@ -8,7 +8,10 @@
 </head>
 <body>
   <header class="topbar">
-    <h1>SolidWorks 交付操作台</h1>
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <h1>SolidWorks 交付操作台</h1>
+    </div>
     <div id="account" class="account" hidden>
       <span id="account-user"></span>
       <button id="logout" type="button" class="ghost">退出</button>
@@ -16,61 +19,127 @@
   </header>
 
   <main>
-    <section id="login-card" class="card narrow">
-      <h2>登录</h2>
-      <p class="muted">使用企业飞书账号登录。</p>
-      <a id="feishu-login" class="button" href="/auth/feishu/login">使用飞书登录</a>
-      <p id="login-error" class="error" hidden></p>
+    <section id="login-card" class="login-shell">
+      <div class="card narrow">
+        <h2>登录</h2>
+        <p class="muted">使用企业飞书账号登录。</p>
+        <a id="feishu-login" class="button" href="/auth/feishu/login">使用飞书登录</a>
+        <p id="login-error" class="error" role="alert" hidden></p>
+      </div>
     </section>
 
-    <section id="workspace" hidden>
-      <section class="card">
-        <h2>新建交付运行</h2>
-        <form id="run-form">
-          <label for="handoff-path">工程文件夹</label>
-          <input id="handoff-path" name="handoff_path" placeholder="/共享目录/机器人工程 或 D:\\CAD\\机器人工程" required>
-          <p class="muted">填写平台可访问的 SolidWorks 工程文件夹，其余信息自动读取。</p>
-          <button type="submit" id="start-button">开始</button>
-          <p id="run-error" class="error" hidden></p>
-        </form>
-      </section>
-
-      <section class="card">
-        <h2>最近运行</h2>
+    <section id="workspace" class="workspace" hidden>
+      <aside class="sidebar" aria-label="运行">
+        <button type="button" id="new-run-button" class="button primary sidebar-action">＋ 新建交付</button>
+        <h2 class="sidebar-title">最近运行</h2>
         <ul id="runs" class="runs"><li class="muted">暂无运行</li></ul>
-      </section>
+      </aside>
 
-      <section id="detail-card" class="card" hidden>
-        <h2>运行状态</h2>
-        <dl class="meta" id="run-meta"></dl>
-        <div id="task-progress" class="progress"></div>
-        <div id="retry-panel" class="run-actions" hidden>
-          <button id="retry-button" type="button" hidden>重试</button>
-          <p id="retry-note" class="muted"></p>
-          <p id="retry-error" class="error" role="alert" hidden></p>
-        </div>
-        <h3>六个工程阶段</h3>
-        <p class="muted">每阶段分别显示输入、输入质检、输出与输出质检。未执行、未支持项和待工程确认不代表通过；仅已验证且摘要绑定的 URDF／网格资产提供下载，其余文件为引用与明细。</p>
-        <div id="stages" class="stages"></div>
-        <h3>自动检查</h3>
-        <div id="automatic" class="automatic"></div>
-        <h3>工程确认</h3>
-        <div id="confirmations" class="confirmations"></div>
-        <h3>问题与发现</h3>
-        <ul id="findings" class="findings"></ul>
-        <div id="pr" class="pr" hidden></div>
-      </section>
+      <div class="content">
+        <section id="upload-view" class="card upload-card">
+          <h2>新建交付运行</h2>
+          <p class="muted small">选择本机的完整 SolidWorks 工程文件夹，上传后自动冻结并执行六个工程阶段。</p>
+          <form id="run-form">
+            <input id="folder-input" type="file" webkitdirectory directory multiple class="hidden-input">
+            <label class="dropzone" for="folder-input">
+              <strong>选择工程文件夹…</strong>
+              <span class="muted small">支持 Chrome / Edge；文件夹不会离开本机，直到你点击“开始”。</span>
+            </label>
+            <div class="upload-row">
+              <button type="button" id="choose-button" class="button">选择文件夹…</button>
+              <button type="submit" id="start-button" disabled>开始</button>
+              <button type="button" id="cancel-button" class="ghost" hidden>取消上传</button>
+              <span id="folder-summary" class="folder-summary muted" hidden></span>
+            </div>
+            <p id="upload-status" class="muted" hidden></p>
+            <p id="run-error" class="error" role="alert" hidden></p>
+            <details class="requirements">
+              <summary>文件要求</summary>
+              <p class="muted small">
+                上限：<span id="upload-limits">总大小 2 GB、文件数 4096、单个文件 512 MB</span>（以平台设置为准）。
+                空子文件夹不会上传；包含 ~$ 临时锁文件将被拒绝上传，请先关闭 SolidWorks 或删除后重试；请勿包含平台生成的
+                robot.yaml / cad-revision.json。
+              </p>
+            </details>
+          </form>
+        </section>
 
-      <section id="viewer-card" class="card" hidden>
-        <h2>已验证 URDF</h2>
-        <p class="muted" id="preview-meta"></p>
-        <p class="viewer-note" id="viewer-note" hidden></p>
-        <div id="viewer" class="viewer"></div>
-        <div class="viewer-footer">
-          <div id="joint-controls" class="joint-controls"></div>
-          <button id="reset-joints" type="button" class="ghost">回到零位</button>
-        </div>
-      </section>
+        <section id="detail-card" class="card run-card" hidden>
+          <header class="run-header">
+            <div class="run-title">
+              <span id="run-dot" class="dot idle" aria-hidden="true"></span>
+              <h2 id="run-heading">运行状态</h2>
+              <span id="run-state-label" class="muted"></span>
+            </div>
+            <div class="run-header-side">
+              <span id="run-initiator" class="muted small"></span>
+              <div id="pr" class="pr" hidden></div>
+              <div id="retry-panel" class="run-actions" hidden>
+                <button id="retry-button" type="button" hidden>重试</button>
+                <p id="retry-note" class="muted small"></p>
+                <p id="retry-error" class="error" role="alert" hidden></p>
+              </div>
+            </div>
+          </header>
+
+          <p id="run-error-detail" class="error" role="alert" hidden></p>
+
+          <nav id="stages" class="stepper" aria-label="工程阶段"></nav>
+
+          <div class="run-workspace">
+            <div class="pane pane-preview">
+              <div id="viewer-card" hidden>
+                <div id="viewer" class="viewer"></div>
+                <p class="muted small" id="preview-meta"></p>
+                <p class="viewer-note" id="viewer-note" hidden></p>
+                <div class="viewer-footer">
+                  <div id="joint-controls" class="joint-controls"></div>
+                  <button id="reset-joints" type="button" class="ghost">回到零位</button>
+                </div>
+              </div>
+              <p id="viewer-placeholder" class="muted small viewer-placeholder">仅当独立校验通过的交付可用时，这里显示 URDF 预览。</p>
+            </div>
+
+            <div class="pane pane-inspect">
+              <nav id="inspect-tabs" class="tabs" aria-label="检查视图">
+                <button type="button" class="tab active" data-tab="overview">概览</button>
+                <button type="button" class="tab" data-tab="stage">阶段</button>
+                <button type="button" class="tab" data-tab="checks">检查</button>
+                <button type="button" class="tab" data-tab="engineering">工程</button>
+              </nav>
+
+              <section id="tab-overview" class="tab-pane">
+                <dl class="meta" id="run-meta"></dl>
+                <details class="meta-more">
+                  <summary>运行标识</summary>
+                  <p id="run-ident" class="muted small"></p>
+                </details>
+                <details class="meta-more">
+                  <summary>任务与传输</summary>
+                  <div id="task-progress" class="progress"></div>
+                </details>
+                <h3>问题与发现</h3>
+                <ul id="findings" class="findings"></ul>
+              </section>
+
+              <section id="tab-stage" class="tab-pane" hidden>
+                <p class="muted small">点击上方阶段查看其输入 / 输入质检 / 输出 / 输出质检；证据默认折叠。</p>
+                <div id="stage-detail"></div>
+              </section>
+
+              <section id="tab-checks" class="tab-pane" hidden>
+                <h3>自动检查</h3>
+                <div id="automatic" class="automatic"></div>
+              </section>
+
+              <section id="tab-engineering" class="tab-pane" hidden>
+                <h3>工程确认</h3>
+                <div id="confirmations" class="confirmations"></div>
+              </section>
+            </div>
+          </div>
+        </section>
+      </div>
     </section>
   </main>
 

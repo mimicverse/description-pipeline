@@ -10,6 +10,12 @@ const state = {
   previewRequest: null,
   previewFiles: null,
   lastRun: null,
+  folderPick: null,
+  uploading: false,
+  uploadAbort: null,
+  blockedPick: false,
+  stages: [],
+  selectedStage: null,
   viewer: null,
   controls: null,
   timer: null,
@@ -67,6 +73,132 @@ const RETRY_REASONS = {
 };
 
 const $ = (id) => document.getElementById(id);
+
+const UPLOAD_LIMITS_DEFAULT = {
+  maxFiles: 4096,
+  maxTotalBytes: 2 * 1024 * 1024 * 1024,
+  maxFileBytes: 512 * 1024 * 1024,
+  maxPathLength: 1024,
+};
+const uploadLimits = { ...UPLOAD_LIMITS_DEFAULT };
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes < 0) return "—";
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
+
+function folderLabel(value) {
+  const name = String(value || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop();
+  return name || "";
+}
+
+function normalizeRelativePath(raw) {
+  const path = String(raw || "").replace(/\\/g, "/");
+  const parts = [];
+  for (const part of path.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === ".." || /[\u0000-\u001f]/.test(part) || /[<>"|?*:]/.test(part)) return null;
+    if (part.length > 255 || part.endsWith(".") || part.endsWith(" ")) return null;
+    parts.push(part);
+  }
+  const normalized = parts.join("/");
+  if (!normalized || normalized.length > uploadLimits.maxPathLength) return null;
+  return normalized;
+}
+
+function applyUploadLimits(advertised) {
+  const limits = advertised && typeof advertised === "object" ? advertised : {};
+  const files = Number(limits.max_files);
+  const bytes = Number(limits.max_bytes);
+  const fileBytes = Number(limits.max_file_bytes);
+  if (Number.isFinite(files) && files > 0) uploadLimits.maxFiles = Math.floor(files);
+  if (Number.isFinite(bytes) && bytes > 0) uploadLimits.maxTotalBytes = Math.floor(bytes);
+  if (Number.isFinite(fileBytes) && fileBytes > 0) uploadLimits.maxFileBytes = Math.floor(fileBytes);
+  const label = $("upload-limits");
+  if (label) {
+    label.textContent = `总大小 ${formatBytes(uploadLimits.maxTotalBytes)}、文件数 ${uploadLimits.maxFiles}、单个文件 ${formatBytes(uploadLimits.maxFileBytes)}`;
+  }
+}
+
+function folderPick(files) {
+  const records = [];
+  let top = null;
+  let bytes = 0;
+  for (const file of files) {
+    const path = normalizeRelativePath(file.webkitRelativePath || file.name);
+    if (!path) return { error: `存在不受支持的文件名：${String(file.name || "").slice(0, 120)}` };
+    const name = path.split("/").pop() || "";
+    if (name.startsWith("~$")) {
+      return { error: "包含 ~$ 临时锁文件将拒绝上传：请关闭 SolidWorks 或删除这些文件后重试。" };
+    }
+    const first = path.split("/")[0];
+    if (top === null) top = first;
+    if (first !== top) return { error: "所选内容来自多个顶层文件夹，请一次选择一个完整的工程文件夹。" };
+    records.push({ file, path });
+    bytes += file.size;
+  }
+  if (!records.length || !top) return { error: "所选文件夹中没有可上传的文件。" };
+  if (records.length > uploadLimits.maxFiles) return { error: `文件数量超出上限（${uploadLimits.maxFiles}）。` };
+  if (bytes > uploadLimits.maxTotalBytes) return { error: `文件夹总大小超出上限（${formatBytes(uploadLimits.maxTotalBytes)}）。` };
+  const oversized = records.find((item) => item.file.size > uploadLimits.maxFileBytes);
+  if (oversized) return { error: `单个文件超出上限（${formatBytes(uploadLimits.maxFileBytes)}）：${oversized.path.slice(0, 120)}` };
+  return { records, top, count: records.length, bytes };
+}
+
+function submitRun(pick, { onProgress } = {}) {
+  return new Promise((resolve, reject) => {
+    const form = new FormData();
+    for (const item of pick.records) form.append("files", item.file, item.path);
+    const request = new XMLHttpRequest();
+    request.open("POST", "/api/runs");
+    request.withCredentials = true;
+    request.setRequestHeader("Accept", "application/json");
+    if (state.csrf) request.setRequestHeader("X-CSRF-Token", state.csrf);
+    request.upload.addEventListener("progress", (event) => {
+      if (event.lengthComputable) onProgress(event.loaded / event.total);
+    });
+    request.addEventListener("load", () => {
+      let payload = {};
+      try {
+        payload = JSON.parse(request.responseText || "{}");
+      } catch {
+        payload = {};
+      }
+      if (request.status >= 200 && request.status < 300) {
+        resolve(payload);
+        return;
+      }
+      const error = new Error(payload.error || `上传失败（HTTP ${request.status}）`);
+      error.status = request.status;
+      if (payload && payload.dag_run_id) error.dagRunId = String(payload.dag_run_id);
+      reject(error);
+    });
+    request.addEventListener("error", () => {
+      const error = new Error("网络中断，上传响应未收到；如已提交成功，请在运行列表中确认，系统不会自动重试。");
+      error.network = true;
+      reject(error);
+    });
+    request.addEventListener("abort", () => {
+      const error = new Error("已取消上传。");
+      error.aborted = true;
+      reject(error);
+    });
+    state.uploadAbort = { abort: () => request.abort() };
+    request.send(form);
+  });
+}
+
+function resetPick() {
+  state.folderPick = null;
+  state.blockedPick = false;
+  $("folder-input").value = "";
+  $("folder-summary").hidden = true;
+  $("upload-status").hidden = true;
+  $("start-button").disabled = true;
+}
 
 async function api(path, { method = "GET", body, signal } = {}) {
   const headers = { Accept: "application/json" };
@@ -126,6 +258,7 @@ function formatTime(value) {
 function showSession(session) {
   state.user = session.user;
   state.csrf = session.csrf_token;
+  applyUploadLimits(session.upload_limits);
   $("login-card").hidden = true;
   $("workspace").hidden = false;
   $("account").hidden = false;
@@ -140,6 +273,7 @@ function clearPreview() {
   state.controls = null;
   if (state.viewer) disposeRobot(state.viewer);
   $("viewer-card").hidden = true;
+  $("viewer-placeholder").hidden = false;
   $("preview-meta").textContent = "";
   $("viewer-note").hidden = true;
   $("joint-controls").textContent = "";
@@ -179,14 +313,14 @@ async function refreshRuns() {
       if (run.dag_run_id === state.dagRunId) item.className = "selected";
       const button = document.createElement("button");
       button.type = "button";
-      const folder = String(run.handoff_path || "工程交付").replace(/[\\/]+$/, "").split(/[\\/]/).pop();
+      const folder = folderLabel(run.handoff_path) || "工程交付";
       const heading = document.createElement("span");
       heading.textContent = `${folder} · ${RUN_STATES[run.state] || run.state || "待执行"}`;
       const submitter = document.createElement("span");
       submitter.className = "run-submitter";
       submitter.textContent = `发起人：${run.user || "未记录"}`;
       button.append(heading, submitter);
-      button.title = `${run.handoff_path || ""}\n${run.dag_run_id}`;
+      button.title = `${folder}\n${run.dag_run_id}`;
       button.addEventListener("click", () => selectRun(run.dag_run_id));
       item.append(button);
       list.append(item);
@@ -196,8 +330,78 @@ async function refreshRuns() {
   }
 }
 
+function stageDotState(state) {
+  if (state === "completed") return "ok";
+  if (state === "failed" || state === "blocked") return "bad";
+  if (state === "running") return "run";
+  return "idle";
+}
+
+function runDotState(state) {
+  if (state === "success") return "ok";
+  if (state === "failed") return "bad";
+  if (state === "running") return "run";
+  return "idle";
+}
+
+function showUploadView() {
+  $("upload-view").hidden = false;
+  $("detail-card").hidden = true;
+}
+
+function showRunView() {
+  $("upload-view").hidden = true;
+  $("detail-card").hidden = false;
+  if (state.viewer) {
+    requestAnimationFrame(() => {
+      state.viewer.resize?.();
+      state.viewer.frame();
+    });
+  }
+}
+
+function selectInspectTab(name) {
+  for (const tab of ["overview", "stage", "checks", "engineering"]) {
+    const pane = $(`tab-${tab}`);
+    if (pane) pane.hidden = tab !== name;
+  }
+  for (const button of document.querySelectorAll("#inspect-tabs .tab")) {
+    button.classList.toggle("active", button.dataset.tab === name);
+  }
+}
+
+function renderStepper() {
+  const stepper = $("stages");
+  stepper.textContent = "";
+  state.stages.forEach((stage, index) => {
+    const step = document.createElement("button");
+    step.type = "button";
+    step.className = `step ${stage.state || ""}${index === state.selectedStage ? " selected" : ""}`.trim();
+    step.setAttribute("aria-pressed", index === state.selectedStage ? "true" : "false");
+    const dot = document.createElement("span");
+    dot.className = `dot ${stageDotState(stage.state)}`;
+    const label = document.createElement("span");
+    label.className = "step-label";
+    label.textContent = stage.name_zh || stage.name;
+    const meta = document.createElement("span");
+    meta.className = "step-meta";
+    meta.textContent = `${stage.checks_passed}/${stage.checks_total}`;
+    step.append(dot, label, meta);
+    step.addEventListener("click", () => {
+      state.selectedStage = index;
+      if (state.lastRun) renderRun(state.lastRun);
+      selectInspectTab("stage");
+    });
+    stepper.append(step);
+  });
+}
+
 function renderRun(run) {
   const runId = String(run.dag_run_id || "");
+  $("run-heading").textContent = folderLabel(run.handoff_path) || "工程文件夹";
+  $("run-state-label").textContent = RUN_STATES[run.state] || run.state || "";
+  $("run-dot").className = `dot ${runDotState(run.state)}`;
+  $("run-initiator").textContent = `发起人：${run.operator || run.user || "未记录"}`;
   const authorized = state.previewFiles || {};
   const artifactUrl = (name) =>
     `/api/runs/${encodeURIComponent(runId)}/artifacts/${String(name)
@@ -228,14 +432,15 @@ function renderRun(run) {
   };
   const meta = $("run-meta");
   meta.textContent = "";
+  state.reference = reference;
   const rows = [
-    ["运行标识", run.dag_run_id],
-    ["发起人", run.operator || "未记录"],
-    ["工程文件夹", run.handoff_path || "—"],
+    ["工程文件夹", folderLabel(run.handoff_path) || "—"],
     ["状态", RUN_STATES[run.state] || run.state || "—"],
     ["开始时间", formatTime(run.started_at)],
     ["结束时间", formatTime(run.ended_at)],
   ];
+  const ident = $("run-ident");
+  if (ident) ident.textContent = runId;
   for (const [label, value] of rows) {
     const dt = document.createElement("dt");
     dt.textContent = label;
@@ -264,23 +469,31 @@ function renderRun(run) {
     progress.append(chip);
   }
 
-  const stages = $("stages");
-  stages.textContent = "";
-  for (const [index, stage] of ((run.stage_view && run.stage_view.stages) || []).entries()) {
-    const item = document.createElement("section");
-    item.className = `stage-card ${stage.state}`;
-    const heading = document.createElement("h4");
-    heading.textContent = `${index + 1}. ${stage.name_zh || stage.name} · ${STAGE_STATES[stage.state] || stage.state} · ${stage.checks_passed}/${stage.checks_total} 项`;
+  state.stages = (run.stage_view && run.stage_view.stages) || [];
+  const attention = state.stages.findIndex((stage) => stage.state === "failed" || stage.state === "blocked" || stage.state === "running");
+  state.selectedStage = Number.isInteger(state.selectedStage) && state.selectedStage >= 0 && state.selectedStage < state.stages.length
+    ? state.selectedStage
+    : attention === -1 ? 0 : attention;
+  renderStepper();
+  const detailRoot = $("stage-detail");
+  detailRoot.textContent = "";
+  for (const stage of state.stages.slice(state.selectedStage, state.selectedStage + 1)) {
+    const item = document.createElement("div");
+    item.className = "stage-body";
+    const body = item;
+    const heading = document.createElement("p");
+    heading.className = "muted small";
+    heading.textContent = `${stage.name_zh || stage.name} · ${STAGE_STATES[stage.state] || stage.state} · ${stage.checks_passed}/${stage.checks_total} 项`;
     item.append(heading);
     if (stage.error) {
       const error = document.createElement("p");
       error.className = "error";
       error.textContent = stage.error;
-      item.append(error);
+      body.append(error);
       if (stage.diagnostic) {
         const evidence = document.createElement("pre");
         evidence.textContent = JSON.stringify(stage.diagnostic, null, 2);
-        expandable(item, "失败诊断").append(evidence);
+        expandable(body, "失败诊断").append(evidence);
       }
     }
     const grid = document.createElement("div");
@@ -327,7 +540,7 @@ function renderRun(run) {
       }
       grid.append(column);
     }
-    item.append(grid);
+    body.append(grid);
     const evidencePaths = (stage.evidence || []).filter((path) => typeof path === "string" && path);
     if (evidencePaths.length) {
       const evidenceRow = document.createElement("div");
@@ -337,7 +550,7 @@ function renderRun(run) {
         if (position) evidenceRow.append("、");
         evidenceRow.append(reference(path, authorized[path]));
       });
-      item.append(evidenceRow);
+      body.append(evidenceRow);
     }
     const unsupported = (stage.unsupported || []).filter((item) => item && item.label);
     if (unsupported.length) {
@@ -350,15 +563,15 @@ function renderRun(run) {
         chip.textContent = `${item.label} · 不支持/待工程确认`;
         row.append(" ", chip);
       }
-      item.append(row);
+      body.append(row);
     }
     if (stage.confirmations.length) {
       const pending = document.createElement("p");
       pending.className = "muted";
       pending.textContent = `工程确认（在本版本 PR／受控记录中完成）：${stage.confirmations.map((row) => row.label).join("、")} · 待确认`;
-      item.append(pending);
+      body.append(pending);
     }
-    stages.append(item);
+    detailRoot.append(item);
   }
 
   const automatic = $("automatic");
@@ -445,15 +658,16 @@ function renderRun(run) {
     link.href = run.pr.url;
     link.target = "_blank";
     link.rel = "noreferrer noopener";
-    link.textContent = `PR：${run.pr.url}`;
+    link.textContent = "查看 PR";
+    link.title = String(run.pr.url || "");
     pr.append(link);
     const stateText = document.createElement("span");
-    stateText.className = "muted";
-    stateText.textContent = ` · ${run.pr.state || ""} · ${String(run.pr.commit || "").slice(0, 12)}`;
+    stateText.className = "muted small";
+    stateText.textContent = run.pr.state || "";
     pr.append(stateText);
     pr.hidden = false;
   } else if (automaticState === "passed") {
-    pr.textContent = "模型已通过独立校验；PR 尚未创建或发布服务失败，可先查看下方已验证 URDF。";
+    pr.textContent = "模型已通过独立校验；PR 尚未创建或发布服务失败，可先查看左侧已验证 URDF。";
     pr.hidden = false;
   } else {
     pr.hidden = true;
@@ -495,6 +709,7 @@ async function loadPreview(dagRunId) {
     state.previewFiles = preview.files || {};
     if (state.lastRun) renderRun(state.lastRun);
     $("viewer-card").hidden = false;
+    $("viewer-placeholder").hidden = true;
     state.viewer.frame();
   } catch (error) {
     if (request.signal.aborted || state.dagRunId !== dagRunId) return;
@@ -505,6 +720,7 @@ async function loadPreview(dagRunId) {
     if (state.lastRun) renderRun(state.lastRun);
     $("joint-controls").textContent = "";
     $("viewer-card").hidden = false;
+    $("viewer-placeholder").hidden = true;
     if (error.status === 404 || error.status === 409) {
       note.textContent = `尚未提供已验证交付：${error.message}`;
       note.hidden = false;
@@ -523,9 +739,10 @@ async function poll() {
   try {
     const run = await api(`/api/runs/${encodeURIComponent(dagRunId)}`);
     if (state.dagRunId !== dagRunId) return;
-    setError($("run-error"), "");
+    setError($("run-error-detail"), "");
     const verified = run.automatic && run.automatic.state === "passed";
     if (!verified) clearPreview();
+    const previous = state.lastRun;
     state.lastRun = run;
     renderRun(run);
     if (verified) {
@@ -536,6 +753,10 @@ async function poll() {
     if ((run.state === "success" || run.state === "failed") && jobDone && (!verified || state.previewSubject)) {
       if (state.timer) window.clearInterval(state.timer);
       state.timer = null;
+    }
+    const terminalNow = run.state === "success" || run.state === "failed";
+    if (terminalNow && !(previous && (previous.state === "success" || previous.state === "failed"))) {
+      await refreshRuns();
     }
   } catch (error) {
     if (state.dagRunId !== dagRunId) return;
@@ -548,13 +769,16 @@ async function poll() {
       clearPreview();
       state.lastRun = null;
       state.dagRunId = null;
+      state.selectedStage = null;
       if (state.timer) window.clearInterval(state.timer);
       state.timer = null;
-      $("detail-card").hidden = true;
       $("retry-panel").hidden = true;
+      showUploadView();
       await refreshRuns();
+      setError($("run-error"), error.message);
+      return;
     }
-    setError($("run-error"), error.message);
+    setError($("run-error-detail"), error.message);
   }
 }
 
@@ -564,9 +788,11 @@ async function selectRun(dagRunId) {
   clearPreview();
   state.dagRunId = dagRunId;
   state.lastRun = null;
+  state.selectedStage = null;
   $("retry-panel").hidden = true;
+  setError($("run-error-detail"), "");
   setError($("retry-error"), "");
-  $("detail-card").hidden = false;
+  showRunView();
   await refreshRuns();
   if (state.dagRunId !== dagRunId) return;
   state.timer = window.setInterval(() => {
@@ -610,6 +836,16 @@ async function retryRun() {
 }
 
 function wire() {
+  $("new-run-button").addEventListener("click", () => {
+    showUploadView();
+    setError($("run-error"), "");
+    void refreshRuns();
+  });
+  for (const button of document.querySelectorAll("#inspect-tabs .tab")) {
+    button.addEventListener("click", () => selectInspectTab(button.dataset.tab));
+  }
+  selectInspectTab("overview");
+
   $("retry-button").addEventListener("click", retryRun);
   $("logout").addEventListener("click", async () => {
     try {
@@ -620,21 +856,100 @@ function wire() {
     clearSession();
   });
 
+  $("choose-button").addEventListener("click", () => $("folder-input").click());
+
+  $("folder-input").addEventListener("change", () => {
+    state.blockedPick = false;
+    const picked = folderPick(Array.from($("folder-input").files || []));
+    const summary = $("folder-summary");
+    if (picked.error) {
+      state.folderPick = null;
+      summary.hidden = true;
+      setError($("run-error"), picked.error);
+      $("start-button").disabled = true;
+      return;
+    }
+    state.folderPick = picked;
+    summary.hidden = false;
+    summary.textContent = `${picked.top} · ${picked.count} 个文件 · ${formatBytes(picked.bytes)}`;
+    setError($("run-error"), "");
+    $("start-button").disabled = false;
+  });
+
+  $("cancel-button").addEventListener("click", () => {
+    if (state.uploadAbort) state.uploadAbort.abort();
+  });
+
   $("run-form").addEventListener("submit", async (event) => {
     event.preventDefault();
+    if (state.uploading) return;
+    const picked = state.folderPick;
+    if (!picked) {
+      setError($("run-error"), "请先选择本机的工程文件夹。");
+      return;
+    }
+    if (state.blockedPick) {
+      setError($("run-error"), "上一提交状态尚未确认；请在上方运行列表中确认，或重新选择文件夹后再提交。");
+      return;
+    }
+    const start = $("start-button");
+    const status = $("upload-status");
+    state.uploading = true;
+    start.disabled = true;
+    $("choose-button").disabled = true;
+    $("folder-input").disabled = true;
+    $("cancel-button").hidden = false;
+    status.hidden = false;
+    status.textContent = "正在上传工程文件夹…";
     setError($("run-error"), "");
-    const button = $("start-button");
-    button.disabled = true;
     try {
-      const payload = await api("/api/runs", {
-        method: "POST",
-        body: { handoff_path: $("handoff-path").value },
+      const payload = await submitRun(picked, {
+        onProgress: (ratio) => {
+          if (ratio >= 1) {
+            status.textContent = "上传完成，正在创建运行…";
+            $("cancel-button").hidden = true;
+          } else {
+            status.textContent = `正在上传工程文件夹… ${Math.round(ratio * 100)}%`;
+          }
+        },
       });
+      status.textContent = "上传完成，正在创建运行…";
       await selectRun(payload.dag_run_id);
+      resetPick();
     } catch (error) {
-      setError($("run-error"), error.message);
+      if (error.aborted) {
+        status.textContent = "已取消上传；正在刷新运行列表，如无新运行则表示未提交。";
+        await refreshRuns().catch(() => {});
+      } else if (error.network) {
+        status.textContent = error.message;
+        await refreshRuns().catch(() => {});
+      } else if (error.status === 401) {
+        clearSession();
+        resetPick();
+        setError($("login-error"), "会话已失效，请重新登录后再试。");
+        return;
+      } else if (error.status === 502 && error.dagRunId) {
+        state.blockedPick = true;
+        setError(
+          $("run-error"),
+          `启动状态尚未确认，请检查运行列表；不要重复提交。运行 ID: ${error.dagRunId}`,
+        );
+        await refreshRuns().catch(() => {});
+      } else {
+        setError($("run-error"), error.message);
+      }
     } finally {
-      button.disabled = false;
+      state.uploading = false;
+      state.uploadAbort = null;
+      $("choose-button").disabled = false;
+      $("folder-input").disabled = false;
+      $("cancel-button").hidden = true;
+      if (state.folderPick && !state.blockedPick) {
+        start.disabled = false;
+      } else {
+        start.disabled = true;
+        status.hidden = true;
+      }
     }
   });
 

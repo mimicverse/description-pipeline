@@ -57,3 +57,21 @@ class ToolIdentityTests(unittest.TestCase):
                 (package / "unlisted.py").write_text("unlisted\n", encoding="utf-8")
                 with self.assertRaises(PipelineError):
                     runtime.tool_record()
+
+    def test_inventory_rejects_directory_case_aliases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Foo").mkdir()
+            if (root / "foo").exists():
+                self.skipTest("Directory aliases require a case-sensitive filesystem")
+            (root / "Foo" / "a.txt").write_text("a\n", encoding="utf-8")
+            (root / "foo").mkdir()
+            (root / "foo" / "b.txt").write_text("b\n", encoding="utf-8")
+            with self.assertRaises(PipelineError) as raised:
+                inventory(root)
+            self.assertIn("Case-colliding", str(raised.exception))
+            (root / "foo" / "b.txt").unlink()
+            (root / "foo").rmdir()
+            (root / "Foo" / "nested").mkdir()
+            (root / "Foo" / "nested" / "c.txt").write_text("c\n", encoding="utf-8")
+            self.assertEqual(len(inventory(root)), 2)

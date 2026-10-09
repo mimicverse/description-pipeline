@@ -7,6 +7,7 @@ import json
 import os
 import posixpath
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -38,6 +39,7 @@ from description_pipeline.orchestration.portal import (
     PortalConfig,
     load_portal_config,
 )
+from description_pipeline.orchestration.uploads import MAX_FILE_BYTES, MAX_FILES, MAX_TOTAL_BYTES
 from tests.v1.test_airflow_client import RUN_ID, MockEndpoint
 
 AIRFLOW_TOKEN = "airflow-session-token"
@@ -94,6 +96,8 @@ class MockAirflow:
         self.hits = 0
         self.revoked = False
         self.deny_runs = False
+        self.trigger_fail_times = 0
+        self.trigger_fail_after_create = False
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -140,6 +144,10 @@ class MockAirflow:
                         )
                         return
                     dag_run_id = payload.get("dag_run_id")
+                    if outer.trigger_fail_times > 0 and not outer.trigger_fail_after_create:
+                        outer.trigger_fail_times -= 1
+                        self._reply(500, {"detail": "transient trigger failure"})
+                        return
                     outer.conf = payload.get("conf")
                     outer.dag_runs[dag_run_id] = {
                         "dag_run_id": dag_run_id,
@@ -153,6 +161,10 @@ class MockAirflow:
                         "start_date": "2026-10-07T00:00:00Z",
                         "end_date": None,
                     }
+                    if outer.trigger_fail_times > 0 and outer.trigger_fail_after_create:
+                        outer.trigger_fail_times -= 1
+                        self._reply(500, {"detail": "trigger outcome unknown"})
+                        return
                     self._reply(201, dict(outer.dag_runs[dag_run_id]))
                     return
                 match = re.fullmatch(r"/api/v2/dags/solidworks_to_urdf/dagRuns/([^/]+)/clear", self.path)
@@ -350,6 +362,19 @@ class PortalClient:
         self.login_response = body
         self.csrf = json.loads(body)["csrf_token"]
 
+    def request_raw(self, method: str, path: str, body: bytes, content_type: str, headers: dict | None = None):
+        headers = {"Accept": "application/json", "Content-Type": content_type, **(headers or {})}
+        if self.csrf and method != "GET":
+            headers["X-CSRF-Token"] = self.csrf
+        request = urlrequest.Request(self.base + path, data=body, method=method, headers=headers)
+        try:
+            with self.opener.open(request, timeout=30) as response:
+                self.last_set_cookies = list(response.headers.get_all("Set-Cookie") or [])
+                return response.status, dict(response.headers), response.read()
+        except urlerror.HTTPError as error:
+            self.last_set_cookies = list(error.headers.get_all("Set-Cookie") or [])
+            return error.code, dict(error.headers), error.read()
+
 
 def _endpoint_files() -> dict[str, str]:
     artifacts = {
@@ -370,11 +395,31 @@ def _preview_payload() -> dict:
     }
 
 
+def _upload_body(
+    folder: str = "机器人工程",
+    files: list[tuple[str, bytes]] | None = None,
+) -> bytes:
+    """One browser-shaped multipart folder body (top folder included, ``/`` separators)."""
+    entries = files or [("model.SLDASM", b"<assembly/>"), ("parts/p1.SLDPRT", b"<part1/>")]
+    chunks = []
+    for rel, data in entries:
+        chunks.append(b"--portal-boundary\r\n")
+        chunks.append(
+            b'Content-Disposition: form-data; name="files"; filename="' + f"{folder}/{rel}".encode() + b'"\r\n'
+        )
+        chunks.append(b"Content-Type: application/octet-stream\r\n\r\n")
+        chunks.append(data + b"\r\n")
+    chunks.append(b"--portal-boundary--\r\n")
+    return b"".join(chunks)
+
+
 class PortalTests(unittest.TestCase):
     def setUp(self) -> None:
         self.airflow = MockAirflow()
         self.airflow.__enter__()
         self.addCleanup(self.airflow.__exit__, None, None, None)
+        self.upload_root = Path(tempfile.mkdtemp(prefix="portal-upload-"))
+        self.addCleanup(shutil.rmtree, self.upload_root, ignore_errors=True)
         self.endpoint_server = MockEndpoint(
             preview_payload=_preview_payload(),
         )
@@ -383,7 +428,10 @@ class PortalTests(unittest.TestCase):
         self.endpoint = WindowsEndpoint(EndpointConfig(base_url=self.endpoint_server.url, token="test-token"))
         self.static_dir = Path(__file__).resolve().parents[2] / "src/description_pipeline/orchestration/static"
         config = PortalConfig(
-            airflow=AirflowApi(self.airflow.url), endpoint=lambda: self.endpoint, static_dir=self.static_dir
+            airflow=AirflowApi(self.airflow.url),
+            endpoint=lambda: self.endpoint,
+            static_dir=self.static_dir,
+            upload_root=self.upload_root,
         )
         self.server = make_server(
             "127.0.0.1",
@@ -404,7 +452,10 @@ class PortalTests(unittest.TestCase):
     def _start_extra_portal(self):
         """A restarted portal process: same Airflow, brand-new (empty) session store."""
         config = PortalConfig(
-            airflow=AirflowApi(self.airflow.url), endpoint=lambda: self.endpoint, static_dir=self.static_dir
+            airflow=AirflowApi(self.airflow.url),
+            endpoint=lambda: self.endpoint,
+            static_dir=self.static_dir,
+            upload_root=self.upload_root,
         )
         server = make_server(
             "127.0.0.1", 0, PortalApp(config), server_class=_ThreadingWSGIServer, handler_class=_QuietHandler
@@ -598,25 +649,145 @@ class PortalTests(unittest.TestCase):
         status, _, body = self.client.request("GET", "/api/session")
         self.assertEqual(status, 401, body)
 
-    def test_start_run_carries_one_folder_field(self) -> None:
+    def test_uploaded_folder_starts_exactly_one_run(self) -> None:
         self.client.login()
-        status, _, body = self.client.request("POST", "/api/runs", {"handoff_path": "/srv/robot-cell"})
+        files = [("model.SLDASM", b"<assembly/>"), ("parts/p1.SLDPRT", b"<part1/>")]
+        status, _, body = self.client.request_raw(
+            "POST", "/api/runs", _upload_body(files=files), "multipart/form-data; boundary=portal-boundary"
+        )
         self.assertEqual(status, 201, body)
-        dag_run_id = json.loads(body)["dag_run_id"]
+        payload = json.loads(body)
+        dag_run_id = payload["dag_run_id"]
         self.assertTrue(dag_run_id.startswith("portal-"))
-        self.assertEqual(self.airflow.conf, {"handoff_path": "/srv/robot-cell"})
+        self.assertEqual(payload["folder"], "机器人工程")
+        self.assertEqual(payload["files"], 2)
+        self.assertEqual(payload["bytes"], sum(len(data) for _, data in files))
+        stored = self.upload_root / dag_run_id / "机器人工程"
+        self.assertTrue((stored / "model.SLDASM").is_file())
+        self.assertEqual(self.airflow.conf, {"handoff_path": str(stored)})
         self.assertEqual(
             self.airflow.trigger_payloads[-1],
-            {"dag_run_id": dag_run_id, "logical_date": None, "conf": {"handoff_path": "/srv/robot-cell"}},
+            {"dag_run_id": dag_run_id, "logical_date": None, "conf": {"handoff_path": str(stored)}},
         )
         status, _, body = self.client.request("GET", "/api/runs")
         self.assertEqual(status, 200)
         listed = json.loads(body)["runs"][0]
         self.assertEqual(listed["dag_run_id"], dag_run_id)
-        self.assertEqual(listed["handoff_path"], "/srv/robot-cell")
+        self.assertEqual(listed["handoff_path"], str(stored))
         self.assertEqual(listed["state"], "running")
         self.assertEqual(listed["user"], FEISHU_NAME)
         self.assertEqual(listed["principal"], FEISHU_PRINCIPAL)
+        staging = self.upload_root / ".staging"
+        self.assertTrue(not staging.exists() or not any(staging.iterdir()))
+
+    def test_manual_paths_and_unconfirmed_sessions_are_refused_before_writes(self) -> None:
+        self.client.login()
+        status, _, body = self.client.request("POST", "/api/runs", {"handoff_path": "/srv/robot-cell"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(self.airflow.trigger_payloads, [])
+        anonymous = PortalClient(self.client.base)
+        status, _, _ = anonymous.request_raw(
+            "POST", "/api/runs", _upload_body(), "multipart/form-data; boundary=portal-boundary"
+        )
+        self.assertEqual(status, 401)
+        self.client.login()
+        self.airflow.revoked = True
+        status, _, body = self.client.request_raw(
+            "POST", "/api/runs", _upload_body(), "multipart/form-data; boundary=portal-boundary"
+        )
+        self.assertEqual(status, 401, body)
+        staging = self.upload_root / ".staging"
+        self.assertTrue(not staging.exists() or not any(staging.iterdir()))
+        self.assertEqual(self.airflow.trigger_payloads, [])
+
+    def test_upload_rejections_leave_no_run_and_no_staging(self) -> None:
+        self.client.login()
+        cases = (
+            ("duplicate", _upload_body(files=[("a.SLDASM", b"x"), ("a.SLDASM", b"x")])),
+            ("case_alias", _upload_body(files=[("a.SLDASM", b"x"), ("A.sldasm", b"x")])),
+            ("traversal", _upload_body(files=[("a/../x.SLDASM", b"x"), ("ok.SLDASM", b"x")])),
+            ("transient", _upload_body(files=[("~$a.SLDASM", b"x"), ("ok.SLDASM", b"x")])),
+            ("no_assembly", _upload_body(files=[("only.SLDPRT", b"x")])),
+            ("empty", b"--portal-boundary--\r\n"),
+        )
+        for label, body in cases:
+            with self.subTest(case=label):
+                status, _, response = self.client.request_raw(
+                    "POST", "/api/runs", body, "multipart/form-data; boundary=portal-boundary"
+                )
+                self.assertEqual(status, 400, response)
+        self.assertEqual(self.airflow.trigger_payloads, [])
+        self.assertEqual(list(self.upload_root.glob("portal-*")), [])
+        staging = self.upload_root / ".staging"
+        self.assertTrue(not staging.exists() or not any(staging.iterdir()))
+
+    def test_ambiguous_trigger_outcomes_reconcile_on_the_recorded_run_id(self) -> None:
+        self.client.login()
+        # (a) The run was created but the response was lost: one GET finds it; no duplicate trigger.
+        self.airflow.trigger_fail_after_create = True
+        self.airflow.trigger_fail_times = 1
+        status, _, body = self.client.request_raw(
+            "POST", "/api/runs", _upload_body(), "multipart/form-data; boundary=portal-boundary"
+        )
+        self.assertEqual(status, 201, body)
+        first = json.loads(body)["dag_run_id"]
+        self.assertEqual(list(self.airflow.dag_runs), [first])
+        self.assertEqual(len(self.airflow.trigger_payloads), 1)
+        # (b) The run was not created: one reconcile + one retry with the same id.
+        self.airflow.trigger_fail_after_create = False
+        self.airflow.trigger_fail_times = 1
+        status, _, body = self.client.request_raw(
+            "POST", "/api/runs", _upload_body(), "multipart/form-data; boundary=portal-boundary"
+        )
+        self.assertEqual(status, 201, body)
+        second = json.loads(body)["dag_run_id"]
+        self.assertIn(second, self.airflow.dag_runs)
+        self.assertEqual(len(self.airflow.dag_runs), 2)
+        # (c) Never confirmed: 502 carries the run id, the upload stays, and no run exists.
+        self.airflow.trigger_fail_times = 10
+        status, _, body = self.client.request_raw(
+            "POST", "/api/runs", _upload_body(), "multipart/form-data; boundary=portal-boundary"
+        )
+        self.assertEqual(status, 502, body)
+        payload = json.loads(body)
+        self.assertEqual(payload["trigger"], "absent")
+        self.assertIn("不要重复提交", payload["error"])
+        unresolved = payload["dag_run_id"]
+        self.assertNotIn(unresolved, self.airflow.dag_runs)
+        self.assertTrue((self.upload_root / unresolved / "机器人工程" / "model.SLDASM").is_file())
+
+    def test_upload_without_configured_intake_root_fails_closed(self) -> None:
+        config = PortalConfig(
+            airflow=AirflowApi(self.airflow.url), endpoint=lambda: self.endpoint, static_dir=self.static_dir
+        )
+        server = make_server(
+            "127.0.0.1", 0, PortalApp(config), server_class=_ThreadingWSGIServer, handler_class=_QuietHandler
+        )
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+        def stop() -> None:
+            server.shutdown()
+            server.server_close()
+
+        self.addCleanup(stop)
+        client = PortalClient(f"http://127.0.0.1:{server.server_address[1]}")
+        client.login()
+        status, _, _ = client.request_raw(
+            "POST", "/api/runs", _upload_body(), "multipart/form-data; boundary=portal-boundary"
+        )
+        self.assertEqual(status, 503)
+        self.assertEqual(self.airflow.trigger_payloads, [])
+
+    def test_session_exposes_authoritative_upload_limits(self) -> None:
+        self.client.login()
+        payload = json.loads(self.client.login_response)
+        self.assertEqual(
+            payload["upload_limits"],
+            {"max_files": MAX_FILES, "max_bytes": MAX_TOTAL_BYTES, "max_file_bytes": MAX_FILE_BYTES},
+        )
+        self.assertEqual(payload["upload_limits"]["max_files"], 4096)
+        self.assertEqual(payload["upload_limits"]["max_bytes"], 2 * 1024**3)
+        self.assertEqual(payload["upload_limits"]["max_file_bytes"], 512 * 1024**2)
 
     def test_run_identity_survives_a_portal_restart(self) -> None:
         """The operator page reads who triggered a run from Airflow, not from its own memory."""
@@ -632,7 +803,9 @@ class PortalTests(unittest.TestCase):
     def test_submitter_name_survives_restart_and_another_viewer(self) -> None:
         """The displayed submitter is the original initiator, never the current viewer."""
         self.client.login()
-        status, _, body = self.client.request("POST", "/api/runs", {"handoff_path": "/srv/robot-cell"})
+        status, _, body = self.client.request_raw(
+            "POST", "/api/runs", _upload_body(), "multipart/form-data; boundary=portal-boundary"
+        )
         self.assertEqual(status, 201, body)
         dag_run_id = json.loads(body)["dag_run_id"]
         # Restart the portal (new process, empty session store); a different operator signs in.
@@ -819,10 +992,12 @@ class PortalTests(unittest.TestCase):
         self.airflow.revoked = True
         self.assertEqual(self.client.request("GET", preview)[0], 401)
         self.assertEqual(self.client.request("GET", artifact)[0], 401)
-        status, _, _ = self.client.request("POST", "/api/runs", {"handoff_path": "/srv/robot-cell", "target": "hidden"})
+        status, _, _ = self.client.request("POST", "/api/runs", {"handoff_path": "/srv/robot-cell"})
         self.assertEqual(status, 400)
         self.client.csrf = None
-        status, _, _ = self.client.request("POST", "/api/runs", {"handoff_path": "/srv/robot-cell"})
+        status, _, _ = self.client.request_raw(
+            "POST", "/api/runs", _upload_body(), "multipart/form-data; boundary=portal-boundary"
+        )
         self.assertEqual(status, 403)
 
     def test_status_separates_automatic_results_from_pending_confirmations(self) -> None:
@@ -1086,6 +1261,21 @@ class PortalTests(unittest.TestCase):
             with self.assertRaises(AirflowApiError):
                 AirflowApi(redirector.url).profile("airflow-session-token")
             self.assertEqual(target.hits, 0)
+
+    def test_internal_airflow_calls_ignore_ambient_proxies(self) -> None:
+        # The child imports the Airflow opener under a hostile proxy environment; only a
+        # direct connection passes and no request may reach the fake proxy.
+        root = Path(__file__).resolve().parents[2]
+        environment = {**os.environ, "PYTHONPATH": str(root / "src")}
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parent / "proxy_probe.py"), "portal"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=environment,
+            cwd=str(root),
+        )
+        self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
 
     def test_no_password_path_survives(self) -> None:
         self.assertFalse(hasattr(AirflowApi, "login"))
