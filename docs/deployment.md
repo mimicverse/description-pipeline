@@ -315,7 +315,7 @@ acceptance. Retain reports for the exact tool and native source revision.
 The upload root also holds `.run-metadata.json`, the portal's durable display
 names and deleted-record state. Back it up with platform state and preserve it
 across upgrades. Moving a run to **已删除** does not reclaim CAD or artifact storage.
-Unreadable history metadata blocks history management; repair or restore the
+Unreadable history metadata blocks run history and its management; repair or restore the
 metadata instead of discarding it and losing the recorded names and deletions.
 
 In a new shell, set `description_env` to the installed configuration file:
