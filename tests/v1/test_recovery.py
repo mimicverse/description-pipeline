@@ -157,6 +157,36 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(plan["earliest_required"], "freeze")
         self.assertTrue(start_plan(failed_freeze, plan["earliest_required"], probe=probe, tool="ok")["accepted"])
 
+    def test_dependency_refusal_at_discovery_outranks_a_later_incomplete_capture(self) -> None:
+        partial = {
+            "run_id": "b3f1c2d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+            "status": "passed",
+            "events": protocol_events(stages=("freeze", "discover")),
+        }
+        probe = dict(ALL_OK, dependency="unverifiable")
+        for stage in ("capture", "generate", "verify", "publish"):
+            with self.subTest(stage=stage):
+                plan = start_plan(partial, stage, probe=probe, tool="ok")
+                self.assertFalse(plan["accepted"])
+                self.assertEqual(plan["reason"], "dependency_changed")
+                self.assertEqual(plan["earliest_required"], "discover")
+                self.assertTrue(start_plan(partial, "discover", probe=probe, tool="ok")["accepted"])
+
+    def test_missing_discovery_bytes_outrank_a_later_incomplete_capture(self) -> None:
+        partial = {
+            "run_id": "b3f1c2d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+            "status": "passed",
+            "events": protocol_events(stages=("freeze", "discover")),
+        }
+        probe = dict(ALL_OK, discover="absent")
+        for stage in ("capture", "generate", "verify", "publish"):
+            with self.subTest(stage=stage):
+                plan = start_plan(partial, stage, probe=probe, tool="ok")
+                self.assertFalse(plan["accepted"])
+                self.assertEqual(plan["reason"], "prerequisite_invalid")
+                self.assertEqual(plan["earliest_required"], "discover")
+                self.assertTrue(start_plan(partial, "discover", probe=probe, tool="ok")["accepted"])
+
     def test_stage_rows_report_recomputes_retains_and_prerequisites(self) -> None:
         rows = {row["stage"]: row for row in stage_reruns(job(), probe=ALL_OK, tool="ok")}
         self.assertEqual(len(rows), 6)

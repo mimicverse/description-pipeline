@@ -69,23 +69,21 @@ def _prerequisite_failure(requested: str, job: dict, probe: dict[str, str], tool
     if tool != "ok" and requested != "freeze":
         return "tool_changed", "freeze"
     for checkpoint in PREREQUISITES.get(requested, ()):
-        # First: the recorded upstream evidence itself must be complete, so the
-        # suggested earliest restart is always executable.
+        # Validate strictly in prerequisite order: completion, retained bytes and
+        # (only when the discovery binding is reused) its dependency and target.
+        # Any refusal therefore names a checkpoint whose own restart is accepted.
         if not _stage_completed(job, checkpoint):
             return "prerequisite_invalid", checkpoint
-    if requested in REUSES_DISCOVERY:
-        # Only the parent's recorded checkpoints are reused from here on: the
-        # binding and its dependency snapshot must still be exactly verifiable.
-        if probe.get("dependency") != "ok":
-            return "dependency_changed", "discover"
-        if probe.get("target") != "ok":
-            return "target_changed", "discover"
-    for checkpoint in PREREQUISITES.get(requested, ()):
         key = AVAILABILITY[checkpoint]
-        if key is None:
-            continue  # the retained upload is already bound by the source probe
-        if probe.get(key) != "ok":
+        if key is not None and probe.get(key) != "ok":
             return "prerequisite_invalid", checkpoint
+        if checkpoint == "discover" and requested in REUSES_DISCOVERY:
+            # Reusing the parent discovery binding: its dependency snapshot and the
+            # publication target must still be exactly verifiable.
+            if probe.get("dependency") != "ok":
+                return "dependency_changed", "discover"
+            if probe.get("target") != "ok":
+                return "target_changed", "discover"
     return None
 
 
