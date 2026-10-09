@@ -1148,22 +1148,25 @@ class SolidWorksBackend(CadBackend):
             raw = _member(self._app_for_path(path), "GetDocumentDependencies2", path, True, True, True)
         except Exception:  # noqa: BLE001 - diagnostics must never mask the open error
             return None
-        items = list(raw or ())
-        unresolved = []
-        for index in range(0, len(items) - 2, 3):
-            name = items[index]
-            if not _is_text_name(name):
-                continue
-            try:
-                exists = os.path.isfile(str(items[index + 1]))
-            except Exception:  # noqa: BLE001
-                exists = False
-            if exists:
-                continue
-            unresolved.append({"name": str(name), "last_known_path": str(items[index + 1])})
-            if len(unresolved) >= limit:
-                break
-        return unresolved
+        try:
+            items = list(raw or ())
+            unresolved = []
+            for index in range(0, len(items) - 2, 3):
+                name = items[index]
+                if not _is_text_name(name):
+                    continue
+                try:
+                    exists = os.path.isfile(str(items[index + 1]))
+                except Exception:  # noqa: BLE001
+                    exists = False
+                if exists:
+                    continue
+                unresolved.append({"name": str(name), "last_known_path": str(items[index + 1])})
+                if len(unresolved) >= limit:
+                    break
+            return unresolved
+        except Exception:  # noqa: BLE001 - malformed diagnostics cannot replace the CAD error
+            return None
 
     def _open_failure(self, path, errors, warnings, exception=None):
         """Strict open failure; the detail carries unresolved references when readable."""

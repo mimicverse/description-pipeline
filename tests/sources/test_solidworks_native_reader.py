@@ -2235,6 +2235,19 @@ class MainAssemblySelectionTests(unittest.TestCase):
             self.assertEqual(error.detail["errors"], 2)
             self.assertNotIn("unresolved_references", error.detail)
 
+    def test_malformed_dependency_reply_cannot_mask_open_failure(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assembly = _write(root, "robot.SLDASM")
+            doc = _Doc(assembly, doc_type=2)
+            app = _App({assembly: doc}, open_errors={assembly: 2}, not_preopened={assembly})
+            app.GetDocumentDependencies2 = lambda *args: 7
+            with self.assertRaises(CadError) as caught:
+                _read(root, app)
+            self.assertEqual(caught.exception.code, "cad_document_open_failed")
+            self.assertEqual(caught.exception.detail["errors"], 2)
+            self.assertNotIn("unresolved_references", caught.exception.detail)
+
     def test_single_unmarked_assembly_is_still_selected(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
