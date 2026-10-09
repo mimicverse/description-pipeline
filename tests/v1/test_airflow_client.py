@@ -45,7 +45,37 @@ from description_pipeline.orchestration.airflow_client import (
 
 TOKEN = "test-token"
 RUN_ID = "b3f1c2d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
+PARENT_ID = "0f3e2d1c-4b5a-6c7d-8e9f-0a1b2c3d4e5f"
 SHA = "a" * 64
+
+
+def rerun_plan_payload(run_id: str, status: str = "failed") -> dict:
+    from description_pipeline.stages import STAGE_IDS
+
+    rows = [
+        {
+            "stage": stage,
+            "name_zh": stage,
+            "eligible": True,
+            "reason": "ok",
+            "reason_zh": "",
+            "recomputes": [stage],
+            "retains": [],
+            "prerequisites": {
+                "inputs": "ok",
+                "tool": "ok",
+                "dependency": "ok",
+                "target": "ok",
+                "receipt": "ok",
+                "earliest_required": None,
+            },
+            "target_changed": False,
+        }
+        for stage in STAGE_IDS
+    ]
+    return {"run_id": run_id, "status": status, "stage_reruns": rows}
+
+
 PREVIEW = {
     "pipeline_id": PIPELINE_ID,
     "run_id": RUN_ID,
@@ -84,6 +114,7 @@ class MockEndpoint:
         handoff_response: dict | None = None,
         preview_payload: dict | None = None,
         artifact_redirect_to: str | None = None,
+        rerun_payload: dict | None = None,
     ) -> None:
         self.token = token
         self.fail_job = fail_job
@@ -96,6 +127,7 @@ class MockEndpoint:
         self.handoff_response = handoff_response
         self.preview_payload = preview_payload
         self.artifact_redirect_to = artifact_redirect_to
+        self.rerun_payload = rerun_payload
         self.hits = 0
         self.jobs: dict[str, dict] = {}
         self.resolved_paths: list[str] = []
@@ -172,6 +204,13 @@ class MockEndpoint:
                         self.send_header("Content-Length", str(len(data)))
                         self.end_headers()
                         self.wfile.write(data)
+                        return
+                    if len(parts) >= 5 and parts[4] == "reruns":
+                        job = outer.jobs.get(run_id)
+                        if job is None:
+                            self._send(404, {"error": "unknown run_id"})
+                            return
+                        self._send(200, outer.rerun_payload or rerun_plan_payload(run_id, job.get("status", "failed")))
                         return
                     job = outer.jobs.get(run_id)
                     if job is None:
@@ -808,6 +847,48 @@ class ClientTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(EndpointProtocolError, "different mechanical handoff"):
             endpoint.start_job(run_id=RUN_ID, resolution=native_resolution())
+
+    def test_linked_start_forwards_resume_and_rerun_plan_round_trips(self) -> None:
+        from description_pipeline.stages import STAGE_IDS
+
+        with MockEndpoint() as server:
+            endpoint = self.endpoint(server)
+            endpoint.start_job(run_id=PARENT_ID, resolution=native_resolution())
+            plan = endpoint.rerun_plan(PARENT_ID)
+            self.assertEqual(plan["run_id"], PARENT_ID)
+            self.assertEqual([row["stage"] for row in plan["stage_reruns"]], list(STAGE_IDS))
+            child = endpoint.start_job(
+                run_id=RUN_ID,
+                resolution=native_resolution(),
+                resume={"parent_run": PARENT_ID, "from_stage": "verify"},
+            )
+            self.assertEqual(child["request"]["resume"], {"parent_run": PARENT_ID, "from_stage": "verify"})
+            with self.assertRaises(EndpointConflict):
+                endpoint.start_job(
+                    run_id=RUN_ID,
+                    resolution=native_resolution(),
+                    resume={"parent_run": PARENT_ID, "from_stage": "generate"},
+                )
+
+    def test_linked_bindings_and_plans_are_validated_before_they_are_trusted(self) -> None:
+        with MockEndpoint() as server:
+            endpoint = self.endpoint(server)
+            endpoint.start_job(run_id=PARENT_ID, resolution=native_resolution())
+            broken = rerun_plan_payload(PARENT_ID)
+            broken["stage_reruns"] = broken["stage_reruns"][:-1]
+            with MockEndpoint(rerun_payload=broken) as bad_server:
+                bad = self.endpoint(bad_server)
+                bad.start_job(run_id=PARENT_ID, resolution=native_resolution())
+                with self.assertRaises(EndpointProtocolError):
+                    bad.rerun_plan(PARENT_ID)
+            for resume in (
+                {"parent_run": PARENT_ID, "from_stage": "freeze", "extra": True},
+                {"parent_run": PARENT_ID, "from_stage": "unknown"},
+                {"parent_run": "not-a-uuid", "from_stage": "verify"},
+                {"parent_run": RUN_ID, "from_stage": "verify"},
+            ):
+                with self.subTest(resume=str(resume)), self.assertRaises(EndpointProtocolError):
+                    endpoint.start_job(run_id=RUN_ID, resolution=native_resolution(), resume=resume)
 
     def test_invalid_url_timeout_and_redirect_fail_closed(self) -> None:
         for address in ("http://127.0.0.1:invalid", "http://127.0.0.1?token=x", "http://127.0.0.1#fragment"):

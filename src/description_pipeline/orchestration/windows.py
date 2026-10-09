@@ -10,6 +10,7 @@ is never silently replayed after a process restart.
 from __future__ import annotations
 
 import contextlib
+import copy
 import hmac
 import hashlib
 import json
@@ -18,6 +19,7 @@ import queue
 import re
 import sys
 import threading
+import time
 import tempfile
 import uuid
 from datetime import UTC, datetime
@@ -32,13 +34,17 @@ from ..io import (
     artifact_path_parts,
     confined,
     digest,
+    file_digest,
     inventory,
     read_data,
     write_json,
 )
+from ..sources.snapshot import verify_snapshot
 from ..sources.solidworks.revision import package_inventory, read_revision
 from ..repository.urdf_pr import _origin_slug, _slug_hardware
-from ..stages import stage_view
+from ..runtime import tool_record
+from ..stages import STAGE_IDS, stage_view
+from .recovery import stage_reruns, start_plan
 from ..sources.solidworks.handoff import HANDOFF_SCHEMA, MAX_HANDOFF_BYTES, freeze_handoff, import_archive
 
 _SHA = re.compile(r"^[0-9a-f]{64}$")
@@ -48,14 +54,35 @@ CONFIG_SCHEMA = "solidworks-to-urdf.endpoint/v1"
 
 
 class RequestError(PipelineError):
-    def __init__(self, message, status=400):
+    def __init__(self, message, status=400, payload=None):
         super().__init__(message)
         self.status = status
+        self.payload = dict(payload or {})
 
 
 def _require(value, message):
     if not value:
         raise RequestError(message)
+
+
+def _resume_spec(request):
+    """The validated linked-run binding, or None for an ordinary fresh job."""
+    resume = request.get("resume") if isinstance(request, dict) else None
+    if resume is None:
+        return None
+    if not isinstance(resume, dict) or set(resume) != {"parent_run", "from_stage"}:
+        raise RequestError("resume must carry exactly parent_run and from_stage")
+    parent = _job_id(resume["parent_run"])
+    stage = resume["from_stage"]
+    if stage not in STAGE_IDS:
+        raise RequestError("from_stage must be a canonical engineering stage")
+    return {"parent_run": parent, "from_stage": stage}
+
+
+def _refusal(reason, message, *, earliest=None, **extra):
+    payload = {"reason": reason, "reason_zh": message, "earliest_required": earliest}
+    payload.update(extra)
+    return RequestError(message, 409, payload=payload)
 
 
 def _job_id(value):
@@ -179,17 +206,23 @@ def _owner_lock(path):
 class Jobs:
     """One persistent queue, one CAD runner, one endpoint process owner."""
 
+    #: Linked-run plans hash retained checkpoints; the detail route may poll, so
+    #: finished plans are memoized briefly. ``create`` always probes afresh.
+    PLAN_TTL = 30.0
+
     def __init__(self, config, *, runner=None, native_preparer=None):
         from ..solidworks import run
 
         self.config = config
         self.runner = runner or run
         self.native_preparer = native_preparer
+        self._plans = {}
         self.directory = config["state_root"] / "jobs"
         self.directory.mkdir(parents=True, exist_ok=True)
         inventory(self.directory)
         self.lock_path = config["state_root"] / ".endpoint.lock"
         self.handle = _owner_lock(self.lock_path)
+        self._closed = False
         self.mutex = threading.RLock()
         self.queue = queue.Queue()
         self.jobs = {}
@@ -253,10 +286,16 @@ class Jobs:
 
     def validate(self, request):
         _require(
-            isinstance(request, dict) and set(request) == {"run_id", "package", "handoff_sha256"},
-            "Expected run_id, package and handoff_sha256",
+            isinstance(request, dict)
+            and set(request)
+            in (
+                {"run_id", "package", "handoff_sha256"},
+                {"run_id", "package", "handoff_sha256", "resume"},
+            ),
+            "Expected run_id, package, handoff_sha256 and an optional resume",
         )
         _job_id(request["run_id"])
+        _resume_spec(request)
         _require(
             isinstance(request["package"], str) and bool(artifact_path_parts(request["package"])),
             "Invalid native package path",
@@ -274,6 +313,312 @@ class Jobs:
             "Native engineering files changed after selection; start a new run",
         )
         return package
+
+    def _delivery_dir(self, job):
+        """Retained delivery or diagnostic directory of one finished native job."""
+        output = self.config["output_root"] / job["run_id"]
+        if output.is_dir():
+            return output
+        diagnostic = (job.get("result") or {}).get("diagnostic_path")
+        if isinstance(diagnostic, str) and Path(diagnostic).is_dir():
+            return Path(diagnostic)
+        failed = output.with_name(output.name + ".failed")
+        return failed if failed.is_dir() else None
+
+    @staticmethod
+    def _recorded_subject(job):
+        result = job.get("result") if isinstance(job.get("result"), dict) else {}
+        subject = result.get("subject_sha256")
+        if isinstance(subject, str) and _SHA.fullmatch(subject):
+            return subject
+        for event in reversed(job.get("events") or []):
+            check = event.get("check") if isinstance(event, dict) else None
+            details = (check or {}).get("details") if isinstance(check, dict) else None
+            value = (details or {}).get("subject_sha256")
+            if isinstance(value, str) and _SHA.fullmatch(value):
+                return value
+        return None
+
+    @staticmethod
+    def _recorded_frozen_names(job):
+        for event in job.get("events") or []:
+            check = event.get("check") if isinstance(event, dict) else None
+            if not isinstance(check, dict) or check.get("id") != "discovery.inputs":
+                continue
+            details = check.get("details") or {}
+            value = details.get("frozen_names_sha256")
+            if isinstance(value, str) and _SHA.fullmatch(value):
+                return value
+        return None
+
+    @staticmethod
+    def _check_details(job, check_id):
+        for event in reversed(job.get("events") or []):
+            check = event.get("check") if isinstance(event, dict) else None
+            if isinstance(check, dict) and check.get("id") == check_id:
+                details = check.get("details")
+                return details if isinstance(details, dict) else None
+        return None
+
+    def _dependency_identity(self):
+        """The dependency inputs a discovery run binds: registry snapshot and record roots."""
+        settings = self.config.get("discovery", {})
+        names = None
+        try:
+            names = read_data(settings["frozen_names_file"]) if settings.get("frozen_names_file") else {}
+        except (PipelineError, OSError, ValueError):
+            names = None
+        roots = None
+        try:
+            roots = sorted(str(Path(value).resolve()) for value in settings.get("record_roots", []))
+        except (TypeError, ValueError, OSError):
+            roots = None
+        return {
+            "frozen_names_sha256": digest(names) if names is not None else None,
+            "record_roots": roots,
+        }
+
+    @staticmethod
+    def _tool_identity():
+        """The full installed tool record; identity is compared as a whole."""
+        try:
+            return tool_record()
+        except (PipelineError, OSError, ValueError):
+            return None
+
+    def _prepared_dir(self, job):
+        """The validated prepared package reused by linked runs (may belong to an ancestor)."""
+        root = (self.config["state_root"] / "prepared").resolve()
+        recorded = job.get("prepared_dir")
+        if isinstance(recorded, str):
+            path = Path(recorded)
+            if (
+                path.is_dir()
+                and not path.is_symlink()
+                and not path.is_junction()
+                and path.resolve().is_relative_to(root)
+            ):
+                return path
+        fallback = root / job["run_id"]
+        return fallback if fallback.is_dir() else None
+
+    def _capture_checkpoint(self, seed, job):
+        """Capture outputs only count when the recorded binding still matches their bytes."""
+        try:
+            if not all((seed / part).exists() for part in ("reports/input.json", "input", "evidence")):
+                return "absent"
+            if not any(
+                isinstance(event, dict) and event.get("stage") == "capture" and event.get("state") == "completed"
+                for event in job.get("events") or []
+            ):
+                return "changed"
+            input_details = self._check_details(job, "input.valid")
+            integrity_details = self._check_details(job, "capture.integrity")
+            if not isinstance(input_details, dict) or not isinstance(integrity_details, dict):
+                return "changed"
+            input_files = inventory(seed / "input")
+            if {"input/" + name: checksum for name, checksum in input_files.items()} != input_details.get("files"):
+                return "changed"
+            if digest(input_files) != input_details.get("files_sha256"):
+                return "changed"
+            report = read_data(seed / "reports" / "input.json")
+            if not isinstance(report, dict) or report.get("package_files") != input_files:
+                return "changed"
+            manifest = verify_snapshot(seed / "evidence")
+            manifest_hash = file_digest(seed / "evidence" / "manifest.json")
+            if manifest_hash != integrity_details.get("manifest_sha256"):
+                return "changed"
+            evidence_files = {"evidence/manifest.json": manifest_hash}
+            evidence_files.update({"evidence/" + name: checksum for name, checksum in manifest["files"].items()})
+            if evidence_files != integrity_details.get("files"):
+                return "changed"
+            return "ok"
+        except (PipelineError, OSError, ValueError, TypeError, KeyError):
+            return "changed"
+
+    def _receipt_checkpoint(self, seed, job):
+        try:
+            if not (seed / "reports/quality.json").is_file():
+                return "absent"
+            quality = read_data(seed / "reports" / "quality.json")
+            subject = self._recorded_subject(job)
+        except (PipelineError, OSError, ValueError):
+            return "changed"
+        if not isinstance(quality, dict):
+            return "changed"
+        return "ok" if quality.get("passed") is True and quality.get("subject_sha256") == subject else "changed"
+
+    def _probe(self, job):
+        """Checkpoint, dependency and target availability for one native job."""
+        probe = {
+            "source": "absent",
+            "discover": "absent",
+            "capture": "absent",
+            "generate": "absent",
+            "receipt": "absent",
+            "dependency": "unverifiable",
+            "target": "unverifiable",
+        }
+        request = job.get("request") if isinstance(job.get("request"), dict) else {}
+        try:
+            package = confined(
+                self.config["package_root"], str(request.get("package", "")) + "/.handoff-folder", exists=False
+            ).parent
+            if package.is_dir():
+                from ..sources.solidworks.handoff import describe_handoff
+
+                identity = describe_handoff(package)
+                files = package_inventory(package)
+                probe["source"] = (
+                    "ok"
+                    if identity.get("handoff_sha256") == request.get("handoff_sha256")
+                    and files == job.get("package_files")
+                    else "changed"
+                )
+        except (PipelineError, OSError, ValueError, TypeError):
+            probe["source"] = "changed"
+        prepared = self._prepared_dir(job)
+        if prepared is not None and isinstance(job.get("prepared_files"), dict):
+            try:
+                probe["discover"] = "ok" if package_inventory(prepared) == job["prepared_files"] else "changed"
+            except (PipelineError, OSError, ValueError):
+                probe["discover"] = "changed"
+        seed = self._delivery_dir(job)
+        if seed is not None:
+            probe["capture"] = self._capture_checkpoint(seed, job)
+            subject = self._recorded_subject(job)
+            generated = (
+                "README.md",
+                "input",
+                "evidence",
+                "model",
+                "urdf",
+                "meshes",
+                "reports/input.json",
+                "reports/tool.json",
+            )
+            if not all((seed / part).exists() for part in generated):
+                probe["generate"] = "absent"
+            else:
+                try:
+                    probe["generate"] = "ok" if subject and digest(subject_inventory(seed)) == subject else "changed"
+                except (PipelineError, OSError, ValueError):
+                    probe["generate"] = "changed"
+            probe["receipt"] = self._receipt_checkpoint(seed, job)
+        recorded = job.get("dependency") if isinstance(job.get("dependency"), dict) else None
+        current = self._dependency_identity()
+        if recorded is None:
+            # Legacy jobs predate the recorded identity: only the registry snapshot can be
+            # compared; the records their discovery embedded stay pinned by the prepared package.
+            recorded = {"frozen_names_sha256": self._recorded_frozen_names(job), "record_roots": None}
+        if recorded.get("frozen_names_sha256") is None or current.get("frozen_names_sha256") is None:
+            probe["dependency"] = "unverifiable"
+        elif recorded["frozen_names_sha256"] != current["frozen_names_sha256"] or (
+            recorded.get("record_roots") is not None and recorded["record_roots"] != current.get("record_roots")
+        ):
+            probe["dependency"] = "changed"
+        elif recorded.get("record_roots") is None and current.get("record_roots"):
+            probe["dependency"] = "unverifiable"
+        else:
+            probe["dependency"] = "ok"
+        target = self.config["targets"].get(job.get("hardware_id"))
+        if (
+            isinstance(target, dict)
+            and isinstance(job.get("repository_slug"), str)
+            and isinstance(job.get("repository_base"), str)
+        ):
+            probe["target"] = (
+                "ok"
+                if _origin_slug(target["repository"]) == job["repository_slug"]
+                and target["base"] == job["repository_base"]
+                else "changed"
+            )
+        return probe
+
+    def _tool_state(self, job):
+        """Whether the installed tool still matches the tool recorded for this job."""
+        try:
+            current = tool_record()
+        except (PipelineError, OSError, ValueError):
+            return "unknown"
+        recorded = job.get("tool")
+        if not isinstance(recorded, dict):
+            seed = self._delivery_dir(job)
+            if seed is not None and (seed / "reports/tool.json").is_file():
+                try:
+                    recorded = read_data(seed / "reports/tool.json")
+                except (PipelineError, OSError, ValueError):
+                    return "unknown"
+        if not isinstance(recorded, dict):
+            # No historical identity: reuse cannot be proven, only a freeze restart may proceed.
+            return "unknown"
+        return "ok" if recorded and recorded == current else "changed"
+
+    @staticmethod
+    def _reuse_events(parent, from_stage):
+        upstream = set(STAGE_IDS[: STAGE_IDS.index(from_stage)])
+        reused = []
+        for event in parent.get("events") or []:
+            if not isinstance(event, dict) or event.get("stage") not in upstream:
+                continue
+            copied = copy.deepcopy(event)
+            previous = copied.get("reuse") if isinstance(copied.get("reuse"), dict) else {}
+            producer = previous.get("source_run") or previous.get("parent_run") or parent["run_id"]
+            copied["reuse"] = {"parent_run": parent["run_id"], "reused": True, "source_run": producer}
+            reused.append(copied)
+        return reused
+
+    @staticmethod
+    def _inherited_metadata(parent, from_stage):
+        if from_stage not in {"capture", "generate", "verify", "publish"}:
+            return {}
+        inherited = {
+            key: copy.deepcopy(parent[key])
+            for key in (
+                "hardware_id",
+                "revision",
+                "repository_slug",
+                "repository_base",
+                "prepared_files",
+                "prepared_dir",
+            )
+            if key in parent
+        }
+        if isinstance(parent.get("discovery"), dict):
+            inherited["discovery"] = copy.deepcopy(parent["discovery"])
+        return inherited
+
+    def _active_attempt(self, parent_run):
+        for other in self.jobs.values():
+            request = other.get("request")
+            resume = request.get("resume") if isinstance(request, dict) else None
+            if (
+                isinstance(resume, dict)
+                and resume.get("parent_run") == parent_run
+                and other.get("status") in {"queued", "running"}
+            ):
+                return other["run_id"]
+        return None
+
+    def plan(self, identifier):
+        """Memoized linked-run plan for the run detail route; create() probes afresh."""
+        job = self.snapshot(identifier)
+        if job.get("status") not in {"passed", "failed"}:
+            rows = stage_reruns(job, probe={}, tool="ok")
+            return {"run_id": identifier, "status": job.get("status"), "stage_reruns": rows}
+        key = (job.get("status"), job.get("completed_at"))
+        with self.mutex:
+            cached = self._plans.get(identifier)
+            if cached and cached[0] == key and time.monotonic() - cached[1] < self.PLAN_TTL:
+                return cached[2]
+        payload = {
+            "run_id": identifier,
+            "status": job.get("status"),
+            "stage_reruns": stage_reruns(job, probe=self._probe(job), tool=self._tool_state(job)),
+        }
+        with self.mutex:
+            self._plans[identifier] = (key, time.monotonic(), payload)
+        return payload
 
     def preview(self, identifier):
         """Expose only artifact bytes bound to a successful independently verified run."""
@@ -331,18 +676,57 @@ class Jobs:
                     raise RequestError("run_id is already bound to a different request", 409)
                 return self.snapshot(identifier), False
             package = self.validate(request)
+            spec = _resume_spec(request)
+            events = []
+            inherited = {}
+            if spec is not None:
+                _require(spec["parent_run"] != identifier, "A linked run cannot reuse itself")
+                parent = self.jobs.get(spec["parent_run"])
+                if parent is None:
+                    raise RequestError("The selected run is unknown to this endpoint", 409)
+                plan = start_plan(parent, spec["from_stage"], probe=self._probe(parent), tool=self._tool_state(parent))
+                if not plan["accepted"]:
+                    raise _refusal(plan["reason"], plan["reason_zh"], earliest=plan["earliest_required"])
+                active = self._active_attempt(spec["parent_run"])
+                if active is not None:
+                    raise _refusal(
+                        "already_active",
+                        "此运行已有正在执行的重新运行，请等待完成后再试",
+                        active_run_id=active,
+                    )
+                parent_request = parent.get("request") if isinstance(parent.get("request"), dict) else {}
+                if (
+                    parent_request.get("package") != request["package"]
+                    or parent_request.get("handoff_sha256") != request["handoff_sha256"]
+                ):
+                    raise _refusal(
+                        "source_changed",
+                        "原始上传不可复用，请重新上传后开始新运行",
+                        earliest=None,
+                    )
+                if spec["from_stage"] in {"verify", "publish"} and self._recorded_subject(parent) is None:
+                    raise _refusal(
+                        "prerequisite_invalid",
+                        "原运行未记录可验证的模型主体，最早可从“生成 URDF”重新开始",
+                        earliest="generate",
+                    )
+                events = self._reuse_events(parent, spec["from_stage"])
+                inherited = self._inherited_metadata(parent, spec["from_stage"])
             job = {
                 "schema_version": JOB_SCHEMA,
                 "pipeline_id": PIPELINE_ID,
                 "run_id": identifier,
                 "request": dict(request),
                 "status": "queued",
-                "events": [],
+                "events": events,
                 "result": None,
                 "error": None,
                 "created_at": datetime.now(UTC).isoformat(),
             }
+            job.update(inherited)
             job["package_files"] = package_inventory(package)
+            job["tool"] = self._tool_identity()
+            job["dependency"] = self._dependency_identity()
             self._save(job)
             self.jobs[identifier] = job
             self.queue.put(identifier)
@@ -389,6 +773,7 @@ class Jobs:
                 repository_slug=_origin_slug(target["repository"]),
                 repository_base=target["base"],
                 prepared_files=files,
+                prepared_dir=str(package),
             )
             self._save(job)
         return package, target
@@ -400,7 +785,9 @@ class Jobs:
                 self.queue.task_done()
                 return
             job = self.jobs[identifier]
+            spec = None
             try:
+                spec = _resume_spec(job["request"])
                 with self.mutex:
                     job.update(status="running", started_at=datetime.now(UTC).isoformat())
                     self._save(job)
@@ -409,13 +796,53 @@ class Jobs:
                 package = confined(
                     self.config["package_root"], job["request"]["package"] + "/.handoff-folder", exists=False
                 ).parent
-                freeze_inputs(
-                    package,
-                    job["request"]["handoff_sha256"],
-                    job["package_files"],
-                    on_event=lambda item, identifier=identifier: self._event(identifier, item),
-                )
-                package, target = self._prepare_native(identifier, package)
+                from_stage = spec["from_stage"] if spec is not None else None
+                resume_kwargs = {"resume": spec} if spec is not None else {}
+                if spec is not None and from_stage != "freeze":
+                    # Revalidate the retained checkpoints at execution time; enqueue-time
+                    # checks are advisory because registries and pulls may change meanwhile.
+                    parent = self.jobs[spec["parent_run"]]
+                    plan = start_plan(parent, from_stage, probe=self._probe(parent), tool=self._tool_state(parent))
+                    if not plan["accepted"]:
+                        failure = RequestError(
+                            plan["reason_zh"],
+                            409,
+                            payload={
+                                "reason": plan["reason"],
+                                "reason_zh": plan["reason_zh"],
+                                "earliest_required": plan["earliest_required"],
+                            },
+                        )
+                        failure.code = plan["reason"]
+                        raise failure
+                if from_stage not in {"discover", "capture", "generate", "verify", "publish"}:
+                    # A fresh job or a freeze restart re-admits the retained upload.
+                    freeze_inputs(
+                        package,
+                        job["request"]["handoff_sha256"],
+                        job["package_files"],
+                        on_event=lambda item, identifier=identifier: self._event(identifier, item),
+                    )
+                if from_stage in {None, "freeze", "discover"}:
+                    package, target = self._prepare_native(identifier, package)
+                else:
+                    # capture..publish reuse the parent's retained freeze+discover
+                    # checkpoints; the plan already proved them intact.
+                    parent = self.jobs[spec["parent_run"]]
+                    package = self._prepared_dir(job)
+                    _require(package is not None, "The retained discovery checkpoint is no longer available")
+                    target = self.config["targets"].get(job.get("hardware_id"))
+                    _require(isinstance(target, dict), "The selected run has no configured publication target")
+                    seed = self._delivery_dir(parent) if from_stage in {"generate", "verify", "publish"} else None
+                    _require(
+                        from_stage == "capture" or seed is not None,
+                        "The retained delivery of the selected run is no longer available",
+                    )
+                    resume_kwargs.update(
+                        resume_from=from_stage,
+                        seed_dir=seed,
+                        expected_subject=self._recorded_subject(parent),
+                    )
                 _require(
                     isinstance(job.get("repository_slug"), str)
                     and bool(job["repository_slug"])
@@ -436,6 +863,7 @@ class Jobs:
                     prior_events=list(job["events"]),
                     expected_inputs=job["prepared_files"],
                     handoff_sha256=job["request"]["handoff_sha256"],
+                    **resume_kwargs,
                 )
                 with self.mutex:
                     job["result"] = result
@@ -476,9 +904,14 @@ class Jobs:
                         status="passed" if passed else "failed",
                         error=None if passed else result.get("error") or "Incomplete or mismatched publication receipt",
                     )
+                    if not passed and result.get("error_code"):
+                        job["error_code"] = str(result["error_code"])
             except Exception as error:
                 with self.mutex:
                     job.update(status="failed", error=f"{type(error).__name__}: {error}")
+                    code = getattr(error, "code", None)
+                    if code:
+                        job["error_code"] = str(code)
                     if getattr(error, "detail", None) is not None:
                         job["detail"] = error.detail
                     elif isinstance(getattr(error, "details", None), dict):
@@ -493,10 +926,13 @@ class Jobs:
                 self.queue.task_done()
 
     def close(self):
+        if self._closed:
+            return
         self.queue.put(None)
         self.thread.join(timeout=30)
         if self.thread.is_alive():
             raise PipelineError("Native job still runs; endpoint ownership lock retained")
+        self._closed = True
         os.close(self.handle)
 
 
@@ -525,6 +961,14 @@ def handler(jobs, token):
                 self._reply(401, {"error": "Unauthorized"})
                 return False
             return True
+
+        def _failure(self, error):
+            body = {"error": str(error)}
+            body.update(getattr(error, "payload", {}) or {})
+            code = getattr(error, "code", None)
+            if code:
+                body.setdefault("error_code", str(code))
+            self._reply(getattr(error, "status", 400), body)
 
         def do_GET(self):
             if not self._authorized():
@@ -561,12 +1005,14 @@ def handler(jobs, token):
                             self.close_connection = True
                     elif suffix.endswith("/preview"):
                         self._reply(200, jobs.preview(suffix[: -len("/preview")]))
+                    elif suffix.endswith("/reruns"):
+                        self._reply(200, jobs.plan(suffix[: -len("/reruns")]))
                     else:
                         self._reply(200, jobs.snapshot(suffix))
                 else:
                     self._reply(404, {"error": "Unknown API route"})
             except (PipelineError, OSError, ValueError, TypeError) as error:
-                self._reply(getattr(error, "status", 400), {"error": str(error)})
+                self._failure(error)
 
         def do_POST(self):
             if not self._authorized():
@@ -611,7 +1057,7 @@ def handler(jobs, token):
                     result, created = jobs.create(request)
                     self._reply(202 if created else 200, result)
             except (PipelineError, ValueError, OSError, TypeError) as error:
-                self._reply(getattr(error, "status", 400), {"error": str(error)})
+                self._failure(error)
 
     return Handler
 

@@ -1,8 +1,9 @@
 """Submit one engineering folder to the Windows SolidWorks execution endpoint.
 
-The DAG carries one operator value, ``handoff_path``. It sends only the resolved native package
-and its digest; hardware, revision and repository routing resolve inside the serialized Windows
-job after CAD discovery and are confirmed here before publication.
+The DAG carries one operator value, ``handoff_path``. A linked attempt (``parent_dag_run_id``
+and ``resume_from``) derives the retained package and digest from the parent native job itself.
+Hardware, revision and repository routing resolve inside the serialized Windows job after CAD
+discovery and are confirmed here before publication.
 """
 
 from __future__ import annotations
@@ -23,7 +24,14 @@ from description_pipeline.orchestration.airflow_client import (
     native_run_id,
     resolved_routing,
 )
-from description_pipeline.stages import compact_view, contract_markdown, require_complete, stage_log, stage_view
+from description_pipeline.stages import (
+    STAGE_IDS,
+    compact_view,
+    contract_markdown,
+    require_complete,
+    stage_log,
+    stage_view,
+)
 from description_pipeline.io import digest
 
 DAG_ID = "solidworks_to_urdf"
@@ -40,6 +48,19 @@ def _endpoint(conn_id: str) -> WindowsEndpoint:
 
 def _run_uuid(context) -> str:
     return native_run_id(context["dag_run"].run_id)
+
+
+def _linked_conf(context) -> dict | None:
+    """The linked-attempt binding of one trigger, or None for an ordinary upload."""
+    conf = getattr(context["dag_run"], "conf", None)
+    conf = conf if isinstance(conf, dict) else {}
+    parent = conf.get("parent_dag_run_id")
+    stage = conf.get("resume_from")
+    if parent is None and stage is None:
+        return None
+    if not (isinstance(parent, str) and parent.strip() and isinstance(stage, str) and stage in STAGE_IDS):
+        raise AirflowFailException("A linked attempt requires parent_dag_run_id and a canonical resume_from stage")
+    return {"parent_run": native_run_id(parent.strip()), "from_stage": stage}
 
 
 def _resolution(request: dict) -> HandoffResolution:
@@ -90,6 +111,8 @@ def _poke(request: dict, **context) -> bool:
 
 def _same_request(job: dict, request: dict) -> None:
     expected = {key: request[key] for key in ("run_id", "package", "handoff_sha256")}
+    if request.get("resume") is not None:
+        expected["resume"] = request["resume"]
     if job.get("request") != expected:
         raise AirflowFailException("Endpoint job differs from the requested mechanical handoff")
 
@@ -125,6 +148,29 @@ def _same_request(job: dict, request: dict) -> None:
 def solidworks_to_urdf():
     @task(doc_md="Collect the admitted native folder and bind its file inventory for the queued engineering job.")
     def resolve_handoff(**context) -> dict:
+        linked = _linked_conf(context)
+        if linked is not None:
+            # The parent native job is the only authority for the retained upload;
+            # client-supplied package or digest values are never trusted.
+            parent = _endpoint(CONN_ID).get_job(linked["parent_run"])
+            retained = parent.get("request") if isinstance(parent.get("request"), dict) else {}
+            package, digest_value = retained.get("package"), retained.get("handoff_sha256")
+            if not isinstance(package, str) or not package or not isinstance(digest_value, str) or not digest_value:
+                raise AirflowFailException(f"Parent job {linked['parent_run']} has no retained mechanical handoff")
+            log.info(
+                "linked attempt parent_run=%s from_stage=%s package=%s endpoint_conn=%s",
+                linked["parent_run"],
+                linked["from_stage"],
+                package,
+                CONN_ID,
+            )
+            return {
+                "run_id": _run_uuid(context),
+                "package": package,
+                "handoff_sha256": digest_value,
+                "conn_id": CONN_ID,
+                "resume": linked,
+            }
         handoff_path = str(context["params"]["handoff_path"]).strip()
         if not handoff_path:
             raise AirflowFailException("handoff_path is required")
@@ -149,6 +195,7 @@ def solidworks_to_urdf():
         job = _endpoint(request["conn_id"]).start_job(
             run_id=request["run_id"],
             resolution=_resolution(request),
+            resume=request.get("resume"),
         )
         log.info("started run_id=%s status=%s", job["run_id"], job["status"])
         return {**request, "status": job["status"]}
