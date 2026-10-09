@@ -13,6 +13,7 @@ const state = {
   folderPick: null,
   uploading: false,
   uploadAbort: null,
+  blockedPick: false,
   stages: [],
   selectedStage: null,
   viewer: null,
@@ -172,6 +173,7 @@ function submitRun(pick, { onProgress } = {}) {
       }
       const error = new Error(payload.error || `上传失败（HTTP ${request.status}）`);
       error.status = request.status;
+      if (payload && payload.dag_run_id) error.dagRunId = String(payload.dag_run_id);
       reject(error);
     });
     request.addEventListener("error", () => {
@@ -191,6 +193,7 @@ function submitRun(pick, { onProgress } = {}) {
 
 function resetPick() {
   state.folderPick = null;
+  state.blockedPick = false;
   $("folder-input").value = "";
   $("folder-summary").hidden = true;
   $("upload-status").hidden = true;
@@ -856,6 +859,7 @@ function wire() {
   $("choose-button").addEventListener("click", () => $("folder-input").click());
 
   $("folder-input").addEventListener("change", () => {
+    state.blockedPick = false;
     const picked = folderPick(Array.from($("folder-input").files || []));
     const summary = $("folder-summary");
     if (picked.error) {
@@ -884,11 +888,16 @@ function wire() {
       setError($("run-error"), "请先选择本机的工程文件夹。");
       return;
     }
+    if (state.blockedPick) {
+      setError($("run-error"), "上一提交状态尚未确认；请在上方运行列表中确认，或重新选择文件夹后再提交。");
+      return;
+    }
     const start = $("start-button");
     const status = $("upload-status");
     state.uploading = true;
     start.disabled = true;
     $("choose-button").disabled = true;
+    $("folder-input").disabled = true;
     $("cancel-button").hidden = false;
     status.hidden = false;
     status.textContent = "正在上传工程文件夹…";
@@ -896,8 +905,12 @@ function wire() {
     try {
       const payload = await submitRun(picked, {
         onProgress: (ratio) => {
-          status.textContent = `正在上传工程文件夹… ${Math.round(ratio * 100)}%`;
-          if (ratio >= 1) $("cancel-button").hidden = true;
+          if (ratio >= 1) {
+            status.textContent = "上传完成，正在创建运行…";
+            $("cancel-button").hidden = true;
+          } else {
+            status.textContent = `正在上传工程文件夹… ${Math.round(ratio * 100)}%`;
+          }
         },
       });
       status.textContent = "上传完成，正在创建运行…";
@@ -911,7 +924,17 @@ function wire() {
         status.textContent = error.message;
         await refreshRuns().catch(() => {});
       } else if (error.status === 401) {
-        setError($("run-error"), "会话已失效，请重新登录后再试。");
+        clearSession();
+        resetPick();
+        setError($("login-error"), "会话已失效，请重新登录后再试。");
+        return;
+      } else if (error.status === 502 && error.dagRunId) {
+        state.blockedPick = true;
+        setError(
+          $("run-error"),
+          `启动状态尚未确认，请检查运行列表；不要重复提交。运行 ID: ${error.dagRunId}`,
+        );
+        await refreshRuns().catch(() => {});
       } else {
         setError($("run-error"), error.message);
       }
@@ -919,10 +942,12 @@ function wire() {
       state.uploading = false;
       state.uploadAbort = null;
       $("choose-button").disabled = false;
+      $("folder-input").disabled = false;
       $("cancel-button").hidden = true;
-      if (state.folderPick) {
+      if (state.folderPick && !state.blockedPick) {
         start.disabled = false;
       } else {
+        start.disabled = true;
         status.hidden = true;
       }
     }
