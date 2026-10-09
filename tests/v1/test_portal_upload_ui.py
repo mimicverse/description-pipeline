@@ -234,6 +234,16 @@ class ReportUiContractTests(unittest.TestCase):
         self.assertIn("不重复检查", app)
         self.assertNotIn("项待确认", app)
 
+    def test_stepper_keeps_names_and_shows_affected_object(self) -> None:
+        app = self.app()
+        css = (STATIC / "style.css").read_text(encoding="utf-8")
+        self.assertIn("STEP_STATE_SHORT", app)
+        self.assertIn("已阻断", app)
+        self.assertIn("minmax(3.5em, 1fr)", css)
+        self.assertIn("max-width: 5.5em", css)
+        self.assertIn("涉及对象", app)
+        self.assertIn("visibleFindings", app)
+
 
 if __name__ == "__main__":
     unittest.main()
