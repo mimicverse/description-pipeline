@@ -449,6 +449,16 @@ function countChecks(rows) {
   return `通过 ${passed}/${rows.length} · 已执行 ${executed}/${rows.length}`;
 }
 
+function countsText(counts, rows) {
+  // Canonical report counts when present; row-derived numbers only as a safety net.
+  if (counts && Number.isFinite(counts.total)) {
+    const passed = Number.isFinite(counts.passed) ? counts.passed : 0;
+    const executed = Number.isFinite(counts.executed) ? counts.executed : 0;
+    return `通过 ${passed}/${counts.total} · 已执行 ${executed}/${counts.total}`;
+  }
+  return countChecks(rows);
+}
+
 function reportRow(row, boundary) {
   const summary = row.summary && typeof row.summary === "object" ? row.summary : {};
   return {
@@ -465,89 +475,36 @@ function reportRow(row, boundary) {
   };
 }
 
-function legacyRow(row, boundary) {
-  return {
-    id: String(row.id || ""),
-    boundary,
-    label: row.label || String(row.id || ""),
-    state: row.state || "not_run",
-    stateZh: CHECK_STATES[row.state] || row.state || "未执行",
-    executed: undefined,
-    scope: "",
-    expected: undefined,
-    actual: undefined,
-    details: row.details || {},
-  };
-}
-
 function stageList(run) {
   const report = run.report && Array.isArray(run.report.stages) ? run.report : null;
-  if (report) {
-    return report.stages.map((stage) => ({
+  if (!report) return [];
+  return report.stages.map((stage) => {
+    const counts = stage.counts && typeof stage.counts === "object" ? stage.counts : {};
+    const boundaryCounts = counts.boundary && typeof counts.boundary === "object" ? counts.boundary : {};
+    const independentCounts = counts.independent && typeof counts.independent === "object" ? counts.independent : {};
+    const sum = (key) =>
+      (Number.isFinite(boundaryCounts[key]) ? boundaryCounts[key] : 0) +
+      (Number.isFinite(independentCounts[key]) ? independentCounts[key] : 0);
+    return {
       id: stage.id,
       nameZh: stage.name_zh || stage.id,
       state: stage.state || "not_run",
-      stateZh: stage.state_zh || STAGE_STATES[stage.state] || "未执行",
+      stateZh: stage.state_zh || "未执行",
       at: stage.at,
-      passed: stage.checks_passed,
-      total: stage.checks_total,
-      executed: stage.checks_executed,
+      counts,
+      passed: sum("passed"),
+      executed: sum("executed"),
+      total: sum("total"),
       boundary: (Array.isArray(stage.boundary) ? stage.boundary : []).map((row) =>
         reportRow(row, row.boundary === "output" ? "output" : "input")),
       independent: (Array.isArray(stage.independent) ? stage.independent : []).map((row) => reportRow(row, "independent")),
       files: Array.isArray(stage.files) ? stage.files : [],
-      unsupported: Array.isArray(stage.unsupported_zh) ? stage.unsupported_zh : [],
-      confirmations: Array.isArray(stage.confirmations_zh) ? stage.confirmations_zh : [],
-    }));
-  }
-  const legacy = (run.stage_view && run.stage_view.stages) || [];
-  return legacy.map((stage) => ({
-    id: stage.id,
-    nameZh: stage.name_zh || stage.name || stage.id,
-    state: stage.state || "not_run",
-    stateZh: STAGE_STATES[stage.state] || stage.state || "未执行",
-    at: stage.at,
-    passed: stage.checks_passed,
-    total: stage.checks_total,
-    boundary: [
-      ...(stage.input_qc || []).map((row) => legacyRow(row, "input")),
-      ...(stage.output_qc || []).map((row) => legacyRow(row, "output")),
-    ],
-    independent: [],
-    files: [],
-    unsupported: (stage.unsupported || []).map((item) => item.label).filter(Boolean),
-    confirmations: (stage.confirmations || []).map((item) => item.label).filter(Boolean),
-  }));
-}
-
-function reviewFacts(report) {
-  const facts = [];
-  const seen = new Set();
-  const push = (item) => {
-    const fact = typeof item === "string"
-      ? { id: "", label: item, scope: "", exclusion: "" }
-      : item && typeof item === "object"
-        ? {
-            id: String(item.id || ""),
-            label: item.label_zh || item.label || String(item.id || ""),
-            scope: item.scope_zh || item.scope || "",
-            exclusion: item.exclusion_zh || item.automatic_exclusion || "",
-          }
-        : null;
-    if (!fact || !fact.label) return;
-    const key = fact.id || fact.label;
-    if (seen.has(key)) return;
-    seen.add(key);
-    facts.push(fact);
-  };
-  if (Array.isArray(report.review_scope)) {
-    for (const item of report.review_scope) push(item);
-    return facts;
-  }
-  for (const stage of Array.isArray(report.stages) ? report.stages : []) {
-    for (const item of stage.confirmations_zh || []) push(item);
-  }
-  return facts;
+      unsupported: (Array.isArray(stage.unsupported) ? stage.unsupported : [])
+        .map((item) => (item && typeof item === "object" ? item.label || item.id : item))
+        .filter(Boolean),
+      manualNote: typeof stage.manual_scope_note_zh === "string" ? stage.manual_scope_note_zh : "",
+    };
+  });
 }
 
 function checkRow(parent, row) {
@@ -609,12 +566,15 @@ function buildFailureCard(failure) {
   return card;
 }
 
-function renderStageDetail(run) {
+function renderStageDetail() {
   const root = $("stage-detail");
   root.textContent = "";
+  if (!state.stages.length) {
+    root.textContent = "报告数据暂不可用：无法显示阶段检查，请刷新重试或联系平台维护人员。";
+    return;
+  }
   const stage = state.stages[state.selectedStage];
   if (!stage) return;
-  const legacyStage = ((run.stage_view && run.stage_view.stages) || []).find((item) => item.id === stage.id) || null;
 
   const summary = document.createElement("div");
   summary.className = "stage-summary";
@@ -630,12 +590,8 @@ function renderStageDetail(run) {
   const counts = document.createElement("p");
   counts.className = "stage-counts muted small";
   const pieces = [];
-  if (stage.boundary.length) pieces.push(`边界检查：${countChecks(stage.boundary)}`);
-  if (stage.independent.length) pieces.push(`独立检查：${countChecks(stage.independent)}`);
-  if (!pieces.length && Number.isFinite(stage.total) && stage.total > 0) {
-    const executed = Number.isFinite(stage.executed) ? stage.executed : "—";
-    pieces.push(`检查：通过 ${Number.isFinite(stage.passed) ? stage.passed : 0} · 已执行 ${executed} · 共 ${stage.total}`);
-  }
+  if (stage.boundary.length) pieces.push(`边界检查：${countsText(stage.counts.boundary, stage.boundary)}`);
+  if (stage.independent.length) pieces.push(`独立检查：${countsText(stage.counts.independent, stage.independent)}`);
   counts.textContent = pieces.join("　•　") || "无检查记录";
   summary.append(counts);
   if (stage.at) {
@@ -662,57 +618,53 @@ function renderStageDetail(run) {
     root.append(group);
   }
 
-  const hashByPath = new Map();
-  if (legacyStage) {
-    for (const item of [...(legacyStage.inputs || []), ...(legacyStage.outputs || [])]) {
-      for (const [path, hash] of Object.entries(item.files || {})) hashByPath.set(path, hash);
-    }
-  }
-  const fileRows = [];
-  if (stage.files.length) {
-    for (const file of stage.files) {
-      fileRows.push({
-        label: file.label || file.path || "文件",
-        path: file.path || "",
-        availability: file.availability || "",
-        hash: hashByPath.get(file.path) || null,
-      });
-    }
-  } else if (legacyStage) {
-    for (const item of [...(legacyStage.inputs || []), ...(legacyStage.outputs || [])]) {
-      const files = Object.entries(item.files || {});
-      if (files.length) {
-        for (const [path, hash] of files) {
-          fileRows.push({ label: item.label || path, path, availability: item.availability || "", hash });
-        }
-      } else {
-        fileRows.push({ label: item.label || "", path: item.path || "", availability: item.availability || "", hash: null });
-      }
-    }
-  }
+  const fileRows = (stage.files || []).map((file) => ({
+    label: file.name_zh || file.label || file.path || "文件",
+    path: file.path || "",
+    availability: file.availability || "",
+    count: Number.isFinite(file.files) ? file.files : null,
+  }));
   if (fileRows.length) {
     const details = expandable(root, `产出与记录（${fileRows.length} 项）`);
     const list = document.createElement("div");
     list.className = "stage-files";
+    const authorized = state.previewFiles || {};
     for (const row of fileRows) {
       const line = document.createElement("p");
       line.className = "file-line";
-      if (row.hash && state.reference) {
-        if (row.label && row.label !== row.path) line.append(`${row.label} · `);
-        line.append(state.reference(row.path, row.hash));
+      if (row.path && Object.prototype.hasOwnProperty.call(authorized, row.path)) {
+        const link = document.createElement("a");
+        link.href = `/api/runs/${encodeURIComponent(state.dagRunId)}/artifacts/${String(row.path)
+          .split("/")
+          .map(encodeURIComponent)
+          .join("/")}`;
+        link.target = "_blank";
+        link.rel = "noopener";
+        link.textContent = [row.label, row.path].filter(Boolean).join(" · ");
+        line.append(link);
       } else {
         line.textContent = [row.label, row.path].filter(Boolean).join(" · ") || "—";
-        if (row.availability) {
-          const tag = document.createElement("code");
-          tag.textContent = row.availability;
-          line.append(" ", tag);
-        }
+      }
+      if (Number.isFinite(row.count) && row.count > 0) {
+        const tag = document.createElement("code");
+        tag.textContent = `${row.count} 个文件`;
+        line.append(" ", tag);
+      } else if (row.availability) {
+        const tag = document.createElement("code");
+        tag.textContent = row.availability;
+        line.append(" ", tag);
       }
       list.append(line);
     }
     details.append(list);
   }
 
+  if (stage.manualNote) {
+    const note = document.createElement("p");
+    note.className = "stage-note muted small";
+    note.textContent = stage.manualNote;
+    root.append(note);
+  }
   if (stage.unsupported.length) {
     const row = document.createElement("p");
     row.className = "stage-note muted small";
@@ -778,41 +730,10 @@ function renderRun(run) {
   $("run-state-label").textContent = RUN_STATES[run.state] || run.state || "";
   $("run-dot").className = `dot ${runDotState(run.state)}`;
   $("run-initiator").textContent = `发起人：${run.operator || run.user || "未记录"}`;
-  const authorized = state.previewFiles || {};
-  const artifactUrl = (name) =>
-    `/api/runs/${encodeURIComponent(runId)}/artifacts/${String(name)
-      .split("/")
-      .map(encodeURIComponent)
-      .join("/")}`;
-  const authorizedDigest = (path, hash) =>
-    Boolean(hash) && Object.prototype.hasOwnProperty.call(authorized, path) && authorized[path] === hash;
-  const reference = (path, hash) => {
-    const line = document.createElement("span");
-    line.className = "file-ref";
-    if (authorizedDigest(path, hash)) {
-      const link = document.createElement("a");
-      link.href = artifactUrl(path);
-      link.target = "_blank";
-      link.rel = "noopener";
-      link.textContent = path;
-      line.append(link);
-    } else {
-      line.append(document.createTextNode(path));
-      line.title = "引用与明细；仅已验证且摘要绑定的 URDF／网格资产提供下载";
-    }
-    if (hash) {
-      const digest = document.createElement("code");
-      digest.textContent = hash;
-      line.append(" ", digest);
-    }
-    return line;
-  };
   const meta = $("run-meta");
   meta.textContent = "";
-  state.reference = reference;
   const report = run.report && Array.isArray(run.report.stages) ? run.report : null;
   const coverage = run.coverage || {};
-  const structure = coverage.structure || {};
   const rows = [
     ["工程文件夹", folderLabel(run.handoff_path) || "—"],
     ["状态", RUN_STATES[run.state] || run.state || "—"],
@@ -822,13 +743,20 @@ function renderRun(run) {
   const measured = report && report.measured ? report.measured : null;
   if (measured) {
     if (measured.subject_sha256) rows.push(["交付摘要", `${String(measured.subject_sha256).slice(0, 12)}…`]);
-    const mass = measured.mass;
-    if (mass && Number.isFinite(mass.mass_kg)) {
-      const range = Array.isArray(mass.expected_kg) && mass.expected_kg.length === 2
-        ? `[${mass.expected_kg[0]}，${mass.expected_kg[1]}] kg`
+    const window = measured.expected_mass_window;
+    if (window && Number.isFinite(window.mass_kg)) {
+      const range = Array.isArray(window.expected_kg) && window.expected_kg.length === 2
+        ? `[${window.expected_kg[0]}，${window.expected_kg[1]}] kg`
         : "—";
-      const delta = Number.isFinite(mass.delta_kg) ? `，偏差 ${mass.delta_kg} kg` : "";
-      rows.push(["质量", `实测 ${mass.mass_kg} kg，预期 ${range}${delta}`]);
+      rows.push(["质量期望窗口", `实测 ${window.mass_kg} kg，窗口 ${range}`]);
+    }
+    const closure = measured.mass_closure;
+    if (closure && Number.isFinite(closure.urdf_mass_kg)) {
+      const delta = Number.isFinite(closure.delta_kg) ? `，差值 ${closure.delta_kg} kg` : "";
+      rows.push([
+        "质量闭合",
+        `URDF ${closure.urdf_mass_kg} kg / 整机 CAD ${closure.whole_cad_mass_kg} kg${delta}`,
+      ]);
     }
   }
   const ident = $("run-ident");
@@ -881,7 +809,7 @@ function renderRun(run) {
   state.stages = stageList(run);
   state.selectedStage = chooseStageIndex(state.stages, runId);
   renderStepper();
-  renderStageDetail(run);
+  renderStageDetail();
 
   const automatic = $("automatic");
   automatic.textContent = "";
@@ -916,95 +844,69 @@ function renderRun(run) {
       automatic.append(group);
     }
   } else {
-    const checks = (run.automatic && run.automatic.checks) || [];
-    const allChecks = checks.length ? expandable(chipRow, `查看全部 ${checks.length} 项检查`) : chipRow;
-    for (const check of checks) {
-      const chip = document.createElement("span");
-      chip.className = `chip ${check.passed === false ? "failed" : check.passed === true ? "success" : ""}`.trim();
-      chip.textContent = `${check.id || "检查"}：${CHECK_STATES[check.state] || "未报告"}`;
-      allChecks.append(chip);
-    }
+    const note = document.createElement("p");
+    note.className = "muted small";
+    note.textContent = "报告数据暂不可用：无法显示逐项检查，请刷新重试或联系平台维护人员。";
+    chipRow.append(note);
   }
 
   const confirmations = $("confirmations");
   confirmations.textContent = "";
-  if (report) {
-    // Canonical review scope: only the external facts automatic checks cannot
-    // cover, and only once a verified model exists. The platform neither claims
-    // pending counts nor syncs external review state.
-    const facts = reviewFacts(report);
-    if (automaticState !== "passed") {
-      const note = document.createElement("p");
-      note.className = "muted small";
-      note.textContent = "工程评审范围未就绪：独立验证通过后，这里显示需要人工确认的外部事实。";
-      confirmations.append(note);
-    } else if (facts.length) {
-      const lead = document.createElement("p");
-      lead.className = "muted small";
-      lead.textContent = "工程评审范围（自动检查无法核验的事实；已通过的自动检查不需要人工重复确认）：";
-      confirmations.append(lead);
-      for (const fact of facts) {
-        const item = document.createElement("div");
-        item.className = "review-fact";
-        const label = document.createElement("strong");
-        label.textContent = fact.label;
-        item.append(label);
-        if (fact.scope) {
-          const scope = document.createElement("p");
-          scope.textContent = `确认内容：${fact.scope}`;
-          item.append(scope);
-        }
-        if (fact.exclusion) {
-          const exclusion = document.createElement("p");
-          exclusion.className = "muted small";
-          exclusion.textContent = `不重复检查：${fact.exclusion}`;
-          item.append(exclusion);
-        }
-        confirmations.append(item);
+  const external = report && report.external_review && typeof report.external_review === "object" ? report.external_review : null;
+  const scopes = external && Array.isArray(external.scopes) ? external.scopes : [];
+  const engineeringState = report && report.overall ? report.overall.engineering_state : null;
+  if (!report) {
+    const note = document.createElement("p");
+    note.className = "muted small";
+    note.textContent = "报告数据暂不可用：工程评审范围无法显示，请刷新重试或联系平台维护人员。";
+    confirmations.append(note);
+  } else if (engineeringState !== "external_review") {
+    const note = document.createElement("p");
+    note.className = "muted small";
+    note.textContent = "工程评审范围未就绪：独立验证通过后，这里显示需要人工确认的外部事实。";
+    confirmations.append(note);
+  } else if (scopes.length) {
+    const lead = document.createElement("p");
+    lead.className = "muted small";
+    lead.textContent = "工程评审范围（自动检查无法核验、需由外部评审确认的事实）：";
+    confirmations.append(lead);
+    for (const scope of scopes) {
+      const item = document.createElement("div");
+      item.className = "review-fact";
+      const label = document.createElement("strong");
+      label.textContent = scope.label || scope.id || "";
+      item.append(label);
+      if (scope.scope) {
+        const text = document.createElement("p");
+        text.textContent = `确认内容：${scope.scope}`;
+        item.append(text);
       }
-      const reuse = document.createElement("p");
-      reuse.className = "muted small";
-      reuse.textContent = "已有且适用的评审结论可以复用；平台不同步外部评审状态，请以受控记录为准。";
-      confirmations.append(reuse);
-    } else {
+      if (scope.automatic_exclusion) {
+        const text = document.createElement("p");
+        text.className = "muted small";
+        text.textContent = `不重复检查：${scope.automatic_exclusion}`;
+        item.append(text);
+      }
+      const stageName = (state.stages.find((entry) => entry.id === scope.stage) || {}).nameZh;
+      if (stageName) {
+        const text = document.createElement("p");
+        text.className = "muted small";
+        text.textContent = `涉及阶段：${stageName}`;
+        item.append(text);
+      }
+      confirmations.append(item);
+    }
+    if (external.note_zh) {
       const note = document.createElement("p");
       note.className = "muted small";
-      note.textContent = "报告未列出需要人工确认的外部事实。";
+      note.textContent = external.note_zh;
       confirmations.append(note);
     }
   } else {
-    const identity = document.createElement("p");
-    identity.className = "muted";
-    identity.textContent = `结构身份：${structure.hardware_id || "待解析"} · 版本 ${structure.revision || "—"} · 交付摘要 ${
-      String(structure.subject_sha256 || "").slice(0, 12) || "—"
-    }`;
-    confirmations.append(identity);
-    const items = (coverage.engineering && coverage.engineering.items) || [];
-    if (run.automatic && run.automatic.state === "passed" && items.length) {
-      const lead = document.createElement("p");
-      lead.className = "muted small";
-      lead.textContent = "待人工确认项：";
-      confirmations.append(lead);
-      const row = document.createElement("p");
-      for (const item of items) {
-        const chip = document.createElement("span");
-        chip.className = "chip";
-        chip.textContent = String(item.id);
-        row.append(" ", chip);
-      }
-      confirmations.append(row);
-    } else {
-      const note = document.createElement("p");
-      note.className = "muted small";
-      note.textContent = "自动分析尚未完成：待人工确认的范围尚未确定。";
-      confirmations.append(note);
-    }
-    if (coverage.engineering && coverage.engineering.message) {
-      const note = document.createElement("p");
-      note.className = "muted";
-      note.textContent = coverage.engineering.message;
-      confirmations.append(note);
-    }
+    const note = document.createElement("p");
+    note.className = "muted small";
+    note.textContent = "报告未列出需要人工确认的外部事实。";
+    confirmations.append(note);
   }
 
   const findings = $("findings");
