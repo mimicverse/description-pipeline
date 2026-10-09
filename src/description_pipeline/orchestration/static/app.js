@@ -75,7 +75,7 @@ const RETRY_REASONS = {
   unknown_failed_task: "无法确认可恢复的任务，请联系平台维护人员。",
   resolution_or_capture_failed: "请修正工程目录或采集问题，再新建运行。",
   publication_failed: "发布失败，请修正问题后新建运行。",
-  native_terminal_failure: "原作业已失败，修正问题后新建运行。",
+  native_terminal_failure: "原作业已终止；可在阶段页选择重新运行。",
   no_failed_transport_task: "没有可恢复的任务，请查看问题与发现。",
   endpoint_evidence_unavailable: "无法确认原作业状态，稍后再试。",
 };

@@ -1596,9 +1596,7 @@ class PortalTests(unittest.TestCase):
 
         def click(index: int) -> None:
             barrier.wait()
-            results[index] = clients[index].request(
-                "POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"}
-            )
+            results[index] = clients[index].request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
 
         with patch.object(self.endpoint, "rerun_plan", create=True, return_value={"stage_reruns": rows}):
             threads = [threading.Thread(target=click, args=(index,)) for index in range(2)]
@@ -1614,6 +1612,19 @@ class PortalTests(unittest.TestCase):
         self.assertNotEqual(child, DAG_RUN_ID)
         self.assertEqual(len(self.airflow.trigger_payloads), 1)
         self.assertEqual(self.airflow.trigger_payloads[0]["dag_run_id"], child)
+
+    def test_corrupt_rerun_reservation_refuses_without_creating_another_run(self) -> None:
+        self._seed_retryable_run()
+        self.client.login()
+        path = self._write_rerun_reservation("portal-original-reservation", "generate")
+        for raw in ("{broken", "{}", '{"attempt_id":"../escape","stage":"generate"}'):
+            with self.subTest(raw=raw):
+                path.write_text(raw, encoding="utf-8")
+                status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
+                self.assertEqual(status, 409, body)
+                self.assertEqual(json.loads(body)["reason"], "unresolved_outcome")
+                self.assertEqual(self.airflow.trigger_payloads, [])
+                self.assertEqual(path.read_text(encoding="utf-8"), raw)
 
     def test_rerun_attempt_reuses_persisted_reservation_after_restart(self) -> None:
         self._seed_retryable_run()

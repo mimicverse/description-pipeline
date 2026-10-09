@@ -616,8 +616,6 @@ def _automatic_summary(job: dict | None) -> dict:
     return {"state": "unverified", "job_state": status, "checks": checks, "message": message}
 
 
-#: Canonical responsibility rows of docs/mechanical-handoff-spec.md §11.1. The automatic column
-#: below mirrors only the spec's explicit coverage statements; every engineering item stays
 def _retry_assessment(run: dict, tasks: list[dict], job: dict | None, endpoint_error: str | None) -> RetryAssessment:
     states: dict[str, object] = {}
     for task in tasks:
@@ -1077,40 +1075,40 @@ class PortalApp:
         stage_view_payload = stage_view(job)
         report = build_report(job, view=stage_view_payload)
         payload = {
-                "dag_run_id": dag_run_id,
-                "state": airflow_run.get("state"),
-                "handoff_path": conf.get("handoff_path"),
-                "operator": operator,
-                "principal": principal,
-                "can_manage": can_manage,
-                "retry": {"eligible": retry.eligible, "reason": retry.reason},
-                "started_at": airflow_run.get("start_date"),
-                "ended_at": airflow_run.get("end_date"),
-                "tasks": [
-                    {
-                        "task_id": str(task.get("task_id") or ""),
-                        "state": task.get("state"),
-                        "start_date": task.get("start_date"),
-                        "end_date": task.get("end_date"),
-                    }
-                    for task in tasks
-                ],
-                "job": None if job is None else {"status": job.get("status"), "error": job.get("error")},
-                "discovery": None
-                if not isinstance(job, dict) or not isinstance(job.get("discovery"), dict)
-                else {
-                    "passed": job["discovery"].get("passed"),
-                    "hardware_id": job["discovery"].get("hardware_id"),
-                    "revision": job["discovery"].get("revision"),
-                    "discovery_sha256": job["discovery"].get("discovery_sha256"),
-                },
-                "stage_view": stage_view_payload,
-                "report": report,
-                "findings": _findings(job),
-                "automatic": _automatic_summary(job),
-                "coverage": _coverage_report(job, report),
-                "pr": pr,
-                "endpoint_error": endpoint_error,
+            "dag_run_id": dag_run_id,
+            "state": airflow_run.get("state"),
+            "handoff_path": conf.get("handoff_path"),
+            "operator": operator,
+            "principal": principal,
+            "can_manage": can_manage,
+            "retry": {"eligible": retry.eligible, "reason": retry.reason},
+            "started_at": airflow_run.get("start_date"),
+            "ended_at": airflow_run.get("end_date"),
+            "tasks": [
+                {
+                    "task_id": str(task.get("task_id") or ""),
+                    "state": task.get("state"),
+                    "start_date": task.get("start_date"),
+                    "end_date": task.get("end_date"),
+                }
+                for task in tasks
+            ],
+            "job": None if job is None else {"status": job.get("status"), "error": job.get("error")},
+            "discovery": None
+            if not isinstance(job, dict) or not isinstance(job.get("discovery"), dict)
+            else {
+                "passed": job["discovery"].get("passed"),
+                "hardware_id": job["discovery"].get("hardware_id"),
+                "revision": job["discovery"].get("revision"),
+                "discovery_sha256": job["discovery"].get("discovery_sha256"),
+            },
+            "stage_view": stage_view_payload,
+            "report": report,
+            "findings": _findings(job),
+            "automatic": _automatic_summary(job),
+            "coverage": _coverage_report(job, report),
+            "pr": pr,
+            "endpoint_error": endpoint_error,
         }
         rerun_rows = self._rerun_rows(run_id)
         if rerun_rows is not None:
@@ -1266,9 +1264,18 @@ class PortalApp:
             return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except FileNotFoundError:
             return None
-        return data if isinstance(data, dict) else None
+        except (OSError, ValueError) as error:
+            raise RerunUncertainty("the rerun reservation cannot be read") from error
+        if (
+            not isinstance(data, dict)
+            or not isinstance(data.get("attempt_id"), str)
+            or _RUN_ID.fullmatch(data["attempt_id"]) is None
+            or data.get("stage") not in _STAGE_IDS
+        ):
+            raise RerunUncertainty("the rerun reservation is invalid")
+        return data
 
     def _write_rerun_journal(self, parent_dag_run_id: str, attempt_id: str, stage: str) -> None:
         """Durable reservation written before the trigger so a 502 retry reuses one run id."""
@@ -1427,9 +1434,7 @@ class PortalApp:
                     if active is not None:
                         active_id, active_stage, active_state = active
                         if active_stage == stage:
-                            return self._accepted_attempt(
-                                start_response, active_id, dag_run_id, stage, active_state
-                            )
+                            return self._accepted_attempt(start_response, active_id, dag_run_id, stage, active_state)
                         return self._rerun_refusal(
                             start_response,
                             "already_active",
