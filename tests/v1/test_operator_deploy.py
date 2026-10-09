@@ -145,6 +145,9 @@ class RenderTests(unittest.TestCase):
             self.assertEqual(render(state).returncode, 0)
             config = (state / "nginx/nginx.conf").read_text(encoding="utf-8")
             self.assertIn("$request_method $uri $server_protocol", config)
+            # OAuth query values must never reach the access log. The canonical-origin redirect
+            # may legitimately carry them in a Location header, so the ban covers the log format.
+            log_format = config.split("log_format", 1)[1].split(";", 1)[0]
             for sensitive in (
                 "$request_uri",
                 "$args",
@@ -153,8 +156,8 @@ class RenderTests(unittest.TestCase):
                 "$http_cookie",
                 "$http_authorization",
             ):
-                self.assertNotIn(sensitive, config)
-            self.assertNotIn('"$request"', config)
+                self.assertNotIn(sensitive, log_format)
+            self.assertNotIn('"$request"', log_format)
             airflow = (ROOT / "deploy/airflow/airflow.cfg.template").read_text(encoding="utf-8")
             self.assertIn("namespace_levels = http.access=WARNING", airflow)
 
