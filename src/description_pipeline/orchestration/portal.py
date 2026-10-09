@@ -82,6 +82,8 @@ AIRFLOW_TOKEN_COOKIE = "_token"
 _AIRFLOW_TIMEOUT = 20.0
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _RUN_ID = re.compile(r"[A-Za-z0-9_.:-]{1,250}\Z")
+_STAGE_IDS = tuple(stage["id"] for stage in CONTRACT["stages"])
+_STAGE_NAMES_ZH = {stage["id"]: stage.get("name_zh") or stage["id"] for stage in CONTRACT["stages"]}
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 _ARTIFACT_TYPES = {
     ".urdf": "application/xml",
@@ -486,6 +488,15 @@ def _run_identity(actor: object, record: PortalRun | None) -> tuple[str | None, 
     return principal, name
 
 
+def _optional_str(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _stage_name_zh(value: object) -> str | None:
+    stage = _optional_str(value)
+    return _STAGE_NAMES_ZH.get(stage) if stage is not None else None
+
+
 def _discovery_evidence(detail: object, digest: str) -> dict:
     """One finding's diagnostic payload, always bound to the raw discovery record digest."""
     evidence: dict = {}
@@ -711,6 +722,9 @@ class PortalApp:
         match = re.fullmatch(r"/api/runs/([^/]+)/retry", path)
         if match and method == "POST":
             return self._retry_run(environ, start_response, match.group(1))
+        match = re.fullmatch(r"/api/runs/([^/]+)/attempts", path)
+        if match and method == "POST":
+            return self._rerun_attempt(environ, start_response, match.group(1))
         match = re.fullmatch(r"/api/runs/([^/]+)/preview", path)
         if match and method == "GET":
             return self._preview(environ, start_response, match.group(1))
@@ -861,6 +875,10 @@ class PortalApp:
                     "principal": principal,
                     "state": item.get("state"),
                     "started_at": item.get("start_date"),
+                    # Linked rerun lineage: derived from the child run's own conf only.
+                    "parent_dag_run_id": _optional_str(conf.get("parent_dag_run_id")),
+                    "resume_from": _optional_str(conf.get("resume_from")),
+                    "resume_from_name_zh": _stage_name_zh(conf.get("resume_from")),
                 }
             )
         for record in sorted(local.values(), key=lambda item: item.started_at, reverse=True):
@@ -875,6 +893,9 @@ class PortalApp:
                         "principal": record.principal,
                         "state": None,
                         "started_at": datetime.fromtimestamp(record.started_at, UTC).isoformat(),
+                        "parent_dag_run_id": None,
+                        "resume_from": None,
+                        "resume_from_name_zh": None,
                     }
                 )
         return _json_response(
@@ -1047,10 +1068,7 @@ class PortalApp:
                 pr = None
         stage_view_payload = stage_view(job)
         report = build_report(job, view=stage_view_payload)
-        return _json_response(
-            start_response,
-            200,
-            {
+        payload = {
                 "dag_run_id": dag_run_id,
                 "state": airflow_run.get("state"),
                 "handoff_path": conf.get("handoff_path"),
@@ -1085,9 +1103,11 @@ class PortalApp:
                 "coverage": _coverage_report(job, report),
                 "pr": pr,
                 "endpoint_error": endpoint_error,
-            },
-            self.config,
-        )
+        }
+        rerun_rows = self._rerun_rows(run_id)
+        if rerun_rows is not None:
+            payload["stage_reruns"] = rerun_rows
+        return _json_response(start_response, 200, payload, self.config)
 
     def _retry_run(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
         session = self._session(environ, csrf=True)
@@ -1164,6 +1184,189 @@ class PortalApp:
                 "state": result.get("state"),
                 "cleared_tasks": list(assessment.cleared_tasks),
             },
+            self.config,
+        )
+
+    # ------------------------------------------------------------- rerun
+    def _rerun_rows(self, native_id: str) -> list[dict] | None:
+        """Finished stage-rerun availability rows; unavailable data is omitted, never faked."""
+        plan = getattr(self._endpoint(), "rerun_plan", None)
+        if plan is None:
+            return None
+        try:
+            payload = plan(native_id)
+        except (EndpointNotFound, EndpointError):
+            return None
+        rows = payload.get("stage_reruns") if isinstance(payload, dict) else None
+        return rows if isinstance(rows, list) and rows else None
+
+    def _active_attempt(
+        self, session: PortalSession, parent_dag_run_id: str
+    ) -> tuple[str, str | None, str | None] | None:
+        """Restart-safe scan of the child runs: an active attempt for this parent, if any."""
+        try:
+            items = self.config.airflow.list_dag_runs(session.token, self.config.dag_id, limit=20)
+        except AirflowAuthError:
+            raise
+        except AirflowApiError:
+            return None
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            conf = item.get("conf") if isinstance(item.get("conf"), dict) else {}
+            if conf.get("parent_dag_run_id") != parent_dag_run_id:
+                continue
+            state = item.get("state")
+            if state is not None and state not in {"queued", "running"}:
+                continue
+            child = _optional_str(item.get("dag_run_id"))
+            if child is None:
+                continue
+            return child, _optional_str(conf.get("resume_from")), _optional_str(state)
+        return None
+
+    def _trigger_linked_attempt(self, session: PortalSession, dag_run_id: str, conf: dict) -> str:
+        """Trigger once; an ambiguous failure is reconciled on the exact run id, never blind-retried."""
+        try:
+            self.config.airflow.trigger_dag_run(session.token, self.config.dag_id, dag_run_id, conf)
+            return "created"
+        except AirflowAuthError:
+            return "auth"
+        except AirflowApiError:
+            pass
+        if self._uploaded_run_exists(session, dag_run_id):
+            return "created"
+        try:
+            self.config.airflow.trigger_dag_run(session.token, self.config.dag_id, dag_run_id, conf)
+            return "created"
+        except AirflowAuthError:
+            return "auth"
+        except AirflowApiError:
+            return "created" if self._uploaded_run_exists(session, dag_run_id) else "absent"
+
+    @staticmethod
+    def _attempt_payload(new_run_id: str, parent_dag_run_id: str, stage: str, state: str) -> dict:
+        return {
+            "dag_run_id": new_run_id,
+            "parent_dag_run_id": parent_dag_run_id,
+            "resume_from": stage,
+            "resume_from_name_zh": _STAGE_NAMES_ZH.get(stage, stage),
+            "state": state,
+        }
+
+    def _rerun_refusal(
+        self,
+        start_response: Callable,
+        reason: str,
+        reason_zh: str,
+        earliest_required: str | None,
+        *,
+        active_dag_run_id: str | None = None,
+    ) -> Iterable[bytes]:
+        payload = {
+            "error": reason_zh,
+            "reason": reason,
+            "reason_zh": reason_zh,
+            "earliest_required": earliest_required,
+        }
+        if active_dag_run_id is not None:
+            payload["active_dag_run_id"] = active_dag_run_id
+        return _json_response(start_response, HTTPStatus.CONFLICT, payload, self.config)
+
+    def _rerun_attempt(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
+        """One linked attempt from a chosen stage; only the stage is client-provided."""
+        session = self._session(environ, csrf=True)
+        if _RUN_ID.fullmatch(dag_run_id) is None:
+            raise PortalError(HTTPStatus.BAD_REQUEST, "运行标识不合法")
+        body = self._body(environ)
+        stage = body.get("stage")
+        if set(body) != {"stage"} or not isinstance(stage, str) or stage not in _STAGE_IDS:
+            raise PortalError(HTTPStatus.BAD_REQUEST, "重新运行只接受有效的 stage 参数")
+        try:
+            airflow_run = self.config.airflow.dag_run(session.token, self.config.dag_id, dag_run_id)
+            if not self._can_manage(session, airflow_run):
+                raise PortalError(HTTPStatus.FORBIDDEN, "只有发起人或平台管理员可重新运行此运行")
+            parent_conf = airflow_run.get("conf") if isinstance(airflow_run.get("conf"), dict) else {}
+            handoff_path = _optional_str(parent_conf.get("handoff_path"))
+            if handoff_path is None:
+                return self._rerun_refusal(
+                    start_response,
+                    "incomplete",
+                    "原运行缺少可复用的上传目录，无法从此步骤重新运行",
+                    None,
+                )
+            active = self._active_attempt(session, dag_run_id)
+            if active is not None:
+                active_id, active_stage, active_state = active
+                if active_stage == stage:
+                    # Same stage, same parent: idempotent acceptance of the running attempt.
+                    return _json_response(
+                        start_response,
+                        HTTPStatus.ACCEPTED,
+                        self._attempt_payload(active_id, dag_run_id, stage, active_state or "queued"),
+                        self.config,
+                    )
+                return self._rerun_refusal(
+                    start_response,
+                    "already_active",
+                    "已有正在执行的关联尝试，请等待其结束",
+                    None,
+                    active_dag_run_id=active_id,
+                )
+            rows = self._rerun_rows(native_run_id(dag_run_id))
+            if rows is None:
+                return self._rerun_refusal(
+                    start_response,
+                    "unresolved_outcome",
+                    "暂时无法确认可复用的检查点，请稍后重试",
+                    None,
+                )
+            row = next((item for item in rows if isinstance(item, dict) and item.get("stage") == stage), None)
+            if row is None or row.get("eligible") is not True:
+                prerequisites = (
+                    row.get("prerequisites")
+                    if isinstance(row, dict) and isinstance(row.get("prerequisites"), dict)
+                    else {}
+                )
+                return self._rerun_refusal(
+                    start_response,
+                    str((row or {}).get("reason") or "not_ready") if isinstance(row, dict) else "not_ready",
+                    str((row or {}).get("reason_zh") or "当前无法从此步骤重新运行"),
+                    _optional_str(prerequisites.get("earliest_required")),
+                )
+            new_run_id = f"portal-{datetime.now(UTC):%Y%m%dT%H%M%S}-{secrets.token_hex(4)}"
+            conf = {"handoff_path": handoff_path, "parent_dag_run_id": dag_run_id, "resume_from": stage}
+            outcome = self._trigger_linked_attempt(session, new_run_id, conf)
+            if outcome == "auth":
+                raise PortalError(HTTPStatus.UNAUTHORIZED, "飞书登录已失效，请重新登录")
+            if outcome == "absent":
+                return _json_response(
+                    start_response,
+                    HTTPStatus.BAD_GATEWAY,
+                    {
+                        "error": "启动状态尚未确认，请在运行列表中核对新尝试；不要重复提交",
+                        "dag_run_id": new_run_id,
+                    },
+                    self.config,
+                )
+        except AirflowAuthError as error:
+            forbidden = isinstance(error.__cause__, urlerror.HTTPError) and error.__cause__.code == 403
+            raise PortalError(HTTPStatus.FORBIDDEN if forbidden else HTTPStatus.UNAUTHORIZED, str(error)) from error
+        except AirflowApiError as error:
+            code = error.__cause__.code if isinstance(error.__cause__, urlerror.HTTPError) else None
+            status = code if code in {404, 409} else HTTPStatus.BAD_GATEWAY
+            raise PortalError(status, str(error)) from error
+        log.info(
+            "portal rerun parent=%s child=%s stage=%s principal=%s",
+            dag_run_id,
+            new_run_id,
+            stage,
+            session.principal,
+        )
+        return _json_response(
+            start_response,
+            HTTPStatus.ACCEPTED,
+            self._attempt_payload(new_run_id, dag_run_id, stage, "queued"),
             self.config,
         )
 

@@ -1359,6 +1359,180 @@ class PortalTests(unittest.TestCase):
                 if process.stdout:
                     process.stdout.close()
 
+    # ------------------------------------------------------- linked reruns
+    @staticmethod
+    def _rerun_rows(overrides: dict[str, tuple[bool, str, str | None]] | None = None) -> list[dict]:
+        names = {
+            "freeze": "冻结输入",
+            "discover": "解析结构",
+            "capture": "采集证据",
+            "generate": "生成 URDF",
+            "verify": "独立验证",
+            "publish": "提交评审 PR",
+        }
+        chosen = overrides or {}
+        rows = []
+        for stage, name in names.items():
+            eligible, reason, earliest = chosen.get(stage, (True, "ok", None))
+            rows.append(
+                {
+                    "stage": stage,
+                    "name_zh": name,
+                    "eligible": eligible,
+                    "reason": reason,
+                    "reason_zh": "" if eligible else "上游检查点不可复用，请从更早步骤重新执行",
+                    "recomputes": [stage],
+                    "retains": [],
+                    "prerequisites": {
+                        "inputs": "ok",
+                        "tool": "ok",
+                        "dependency": "ok",
+                        "target": "ok",
+                        "receipt": "ok",
+                        "earliest_required": earliest,
+                    },
+                }
+            )
+        return rows
+
+    def test_rerun_attempt_requires_owner_and_csrf_and_valid_stage(self) -> None:
+        self._seed_passed_job()
+        viewer = PortalClient(self.client.base)
+        viewer.login(VIEWER_TOKEN)
+        status, _, _ = viewer.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
+        self.assertEqual(status, 403)
+        self.client.login()
+        self.client.csrf = None
+        status, _, _ = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
+        self.assertEqual(status, 403)
+        self.client.login()
+        for body in ({"stage": "bogus"}, {}, {"stage": "generate", "handoff_path": "/elsewhere"}):
+            with self.subTest(body=body):
+                status, _, _ = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", body)
+                self.assertEqual(status, 400)
+
+    def test_rerun_attempt_creates_linked_child_from_authoritative_parent(self) -> None:
+        self._seed_retryable_run()
+        self.client.login()
+        rows = self._rerun_rows()
+        parent_conf = dict(self.airflow.dag_runs[DAG_RUN_ID]["conf"])
+        jobs_before = set(self.endpoint_server.jobs)
+        with patch.object(self.endpoint, "rerun_plan", create=True, return_value={"stage_reruns": rows}):
+            status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
+        self.assertEqual(status, 202, body)
+        payload = json.loads(body)
+        child = payload["dag_run_id"]
+        self.assertNotEqual(child, DAG_RUN_ID)
+        self.assertEqual(payload["parent_dag_run_id"], DAG_RUN_ID)
+        self.assertEqual(payload["resume_from"], "generate")
+        self.assertEqual(payload["resume_from_name_zh"], "生成 URDF")
+        self.assertEqual(payload["state"], "queued")
+        self.assertEqual(self.airflow.trigger_payloads[-1]["dag_run_id"], child)
+        self.assertEqual(
+            self.airflow.trigger_payloads[-1]["conf"],
+            {"handoff_path": "/srv/robot-cell", "parent_dag_run_id": DAG_RUN_ID, "resume_from": "generate"},
+        )
+        # The original run, its conf and the native job stay immutable.
+        self.assertEqual(self.airflow.dag_runs[DAG_RUN_ID]["conf"], parent_conf)
+        self.assertEqual(self.airflow.dag_runs[DAG_RUN_ID]["state"], "failed")
+        self.assertEqual(set(self.endpoint_server.jobs), jobs_before)
+
+    def test_rerun_attempt_same_stage_is_idempotent_and_other_stage_conflicts(self) -> None:
+        self._seed_retryable_run()
+        child = "portal-20261009T000000-deadbeef"
+        self._seed_airflow_run(
+            child,
+            state="queued",
+            conf={"handoff_path": "/srv/robot-cell", "parent_dag_run_id": DAG_RUN_ID, "resume_from": "generate"},
+        )
+        self.client.login()
+        rows = self._rerun_rows()
+        with patch.object(self.endpoint, "rerun_plan", create=True, return_value={"stage_reruns": rows}):
+            before = len(self.airflow.trigger_payloads)
+            status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
+            self.assertEqual(status, 202, body)
+            self.assertEqual(json.loads(body)["dag_run_id"], child)
+            self.assertEqual(len(self.airflow.trigger_payloads), before)
+            status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "capture"})
+        self.assertEqual(status, 409, body)
+        payload = json.loads(body)
+        self.assertEqual(payload["reason"], "already_active")
+        self.assertEqual(payload["active_dag_run_id"], child)
+        self.assertTrue(payload["reason_zh"])
+
+    def test_rerun_attempt_refuses_ineligible_stage_with_earliest_required(self) -> None:
+        self._seed_retryable_run()
+        self.client.login()
+        rows = self._rerun_rows({"verify": (False, "dependency_changed", "discover")})
+        with patch.object(self.endpoint, "rerun_plan", create=True, return_value={"stage_reruns": rows}):
+            status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "verify"})
+        self.assertEqual(status, 409, body)
+        payload = json.loads(body)
+        self.assertEqual(payload["reason"], "dependency_changed")
+        self.assertEqual(payload["earliest_required"], "discover")
+        self.assertTrue(payload["reason_zh"])
+        self.assertEqual(self.airflow.trigger_payloads, [])
+
+    def test_rerun_attempt_without_planner_refuses_without_creating(self) -> None:
+        self._seed_retryable_run()
+        self.client.login()
+        status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(json.loads(body)["reason"], "unresolved_outcome")
+        self.assertEqual(self.airflow.trigger_payloads, [])
+
+    def test_rerun_attempt_reconciles_ambiguous_trigger(self) -> None:
+        self._seed_retryable_run()
+        self.client.login()
+        rows = self._rerun_rows()
+        self.airflow.trigger_fail_after_create = True
+        self.airflow.trigger_fail_times = 1
+        with patch.object(self.endpoint, "rerun_plan", create=True, return_value={"stage_reruns": rows}):
+            status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "freeze"})
+        self.assertEqual(status, 202, body)
+        self.assertIn(json.loads(body)["dag_run_id"], self.airflow.dag_runs)
+
+    def test_rerun_attempt_reports_unconfirmed_start_when_absent(self) -> None:
+        self._seed_retryable_run()
+        self.client.login()
+        rows = self._rerun_rows()
+        self.airflow.trigger_fail_times = 10
+        with patch.object(self.endpoint, "rerun_plan", create=True, return_value={"stage_reruns": rows}):
+            status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "capture"})
+        self.assertEqual(status, 502, body)
+        self.assertTrue(json.loads(body)["dag_run_id"])
+        self.assertEqual(list(self.airflow.dag_runs), [DAG_RUN_ID])
+
+    def test_list_runs_exposes_linked_attempt_lineage(self) -> None:
+        self._seed_retryable_run()
+        child = "portal-20261009T000000-cafebabe"
+        self._seed_airflow_run(
+            child,
+            state="queued",
+            conf={"handoff_path": "/srv/robot-cell", "parent_dag_run_id": DAG_RUN_ID, "resume_from": "verify"},
+        )
+        self.client.login()
+        status, _, body = self.client.request("GET", "/api/runs")
+        self.assertEqual(status, 200, body)
+        runs = {item["dag_run_id"]: item for item in json.loads(body)["runs"]}
+        self.assertEqual(runs[child]["parent_dag_run_id"], DAG_RUN_ID)
+        self.assertEqual(runs[child]["resume_from"], "verify")
+        self.assertEqual(runs[child]["resume_from_name_zh"], "独立验证")
+        self.assertIsNone(runs[DAG_RUN_ID]["parent_dag_run_id"])
+        self.assertIsNone(runs[DAG_RUN_ID]["resume_from"])
+
+    def test_run_detail_stage_reruns_passthrough_and_omission(self) -> None:
+        self._seed_retryable_run()
+        self.client.login()
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 200, body)
+        self.assertNotIn("stage_reruns", json.loads(body))
+        rows = self._rerun_rows()
+        with patch.object(self.endpoint, "rerun_plan", create=True, return_value={"stage_reruns": rows}):
+            status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["stage_reruns"], rows)
+
 
 if __name__ == "__main__":
     unittest.main()
