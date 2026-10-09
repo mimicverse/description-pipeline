@@ -181,14 +181,15 @@ class RenderTests(unittest.TestCase):
             self.assertIn('"url": "http://127.0.0.1:8791"', portal)
             self.assertIn('"url": "http://127.0.0.1:18765"', portal)
             self.assertIn('"port": 18788', portal)
-            # c9's portal refuses unknown keys, so the bootstrap config is exactly three sections.
+            # The portal refuses unknown keys, so the bootstrap config stays exactly three
+            # sections; upload_root names the single Linux intake used by the folder picker.
             import json
 
             parsed = json.loads(portal)
             self.assertEqual(sorted(parsed), ["airflow", "endpoint", "portal"])
             self.assertEqual(sorted(parsed["airflow"]), ["url"])
             self.assertEqual(sorted(parsed["endpoint"]), ["token_file", "url"])
-            self.assertEqual(sorted(parsed["portal"]), ["host", "port"])
+            self.assertEqual(sorted(parsed["portal"]), ["host", "port", "upload_root"])
             # Deterministic: a changed environment re-renders the current config, identical
             # environments produce identical bytes, and unknown keys are not passed through.
             first = (state / "portal.json").read_bytes()

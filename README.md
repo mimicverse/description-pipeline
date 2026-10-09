@@ -11,13 +11,19 @@ Windows SolidWorks worker.
 
 Open the single HTTPS address provided by the platform maintainer.
 
-1. Prepare saved native engineering under the
+1. Prepare saved native engineering on your own computer under the
    [mechanical specification](docs/mechanical-handoff-spec.md).
-2. Sign in with Feishu, select its accessible engineering-folder path,
-   and start the run.
+2. Sign in with Feishu, choose the complete project folder on your computer
+   (Chrome or Edge) and start the run. The browser uploads the folder's files to
+   the platform before anything is frozen; no server path is entered by hand.
 3. Review the six steps and their input/output checks (pending confirmations and
    per-stage unsupported items stay visible), inspect the verified URDF and joint
    limits, and open the PR for engineering approval.
+
+The picker uploads only the chosen folder (up to 16 GB total, 100 000 files,
+512 MB per file); empty subfolders and temporary SolidWorks lock files are
+skipped. Generated platform inputs such as `robot.yaml` and
+`cad-revision.json` must not be included — the platform generates them.
 
 Run history and details show the original submitter's Feishu username, obtained
 automatically through Feishu's authentication API.

@@ -8,6 +8,7 @@
   },
   "portal": {
     "host": "@OPERATOR_UPSTREAM_HOST@",
-    "port": @OPERATOR_UPSTREAM_PORT@
+    "port": @OPERATOR_UPSTREAM_PORT@,
+    "upload_root": "@OPERATOR_UPLOAD_ROOT@"
   }
 }

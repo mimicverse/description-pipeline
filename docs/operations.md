@@ -37,11 +37,12 @@ current review-branch delivery, or in the configured base if no review delivery
 exists. Each new delivery continues that baseline. Reusing a revision requires
 identical revision content.
 
-Make the folder accessible to the platform. The path may name a directory on
-the Linux server or the configured Windows worker. Linux folders must be within
-`SOLIDWORKS_HANDOFF_ROOT`; Windows folders must be within the endpoint's
-`handoff_roots`. A browser cannot read an arbitrary folder on another computer
-merely from its path.
+Choose the complete project folder from your own computer in the operator page.
+The browser uploads its files, preserving relative paths, to the platform's
+dedicated Linux intake before anything is frozen; server-side admission applies
+the same naming, case and generated-input rules as the native handoff
+(`robot.yaml` and `cad-revision.json` are generated and must not be included).
+Platform-managed paths are never entered by hand.
 
 ## 3. Start and inspect the run
 
