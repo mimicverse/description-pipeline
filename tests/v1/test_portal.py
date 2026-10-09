@@ -966,6 +966,46 @@ class PortalTests(unittest.TestCase):
             status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
             self.assertEqual(status, 200)
 
+    def test_publication_failure_preserves_the_verified_preview(self) -> None:
+        # Acceptance 8: a PR-service failure keeps the verified preview; the automatic summary
+        # reflects the model qualification, not the overall job or publication state.
+        self.client.login()
+        self._seed_airflow_run(state="failed")
+        with MockEndpoint(publish_failed=True, preview_payload=_preview_payload()) as server:
+            endpoint = WindowsEndpoint(EndpointConfig(base_url=server.url, token="test-token"))
+            run_id = native_run_id(DAG_RUN_ID)
+            endpoint.start_job(run_id=run_id, resolution=endpoint.resolve_handoff("handoff/m3.0"))
+            endpoint.get_job(run_id)
+            self.endpoint = endpoint
+            status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+            self.assertEqual(status, 200, body)
+            payload = json.loads(body)
+            self.assertEqual(payload["automatic"]["state"], "passed")
+            self.assertEqual(payload["job"]["status"], "failed")
+            self.assertIsNone(payload["pr"])
+            status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
+            self.assertEqual(status, 200, body)
+            self.assertEqual(json.loads(body)["urdf"], "urdf/robot.urdf")
+
+    def test_publication_failure_with_mismatched_quality_is_still_blocked(self) -> None:
+        self.client.login()
+        self._seed_airflow_run(state="failed")
+        with MockEndpoint(
+            publish_failed=True, quality_mismatch=True, preview_payload=_preview_payload()
+        ) as server:
+            endpoint = WindowsEndpoint(EndpointConfig(base_url=server.url, token="test-token"))
+            run_id = native_run_id(DAG_RUN_ID)
+            endpoint.start_job(run_id=run_id, resolution=endpoint.resolve_handoff("handoff/m3.0"))
+            endpoint.get_job(run_id)
+            self.endpoint = endpoint
+            status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+            self.assertEqual(status, 200, body)
+            payload = json.loads(body)
+            self.assertEqual(payload["automatic"]["state"], "failed")
+            self.assertIn("subject_sha256 differs", payload["automatic"]["message"])
+            status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
+            self.assertEqual(status, 409)
+
     def test_static_assets_are_local_and_traversal_is_refused(self) -> None:
         client = PortalClient(self.client.base)
         status, _, body = client.request("GET", "/")

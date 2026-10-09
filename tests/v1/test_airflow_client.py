@@ -38,6 +38,7 @@ from description_pipeline.orchestration.airflow_client import (
     validate_artifact_name,
     validate_package,
     validate_run_id,
+    verified_result,
 )
 
 TOKEN = "test-token"
@@ -75,6 +76,8 @@ class MockEndpoint:
         invalid_events: bool = False,
         omit_quality: bool = False,
         omit_submission: bool = False,
+        publish_failed: bool = False,
+        quality_mismatch: bool = False,
         redirect_to: str | None = None,
         handoff_response: dict | None = None,
         preview_payload: dict | None = None,
@@ -85,6 +88,8 @@ class MockEndpoint:
         self.invalid_events = invalid_events
         self.omit_quality = omit_quality
         self.omit_submission = omit_submission
+        self.publish_failed = publish_failed
+        self.quality_mismatch = quality_mismatch
         self.redirect_to = redirect_to
         self.handoff_response = handoff_response
         self.preview_payload = preview_payload
@@ -137,7 +142,12 @@ class MockEndpoint:
                     run_id = parts[3] if len(parts) > 3 else ""
                     if len(parts) >= 5 and parts[4] == "preview":
                         job = outer.jobs.get(run_id)
-                        if job is None or job.get("status") != "passed":
+                        # The deployed endpoint retains a digest-bound preview for a verified
+                        # delivery even when the publish stage failed afterwards.
+                        retained_failure = (
+                            outer.publish_failed and job is not None and job.get("status") == "failed"
+                        )
+                        if job is None or (job.get("status") != "passed" and not retained_failure):
                             self._send(404, {"error": "no passed delivery"})
                             return
                         payload = dict(outer.preview_payload or PREVIEW)
@@ -196,6 +206,36 @@ class MockEndpoint:
                             "discovery_sha256": "d" * 64,
                         }
                         job["events"] = protocol_events(failed_stage="discover")
+                    elif outer.publish_failed:
+                        # Real shape of a PR-service failure: verification passed, the overall
+                        # job and its publication failed, the delivery stays retained.
+                        quality_subject = "b" * 64 if outer.quality_mismatch else SHA
+                        job["status"] = "failed"
+                        job["error"] = "Incomplete or mismatched publication receipt"
+                        job["result"] = {
+                            "passed": False,
+                            "pipeline_id": PIPELINE_ID,
+                            "output": "build/out",
+                            "stage": "publish",
+                            "state": "failed",
+                            "subject_sha256": SHA,
+                            "quality": {
+                                "passed": True,
+                                "subject_sha256": quality_subject,
+                                "checks": [{"id": "physics.expected_mass", "state": "passed"}],
+                            },
+                            "submission": {
+                                "passed": False,
+                                "subject_sha256": SHA,
+                                "base": "feature/m3.0",
+                                "branch": "work/solidworks/m3.0",
+                                "state": "failed",
+                                "error": "git_failed",
+                                "commit": "",
+                                "repository_slug": "example/m3.0",
+                            },
+                        }
+                        job["events"] = protocol_events(subject=SHA, failed_stage="publish")
                     elif job["pokes"] >= 2:
                         job["status"] = "passed"
                         result = {
@@ -661,6 +701,44 @@ class ClientTests(unittest.TestCase):
                     expected_slug="example/m3.0",
                     expected_base="feature/m3.0",
                 )
+
+    def test_publication_failure_never_hides_or_weakens_the_verified_model(self) -> None:
+        # Real shape of a PR-service failure: the overall job and its publication failed while
+        # the model itself passed independent verification. Qualification must not hinge on
+        # publication success, and the strict publication gate must stay in place.
+        result = {
+            "passed": False,
+            "pipeline_id": PIPELINE_ID,
+            "stage": "publish",
+            "state": "failed",
+            "subject_sha256": SHA,
+            "quality": {"passed": True, "subject_sha256": SHA, "checks": [{"id": "x", "state": "passed"}]},
+            "submission": {
+                "passed": False,
+                "subject_sha256": SHA,
+                "state": "failed",
+                "error": "git_failed",
+                "commit": "",
+                "base": "feature/m3.0",
+                "branch": "work/solidworks/m3.0",
+                "repository_slug": "example/m3.0",
+            },
+        }
+        self.assertIs(verified_result(result), result)
+        with self.assertRaises(ResultNotPublishable) as raised:
+            check_result(result, expected_slug="example/m3.0", expected_base="feature/m3.0")
+        self.assertEqual(str(raised.exception), "result.passed is not true")
+        for bad in (
+            None,
+            {**result, "pipeline_id": "other-pipeline"},
+            {**result, "subject_sha256": "not-a-digest"},
+            {key: value for key, value in result.items() if key != "quality"},
+            {**result, "quality": None},
+            {**result, "quality": {**result["quality"], "passed": False}},
+            {**result, "quality": {**result["quality"], "subject_sha256": "b" * 64}},
+        ):
+            with self.subTest(bad=bad), self.assertRaises(ResultNotPublishable):
+                verified_result(bad)
 
     def test_failed_job_raises(self) -> None:
         with MockEndpoint(fail_job=True) as server:

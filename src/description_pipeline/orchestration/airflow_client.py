@@ -485,13 +485,13 @@ class WindowsEndpoint:
 def verified_result(result: dict | None) -> dict:
     """Fail closed unless the run carries an independently verified model result.
 
-    Publication evidence is checked separately by :func:`check_result`. A PR service failure must
-    not hide an otherwise verified delivery; a failed or unverified model must never be shown.
+    Qualification covers the delivered model only: the pipeline identity, the run subject and a
+    passing, subject-bound quality document. Whole-job and publication success are separate
+    gates (:func:`check_result`); a PR service failure must not hide an otherwise verified
+    delivery, and a failed or unverified model must never be shown.
     """
     if not isinstance(result, dict):
         raise ResultNotPublishable("passed job has no result payload")
-    if result.get("passed") is not True:
-        raise ResultNotPublishable("result.passed is not true")
     if result.get("pipeline_id") != PIPELINE_ID:
         raise ResultNotPublishable(f"result.pipeline_id must be {PIPELINE_ID}")
     subject = result.get("subject_sha256")
@@ -506,8 +506,15 @@ def verified_result(result: dict | None) -> dict:
 
 
 def check_result(result: dict | None, *, expected_slug: str, expected_base: str) -> dict:
-    """Fail closed unless the passed job carries bound quality and publication evidence."""
+    """Fail closed unless the passed job carries bound quality and publication evidence.
+
+    The publication gate stays strict: it requires the whole job's ``passed`` flag in addition
+    to the model qualification from :func:`verified_result` and a subject-bound, passing
+    submission for the configured repository.
+    """
     result = verified_result(result)
+    if result.get("passed") is not True:
+        raise ResultNotPublishable("result.passed is not true")
     subject = result["subject_sha256"]
     submission = result.get("submission")
     if not isinstance(submission, dict) or submission.get("passed") is not True:
