@@ -104,9 +104,9 @@ shown as not executed. Passed automatic checks need no repeated manual sign-off.
 After verification, the engineering view lists only facts outside automatic
 coverage; it does not claim that external approvals are pending or complete.
 Unsupported items never become implicit passes.
-Airflow's DAG documentation shows the contract; `wait_for_job` logs and its
-`engineering_stages` XCom retain terminal results even when `confirm_job` is blocked.
-The detailed local receipt is `reports/stages.json`.
+The detailed delivery receipt is `reports/stages.json`. Maintainers can also
+inspect terminal results in Airflow's `wait_for_job` task logs, including when
+`confirm_job` is blocked; see [deployment maintenance](deployment.md#maintenance).
 
 An engineer cannot override a failed automatic check by signing a review.
 Existing approvals may be reused only while the relevant structure,

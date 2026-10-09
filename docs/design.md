@@ -1,6 +1,6 @@
 # Design
 
-Release 1.0 has one operator workflow: **SolidWorks folder → Airflow → verified URDF → review PR**.
+One operator workflow: **SolidWorks folder → Airflow → verified URDF → review PR**.
 
 ## 1. Core principles
 
