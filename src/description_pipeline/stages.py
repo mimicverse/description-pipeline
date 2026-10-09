@@ -181,12 +181,19 @@ def stage_view(job=None):
             stage["diagnostic"] = job.get("detail") or result.get("detail") or latest.get("detail")
             blocked = True
         stage["confirmations"] = [
-            {**item, "state": "pending", "subject_sha256": subject}
+            {**item, "state": "not_ready", "subject_sha256": subject, "approval_tracking": "external"}
             for item in CONTRACT["confirmations"]
             if item["review_stage"] == stage["id"]
         ]
         stage["unsupported"] = [{**item} for item in view["unsupported"] if item["stage"] == stage["id"]]
         view["stages"].append(stage)
+    # Engineering review concerns facts outside the automatic proof. Do not
+    # manufacture outstanding approvals merely because this service does not
+    # read the review PR or the organization's controlled approval records.
+    if any(stage["id"] == "verify" and stage["state"] == "completed" for stage in view["stages"]):
+        for stage in view["stages"]:
+            for item in stage["confirmations"]:
+                item["state"] = "external_review"
     return view
 
 
@@ -254,7 +261,9 @@ def compact_view(view):
                     for key in ("input_qc", "output_qc")
                 },
                 "evidence": stage["evidence"],
-                "confirmations": "pending",
+                "confirmations": [
+                    {"id": item["id"], "state": item["state"]} for item in stage["confirmations"]
+                ],
             }
             for stage in view["stages"]
         ],

@@ -69,15 +69,20 @@ Feishu's authentication API and fills it in automatically.
 
 The page shows the [six engineering steps](design.md#2-how-the-system-works):
 freeze inputs, discover structure, capture evidence, generate URDF, verify and
-publish the review PR. Open each step's **Input**, **Input QC**, **Output** and
-**Output QC** to inspect checks, affected objects, recorded values and file hashes.
+publish the review PR. Each step shows its **Input**, **Input QC**, **Output** and
+**Output QC**, with readable check names, criteria, actual results and status.
+Failures show the affected object and next action first; file hashes and raw
+evidence are available in collapsed details. Without a verified URDF, the report
+uses the available workspace instead of reserving an empty preview pane.
 Generation-input inspection belongs to capture; it is not another operator step.
 
 A completed step requires its boundary checks to pass. Failed checks retain their
 diagnostics, and later steps show blocked. Checks whose prerequisites failed show
 not run. Each run records which steps actually ran; steps outside the run are
-shown as not executed. Engineering confirmations stay pending under the relevant
-step, and unsupported items never become implicit passes.
+shown as not executed. Passed automatic checks need no repeated manual sign-off.
+After verification, the engineering view lists only facts outside automatic
+coverage; it does not claim that external approvals are pending or complete.
+Unsupported items never become implicit passes.
 Airflow's DAG documentation shows the contract; `wait_for_job` logs and its
 `engineering_stages` XCom retain terminal results even when `confirm_job` is blocked.
 The detailed local receipt is `reports/stages.json`.
@@ -85,9 +90,10 @@ The detailed local receipt is `reports/stages.json`.
 Automatic Airflow transport retries retain the frozen input and native job UUID;
 they reconnect to the existing job without repeating capture. A terminal native
 failure, including an endpoint restart during capture, requires a new run.
-Changed inputs also require a new run. Automatic checks and engineering
-confirmations remain separate; pending or unsupported items never become
-implicit passes.
+Changed inputs also require a new run. An engineer cannot override a failed
+automatic check by signing a review. Existing approvals may be reused only while
+the relevant structure, configuration and supporting facts remain applicable;
+review changes and their effects in the matching PR or controlled record.
 
 ## 4. Correct findings
 

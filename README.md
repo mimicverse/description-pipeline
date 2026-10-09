@@ -16,8 +16,9 @@ Open the single HTTPS address provided by the platform maintainer.
 2. Sign in with Feishu, choose the complete project folder on your computer
    (Chrome or Edge) and start the run. The browser uploads the folder's files to
    the platform before anything is frozen; no server path is entered by hand.
-3. Review the six steps and their input/output checks (pending confirmations and
-   per-stage unsupported items stay visible), inspect the verified URDF and joint
+3. Review each step's actual check results and any failure diagnosis. Automatic
+   passes need no manual repetition; external engineering scope remains explicit.
+   Inspect the verified URDF and joint
    limits, and open the PR for engineering approval.
 
 The picker uploads only the chosen folder; the page shows the platform's current

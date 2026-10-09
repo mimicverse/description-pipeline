@@ -19,13 +19,16 @@ frozen evidence and actual files rather than trusting earlier success flags.
 | Step | `not_run`, `running`, `completed`, `failed`, `blocked`; completed requires every boundary check to pass |
 | Automatic check | `passed`, `failed`, `not_run`; missing prerequisites leave a required check unexecuted and prevent qualification |
 | Unsupported check | `unsupported`, with its scope and responsible stage stated; it is never an automatic pass |
-| Engineering confirmation | `pending` on the page under its `review_stage` (a UI anchor for the responsible step, not an execution stage); approval is recorded in the matching subject-bound PR or controlled engineering record |
+| Engineering review | `not_ready` before automatic verification completes, then `external_review`: only facts outside automatic coverage; the portal does not read or infer approval status from the matching PR or controlled records |
 
 `quality.json` records the required gate inventory and every executed or unexecuted
 gate. `stages.json` records boundary results, inputs/outputs, file hashes and
 responsibility references. Airflow task logs retain detailed terminal results,
 including failures; XCom retains the compact stage summary. Automatic publication
 creates a candidate PR and cannot set an engineering-approved release state.
+Passed automatic checks do not require manual repetition. Failed checks require
+correction, not human override. Applicable approvals of unchanged engineering
+facts can be reused; changed facts and their effects need review.
 Each receipt declares its `execution_scope`: a complete endpoint job covers all
 six stages, while maintenance generation/verification runs cover only the stages
 they execute ([operations](operations.md#6-independent-review-and-recovery));
