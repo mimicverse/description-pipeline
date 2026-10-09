@@ -593,7 +593,9 @@ class PortalTests(unittest.TestCase):
         for malformed in ("cli:tenant:ou:worker", "cli:tenant:ou worker", "not-a-principal"):
             with self.subTest(principal=malformed):
                 token = "airflow-malformed-principal"
-                self.airflow.profiles[token] = _feishu_profile("崔工", malformed, "ou_boundary")
+                profile = _feishu_profile("崔工", principal, "ou_boundary")
+                profile["principal"] = malformed
+                self.airflow.profiles[token] = profile
                 client = PortalClient(self.client.base)
                 client.jar.set_cookie(_airflow_token_cookie(token))
                 status, _, body = client.request("GET", "/api/session")
