@@ -8,6 +8,7 @@
   },
   "portal": {
     "host": "127.0.0.1",
-    "port": 8788
+    "port": 8788,
+    "upload_root": "/srv/description/cad-handoffs"
   }
 }

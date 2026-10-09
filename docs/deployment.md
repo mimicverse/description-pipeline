@@ -273,8 +273,11 @@ Commission the complete workflow with actual native CAD and live Feishu:
    `dry_run`, `only_failed: true`, `only_new: false`,
    `run_on_latest_version: false`) is accepted for the initiator and refused
    for another approved user.
-4. Supply a compliant native folder from an approved Linux or Windows source
-   root. Start without YAML, branch, hardware or credential fields.
+4. In the operator page, choose the complete engineering folder once (Chrome or
+   Edge); the browser uploads its files to the platform's Linux intake and
+   `Start` creates the run. No server path, YAML, branch, hardware or
+   credential field is entered by hand; selections containing SolidWorks lock
+   transients (`~$…`) are rejected before anything runs.
 5. Verify the UUID, frozen inventory and all six engineering steps. Inspect
    input/input QC/output/output QC in the page, the DAG contract table,
    terminal task logs and `engineering_stages` XCom. Confirm failed, blocked,
