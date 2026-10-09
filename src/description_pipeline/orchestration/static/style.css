@@ -97,6 +97,9 @@ button:disabled { opacity: 0.55; cursor: progress; }
 .meta dd { margin: 0; word-break: break-all; }
 
 .progress { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 4px; }
+.run-actions { margin: 12px 0; }
+.run-actions button { margin-top: 0; }
+.run-actions p { margin: 6px 0 0; }
 .chip {
   border: 1px solid var(--line);
   border-radius: 999px;

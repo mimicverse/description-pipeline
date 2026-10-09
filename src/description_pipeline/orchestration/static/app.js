@@ -13,6 +13,7 @@ const state = {
   viewer: null,
   controls: null,
   timer: null,
+  retryingRunId: null,
 };
 
 const RUN_STATES = {
@@ -50,6 +51,16 @@ const AUTOMATIC_STATES = {
   pending: "等待自动检查",
   queued: "排队中",
   running: "检查中",
+};
+const RETRY_REASONS = {
+  transport_recovery: "继续原作业，不重新采集 CAD。",
+  run_active: "运行尚未结束。",
+  run_succeeded: "运行已成功。",
+  resolution_or_capture_failed: "请修正工程目录或采集问题，再新建运行。",
+  publication_failed: "发布失败，请修正问题后新建运行。",
+  native_terminal_failure: "原作业已失败，修正问题后新建运行。",
+  no_failed_transport_task: "没有可恢复的任务，请查看问题与发现。",
+  endpoint_evidence_unavailable: "无法确认原作业状态，稍后再试。",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -144,6 +155,8 @@ function clearSession() {
   $("login-card").hidden = false;
   $("detail-card").hidden = true;
   $("viewer-card").hidden = true;
+  $("retry-panel").hidden = true;
+  setError($("retry-error"), "");
 }
 
 async function refreshRuns() {
@@ -227,6 +240,17 @@ function renderRun(run) {
     dd.textContent = value;
     meta.append(dt, dd);
   }
+
+  const retry = run.retry || {};
+  const canRetry = run.can_manage === true && retry.eligible === true;
+  const retryReason = typeof retry.reason === "string" ?
+    RETRY_REASONS[retry.reason] || "暂不可重试，请查看检查结果。" : "";
+  $("retry-panel").hidden = !canRetry && !(run.state === "failed" && retryReason);
+  $("retry-button").hidden = !canRetry;
+  $("retry-button").disabled = state.retryingRunId !== null;
+  $("retry-button").textContent = state.retryingRunId === runId ? "正在重试…" : "重试";
+  $("retry-note").textContent = retry.eligible === true && run.can_manage !== true ?
+    "该运行可由发起人或平台管理员重试。" : retryReason;
 
   const progress = $("task-progress");
   progress.textContent = "";
@@ -517,7 +541,16 @@ async function poll() {
       setError($("login-error"), error.message);
       return;
     }
-    if (error.status === 403) clearPreview();
+    if (error.status === 403 || error.status === 404) {
+      clearPreview();
+      state.lastRun = null;
+      state.dagRunId = null;
+      if (state.timer) window.clearInterval(state.timer);
+      state.timer = null;
+      $("detail-card").hidden = true;
+      $("retry-panel").hidden = true;
+      await refreshRuns();
+    }
     setError($("run-error"), error.message);
   }
 }
@@ -528,6 +561,8 @@ async function selectRun(dagRunId) {
   clearPreview();
   state.dagRunId = dagRunId;
   state.lastRun = null;
+  $("retry-panel").hidden = true;
+  setError($("retry-error"), "");
   $("detail-card").hidden = false;
   await refreshRuns();
   if (state.dagRunId !== dagRunId) return;
@@ -537,7 +572,42 @@ async function selectRun(dagRunId) {
   await poll();
 }
 
+async function retryRun() {
+  const dagRunId = state.dagRunId;
+  const run = state.lastRun;
+  if (
+    !dagRunId || state.retryingRunId !== null || !run ||
+    run.dag_run_id !== dagRunId || run.can_manage !== true ||
+    !run.retry || run.retry.eligible !== true
+  ) return;
+  state.retryingRunId = dagRunId;
+  setError($("retry-error"), "");
+  renderRun(run);
+  try {
+    await api(`/api/runs/${encodeURIComponent(dagRunId)}/retry`, { method: "POST", body: {} });
+    if (state.dagRunId !== dagRunId) return;
+    if (!state.timer) state.timer = window.setInterval(() => { void poll(); }, 3000);
+    await poll();
+    await refreshRuns();
+  } catch (error) {
+    if (error.status === 401) {
+      clearSession();
+      setError($("login-error"), error.message);
+    } else if (state.dagRunId === dagRunId) {
+      setError($("retry-error"), error.message);
+      if (error.status === 403 || error.status === 404 || error.status === 409) {
+        await poll();
+        await refreshRuns();
+      }
+    }
+  } finally {
+    state.retryingRunId = null;
+    if (state.lastRun && state.lastRun.dag_run_id === state.dagRunId) renderRun(state.lastRun);
+  }
+}
+
 function wire() {
+  $("retry-button").addEventListener("click", retryRun);
   $("logout").addEventListener("click", async () => {
     try {
       await api("/api/session", { method: "DELETE" });
