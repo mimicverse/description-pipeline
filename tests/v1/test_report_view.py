@@ -273,11 +273,12 @@ class ReportViewTests(unittest.TestCase):
         parent = "original-native-run"
         for event in job["events"]:
             if event["stage"] == "freeze":
-                event["reuse"] = {"parent_run": parent, "reused": True}
+                event["reuse"] = {"parent_run": parent, "source_run": "original-producer", "reused": True}
                 event["at"] = "2026-10-09T08:00:00Z"
         report = build_report(job)
         freeze = report["stages"][0]
         self.assertEqual(freeze["reuse"]["parent_run"], parent)
+        self.assertEqual(freeze["reuse"]["source_run"], "original-producer")
         self.assertEqual(freeze["at"], "2026-10-09T08:00:00Z")
         self.assertTrue(all(row["reuse"]["reused"] for row in freeze["boundary"]))
         self.assertNotIn("reuse", report["stages"][1])

@@ -130,6 +130,8 @@ def stage_view(job=None):
             and all(event.get("reuse") == reuse for event in observed)
         ):
             stage["reuse"] = {"parent_run": reuse["parent_run"], "reused": True}
+            if isinstance(reuse.get("source_run"), str) and reuse["source_run"]:
+                stage["reuse"]["source_run"] = reuse["source_run"]
         for boundary in ("input", "output"):
             for item in stage[f"{boundary}_qc"]:
                 matches = [
