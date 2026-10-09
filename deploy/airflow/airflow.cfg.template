@@ -13,6 +13,9 @@ sql_alchemy_conn = @AIRFLOW_DB_URL@
 [logging]
 base_log_folder = @AIRFLOW_HOME@/logs
 logging_level = INFO
+# nginx owns HTTP access logging (URI-only); drop the API server's INFO access
+# records so query values (OAuth code/state) never reach the journal.
+namespace_levels = http.access=WARNING
 [api]
 expose_config = False
 [api_auth]

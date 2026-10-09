@@ -8,10 +8,12 @@ environment.
 from __future__ import annotations
 
 import json
+import io
 import os
 import tempfile
 import unittest
 import urllib.parse
+from urllib import error as urlerror
 from pathlib import Path
 
 from description_pipeline.orchestration.feishu_oauth import (
@@ -46,19 +48,36 @@ class _Response:
 
 
 class _Recorder:
-    def __init__(self, payload: dict) -> None:
+    def __init__(self, payload: dict, *, status: int = 200, error_body: dict | None = None) -> None:
         self.payload = payload
+        self.status = status
+        self.error_body = error_body
         self.requests: list[dict] = []
 
     def __call__(self, request, timeout=None):  # noqa: ANN001
-        body = urllib.parse.parse_qs(request.data.decode("ascii")) if request.data else None
+        headers = {key.lower(): value for key, value in request.header_items()}
+        body = None
+        if request.data:
+            raw = request.data.decode("utf-8")
+            if "json" in headers.get("content-type", ""):
+                body = json.loads(raw)
+            else:
+                body = {key: values[0] for key, values in urllib.parse.parse_qs(raw).items()}
         self.requests.append(
             {
                 "url": request.full_url,
-                "headers": {key.lower(): value for key, value in request.header_items()},
-                "body": None if body is None else {key: values[0] for key, values in body.items()},
+                "headers": headers,
+                "body": body,
             }
         )
+        if self.status >= 400:
+            raise urlerror.HTTPError(
+                request.full_url,
+                self.status,
+                "Bad Request",
+                {},
+                io.BytesIO(json.dumps(self.error_body or {}).encode("utf-8")),
+            )
         return _Response(self.payload)
 
 
@@ -128,7 +147,9 @@ class FeishuCoreTests(unittest.TestCase):
     def test_settings_are_absolute_regular_non_symlink_and_repr_hides_secret(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = self.settings(tmp, FEISHU_TOKEN_URL="https://attacker.example/token")
-            self.assertEqual(FEISHU_TOKEN_URL, "https://accounts.feishu.cn/oauth/v3/token")
+            self.assertEqual(FEISHU_TOKEN_URL, "https://open.feishu.cn/open-apis/authen/v2/oauth/token")
+            self.assertNotEqual(FEISHU_TOKEN_URL, "https://accounts.feishu.cn/oauth/v3/token")
+            self.assertNotIn("/authen/v1/access_token", FEISHU_TOKEN_URL)
             self.assertEqual(settings.token_url, FEISHU_TOKEN_URL)
             self.assertNotIn("s3cret", repr(settings))
             secret = Path(tmp) / "feishu.json"
@@ -179,7 +200,7 @@ class FeishuCoreTests(unittest.TestCase):
         self.assertNotIn("state-1", digest)
         self.assertEqual(digest, state_digest("state-1"))
 
-    def test_exchange_uses_form_body_and_pkce_without_basic_auth(self) -> None:
+    def test_exchange_uses_json_body_and_pkce_without_basic_auth(self) -> None:
         settings = self.direct()
         recorder = _Recorder(
             {"code": 0, "access_token": "u-token", "expires_in": 7200, "token_type": "Bearer", "scope": "openid"}
@@ -188,15 +209,21 @@ class FeishuCoreTests(unittest.TestCase):
         self.assertEqual(token, "u-token")
         request = recorder.requests[0]
         self.assertEqual(request["url"], settings.token_url)
-        self.assertEqual(request["headers"]["content-type"], "application/x-www-form-urlencoded")
+        self.assertEqual(request["url"], "https://open.feishu.cn/open-apis/authen/v2/oauth/token")
+        self.assertEqual(request["headers"]["content-type"], "application/json; charset=utf-8")
         self.assertNotIn("authorization", request["headers"])
-        self.assertEqual(request["body"]["code_verifier"], "verifier-1")
-        self.assertEqual(request["body"]["redirect_uri"], settings.redirect_uri)
         self.assertEqual(request["body"]["grant_type"], "authorization_code")
         self.assertEqual(request["body"]["client_id"], "cli_app")
+        self.assertEqual(request["body"]["code"], "code-1")
+        self.assertEqual(request["body"]["code_verifier"], "verifier-1")
+        self.assertEqual(request["body"]["redirect_uri"], settings.redirect_uri)
         for bad in (
-            # the deprecated v2 wrapper shape is not a fallback
+            # the older data-wrapped access-token shape is not accepted
             {"code": 0, "data": {"access_token": "u"}},
+            # the integer code envelope is mandatory: an absent or boolean code is not success
+            {"access_token": "u2", "expires_in": 7200, "token_type": "Bearer"},
+            {"code": True, "access_token": "u", "expires_in": 7200, "token_type": "Bearer"},
+            {"code": False, "access_token": "u", "expires_in": 7200, "token_type": "Bearer"},
             {"code": 7, "access_token": "u", "expires_in": 7200, "token_type": "Bearer"},
             {"code": 0, "access_token": "", "expires_in": 7200, "token_type": "Bearer"},
             {"code": 0, "access_token": "u", "token_type": "Bearer"},
@@ -205,6 +232,57 @@ class FeishuCoreTests(unittest.TestCase):
         ):
             with self.subTest(bad=bad), self.assertRaises(FeishuAuthError):
                 exchange_code(settings, "code-1", "verifier-1", opener=_Recorder(bad))
+
+    def test_exchange_reports_only_bounded_typed_provider_diagnostics(self) -> None:
+        settings = self.direct()
+        secret_prose = "code=code-secret verifier=verifier-secret client_secret=s3cret\ninjected"
+        failing = _Recorder(
+            {},
+            status=400,
+            error_body={
+                "error": "invalid_request",
+                "error_description": secret_prose,
+                "msg": secret_prose,
+                "code": 20049,
+                "nested": {"error_description": secret_prose, "code": 999},
+            },
+        )
+        with self.assertRaises(FeishuAuthError) as raised:
+            exchange_code(settings, "code-secret", "verifier-secret", opener=failing)
+        message = str(raised.exception)
+        self.assertIn("HTTP 400", message)
+        self.assertIn("error=invalid_request", message)
+        self.assertIn("provider_code=20049", message)
+        for leaked in ("code-secret", "verifier-secret", "s3cret", "injected", "\n"):
+            self.assertNotIn(leaked, message)
+        # Unknown enums, boolean "codes" and nested values are dropped entirely.
+        noisy = _Recorder(
+            {},
+            status=400,
+            error_body={"error": "custom-error", "code": True, "msg": secret_prose},
+        )
+        with self.assertRaises(FeishuAuthError) as raised:
+            exchange_code(settings, "code-secret", "verifier-secret", opener=noisy)
+        self.assertEqual(str(raised.exception), "Feishu token request failed: HTTP 400")
+        # A success-status payload without the documented integer code envelope is refused.
+        for shapeless in (
+            {"access_token": "u", "expires_in": 7200, "token_type": "Bearer"},
+            {"code": True, "access_token": "u", "expires_in": 7200, "token_type": "Bearer"},
+        ):
+            with self.subTest(shapeless=shapeless), self.assertRaises(FeishuAuthError) as raised:
+                exchange_code(settings, "code-secret", "verifier-secret", opener=_Recorder(shapeless))
+            self.assertEqual(
+                str(raised.exception),
+                "Feishu token response does not carry the documented integer code envelope",
+            )
+        # A rejected success-status payload uses the same bounded formatter.
+        rejected = _Recorder({"code": 20049, "msg": secret_prose, "error_description": secret_prose})
+        with self.assertRaises(FeishuAuthError) as raised:
+            exchange_code(settings, "code-secret", "verifier-secret", opener=rejected)
+        message = str(raised.exception)
+        self.assertIn("HTTP 200", message)
+        self.assertIn("provider_code=20049", message)
+        self.assertNotIn("s3cret", message)
 
     def test_identity_requires_open_id_and_allowlisted_tenant(self) -> None:
         settings = self.direct()

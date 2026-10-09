@@ -139,6 +139,18 @@ class RenderTests(unittest.TestCase):
             self.assertIn("proxy_pass http://127.0.0.1:8791;", config)
             self.assertIn("proxy_pass http://127.0.0.1:18788;", config)
 
+    def test_access_logs_exclude_oauth_queries_and_headers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            self.assertEqual(render(state).returncode, 0)
+            config = (state / "nginx/nginx.conf").read_text(encoding="utf-8")
+            self.assertIn("$request_method $uri $server_protocol", config)
+            for sensitive in ("$request_uri", "$args", "$query_string", "$http_referer", "$http_cookie", "$http_authorization"):
+                self.assertNotIn(sensitive, config)
+            self.assertNotIn('"$request"', config)
+            airflow = (ROOT / "deploy/airflow/airflow.cfg.template").read_text(encoding="utf-8")
+            self.assertIn("namespace_levels = http.access=WARNING", airflow)
+
     def test_check_paths_reports_missing_runtime_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp) / "state"

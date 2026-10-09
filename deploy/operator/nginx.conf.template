@@ -10,7 +10,10 @@ events {
 }
 
 http {
-    access_log @OPERATOR_STATE@/nginx/access.log;
+    # Access logs stay URI-only: OAuth code/state values never reach a log file.
+    log_format operator_uri_only '$remote_addr - $remote_user [$time_local] '
+                                 '"$request_method $uri $server_protocol" $status $body_bytes_sent';
+    access_log @OPERATOR_STATE@/nginx/access.log operator_uri_only;
     client_body_temp_path @OPERATOR_STATE@/nginx/tmp/body;
     proxy_temp_path @OPERATOR_STATE@/nginx/tmp/proxy;
     fastcgi_temp_path @OPERATOR_STATE@/nginx/tmp/fastcgi;

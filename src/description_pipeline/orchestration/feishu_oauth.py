@@ -1,35 +1,21 @@
-"""Portable Feishu OAuth2 sign-in core for pinned Airflow 3.3.2.
+"""Feishu OAuth 2.0 sign-in core for pinned Airflow 3.3.2.
 
-Official Feishu web login: authorize at
-``https://accounts.feishu.cn/open-apis/authen/v1/authorize`` and exchange the code at the current
-v3 token endpoint ``https://accounts.feishu.cn/oauth/v3/token`` with an
-``application/x-www-form-urlencoded`` body (``grant_type=authorization_code``, ``client_id``,
-``client_secret``, ``code``, ``redirect_uri`` and ``code_verifier``). Never mix a Basic header
-with body credentials; Feishu rejects that with error 20070. The v3 response is flat JSON
-(``{"code": 0, "access_token": ..., "expires_in": ..., "token_type": "Bearer", "scope": ...}``);
-the deprecated v2 shape is not accepted as a fallback. The signed-in identity is one explicit
-``open_id`` from ``https://open.feishu.cn/open-apis/authen/v1/user_info`` bound to the configured
-App ID and an allowlisted ``tenant_key``; there is no user_id/union_id fallback and no
-cross-tenant provisioning.
+Authorization uses a state cookie and an S256 PKCE challenge. The server exchanges
+one authorization code through the JSON token API, validates its integer ``code``
+envelope and Bearer token, then reads the basic user profile. The authenticated
+identity is the app-scoped ``open_id`` within an allowlisted ``tenant_key``.
+Provider error logs contain only HTTP status, numeric code and recognized OAuth
+error values; arbitrary provider text is discarded.
 
-This module carries no Airflow import: the toolkit runtime stays free of the Airflow dependency,
-and ``description_pipeline.orchestration.feishu_auth`` binds these pieces to the pinned
-``BaseAuthManager`` contract only inside the Airflow environment. Single-use state and the PKCE
-verifier live in one restart-safe store shared by every api-server worker: the
-``feishu_auth_state`` table in the Airflow metadata database.
+This module has no Airflow dependency. ``feishu_auth`` binds it to the platform's
+authentication manager; the shared ``feishu_auth_state`` metadata table stores
+single-use state and PKCE verifiers across API workers and restarts.
 
-Official references (read 2026-10-07):
+Official references:
 
-* authorize (S256): https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/authen-v1/authorize/get
-* token v3: https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/authentication-management/access-token/get-user-access-token-v3
-* user_info v1: https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/authen-v1/user_info/get
-
-Sign-in reads only ``open_id``, ``tenant_key``, ``name``/``en_name`` and the avatar from the v1
-profile; no sensitive field (user_id, email, mobile, employment) is requested, so this enterprise
-app needs no additional contact-directory permission. The authorize request omits ``scope`` and
-``offline_access`` entirely: it is a sign-in-only app, not a generic OIDC client. A display name
-is required: it is NFC-normalized and must be free of control, format, surrogate and separator
-characters, and the open_id is never substituted where a username would be shown.
+* authorize: https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/authen-v1/authorize/get
+* token: https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/authentication-management/access-token/get-user-access-token
+* profile: https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/authen-v1/user_info/get
 """
 
 from __future__ import annotations
@@ -50,7 +36,7 @@ from urllib import parse as urlparse
 from urllib import request as urlrequest
 
 FEISHU_AUTHORIZE_BASE = "https://accounts.feishu.cn/open-apis/authen/v1/authorize"
-FEISHU_TOKEN_URL = "https://accounts.feishu.cn/oauth/v3/token"
+FEISHU_TOKEN_URL = "https://open.feishu.cn/open-apis/authen/v2/oauth/token"
 FEISHU_USERINFO_URL = "https://open.feishu.cn/open-apis/authen/v1/user_info"
 DEFAULT_STATE_TTL = 300.0
 STATE_COOKIE = "feishu_oauth_state"
@@ -206,13 +192,58 @@ def build_authorize_url(settings: FeishuSettings, state: str, challenge: str, *,
     return f"{settings.authorize_base}?{query}"
 
 
-def _post_form(url: str, payload: dict, *, opener=None) -> dict:
+#: Recognized standard OAuth error values (RFC 6749 section 5.2 and its registration registry).
+_OAUTH_ERRORS = frozenset(
+    {
+        "invalid_request",
+        "invalid_client",
+        "invalid_grant",
+        "unauthorized_client",
+        "unsupported_grant_type",
+        "invalid_scope",
+        "access_denied",
+        "server_error",
+        "temporarily_unavailable",
+    }
+)
+_ERROR_BODY_LIMIT = 8192
+
+
+def token_error_summary(status: int, payload: object) -> str:
+    """Bounded typed summary of a provider token error; untrusted prose is never echoed.
+
+    Only the HTTP status, an integer provider ``code`` (booleans excluded) and a recognized
+    standard OAuth ``error`` enum survive. There is no endpoint or content-type fallback: the JSON
+    request style is the single supported exchange.
+    """
+    parts = [f"HTTP {int(status)}"]
+    if isinstance(payload, dict):
+        code = payload.get("code")
+        if isinstance(code, int) and not isinstance(code, bool):
+            parts.append(f"provider_code={code}")
+        error = payload.get("error")
+        if isinstance(error, str) and error in _OAUTH_ERRORS:
+            parts.append(f"error={error}")
+    return " ".join(parts)
+
+
+def _http_error_summary(error: urlerror.HTTPError) -> str:
+    """Parse a bounded error body and reduce it to the typed summary."""
+    try:
+        raw = error.read(_ERROR_BODY_LIMIT).decode("utf-8", "replace")
+        payload = json.loads(raw or "{}")
+    except (ValueError, UnicodeDecodeError):
+        payload = None
+    return token_error_summary(error.code, payload)
+
+
+def _post_json(url: str, payload: dict, *, opener=None) -> dict:
     request = urlrequest.Request(
         url,
-        data=urlparse.urlencode(payload).encode("ascii"),
+        data=json.dumps(payload).encode("utf-8"),
         method="POST",
         headers={
-            "Content-Type": "application/x-www-form-urlencoded",
+            "Content-Type": "application/json; charset=utf-8",
             "Accept": "application/json",
         },
     )
@@ -220,18 +251,23 @@ def _post_form(url: str, payload: dict, *, opener=None) -> dict:
     try:
         with open_url(request, timeout=20.0) as response:
             data = json.loads(response.read().decode("utf-8") or "{}")
-    except (urlerror.URLError, urlerror.HTTPError, ValueError) as error:
+    except urlerror.HTTPError as error:
+        raise FeishuAuthError(f"Feishu token request failed: {_http_error_summary(error)}") from error
+    except (urlerror.URLError, ValueError) as error:
         raise FeishuAuthError(f"Feishu token request failed: {error}") from error
     if not isinstance(data, dict):
         raise FeishuAuthError("Feishu token response is not a JSON object")
-    if data.get("code") != 0:
-        raise FeishuAuthError("Feishu token request was rejected")
+    code = data.get("code")
+    if not isinstance(code, int) or isinstance(code, bool):
+        raise FeishuAuthError("Feishu token response does not carry the documented integer code envelope")
+    if code != 0:
+        raise FeishuAuthError(f"Feishu token request was rejected: {token_error_summary(200, data)}")
     return data
 
 
 def exchange_code(settings: FeishuSettings, code: str, verifier: str, *, opener=None) -> str:
-    """Exchange the authorization code at the current v3 endpoint; exactly one auth style."""
-    payload = _post_form(
+    """Exchange the authorization code at the documented v2 endpoint; exactly one auth style."""
+    payload = _post_json(
         settings.token_url,
         {
             "grant_type": "authorization_code",
@@ -253,7 +289,7 @@ def exchange_code(settings: FeishuSettings, code: str, verifier: str, *, opener=
         or expires_in <= 0
         or token_type.lower() != "bearer"
     ):
-        raise FeishuAuthError("Feishu token response does not match the pinned v3 shape")
+        raise FeishuAuthError("Feishu token response does not match the documented v2 success shape")
     return token
 
 
