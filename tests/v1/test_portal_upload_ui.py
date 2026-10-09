@@ -147,6 +147,37 @@ class UploadRenderTests(unittest.TestCase):
             self.assertIn("proxy_read_timeout 3600s;", nginx)
 
 
+class RerunUiContractTests(unittest.TestCase):
+    """Per-stage rerun action bound to C's confirmed attempts contract."""
+
+    def app(self) -> str:
+        return (STATIC / "app.js").read_text(encoding="utf-8")
+
+    def test_rerun_contract_is_rendered(self) -> None:
+        app = self.app()
+        for token in (
+            "stage_reruns",
+            "/attempts",
+            "body: { stage: stageId }",
+            "resume_from_name_zh",
+            "parent_dag_run_id",
+            "reason_zh",
+            "earliest_required",
+            "renderRerunPanel",
+            "rerunFromStage",
+            "shortRunId",
+            "从此步骤重新运行",
+            "继续原作业",
+            "仅发起人或平台管理员可重新运行。",
+            "将重算该步骤及其后续阶段；原始运行与证据保留，重跑为新关联运行。",
+            "重新运行 · 来源",
+        ):
+            self.assertIn(token, app)
+        # The superseded picker design and its parameter name are gone.
+        self.assertNotIn("from_stage", app)
+        self.assertNotIn("重试失败步骤", app)
+
+
 class ReportUiContractTests(unittest.TestCase):
     """The run detail renders C's canonical report payload without local copies."""
 

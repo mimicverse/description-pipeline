@@ -21,6 +21,9 @@ const state = {
   timer: null,
   retryingRunId: null,
   tabsInitializedFor: null,
+  rerunningRunId: null,
+  rerunNotice: null,
+  rerunError: null,
 };
 
 const RUN_STATES = {
@@ -96,6 +99,11 @@ function formatBytes(bytes) {
 function folderLabel(value) {
   const name = String(value || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop();
   return name || "";
+}
+
+function shortRunId(value) {
+  const text = String(value || "");
+  return text.split("-").pop() || text;
 }
 
 function normalizeRelativePath(raw) {
@@ -226,6 +234,7 @@ async function api(path, { method = "GET", body, signal } = {}) {
   if (!response.ok) {
     const error = new Error(payload.error || `请求失败（HTTP ${response.status}）`);
     error.status = response.status;
+    error.payload = payload;
     throw error;
   }
   return payload;
@@ -291,6 +300,9 @@ function clearSession() {
   state.dagRunId = null;
   state.lastRun = null;
   state.tabsInitializedFor = null;
+  state.rerunNotice = "";
+  state.rerunError = "";
+  $("stage-rerun").hidden = true;
   if (state.timer) window.clearInterval(state.timer);
   state.timer = null;
   $("workspace").hidden = true;
@@ -321,7 +333,10 @@ async function refreshRuns() {
       button.type = "button";
       const folder = folderLabel(run.handoff_path) || "工程交付";
       const heading = document.createElement("span");
-      heading.textContent = `${folder} · ${RUN_STATES[run.state] || run.state || "待执行"}`;
+      const stateText = RUN_STATES[run.state] || run.state || "待执行";
+      heading.textContent = run.resume_from_name_zh
+        ? `自${run.resume_from_name_zh}重新运行 · 来源 ${shortRunId(run.parent_dag_run_id)} · ${stateText}`
+        : `${folder} · ${stateText}`;
       const submitter = document.createElement("span");
       submitter.className = "run-submitter";
       submitter.textContent = `发起人：${run.user || "未记录"}`;
@@ -750,6 +765,101 @@ function renderStepper() {
   });
 }
 
+function renderRerunPanel(run) {
+  const host = $("stage-rerun");
+  if (!host) return;
+  host.textContent = "";
+  const rows = Array.isArray(run.stage_reruns) ? run.stage_reruns : null;
+  const stage = state.stages[state.selectedStage];
+  if (!rows || !stage) {
+    host.hidden = true;
+    return;
+  }
+  host.hidden = false;
+  const row = rows.find((item) => item && item.stage === stage.id) || null;
+  const runId = String(run.dag_run_id || "");
+  const canManage = run.can_manage === true;
+  const eligible = Boolean(row && row.eligible === true);
+  const busy = state.rerunningRunId === runId;
+
+  const line = document.createElement("div");
+  line.className = "rerun-row";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = busy ? "正在创建尝试…" : "从此步骤重新运行";
+  button.disabled = busy || !canManage || !eligible;
+  button.addEventListener("click", () => {
+    void rerunFromStage(stage.id);
+  });
+  line.append(button);
+
+  const note = document.createElement("span");
+  note.className = "muted small";
+  if (state.rerunNotice) {
+    note.textContent = state.rerunNotice;
+  } else if (!canManage) {
+    note.textContent = "仅发起人或平台管理员可重新运行。";
+  } else if (row && row.reason_zh) {
+    // Canonical backend reason shown verbatim whenever the stage is not eligible.
+    note.textContent = row.reason_zh;
+  } else if (eligible) {
+    note.textContent = "将重算该步骤及其后续阶段；原始运行与证据保留，重跑为新关联运行。";
+  }
+  line.append(note);
+  host.append(line);
+
+  if (state.rerunError) {
+    const error = document.createElement("p");
+    error.className = "error";
+    error.textContent = state.rerunError;
+    host.append(error);
+  }
+}
+
+async function rerunFromStage(stageId) {
+  const run = state.lastRun;
+  const runId = state.dagRunId;
+  if (!run || !runId || state.rerunningRunId !== null || run.can_manage !== true || !stageId) return;
+  state.rerunningRunId = runId;
+  state.rerunNotice = "";
+  state.rerunError = "";
+  renderRerunPanel(run);
+  try {
+    const payload = await api(`/api/runs/${encodeURIComponent(runId)}/attempts`, {
+      method: "POST",
+      body: { stage: stageId },
+    });
+    const name = payload.resume_from_name_zh || stageId;
+    state.rerunNotice = `已创建新关联运行，自「${name}」重新执行；原始运行与证据保留。`;
+    if (!state.timer && state.dagRunId === runId) {
+      state.timer = window.setInterval(() => {
+        void poll();
+      }, 3000);
+    }
+    await poll();
+    await refreshRuns();
+  } catch (error) {
+    if (error.status === 401) {
+      clearSession();
+      setError($("login-error"), error.message);
+      return;
+    }
+    if (state.dagRunId === runId) {
+      const detail = error.payload && typeof error.payload === "object" ? error.payload : {};
+      state.rerunError = detail.reason_zh || error.message || "重新运行未受理。";
+      if (detail.earliest_required) {
+        const index = state.stages.findIndex((item) => item.id === detail.earliest_required);
+        if (index !== -1) state.selectedStage = index;
+      }
+      await poll();
+      await refreshRuns();
+    }
+  } finally {
+    state.rerunningRunId = null;
+    if (state.lastRun && state.lastRun.dag_run_id === state.dagRunId) renderRun(state.lastRun);
+  }
+}
+
 function renderRun(run) {
   const runId = String(run.dag_run_id || "");
   $("run-heading").textContent = folderLabel(run.handoff_path) || "工程文件夹";
@@ -819,7 +929,7 @@ function renderRun(run) {
   $("retry-panel").hidden = !canRetry && !(run.state === "failed" && retryReason);
   $("retry-button").hidden = !canRetry;
   $("retry-button").disabled = state.retryingRunId !== null;
-  $("retry-button").textContent = state.retryingRunId === runId ? "正在重试…" : "重试";
+  $("retry-button").textContent = state.retryingRunId === runId ? "正在重试…" : "继续原作业";
   $("retry-note").textContent = retry.eligible === true && run.can_manage !== true ?
     "该运行可由发起人或平台管理员重试。" : retryReason;
 
@@ -988,6 +1098,7 @@ function renderRun(run) {
   } else {
     pr.hidden = true;
   }
+  renderRerunPanel(run);
   updatePreviewLayout();
 }
 
@@ -1107,6 +1218,8 @@ async function selectRun(dagRunId) {
   state.lastRun = null;
   state.selectedStage = null;
   state.tabsInitializedFor = null;
+  state.rerunNotice = "";
+  state.rerunError = "";
   $("retry-panel").hidden = true;
   setError($("run-error-detail"), "");
   setError($("retry-error"), "");
