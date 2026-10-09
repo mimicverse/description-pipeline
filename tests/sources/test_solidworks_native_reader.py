@@ -379,14 +379,26 @@ class _App:
     RevisionNumber = "2026-portable-mock"
     Visible = False
 
-    def __init__(self, docs):
+    def __init__(self, docs, open_errors=None, not_preopened=None, dependencies=None, dependency_error=None):
         self._docs = {os.path.normcase(os.path.abspath(str(path))): doc for path, doc in docs.items()}
+        self._open_errors = {
+            os.path.normcase(os.path.abspath(str(path))): code for path, code in (open_errors or {}).items()
+        }
+        self._not_preopened = {os.path.normcase(os.path.abspath(str(path))) for path in (not_preopened or ())}
+        self._dependencies = {
+            os.path.normcase(os.path.abspath(str(path))): tuple(entries)
+            for path, entries in (dependencies or {}).items()
+        }
+        self._dependency_error = dependency_error
 
     def GetOpenDocumentByName(self, path):
         key = os.path.normcase(os.path.abspath(str(path)))
-        if key in self._docs:
+        if key in self._docs and key not in self._not_preopened:
             return self._docs[key]
         # Opening an assembly also opens its resolved component documents.
+        return self._component_document(key)
+
+    def _component_document(self, key):
         stack = [component for doc in self._docs.values() for component in doc._children]
         visited = set()
         while stack:
@@ -408,6 +420,18 @@ class _App:
 
     def GetDocuments(self):
         return list(self._docs.values())
+
+    def OpenDoc6(self, path, _kind, _options, _configuration, errors, warnings):
+        key = os.path.normcase(os.path.abspath(str(path)))
+        errors.value = self._open_errors.get(key, 0)
+        warnings.value = 0
+        return self._docs.get(key) or self._component_document(key)
+
+    def GetDocumentDependencies2(self, path, _traverse, _search, _read_only):
+        if self._dependency_error is not None:
+            raise self._dependency_error
+        key = os.path.normcase(os.path.abspath(str(path)))
+        return self._dependencies.get(key, ())
 
 
 class _Session:
@@ -1949,7 +1973,17 @@ class PropertyContractTests(unittest.TestCase):
         # exact six-argument vendor signature with ResolvedFlag False.
         self.assertEqual(record["identity"]["hardware_id"], "m3.0")
         self.assertEqual(record["identity"]["revision"], "r1")
-        self.assertEqual(manager.get6_calls, [("dp.hardware_id", False), ("dp.revision", False)])
+        # Root selection probes the candidate marker once; the record then reads
+        # the identity again from the same six-argument by-ref contract.
+        self.assertEqual(
+            manager.get6_calls,
+            [
+                ("dp.hardware_id", False),
+                ("dp.revision", False),
+                ("dp.hardware_id", False),
+                ("dp.revision", False),
+            ],
+        )
         self.assertEqual(manager.get_calls, [])
 
     def test_get6_status_must_be_actual_two(self) -> None:
@@ -2063,6 +2097,234 @@ class PropertyContractTests(unittest.TestCase):
             error = caught.exception
             self.assertEqual(error.code, "cad_property_unreadable")
             self.assertEqual(error.detail["configuration"], "Right")
+
+
+class MainAssemblySelectionTests(unittest.TestCase):
+    """Root selection: declared identity first, otherwise a unique graph root."""
+
+    def _delivery_scene(self, root: Path, name: str, *, marker: bool):
+        stem = name.split(".", 1)[0]
+        base = _write(root, f"{stem}-base.SLDPRT")
+        component = _Component("base-1", base)
+        seat = _mate(
+            "seat",
+            0,
+            [_MateEntity(component, "Face1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0)))],
+        )
+        group = _Feature("MateGroup", "MateGroup", first_sub=seat)
+        assembly = _write(root, name)
+        properties = {"dp.hardware_id": "m3.0", "dp.delivery_configuration": "Default"} if marker else {}
+        doc = _Doc(assembly, first_feature=group, children=[component], properties=properties)
+        return assembly, doc
+
+    def test_declared_marker_wins_over_broken_unreferenced_assembly(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assembly, doc = self._delivery_scene(root, "robot.SLDASM", marker=True)
+            spare = _write(root, "spare.SLDASM")
+            app = _App(
+                {assembly: doc, spare: _Doc(spare, doc_type=2)},
+                open_errors={spare: 2},
+                not_preopened={spare},
+            )
+
+            record = _read(root, app)
+
+            self.assertEqual(record["identity"]["main_assembly"], "robot.SLDASM")
+            self.assertEqual(record["identity"]["hardware_id"], "m3.0")
+            self.assertEqual(record["identity"]["delivery_configuration"], "Default")
+
+    def test_unmarked_multiple_roots_fail_with_actionable_ambiguity(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = _write(root, "aaa.SLDASM")
+            second = _write(root, "zzz.SLDASM")
+            app = _App({first: _Doc(first, doc_type=2), second: _Doc(second, doc_type=2)})
+
+            with self.assertRaises(CadError) as caught:
+                _read(root, app)
+
+            error = caught.exception
+            self.assertEqual(error.code, "native_discovery_main_assembly_ambiguous")
+            self.assertEqual(
+                sorted(os.path.basename(entry) for entry in error.detail["unreferenced"]),
+                ["aaa.SLDASM", "zzz.SLDASM"],
+            )
+            self.assertIn("dp.hardware_id", error.message)
+
+    def test_two_marked_assemblies_fail_as_ambiguous(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = _write(root, "first.SLDASM")
+            second = _write(root, "second.SLDASM")
+            marker = {"dp.hardware_id": "m3.0", "dp.delivery_configuration": "Default"}
+            app = _App(
+                {
+                    first: _Doc(first, doc_type=2, properties=dict(marker)),
+                    second: _Doc(second, doc_type=2, properties=dict(marker)),
+                }
+            )
+
+            with self.assertRaises(CadError) as caught:
+                _read(root, app)
+
+            error = caught.exception
+            self.assertEqual(error.code, "native_discovery_main_assembly_ambiguous")
+            self.assertEqual(
+                sorted(os.path.basename(entry) for entry in error.detail["marked"]),
+                ["first.SLDASM", "second.SLDASM"],
+            )
+
+    def test_marked_main_must_pass_the_strict_open_with_diagnostics(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assembly = _write(root, "robot.SLDASM")
+            doc = _Doc(
+                assembly,
+                doc_type=2,
+                properties={"dp.hardware_id": "m3.0", "dp.delivery_configuration": "Default"},
+            )
+            app = _App(
+                {assembly: doc},
+                open_errors={assembly: 2},
+                not_preopened={assembly},
+                dependencies={
+                    assembly: (
+                        "foot",
+                        str(assembly),
+                        False,
+                        "NP-F550",
+                        r"C:\missing\NP-F550.SLDPRT",
+                        True,
+                    )
+                },
+            )
+
+            with self.assertRaises(CadError) as caught:
+                _read(root, app)
+
+            error = caught.exception
+            self.assertEqual(error.code, "cad_document_open_failed")
+            self.assertEqual(error.detail["errors"], 2)
+            self.assertEqual(
+                error.detail["unresolved_references"],
+                [{"name": "NP-F550", "last_known_path": r"C:\missing\NP-F550.SLDPRT"}],
+            )
+
+    def test_open_failure_without_dependency_enumeration_keeps_original_error(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assembly = _write(root, "robot.SLDASM")
+            doc = _Doc(
+                assembly,
+                doc_type=2,
+                properties={"dp.hardware_id": "m3.0", "dp.delivery_configuration": "Default"},
+            )
+            app = _App(
+                {assembly: doc},
+                open_errors={assembly: 2},
+                not_preopened={assembly},
+                dependency_error=RuntimeError("RPC unavailable"),
+            )
+
+            with self.assertRaises(CadError) as caught:
+                _read(root, app)
+
+            error = caught.exception
+            self.assertEqual(error.code, "cad_document_open_failed")
+            self.assertEqual(error.detail["errors"], 2)
+            self.assertNotIn("unresolved_references", error.detail)
+
+    def test_single_unmarked_assembly_is_still_selected(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assembly, doc = self._delivery_scene(root, "robot.SLDASM", marker=False)
+
+            record = _read(root, _App({assembly: doc}))
+
+            self.assertEqual(record["identity"]["main_assembly"], "robot.SLDASM")
+
+    def test_unreadable_open_status_blocks_the_selected_root(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assembly = _write(root, "robot.SLDASM")
+            doc = _Doc(
+                assembly,
+                doc_type=2,
+                properties={"dp.hardware_id": "m3.0", "dp.delivery_configuration": "Default"},
+            )
+            app = _App({assembly: doc}, open_errors={assembly: "unreadable"}, not_preopened={assembly})
+
+            with self.assertRaises(CadError) as caught:
+                _read(root, app)
+
+            error = caught.exception
+            self.assertEqual(error.code, "cad_document_open_failed")
+            self.assertIsNone(error.detail["errors"])
+
+    def test_transitively_open_declared_main_needs_a_fresh_exact_status(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            carried = _write(root, "robot.SLDASM")
+            carried_doc = _Doc(
+                carried,
+                doc_type=2,
+                properties={"dp.hardware_id": "m3.0", "dp.delivery_configuration": "Default"},
+            )
+            carrier = _write(root, "carrier.SLDASM")
+            component = _Component("robot-1", carried, doc=carried_doc)
+            carrier_doc = _Doc(carrier, doc_type=2, children=[component])
+            app = _App({carrier: carrier_doc}, open_errors={carried: 2})
+
+            with self.assertRaises(CadError) as caught:
+                _read(root, app)
+
+            error = caught.exception
+            self.assertEqual(error.code, "cad_document_open_failed")
+            self.assertEqual(error.detail["errors"], 2)
+
+    def test_partial_candidate_graph_blocks_unique_root_selection(self) -> None:
+        class _UnreadableGraph(_Doc):
+            def GetComponents(self, _ignored):
+                raise RuntimeError("graph unreadable")
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = _write(root, "aaa.SLDASM")
+            second = _write(root, "zzz.SLDASM")
+            app = _App({first: _Doc(first, doc_type=2), second: _UnreadableGraph(second, doc_type=2)})
+
+            with self.assertRaises(CadError) as caught:
+                _read(root, app)
+
+            error = caught.exception
+            self.assertEqual(error.code, "native_discovery_main_assembly_ambiguous")
+            self.assertEqual(
+                [os.path.basename(entry) for entry in error.detail["incomplete_graph"]],
+                ["zzz.SLDASM"],
+            )
+
+    def test_unreadable_identity_blocks_a_declared_main_selection(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assembly, doc = self._delivery_scene(root, "robot.SLDASM", marker=True)
+            extra = _write(root, "extra.SLDASM")
+            extra_doc = _Doc(
+                extra,
+                doc_type=2,
+                scope_managers={"": _PropertyManager({}, get_names_error=RuntimeError("no scope"))},
+            )
+            app = _App({assembly: doc, extra: extra_doc})
+
+            with self.assertRaises(CadError) as caught:
+                _read(root, app)
+
+            error = caught.exception
+            self.assertEqual(error.code, "native_discovery_main_assembly_ambiguous")
+            self.assertEqual(
+                [os.path.basename(entry) for entry in error.detail["unreadable_identity"]],
+                ["extra.SLDASM"],
+            )
 
 
 class EntityGeometryTests(unittest.TestCase):

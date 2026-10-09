@@ -1105,6 +1105,25 @@ class SolidWorksBackend(CadBackend):
 
     def open_document(self, path):
         # Silent + read-only in the owned application for this phase.
+        doc, errors, warnings = self._open_document_raw(path)
+        if doc is None or errors.value:
+            raise self._open_failure(path, errors.value, warnings.value)
+        return {
+            "opened": _member(doc, "GetTitle"),
+            "path": _member(doc, "GetPathName"),
+            "read_only": True,
+            "errors": errors.value,
+            "warnings": warnings.value,
+        }
+
+    def _open_document_raw(self, path):
+        """Open a document read-only in the owned application.
+
+        Returns ``(doc, errors, warnings)`` and leaves CAD-reported open errors
+        to the caller: :meth:`open_document` applies the strict gate, while
+        root selection records them per candidate.
+        """
+
         import pythoncom
 
         wc = _win32()
@@ -1115,15 +1134,47 @@ class SolidWorksBackend(CadBackend):
         warnings = wc.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
         configuration = self._requested_configurations.get(normalize_document_path(path), "")
         doc = _member(self._app_for_path(path), "OpenDoc6", path, kind, 3, configuration, errors, warnings)
-        if doc is None or errors.value:
-            raise CadError("cad_document_open_failed", path, {"errors": errors.value, "warnings": warnings.value})
-        return {
-            "opened": _member(doc, "GetTitle"),
-            "path": _member(doc, "GetPathName"),
-            "read_only": True,
-            "errors": errors.value,
-            "warnings": warnings.value,
-        }
+        return doc, errors, warnings
+
+    def _unresolved_references(self, path, limit=32):
+        """Best-effort unresolved dependency names and last-known paths.
+
+        Read-only diagnostics for open failures: bounded, never raised, and
+        ``None`` when the enumeration is unavailable so the original open error
+        keeps its exact reporting.
+        """
+
+        try:
+            raw = _member(self._app_for_path(path), "GetDocumentDependencies2", path, True, True, True)
+        except Exception:  # noqa: BLE001 - diagnostics must never mask the open error
+            return None
+        items = list(raw or ())
+        unresolved = []
+        for index in range(0, len(items) - 2, 3):
+            name = items[index]
+            if not _is_text_name(name):
+                continue
+            try:
+                exists = os.path.isfile(str(items[index + 1]))
+            except Exception:  # noqa: BLE001
+                exists = False
+            if exists:
+                continue
+            unresolved.append({"name": str(name), "last_known_path": str(items[index + 1])})
+            if len(unresolved) >= limit:
+                break
+        return unresolved
+
+    def _open_failure(self, path, errors, warnings, exception=None):
+        """Strict open failure; the detail carries unresolved references when readable."""
+
+        detail = {"errors": errors, "warnings": warnings}
+        if exception:
+            detail["exception"] = exception
+        unresolved = self._unresolved_references(path)
+        if unresolved is not None:
+            detail["unresolved_references"] = unresolved
+        return CadError("cad_document_open_failed", path, detail)
 
     def close_document(self, name, confirm=False):
         if not confirm:
@@ -2347,6 +2398,146 @@ class SolidWorksBackend(CadBackend):
             "instances": instances,
         }
 
+    def _probe_document(self, path):
+        """Collect one candidate for root selection without strict gating.
+
+        Documents already open in the owned session are reused.  Otherwise the
+        read-only open is attempted and its CAD-reported errors are recorded
+        instead of raised; the selected document is validated strictly before
+        anything downstream reads it.  Only the exact vendor integer status is
+        recorded: an unreadable VARIANT leaves the counts unset and blocks the
+        selected root instead of coercing to zero.
+        """
+
+        try:
+            doc = self._document_by_path(path)
+        except CadError as exc:
+            if exc.code != "document_not_open":
+                raise
+        else:
+            return {"doc": doc, "errors": 0, "warnings": 0, "open_exception": None, "already_open": True}
+        try:
+            doc, errors, warnings = self._open_document_raw(path)
+        except Exception as exc:  # noqa: BLE001 - per-candidate failure is recorded, not fatal
+            return {
+                "doc": None,
+                "errors": None,
+                "warnings": None,
+                "open_exception": f"{type(exc).__name__}: {exc}"[:300],
+                "already_open": False,
+            }
+        if type(errors.value) is int and type(warnings.value) is int:
+            counts = (errors.value, warnings.value)
+        else:
+            # An unreadable status VARIANT is not an observed zero; the
+            # selected root is blocked later instead of coerced.
+            counts = (None, None)
+        return {
+            "doc": doc,
+            "errors": counts[0],
+            "warnings": counts[1],
+            "open_exception": None,
+            "already_open": False,
+        }
+
+    def _identity_marker(self, doc):
+        """Declared-main marker from the candidate's active configuration.
+
+        ``dp.hardware_id`` plus ``dp.delivery_configuration`` identify the
+        delivered assembly; both must be recorded, merged across the document
+        and active-configuration scopes exactly as the main record reads them.
+        Returns ``(marker, unreadable)``: an open document whose properties
+        cannot be read is not the same as an unmarked document, and selection
+        must never silently default between the two.
+        """
+
+        if doc is None:
+            return None, False
+        try:
+            _manager, active = _active_configuration_view(doc)
+            configuration = str(_member(active, "Name") or "")
+        except Exception:  # noqa: BLE001 - an unreadable identity is reported, not defaulted
+            return None, True
+        try:
+            values = _custom_properties(doc, configuration or None)
+        except Exception:  # noqa: BLE001 - an unreadable identity is reported, not defaulted
+            return None, True
+        hardware = values.get("dp.hardware_id")
+        delivery = values.get("dp.delivery_configuration")
+        if _is_text_name(hardware) and _is_text_name(delivery):
+            return {"hardware_id": str(hardware).strip(), "delivery_configuration": str(delivery).strip()}, False
+        return None, False
+
+    @staticmethod
+    def _select_main_assembly(entries, referenced):
+        """Choose the delivered assembly: declared marker first, else unique root.
+
+        A single candidate carrying the ``dp.hardware_id`` and
+        ``dp.delivery_configuration`` marker is the declared delivery and
+        cannot be displaced by broken or unreferenced extra documents.  Only a
+        demonstrable selection is accepted: an open document whose identity or
+        graph cannot be read is never silently treated as absent, and without a
+        marker the graph must be complete and show exactly one unreferenced
+        candidate.  Anything else is an actionable ambiguity, never a name,
+        size or order heuristic.
+        """
+
+        marked = [entry for entry in entries if entry.get("marker")]
+        if len(marked) > 1:
+            raise CadError(
+                "native_discovery_main_assembly_ambiguous",
+                "several assemblies declare a delivery identity; keep one marked top-level assembly",
+                {
+                    "candidates": [str(entry["path"]) for entry in entries],
+                    "marked": [str(entry["path"]) for entry in marked],
+                },
+            )
+        unreadable = [entry for entry in entries if entry.get("identity_unreadable")]
+        if len(marked) == 1:
+            if unreadable:
+                raise CadError(
+                    "native_discovery_main_assembly_ambiguous",
+                    "the declared delivery identity cannot be verified; some candidate properties could not be read",
+                    {
+                        "candidates": [str(entry["path"]) for entry in entries],
+                        "unreadable_identity": [str(entry["path"]) for entry in unreadable],
+                    },
+                )
+            return marked[0]
+        if len(entries) == 1:
+            return entries[0]
+        if unreadable:
+            raise CadError(
+                "native_discovery_main_assembly_ambiguous",
+                "no delivery identity could be read; some candidate properties could not be read",
+                {
+                    "candidates": [str(entry["path"]) for entry in entries],
+                    "unreadable_identity": [str(entry["path"]) for entry in unreadable],
+                },
+            )
+        incomplete = [entry for entry in entries if not entry.get("graph_readable")]
+        if incomplete:
+            raise CadError(
+                "native_discovery_main_assembly_ambiguous",
+                "the assembly graph is incomplete; an unreadable candidate could hide the delivered assembly",
+                {
+                    "candidates": [str(entry["path"]) for entry in entries],
+                    "incomplete_graph": [str(entry["path"]) for entry in incomplete],
+                },
+            )
+        roots = [entry for entry in entries if normalize_document_path(str(entry["path"])) not in referenced]
+        if len(roots) == 1:
+            return roots[0]
+        raise CadError(
+            "native_discovery_main_assembly_ambiguous",
+            "no unique delivered assembly; mark the top with dp.hardware_id and "
+            "dp.delivery_configuration or keep one top-level assembly",
+            {
+                "candidates": [str(entry["path"]) for entry in entries],
+                "unreferenced": [str(entry["path"]) for entry in roots],
+            },
+        )
+
     def discover_native(self, frozen_source: Path, settings: dict) -> dict:
         """Read the raw native record for CAD-only discovery (owned session).
 
@@ -2355,7 +2546,11 @@ class SolidWorksBackend(CadBackend):
         identity properties, the component graph with occurrence transforms,
         mate features with component-frame entity geometry, coordinate systems
         (assembly and component scope), materials/masses and per-document
-        hashes.  Every read fails closed; nothing is defaulted.
+        hashes.  Every read fails closed; nothing is defaulted.  The delivered
+        assembly is selected by a declared ``dp`` identity marker first and
+        otherwise by a unique unreferenced graph root; per-candidate open
+        errors are collected per document, and only the selected assembly
+        gates the run.
         """
 
         source_root = Path(frozen_source).resolve()
@@ -2367,30 +2562,58 @@ class SolidWorksBackend(CadBackend):
         if not candidates:
             raise CadError("native_discovery_assembly_missing", "no SolidWorks assembly in the engineering directory")
         with self.session():
-            assemblies = []
+            entries = []
             for candidate in candidates:
-                doc = self._ensure_document(str(candidate))
-                assemblies.append((candidate, doc))
-            main = None
-            if len(assemblies) == 1:
-                main = assemblies[0]
-            else:
-                referenced = set()
-                for _candidate, doc in assemblies:
+                entry = self._probe_document(str(candidate))
+                entry["path"] = candidate
+                entry["marker"], entry["identity_unreadable"] = self._identity_marker(entry.get("doc"))
+                entries.append(entry)
+            referenced = set()
+            for entry in entries:
+                doc = entry.get("doc")
+                entry["graph_readable"] = doc is not None
+                if doc is None:
+                    continue
+                try:
                     for component in _assembly_components(doc):
                         path = _method(_component(component), "GetPathName")
                         if _is_text_name(path):
                             referenced.add(normalize_document_path(str(path)))
-                roots = [item for item in assemblies if normalize_document_path(str(item[0])) not in referenced]
-                if len(roots) == 1:
-                    main = roots[0]
-            if main is None:
-                raise CadError(
-                    "native_discovery_main_assembly_ambiguous",
-                    "several assemblies could be the delivered model; keep one top-level assembly",
-                    {"candidates": [str(item[0]) for item in assemblies]},
+                except Exception:  # noqa: BLE001 - a partial candidate graph is tracked, not defaulted
+                    entry["graph_readable"] = False
+                    continue
+            main_entry = self._select_main_assembly(entries, referenced)
+            main_path = main_entry["path"]
+            errors = main_entry.get("errors")
+            warnings = main_entry.get("warnings")
+            if main_entry.get("already_open"):
+                # A document already open in the owned session may have been
+                # loaded as a transitive dependency of another candidate; only
+                # a fresh exact-root open reports this document's own status.
+                try:
+                    doc, raw_errors, raw_warnings = self._open_document_raw(str(main_path))
+                except Exception as exc:  # noqa: BLE001 - reported as the strict open failure
+                    raise self._open_failure(
+                        str(main_path), None, None, exception=f"{type(exc).__name__}: {exc}"[:300]
+                    ) from exc
+                if doc is None:
+                    raise self._open_failure(
+                        str(main_path), None, None, exception="exact-root open returned no document"
+                    )
+                if type(raw_errors.value) is not int or type(raw_warnings.value) is not int:
+                    raise self._open_failure(
+                        str(main_path), None, None, exception="exact-root open status is not an integer"
+                    )
+                errors, warnings = raw_errors.value, raw_warnings.value
+                main_entry = {**main_entry, "doc": doc, "errors": errors, "warnings": warnings}
+            if main_entry.get("doc") is None or type(errors) is not int or errors != 0:
+                raise self._open_failure(
+                    str(main_path),
+                    errors if type(errors) is int else None,
+                    warnings if type(warnings) is int else None,
+                    exception=main_entry.get("open_exception"),
                 )
-            main_path, doc = main
+            doc = main_entry["doc"]
             notes: list[str] = []
             try:
                 rebuilt = bool(_member(doc, "ForceRebuild3", False))
@@ -2403,8 +2626,8 @@ class SolidWorksBackend(CadBackend):
             _manager, active = _active_configuration_view(doc)
             configuration = str(_member(active, "Name") or "")
             identity_properties = _custom_properties(doc, configuration)
-            assemblies.clear()
-            main = doc = active = None
+            entries = None
+            doc = active = None
             components = []
             by_component = {}
             by_document: dict[str, str] = {}
