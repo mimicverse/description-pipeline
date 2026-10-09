@@ -49,6 +49,10 @@ Sign in to the operator page with Feishu. Select the engineering
 folder and click **Start**. Hardware, revision, repository and branch are derived
 or configured by the platform; they are not operator form fields.
 
+Approved Feishu users may start new pipeline runs and view shared results.
+Modifying an existing run, including manually retrying, cancelling or deleting
+it, requires an administrator.
+
 Run history and details show the original submitter's verified Feishu username,
 including when viewed by another operator. The platform reads the name through
 Feishu's authentication API and fills it in automatically.
@@ -68,11 +72,12 @@ Airflow's DAG documentation shows the contract; `wait_for_job` logs and its
 `engineering_stages` XCom retain terminal results even when `confirm_job` is blocked.
 The detailed local receipt is `reports/stages.json`.
 
-Airflow transport retries retain the frozen input and native job UUID; they
-reconnect to the existing job without repeating capture. A terminal native failure,
-including an endpoint restart during capture, requires a new run. Changed inputs
-also require a new run. Automatic checks and engineering confirmations remain
-separate; pending or unsupported items never become implicit passes.
+Automatic Airflow transport retries retain the frozen input and native job UUID;
+they reconnect to the existing job without repeating capture. A terminal native
+failure, including an endpoint restart during capture, requires a new run.
+Changed inputs also require a new run. Automatic checks and engineering
+confirmations remain separate; pending or unsupported items never become
+implicit passes.
 
 ## 4. Correct findings
 

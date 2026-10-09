@@ -235,7 +235,10 @@ Commission the complete workflow with actual native CAD and live Feishu:
    pass. Confirm HTTPS trust, all services, authenticated Windows endpoint health
    and the installed Airflow Connection.
 2. Sign in with Feishu. Verify the displayed Feishu username, approved tenant,
-   workflow permissions, explicit admin assignment and denied unauthorized users.
+   explicit admin assignment and denied unauthorized users. Confirm an approved
+   operator can start new pipeline runs and view shared results from other
+   operators. Confirm only administrators can modify existing runs, including
+   manual retries, cancellation and deletion.
 3. Supply a compliant native folder from an approved Linux or Windows source
    root. Start without YAML, branch, hardware or credential fields.
 4. Verify the UUID, frozen inventory and all six engineering steps. Inspect
@@ -249,8 +252,9 @@ Commission the complete workflow with actual native CAD and live Feishu:
    joint controls and limits; confirm preview binds to the passing file subject.
 6. Check the resulting private-model PR's exact base, head, structural revision
    and verified commit. Candidate submission does not grant engineering approval.
-7. Exercise retries, changed inputs, quality failure, service restart and PR
-   failure. Retain diagnostics; a PR-service failure preserves verified preview.
+7. Exercise automatic transport retries, changed inputs, quality failure, service
+   restart and PR failure. Retain diagnostics; a PR-service failure preserves
+   verified preview.
 
 Mocks, server liveness and an unconfigured OAuth callback do not establish this
 acceptance. Retain reports for the exact tool and native source revision.
