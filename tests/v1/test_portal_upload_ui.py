@@ -159,27 +159,46 @@ class ReportUiContractTests(unittest.TestCase):
             "run.report",
             "report.overall",
             "headline_zh",
+            "engineering_state",
             "report.failure",
             "title_zh",
             "meaning_zh",
             "raw_error",
             "raw_detail",
             "report.measured",
-            "mass_kg",
-            "expected_kg",
+            "expected_mass_window",
+            "mass_closure",
+            "urdf_mass_kg",
+            "whole_cad_mass_kg",
             "label_zh",
             "state_zh",
-            "scope_zh",
             "raw_details",
-            "checks_executed",
+            "counts",
+            "countsText",
+            "external_review",
+            "scopes",
+            "automatic_exclusion",
+            "note_zh",
+            "manual_scope_note_zh",
             "executed",
-            "unsupported_zh",
-            "confirmations_zh",
-            "review_scope",
             "independent",
             "boundary",
         ):
             self.assertIn(token, app)
+
+    def test_no_legacy_stage_view_rendering_survives(self) -> None:
+        app = self.app()
+        for legacy in (
+            "legacyRow",
+            "reviewFacts",
+            "stage_view",
+            "confirmations_zh",
+            "unsupported_zh",
+            "review_scope",
+            "checks_executed",
+        ):
+            self.assertNotIn(legacy, app)
+        self.assertIn("报告数据暂不可用", app)
 
     def test_failed_stage_is_auto_selected_and_selection_persists(self) -> None:
         app = self.app()
@@ -211,7 +230,8 @@ class ReportUiContractTests(unittest.TestCase):
         app = self.app()
         self.assertIn("工程评审范围", app)
         self.assertIn("未就绪", app)
-        self.assertIn("平台不同步外部评审状态", app)
+        self.assertIn("自动检查无法核验", app)
+        self.assertIn("不重复检查", app)
         self.assertNotIn("项待确认", app)
 
 
