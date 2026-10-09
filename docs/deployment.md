@@ -281,7 +281,7 @@ Commission the complete workflow with actual native CAD and live Feishu:
 5. Verify the UUID, frozen inventory and all six engineering steps. Inspect
    input/input QC/output/output QC in the page, the DAG contract table,
    terminal task logs and `engineering_stages` XCom. Confirm failed, blocked,
-   not-run and pending-confirmation states, and the hashed `reports/stages.json`.
+   not-run states and external engineering review scope, and the hashed `reports/stages.json`.
    Verify the actual native discovery and every independent quality result.
    Confirm history and details show the original submitter's Feishu username
    after reload and when viewed by another authorized operator.

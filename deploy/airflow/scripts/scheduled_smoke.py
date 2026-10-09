@@ -42,6 +42,34 @@ HANDOFF = {
 }
 
 
+def _qualifying_events(subject: str) -> list[dict]:
+    """Clearly synthetic events that satisfy the canonical six-stage contract."""
+    from description_pipeline.stages import CONTRACT
+
+    events = []
+    for definition in CONTRACT["stages"]:
+        for boundary in ("input", "output"):
+            for check in definition[f"{boundary}_qc"]:
+                events.append(
+                    {
+                        "at": "t0",
+                        "stage": definition["id"],
+                        "state": "running",
+                        "check": {
+                            "id": check["id"],
+                            "boundary": boundary,
+                            "state": "passed",
+                            "details": {
+                                "scope": "Scheduled smoke; neutral mocked endpoint; no native qualification",
+                                "subject_sha256": subject,
+                            },
+                        },
+                    }
+                )
+        events.append({"at": "t0", "stage": definition["id"], "state": "completed"})
+    return events
+
+
 def _view(job: dict) -> dict:
     """The job document as served: everything but the test-only poke counter."""
     return {key: value for key, value in job.items() if key != "pokes"}
@@ -82,12 +110,19 @@ def _mock_endpoint() -> tuple[ThreadingHTTPServer, dict]:
             job["pokes"] += 1
             if job["pokes"] >= 2:
                 job["status"] = "passed"
+                from description_pipeline.stages import STAGE_IDS
+
                 job["result"] = {
                     "passed": True,
                     "pipeline_id": "solidworks-to-urdf",
                     "output": "build/out",
                     "subject_sha256": SUBJECT,
-                    "quality": {"passed": True, "subject_sha256": SUBJECT, "checks": [{"id": "x"}]},
+                    "execution_scope": list(STAGE_IDS),
+                    "quality": {
+                        "passed": True,
+                        "subject_sha256": SUBJECT,
+                        "checks": [{"id": "source.native_discovery", "passed": True}],
+                    },
                     "submission": {
                         "passed": True,
                         "subject_sha256": SUBJECT,
@@ -99,6 +134,7 @@ def _mock_endpoint() -> tuple[ThreadingHTTPServer, dict]:
                         "url": "https://github.com/example/m3.0/pull/1",
                     },
                 }
+                job["events"] = _qualifying_events(SUBJECT)
             else:
                 job["status"] = "running"
             job["events"].append({"stage": "job", "state": job["status"], "at": "t0"})
@@ -162,11 +198,19 @@ def _auth_health(port: int) -> dict:
     try:
         with urlrequest.urlopen(url, timeout=10) as response:
             payload = json.loads(response.read() or b"{}")
-            return {"status": response.status, "configured": payload.get("configured")}
+            return {
+                "status": response.status,
+                "configured": payload.get("configured"),
+                "request_context": payload.get("request_context"),
+            }
     except urlerror.HTTPError as error:
         with contextlib.suppress(ValueError):
             payload = json.loads(error.read() or b"{}")
-            return {"status": error.code, "configured": payload.get("configured")}
+            return {
+                "status": error.code,
+                "configured": payload.get("configured"),
+                "request_context": payload.get("request_context"),
+            }
         return {"status": error.code}
     except (urlerror.URLError, TimeoutError, OSError) as error:
         return {"status": None, "error": str(error)}
@@ -182,6 +226,26 @@ def _feishu_env(home: Path) -> dict[str, str]:
         "FEISHU_TENANT_KEYS": FEISHU_TENANT,
         "FEISHU_REDIRECT_URI": "https://127.0.0.1:8443/auth/feishu/callback",
     }
+
+
+def _plugin_preflight(venv: Path, env: dict[str, str]) -> str | None:
+    """The installed distribution must provide the airflow.plugins entry point."""
+    code = (
+        "import importlib.metadata as m;"
+        "print(any(e.group == 'airflow.plugins' and e.name == 'description_pipeline' for e in m.entry_points()))"
+    )
+    try:
+        probe = subprocess.run(
+            [str(venv / "bin/python"), "-c", code], env=env, capture_output=True, text=True, timeout=60
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return f"cannot probe the Airflow environment: {error}"
+    if probe.returncode != 0 or probe.stdout.strip() != "True":
+        return (
+            "the Airflow environment does not provide the description-pipeline plugin: the "
+            "airflow.plugins entry point is missing; install the release wheel into this venv"
+        )
+    return None
 
 
 def _operator_jwt(venv: Path, env: dict[str, str]) -> str:
@@ -215,7 +279,7 @@ def main() -> int:
     env = dict(
         os.environ,
         AIRFLOW_HOME=str(args.airflow_home),
-        PYTHONPATH=str(args.root / "src"),
+        PYTHONPATH=os.pathsep.join(filter(None, [str(args.root / "src"), os.environ.get("PYTHONPATH")])),
         AIRFLOW_CONN_SOLIDWORKS_WINDOWS=connection,
         AIRFLOW__CORE__AUTH_MANAGER="description_pipeline.orchestration.feishu_auth.FeishuAuthManager",
         AIRFLOW__API_AUTH__JWT_SECRET=JWT_SECRET,
@@ -227,6 +291,10 @@ def main() -> int:
         AIRFLOW__CORE__DAGS_FOLDER=str(args.root / "deploy/airflow/dags"),
         AIRFLOW__CORE__EXECUTION_API_SERVER_URL=f"http://127.0.0.1:{api_port}/execution",
     )
+    problem = _plugin_preflight(args.venv, env)
+    if problem is not None:
+        print(json.dumps({"ok": False, "stage": "plugin_missing", "error": problem}))
+        return 1
     log_dir = args.airflow_home / "logs" / "smoke"
     log_dir.mkdir(parents=True, exist_ok=True)
     logs = {}
@@ -263,6 +331,19 @@ def main() -> int:
         auth_health = _auth_health(api_port)
         if auth_health.get("status") is None:
             print(json.dumps({"ok": False, "stage": "auth_health", "auth_health": auth_health}))
+            return 1
+        if auth_health.get("status") == 200 and auth_health.get("request_context") is not True:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "stage": "auth_middleware_missing",
+                        "auth_health": auth_health,
+                        "error": "the request-context middleware is not bound; install the release wheel "
+                        "into the Airflow venv so the airflow.plugins entry point loads",
+                    }
+                )
+            )
             return 1
         unpause = _run(args.venv, env, "dags", "unpause", "solidworks_to_urdf")
         if unpause.returncode != 0:

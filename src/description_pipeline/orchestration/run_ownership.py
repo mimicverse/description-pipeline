@@ -1,10 +1,11 @@
 """Strict single-run ownership for the one SolidWorks workflow DAG.
 
-A non-admin may perform exactly one mutation on an existing run: retrying their own run through
+A non-admin may resume transport on their own run through
 Airflow's single-run ``clear_dag_run`` endpoint with the immutable-retry body. Every input is
 server-owned — the routed endpoint and path parameters bound by the root middleware, the recorded
 ``triggering_user_name`` envelope and the validated Feishu user from the auth dependency.
-Missing, damaged or absent values deny; they never grant.
+Linked-run creation additionally checks the stored parent actor. Missing, damaged or absent
+authority values deny; they never grant.
 
 Eligibility is a positive transport classification: the run must be failed, the failed task set
 must be ``wait_for_job`` or ``start_job`` (the latter only with a positively successful
@@ -25,7 +26,7 @@ from .feishu_oauth import (
     recorded_display_name,
     valid_actor_principal,
 )
-from .request_context import CLEAR_BODY_SCOPE_KEY, bound_request
+from .request_context import CLEAR_BODY_SCOPE_KEY, CREATE_BODY_SCOPE_KEY, bound_request
 
 #: The pinned route module that owns the DAG-run handlers; matching module+name means a future
 #: route rename fails closed instead of matching some other handler.
@@ -210,3 +211,18 @@ def owner_retry_allowed(user: Any, dag_id: str, run_id: str) -> bool:
     if principal is None or principal != user.get_id():
         return False
     return classify_transport_retry(run_state, task_states).eligible
+
+
+def owner_create_allowed(user: Any, dag_id: str) -> bool:
+    """A linked run may reuse only a terminal parent owned by this authenticated user."""
+    request = bound_request()
+    candidate = getattr(request, "scope", {}).get(CREATE_BODY_SCOPE_KEY)
+    if not isinstance(candidate, dict) or candidate.get("safe") is not True:
+        return False
+    parent = candidate.get("parent_dag_run_id")
+    if parent is None:
+        return True
+    facts = recorded_run_facts(dag_id, parent)
+    return bool(
+        facts and facts[0] is not None and facts[0] == user.get_id() and _state_value(facts[1]) in {"success", "failed"}
+    )

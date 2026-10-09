@@ -161,7 +161,7 @@ class StageTests(unittest.TestCase):
         view = stage_view()
         self.assertEqual({row["stage"] for row in view["unsupported"]}, {"discover", "verify"})
 
-    def test_transport_is_not_an_engineering_stage_and_manual_remains_pending(self):
+    def test_transport_cannot_create_engineering_review_or_approve_external_facts(self):
         job = {
             "events": [{"stage": "wait_for_job", "state": "completed"}],
             "confirmations": [{"id": "bodies", "state": "confirmed"}],
@@ -173,10 +173,35 @@ class StageTests(unittest.TestCase):
         for stage in view["stages"]:
             self.assertEqual(stage["state"], "not_run")
             for row in stage["confirmations"]:
-                self.assertEqual(row["state"], "pending")
+                self.assertEqual(row["state"], "not_ready")
+                self.assertEqual(row["approval_tracking"], "external")
                 self.assertEqual(row["subject_sha256"], "a" * 64)
         self.assertEqual(view["unsupported"][0]["state"], "unsupported")
         self.assertEqual(view["release_approval"], "required")
+
+    def test_verified_delivery_exposes_only_external_review_scope(self):
+        events = []
+        for definition in CONTRACT["stages"]:
+            for boundary in ("input", "output"):
+                for item in definition[f"{boundary}_qc"]:
+                    record_check(events.append, definition["id"], boundary, item["id"], "passed", {})
+            events.append({"stage": definition["id"], "state": "completed"})
+        job = {"events": events, "subject_sha256": "a" * 64, "confirmations": [{"state": "confirmed"}]}
+        view = stage_view(job)
+        scopes = [row for stage in view["stages"] for row in stage["confirmations"]]
+        self.assertTrue(scopes)
+        self.assertTrue(all(row["state"] == "external_review" for row in scopes))
+        self.assertTrue(all(row["scope"] and row["automatic_exclusion"] for row in scopes))
+        self.assertFalse({row["id"] for row in scopes} & {"dependencies", "saved_state", "revision"})
+        self.assertTrue(all(row["approval_tracking"] == "external" for row in scopes))
+        # A later PR transport error does not invalidate verified evidence or
+        # manufacture a new list of unresolved engineering approvals.
+        job["events"].append({"stage": "publish", "state": "failed"})
+        job["status"] = "failed"
+        after = stage_view(job)
+        self.assertTrue(
+            all(row["state"] == "external_review" for stage in after["stages"] for row in stage["confirmations"])
+        )
 
     def test_contract_render_is_pure_and_terminal_xcom_excludes_large_evidence(self):
         job = {"events": [], "artifacts": {f"evidence/{i}.json": "a" * 64 for i in range(10000)}}

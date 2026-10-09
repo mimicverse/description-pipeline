@@ -147,5 +147,147 @@ class UploadRenderTests(unittest.TestCase):
             self.assertIn("proxy_read_timeout 3600s;", nginx)
 
 
+class RerunUiContractTests(unittest.TestCase):
+    """Per-stage rerun action bound to C's confirmed attempts contract."""
+
+    def app(self) -> str:
+        return (STATIC / "app.js").read_text(encoding="utf-8")
+
+    def test_rerun_contract_is_rendered(self) -> None:
+        app = self.app()
+        for token in (
+            "stage_reruns",
+            "/attempts",
+            "body: { stage: stageId }",
+            "resume_from_name_zh",
+            "parent_dag_run_id",
+            "reason_zh",
+            "earliest_required",
+            "renderRerunPanel",
+            "rerunFromStage",
+            "shortRunId",
+            "从此步骤重新运行",
+            "继续原作业",
+            "仅发起人或平台管理员可重新运行。",
+            "将重算该步骤及其后续阶段；原始运行与证据保留，重跑为新关联运行。",
+            "重新运行 · 来源",
+            "prerequisites",
+            "recomputes",
+            "retains",
+            "PREREQ_STATE_ZH",
+            "rerunStageName",
+            "前置条件：",
+            "将重算：",
+            "最早可重新运行：",
+            "复用既有输入/结果",
+            "nextRunId",
+            "stageToShow",
+            "stageSelectionKey(nextRunId)",
+            "run-origin",
+        ):
+            self.assertIn(token, app)
+        # The superseded picker design and its parameter name are gone.
+        self.assertNotIn("from_stage", app)
+        self.assertNotIn("重试失败步骤", app)
+
+
+class ReportUiContractTests(unittest.TestCase):
+    """The run detail renders C's canonical report payload without local copies."""
+
+    def app(self) -> str:
+        return (STATIC / "app.js").read_text(encoding="utf-8")
+
+    def test_report_payload_fields_are_rendered(self) -> None:
+        app = self.app()
+        for token in (
+            "run.report",
+            "report.overall",
+            "headline_zh",
+            "engineering_state",
+            "report.failure",
+            "title_zh",
+            "meaning_zh",
+            "raw_error",
+            "raw_detail",
+            "report.measured",
+            "expected_mass_window",
+            "mass_closure",
+            "urdf_mass_kg",
+            "whole_cad_mass_kg",
+            "label_zh",
+            "state_zh",
+            "raw_details",
+            "counts",
+            "countsText",
+            "external_review",
+            "scopes",
+            "automatic_exclusion",
+            "note_zh",
+            "manual_scope_note_zh",
+            "executed",
+            "independent",
+            "boundary",
+        ):
+            self.assertIn(token, app)
+
+    def test_no_legacy_stage_view_rendering_survives(self) -> None:
+        app = self.app()
+        for legacy in (
+            "legacyRow",
+            "reviewFacts",
+            "stage_view",
+            "confirmations_zh",
+            "unsupported_zh",
+            "review_scope",
+            "checks_executed",
+        ):
+            self.assertNotIn(legacy, app)
+        self.assertIn("报告数据暂不可用", app)
+
+    def test_failed_stage_is_auto_selected_and_selection_persists(self) -> None:
+        app = self.app()
+        self.assertIn("localStorage.getItem", app)
+        self.assertIn("localStorage.setItem", app)
+        self.assertIn("portal.stage.", app)
+        self.assertIn('stage.state === "failed"', app)
+
+    def test_blocked_stages_are_neutral_not_failed(self) -> None:
+        app = self.app()
+        self.assertNotIn('state === "failed" || state === "blocked") return "bad"', app)
+        self.assertIn('if (state === "failed") return "bad"', app)
+        css = (STATIC / "style.css").read_text(encoding="utf-8")
+        self.assertNotIn(".step.blocked .step-meta { color: var(--bad); }", css)
+        self.assertNotIn(".chip.failed, .chip.blocked", css)
+        self.assertIn(".step.blocked .step-meta { color: var(--muted); }", css)
+
+    def test_preview_uses_full_width_when_absent(self) -> None:
+        app = self.app()
+        css = (STATIC / "style.css").read_text(encoding="utf-8")
+        self.assertIn("no-preview", app)
+        self.assertIn("updatePreviewLayout", app)
+        self.assertIn(".run-workspace.no-preview", css)
+        self.assertNotIn("repeat(4, minmax(0, 1fr))", css)
+        self.assertNotIn("stage-boundaries", app)
+        self.assertNotIn("stage-boundaries", css)
+
+    def test_manual_scope_is_gated_and_honest(self) -> None:
+        app = self.app()
+        self.assertIn("工程评审范围", app)
+        self.assertIn("未就绪", app)
+        self.assertIn("自动检查无法核验", app)
+        self.assertIn("text.textContent = scope.automatic_exclusion", app)
+        self.assertNotIn("项待确认", app)
+
+    def test_stepper_keeps_names_and_shows_affected_object(self) -> None:
+        app = self.app()
+        css = (STATIC / "style.css").read_text(encoding="utf-8")
+        self.assertIn("STEP_STATE_SHORT", app)
+        self.assertIn("已阻断", app)
+        self.assertIn("minmax(3.5em, 1fr)", css)
+        self.assertIn("max-width: 5.5em", css)
+        self.assertIn("涉及对象", app)
+        self.assertIn("visibleFindings", app)
+
+
 if __name__ == "__main__":
     unittest.main()

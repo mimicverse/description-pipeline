@@ -188,6 +188,91 @@ class DagTests(unittest.TestCase):
             self.assertEqual(job["repository_base"], "feature/m3.0")
             self.assertEqual(server.resolved_paths, ["handoff/m3.0"])
 
+    def test_linked_conf_binding_is_validated(self) -> None:
+        from types import SimpleNamespace
+        from airflow.sdk.exceptions import AirflowFailException
+
+        module = self._module()
+
+        def context(conf):
+            return {"dag_run": SimpleNamespace(conf=conf)}
+
+        self.assertIsNone(module._linked_conf(context({})))
+        linked = module._linked_conf(context({"parent_dag_run_id": "portal-parent", "resume_from": "verify"}))
+        self.assertEqual(linked["from_stage"], "verify")
+        self.assertTrue(linked["parent_run"])
+        for conf in (
+            {"parent_dag_run_id": "portal-parent"},
+            {"resume_from": "verify"},
+            {"parent_dag_run_id": "portal-parent", "resume_from": "bogus"},
+        ):
+            with self.subTest(conf=str(conf)), self.assertRaises(AirflowFailException):
+                module._linked_conf(context(conf))
+
+    def test_linked_dag_run_derives_the_retained_upload_from_the_parent_job(self) -> None:
+        from tests.v1.test_airflow_client import JOB_SCHEMA, MockEndpoint, PIPELINE_ID
+        from description_pipeline.orchestration.airflow_client import native_run_id
+
+        venv = Path(os.environ.get("AIRFLOW_VENV", sys.prefix))
+        airflow = venv / "bin" / "airflow"
+        self.assertTrue(airflow.is_file(), airflow)
+        parent_dag_run_id = "portal-parent-20261009"
+        parent_run_id = native_run_id(parent_dag_run_id)
+        with MockEndpoint() as server:
+            server.jobs[parent_run_id] = {
+                "schema_version": JOB_SCHEMA,
+                "pipeline_id": PIPELINE_ID,
+                "run_id": parent_run_id,
+                "status": "failed",
+                "events": [{"stage": "freeze", "state": "completed", "at": "t0"}],
+                "result": None,
+                "error": "verification failed",
+                "pokes": 0,
+                "request": {"run_id": parent_run_id, "package": "handoff/m3.0", "handoff_sha256": "b" * 64},
+            }
+            connection = json.dumps(
+                {
+                    "conn_type": "http",
+                    "host": "127.0.0.1",
+                    "port": server.server.server_address[1],
+                    "password": "test-token",
+                }
+            )
+            env = dict(
+                os.environ,
+                AIRFLOW_HOME=str(migrated_airflow_home(venv)),
+                AIRFLOW__CORE__DAGS_FOLDER=str(DAG_DIR),
+                PYTHONPATH=str(ROOT / "src"),
+                AIRFLOW_CONN_SOLIDWORKS_WINDOWS=connection,
+                SOLIDWORKS_SENSOR_MODE="poke",
+                SOLIDWORKS_POLL_INTERVAL="0.2",
+                SOLIDWORKS_TIMEOUT="60",
+            )
+            conf = json.dumps(
+                {
+                    "handoff_path": "handoff/m3.0",
+                    "parent_dag_run_id": parent_dag_run_id,
+                    "resume_from": "verify",
+                }
+            )
+            result = subprocess.run(
+                [str(airflow), "dags", "test", "solidworks_to_urdf", "2026-01-01", "--conf", conf],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+            self.assertEqual(server.resolved_paths, [])
+            children = [job for job in server.jobs.values() if job["run_id"] != parent_run_id]
+            self.assertEqual(len(children), 1)
+            child = children[0]
+            self.assertEqual(child["status"], "passed")
+            self.assertEqual(child["request"]["package"], "handoff/m3.0")
+            self.assertEqual(child["request"]["handoff_sha256"], "b" * 64)
+            self.assertEqual(child["request"]["resume"], {"parent_run": parent_run_id, "from_stage": "verify"})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -256,100 +256,44 @@
   ],
   "confirmations": [
     {
-      "id": "scope",
-      "label": "范围与身份",
+      "id": "design_fidelity",
+      "label": "设计与实物对应",
       "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
-      "review_stage": "discover"
+      "review_stage": "discover",
+      "scope": "确认本版 CAD 的配置、附件和机构符合预期实物；确认接口名称与实物身份、跨版本改名对应关系、轴线原点与偏置、机械零位和正向；确认设计表、方程及上下文引用表达正确设计意图。",
+      "automatic_exclusion": "不重复检查主装配唯一性、实例覆盖、刚体唯一归属、树拓扑、坐标变换或导出一致性。"
     },
     {
-      "id": "revision",
-      "label": "版本留存",
+      "id": "motion_safety",
+      "label": "全行程与装配安全",
       "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
-      "review_stage": "freeze"
+      "review_stage": "verify",
+      "scope": "确认全行程及关键组合姿态的干涉、间隙、公差、止挡、安全余量和线缆约束；保留设计接触等例外依据。",
+      "automatic_exclusion": "不重复检查限位数值合法性、原生限位与输出限位的一致性。"
     },
     {
-      "id": "dependencies",
-      "label": "文件依赖",
+      "id": "drive_applicability",
+      "label": "驱动工况适用性",
       "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
-      "review_stage": "capture"
+      "review_stage": "discover",
+      "scope": "确认受控驱动规格适用于实际型号、传动、输出侧、负载及持续／峰值工况。",
+      "automatic_exclusion": "不重复抄录或核算流水线已验证的规格引用、版本、数值和派生一致性。"
     },
     {
-      "id": "saved_state",
-      "label": "重建与保存",
+      "id": "physical_fidelity",
+      "label": "物理参数真实性",
       "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
-      "review_stage": "capture"
+      "review_stage": "capture",
+      "scope": "确认实际材料、密度、质量边界和简化假设符合实物，覆盖值或实测参数具有可信来源。",
+      "automatic_exclusion": "不重复验算 CAD 与 URDF 总质量、质心、惯量组合、单位和变换。"
     },
     {
-      "id": "configuration",
-      "label": "配置与实例",
+      "id": "acceptance_basis",
+      "label": "独立验收依据",
       "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
-      "review_stage": "discover"
-    },
-    {
-      "id": "bodies",
-      "label": "刚体归属",
-      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
-      "review_stage": "discover"
-    },
-    {
-      "id": "topology",
-      "label": "拓扑与配合",
-      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
-      "review_stage": "discover"
-    },
-    {
-      "id": "datums",
-      "label": "轴线与基准",
-      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
-      "review_stage": "discover"
-    },
-    {
-      "id": "motion",
-      "label": "零位与正向",
-      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
-      "review_stage": "discover"
-    },
-    {
-      "id": "limits",
-      "label": "工作范围",
-      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
-      "review_stage": "discover"
-    },
-    {
-      "id": "clearance",
-      "label": "干涉与间隙",
-      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
-      "review_stage": "verify"
-    },
-    {
-      "id": "interfaces",
-      "label": "工具与传感器",
-      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
-      "review_stage": "discover"
-    },
-    {
-      "id": "drives",
-      "label": "驱动规格",
-      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
-      "review_stage": "discover"
-    },
-    {
-      "id": "physics",
-      "label": "物理属性",
-      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
-      "review_stage": "capture"
-    },
-    {
-      "id": "budgets",
-      "label": "独立依据",
-      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
-      "review_stage": "verify"
-    },
-    {
-      "id": "geometry",
-      "label": "几何与引用",
-      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
-      "review_stage": "generate"
+      "review_stage": "verify",
+      "scope": "确认质量及外形验收区间来自独立设计预算、受控规格或实测，并适用于本版配置和不确定度。",
+      "automatic_exclusion": "不重复比较产物是否落在已声明区间内。"
     }
   ],
   "unsupported": [

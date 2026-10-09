@@ -121,6 +121,17 @@ def stage_view(job=None):
         stage = copy.deepcopy(definition)
         observed = [event for event in events if event.get("stage") == stage["id"]]
         latest = observed[-1] if observed else {}
+        reuse = latest.get("reuse")
+        if (
+            isinstance(reuse, dict)
+            and reuse.get("reused") is True
+            and isinstance(reuse.get("parent_run"), str)
+            and reuse["parent_run"]
+            and all(event.get("reuse") == reuse for event in observed)
+        ):
+            stage["reuse"] = {"parent_run": reuse["parent_run"], "reused": True}
+            if isinstance(reuse.get("source_run"), str) and reuse["source_run"]:
+                stage["reuse"]["source_run"] = reuse["source_run"]
         for boundary in ("input", "output"):
             for item in stage[f"{boundary}_qc"]:
                 matches = [
@@ -179,14 +190,22 @@ def stage_view(job=None):
         if state == "failed":
             stage["error"] = job.get("error") or result.get("error") or "Required stage checks failed or were not run"
             stage["diagnostic"] = job.get("detail") or result.get("detail") or latest.get("detail")
+            stage["error_code"] = job.get("error_code") or result.get("error_code")
             blocked = True
         stage["confirmations"] = [
-            {**item, "state": "pending", "subject_sha256": subject}
+            {**item, "state": "not_ready", "subject_sha256": subject, "approval_tracking": "external"}
             for item in CONTRACT["confirmations"]
             if item["review_stage"] == stage["id"]
         ]
         stage["unsupported"] = [{**item} for item in view["unsupported"] if item["stage"] == stage["id"]]
         view["stages"].append(stage)
+    # Engineering review concerns facts outside the automatic proof. Do not
+    # manufacture outstanding approvals merely because this service does not
+    # read the review PR or the organization's controlled approval records.
+    if any(stage["id"] == "verify" and stage["state"] == "completed" for stage in view["stages"]):
+        for stage in view["stages"]:
+            for item in stage["confirmations"]:
+                item["state"] = "external_review"
     return view
 
 
@@ -254,7 +273,8 @@ def compact_view(view):
                     for key in ("input_qc", "output_qc")
                 },
                 "evidence": stage["evidence"],
-                "confirmations": "pending",
+                **({"reuse": stage["reuse"]} if stage.get("reuse") else {}),
+                "confirmations": [{"id": item["id"], "state": item["state"]} for item in stage["confirmations"]],
             }
             for stage in view["stages"]
         ],

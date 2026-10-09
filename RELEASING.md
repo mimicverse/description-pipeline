@@ -27,8 +27,8 @@ model repository. Retain local acceptance evidence; GitHub CI is not required.
    Regenerate contract-derived tables from `contract_markdown()` and confirm the
    six-stage contract still matches the code before merging.
 6. Merge the reviewed result into public `main`, create the release tag as
-   `v<package version>` from the distribution's `__version__` (currently
-   `1.0.1`) and publish distributions, their SHA-256 manifest and acceptance
+   `v<package version>` from the distribution's `__version__` and publish
+   distributions, their SHA-256 manifest and acceptance
    evidence. Never reuse or rewrite a published tag or asset. Verify the remote
    commit, tag, downloaded bytes and installed identity.
 

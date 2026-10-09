@@ -51,9 +51,19 @@ six stages, while maintenance commands cover only the stages they execute
 native stages are reported as out of scope, never as qualified.
 [Quality](quality.md) defines the independent gates and tolerances.
 [The mechanical specification](mechanical-handoff-spec.md#111-自动检查与工程师确认)
-defines engineering confirmations. The page displays them as pending under the
-relevant step; approval is recorded in the subject-bound PR or controlled
-engineering records. Unsupported items stay visible on their responsible step.
+defines the remaining external engineering facts. Passed automatic checks are
+accepted without repeated manual review. After verification, the page shows only
+this external review scope; approvals remain in the matching PR or controlled
+records and are not inferred by the portal. Unsupported capabilities stay visible
+on their responsible step.
+
+Any engineering step can start a new linked run. Upstream results are reused
+only after checking their frozen inputs, tool and dependency identities, and
+checkpoint integrity. The selected step and all downstream steps execute again;
+prior runs remain immutable. Reports identify reused evidence and retain its
+original timestamps. A missing or invalid prerequisite points to the earliest
+safe restart step. Transport recovery reconnects an existing job and remains
+separate from engineering reruns.
 
 Native input and collected evidence remain immutable. The canonical model contains
 topology, transforms, geometry and full physical properties. Verification reconstructs
