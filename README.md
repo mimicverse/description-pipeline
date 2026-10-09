@@ -20,7 +20,7 @@ Open the single HTTPS address provided by the platform maintainer.
    per-stage unsupported items stay visible), inspect the verified URDF and joint
    limits, and open the PR for engineering approval.
 
-The picker uploads only the chosen folder (up to 16 GB total, 100 000 files,
+The picker uploads only the chosen folder (up to 2 GB total, 4 096 files,
 512 MB per file); empty subfolders and temporary SolidWorks lock files are
 skipped. Generated platform inputs such as `robot.yaml` and
 `cad-revision.json` must not be included — the platform generates them.

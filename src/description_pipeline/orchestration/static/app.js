@@ -72,8 +72,8 @@ const RETRY_REASONS = {
 const $ = (id) => document.getElementById(id);
 
 const UPLOAD_LIMITS = {
-  maxFiles: 100000,
-  maxTotalBytes: 16 * 1024 * 1024 * 1024,
+  maxFiles: 4096,
+  maxTotalBytes: 2 * 1024 * 1024 * 1024,
   maxFileBytes: 512 * 1024 * 1024,
   maxPathLength: 1024,
 };
@@ -126,7 +126,7 @@ function folderPick(files) {
   }
   if (!records.length || !top) return { error: "所选文件夹中没有可上传的文件。" };
   if (records.length > UPLOAD_LIMITS.maxFiles) return { error: `文件数量超出上限（${UPLOAD_LIMITS.maxFiles}）。` };
-  if (bytes > UPLOAD_LIMITS.maxTotalBytes) return { error: "文件夹总大小超出上限（16 GB）。" };
+  if (bytes > UPLOAD_LIMITS.maxTotalBytes) return { error: "文件夹总大小超出上限（2 GB）。" };
   const oversized = records.find((item) => item.file.size > UPLOAD_LIMITS.maxFileBytes);
   if (oversized) return { error: `单个文件超出上限（512 MB）：${oversized.path.slice(0, 120)}` };
   return { records, top, count: records.length, bytes, skipped };
