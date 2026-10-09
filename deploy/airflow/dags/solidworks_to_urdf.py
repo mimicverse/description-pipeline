@@ -2,8 +2,9 @@
 
 The DAG carries ``handoff_path`` and an optional ``main_assembly`` (the explicit delivered
 assembly). A linked attempt (``parent_dag_run_id`` and ``resume_from``) derives the retained
-package, digest and selection from the parent native job itself. Hardware, revision and
-repository routing resolve inside the serialized Windows job after CAD discovery and are
+package, digest and selection from the parent native job itself; a supplied selection that
+differs from the parent's is refused instead of being silently discarded. Hardware, revision
+and repository routing resolve inside the serialized Windows job after CAD discovery and are
 confirmed here before publication.
 """
 
@@ -63,6 +64,35 @@ def _linked_conf(context) -> dict | None:
     if not (isinstance(parent, str) and parent.strip() and isinstance(stage, str) and stage in STAGE_IDS):
         raise AirflowFailException("A linked attempt requires parent_dag_run_id and a canonical resume_from stage")
     return {"parent_run": native_run_id(parent.strip()), "from_stage": stage}
+
+
+def _param_selection(context) -> str | None:
+    """The explicit main assembly of this trigger, validated, or None when absent."""
+
+    value = context["params"].get("main_assembly")
+    if value is None or value == "":
+        return None
+    return validate_main_assembly(value)
+
+
+def _linked_selection(parent_value, supplied) -> str | None:
+    """A linked attempt's effective selection: inherit the parent, or an explicitly equal value.
+
+    The parent job remains the single authority for its checkpoints; a supplied different
+    selection would describe a run the retained discovery cannot serve, so it is refused
+    rather than replaced by the parent's value (which would let the stored conf lie).
+    """
+
+    parent_selection = parent_value if isinstance(parent_value, str) and parent_value else None
+    if supplied is None or supplied == "":
+        return parent_selection
+    supplied = validate_main_assembly(supplied)
+    if supplied != parent_selection:
+        raise AirflowFailException(
+            "A linked attempt must keep the parent's main assembly selection "
+            f"({parent_selection!r} != {supplied!r}); restore it or start a new run"
+        )
+    return supplied
 
 
 def _resolution(request: dict) -> HandoffResolution:
@@ -185,19 +215,15 @@ def solidworks_to_urdf():
                 "conn_id": CONN_ID,
                 "resume": linked,
             }
-            selection = retained.get("main_assembly")
-            if isinstance(selection, str) and selection:
-                request["main_assembly"] = validate_main_assembly(selection)
-                log.info("linked attempt main_assembly=%s", request["main_assembly"])
+            selection = _linked_selection(retained.get("main_assembly"), context["params"].get("main_assembly"))
+            if selection is not None:
+                request["main_assembly"] = selection
+                log.info("linked attempt main_assembly=%s", selection)
             return request
         handoff_path = str(context["params"]["handoff_path"]).strip()
         if not handoff_path:
             raise AirflowFailException("handoff_path is required")
-        selection = context["params"].get("main_assembly")
-        if selection == "":
-            selection = None
-        if selection is not None:
-            selection = validate_main_assembly(selection)
+        selection = _param_selection(context)
         resolved = _endpoint(CONN_ID).resolve_handoff(handoff_path)
         run_id = _run_uuid(context)
         log.info(
