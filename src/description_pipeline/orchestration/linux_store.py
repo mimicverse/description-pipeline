@@ -285,7 +285,9 @@ class LinuxStore:
             "urdf": urdf,
             "files": files,
         }
-        self._previews = {cache_key: preview}
+        if len(self._previews) >= 8:
+            self._previews.pop(next(iter(self._previews)))
+        self._previews[cache_key] = preview
         return preview
 
     def open_artifact(self, run_id: str, name: str, *, sha256: str):
