@@ -29,7 +29,7 @@ def prepare_control(source, output, run_id, **kwargs):
         summary="Synthetic queue control",
     )
     discovery = output / "discovery/discovery.json"
-    write_json(discovery, {"synthetic_control": True})
+    write_json(discovery, {"synthetic_control": True, "identity": {"main_assembly": "总装.SLDASM"}})
     return SimpleNamespace(
         passed=True,
         findings=(),

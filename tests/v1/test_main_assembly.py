@@ -6,6 +6,7 @@ they do not qualify native CAD behavior.
 
 from __future__ import annotations
 
+import json
 import time
 import unittest
 import uuid
@@ -191,6 +192,13 @@ class MainAssemblyResumeTests(EndpointFixture, unittest.TestCase):
     def test_legacy_parent_cannot_gain_a_selection_on_resume(self):
         parent_jobs, parent = self.finished_parent(None)
         parent_jobs.close()
+        # A run stored before effective selections were recorded carries none; it cannot
+        # acquire one retroactively on resume.
+        ledger = self.config["state_root"] / "jobs" / (parent["run_id"] + ".json")
+        stored = json.loads(ledger.read_text(encoding="utf-8"))
+        stored["main_assembly"] = None
+        ledger.write_text(json.dumps(stored, ensure_ascii=False), encoding="utf-8")
+        parent["main_assembly"] = None
         jobs = self.jobs()
         with self.assertRaises(RequestError) as error:
             jobs.create(self.linked_request(parent, "总装.SLDASM"))

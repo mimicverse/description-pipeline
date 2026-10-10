@@ -7,7 +7,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from description_pipeline.io import digest, file_digest, write_json
 from description_pipeline.orchestration.windows import Jobs, RequestError
+from description_pipeline.sources.solidworks.revision import package_inventory
 from .endpoint_support import EndpointFixture
 
 
@@ -116,6 +118,98 @@ class NativeEndpointTests(EndpointFixture, unittest.TestCase):
         job = jobs.snapshot(request["run_id"])
         self.assertEqual("failed", job["status"])
         self.assertIn("sealed capture transfer", job["error"])
+
+    def test_request_without_selection_seals_with_the_discovered_assembly(self):
+        seen = []
+
+        def runner(package, output, **kwargs):
+            seen.append(kwargs["main_assembly"])
+            return self.capture_transfer_result(output, run_id=kwargs["run_id"], on_event=kwargs["on_event"])
+
+        jobs = self.jobs(runner=runner)
+        request = self.request(jobs)
+        self.assertNotIn("main_assembly", request)
+        jobs.create(request)
+        jobs.queue.join()
+        job = jobs.snapshot(request["run_id"])
+        self.assertEqual("native_complete", job["status"])
+        self.assertEqual("总装.SLDASM", job["main_assembly"])
+        self.assertEqual(["总装.SLDASM"], seen)
+        # The operator request binding stays exactly as submitted.
+        self.assertEqual(request, job["request"])
+
+    def test_explicit_selection_is_unchanged_by_discovery(self):
+        seen = []
+
+        def prepare(source, output, run_id, **kwargs):
+            result = self.prepare(source, output, run_id, **kwargs)
+            write_json(
+                result.discovery_path,
+                {"synthetic_control": True, "identity": {"main_assembly": "OTHER.SLDASM"}},
+            )
+            result.discovery_sha256 = file_digest(result.discovery_path)
+            result.prepared_sha256 = digest(package_inventory(result.package))
+            return result
+
+        def runner(package, output, **kwargs):
+            seen.append(kwargs["main_assembly"])
+            return self.capture_transfer_result(output, run_id=kwargs["run_id"], on_event=kwargs["on_event"])
+
+        jobs = self.jobs(runner=runner, preparer=prepare)
+        request = {**self.request(jobs), "main_assembly": "总装.SLDASM"}
+        jobs.create(request)
+        jobs.queue.join()
+        job = jobs.snapshot(request["run_id"])
+        self.assertEqual("native_complete", job["status"])
+        self.assertEqual("总装.SLDASM", job["main_assembly"])
+        self.assertEqual("总装.SLDASM", job["request"]["main_assembly"])
+        self.assertEqual(["总装.SLDASM"], seen)
+
+    def test_linked_rerun_uses_the_effective_parent_selection(self):
+        seen = []
+
+        def runner(package, output, **kwargs):
+            seen.append(kwargs.get("main_assembly"))
+            return self.capture_transfer_result(output, run_id=kwargs["run_id"], on_event=kwargs["on_event"])
+
+        jobs = self.jobs(runner=runner)
+        parent = self.request(jobs)
+        jobs.create(parent)
+        jobs.queue.join()
+        parent_job = jobs.snapshot(parent["run_id"])
+        self.assertEqual("native_complete", parent_job["status"])
+        self.assertEqual("总装.SLDASM", parent_job["main_assembly"])
+        self.assertNotIn("main_assembly", parent_job["request"])
+
+        def linked(**extra):
+            base = self.request(jobs)
+            return {
+                **base,
+                **extra,
+                "resume": {"parent_run": parent["run_id"], "from_stage": "capture"},
+            }
+
+        accepted = {"accepted": True}
+        with patch("description_pipeline.orchestration.windows.start_plan", return_value=accepted):
+            with self.assertRaises(RequestError) as refused:
+                jobs.create(linked(main_assembly="OTHER.SLDASM"))
+            self.assertEqual(409, refused.exception.status)
+            inherited = linked()
+            jobs.create(inherited)
+            jobs.queue.join()
+            explicit = linked(main_assembly="总装.SLDASM")
+            jobs.create(explicit)
+            jobs.queue.join()
+
+        inherited_job = jobs.snapshot(inherited["run_id"])
+        self.assertEqual("native_complete", inherited_job["status"])
+        self.assertEqual("总装.SLDASM", inherited_job["main_assembly"])
+        self.assertNotIn("main_assembly", inherited_job["request"])
+        explicit_job = jobs.snapshot(explicit["run_id"])
+        self.assertEqual("native_complete", explicit_job["status"])
+        self.assertEqual("总装.SLDASM", explicit_job["main_assembly"])
+        self.assertEqual("总装.SLDASM", explicit_job["request"]["main_assembly"])
+        self.assertEqual(["总装.SLDASM", "总装.SLDASM", "总装.SLDASM"], seen)
 
     def test_sealed_transfer_artifacts_are_hash_bound_and_state_gated(self):
         jobs = self.jobs()

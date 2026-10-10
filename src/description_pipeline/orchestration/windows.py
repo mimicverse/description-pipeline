@@ -672,6 +672,7 @@ class Jobs:
             for key in (
                 "hardware_id",
                 "revision",
+                "main_assembly",
                 "repository_slug",
                 "repository_base",
                 "prepared_files",
@@ -826,10 +827,7 @@ class Jobs:
                         "原始上传不可复用，请重新上传后开始新运行",
                         earliest=None,
                     )
-                if (
-                    request.get("main_assembly") is not None
-                    and request["main_assembly"] != parent_request.get("main_assembly")
-                ):
+                if request.get("main_assembly") is not None and request["main_assembly"] != parent.get("main_assembly"):
                     raise _refusal(
                         "selection_changed",
                         "所选主装配与原运行不一致，无法复用其检查点；请保持同一主装配或重新开始新运行",
@@ -845,12 +843,8 @@ class Jobs:
                 inherited = self._inherited_metadata(parent, spec["from_stage"])
             selection = request.get("main_assembly")
             if selection is None and spec is not None:
-                parent_request = (
-                    self.jobs.get(spec["parent_run"], {}).get("request")
-                    if isinstance(self.jobs.get(spec["parent_run"]), dict)
-                    else None
-                )
-                selection = parent_request.get("main_assembly") if isinstance(parent_request, dict) else None
+                parent_job = self.jobs.get(spec["parent_run"])
+                selection = parent_job.get("main_assembly") if isinstance(parent_job, dict) else None
             job = {
                 "schema_version": JOB_SCHEMA,
                 "pipeline_id": PIPELINE_ID,
@@ -916,6 +910,16 @@ class Jobs:
                 prepared_files=files,
                 prepared_dir=str(package),
             )
+            if job.get("main_assembly") is None:
+                # A request may omit the selection; native discovery resolves the delivered
+                # assembly into its bound identity record.  Persist that resolved value
+                # (the operator's request payload stays untouched) so the runner and the
+                # capture seal bind the same assembly.
+                loaded = read_data(prepared.discovery_path)
+                identity = loaded.get("identity") if isinstance(loaded, dict) else None
+                assembly = identity.get("main_assembly") if isinstance(identity, dict) else None
+                if isinstance(assembly, str) and assembly.strip():
+                    job["main_assembly"] = assembly
             self._save(job)
         return package, target
 
@@ -950,8 +954,7 @@ class Jobs:
                 selection = job.get("main_assembly")
                 if selection is None and spec is not None:
                     parent = self.jobs.get(spec["parent_run"]) or {}
-                    parent_request = parent.get("request") if isinstance(parent, dict) else None
-                    selection = parent_request.get("main_assembly") if isinstance(parent_request, dict) else None
+                    selection = parent.get("main_assembly") if isinstance(parent, dict) else None
                 resume_kwargs = {"resume": spec} if spec is not None else {}
                 if spec is not None and from_stage != "freeze":
                     # Revalidate the retained checkpoints at execution time; enqueue-time
@@ -999,6 +1002,10 @@ class Jobs:
                         seed_dir=seed,
                         expected_subject=self._recorded_subject(parent),
                     )
+                # Re-read after preparation: a request without an explicit selection now
+                # carries the discovery-resolved assembly, and linked native reruns
+                # inherit the parent's effective selection.
+                selection = job.get("main_assembly")
                 _require(
                     isinstance(job.get("repository_slug"), str)
                     and bool(job["repository_slug"])
