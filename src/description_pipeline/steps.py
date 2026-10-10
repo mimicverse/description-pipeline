@@ -229,6 +229,8 @@ def _delivery_readme(hardware: str) -> str:
         "`reports/input.json` checks the supplied package. `reports/quality.json`\n"
         "records independent checks of the captured evidence and delivered URDF.\n"
         "`reports/tool.json` identifies the build tool and runtime.\n\n"
+        "Generation alone does not qualify this model. Read the quality report\n"
+        "for unresolved coverage, mass and motion findings before using it.\n\n"
         "A passing report covers its stated checks and bound file bytes. It does\n"
         "not establish hardware safety, measured accuracy or training readiness.\n"
         "Rerun `description check .` before consuming a copied delivery.\n"

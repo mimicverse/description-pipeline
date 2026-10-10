@@ -25,8 +25,8 @@ The page is **SolidWorks2URDF 交付操作台**.
    assembly is selected automatically. The choice is recorded with the run and its
    evidence, is kept by retries and reruns, and only fixes the entry point —
    identity and physical checks still run on the native data.
-3. Review each step's actual check results, the warnings flagged for engineering
-   inspection, and any failure diagnosis. Automatic passes need no manual
+3. Review each step's actual check results, warnings and failure diagnoses.
+   Automatic passes need no manual
    repetition; warnings never count as passes, and external engineering scope
    remains explicit. Inspect the verified URDF and joint limits, and open the PR
    for engineering approval.

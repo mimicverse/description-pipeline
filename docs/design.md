@@ -21,7 +21,8 @@ limits are preserved verbatim; zero or degenerate values are kept for capture an
 generation, flagged as stage warnings, and never qualify motion. Stored meshes,
 inertias and non-customized joint origins are derived content and are regenerated
 from native CAD, never adopted. Independent verification re-decodes the sealed
-payload and fails closed on contradiction.
+payload. Mates that restrict declared motion in the saved pose remain diagnostics;
+invalid declarations, unresolved references and inconsistent native geometry fail.
 
 Each fact has one effective definition and a recorded source; conflicting or
 ambiguous definitions stop derivation. Mechanical engineers maintain these inputs;
@@ -109,8 +110,8 @@ payload and its PID resolution rows when present; Linux checks its complete
 inventory, file hashes, selected assembly, run identity and native tool identity
 before use. Native completion is an intermediate state, not a verified model: an
 extracted declaration is evidence to reconcile, extraction warnings (uncovered
-occurrences, unusable ranges or drives) stay visible, and contradictions fail
-closed.
+occurrences, unusable ranges or drives) stay visible. Saved-pose mate restrictions
+do not override the declared kinematics.
 
 Both hosts use the same tool source release and record their own runtime
 requirements. Windows checks SolidWorks and COM readiness. Linux checks MuJoCo

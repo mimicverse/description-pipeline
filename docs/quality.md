@@ -19,7 +19,7 @@ frozen evidence and actual files rather than trusting earlier success flags.
 | Step | `not_run`, `running`, `completed`, `failed`, `blocked`; completed requires every boundary check to pass |
 | Automatic check | `passed`, `failed`, `not_run`; missing prerequisites leave a required check unexecuted and prevent qualification |
 | Unsupported check | `unsupported`, with its scope and responsible stage stated; it is never an automatic pass |
-| Stage warning | `warning`: a recorded, non-blocking observation scoped to its stage (for example an unowned occurrence, a zero-width authored range or a zero authored drive); carried in the stage result and run report, requires engineering inspection, and never counts as a pass or qualification |
+| Stage warning | `warning`: a nonblocking observation with its affected objects and qualification impact. It never substitutes for a required check. An unspecified optional budget needs no manual confirmation. |
 | Engineering review | `not_ready` before automatic verification completes, then `external_review`: only facts outside automatic coverage; the portal does not read or infer approval status from the matching PR or controlled records |
 
 `quality.json` records the required gate inventory and every executed or unexecuted
@@ -49,7 +49,8 @@ their dependency records identify their different execution roles.
 When present, the saved exporter declaration payload and its PID resolution rows
 travel with the sealed bundle. Discovery derives the declared structure on the
 native side; Linux verification re-decodes the sealed bytes independently and
-fails closed on contradiction. Authored limits are preserved verbatim: a
+checks the declared topology and native geometry. Saved-pose mate restrictions
+remain diagnostics; conflicting authored operating limits still fail. Authored limits are preserved verbatim: a
 zero-width range or a zero effort/velocity is a stage warning that is kept for
 capture and generation and never qualifies motion. Stored meshes, inertias and
 non-customized origins are regenerated from native CAD and are never adopted.
@@ -226,7 +227,8 @@ the independently reread cylindrical interface required for a joint axis.
 Capture requires a rereadable native axis reference for each motion axis: a
 named reference axis bound by the saved declaration's axis name, or a rereadable
 cylindrical interface on the reconstruction path. Serialized axis numbers alone
-never qualify. Owned `CS_<link>` datums
+never qualify. Explicit declarations retain their exact named frames and signed
+axes. On the inferred path, owned `CS_<link>` datums
 identify body frames and `CS_base_link` the root; an optional JCS must match its
 child body frame and owner. Native `axis_sign` supplies the confirmed positive
 direction. Installation, TCP and sensor datums retain their interface names and
