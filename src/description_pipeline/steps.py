@@ -297,9 +297,9 @@ def capture_evidence(
         if backend is None and sys.platform != "win32":
             raise PipelineError("Native SLDASM/SLDPRT capture requires Windows with licensed SolidWorks")
         if backend is None:
-            from .verification.consumer import readiness
+            from .runtime import native_readiness
 
-            return readiness()
+            return native_readiness()
         return {"scope": "injected regression backend; no native qualification"}
 
     checked(on_event, "capture", "input", "runtime.ready", ready)
