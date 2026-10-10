@@ -9,6 +9,7 @@ independent verifier that re-derives every claim from the bound record.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import shutil
 import tempfile
@@ -256,7 +257,10 @@ def record() -> dict:
                 }
             },
         },
-        "files": {},
+        "files": {
+            name: hashlib.sha256(f"placeholder {name}\n".encode()).hexdigest()
+            for name in ("cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT")
+        },
     }
 
 
@@ -2062,10 +2066,6 @@ class MateReaderTests(unittest.TestCase):
         self.assertIsNone(_mate_specific(FakeMateFeature("RefPlane"), strict=False))
 
 
-PRIVATE_M3_ROOT = Path("/home/andy/Work/reviews/incident094339")
-PRIVATE_M3_LOCKED = Path("/home/andy/Downloads/3.0 总装1008")
-
-
 class DerivationSplitTests(unittest.TestCase):
     """The pure derivation runs without any native module or CAD session."""
 
@@ -2120,14 +2120,17 @@ class DerivationSplitTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "did not open the selected main assembly"):
             derive_native_package(source, self.tmp / "derived", "run-1", record(), settings=settings)
 
-    def test_derivation_refuses_a_missing_main_inside_the_frozen_directory(self) -> None:
+    def test_derivation_refuses_a_changed_frozen_file(self) -> None:
         source, records = self._scene()
         (source / "cad/robot.SLDASM").unlink()
-        result = derive_native_package(
-            source, self.tmp / "derived", "run-1", record(), settings=DiscoverySettings(record_roots=(records,))
-        )
-        self.assertFalse(result.passed)
-        self.assertIn("discovery.main_assembly_ambiguous", [finding["code"] for finding in result.findings])
+        with self.assertRaisesRegex(PipelineError, "file binding does not match"):
+            derive_native_package(
+                source,
+                self.tmp / "derived",
+                "run-1",
+                record(),
+                settings=DiscoverySettings(record_roots=(records,)),
+            )
 
     def test_derivation_binds_the_payload_to_the_frozen_bytes_it_reads(self) -> None:
         # The steps-level guard (frozen inventory unchanged before/during discovery)
@@ -2141,46 +2144,90 @@ class DerivationSplitTests(unittest.TestCase):
         self.assertEqual(payload["native_files"], inventory(source))
         self.assertEqual(result.handoff_sha256, digest(inventory(source)))
 
-
-@unittest.skipUnless(
-    (PRIVATE_M3_ROOT / "7452a463-native-discovery.json").is_file() and PRIVATE_M3_LOCKED.is_dir(),
-    "private M3 evidence is not available on this host",
-)
-class PrivateM3DerivationReplayTests(unittest.TestCase):
-    """Private locked50/raw48 replay; the committed test skips without the evidence."""
-
-    def test_recorded_raw_replays_purely_and_matches_preparation(self) -> None:
-        payload = json.loads((PRIVATE_M3_ROOT / "7452a463-native-discovery.json").read_text(encoding="utf-8"))
-        raw = payload["raw"]
-        lock = json.loads((PRIVATE_M3_ROOT / "m3-input-lock.json").read_text(encoding="utf-8"))
-        tmp = Path(tempfile.mkdtemp(prefix="sw-m3-replay-"))
-        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
-        first, second = tmp / "locked-a", tmp / "locked-b"
-        shutil.copytree(PRIVATE_M3_LOCKED, first)
-        shutil.copytree(PRIVATE_M3_LOCKED, second)
-        settings = DiscoverySettings()
-        prepared = prepare_native_package(
-            first, tmp / "prepared", run_id="m3-replay", backend=FakeBackend(raw), settings=settings
+    def test_derivation_refuses_record_files_that_do_not_bind_the_frozen_bytes(self) -> None:
+        source, records = self._scene()
+        settings = DiscoverySettings(record_roots=(records,))
+        mutations = (
+            ({"files": {}}, "carries no bound file inventory"),
+            (
+                {"files": {**record()["files"], "cad/base.SLDPRT": "f" * 64}},
+                "file binding does not match",
+            ),
+            (
+                {"files": {key: value for key, value in record()["files"].items() if key != "cad/robot.SLDASM"}},
+                "recorded main assembly is not bound",
+            ),
+            (
+                {"files": {**record()["files"], "cad/unknown.SLDPRT": "e" * 64}},
+                "file binding does not match",
+            ),
         )
-        with mock.patch(
-            "description_pipeline.runtime.native_readiness",
-            side_effect=AssertionError("derivation must not consult the native runtime"),
-        ):
-            derived = derive_native_package(second, tmp / "derived", "m3-replay", raw, settings=settings)
-        self.assertEqual(inventory(tmp / "prepared"), inventory(tmp / "derived"))
-        self.assertEqual(prepared.prepared_sha256, derived.prepared_sha256)
-        self.assertEqual(prepared.discovery_sha256, derived.discovery_sha256)
-        self.assertEqual([f["code"] for f in prepared.findings], [f["code"] for f in derived.findings])
-        # This record carries blocking findings: both paths return the failed
-        # package without the robot document, and their definitions/findings agree.
-        self.assertFalse(prepared.passed)
-        self.assertFalse(derived.passed)
-        self.assertGreater(len(derived.findings), 0)
-        self.assertFalse((tmp / "prepared" / "robot.yaml").exists())
-        self.assertFalse((tmp / "derived" / "robot.yaml").exists())
-        derived_payload = json.loads((tmp / "derived/discovery/native-discovery.json").read_text(encoding="utf-8"))
-        self.assertEqual(derived_payload["native_files"], lock["files"])
-        self.assertEqual(inventory(first), inventory(second))
+        for index, (patch, message) in enumerate(mutations):
+            payload = record()
+            payload.update(patch)
+            output = self.tmp / f"derived-refused-{index}"
+            with self.subTest(patch=patch), self.assertRaisesRegex(PipelineError, message):
+                derive_native_package(source, output, "run-1", payload, settings=settings)
+            # every refused attempt must leave its output untouched
+            self.assertFalse(output.exists() and any(output.iterdir()))
+
+    def test_derivation_refuses_a_configuration_that_differs_from_the_record(self) -> None:
+        source, records = self._scene()
+        settings = DiscoverySettings(record_roots=(records,))
+        with self.assertRaisesRegex(PipelineError, "requested configuration does not match"):
+            derive_native_package(
+                source,
+                self.tmp / "derived-other-config",
+                "run-1",
+                record(),
+                settings=settings,
+                configuration="Other",
+            )
+        matching = derive_native_package(
+            source,
+            self.tmp / "derived-matching-config",
+            "run-1",
+            record(),
+            settings=settings,
+            configuration="Default",
+        )
+        self.assertTrue(matching.passed, matching.findings)
+
+    def test_preparation_refuses_authored_files_before_any_native_read(self) -> None:
+        source, records = self._scene()
+        (source / "robot.yaml").write_text("schema_version: x\n", encoding="utf-8")
+
+        class ExplodingBackend:
+            def discover_native(self, *args, **kwargs):  # pragma: no cover - must never run
+                raise AssertionError("the native backend must not be invoked for a preflight refusal")
+
+        with self.assertRaisesRegex(PipelineError, "authored package files"):
+            prepare_native_package(
+                source,
+                self.tmp / "prepared",
+                "run-1",
+                backend=ExplodingBackend(),
+                settings=DiscoverySettings(record_roots=(records,)),
+            )
+
+    def test_preparation_refuses_a_nonempty_output_before_any_native_read(self) -> None:
+        source, records = self._scene()
+        output = self.tmp / "prepared"
+        output.mkdir()
+        (output / "leftover.txt").write_text("x", encoding="utf-8")
+
+        class ExplodingBackend:
+            def discover_native(self, *args, **kwargs):  # pragma: no cover - must never run
+                raise AssertionError("the native backend must not be invoked for a preflight refusal")
+
+        with self.assertRaisesRegex(PipelineError, "prepared output directory must be empty"):
+            prepare_native_package(
+                source,
+                output,
+                "run-1",
+                backend=ExplodingBackend(),
+                settings=DiscoverySettings(record_roots=(records,)),
+            )
 
 
 if __name__ == "__main__":

@@ -3722,6 +3722,14 @@ def _check_derivation_paths(frozen_source: Path, output: Path) -> None:
         raise PipelineError("prepared output directory must be empty")
 
 
+def _check_authored_files(native_files: Mapping[str, str]) -> None:
+    authored = sorted(
+        name for name in native_files if name in {ROBOT_FILE, REVISION_FILE} or name.startswith("discovery/")
+    )
+    if authored:
+        raise PipelineError(f"frozen_source already contains authored package files: {authored[:5]}")
+
+
 def prepare_native_package(
     frozen_source: Path,
     output: Path,
@@ -3744,6 +3752,7 @@ def prepare_native_package(
 
     settings = settings or DiscoverySettings()
     _check_derivation_paths(Path(frozen_source), Path(output))
+    _check_authored_files(package_inventory(Path(frozen_source)))
     record = read_native_record(frozen_source, settings, backend=backend, on_activity=on_activity)
     return derive_native_package(
         frozen_source,
@@ -3754,7 +3763,6 @@ def prepare_native_package(
         configuration=configuration,
         assembly=assembly,
         on_event=on_event,
-        on_activity=on_activity,
     )
 
 
@@ -3788,14 +3796,12 @@ def derive_native_package(
     configuration: str | None = None,
     assembly: str | None = None,
     on_event=None,
-    on_activity=None,
 ) -> PreparedPackage:
     """Derive a prepared package purely from a raw native record.
 
     No backend, COM or session import happens here: the record is validated,
-    bound to the frozen bytes and derived into the robot document, revision and
-    findings.  ``on_activity`` stays accepted for API compatibility with the
-    reading adapter; nothing in this function observes a session.
+    its file bindings are proven against the frozen bytes, and the robot
+    document, revision and findings follow from that evidence.
     """
 
     settings = settings or DiscoverySettings()
@@ -3806,23 +3812,37 @@ def derive_native_package(
     output = Path(output)
     native_files = package_inventory(frozen_source)
     handoff_sha256 = digest(native_files)
-    authored = sorted(
-        name for name in native_files if name in {ROBOT_FILE, REVISION_FILE} or name.startswith("discovery/")
-    )
-    if authored:
-        raise PipelineError(f"frozen_source already contains authored package files: {authored[:5]}")
+    _check_authored_files(native_files)
     _validate_native_record(record)
-    if settings.main_assembly:
-        identity_block = record.get("identity") if isinstance(record.get("identity"), dict) else {}
-        recorded_main = identity_block.get("main_assembly")
-        if not _text(recorded_main):
-            recorded_main = _identity_value(record, NAMESPACE, "main_assembly")
-        recorded_main = str(recorded_main).replace("\\", "/") if _text(recorded_main) else None
-        if recorded_main != settings.main_assembly:
+    record_files = record.get("files")
+    if not isinstance(record_files, dict) or not record_files:
+        raise PipelineError(
+            "native discovery record carries no bound file inventory; the frozen bytes cannot be tied to the record"
+        )
+    for name, recorded_sha in record_files.items():
+        if not isinstance(recorded_sha, str) or native_files.get(str(name)) != recorded_sha:
             raise PipelineError(
-                "Native discovery did not open the selected main assembly "
-                f"({recorded_main!r} != {settings.main_assembly!r})"
+                f"native discovery record file binding does not match the frozen directory: {name!r}"
             )
+    identity_block = record.get("identity") if isinstance(record.get("identity"), dict) else {}
+    recorded_main = identity_block.get("main_assembly")
+    if not _text(recorded_main):
+        recorded_main = _identity_value(record, NAMESPACE, "main_assembly")
+    recorded_main = str(recorded_main).replace("\\", "/") if _text(recorded_main) else None
+    if recorded_main is None or recorded_main not in record_files:
+        raise PipelineError("the recorded main assembly is not bound by the record file inventory")
+    if settings.main_assembly and recorded_main != settings.main_assembly:
+        raise PipelineError(
+            "Native discovery did not open the selected main assembly "
+            f"({recorded_main!r} != {settings.main_assembly!r})"
+        )
+    recorded_configuration = _identity_value(record, NAMESPACE, "delivery_configuration") or record.get(
+        "saved_configuration"
+    )
+    if configuration is not None and _text(recorded_configuration) and str(configuration) != str(
+        recorded_configuration
+    ):
+        raise PipelineError("the requested configuration does not match the recorded delivery configuration")
     findings: list[dict] = []
     known_occurrences = {
         str(item.get("name2"))
