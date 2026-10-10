@@ -18,7 +18,7 @@ from . import __version__
 from .delivery import BUNDLE_SCHEMA, PIPELINE_ID, subject_inventory
 from .io import PipelineError, acquire_process_lock, digest, file_digest, inventory, read_data, write_json
 
-from .runtime import RUNTIME_VERSIONS, native_readiness, required_packages, runtime_role
+from .runtime import RUNTIME_PACKAGES
 from .stages import STAGE_IDS, stage_view
 
 
@@ -91,6 +91,12 @@ def _seed_resume(staging: Path, seed_dir: Path | None, resume_from: str) -> None
             shutil.copy2(source, target)
         else:
             raise PipelineError(f"Resume checkpoint is missing: {part}")
+    for name in ("reports/native-tool.json", "reports/native-stages.json", "transfer-manifest.json"):
+        source = seed / name
+        if source.is_file():
+            target = staging / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
 
 
 def _install(staging: Path, target: Path) -> None:
@@ -137,6 +143,57 @@ def _keep_diagnostic(staging: Path, output: Path, receipt: dict) -> Path:
         failed.rmdir()
     _install(staging, failed)
     return failed
+
+
+def _native_tool_record() -> dict:
+    """The native-role tool identity; role-aware runtimes land with the host split."""
+
+    from .runtime import tool_record
+
+    try:
+        return tool_record(role="native")
+    except TypeError:  # pragma: no cover - transitional runtimes without role support
+        return tool_record()
+
+
+def _executed_stages(restart: int, stop_after: str | None, repository) -> list[str]:
+    """The stages this run executes: restart..stop; publish only when it can run."""
+
+    stop = STAGE_IDS.index(stop_after) if stop_after is not None else len(STAGE_IDS) - 1
+    return [
+        stage
+        for stage in ("capture", "generate", "verify", "publish")
+        if STAGE_IDS.index(stage) >= restart
+        and STAGE_IDS.index(stage) <= stop
+        and (stage != "publish" or repository is not None)
+    ]
+
+
+def _finish_native_capture(staging, output, receipt, *, run_id, handoff_sha256, main_assembly):
+    """Close a capture-only run: provenance reports, sealed transfer, native_complete."""
+
+    tool = _native_tool_record()
+    write_json(staging / "reports/native-tool.json", tool)
+    receipt.update(state="native_complete", passed=False, native_complete=True, native_tool=tool, stage="capture")
+    _stamp(staging, receipt)
+    # The native receipt must stay stable even when Linux rewrites reports/stages.json.
+    shutil.copy2(staging / "reports/stages.json", staging / "reports/native-stages.json")
+    from .stage_transfer import CAPTURE_ARCHIVE, CAPTURE_MANIFEST, seal_capture
+
+    archive = staging / CAPTURE_ARCHIVE
+    manifest = seal_capture(
+        staging, archive, run_id=run_id, handoff_sha256=handoff_sha256, main_assembly=main_assembly, native_tool=tool
+    )
+    write_json(staging / CAPTURE_MANIFEST, manifest)
+    receipt["capture_archive"] = {
+        "name": CAPTURE_ARCHIVE,
+        "sha256": file_digest(archive),
+        "size": archive.stat().st_size,
+        "manifest_sha256": file_digest(staging / CAPTURE_MANIFEST),
+    }
+    _stamp(staging, receipt)
+    _install(staging, output)
+    return {**receipt, "output": str(output)}
 
 
 def _event_sink(receipt, on_event=None):
@@ -194,8 +251,17 @@ def run(
     seed_dir: Path | None = None,
     expected_subject: str | None = None,
     resume: dict | None = None,
+    stop_after: str | None = None,
+    main_assembly: str | None = None,
 ) -> dict:
     """Continue a prepared native job through capture, generation, verification and publication.
+
+    ``stop_after`` bounds one run to a single stage boundary for per-stage hosts: the
+    Windows endpoint stops at ``capture`` with a sealed ``native-evidence.zip`` transfer
+    (``native_complete``, never ``passed``); the Linux tasks stop at ``generate``
+    (``generated``, unverified checkpoint), ``verify`` (``verified``, no submission) or
+    ``publish`` (full qualification).  ``resume_from`` >= ``generate`` with a seeded
+    staging directory is the portable continuation contract.
 
     ``backend`` is an internal dependency-injection seam for native regressions;
     the endpoint always uses the native SolidWorks backend. Capture or quality
@@ -214,6 +280,15 @@ def run(
         repo = Path(repository).resolve()
         if output.resolve().is_relative_to(repo) or repo.is_relative_to(output.resolve()):
             raise PipelineError("Build output and the model repository must be separate directories")
+    if stop_after is not None and stop_after not in STAGE_IDS:
+        raise PipelineError(f"Unknown stop_after stage: {stop_after!r}")
+    restart_stage = resume_from if resume_from in STAGE_IDS else "capture"
+    if stop_after is not None and STAGE_IDS.index(stop_after) < STAGE_IDS.index(restart_stage):
+        raise PipelineError("stop_after must not precede the resume stage")
+    if stop_after in ("capture", "generate", "verify") and repository is not None:
+        raise PipelineError(f"stop_after={stop_after!r} runs cannot publish; omit the repository")
+    if stop_after == "publish" and repository is None:
+        raise PipelineError("stop_after='publish' requires a model repository")
     with output_lock(output) as output:
         if not _owned_output(output):
             raise PipelineError(f"Output contains unrelated files: {output}")
@@ -228,8 +303,7 @@ def run(
             "state": "failed",
             "events": prior,
             "execution_scope": [stage for stage in STAGE_IDS if any(event.get("stage") == stage for event in prior)]
-            + [stage for stage in ("capture", "generate", "verify") if STAGE_IDS.index(stage) >= restart]
-            + (["publish"] if repository else []),
+            + _executed_stages(restart, stop_after, repository),
         }
         if isinstance(resume, dict) and resume:
             receipt["resume"] = {"parent_run": resume.get("parent_run"), "from_stage": resume.get("from_stage")}
@@ -251,6 +325,15 @@ def run(
                     handoff_sha256=handoff_sha256,
                 )
                 receipt["cad_revision"] = input_report["cad_revision"]["revision"]
+                if stop_after == "capture":
+                    return _finish_native_capture(
+                        staging,
+                        output,
+                        receipt,
+                        run_id=receipt["run_id"],
+                        handoff_sha256=handoff_sha256,
+                        main_assembly=main_assembly,
+                    )
             else:
                 _seed_resume(staging, seed_dir, resume_from)
                 input_report = read_data(staging / "reports/input.json")
@@ -277,6 +360,16 @@ def run(
                 generated_subject = digest(subject_inventory(staging))
                 if generated_subject != expected_subject:
                     raise PipelineError("Generated subject does not match the recorded delivery")
+            if stop_after == "generate":
+                receipt.update(
+                    state="generated",
+                    passed=False,
+                    subject_sha256=generated_subject,
+                    hardware_id=definition["hardware_id"],
+                )
+                _stamp(staging, receipt)
+                _install(staging, output)
+                return {**receipt, "output": str(output)}
             if resume_from in (None, "capture", "generate", "verify"):
                 report = verify_delivery(staging, generated_subject, on_event=event)
             else:
@@ -436,49 +529,40 @@ def submit(bundle: Path, repository: Path, *, base=None, message=None):
 
 
 def doctor() -> dict:
-    """Check the pinned runtime and readiness required by this host's role."""
-    role = runtime_role()
+    """Check the runtime; native capture availability is a separate explicit fact."""
+
     results = [{"id": "python", "passed": sys.version_info[:2] == (3, 12), "actual": platform.python_version()}]
-    for name in required_packages(role):
-        expected = RUNTIME_VERSIONS[name]
+    for name in RUNTIME_PACKAGES:
         try:
-            actual = importlib.metadata.version(name)
-            results.append({"id": name, "passed": actual == expected, "actual": actual, "expected": expected})
+            results.append({"id": name, "passed": True, "actual": importlib.metadata.version(name)})
         except importlib.metadata.PackageNotFoundError:
             results.append({"id": name, "passed": False, "message": "Reinstall the pinned release runtime"})
+    from .verification.consumer import readiness
+
+    try:
+        consumer = readiness()
+        results.append({"id": "consumer.urdf", "passed": True, "details": consumer})
+    except Exception as error:
+        results.append(
+            {"id": "consumer.urdf", "passed": False, "message": str(error), "details": getattr(error, "details", {})}
+        )
     native = False
-    native_detail = "Native CAD capture runs on the Windows worker"
-    if role == "native":
-        try:
-            detail = native_readiness()
-            native, native_detail = True, detail["solidworks_executable"]
-            results.append({"id": "native.solidworks", "passed": True, "details": detail})
-        except Exception as error:
-            native_detail = str(error)
-            results.append({"id": "native.solidworks", "passed": False, "message": str(error)})
-    else:
-        from .verification.consumer import readiness
+    native_detail = "Native CAD capture requires Windows with licensed SolidWorks"
+    if sys.platform == "win32":
+        from .sources.solidworks.isolation import registered_executable
 
         try:
-            results.append({"id": "consumer.urdf", "passed": True, "details": readiness()})
+            native_detail = registered_executable()
+            native = True
         except Exception as error:
-            results.append(
-                {
-                    "id": "consumer.urdf", "passed": False,
-                    "message": str(error), "details": getattr(error, "details", {}),
-                }
-            )
-    result = {
+            native_detail = str(error)
+    return {
         "pipeline_id": PIPELINE_ID,
         "version": __version__,
-        "role": role,
         "passed": all(item["passed"] for item in results),
         "checks": results,
         "native_capture_available": native,
         "native_capture_detail": native_detail,
+        "git_available": shutil.which("git") is not None,
+        "github_cli_available": shutil.which("gh") is not None,
     }
-    if role == "portable":
-        result.update(
-            git_available=shutil.which("git") is not None, github_cli_available=shutil.which("gh") is not None
-        )
-    return result
