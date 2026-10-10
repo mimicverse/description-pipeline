@@ -218,6 +218,91 @@ class ReportViewTests(unittest.TestCase):
                 self.assertEqual(stages[downstream]["counts"]["boundary"]["executed"], 0)
                 self.assertTrue(all(not row["executed"] for row in stages[downstream]["boundary"]))
 
+    def test_structured_discovery_failure_groups_findings_without_blame(self) -> None:
+        job = passed_job()
+        job["status"] = "failed"
+        job["events"] = protocol_events(subject=SHA, failed_stage="discover")
+        job["error"] = "PipelineError: Required check failed: discovery.definition"
+        job["discovery"] = {
+            "passed": False,
+            "hardware_id": None,
+            "revision": None,
+            "discovery_sha256": "c" * 64,
+            "findings": [
+                {
+                    "code": "discovery.link_name_missing",
+                    "object": f"body:{name}",
+                    "message": "no CS_<link> coordinate system is owned by this body",
+                    "blocking": True,
+                }
+                for name in ("a", "b", "c", "d")
+            ]
+            + [
+                {
+                    "code": "discovery.joint_unsupported_pattern",
+                    "object": "mate:平行43",
+                    "message": "the reconstructed mate constraints do not leave exactly one joint motion",
+                    "blocking": True,
+                },
+                {"code": "discovery.unknown_code", "object": "x", "message": "m", "blocking": True},
+                {"code": "discovery.link_name_missing", "object": "body:skipped", "message": "w", "blocking": False},
+            ],
+        }
+        failure = build_report(job)["failure"]
+        self.assertEqual(failure["title_zh"], "结构解析检查未通过")
+        self.assertEqual(failure["kind"], "definition")
+        self.assertEqual(failure["finding_total"], 6)
+        self.assertEqual(failure["discovery_sha256"], "c" * 64)
+        self.assertEqual(
+            failure["finding_counts"][0],
+            {"code": "discovery.link_name_missing", "label_zh": "未识别刚体坐标系", "count": 4},
+        )
+        labels = {group["code"]: group["label_zh"] for group in failure["finding_counts"]}
+        self.assertEqual(labels["discovery.unknown_code"], "discovery.unknown_code")
+        self.assertEqual(len(failure["finding_samples"]["discovery.link_name_missing"]), 3)
+        self.assertIn("共 6 项", failure["meaning_zh"])
+        for word in ("损坏", "输入有误", "错误"):
+            self.assertNotIn(word, failure["meaning_zh"])
+
+    def test_later_runtime_failure_is_not_overridden_by_stale_discovery_findings(self) -> None:
+        job = passed_job()
+        job["status"] = "failed"
+        job["events"] = protocol_events(subject=SHA, failed_stage="capture")
+        job["error"] = "CadError: C:\\packages\\imports\\x\\robot.SLDASM"
+        job["detail"] = {"errors": 2, "warnings": 0}
+        job["discovery"] = {
+            "passed": False,
+            "discovery_sha256": "c" * 64,
+            "findings": [
+                {"code": "discovery.link_name_missing", "object": "body:a", "message": "no CS", "blocking": True}
+            ],
+        }
+        failure = build_report(job)["failure"]
+        self.assertEqual(failure["stage"], "capture")
+        self.assertEqual(failure["title_zh"], "原生 CAD 打开失败")
+        self.assertEqual(failure["kind"], "runtime")
+        self.assertNotIn("finding_counts", failure)
+        self.assertNotIn("finding_total", failure)
+
+    def test_discovery_failure_without_findings_keeps_the_generic_fallback(self) -> None:
+        job = passed_job()
+        job["status"] = "failed"
+        job["events"] = protocol_events(subject=SHA, failed_stage="discover")
+        job["error"] = "PipelineError: Required check failed: discovery.definition"
+        failure = build_report(job)["failure"]
+        self.assertEqual(failure["title_zh"], "阶段失败（原因未判定）")
+        self.assertEqual(failure["kind"], "unknown")
+
+    def test_failed_summary_points_to_findings_and_never_blanks(self) -> None:
+        from description_pipeline.orchestration.report_view import _failed_summary
+
+        long_row = _failed_summary("结构定义生成", None, {"error": "x" * 300})
+        self.assertTrue(long_row["actual"].startswith("未通过："))
+        self.assertIn("完整诊断见问题清单", long_row["actual"])
+        blank_row = _failed_summary("结构定义生成", None, {})
+        self.assertIn("未通过", blank_row["actual"])
+        self.assertIn("原因未记录", blank_row["actual"])
+
     def test_exact_unresolved_references_render_only_when_recorded(self) -> None:
         job = passed_job()
         job["status"] = "failed"
