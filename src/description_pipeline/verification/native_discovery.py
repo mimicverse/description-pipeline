@@ -634,8 +634,10 @@ def _frame_attachment(record: dict) -> dict:
             continue
         seen += 1
         name = str(mate.get("name") or index)
-        scope = str(mate.get("scope") or "")
-        if scope:
+        scope = mate.get("scope")
+        if scope != "":
+            # Missing, null or numeric scopes are as unsupported as a nested one: the
+            # frozen top scope must be exactly the empty string.
             problem(
                 "a frame-attached mate outside the frozen top assembly is not supported",
                 {"mate": name, "scope": scope},
@@ -1174,6 +1176,13 @@ def verify_discovery(package: Path) -> dict:
                 isinstance(datum, dict) and _frame(datum.get("array")) is not None,
                 "discovery.graph",
                 "a datum transform is not a 4x4 frame",
+            )
+            owner = datum.get("owner")
+            _require(
+                isinstance(owner, str) and (owner == "" or owner in names),
+                "discovery.graph",
+                "a datum owner must be a known occurrence name or the frozen top assembly",
+                {"datum": datum.get("name"), "owner": owner},
             )
         component_properties = (raw.get("properties") or {}).get("components") or {}
         for name, values in component_properties.items():
