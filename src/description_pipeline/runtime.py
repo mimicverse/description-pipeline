@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import importlib
 import platform
 import sys
 from pathlib import Path
@@ -11,12 +12,52 @@ from . import __version__
 from .delivery import PIPELINE_ID
 from .io import PipelineError, digest, file_digest, read_data
 
-RUNTIME_PACKAGES = ("numpy", "PyYAML", "jsonschema", "packaging", "mujoco")
+RUNTIME_PACKAGES = ("numpy", "PyYAML", "jsonschema", "packaging", "python-multipart")
+RUNTIME_VERSIONS = {
+    "numpy": "2.5.3",
+    "PyYAML": "6.0.3",
+    "jsonschema": "4.26.0",
+    "packaging": "26.3",
+    "python-multipart": "0.0.32",
+    "pywin32": "311",
+    "mujoco": "3.13.0",
+}
 
 
-def tool_record() -> dict:
+def runtime_role(role: str | None = None) -> str:
+    role = role or ("native" if sys.platform == "win32" else "portable")
+    if role not in {"native", "portable"}:
+        raise PipelineError(f"Unknown runtime role: {role}")
+    return role
+
+
+def required_packages(role: str | None = None) -> tuple[str, ...]:
+    return RUNTIME_PACKAGES + (("pywin32",) if runtime_role(role) == "native" else ("mujoco",))
+
+
+def native_readiness() -> dict:
+    """Check native prerequisites without opening CAD or importing a consumer."""
+    if sys.platform != "win32":
+        raise PipelineError("Native CAD capture requires Windows with licensed SolidWorks")
+    if sys.version_info[:2] != (3, 12):
+        raise PipelineError("Native CAD capture requires Python 3.12")
+    if importlib.metadata.version("pywin32") != RUNTIME_VERSIONS["pywin32"]:
+        raise PipelineError("Reinstall the pinned Windows runtime: pywin32 version differs")
+    importlib.import_module("pythoncom")
+    importlib.import_module("win32com.client")
+    from .sources.solidworks.isolation import registered_executable
+
+    return {
+        "role": "native",
+        "solidworks_executable": registered_executable(),
+        "scope": "Native prerequisites; the capture session checks CAD access and document readiness",
+    }
+
+
+def tool_record(role: str | None = None) -> dict:
     """Identify the code and runtime actually used, without a mutable Git ref."""
 
+    role = runtime_role(role)
     package = Path(__file__).resolve().parent
     files = {}
     for path in sorted(package.rglob("*")):
@@ -40,20 +81,21 @@ def tool_record() -> dict:
         "source_sha256": source_hash,
         "release": identity,
         "runtime": {
+            "role": role,
             "python": platform.python_version(),
             "system": platform.system(),
             "machine": platform.machine(),
-            "packages": runtime_packages(),
+            "packages": runtime_packages(role),
         },
     }
 
 
-def runtime_packages() -> dict:
+def runtime_packages(role: str | None = None) -> dict:
     """Record runtime dependency closure, excluding unrelated developer tools."""
     from packaging.requirements import Requirement
     from packaging.utils import canonicalize_name
 
-    pending = [(name, frozenset()) for name in RUNTIME_PACKAGES + (("pywin32",) if sys.platform == "win32" else ())]
+    pending = [(name, frozenset()) for name in required_packages(role)]
     versions = {}
     visited = set()
     while pending:
