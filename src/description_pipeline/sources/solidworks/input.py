@@ -768,11 +768,17 @@ def _validate_source(
         effort = limits.get("effort")
         velocity = limits.get("velocity")
         for key, value in (("effort", effort), ("velocity", velocity)):
-            if not _is_number(value) or float(value) <= 0.0:
+            if not _is_number(value) or float(value) < 0.0:
                 report.error(
                     "input.joint_limits_invalid",
-                    f"{where}.limits.{key} must be finite and positive",
+                    f"{where}.limits.{key} must be finite and nonnegative",
                     {key: value},
+                )
+            elif float(value) == 0.0:
+                report.warn(
+                    "input.joint_drive_unspecified",
+                    f"{where}.limits.{key} is zero; retained for inspection, not qualified for motion",
+                    {"joint": name, key: value, "qualification_blocker": "usable_joint_drive"},
                 )
         if joint_type in ("revolute", "prismatic"):
             lower, upper = limits.get("lower"), limits.get("upper")
@@ -789,10 +795,15 @@ def _validate_source(
                     {"lower": lower, "upper": upper},
                 )
             elif float(lower) == float(upper):
-                report.error(
-                    "input.joint_limits_invalid",
-                    f"{where}.limits.lower must be strictly below .upper",
-                    {"lower": lower, "upper": upper},
+                report.warn(
+                    "input.joint_limits_degenerate",
+                    f"{where}.limits has zero width; retained for inspection, not a usable motion range",
+                    {
+                        "joint": name,
+                        "lower": lower,
+                        "upper": upper,
+                        "qualification_blocker": "usable_joint_range",
+                    },
                 )
         elif joint_type == "continuous":
             if "lower" in limits or "upper" in limits:

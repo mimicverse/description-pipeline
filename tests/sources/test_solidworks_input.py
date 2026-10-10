@@ -546,7 +546,7 @@ class InputPackageTests(unittest.TestCase):
 
                 self._assert_code(self._package(mutate), "input.joint_axis_reference_invalid")
 
-    def test_named_axis_does_not_qualify_zero_operating_limits(self):
+    def test_named_axis_preserves_zero_limits_with_explicit_warnings(self):
         def mutate(document):
             joint = document["source"]["joints"][0]
             joint["axis_reference"] = {
@@ -554,7 +554,19 @@ class InputPackageTests(unittest.TestCase):
             }
             joint["limits"] = {"lower": 0, "upper": 0, "effort": 0, "velocity": 0}
 
-        self._assert_code(self._package(mutate), "input.joint_limits_invalid")
+        root = self._package(mutate)
+        report = inspect_package(root)
+        self.assertTrue(report["passed"], report["errors"])
+        warnings = [row for row in report["warnings"] if row["code"].startswith("input.joint_")]
+        self.assertEqual(len(warnings), 3)
+        self.assertEqual(
+            {row["detail"]["qualification_blocker"] for row in warnings},
+            {"usable_joint_drive", "usable_joint_range"},
+        )
+        self.assertEqual(
+            load_package(root)["source"]["joints"][0]["limits"],
+            {"lower": 0, "upper": 0, "effort": 0, "velocity": 0},
+        )
 
     def test_joint_axis_and_limits_are_strict_si(self):
         def axis(document):
@@ -563,7 +575,7 @@ class InputPackageTests(unittest.TestCase):
         self._assert_code(self._package(axis), "input.joint_axis_invalid")
 
         def effort(document):
-            document["source"]["joints"][0]["limits"]["effort"] = 0.0
+            document["source"]["joints"][0]["limits"]["effort"] = -1.0
 
         self._assert_code(self._package(effort), "input.joint_limits_invalid")
 
@@ -773,11 +785,13 @@ class InputPackageTests(unittest.TestCase):
 
                 self._assert_code(self._package(invalid), "input.checks_invalid")
 
-    def test_joint_limits_must_be_strictly_ordered(self):
+    def test_nonzero_equal_bounds_are_retained_for_inspection(self):
         def equal_bounds(document):
             document["source"]["joints"][0]["limits"]["lower"] = 1.5
 
-        self._assert_code(self._package(equal_bounds), "input.joint_limits_invalid")
+        report = inspect_package(self._package(equal_bounds))
+        self.assertTrue(report["passed"], report["errors"])
+        self.assertIn("input.joint_limits_degenerate", [row["code"] for row in report["warnings"]])
 
     def test_malformed_keys_and_overflowing_numbers_are_findings(self):
         def non_string_key(document):

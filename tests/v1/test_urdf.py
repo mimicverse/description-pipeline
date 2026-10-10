@@ -11,6 +11,20 @@ from description_pipeline.model import Robot
 
 
 class UrdfWriterTests(unittest.TestCase):
+    def test_diagnostic_urdf_preserves_declared_zero_limits(self):
+        source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
+        scene = read_data(source / "scene.json")
+        joint = next(row for row in scene["joints"] if row["type"] == "revolute")
+        joint["limits"] = {"lower": 0.0, "upper": 0.0, "effort": 0.0, "velocity": 0.0}
+        robot = Robot.from_dict(scene)
+        with tempfile.TemporaryDirectory() as temp:
+            output = generate_urdf(robot, source, Path(temp), name="diagnostic_arm")
+            node = next(row for row in ET.parse(output).getroot().findall("joint") if row.get("name") == joint["name"])
+            self.assertEqual(
+                {key: float(value) for key, value in node.find("limit").attrib.items()},
+                joint["limits"],
+            )
+
     def test_mesh_delivery_is_self_contained_and_deterministic(self):
         source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
         robot = Robot.from_dict(read_data(source / "scene.json"))
