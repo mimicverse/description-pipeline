@@ -238,6 +238,30 @@ class ReportUiContractTests(unittest.TestCase):
         ):
             self.assertIn(token, app)
 
+    def test_stage_warnings_render_counts_values_and_blocker_kinds(self) -> None:
+        """Recorded warnings reach the stage view: bounded, valued, never passes."""
+
+        app = self.app()
+        css = (STATIC / "style.css").read_text(encoding="utf-8")
+        for token in (
+            "warnings: Array.isArray(stage.warnings)",
+            "renderStageWarnings(root, stage",
+            "stage.counts.warnings",
+            "限定资格阻断：",
+            "发布阻断：",
+            "记录值",
+            "warningValueText",
+            "rows.slice(0, WARNING_ROW_LIMIT)",
+            "WARNING_VALUE_LIMIT",
+        ):
+            self.assertIn(token, app)
+        self.assertIn(".warning-row", css)
+        self.assertIn(".chip.warning", css)
+        # Warnings stay recorded observations: no pass bookkeeping, no per-item human
+        # confirmation and no substitute values.
+        self.assertNotIn('sum("warnings")', app)
+        self.assertNotIn("checkbox", app)
+
     def test_no_legacy_stage_view_rendering_survives(self) -> None:
         app = self.app()
         for legacy in (
@@ -493,7 +517,7 @@ class ActivityUiContractTests(unittest.TestCase):
             "finished",
             "最后活动",
             "打开文档",
-            "重建模型",
+            "读取已保存的模型状态",
             "discover.open_document",
             "discover.session_start",
             "正在启动 SolidWorks",

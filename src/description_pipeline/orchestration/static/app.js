@@ -865,6 +865,7 @@ function stageList(run) {
         reportRow(row, row.boundary === "output" ? "output" : "input")),
       independent: (Array.isArray(stage.independent) ? stage.independent : []).map((row) => reportRow(row, "independent")),
       files: Array.isArray(stage.files) ? stage.files : [],
+      warnings: Array.isArray(stage.warnings) ? stage.warnings : [],
       unsupported: (Array.isArray(stage.unsupported) ? stage.unsupported : [])
         .map((item) => (item && typeof item === "object" ? item.label || item.id : item))
         .filter(Boolean),
@@ -905,6 +906,119 @@ function checkRow(parent, row) {
   appendEvidence(item, "原始证据", row.details);
   parent.append(item);
   return item;
+}
+
+//: Recorded observations render as bounded warning rows: exact recorded values
+//: (including authored zeros), the qualification/publication blocker kind, and no
+//: pass bookkeeping or per-item human confirmation.
+const WARNING_ROW_LIMIT = 8;
+const WARNING_VALUE_LIMIT = 8;
+const WARNING_VALUE_KEYS = [
+  "limits",
+  "components",
+  "links",
+  "joint",
+  "mate",
+  "mate_type",
+  "scope",
+  "mass_kg",
+  "masses",
+  "qualification_blocker",
+  "publication_blocker",
+];
+
+function warningValueText(value) {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    const shown = value.slice(0, WARNING_VALUE_LIMIT).map((item) => warningValueText(item));
+    return `${shown.join("、")}${value.length > shown.length ? ` 等 ${value.length} 项` : ""}`;
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value).slice(0, WARNING_VALUE_LIMIT);
+    const shown = entries.map(([key, item]) => `${key}=${warningValueText(item)}`);
+    return `${shown.join("；")}${Object.keys(value).length > entries.length ? " …" : ""}`;
+  }
+  return String(value);
+}
+
+function stageWarningRow(row) {
+  const item = document.createElement("div");
+  item.className = "warning-row";
+  const head = document.createElement("div");
+  head.className = "warning-head";
+  const label = document.createElement("span");
+  label.className = "warning-label";
+  label.textContent = row.label_zh || row.code || "警告";
+  const chip = document.createElement("span");
+  chip.className = "chip warning";
+  chip.textContent = row.state_zh || "警告";
+  head.append(label, chip);
+  item.append(head);
+  const meta = [row.object, row.code].filter(Boolean).join(" · ");
+  if (meta) {
+    const line = document.createElement("p");
+    line.className = "warning-meta muted small";
+    line.textContent = meta;
+    item.append(line);
+  }
+  if (row.message) {
+    const message = document.createElement("p");
+    message.className = "warning-message";
+    message.textContent = row.message;
+    item.append(message);
+  }
+  const blockers = [];
+  if (row.qualification_blocker) blockers.push(`限定资格阻断：${row.qualification_blocker}`);
+  if (row.publication_blocker) blockers.push(`发布阻断：${row.publication_blocker}`);
+  if (blockers.length) {
+    const line = document.createElement("p");
+    line.className = "warning-blocker";
+    line.textContent = blockers.join("；");
+    item.append(line);
+  }
+  const keys = WARNING_VALUE_KEYS.filter((key) => row[key] !== undefined && row[key] !== null);
+  const residual = row.residual && typeof row.residual === "object" ? Object.entries(row.residual) : [];
+  if (keys.length || residual.length) {
+    const details = expandable(item, "记录值");
+    const list = document.createElement("div");
+    list.className = "warning-values";
+    for (const key of keys) {
+      const line = document.createElement("p");
+      line.textContent = `${key}：${warningValueText(row[key])}`;
+      list.append(line);
+    }
+    for (const [key, value] of residual) {
+      const line = document.createElement("p");
+      line.textContent = `residual.${key}：${warningValueText(value)}`;
+      list.append(line);
+    }
+    details.append(list);
+  }
+  return item;
+}
+
+function renderStageWarnings(root, stage, note) {
+  const rows = Array.isArray(stage.warnings) ? stage.warnings : [];
+  if (!rows.length) return;
+  const group = document.createElement("div");
+  group.className = "check-group warning-group";
+  const title = document.createElement("h4");
+  title.textContent = `警告（${rows.length}）`;
+  group.append(title);
+  const hint = document.createElement("p");
+  hint.className = "stage-note muted small";
+  hint.textContent = note || "记录项，不阻断采集与生成；不计为通过，也不作为验收或发布依据。";
+  group.append(hint);
+  for (const row of rows.slice(0, WARNING_ROW_LIMIT)) group.append(stageWarningRow(row));
+  if (rows.length > WARNING_ROW_LIMIT) {
+    const more = document.createElement("p");
+    more.className = "muted small";
+    more.textContent = `另有 ${rows.length - WARNING_ROW_LIMIT} 项警告，详见报告记录。`;
+    group.append(more);
+  }
+  root.append(group);
 }
 
 function buildFailureCard(failure) {
@@ -1013,6 +1127,9 @@ function renderStageDetail() {
   const pieces = [];
   if (stage.boundary.length) pieces.push(`边界检查：${countsText(stage.counts.boundary, stage.boundary)}`);
   if (stage.independent.length) pieces.push(`独立检查：${countsText(stage.counts.independent, stage.independent)}`);
+  if (Number.isFinite(stage.counts.warnings) && stage.counts.warnings > 0) {
+    pieces.push(`警告：${stage.counts.warnings} 项`);
+  }
   counts.textContent = pieces.join("　•　") || "无检查记录";
   summary.append(counts);
   if (stage.at) {
@@ -1045,6 +1162,13 @@ function renderStageDetail() {
     for (const row of rows) checkRow(group, row);
     root.append(group);
   }
+
+  const reportWarnings = state.lastRun && state.lastRun.report ? state.lastRun.report.warnings : null;
+  renderStageWarnings(
+    root,
+    stage,
+    reportWarnings && typeof reportWarnings.note_zh === "string" ? reportWarnings.note_zh : "",
+  );
 
   const fileRows = (stage.files || []).map((file) => ({
     label: file.label_zh || file.path || "文件",
@@ -1249,7 +1373,8 @@ function renderStepper() {
     } else {
       meta.textContent = `${Number.isFinite(stage.passed) ? stage.passed : 0}/${stage.total} 通过`;
     }
-    const tooltip = `${stage.nameZh} · ${stage.stateZh}${
+    const warningCount = Number.isFinite(stage.counts.warnings) ? stage.counts.warnings : 0;
+    const tooltip = `${stage.nameZh} · ${stage.stateZh}${warningCount > 0 ? ` · 警告 ${warningCount}` : ""}${
       Number.isFinite(stage.total) && stage.total > 0
         ? ` · 通过 ${Number.isFinite(stage.passed) ? stage.passed : 0}/${stage.total} · 已执行 ${
             Number.isFinite(stage.executed) ? stage.executed : 0
