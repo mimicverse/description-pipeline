@@ -145,7 +145,8 @@ receipts; the renderer does not execute engineering work.
 
 One Linux server hosts Airflow, its database and the operator page. One licensed
 Windows endpoint serializes native jobs in owned processes, separate from an
-engineer's CAD session. Native runtime readiness precedes CAD access; consumer readiness is checked on Linux. Native acquisitions
+engineer's CAD session. Native runtime readiness precedes CAD access; consumer
+readiness is checked on Linux. Native acquisitions
 bind their documented interfaces; each rebuild refreshes and verifies the owned
 document once before continuation. Lost bindings or unavailable capabilities
 stop execution, retain diagnostics and release owned resources.
