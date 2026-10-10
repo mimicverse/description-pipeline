@@ -1079,7 +1079,7 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
             if line is None or plane is None:
                 return fail("discovery.mate_entities_unsupported", "parallel mate entities carry no direction")
             direction, normal = line[1], plane[1]
-            if abs(_dot(direction, normal)) > math.sin(_ORIENTATION_TOL_RAD):
+            if abs(_dot(direction, normal)) > _TOL:
                 return fail(
                     "discovery.mate_geometry_mismatch", "solved parallel line and plane are not parallel"
                 )
