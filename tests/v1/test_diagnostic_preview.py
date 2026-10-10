@@ -33,6 +33,8 @@ from .test_stage_transfer import HANDOFF, MAIN_ASSEMBLY, capture_root, native_to
 
 DAG_RUN_ID = "portal-20261010T000000-abcdef01"
 RUN = native_run_id(DAG_RUN_ID)
+FOREIGN = "9b2f4c55-0c3a-4f2b-9d1e-7a6b5c4d3e2f"
+FOREIGN_HANDOFF = "c" * 64
 URDF = b'<robot name="probe"><link name="base_link"/></robot>\n'
 FAILING_CHECKS = [
     {
@@ -114,6 +116,12 @@ class DiagnosticPreviewTests(unittest.TestCase):
             expected_main_assembly=MAIN_ASSEMBLY,
             expected_native_tool=self.tool,
         )
+        # The prepared package ships its discovery findings inside the captured payload; the
+        # admitted capture and every delivery seeded from it therefore carry them too.
+        discovery_path = self.store.capture_dir(RUN) / "input/discovery/native-discovery.json"
+        payload = json.loads(discovery_path.read_text(encoding="utf-8"))
+        payload["findings"] = DISCOVERY_FINDINGS["findings"]
+        write_json(discovery_path, payload)
 
     # ------------------------------------------------------------------ fixture
     def _retained_failed_verify(self, *, passed: bool = False, stamp: bool = True) -> Path:
@@ -132,7 +140,6 @@ class DiagnosticPreviewTests(unittest.TestCase):
             failed / "reports/tool.json",
             {"pipeline_id": "solidworks-to-urdf", "schema_version": "solidworks-to-urdf.tool/v1"},
         )
-        write_json(failed / "input/discovery/findings.json", DISCOVERY_FINDINGS)
         subject = subject_digest(failed)
         report = {"passed": passed, "subject_sha256": subject, "checks": FAILING_CHECKS}
         write_json(failed / "reports/quality.json", report)
@@ -145,6 +152,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
                     "state": "failed",
                     "passed": False,
                     "stage": "verify",
+                    "handoff_sha256": HANDOFF,
                     "subject_sha256": subject,
                     "owned_files": inventory(failed, exclude=("reports/run.json",)),
                 },
@@ -158,6 +166,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
                 "state": "failed",
                 "passed": False,
                 "stage": "verify",
+                "handoff_sha256": HANDOFF,
                 "subject_sha256": subject,
                 "error": "URDF verification failed; see reports/quality.json",
                 "quality": report,
@@ -166,6 +175,105 @@ class DiagnosticPreviewTests(unittest.TestCase):
             },
         )
         return failed
+
+    def _foreign_attempt(self) -> str:
+        """A second admitted attempt with its own capture input and handoff identity."""
+
+        capture = self.store.capture_dir(FOREIGN)
+        (capture / "input").mkdir(parents=True)
+        (capture / "input/foreign.SLDPRT").write_text("foreign input\n", encoding="utf-8")
+        (capture / "evidence").mkdir()
+        self.store.update_meta(FOREIGN, state="capture_admitted", handoff_sha256=FOREIGN_HANDOFF)
+        return FOREIGN
+
+    def _copied_bundle(self) -> Path:
+        """A verbatim copy of another attempt's stamped failed-verify bundle."""
+
+        failed = self._retained_failed_verify()
+        foreign = self._foreign_attempt()
+        copy = self.store.stage_dir(foreign, "verify").with_name("verify.failed")
+        shutil.copytree(failed, copy)
+        return copy
+
+    def _foreign_receipt(
+        self, run_id: str, bundle: Path, *, handoff: str | None = None, receipt_run: str | None = None
+    ) -> None:
+        """This attempt's verify receipt naming the copied bundle, like a relabeling attempt."""
+
+        self.store.record_stage(
+            run_id,
+            "verify",
+            {
+                "schema_version": "solidworks-to-urdf.bundle/v1",
+                "run_id": receipt_run or run_id,
+                "state": "failed",
+                "passed": False,
+                "stage": "verify",
+                "subject_sha256": subject_digest(bundle),
+                "handoff_sha256": handoff or FOREIGN_HANDOFF,
+                "error": "URDF verification failed; see reports/quality.json",
+                "quality": json.loads((bundle / "reports/quality.json").read_text(encoding="utf-8")),
+                "diagnostic_path": str(bundle),
+                "events": [],
+            },
+        )
+
+    def _restamp(self, bundle: Path, *, run_id: str, handoff: str, manifest_run_id: str) -> str:
+        """Re-label a copied bundle self-consistently, then re-stamp it; returns its subject."""
+
+        manifest_path = bundle / "transfer-manifest.json"
+        if manifest_path.is_file():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest.update(run_id=manifest_run_id, handoff_sha256=handoff)
+            write_json(manifest_path, manifest)
+        subject = subject_digest(bundle)
+        report = json.loads((bundle / "reports/quality.json").read_text(encoding="utf-8"))
+        report["subject_sha256"] = subject
+        write_json(bundle / "reports/quality.json", report)
+        embedded = json.loads((bundle / "reports/run.json").read_text(encoding="utf-8"))
+        embedded.update(run_id=run_id, handoff_sha256=handoff, subject_sha256=subject)
+        embedded["owned_files"] = inventory(bundle, exclude=("reports/run.json",))
+        write_json(bundle / "reports/run.json", embedded)
+        return subject
+
+    # ------------------------------------------------------- foreign bundle binding
+    def test_a_foreign_stamped_bundle_cannot_be_mislabeled(self) -> None:
+        copy = self._copied_bundle()
+        self._foreign_receipt(FOREIGN, copy)
+        with self.assertRaises(PipelineError) as caught:
+            self.store.preview(FOREIGN)
+        self.assertIn("another run or handoff", str(caught.exception))
+
+    def test_a_foreign_receipt_run_id_is_refused(self) -> None:
+        copy = self._copied_bundle()
+        self._foreign_receipt(FOREIGN, copy, receipt_run=RUN)
+        with self.assertRaises(PipelineError) as caught:
+            self.store.preview(FOREIGN)
+        self.assertIn("another attempt", str(caught.exception))
+
+    def test_a_rebadged_foreign_bundle_still_fails_the_input_binding(self) -> None:
+        copy = self._copied_bundle()
+        self._restamp(copy, run_id=FOREIGN, handoff=FOREIGN_HANDOFF, manifest_run_id=FOREIGN)
+        self._foreign_receipt(FOREIGN, copy)
+        with self.assertRaises(PipelineError) as caught:
+            self.store.preview(FOREIGN)
+        self.assertIn("archived input", str(caught.exception))
+
+    def test_foreign_transfer_provenance_is_refused(self) -> None:
+        copy = self._copied_bundle()
+        self._restamp(copy, run_id=FOREIGN, handoff=FOREIGN_HANDOFF, manifest_run_id=RUN)
+        self._foreign_receipt(FOREIGN, copy)
+        with self.assertRaises(PipelineError) as caught:
+            self.store.preview(FOREIGN)
+        self.assertIn("transfer provenance", str(caught.exception))
+
+    def test_embedded_handoff_must_match_the_attempt(self) -> None:
+        copy = self._copied_bundle()
+        self._restamp(copy, run_id=FOREIGN, handoff=HANDOFF, manifest_run_id=FOREIGN)
+        self._foreign_receipt(FOREIGN, copy)
+        with self.assertRaises(PipelineError) as caught:
+            self.store.preview(FOREIGN)
+        self.assertIn("another run or handoff", str(caught.exception))
 
     # ------------------------------------------------------------- store payload
     def test_failed_verify_serves_an_explicitly_unverified_diagnostic(self) -> None:

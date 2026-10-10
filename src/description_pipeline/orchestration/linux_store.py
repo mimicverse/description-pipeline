@@ -19,7 +19,7 @@ from ..io import PipelineError, confined, inventory, read_data, write_json
 from ..stages import STAGE_IDS, stage_view
 from ..verification.solidworks_urdf import check_bundle, require_qualified_report
 from .airflow_client import JOB_SCHEMA, validate_run_id
-from .stage_transfer import CAPTURE_MANIFEST, admit_capture
+from .stage_transfer import CAPTURE_MANIFEST, TRANSFER_SCHEMA, admit_capture
 
 STORE_SCHEMA = "solidworks-to-urdf.linux-run/v1"
 PORTABLE_STAGES = ("generate", "verify", "publish")
@@ -396,13 +396,17 @@ class LinuxStore:
         return root, preview
 
     def _diagnostic_delivery(self, run_id: str) -> Path | None:
-        """The retained failed-verify checkpoint, only when the store recorded one.
+        """The retained failed-verify checkpoint, only when this attempt owns it.
 
-        The stage receipt is the sole authority for the location: it must describe a
-        failed verify stage, its diagnostic path must stay inside this attempt, and that
-        directory must still be a stamped pipeline delivery carrying a bound failed
-        report.  A recorded location that fails any of that is an integrity error, never
-        a reason to serve something else.
+        The stage receipt is the sole authority for the location, and the location has
+        to prove one identity from several directions before anything is served: the
+        failed verify stage, an in-attempt path, a directory still matching its stamped
+        inventory, the embedded receipt's run id, handoff and subject equal to this
+        attempt's recorded ones, the transfer provenance (when present) naming the same
+        run and handoff, and the archived input bytes equal to this attempt's admitted
+        capture.  Failure at any step is an integrity error, never a reason to serve
+        something else, so a foreign stamped bundle copied into another attempt cannot
+        be mislabeled as its diagnostic preview.
         """
         receipt_path = self.receipt_path(run_id, "verify")
         if not receipt_path.is_file():
@@ -421,11 +425,40 @@ class LinuxStore:
         candidate = Path(recorded).resolve()
         if candidate != run_root and run_root not in candidate.parents:
             raise PipelineError("The retained diagnostic location is outside this attempt")
-        if not _owned_delivery(candidate):
+        embedded = _stamped_receipt(candidate)
+        if embedded is None:
             raise PipelineError("The retained diagnostic delivery is not a stamped pipeline output")
+        if receipt.get("run_id") != run_id:
+            raise PipelineError("The retained verify receipt belongs to another attempt")
         subject = receipt.get("subject_sha256")
         if not isinstance(subject, str):
             raise PipelineError("The failed verify receipt is not bound to a subject")
+        meta = self.meta(run_id) or {}
+        expected_handoff = meta.get("handoff_sha256") or receipt.get("handoff_sha256")
+        if not isinstance(expected_handoff, str) or not expected_handoff:
+            raise PipelineError("This attempt records no handoff identity for its diagnostic delivery")
+        if (
+            embedded.get("run_id") != run_id
+            or embedded.get("handoff_sha256") != expected_handoff
+            or embedded.get("subject_sha256") != subject
+        ):
+            raise PipelineError("The retained diagnostic delivery belongs to another run or handoff")
+        manifest_path = candidate / CAPTURE_MANIFEST
+        if manifest_path.is_file():
+            manifest = read_data(manifest_path)
+            if (
+                not isinstance(manifest, dict)
+                or manifest.get("schema_version") != TRANSFER_SCHEMA
+                or manifest.get("run_id") != run_id
+                or manifest.get("handoff_sha256") != expected_handoff
+            ):
+                raise PipelineError("The retained diagnostic transfer provenance belongs to another attempt")
+        try:
+            capture = self.capture_dir(self.checkpoint_owner(run_id, "capture"))
+        except PipelineError as error:
+            raise PipelineError("This attempt has no admitted capture to bind its diagnostic delivery") from error
+        if inventory(candidate / "input") != inventory(capture / "input"):
+            raise PipelineError("The retained diagnostic delivery does not carry this attempt's archived input")
         report = _read_optional_json(candidate / "reports/quality.json")
         if (
             not isinstance(report, dict)
@@ -548,26 +581,28 @@ def _delivery_fingerprint(delivery: Path) -> tuple:
     return tuple(rows)
 
 
-def _owned_delivery(path: Path) -> bool:
-    """True for a directory this pipeline stamped, with members matching its own inventory."""
+def _stamped_receipt(path: Path) -> dict | None:
+    """The receipt of a directory this pipeline stamped, when members match its inventory."""
 
     path = Path(path)
     if path.is_symlink() or path.is_junction() or not path.is_dir():
-        return False
+        return None
     if not (path / "input").is_dir() or not (path / "reports").is_dir():
-        return False
+        return None
     marker = path / "reports/run.json"
     if not marker.is_file():
-        return False
+        return None
     try:
         receipt = read_data(marker)
-        return (
-            isinstance(receipt, dict)
-            and receipt.get("schema_version") == BUNDLE_SCHEMA
-            and receipt.get("owned_files") == inventory(path, exclude=("reports/run.json",))
-        )
     except (PipelineError, OSError, ValueError):
-        return False
+        return None
+    if (
+        isinstance(receipt, dict)
+        and receipt.get("schema_version") == BUNDLE_SCHEMA
+        and receipt.get("owned_files") == inventory(path, exclude=("reports/run.json",))
+    ):
+        return receipt
+    return None
 
 
 def _read_optional_json(path: Path) -> object | None:
@@ -615,8 +650,12 @@ def _delivery_warnings(delivery: Path) -> list[dict]:
                     }
                 )
     findings = _read_optional_json(delivery / "input/discovery/findings.json")
-    if isinstance(findings, dict):
-        for item in findings.get("findings") or []:
+    rows = findings.get("findings") if isinstance(findings, dict) else None
+    if not isinstance(rows, list):
+        payload = _read_optional_json(delivery / "input/discovery/native-discovery.json")
+        rows = payload.get("findings") if isinstance(payload, dict) else None
+    if isinstance(rows, list):
+        for item in rows:
             if isinstance(item, dict) and item.get("blocking") is False:
                 warnings.append(
                     {
