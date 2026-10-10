@@ -174,5 +174,53 @@ class MainAssemblyResumeTests(EndpointFixture, unittest.TestCase):
         self.assertEqual(400, error.exception.status)
         self.assertIn("exact upload", str(error.exception))
 
+    def test_null_effective_selection_is_refused_before_any_capture(self):
+        calls: list = []
+        parent_jobs, parent = self.native_parent()
+        parent_jobs.close()
+        ledger = self.config["state_root"] / "jobs" / (parent["run_id"] + ".json")
+        stored = json.loads(ledger.read_text(encoding="utf-8"))
+        stored["main_assembly"] = None
+        ledger.write_text(json.dumps(stored, ensure_ascii=False), encoding="utf-8")
+        jobs = self.jobs(
+            lambda *args, **kwargs: calls.append(args),
+            native_reader=lambda *args, **kwargs: self.fail("discovery must not rerun"),
+        )
+        with self.assertRaises(RequestError) as error:
+            jobs.create(self.linked_request(parent))
+        self.assertEqual(400, error.exception.status)
+        self.assertIn("effective main assembly", str(error.exception))
+        self.assertEqual([], calls)
+
+    def test_changed_effective_selection_is_refused_before_any_capture(self):
+        for forge in ("effective", "manifest"):
+            with self.subTest(forge=forge):
+                calls: list = []
+                parent_jobs, parent = self.native_parent()
+                parent_jobs.close()
+                ledger = self.config["state_root"] / "jobs" / (parent["run_id"] + ".json")
+                stored = json.loads(ledger.read_text(encoding="utf-8"))
+                if forge == "effective":
+                    stored["main_assembly"] = "cad/other.SLDASM"
+                else:
+                    stored["selection"]["manifest"]["main_assembly"] = "cad/other.SLDASM"
+                ledger.write_text(json.dumps(stored, ensure_ascii=False), encoding="utf-8")
+                jobs = self.jobs(
+                    lambda *args, **kwargs: calls.append(args),
+                    native_reader=lambda *args, **kwargs: self.fail("discovery must not rerun"),
+                )
+                try:
+                    jobs.create(self.linked_request(parent))
+                except RequestError as error:
+                    # A changed effective selection is refused either by the
+                    # linked-parent guard (400) or by the re-probed plan (409).
+                    self.assertIn(error.status, {400, 409})
+                    if error.status == 400:
+                        self.assertIn("effective main assembly", str(error))
+                else:
+                    self.fail("a mutated parent selection must be refused")
+                self.assertEqual([], calls)
+                jobs.close()
+
 if __name__ == "__main__":
     unittest.main()
