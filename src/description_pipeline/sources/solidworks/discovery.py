@@ -1930,12 +1930,20 @@ def _body_records(
             )
             continue
         else:
+            detail: dict = {"components": members}
+            observations = {}
+            for member in members:
+                item = components.get(member)
+                if isinstance(item, dict) and isinstance(item.get("solver_observation"), dict):
+                    observations[member] = item["solver_observation"]
+            if observations:
+                detail["solver_observations"] = observations
             findings.append(
                 _finding(
                     "discovery.link_name_missing",
                     f"body:{root}",
                     "no CS_<link> coordinate system is owned by this body",
-                    {"components": members},
+                    detail,
                 )
             )
             continue

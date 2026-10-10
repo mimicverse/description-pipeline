@@ -1132,6 +1132,49 @@ class DiscoveryTests(unittest.TestCase):
         result, _source, _output = self._prepare(mutate=mutate)
         self.assertIn("discovery.link_name_missing", self._codes(result))
 
+    def test_link_name_missing_detail_carries_context_bound_solver_observations(self):
+        observation = {
+            "context": {"document": "robot.SLDASM", "configuration": "Default", "scope": ""},
+            "solving": {
+                "method": "IComponent2.Solving",
+                "family": "swComponentSolvingOption_e",
+                "value": 0,
+                "error": None,
+            },
+            "constrained_status": {
+                "method": "IComponent2.GetConstrainedStatus",
+                "family": "swConstrainedStatus_e",
+                "value": 3,
+                "error": None,
+            },
+        }
+
+        def mutate(payload):
+            for datum in payload["datums"]:
+                datum["name"] = datum["name"].replace("CS_", "AX_")
+            for component in payload["components"]:
+                component["solver_observation"] = copy.deepcopy(observation)
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        findings = [item for item in result.findings if item["code"] == "discovery.link_name_missing"]
+        self.assertTrue(findings)
+        for item in findings:
+            # Wording stays neutral: an unproven body, never a loose-CAD claim.
+            self.assertEqual(item["message"], "no CS_<link> coordinate system is owned by this body")
+            observations = item["detail"]["solver_observations"]
+            for member in item["detail"]["components"]:
+                self.assertEqual(observations[member], observation)
+
+    def test_link_name_missing_detail_is_unchanged_without_solver_observations(self):
+        def mutate(payload):
+            for datum in payload["datums"]:
+                datum["name"] = datum["name"].replace("CS_", "AX_")
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        findings = [item for item in result.findings if item["code"] == "discovery.link_name_missing"]
+        self.assertTrue(findings)
+        self.assertTrue(all(set(item["detail"]) == {"components"} for item in findings))
+
     def test_point_plane_coincident_does_not_rigidify(self):
         """A vertex-on-face mate removes one translation, never orientation."""
 
