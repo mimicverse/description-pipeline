@@ -110,21 +110,20 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual("Existing output bytes", marker.read_text())
         self.assertTrue(solidworks._owned_output(self.output))
 
-    def test_consumer_preflight_failure_blocks_capture_and_retains_diagnostics(self):
-        from description_pipeline.verification.consumer import ConsumerError
-
+    def test_native_preflight_failure_blocks_capture_and_retains_diagnostics(self):
         self.seal()
-        error = ConsumerError("Consumer loading failed", stderr="ImportError: native library unavailable")
+        error = PipelineError("Native readiness failed")
+        error.details = {"reason": "SolidWorks registration unavailable"}
         with (
             patch.object(solidworks.sys, "platform", "win32"),
-            patch("description_pipeline.verification.consumer.readiness", side_effect=error),
+            patch("description_pipeline.runtime.native_readiness", side_effect=error),
             patch("description_pipeline.sources.solidworks.freeze.freeze") as capture,
         ):
             result = solidworks.run(self.package, self.output)
         capture.assert_not_called()
         self.assertFalse(result["passed"])
         self.assertEqual(result["stage"], "capture")
-        self.assertEqual(result["error"], "Consumer loading failed")
+        self.assertEqual(result["error"], "Native readiness failed")
         self.assertEqual(result["detail"], error.details)
         self.assertTrue((Path(result["diagnostic_path"]) / "reports/run.json").is_file())
         root = Path(result["diagnostic_path"])
@@ -179,7 +178,7 @@ class WorkflowTests(unittest.TestCase):
         error = ConsumerError("Consumer loading failed", stderr="ImportError: control")
         with (
             patch.object(solidworks.sys, "platform", "win32"),
-            patch("description_pipeline.verification.consumer.readiness", side_effect=error),
+            patch("description_pipeline.runtime.native_readiness", side_effect=error),
             patch("description_pipeline.sources.solidworks.freeze.freeze") as native,
         ):
             result = solidworks.run(self.package, self.output, expected_inputs=expected, handoff_sha256=handoff)
