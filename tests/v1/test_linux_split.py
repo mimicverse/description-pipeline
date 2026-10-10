@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import tempfile
 import unittest
@@ -195,17 +194,16 @@ class LinuxSplitTests(unittest.TestCase):
                 self.store.open_artifact(self.run_id, "urdf/robot.urdf", sha256="c" * 64)
             # The preview is verified once for immutable checkpoint serving.
             self.assertEqual(calls["bundle"], 1)
-            # Bytes changed after verification (same length, checkpoint identity held)
-            # must be refused on the served stream itself.
-            before = verify.stat()
+            # An in-place member edit keeps the verified reports untouched; the digest-bound
+            # stream still refuses the changed bytes at EOF.
             (verify / "urdf/robot.urdf").write_text("<roboX/>\n", encoding="utf-8")
-            os.utime(verify, ns=(before.st_atime_ns, before.st_mtime_ns))
             tampered, _tampered_size = self.store.open_artifact(self.run_id, "urdf/robot.urdf", sha256=digest)
             with tampered:
                 self.assertEqual(tampered.read(), b"<roboX/>\n")
                 with self.assertRaises(PipelineError):
                     tampered.read()
-        os.utime(verify)  # a new checkpoint identity forces re-verification
+        # A report member change forces re-verification of the checkpoint.
+        (verify / "reports/quality.json").write_text('{"passed": true}\n', encoding="utf-8")
         with (
             mock.patch.object(store_module, "check_bundle", side_effect=PipelineError("report bytes changed")),
             self.assertRaises(PipelineError),
