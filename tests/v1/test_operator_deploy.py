@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import stat
@@ -61,6 +62,38 @@ def write_stub(path: Path, body: str) -> None:
 
 
 class RenderTests(unittest.TestCase):
+    def test_linux_routes_are_rendered_and_mapping_changes_are_drift(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            mapping = root / "repositories.json"
+            mapping.write_text(json.dumps({"example/robot": str(root / "models/robot")}))
+            mapping.chmod(0o600)
+            result = render(state, MODEL_REPOSITORIES_FILE=str(mapping))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            config = json.loads((state / "portal.json").read_text())
+            self.assertEqual(config["pipeline"]["repositories"], {"example/robot": str(root / "models/robot")})
+            old = (state / "portal.json").read_bytes()
+            mapping.write_text(json.dumps({"example/robot": str(root / "models/new-checkout")}))
+            drift = run([sys.executable, str(RENDER), "--env-file", str(root / "operator.env"), "--dry-run"], {})
+            self.assertNotEqual(drift.returncode, 0)
+            self.assertIn("portal.json", drift.stdout + drift.stderr)
+            self.assertEqual((state / "portal.json").read_bytes(), old)
+
+    def test_linux_store_and_checkout_cannot_overlap_intake_or_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            for path in (root / "handoffs", root / "venv/checkpoints", state, Path("/srv")):
+                with self.subTest(store=str(path)):
+                    self.assertNotEqual(render(state, PIPELINE_STORE_ROOT=str(path)).returncode, 0)
+            mapping = root / "repositories.json"
+            mapping.write_text(json.dumps({"example/robot": str(state / "runs/robot")}))
+            mapping.chmod(0o600)
+            rejected = render(state, MODEL_REPOSITORIES_FILE=str(mapping))
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("overlap", rejected.stderr)
+
     def test_render_private_idempotent_and_shell_safe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp) / "state"
@@ -188,12 +221,13 @@ class RenderTests(unittest.TestCase):
             self.assertIn('"url": "http://127.0.0.1:8791"', portal)
             self.assertIn('"url": "http://127.0.0.1:18765"', portal)
             self.assertIn('"port": 18788', portal)
-            # The portal refuses unknown keys, so the bootstrap config stays exactly three
+            # The portal refuses unknown keys, so the bootstrap config stays exactly four
             # sections; upload_root names the single Linux intake used by the folder picker.
             import json
 
             parsed = json.loads(portal)
-            self.assertEqual(sorted(parsed), ["airflow", "endpoint", "portal"])
+            self.assertEqual(sorted(parsed), ["airflow", "endpoint", "pipeline", "portal"])
+            self.assertEqual(parsed["pipeline"], {"store_root": str(state / "runs"), "repositories": {}})
             self.assertEqual(sorted(parsed["airflow"]), ["url"])
             self.assertEqual(sorted(parsed["endpoint"]), ["token_file", "url"])
             self.assertEqual(sorted(parsed["portal"]), ["host", "port", "upload_root"])

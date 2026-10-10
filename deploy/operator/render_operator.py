@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
+import json
 import os
 import re
 import shlex
@@ -207,6 +208,8 @@ def ensure_portal_config(state: Path, resolved: dict[str, str]) -> Path:
         ("@OPERATOR_UPLOAD_ROOT@", resolved["SOLIDWORKS_HANDOFF_ROOT"]),
     ):
         rendered = rendered.replace(token, value)
+    rendered = rendered.replace('"@PIPELINE_STORE_ROOT@"', json.dumps(resolved["PIPELINE_STORE_ROOT"]))
+    rendered = rendered.replace("@MODEL_REPOSITORIES_JSON@", resolved["MODEL_REPOSITORIES_JSON"])
     write_private(target, rendered)
     return target
 
@@ -280,6 +283,37 @@ def main() -> int:
     for label, other in runtime_paths:
         if handoff_root == other or other in handoff_root.parents or handoff_root in other.parents:
             die(f"SOLIDWORKS_HANDOFF_ROOT must not overlap {label}: {handoff_root}")
+    store_root = private_dir(
+        require_no_space(values.get("PIPELINE_STORE_ROOT") or str(installed_state / "runs"), "PIPELINE_STORE_ROOT"),
+        "PIPELINE_STORE_ROOT",
+    )
+    if store_root in BROAD_ROOTS or store_root == installed_state:
+        die("PIPELINE_STORE_ROOT must be a dedicated run directory")
+    for parent in (store_root, *store_root.parents):
+        if parent.is_symlink():
+            die("PIPELINE_STORE_ROOT cannot traverse a symlink")
+    for label, other in [("SOLIDWORKS_HANDOFF_ROOT", handoff_root), *runtime_paths[1:]]:
+        if store_root.is_relative_to(other) or other.is_relative_to(store_root):
+            die(f"PIPELINE_STORE_ROOT must not overlap {label}")
+    repositories = {}
+    repositories_file = values.get("MODEL_REPOSITORIES_FILE", "")
+    if repositories_file:
+        path = private_file(repositories_file, "MODEL_REPOSITORIES_FILE")
+        try:
+            repositories = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            die(f"MODEL_REPOSITORIES_FILE is unreadable: {error}")
+        if not isinstance(repositories, dict):
+            die("MODEL_REPOSITORIES_FILE must map repository slugs to Linux checkout paths")
+        for slug, checkout in repositories.items():
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", slug) or not isinstance(checkout, str):
+                die("MODEL_REPOSITORIES_FILE requires owner/name keys and absolute Linux paths")
+            directory = private_dir(checkout, "model checkout")
+            if directory in BROAD_ROOTS or any(parent.is_symlink() for parent in directory.parents):
+                die("Model checkout must be a dedicated real directory")
+            for label, other in [("capture store", store_root), ("handoff intake", handoff_root), *runtime_paths]:
+                if directory.is_relative_to(other) or other.is_relative_to(directory):
+                    die(f"Model checkout must not overlap {label}")
     nginx_bin = values.get("NGINX_BIN", "/usr/sbin/nginx")
     if args.check_paths:
         for path, where in ((Path(values["PIPELINE_WHEEL"]), "PIPELINE_WHEEL"), (Path(nginx_bin), "NGINX_BIN")):
@@ -312,6 +346,8 @@ def main() -> int:
         AIRFLOW_BASE_URL="http://127.0.0.1:8791",
         OPERATOR_URL=f"https://{host}:{https_port}/",
         SOLIDWORKS_HANDOFF_ROOT=str(handoff_root),
+        PIPELINE_STORE_ROOT=str(store_root),
+        MODEL_REPOSITORIES_JSON=json.dumps(repositories, sort_keys=True),
         ENDPOINT_TOKEN_FILE=values.get("ENDPOINT_TOKEN_FILE", str(state / "secrets" / "endpoint.token")),
         NGINX_BIN=nginx_bin,
         FEISHU_APP_SECRET_FILE=feishu_secret,
@@ -420,7 +456,6 @@ def main() -> int:
         return 1 if drift else 0
 
     if args.json:
-        import json
 
         print(json.dumps(dict(sorted(resolved.items())), indent=2))
     else:

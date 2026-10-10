@@ -157,8 +157,24 @@ Complete these configuration groups once:
 | `SOLIDWORKS_SSH_HOST`, `SOLIDWORKS_ENDPOINT_PORT` | Key-authenticated SSH alias to Windows and its loopback endpoint |
 | `ENDPOINT_TOKEN_FILE` | Private copy of the Windows endpoint token, mode `0600` |
 | `SOLIDWORKS_HANDOFF_ROOT` | Dedicated Linux intake, such as `/srv/description/cad-handoffs`, outside runtime and state |
+| `PIPELINE_STORE_ROOT` | Linux stage checkpoints, model deliveries and diagnostics; defaults to `OPERATOR_STATE/runs` |
+| `MODEL_REPOSITORIES_FILE` | Mode-`0600` JSON mapping repository slugs to dedicated Linux model checkouts |
 | `FEISHU_APP_SECRET_FILE`, `FEISHU_TENANT_KEYS` | App credentials and mandatory tenant allowlist |
 | `FEISHU_ADMIN_OPEN_IDS` | Explicit administrator identities; optional, no automatic administrator |
+
+Create the repository mapping before accepting runs, for example:
+
+```json
+{"<owner>/<model-repository>": "/srv/description/models/arm"}
+```
+
+Set `MODEL_REPOSITORIES_FILE` to its absolute path and restrict it to mode `0600`.
+The slug must match the Windows target's `repository_slug`; its Git origin must
+match that slug. Keep checkouts separate from CAD intake, runtime and run storage.
+Installation renders the same store and routing into the portal and Airflow
+Connection. Health refuses an empty mapping. Reinstall after changing routing.
+Back up the run store with platform state; it owns portable checkpoints and
+published model receipts.
 
 Use comma-separated tenant and administrator lists without spaces.
 The configuration example defines the remaining service and transport defaults.
@@ -240,7 +256,8 @@ Installation provisions the pinned Python toolchain, PostgreSQL 14, Airflow
 3.3.2, the matching tool wheel, proxy and service configuration. It starts the
 managed database before migration; `start` launches the remaining services.
 Installation creates the sole `solidworks_windows` Connection with the endpoint
-token and Linux source allowlist. Operators need no Connection or DAG setup.
+token, Linux source allowlist, run store and model routing. Operators need no
+Connection or DAG setup.
 
 `install` writes configuration, secrets and service units while preserving the
 DAG's admission state. `start` opens and verifies DAG admission before starting

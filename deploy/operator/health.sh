@@ -92,7 +92,8 @@ fi
 # the handoff allowlist. Neither the token nor the connection is ever printed.
 if [ -x "${AIRFLOW_VENV:-}/bin/python" ] && [ -f "${ENDPOINT_TOKEN_FILE:-}" ]; then
   if AIRFLOW_HOME="${AIRFLOW_HOME:-}" "$AIRFLOW_VENV/bin/python" - \
-      "$SOLIDWORKS_HANDOFF_ROOT" "$ENDPOINT_TOKEN_FILE" <<'PY'
+      "$SOLIDWORKS_HANDOFF_ROOT" "$ENDPOINT_TOKEN_FILE" "$PORTAL_CONFIG" <<'PY'
+import json
 import sys
 from pathlib import Path
 
@@ -106,10 +107,18 @@ with Session() as session:
 host_ok = bool(connection) and connection.host == "127.0.0.1" and connection.port == 18765
 token_ok = bool(connection) and bool(expected_token) and connection.password == expected_token
 roots_ok = bool(connection) and (connection.extra_dejson or {}).get("handoff_roots") == [expected_root]
-raise SystemExit(0 if host_ok and token_ok and roots_ok else 1)
+pipeline = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))["pipeline"]
+extra = (connection.extra_dejson or {}) if connection else {}
+pipeline_ok = (
+    bool(pipeline["repositories"])
+    and extra.get("repositories") == pipeline["repositories"]
+    and extra.get("store_root") == pipeline["store_root"]
+    and Path(pipeline["store_root"]).is_dir()
+)
+raise SystemExit(0 if host_ok and token_ok and roots_ok and pipeline_ok else 1)
 PY
   then
-    report PASS "connection solidworks_windows matches host/port, the endpoint token file and handoff_roots"
+    report PASS "connection solidworks_windows matches endpoint, handoff_roots and Linux execution routing"
   else
     report FAIL "connection solidworks_windows is missing or differs from the deployment env"
   fi

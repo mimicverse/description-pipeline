@@ -6,6 +6,10 @@
     "url": "http://127.0.0.1:18765",
     "token_file": "@ENDPOINT_TOKEN_FILE@"
   },
+  "pipeline": {
+    "store_root": "@PIPELINE_STORE_ROOT@",
+    "repositories": @MODEL_REPOSITORIES_JSON@
+  },
   "portal": {
     "host": "@OPERATOR_UPSTREAM_HOST@",
     "port": @OPERATOR_UPSTREAM_PORT@,
