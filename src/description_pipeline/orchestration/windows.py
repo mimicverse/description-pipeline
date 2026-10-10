@@ -968,8 +968,8 @@ class Jobs:
             job.update(
                 hardware_id=prepared.hardware_id,
                 revision=prepared.revision,
-                repository_slug=target["repository_slug"],
-                repository_base=target["base"],
+                repository_slug=(target or {}).get("repository_slug"),
+                repository_base=(target or {}).get("base"),
                 prepared_files=files,
                 prepared_dir=str(package),
             )
@@ -1054,7 +1054,6 @@ class Jobs:
                     package = self._prepared_dir(job)
                     _require(package is not None, "The retained discovery checkpoint is no longer available")
                     target = self.config["targets"].get(job.get("hardware_id"))
-                    _require(isinstance(target, dict), "The selected run has no configured publication target")
                     seed = self._delivery_dir(parent) if from_stage in {"generate", "verify", "publish"} else None
                     _require(
                         from_stage == "capture" or seed is not None,
@@ -1070,11 +1069,9 @@ class Jobs:
                 # inherit the parent's effective selection.
                 selection = job.get("main_assembly")
                 _require(
-                    isinstance(job.get("repository_slug"), str)
-                    and bool(job["repository_slug"])
-                    and job["repository_slug"] == target["repository_slug"]
-                    and job.get("repository_base") == target["base"],
-                    "Persisted job lacks matching repository metadata; review it and use a new run_id",
+                    job.get("repository_slug") == (target or {}).get("repository_slug")
+                    and job.get("repository_base") == (target or {}).get("base"),
+                    "Persisted publication routing changed; review it and use a new run_id",
                 )
                 result = self.runner(
                     package,

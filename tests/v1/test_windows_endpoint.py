@@ -22,6 +22,23 @@ from .endpoint_support import EndpointFixture
 
 
 class EndpointTests(EndpointFixture, unittest.TestCase):
+    def test_missing_publication_route_does_not_stop_native_capture(self):
+        self.config["targets"] = {"another_robot": {"repository_slug": "a/c", "base": "feature/another_robot"}}
+        jobs = self.jobs()
+        request = self.request()
+        jobs.create(request)
+        jobs.queue.join()
+        result = jobs.snapshot(request["run_id"])
+        self.assertEqual(result["status"], "native_complete", result.get("error"))
+        self.assertIsNone(result["repository_slug"])
+        self.assertIsNone(result["repository_base"])
+        finding = next(
+            row for row in result["discovery"]["findings"]
+            if row["code"] == "discovery.publication_target_missing"
+        )
+        self.assertIs(finding["blocking"], False)
+        self.assertEqual(finding["detail"]["publication_blocker"], "repository_target")
+
     def test_airflow_client_can_poll_native_discovery_and_completed_events(self):
         preparing, release = threading.Event(), threading.Event()
         captured = {"stage": "capture", "state": "completed", "at": "2026-01-01T00:00:00+00:00"}

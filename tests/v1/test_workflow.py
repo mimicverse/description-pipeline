@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -83,6 +84,76 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("input.cad_revision", [e["code"] for e in report["errors"]])
         self.seal()
         self.assertTrue(steps.inspect_prepared_input(self.package)["passed"])
+
+    def acquisition_without_admin(self):
+        """Byte-binding control only; these placeholders do not qualify CAD."""
+        author = read_data(self.package / "robot.yaml")
+        author["hardware_id"] = None
+        author["source"]["robot_name"] = "robot"
+        files = {name: checksum for name, checksum in package_inventory(self.package).items() if name != "robot.yaml"}
+        identity = {
+            "hardware_id": None, "revision": None, "owner": None, "change_summary": None,
+            "control": None, "robot_name": None, "main_assembly": "assembly.SLDASM",
+        }
+        record = {
+            "schema_version": "solidworks-to-urdf.native-discovery/v1",
+            "contract": "native-discovery/v1", "run_id": "metadata-control",
+            "handoff_sha256": digest(files), "native_files": files, "identity": identity,
+        }
+        record_path = self.package / "discovery/native-discovery.json"
+        write_json(record_path, record)
+        author["provenance"] = {
+            "generator": "native-discovery", "generator_version": "1", "contract": record["contract"],
+            "run_id": record["run_id"], "discovery_sha256": file_digest(record_path),
+            "native_inventory_sha256": digest(files),
+        }
+        write_json(self.package / "robot.yaml", author)
+        return author, record
+
+    def test_bound_missing_admin_allows_inspection_but_not_publication(self):
+        self.acquisition_without_admin()
+        report = steps.inspect_prepared_input(self.package)
+        self.assertTrue(report["passed"], report["errors"])
+        self.assertIsNone(report["input"]["hardware_id"])
+        self.assertIsNone(report["cad_revision"])
+        self.assertFalse((self.package / "cad-revision.json").exists())
+        self.assertIn("input.cad_revision_pending", [row["code"] for row in report["warnings"]])
+        bundle = self.root / "unpublished"
+        bundle.mkdir()
+        shutil.copytree(self.package, bundle / "input")
+        with (
+            patch("description_pipeline.repository.urdf_pr.submit_bundle") as publish,
+            self.assertRaisesRegex(PipelineError, "authored CAD hardware"),
+        ):
+            steps.publish_model(bundle, self.root / "repository")
+        publish.assert_not_called()
+
+    def test_absent_admin_does_not_waive_binding_or_malformed_revision(self):
+        self.acquisition_without_admin()
+        (self.package / "part.SLDPRT").write_bytes(b"changed after acquisition")
+        self.assertFalse(steps.inspect_prepared_input(self.package)["passed"])
+        # Rebind the intentionally changed fixture, then supply an invalid revision.
+        (self.package / "discovery/native-discovery.json").unlink()
+        self.acquisition_without_admin()
+        write_json(self.package / "cad-revision.json", {"hardware_id": None})
+        report = steps.inspect_prepared_input(self.package)
+        self.assertFalse(report["passed"])
+        self.assertIn("input.cad_revision", [row["code"] for row in report["errors"]])
+
+    def test_complete_admin_cannot_hide_a_deleted_revision(self):
+        author, record = self.acquisition_without_admin()
+        author["hardware_id"] = "arm"
+        record["identity"].update(
+            hardware_id="arm", revision="r1", owner="mechanical", change_summary="fixture",
+            control={"system": "handoff", "reference": "fixture/r1"},
+        )
+        path = self.package / "discovery/native-discovery.json"
+        write_json(path, record)
+        author["provenance"]["discovery_sha256"] = file_digest(path)
+        write_json(self.package / "robot.yaml", author)
+        report = steps.inspect_prepared_input(self.package)
+        self.assertFalse(report["passed"])
+        self.assertIn("requires its generated", report["errors"][-1]["message"])
 
     def test_linux_never_opens_native_cad_and_keeps_failure_evidence(self):
         self.seal()

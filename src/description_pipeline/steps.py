@@ -147,6 +147,15 @@ def discover_structure(
         "revision": prepared.revision,
         "discovery_sha256": prepared.discovery_sha256,
     }
+    target = targets.get(prepared.hardware_id)
+    if target is None:
+        discovery["findings"].append({
+            "code": "discovery.publication_target_missing",
+            "object": "assembly",
+            "message": "No model repository is configured for this CAD identity; publication is unavailable",
+            "blocking": False,
+            "detail": {"hardware_id": prepared.hardware_id, "publication_blocker": "repository_target"},
+        })
     _state(on_event, "discover", "running", discovery=discovery)
     checked(on_event, "discover", "output", "discovery.definition", lambda: discovery)
 
@@ -162,13 +171,17 @@ def discover_structure(
         _require(package_inventory(frozen) == expected_files, "Frozen engineering changed during discovery")
         for name, checksum in expected_files.items():
             _require(file_digest(confined(package, name)) == checksum, "Native preparation changed engineering files")
-        revision = read_revision(package)
-        _require(
-            revision["hardware_id"] == prepared.hardware_id and revision["revision"] == prepared.revision,
-            "Generated revision differs from native discovery",
-        )
-        target = targets.get(prepared.hardware_id)
-        _require(target is not None, f"Hardware {prepared.hardware_id!r} has no configured model repository")
+        if (package / "cad-revision.json").exists():
+            revision = read_revision(package)
+        else:
+            inspected = inspect_prepared_input(package)
+            _require(inspected["passed"], "Generated native inputs are invalid")
+            revision = inspected["cad_revision"]
+        if revision is not None:
+            _require(
+                revision["hardware_id"] == prepared.hardware_id and revision["revision"] == prepared.revision,
+                "Generated revision differs from native discovery",
+            )
         files = package_inventory(package)
         _require(digest(files) == prepared.prepared_sha256, "Prepared files differ from native discovery")
         return package, target, files
@@ -183,8 +196,8 @@ def discover_structure(
             "discovery_sha256": prepared.discovery_sha256,
             "hardware_id": prepared.hardware_id,
             "revision": prepared.revision,
-            "repository_slug": value[1]["repository_slug"],
-            "base": value[1]["base"],
+            "repository_slug": (value[1] or {}).get("repository_slug"),
+            "base": (value[1] or {}).get("base"),
             "prepared_sha256": digest(value[2]),
             "files": {"input/" + name: checksum for name, checksum in value[2].items()},
         },
@@ -194,15 +207,33 @@ def discover_structure(
 
 
 def inspect_prepared_input(package: Path) -> dict:
-    """Check robot semantics and the mechanical team's sealed CAD revision."""
+    """Check acquisition inputs; missing administrative facts defer publication."""
 
-    from .sources.solidworks.input import inspect_package
+    from .sources.solidworks.input import inspect_package, native_metadata
 
     report = inspect_package(package)
     try:
         author = report.get("input")
         hardware = author.get("hardware_id") if isinstance(author, dict) else None
-        report["cad_revision"] = read_revision(package, hardware_id=hardware)
+        report["cad_revision"] = None
+        if (package / "cad-revision.json").exists():
+            report["cad_revision"] = read_revision(package, hardware_id=hardware)
+            _require(
+                report["cad_revision"]["hardware_id"] == hardware,
+                "Revision claims an absent CAD hardware identity",
+            )
+        else:
+            identity = native_metadata(package, author or {})
+            missing = [
+                key for key in ("hardware_id", "revision", "owner", "change_summary", "control")
+                if identity.get(key) is None
+            ]
+            _require(bool(missing), "Complete CAD identity requires its generated cad-revision.json")
+            report["warnings"].append({
+                "code": "input.cad_revision_pending",
+                "message": "CAD administrative identity is incomplete; publication is unavailable",
+                "detail": {"publication_blocker": "cad_revision", "missing": missing},
+            })
     except (PipelineError, OSError, ValueError) as error:
         report["errors"].append({"code": "input.cad_revision", "message": str(error), "detail": None})
         report["passed"] = False
@@ -296,6 +327,7 @@ def capture_evidence(
             "handoff_sha256": handoff_sha256,
             "files_sha256": digest(value[1]["package_files"]),
             "cad_revision": value[1]["cad_revision"],
+            "warnings": value[1].get("warnings", []),
             "files": {"input/" + path: checksum for path, checksum in value[1]["package_files"].items()},
         },
     )
@@ -343,13 +375,13 @@ def generate_model(staging: Path, definition: dict, input_report: dict, *, on_ev
         lambda: verify_snapshot(staging / "evidence"),
         describe=lambda value: _snapshot_details(staging, value),
     )
-    hardware = definition["hardware_id"]
-    (staging / "README.md").write_text(_delivery_readme(hardware), encoding="utf-8", newline="\n")
+    name = definition["source"]["robot_name"]
+    (staging / "README.md").write_text(_delivery_readme(name), encoding="utf-8", newline="\n")
     write_json(staging / "reports/input.json", input_report)
     write_json(staging / "reports/tool.json", tool_record())
     robot = Robot.from_dict(load_scene(staging / "evidence"))
     write_json(staging / "model/robot.json", robot.to_dict())
-    generate_urdf(robot, staging / "evidence", staging, name=hardware)
+    generate_urdf(robot, staging / "evidence", staging, name=name)
 
     def generated():
         Robot.from_dict(read_data(staging / "model/robot.json"))
@@ -403,6 +435,8 @@ def publish_model(
     _state(on_event, "publish", "running")
     author = read_data(Path(bundle) / "input/robot.yaml")
     hardware = author["hardware_id"]
+    _require(isinstance(hardware, str) and bool(hardware), "Publication requires an authored CAD hardware identity")
+    read_revision(Path(bundle) / "input", hardware_id=hardware)
     result = submit_bundle(
         bundle,
         repository,

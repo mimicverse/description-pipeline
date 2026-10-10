@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ...io import PipelineError, confined, digest, inventory, read_data
+from ...io import PipelineError, confined, digest, file_digest, inventory, read_data
 
 INPUT_SCHEMA = "solidworks-to-urdf.input/v1"
 INSPECTION_SCHEMA = "solidworks-to-urdf.input-inspection/v1"
@@ -78,6 +78,51 @@ def _is_id(value: Any) -> bool:
 
 def _is_text(value: Any) -> bool:
     return isinstance(value, str) and value.strip() != "" and _CONTROL_RE.search(value) is None
+
+
+def native_metadata(package: Path, definition: dict) -> dict:
+    """Read absent administrative facts only from a byte-bound native acquisition.
+
+    This checks provenance, not engineering qualification. The independent
+    verifier separately reconstructs the authored values and model semantics.
+    """
+    marker = definition.get("provenance")
+    if not isinstance(marker, dict) or marker.get("generator") != "native-discovery":
+        raise PipelineError("Missing native acquisition provenance")
+    path = confined(package, "discovery/native-discovery.json")
+    if file_digest(path) != marker.get("discovery_sha256"):
+        raise PipelineError("Native discovery bytes differ from the generated definition")
+    record = read_data(path)
+    if (
+        not isinstance(record, dict)
+        or record.get("schema_version") != "solidworks-to-urdf.native-discovery/v1"
+        or record.get("contract") != "native-discovery/v1"
+        or record.get("contract") != marker.get("contract")
+        or not _is_text(marker.get("run_id"))
+        or record.get("run_id") != marker["run_id"]
+    ):
+        raise PipelineError("Native discovery identity differs from its provenance")
+    files = record.get("native_files")
+    if (
+        not isinstance(files, dict)
+        or not files
+        or digest(files) != marker.get("native_inventory_sha256")
+        or digest(files) != record.get("handoff_sha256")
+    ):
+        raise PipelineError("Native acquisition lacks its frozen handoff inventory")
+    for relative, checksum in files.items():
+        if not isinstance(relative, str) or file_digest(confined(package, relative)) != checksum:
+            raise PipelineError("Native acquisition files differ from the frozen handoff")
+    identity = record.get("identity")
+    source = definition.get("source") or {}
+    if (
+        not isinstance(identity, dict)
+        or identity.get("hardware_id") != definition.get("hardware_id")
+        or identity.get("main_assembly") != source.get("assembly")
+        or source.get("assembly") not in files
+    ):
+        raise PipelineError("Generated identity differs from native discovery")
+    return identity
 
 
 def _as_mapping(value: Any, report: _Report, code: str, where: str) -> dict[str, Any] | None:
@@ -1092,7 +1137,18 @@ def inspect_package(path: Path) -> dict[str, Any]:
                 f"schema_version must be exactly {INPUT_SCHEMA!r}",
                 {"value": data.get("schema_version")},
             )
-        if not _is_id(data.get("hardware_id")):
+        if data.get("hardware_id") is None:
+            try:
+                native_metadata(root, data)
+            except (PipelineError, OSError, ValueError, TypeError) as error:
+                report.error("input.hardware_id_invalid", str(error), {"value": None})
+            else:
+                report.warn(
+                    "input.hardware_id_missing",
+                    "CAD supplies no hardware identity; inspection is allowed, publication is not",
+                    {"publication_blocker": "hardware_id"},
+                )
+        elif not _is_id(data.get("hardware_id")):
             report.error(
                 "input.hardware_id_invalid",
                 "hardware_id must be an ASCII identifier",

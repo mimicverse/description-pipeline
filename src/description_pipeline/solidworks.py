@@ -328,7 +328,7 @@ def run(
                     expected_inputs=expected_inputs,
                     handoff_sha256=handoff_sha256,
                 )
-                receipt["cad_revision"] = input_report["cad_revision"]["revision"]
+                receipt["cad_revision"] = (input_report["cad_revision"] or {}).get("revision")
                 if stop_after == "capture":
                     return _finish_native_capture(
                         staging,
@@ -360,7 +360,7 @@ def run(
                 # The equality checks above already bound the replay to the frozen report and
                 # its inventory rows, so no inventory check is skipped.
                 definition = resolve_package(replayed)
-                receipt["cad_revision"] = input_report["cad_revision"]["revision"]
+                receipt["cad_revision"] = (input_report["cad_revision"] or {}).get("revision")
             if resume_from in (None, "capture", "generate"):
                 generated_subject = generate_model(staging, definition, input_report, on_event=event)
             else:
