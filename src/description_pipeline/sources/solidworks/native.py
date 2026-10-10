@@ -446,47 +446,39 @@ def resolve_dependency_path(value, document_path):
     return module.normpath(module.join(base, text))
 
 
-def closed_document_dependencies(
-    app,
-    document_path,
-    *,
-    traverse=False,
-    search=False,
-    add_read_only_info=False,
-    max_documents=4096,
-):
-    """Dependencies of a saved document **without opening it**.
+def closed_document_dependencies(app, document_path, *, max_documents=4096):
+    """Stored direct dependencies of a saved document, without opening it.
 
-    ``ISldWorks::GetDocumentDependencies2`` reads a closed document's stored
-    references; with ``search=False`` SolidWorks looks "where the documents
-    were last saved" instead of applying the File Locations search rules, and
-    ``traverse=False`` returns the first level only (walk per file for a
-    closure).  Each document contributes two strings (file name, location) or
-    three when read-only info is requested; bare names are joined against the
-    document directory with :func:`resolve_dependency_path`.
+    Exactly the documented no-search form is used:
+    ``GetDocumentDependencies2(path, False, False, False)``.  With Searchflag
+    false SolidWorks reports "where the documents were last saved", so the
+    result is the saved document's stored references: two strings per document
+    (the stored file name and the stored location).  The stored fields are
+    preserved verbatim; a missing or empty location is refused instead of
+    being guessed from the name, because a name is not an authoritative path.
 
-    No document is opened, no geometry is read and no folder search happens.
+    No document is opened, no search rules run, no geometry is read.
     """
 
-    raw = list(
-        _method(
-            app,
-            "GetDocumentDependencies2",
-            str(document_path),
-            bool(traverse),
-            bool(search),
-            bool(add_read_only_info),
+    if isinstance(max_documents, bool) or not isinstance(max_documents, int) or max_documents <= 0:
+        raise CadError(
+            "dependency_limit_invalid",
+            "max_documents must be a positive integer",
+            {"max_documents": repr(max_documents)},
         )
-        or ()
-    )
-    width = 3 if add_read_only_info else 2
-    if len(raw) % width:
+    result = _method(app, "GetDocumentDependencies2", str(document_path), False, False, False)
+    if result is None:
+        return []
+    if isinstance(result, (str, bytes)) or not isinstance(result, (list, tuple)):
         raise CadError(
             "dependency_list_invalid",
-            str(document_path),
-            {"entries": len(raw), "width": width},
+            "the dependency result must be an array of strings",
+            {"type": type(result).__name__},
         )
-    documents = len(raw) // width
+    raw = list(result)
+    if len(raw) % 2:
+        raise CadError("dependency_list_invalid", str(document_path), {"entries": len(raw)})
+    documents = len(raw) // 2
     if documents > max_documents:
         raise CadError(
             "dependency_list_too_large",
@@ -494,20 +486,24 @@ def closed_document_dependencies(
             {"documents": documents, "limit": max_documents},
         )
     entries = []
-    for index in range(0, len(raw), width):
+    for index in range(0, len(raw), 2):
         name = raw[index]
+        location = raw[index + 1]
         if not isinstance(name, str) or not name.strip():
             raise CadError("dependency_list_invalid", str(document_path), {"index": index})
-        location = raw[index + 1]
-        if location is not None and not isinstance(location, str):
-            raise CadError("dependency_list_invalid", str(document_path), {"index": index + 1})
-        entry = {
-            "name": name,
-            "path": resolve_dependency_path(str(location or name), str(document_path)),
-        }
-        if width == 3:
-            entry["read_only"] = bool(raw[index + 2])
-        entries.append(entry)
+        if not isinstance(location, str) or not location.strip():
+            raise CadError(
+                "dependency_location_missing",
+                "a stored reference has no usable location; a name is not a path",
+                {"index": index + 1, "name": name},
+            )
+        entries.append(
+            {
+                "name": name,
+                "location": location,
+                "path": resolve_dependency_path(location, str(document_path)),
+            }
+        )
     return entries
 
 

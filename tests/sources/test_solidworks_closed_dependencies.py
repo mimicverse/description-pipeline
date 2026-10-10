@@ -1,4 +1,4 @@
-"""Closed-document dependency query: no OpenDoc, no search, exact parsing."""
+"""Closed-document dependency query: one documented call, exact stored fields."""
 
 from __future__ import annotations
 
@@ -28,14 +28,32 @@ class FakeApp:
 
 
 class ClosedDocumentDependencyTests(unittest.TestCase):
-    def test_default_call_is_no_traverse_no_search_no_read_only_info(self) -> None:
-        app = FakeApp(["part.SLDPRT", BS.join(("C:", "pkg", "part.SLDPRT"))])
+    def test_call_is_exactly_no_traverse_no_search_no_read_only(self) -> None:
+        location = BS.join(("C:", "pkg", "part.SLDPRT"))
+        app = FakeApp(["part.SLDPRT", location])
         entries = closed_document_dependencies(app, MAIN)
         self.assertEqual(app.calls, [(MAIN, False, False, False)])
         self.assertEqual(
             entries,
-            [{"name": "part.SLDPRT", "path": BS.join(("C:", "pkg", "part.SLDPRT"))}],
+            [{"name": "part.SLDPRT", "location": location, "path": location}],
         )
+
+    def test_stored_name_and_location_are_preserved_verbatim(self) -> None:
+        location = BS.join(
+            ("D:", "M2.2(9.17) DengJingjie - 副本", "change11", "HD-1910-C001-20260902.stp")
+        )
+        app = FakeApp(["HD-1910-C001-20260902.stp", location])
+        entries = closed_document_dependencies(app, MAIN)
+        self.assertEqual(entries[0]["name"], "HD-1910-C001-20260902.stp")
+        self.assertEqual(entries[0]["location"], location)
+        self.assertEqual(entries[0]["path"], location)
+
+    def test_the_query_options_are_not_parameters(self) -> None:
+        app = FakeApp([])
+        for keyword in ("traverse", "search", "add_read_only_info"):
+            with self.assertRaises(TypeError):
+                closed_document_dependencies(app, MAIN, **{keyword: True})
+        self.assertEqual(app.calls, [])
 
     def test_bare_names_join_against_the_document_directory(self) -> None:
         app = FakeApp(["000_femur.SLDPRT", "000_femur.SLDPRT"])
@@ -44,30 +62,36 @@ class ClosedDocumentDependencyTests(unittest.TestCase):
             entries[0]["path"],
             BS.join(("C:", "packages", "262ed241", "000_femur.SLDPRT")),
         )
-
-    def test_absolute_paths_pass_through(self) -> None:
-        external = BS.join(("D:", "M2.2", "change11", "HD-1910-C001-20260902.stp"))
-        app = FakeApp(["HD-1910-C001-20260902.stp", external])
-        entries = closed_document_dependencies(app, MAIN)
-        self.assertEqual(entries[0]["path"], external)
-
-    def test_read_only_info_parses_three_string_groups(self) -> None:
-        app = FakeApp(
-            [
-                "part.SLDPRT",
-                BS.join(("C:", "pkg", "part.SLDPRT")),
-                True,
-            ]
-        )
-        entries = closed_document_dependencies(app, MAIN, add_read_only_info=True)
-        self.assertEqual(app.calls, [(MAIN, False, False, True)])
-        self.assertEqual(entries[0]["read_only"], True)
+        self.assertEqual(entries[0]["name"], "000_femur.SLDPRT")
+        self.assertEqual(entries[0]["location"], "000_femur.SLDPRT")
 
     def test_empty_result_is_an_empty_list(self) -> None:
-        app = FakeApp(None)
-        self.assertEqual(closed_document_dependencies(app, MAIN), [])
+        for payload in (None, [], ()):
+            app = FakeApp(payload)
+            self.assertEqual(closed_document_dependencies(app, MAIN), [])
+            self.assertEqual(app.calls, [(MAIN, False, False, False)])
 
-    def test_malformed_array_is_refused(self) -> None:
+    def test_missing_location_is_refused_instead_of_falling_back_to_the_name(self) -> None:
+        for payload in (None, "", "   "):
+            app = FakeApp(["part.SLDPRT", payload])
+            with self.assertRaises(CadError) as caught:
+                closed_document_dependencies(app, MAIN)
+            self.assertEqual(caught.exception.code, "dependency_location_missing")
+
+    def test_non_string_location_is_refused(self) -> None:
+        app = FakeApp(["part.SLDPRT", 123])
+        with self.assertRaises(CadError) as caught:
+            closed_document_dependencies(app, MAIN)
+        self.assertEqual(caught.exception.code, "dependency_location_missing")
+
+    def test_non_array_result_is_refused(self) -> None:
+        for payload in ("part.SLDPRT", b"part.SLDPRT"):
+            app = FakeApp(payload)
+            with self.assertRaises(CadError) as caught:
+                closed_document_dependencies(app, MAIN)
+            self.assertEqual(caught.exception.code, "dependency_list_invalid")
+
+    def test_odd_entry_count_is_refused(self) -> None:
         app = FakeApp(["only-a-name"])
         with self.assertRaises(CadError) as caught:
             closed_document_dependencies(app, MAIN)
@@ -78,6 +102,20 @@ class ClosedDocumentDependencyTests(unittest.TestCase):
         with self.assertRaises(CadError) as caught:
             closed_document_dependencies(app, MAIN)
         self.assertEqual(caught.exception.code, "dependency_list_invalid")
+
+    def test_blank_name_is_refused(self) -> None:
+        app = FakeApp(["", BS.join(("C:", "pkg", "part.SLDPRT"))])
+        with self.assertRaises(CadError) as caught:
+            closed_document_dependencies(app, MAIN)
+        self.assertEqual(caught.exception.code, "dependency_list_invalid")
+
+    def test_invalid_document_cap_is_refused_before_any_call(self) -> None:
+        for bad in (True, False, 0, -1, 2.5, "16"):
+            app = FakeApp([])
+            with self.assertRaises(CadError) as caught:
+                closed_document_dependencies(app, MAIN, max_documents=bad)
+            self.assertEqual(caught.exception.code, "dependency_limit_invalid")
+            self.assertEqual(app.calls, [])
 
     def test_document_cap_is_refused_explicitly(self) -> None:
         payload = []
