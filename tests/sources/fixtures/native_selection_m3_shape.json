@@ -1,0 +1,22 @@
+{
+  "stage_root": "C:\\stage\\fixture",
+  "main": "assembly.SLDASM",
+  "upload_files": {
+    "assembly.SLDASM": "1111111111111111111111111111111111111111111111111111111111111111",
+    "parts/frame.SLDASM": "2222222222222222222222222222222222222222222222222222222222222222",
+    "parts/link.SLDPRT": "3333333333333333333333333333333333333333333333333333333333333333",
+    "imports/cover.step": "4444444444444444444444444444444444444444444444444444444444444444"
+  },
+  "documents": {
+    "assembly.SLDASM": [
+      {"name": "frame", "location": "parts\\frame.SLDASM"},
+      {"name": "link", "location": "C:\\Users\\example\\Desktop\\DesignTemp\\link.SLDPRT"},
+      {"name": "cover.step", "location": "C:\\Users\\example\\AppData\\Local\\Temp\\swx42\\IC~~\\cover.step.SLDAPRT"},
+      {"name": "notes", "location": "docs\\notes.txt"}
+    ],
+    "parts/frame.SLDASM": [
+      {"name": "link", "location": "link.SLDPRT"}
+    ],
+    "parts/link.SLDPRT": []
+  }
+}

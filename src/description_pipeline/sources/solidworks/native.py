@@ -1769,6 +1769,9 @@ class SolidWorksBackend(CadBackend):
         self._cancelled = threading.Event()
         self._capture_roots = []
         self._requested_configurations = {}
+        #: ``None`` disables the pre-open gate; a set of normalized absolute
+        #: source paths seals exactly which documents may be opened.
+        self._sealed_documents: set[str] | None = None
         self._components = set()
         self._source_components = {}
         self._source_documents = {}
@@ -1827,6 +1830,56 @@ class SolidWorksBackend(CadBackend):
     def _role_for_path(self, path):
         normalized = normalize_document_path(os.path.abspath(path))
         return "copy" if any(normalized.startswith(root + "\\") for root in self._capture_roots) else "source"
+
+    def seal_documents(self, documents):
+        """Seal the exact source documents this backend may open.
+
+        The endpoint configures the verified selection here before any
+        geometry or discovery work.  From then on every open of a source
+        document - ``OpenDoc6`` through :meth:`open_document`,
+        ``_ensure_document`` or discovery - must name one of these absolute
+        paths; anything else raises ``document_not_sealed`` before COM is
+        touched.  Collected copies under the capture roots stay exempt: freeze
+        proves those with the collector, ``resolve_dependencies`` and
+        ``inspect_copy``.
+
+        This gates which documents may be opened; it is not OS file-access
+        sandboxing, which the owned session does not provide.  Pass absolute
+        document paths and receive the sorted normalized sealed set as
+        evidence.
+        """
+
+        sealed = set()
+        for document in documents:
+            text = os.fspath(document) if isinstance(document, os.PathLike) else document
+            if not isinstance(text, str) or not text.strip():
+                raise CadError(
+                    "document_seal_invalid", "Sealed documents must be non-empty paths", {"document": repr(document)}
+                )
+            sealed.add(normalize_document_path(os.path.abspath(text)))
+        self._sealed_documents = sealed
+        return sorted(sealed)
+
+    def sealed_documents(self):
+        """The sealed source-document set, or ``None`` while the gate is disabled."""
+
+        if self._sealed_documents is None:
+            return None
+        return sorted(self._sealed_documents)
+
+    def _require_sealed(self, path):
+        """Refuse an unsealed source open before any COM call is made."""
+
+        if self._sealed_documents is None:
+            return
+        if self._role_for_path(path) == "copy":
+            return
+        if normalize_document_path(os.path.abspath(str(path))) not in self._sealed_documents:
+            raise CadError(
+                "document_not_sealed",
+                "The document is not in the sealed selection; refusing to open it",
+                {"document": str(path)},
+            )
 
     def _app_for_path(self, path):
         previous = getattr(self._local, "role", None)
@@ -1968,6 +2021,7 @@ class SolidWorksBackend(CadBackend):
         main-assembly open records them for the selected document.
         """
 
+        self._require_sealed(path)
         import pythoncom
 
         wc = _win32()
