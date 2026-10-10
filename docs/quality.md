@@ -47,9 +47,9 @@ assembly agree with the request. Both hosts must use the same tool source releas
 their dependency records identify their different execution roles.
 
 When present, the saved exporter declaration payload and its PID resolution rows
-travel with the sealed bundle. Discovery derives the declared structure on the
-native side; Linux verification re-decodes the sealed bytes independently and
-checks the declared topology and native geometry. Saved-pose mate restrictions
+travel with the sealed bundle. The declared structure is derived from the raw
+native record during Linux derivation; Linux verification re-decodes the sealed
+bytes independently and checks the declared topology and native geometry. Saved-pose mate restrictions
 remain diagnostics; conflicting authored operating limits still fail. Authored limits are preserved verbatim: a
 zero-width range or a zero effort/velocity is a stage warning that is kept for
 capture and generation and never qualifies motion. Stored meshes, inertias and
@@ -70,7 +70,7 @@ Implementation paths below are relative to `src/description_pipeline/`.
 | Native definition | Independently reconstruct membership, adjacency, motion, names, frames and limits from native observations; required gate `source.native_discovery` | `verification/native_discovery.py` |
 | Declared native facts | Exporter declaration ingested at discovery and independently re-decoded at verification; declared membership, topology, frames, axes and limits reconciled with native observations and with the generated source (`discovery.declarations`); contradictions fail closed | `sources/solidworks/exporter.py`, `verification/v14_declarations.py`, `verification/native_declarations.py` |
 | Native source | Native SolidWorks evidence, qualified API/build, matching collection identity and environment | `verification/solidworks_urdf.py` |
-| Dependency closure | No unresolved reference; original CAD belongs to the handoff; collected-copy hashes and configuration agree | `verification/solidworks_urdf.py` |
+| Dependency closure | No unresolved reference; closed-document stored references must map inside the staged selected tree — a missing, outside or temporarily materialized reference refuses before any geometry is opened (a pipeline read-admission rule, not an OS sandbox); original CAD belongs to the staged selection; collected-copy hashes and configuration agree | `verification/solidworks_urdf.py` |
 | Occurrence coverage | Every included native occurrence belongs to exactly one body; unowned occurrences are stage warnings for engineering inspection, and qualification still requires complete material coverage and exact whole-CAD mass equality - instances or their mass are never excluded to clear a warning; identity survives normalization | `verification/solidworks_urdf.py` |
 | Coordinates | Finite SI homogeneous transforms, orthonormal right-handed bases, CAD-derived body/joint/reference frames | `verification/solidworks_urdf.py` |
 | Shaft alignment | Numeric shaft line from the independently re-read reference axis or cylindrical interface, stable native identity, origin on shaft and axis collinearity | `verification/solidworks_urdf.py` |

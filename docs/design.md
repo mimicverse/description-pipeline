@@ -63,8 +63,9 @@ operation, object and known item counts with timestamps and a bounded history.
 The operator page displays these observations without inferring progress from
 polling, inventing a completion percentage or changing qualification results.
 Each receipt declares its `execution_scope`: Windows covers freeze, discover and
-capture, including ingestion and derivation of the saved exporter declaration;
-it runs no URDF generation, MuJoCo verification or Git operations. Linux covers
+capture, including reading and sealing the raw native record and the saved
+exporter declaration; it runs no structure derivation, URDF generation, MuJoCo
+verification or Git operations. Linux derives the prepared definition and covers
 generate, verify and publish, including an independent re-decode of the sealed
 declaration. The complete Airflow run
 combines both receipts, while maintenance commands cover only the stages they execute
@@ -103,19 +104,27 @@ execution. Transport retries reconnect to the same UUID and frozen inputs. A
 terminal native failure or source correction requires a new run. Frozen evidence
 can be rebuilt on Linux without reopening CAD.
 
-Airflow sends freeze, discovery and capture to the serialized Windows worker,
-then runs generation, independent verification and publication on Linux.
-Windows returns a sealed capture bundle, including the saved exporter declaration
-payload and its PID resolution rows when present; Linux checks its complete
-inventory, file hashes, selected assembly, run identity and native tool identity
-before use. Native completion is an intermediate state, not a verified model: an
-extracted declaration is evidence to reconcile, extraction warnings (uncovered
-occurrences, unusable ranges or drives) stay visible. Saved-pose mate restrictions
-do not override the declared kinematics. Administrative metadata (hardware ID,
-revision, owner, control record) is a publication-readiness requirement: when it
-is absent, measurement and inspection continue, the raw record keeps the
-absence, and no value and no neutral technical name is promoted to authored
-identity.
+Airflow stages the selected CAD closure to the serialized Windows worker, which
+reads the raw native record and later captures the staged engineering. Linux
+admits the record against the sealed selection, derives the prepared definition
+from the frozen selected bytes alone and returns only the generated text
+definition; no CAD is re-transferred. Windows then returns a sealed capture
+bundle, including the saved exporter declaration payload and its PID resolution
+rows when present; Linux checks its complete inventory, file hashes, selected
+assembly, run identity and native tool identity before use. Native completion is
+an intermediate state, not a verified model: an extracted declaration is
+evidence to reconcile, extraction warnings (uncovered occurrences, unusable
+ranges or drives) stay visible. Saved-pose mate restrictions do not override the
+declared kinematics. Administrative metadata (hardware ID, revision, owner,
+control record) is a publication-readiness requirement: when it is absent,
+measurement and inspection continue, the raw record keeps the absence, and no
+value and no neutral technical name is promoted to authored identity.
+
+Native reading is limited to the staged selected tree. A closed document's
+stored references must map to files inside that tree; a missing, outside or
+temporarily materialized reference refuses the run before any geometry is
+opened. This is a pipeline read-admission rule, not an operating-system
+sandbox.
 
 Both hosts use the same tool source release and record their own runtime
 requirements. Windows checks SolidWorks and COM readiness. Linux checks MuJoCo
