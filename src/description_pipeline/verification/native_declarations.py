@@ -130,7 +130,10 @@ def _valid_mate(mate, components):
         or mate["error_code"] != 0
         or not isinstance(entities, list)
         or len(entities) != 2
-        or not all(isinstance(item, dict) and item.get("component") in components for item in entities)
+        or not all(
+            isinstance(item, dict) and isinstance(item.get("component"), str) and item["component"] in components
+            for item in entities
+        )
     ):
         return False
     try:
@@ -145,8 +148,19 @@ def _valid_mate(mate, components):
     return True
 
 
+def _measured_rows(mate, frames, components):
+    from .native_discovery import _rows_for
+
+    if not _valid_mate(mate, components):
+        return None
+    try:
+        return _rows_for(mate, frames)
+    except Exception:  # noqa: BLE001 - unread geometry cannot prove rigid attachment
+        return None
+
+
 def _complete_membership(raw, components, members, leaves):
-    from .native_discovery import _frames, _rows_for, _span
+    from .native_discovery import _frames, _span
 
     grouped = {}
     frames = _frames(raw)
@@ -161,7 +175,7 @@ def _complete_membership(raw, components, members, leaves):
             continue
         pair = tuple(sorted(names))
         group = grouped.setdefault(pair, {"rows": [], "invalid": False, "mates": []})
-        rows = _rows_for(mate, frames) if _valid_mate(mate, components) else None
+        rows = _measured_rows(mate, frames, components)
         group["mates"].append(index)
         if rows is None:
             group["invalid"] = True
@@ -211,7 +225,7 @@ def _complete_membership(raw, components, members, leaves):
 
 def verify_declarations(raw: dict, source: dict | None = None) -> dict:
     """Audit raw native declaration evidence and, optionally, generated source claims."""
-    checks, errors, state = [], [], {}
+    checks, errors, diagnostics, state = [], [], [], {}
 
     def check(identifier, callback):
         try:
@@ -500,10 +514,18 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
         state.setdefault("axes", {})[name] = reference
         return {**details, "origin_customized": origin["customized"]}
 
-    def contradictions():
-        from .native_discovery import _frames, _rows_for
+    def pose_diagnostics():
+        from .native_discovery import _frames
 
-        _require("members" in state, "v14.membership_unread", "motion comparison awaits complete PID membership reads")
+        if "members" not in state:
+            return [
+                {
+                    "code": "v14.pose_diagnostics_unread",
+                    "blocking": False,
+                    "message": "saved-pose diagnostics await complete PID membership reads",
+                    "detail": {},
+                }
+            ]
         components, leaves, members = state["components"], state["leaves"], state["members"]
         owners = {}
         for component in components:
@@ -511,8 +533,30 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
             matching = [name for name, group in members.items() if material and material <= group]
             if len(matching) == 1:
                 owners[component] = matching[0]
-        conflicts = []
+        findings = []
         frames = _frames(raw)
+        measured = []
+        for mate in raw.get("mates") or []:
+            if not isinstance(mate, dict) or mate.get("suppressed") is True:
+                continue
+            rows = _measured_rows(mate, frames, components)
+            if rows is None:
+                findings.append(
+                    {
+                        "code": "v14.mate_inference_unavailable",
+                        "blocking": False,
+                        "message": "saved mate evidence cannot independently reconstruct a pose constraint",
+                        "detail": {
+                            "mate": mate.get("name"),
+                            "scope": mate.get("scope"),
+                            "mate_type": mate.get("type"),
+                            "error_code": mate.get("error_code"),
+                        },
+                    }
+                )
+                continue
+            names = [entity["component"] for entity in mate["entities"]]
+            measured.append((mate, names, rows["rows"]))
         for name, joint in state["joints"].items():
             if joint["type"] == "fixed" or joint["child_link"] not in state.get("frames", {}):
                 continue
@@ -532,26 +576,35 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
                 if expanded == descendants:
                     break
                 descendants = expanded
-            for mate in raw.get("mates") or []:
-                if not isinstance(mate, dict) or not _valid_mate(mate, components):
-                    continue
-                left, right = [owners.get(entity["component"]) for entity in mate["entities"]]
+            for mate, names, rows in measured:
+                left, right = [owners.get(component) for component in names]
                 if left is None or right is None or (left in descendants) == (right in descendants):
                     continue
-                rows = _rows_for(mate, frames)
-                if rows is None:
-                    continue
+                residuals = [float(np.dot(row, twist)) for row in rows]
                 if any(
-                    abs(float(np.dot(row, twist))) > 1e-6 * max(1, float(np.linalg.norm(row))) for row in rows["rows"]
+                    abs(residual) > 1e-6 * max(1, float(np.linalg.norm(row)))
+                    for row, residual in zip(rows, residuals, strict=True)
                 ):
-                    conflicts.append({"joint": name, "mate": mate.get("name"), "links": [left, right]})
-        _require(
-            not conflicts,
-            "v14.motion_conflict",
-            "complete active native constraints contradict declared motion",
-            conflicts=conflicts,
-        )
-        return {"conflicts": [], "unresolved_mates": "not evidence of a declaration defect"}
+                    findings.append(
+                        {
+                            "code": "v14.saved_pose_restriction",
+                            "blocking": False,
+                            "message": "an active native mate restricts the declared joint in the saved CAD pose",
+                            "detail": {
+                                "joint": name,
+                                "mate": mate.get("name"),
+                                "scope": mate.get("scope"),
+                                "mate_type": mate.get("type"),
+                                "components": names,
+                                "links": [left, right],
+                                "rows": rows,
+                                "declared_twist": twist.tolist(),
+                                "raw_residuals": residuals,
+                                "max_abs_residual": max(abs(value) for value in residuals),
+                            },
+                        }
+                    )
+        return findings
 
     def claims():
         _require("members" in state, "v14.membership_unread", "claim comparison awaits complete PID membership reads")
@@ -614,7 +667,9 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
         for name, joint in state["joints"].items():
             check("declarations.limits." + name, lambda n=name, j=joint: joint_limits(n, j))
             check("declarations.axis." + name, lambda n=name, j=joint: joint_geometry(n, j))
-        check("declarations.motion", contradictions)
+        # Saved mates may intentionally hold an authored moving joint at its current
+        # pose. Preserve the measured restriction separately; it is no pass/fail gate.
+        diagnostics.extend(pose_diagnostics())
         if source is not None:
             check("declarations.claims", claims)
     return {
@@ -622,6 +677,7 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
         "passed": not errors and bool(checks),
         "checks": checks,
         "errors": errors,
+        "diagnostics": diagnostics,
         "members": {name: sorted(values) for name, values in state.get("members", {}).items()},
         "completion": state.get("completion", {}),
     }

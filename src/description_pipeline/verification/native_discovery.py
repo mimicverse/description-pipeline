@@ -2490,13 +2490,14 @@ def verify_discovery(package: Path) -> dict:
             report["passed"],
             "discovery.declarations",
             "independent native declaration verification failed",
-            {"failures": report["errors"], "checks": report["checks"]},
+            {"failures": report["errors"], "checks": report["checks"], "diagnostics": report["diagnostics"]},
         )
         return {
             "bodies": len(report["members"]),
             "joints": len((state["robot"].get("source") or {}).get("joints") or []),
             "checks": report["checks"],
             "rigid_completion": report["completion"],
+            "diagnostics": report["diagnostics"],
         }
 
     bound = check("discovery.binding", binding)

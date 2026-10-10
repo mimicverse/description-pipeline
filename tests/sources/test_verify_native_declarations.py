@@ -262,12 +262,23 @@ class NativeDeclarationsTests(unittest.TestCase):
         rewrite(raw, lambda root: [setattr(item, "text", "true") for item in root.iter(NS + "isCustomized")])
         self.assertIn("v14.evidence_invalid", self.errors(raw))
 
-    def test_motion_contradiction_requires_complete_valid_native_evidence(self):
+    def test_saved_pose_restrictions_are_residual_diagnostics_not_qualification_gates(self):
         raw = fixture()
         raw["mates"] = [lock("base_part", "module-1/tool_part")]
-        self.assertIn("v14.motion_conflict", self.errors(raw))
+        report = verify_declarations(raw)
+        self.assertTrue(report["passed"], report["errors"])
+        (warning,) = report["diagnostics"]
+        self.assertEqual(warning["code"], "v14.saved_pose_restriction")
+        self.assertFalse(warning["blocking"])
+        self.assertEqual(warning["detail"]["joint"], "hinge")
+        self.assertEqual(warning["detail"]["raw_residuals"], [0, 0, 0, 0, 1, 0])
+        self.assertEqual(warning["detail"]["max_abs_residual"], 1)
+        self.assertNotIn("declarations.motion", {row["id"] for row in report["checks"]})
         raw["mates"][0]["type"] = "unknown"
-        self.assertNotIn("v14.motion_conflict", self.errors(raw))
+        report = verify_declarations(raw)
+        self.assertTrue(report["passed"])
+        self.assertNotIn("v14.saved_pose_restriction", {row["code"] for row in report["diagnostics"]})
+        self.assertIn("v14.mate_inference_unavailable", {row["code"] for row in report["diagnostics"]})
 
     def test_frame_axis_and_generated_claim_tampering_fail(self):
         raw = fixture()
