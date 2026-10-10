@@ -25,6 +25,7 @@ from description_pipeline.sources.solidworks.discovery import (  # noqa: E402
     CONTRACT,
     DISCOVERY_SCHEMA,
     DiscoverySettings,
+    _budgets,
     _clusters,
     _component_frames,
     _mate_rows,
@@ -750,9 +751,7 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual((joints[0]["parent"], joints[0]["child"]), ("base_link", "arm_link"))
         # The grounding mates add no joint and never rewrite the raw evidence.
         raw = json.loads((output / "discovery" / "native-discovery.json").read_text(encoding="utf-8"))["raw"]
-        self.assertEqual(
-            [datum["name"] for datum in raw["datums"]], ["CS_base_link", "CS_arm_link", "SCS_tool_flange"]
-        )
+        self.assertEqual([datum["name"] for datum in raw["datums"]], ["CS_base_link", "CS_arm_link", "SCS_tool_flange"])
         self.assertEqual([datum["owner"] for datum in raw["datums"]], ["", "arm-1", ""])
         frame_entity = next(
             entity
@@ -1076,11 +1075,49 @@ class DiscoveryTests(unittest.TestCase):
         result, _source, _output = self._prepare(mutate=mutate)
         self.assertIn("discovery.joint_axis_selector_missing", self._codes(result))
 
-    def test_missing_design_budget_record_blocks(self):
-        result, _source, _output = self._prepare(
-            mutate=lambda payload: payload["properties"]["document"].pop("dp.design_budget_record")
-        )
-        self.assertIn("discovery.design_budget_missing", self._codes(result))
+    def test_unspecified_design_budget_adds_no_ranges_and_no_blocker(self):
+        payload = record()
+        payload["properties"]["document"].pop("dp.design_budget_record")
+        findings = []
+        with mock.patch("description_pipeline.sources.solidworks.discovery._resolve_record") as resolve:
+            checks, evidence = _budgets(payload, DiscoverySettings(), findings)
+        resolve.assert_not_called()
+        self.assertEqual(checks, {})
+        self.assertIsNone(evidence)
+        self.assertEqual([item["code"] for item in findings], ["discovery.design_budget_unspecified"])
+        self.assertFalse(findings[0]["blocking"])
+
+    def test_unspecified_budget_does_not_replace_missing_inferred_joint_drive(self):
+        def mutate(payload):
+            payload["properties"]["document"].pop("dp.design_budget_record")
+            payload["properties"]["mates"]["shoulder_pitch_joint__coaxial"].pop("dp.joint.drive_record")
+
+        result, _source, output = self._prepare(mutate=mutate)
+        blockers = {item["code"] for item in result.findings if item["blocking"]}
+        self.assertEqual(blockers, {"discovery.joint_drive_missing", "discovery.tree_disconnected"})
+        budget = next(item for item in result.findings if item["code"] == "discovery.design_budget_unspecified")
+        self.assertFalse(budget["blocking"])
+        payload = json.loads((output / "discovery/native-discovery.json").read_text())
+        self.assertNotIn("budget", payload)
+
+    def test_explicit_missing_design_budget_record_still_blocks(self):
+        def mutate(payload):
+            payload["properties"]["document"]["dp.design_budget_record"] = "missing-budget.json#robot"
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        self.assertIn("discovery.record_missing", self._codes(result))
+        self.assertNotIn("discovery.design_budget_unspecified", {item["code"] for item in result.findings})
+
+    def test_explicit_invalid_budget_reference_is_not_treated_as_unspecified(self):
+        for reference in (False, 42, [], {}):
+            payload = record()
+            payload["properties"]["document"]["dp.design_budget_record"] = reference
+            findings = []
+            checks, evidence = _budgets(payload, DiscoverySettings(), findings)
+            self.assertIsNone(checks)
+            self.assertIsNone(evidence)
+            self.assertEqual([item["code"] for item in findings], ["discovery.design_budget_invalid"])
+            self.assertTrue(findings[0]["blocking"])
 
     def test_nonfinite_controlled_budget_retains_serializable_blocking_findings(self):
         def mutate(_payload):
@@ -1603,9 +1640,7 @@ class DiscoveryTests(unittest.TestCase):
         ):
             rows, findings = run(broken)
             self.assertIsNone(rows)
-            self.assertTrue(
-                any(item["code"] == "discovery.mate_entities_unsupported" for item in findings), findings
-            )
+            self.assertTrue(any(item["code"] == "discovery.mate_entities_unsupported" for item in findings), findings)
 
     def test_coincident_circle_with_plane_locks_alignment_and_position(self):
         frames = _component_frames(record(), [])

@@ -423,6 +423,13 @@ class ExporterDiscoveryTests(unittest.TestCase):
         self.assertEqual(payload["derived"]["bodies"][0]["frame"], {"coordinate_system": "c_arm"})
         self.assertEqual(payload["raw"]["exporter"]["raw_xml"], raw["exporter"]["raw_xml"])
         self.assertNotIn("discovery.joint_name_missing", {item["code"] for item in result.findings})
+        budget = next(item for item in result.findings if item["code"] == "discovery.design_budget_unspecified")
+        self.assertFalse(budget["blocking"])
+        self.assertNotIn("budget", payload)
+        self.assertEqual(
+            {item["code"] for item in result.findings if item["blocking"]},
+            {"discovery.joint_limits_invalid", "discovery.joint_drive_invalid"},
+        )
 
     def test_valid_declarations_generate_named_axis_input_without_stale_derived_values(self):
         raw = raw_record()

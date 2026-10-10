@@ -3288,22 +3288,29 @@ def _budgets(
     settings: DiscoverySettings,
     findings: list[dict],
 ) -> tuple[dict | None, dict | None]:
-    """Resolve the versioned design budget/measurement record.
+    """Resolve an explicitly referenced design budget/measurement record.
 
     Exported CAD mass and bounding extents can never budget themselves.  The
-    CAD carries one scalar reference to a versioned design budget record; the
-    intervals it declares are the only accepted capture windows, and a missing
-    or malformed record blocks the package.
+    CAD may carry one scalar reference to a versioned design budget record.
+    Its authored intervals are acceptance checks when provided; without a
+    reference no intervals are constructed. An explicit reference that cannot
+    be resolved or validated still blocks the package.
     """
 
     reference = _scalar(record, NAMESPACE, "design_budget_record")
-    if not _text(reference):
+    if reference is None or (isinstance(reference, str) and not reference.strip()):
         findings.append(
             _finding(
-                "discovery.design_budget_missing",
+                "discovery.design_budget_unspecified",
                 "assembly",
-                "no versioned design budget record is referenced; exported CAD readings cannot budget themselves",
+                "no design budget is specified; no optional mass or extent acceptance ranges are applied",
+                blocking=False,
             )
+        )
+        return {}, None
+    if not _text(reference):
+        findings.append(
+            _finding("discovery.design_budget_invalid", "assembly", "design budget reference must be a nonempty string")
         )
         return None, None
     resolved = _resolve_record(settings, str(reference), findings, "assembly")
