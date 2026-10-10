@@ -1,11 +1,6 @@
-"""Focused tests for the minimal independent v1.4 declaration decoder.
+"""Independent oracle fixtures use the native DataContract object/reference shape.
 
-The XML fixtures follow the authoritative SW2URDF DataContract shapes
-(``DataContractSerializer(typeof(Link))``): wrapped ``URDFAttribute`` values carry
-``AttributeType``/``IsRequired``/``Value`` with ``i:type`` annotations, arrays use the
-Serialization ``ArrayOfdouble`` shape, references carry ``z:Id``/``z:Ref``, and strings
-use ``i:nil`` for null.  Fixtures are synthetic and generic; no M3 names, counts or
-hashes appear anywhere here (synthetic tests are never generation input).
+The generic two-link records are tests only, never CAD generation inputs.
 """
 
 from __future__ import annotations
@@ -13,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import unittest
 from unittest import mock
+from xml.sax.saxutils import escape
 
 from description_pipeline.verification import v14_declarations as v14
 
@@ -21,333 +17,253 @@ XI = 'xmlns:i="http://www.w3.org/2001/XMLSchema-instance"'
 ARR = 'xmlns:a="http://schemas.microsoft.com/2003/10/Serialization/Arrays"'
 XS = 'xmlns:b="http://www.w3.org/2001/XMLSchema"'
 Z = 'xmlns:z="http://schemas.microsoft.com/2003/10/Serialization/"'
+HEADER = f"{NS} {XI} {ARR} {XS} {Z}"
 
 
-def attr_string(field: str, atype: str, value: str | None) -> str:
-    value_xml = '<Value i:nil="true"/>' if value is None else f'<Value i:type="b:string">{value}</Value>'
-    return f"<{field}><Attribute {NS}><AttributeType>{atype}</AttributeType><IsRequired>true</IsRequired>{value_xml}</Attribute></{field}>"
+def value_xml(value):
+    if value is None:
+        return '<Value i:nil="true"/>'
+    if isinstance(value, list):
+        values = "".join(f"<a:double>{v}</a:double>" for v in value)
+        return f'<Value i:type="a:ArrayOfdouble">{values}</Value>'
+    kind = "string" if isinstance(value, str) else "double"
+    return f'<Value i:type="b:{kind}">{escape(str(value))}</Value>'
 
 
-def attr_numbers(field: str, atype: str, values: list[float] | None) -> str:
-    if values is None:
-        value_xml = '<Value i:nil="true"/>'
-    else:
-        items = "".join(f"<a:double>{value!r}</a:double>" for value in values)
-        value_xml = f'<Value i:type="a:ArrayOfdouble">{items}</Value>'
-    return f"<{field}><Attribute {NS}><AttributeType>{atype}</AttributeType><IsRequired>true</IsRequired>{value_xml}</Attribute></{field}>"
-
-
-def attr_scalar(field: str, atype: str, value: float | None, *, nil: bool = False) -> str:
-    if nil or value is None:
-        value_xml = '<Value i:nil="true"/>'
-    else:
-        value_xml = f'<Value i:type="b:double">{value!r}</Value>'
-    return f"<{field}><Attribute {NS}><AttributeType>{atype}</AttributeType><IsRequired>true</IsRequired>{value_xml}</Attribute></{field}>"
-
-
-def joint_xml(*, nil_velocity: bool = True) -> str:
-    limit = (
-        "<Limit>"
-        + attr_scalar("LowerAttribute", "lower", -1.5)
-        + attr_scalar("UpperAttribute", "upper", 1.5)
-        + attr_scalar("EffortAttribute", "effort", 0.0)
-        + attr_scalar("VelocityAttribute", "velocity", 3.0, nil=nil_velocity)
-        + "</Limit>"
+def attributes(identifier, fields):
+    definitions = "".join(
+        f'<Attribute z:Id="{identifier}_{member}"><AttributeType>{kind}</AttributeType>'
+        f"<IsRequired>true</IsRequired>{value_xml(value)}</Attribute>"
+        for member, kind, value in fields
     )
-    return (
-        "<Joint>"
-        + attr_string("NameAttribute", "name", "joint-1")
-        + attr_string("TypeAttribute", "type", "revolute")
-        + "<Origin>"
-        + attr_numbers("XYZAttribute", "xyz", [0.0, 0.0, 0.2])
-        + attr_numbers("RPYAttribute", "rpy", [0.0, 0.0, 1.5707963267948966])
-        + "</Origin>"
-        + "<Parent>" + attr_string("NameAttribute", "link", "base-1") + "</Parent>"
-        + "<Child>" + attr_string("NameAttribute", "link", "tool-1") + "</Child>"
-        + "<Axis>" + attr_numbers("XYZAttribute", "xyz", [0.0, 1.0, 0.0]) + "</Axis>"
-        + limit
-        + "<CoordinateSystemName>axis-frame</CoordinateSystemName>"
-        + "<AxisName>RefAxis-A</AxisName>"
-        + "</Joint>"
+    refs = "".join(f'<{member} z:Ref="{identifier}_{member}"/>' for member, _kind, _value in fields)
+    return f"<Attributes>{definitions}</Attributes>", refs
+
+
+def element(kind, identifier, fields, extras=""):
+    attrs, refs = attributes(identifier, fields)
+    return f'<URDFElement z:Id="{identifier}" i:type="{kind}">{attrs}{extras}{refs}</URDFElement>'
+
+
+def joint_xml(*, nil_velocity=True, root=False):
+    prefix = "root_joint" if root else "joint"
+    child_objects = "".join(
+        [
+            element(
+                "Origin",
+                prefix + "_origin",
+                [("XYZAttribute", "xyz", [0, 0, 0.2]), ("RPYAttribute", "rpy", [0, 0, 1.5707963267948966])],
+                '<isCustomized>false</isCustomized>',
+            ),
+            element("ParentLink", prefix + "_parent", [("NameAttribute", "link", "" if root else "base")]),
+            element("ChildLink", prefix + "_child", [("NameAttribute", "link", "" if root else "tool")]),
+            element("Axis", prefix + "_axis", [("XYZAttribute", "xyz", [0, 1, 0])]),
+            element(
+                "Limit",
+                prefix + "_limit",
+                [
+                    ("LowerAttribute", "lower", -1.5),
+                    ("UpperAttribute", "upper", 1.5),
+                    ("EffortAttribute", "effort", 0.0),
+                    ("VelocityAttribute", "velocity", None if nil_velocity else 3.0),
+                ],
+            ),
+        ]
+    )
+    extras = (
+        f"<ChildElements>{child_objects}</ChildElements>"
+        + "".join(
+            f'<{name} z:Ref="{prefix}_{name.lower()}"/>' for name in ["Origin", "Parent", "Child", "Axis", "Limit"]
+        )
+        + "<CoordinateSystemName>frame</CoordinateSystemName><AxisName>shaft</AxisName>"
+    )
+    return element(
+        "Joint",
+        prefix,
+        [("NameAttribute", "name", "" if root else "hinge"), ("TypeAttribute", "type", "" if root else "revolute")],
+        extras,
     )
 
 
-def document_xml(*, with_namespace: bool = True, extra_elements: str = "") -> str:
-    prefixes = f'{NS} {XI} {ARR} {XS} {Z}' if with_namespace else f'{XI} {ARR} {XS} {Z}'
-    header = f'{prefixes} z:Id="i1"'
+def document_xml(*, extra_elements="", root_joint=False):
+    child_attrs, child_refs = attributes("tool", [("NameAttribute", "name", "tool")])
     child = (
-        '<Link z:Id="i2">'
-        '<Parent z:Ref="i1"/>'
-        "<Children />"
-        + attr_string("NameAttribute", "name", "tool-1")
-        + "<SWComponentPIDs>QUJD</SWComponentPIDs>"
-        + "<SWComponentPIDs>REVG</SWComponentPIDs>"
-        + joint_xml()
-        + "<isFixedFrame>false</isFixedFrame>"
-        + "<isIncomplete>false</isIncomplete>"
-        + "<STLQualityFine>true</STLQualityFine>"
-        + "</Link>"
+        f'<Link z:Id="tool">{child_attrs}<ChildElements>{joint_xml()}</ChildElements>'
+        '<Joint z:Ref="joint"/><Parent z:Ref="base"/><Children/>'
+        + child_refs
+        + "<SWComponentPIDs><a:base64Binary>QUJD</a:base64Binary>"
+        "<a:base64Binary>REVG</a:base64Binary></SWComponentPIDs>"
+        "<isFixedFrame>false</isFixedFrame><isIncomplete>false</isIncomplete>"
+        "<STLQualityFine>true</STLQualityFine></Link>"
     )
+    attrs, refs = attributes("base", [("NameAttribute", "name", "base")])
+    metadata = f'<ChildElements>{joint_xml(root=True)}</ChildElements><Joint z:Ref="root_joint"/>' if root_joint else ""
     return (
-        f"<Link {header}>"
-        '<Parent i:nil="true"/>'
-        f"<Children>{child}</Children>"
-        + extra_elements
-        + attr_string("NameAttribute", "name", "base-1")
-        + "<SWMainComponentPID>QUJDRA==</SWMainComponentPID>"
-        + "<isFixedFrame>true</isFixedFrame>"
-        + "</Link>"
+        f'<Link {HEADER} z:Id="base">{attrs}{metadata}<Parent i:nil="true"/>'
+        f"<Children>{child}</Children>{refs}{extra_elements}"
+        "<SWMainComponentPID>QUJDRA==</SWMainComponentPID><isFixedFrame>true</isFixedFrame></Link>"
     )
 
 
 class V14DeclarationDecoderTests(unittest.TestCase):
-    def test_extracts_declared_tree_with_exact_missing_vs_zero(self):
+    def assert_code(self, payload, expected):
+        with self.assertRaises(v14.DeclarationError) as caught:
+            v14.parse_v14_xml(payload)
+        self.assertEqual(caught.exception.code, expected)
+
+    def test_native_object_references_and_exact_missing_vs_zero(self):
         root = v14.parse_v14_xml(document_xml())
-        self.assertEqual(root["name"], "base-1")
+        self.assertEqual(root["name"], "base")
         self.assertTrue(root["is_fixed_frame"])
         self.assertIsNone(root["is_incomplete"])
         self.assertIsNone(root["stl_quality_fine"])
         self.assertEqual(root["main_component_pid"], "QUJDRA==")
         self.assertIsNone(root["component_pids"])
         self.assertIsNone(root["joint"])
-        self.assertEqual(len(root["children"]), 1)
-        child = root["children"][0]
-        self.assertEqual(child["name"], "tool-1")
+        (child,) = root["children"]
+        self.assertEqual(child["name"], "tool")
         self.assertFalse(child["is_fixed_frame"])
         self.assertFalse(child["is_incomplete"])
         self.assertTrue(child["stl_quality_fine"])
         self.assertEqual(child["children"], [])
         self.assertEqual(child["component_pids"], ["QUJD", "REVG"])
-        joint = child["joint"]
-        self.assertEqual(joint["name"], "joint-1")
-        self.assertEqual(joint["type"], "revolute")
-        self.assertEqual(joint["parent_link"], "base-1")
-        self.assertEqual(joint["child_link"], "tool-1")
-        self.assertEqual(joint["origin"]["xyz"], [0.0, 0.0, 0.2])
-        self.assertAlmostEqual(joint["origin"]["rpy"][2], 1.5707963267948966, places=12)
-        self.assertEqual(joint["axis"], [0.0, 1.0, 0.0])
-        self.assertEqual(joint["limit"]["lower"], -1.5)
-        self.assertEqual(joint["limit"]["effort"], 0.0)  # a present zero stays zero
-        self.assertIsNone(joint["limit"]["velocity"])  # i:nil is missing, not zero
-        self.assertEqual(joint["coordinate_system_name"], "axis-frame")
-        self.assertEqual(joint["axis_name"], "RefAxis-A")
-
-    def test_missing_fields_are_none_and_never_defaulted(self):
-        minimal = (
-            f"<Link {NS} {XI}>{attr_string('NameAttribute', 'name', 'only-1')}</Link>"
-        )
-        root = v14.parse_v14_xml(minimal)
         self.assertEqual(
-            sorted(root),
-            [
-                "children",
-                "component_pids",
-                "is_fixed_frame",
-                "is_incomplete",
-                "joint",
-                "main_component_pid",
-                "name",
-                "stl_quality_fine",
-            ],
+            child["joint"],
+            {
+                "name": "hinge",
+                "type": "revolute",
+                "parent_link": "base",
+                "child_link": "tool",
+                "origin": {"xyz": [0, 0, 0.2], "rpy": [0, 0, 1.5707963267948966], "customized": False},
+                "axis": [0, 1, 0],
+                "limit": {"lower": -1.5, "upper": 1.5, "effort": 0, "velocity": None},
+                "coordinate_system_name": "frame",
+                "axis_name": "shaft",
+            },
         )
-        self.assertIsNone(root["children"])
-        self.assertIsNone(root["joint"])
-        self.assertIsNone(root["is_fixed_frame"])
-        joint = (
-            "<Joint>"
-            + attr_string("NameAttribute", "name", "j2")
-            + attr_string("TypeAttribute", "type", "fixed")
-            + "</Joint>"
+
+    def test_root_metadata_holder_is_preserved_without_invented_joint(self):
+        root = v14.parse_v14_xml(document_xml(root_joint=True))
+        self.assertEqual(root["joint"]["name"], "")
+        self.assertEqual(root["joint"]["type"], "")
+        self.assertEqual(root["joint"]["coordinate_system_name"], "frame")
+
+    def test_absent_nil_and_empty_arrays(self):
+        for extra, expected in [
+            ("", None),
+            ('<SWComponentPIDs i:nil="true"/>', None),
+            ("<SWComponentPIDs/>", []),
+            ('<SWComponentPIDs><a:base64Binary i:nil="true"/></SWComponentPIDs>', [None]),
+        ]:
+            root = v14.parse_v14_xml(f"<Link {HEADER}>{extra}</Link>")
+            self.assertEqual(root["component_pids"], expected)
+            self.assertIsNone(root["joint"])
+            self.assertIsNone(root["children"])
+
+    def test_direct_serialized_members_are_attributes_without_nested_attribute(self):
+        payload = (
+            f"<Link {HEADER}><NameAttribute><AttributeType>name</AttributeType>"
+            '<IsRequired>true</IsRequired><Value i:type="b:string">direct</Value>'
+            "</NameAttribute></Link>"
         )
-        with_joint = f"<Link {NS} {XI}>{attr_string('NameAttribute', 'name', 'l2')}{joint}</Link>"
-        parsed_joint = v14.parse_v14_xml(with_joint)["joint"]
-        self.assertIsNone(parsed_joint["origin"])
-        self.assertIsNone(parsed_joint["axis"])
-        self.assertIsNone(parsed_joint["limit"])
-        self.assertIsNone(parsed_joint["coordinate_system_name"])
-        self.assertIsNone(parsed_joint["axis_name"])
-        self.assertIsNone(parsed_joint["parent_link"])
-        self.assertIsNone(parsed_joint["child_link"])
+        self.assertEqual(v14.parse_v14_xml(payload)["name"], "direct")
+        self.assert_code(payload.replace("<AttributeType>name</AttributeType>", ""), "v14.attribute_shape")
+        self.assert_code(payload.replace('<Value i:type="b:string">direct</Value>', ""), "v14.attribute_shape")
+
+    def test_shared_values_and_pid_slots(self):
+        payload = document_xml().replace(
+            "<a:base64Binary>QUJD</a:base64Binary>", '<a:base64Binary z:Id="pid">QUJD</a:base64Binary>'
+        )
+        payload = payload.replace(
+            "<a:base64Binary>REVG</a:base64Binary>", '<a:base64Binary z:Ref="pid"/><a:base64Binary i:nil="true"/>'
+        )
+        root = v14.parse_v14_xml(payload)
+        self.assertEqual(root["children"][0]["component_pids"], ["QUJD", "QUJD", None])
+        payload = document_xml().replace(
+            '<Value i:type="a:ArrayOfdouble">', '<Value z:Id="values" i:type="a:ArrayOfdouble">', 1
+        )
+        payload = payload.replace(
+            '<Value i:type="a:ArrayOfdouble"><a:double>0</a:double><a:double>1</a:double>'
+            "<a:double>0</a:double></Value>",
+            '<Value z:Ref="values"/>',
+        )
+        self.assertEqual(v14.parse_v14_xml(payload)["children"][0]["joint"]["axis"], [0, 0, 0.2])
+
+    def test_invalid_pid_and_old_repeated_container_shape_refused(self):
+        for extra, code in [
+            ("<SWComponentPIDs>QUJD</SWComponentPIDs>", "v14.pid_array"),
+            ("<SWComponentPIDs/><SWComponentPIDs/>", "v14.duplicate_field"),
+            ("<SWComponentPIDs><a:base64Binary>!</a:base64Binary></SWComponentPIDs>", "v14.invalid_pid"),
+        ]:
+            self.assert_code(f"<Link {HEADER}>{extra}</Link>", code)
+
+    def test_reference_failures_are_explicit(self):
+        for replacement, code in [
+            ('<NameAttribute z:Ref="missing"/>', "v14.unresolved_reference"),
+            ('<NameAttribute z:Id="both" z:Ref="base"/>', "v14.malformed_reference"),
+            ('<NameAttribute z:Ref="base">text</NameAttribute>', "v14.malformed_reference"),
+            ('<NameAttribute z:Ref="joint"/>', "v14.reference_type"),
+        ]:
+            self.assert_code(document_xml().replace('<NameAttribute z:Ref="base_NameAttribute"/>', replacement), code)
+        self.assert_code(
+            document_xml().replace("<Children/>", '<Children><Link z:Ref="base"/></Children>'), "v14.reference_cycle"
+        )
+        self.assert_code(document_xml().replace('z:Id="tool"', 'z:Id="base"'), "v14.reference_duplicate")
+        self.assert_code(document_xml().replace('i:type="Limit"', 'i:type="Origin"'), "v14.reference_type")
+
+    def test_bounded_reference_and_expanded_tree(self):
+        with mock.patch.object(v14, "MAX_REF_HOPS", 0):
+            self.assert_code(document_xml(), "v14.reference_too_deep")
+        with mock.patch.object(v14, "MAX_LINKS", 1):
+            self.assert_code(document_xml(), "v14.payload_too_large")
+
+    def test_stale_serialized_physics_is_ignored(self):
+        extra = "<Inertial><Mass>nonsense</Mass></Inertial><Visual><Mesh>missing.stl</Mesh></Visual>"
+        self.assertEqual(v14.parse_v14_xml(document_xml()), v14.parse_v14_xml(document_xml(extra_elements=extra)))
+
+    def test_xml_safety_guards(self):
+        for xml, code in [
+            ('<?xml version="1.0"?><!DOCTYPE Link><Link/>', "v14.unsafe_xml"),
+            ('<!ENTITY x "y"><Link/>', "v14.unsafe_xml"),
+            ("<Link><Children", "v14.malformed_xml"),
+            ("<Robot/>", "v14.root_name"),
+            ("<Link/>", "v14.root_name"),
+        ]:
+            self.assert_code(xml, code)
+        with mock.patch.object(v14, "MAX_PAYLOAD_BYTES", 32):
+            self.assert_code(document_xml(), "v14.payload_too_large")
+        with mock.patch.object(v14, "MAX_DEPTH", 4):
+            self.assert_code(document_xml(), "v14.payload_too_deep")
+        with mock.patch.object(v14, "MAX_ELEMENTS", 3):
+            self.assert_code(document_xml(), "v14.payload_too_large")
 
     def test_boundary_validation_and_hash(self):
         raw = document_xml()
-        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-        result = v14.validate_boundary(
-            {
-                "attribute_name": v14.ATTRIBUTE_NAME,
-                "exporter_version": 1.4,
-                "raw_xml": raw,
-                "raw_xml_sha256": digest.upper(),
-                "document": "robot.SLDASM",
-                "configuration": "Default",
-                "pid_bindings": {"QUJD": "part-1"},
-            }
-        )
-        self.assertEqual(result["raw_xml_sha256"], digest)
-        self.assertEqual(result["root"]["name"], "base-1")
-        self.assertEqual(result["document"], "robot.SLDASM")
-        self.assertEqual(result["pid_bindings"], {"QUJD": "part-1"})
-
-        def code(block) -> str:
+        digest = hashlib.sha256(raw.encode()).hexdigest()
+        bindings = [{"pid_hex": "414243", "name2": "part-1", "error_code": 0}]
+        base = {
+            "attribute_name": v14.ATTRIBUTE_NAME,
+            "exporter_version": 1.4,
+            "raw_xml": raw,
+            "raw_xml_sha256": digest.upper(),
+            "pid_bindings": bindings,
+            "document": "robot.SLDASM",
+        }
+        decoded = v14.validate_boundary(base)
+        self.assertEqual(decoded["root"]["name"], "base")
+        self.assertEqual(decoded["raw_xml_sha256"], digest)
+        self.assertEqual(decoded["pid_bindings"], bindings)
+        self.assertEqual(v14.pid_hex(" Q U J D \n"), "414243")
+        for changes, code in [
+            ({"attribute_name": v14.LEGACY_ATTRIBUTE_NAMES[0]}, "v14.legacy_attribute"),
+            ({"attribute_name": "other"}, "v14.attribute_name"),
+            ({"exporter_version": 1.3}, "v14.exporter_version"),
+            ({"raw_xml_sha256": "0" * 64}, "v14.raw_hash_mismatch"),
+            ({"raw_xml": ""}, "v14.empty_payload"),
+        ]:
             with self.assertRaises(v14.DeclarationError) as caught:
-                v14.validate_boundary(block)
-            return caught.exception.code
-
-        base = {"attribute_name": v14.ATTRIBUTE_NAME, "exporter_version": 1.4, "raw_xml": raw}
-        self.assertEqual(code({**base, "attribute_name": "URDF Export Configuration (v1.3)"}), "v14.legacy_attribute")
-        self.assertEqual(code({**base, "attribute_name": "URDF Export Configuration"}), "v14.legacy_attribute")
-        self.assertEqual(code({**base, "attribute_name": "Something Else"}), "v14.attribute_name")
-        self.assertEqual(code({**base, "exporter_version": 1.3}), "v14.exporter_version")
-        self.assertEqual(code({**base, "exporter_version": 1.5}), "v14.exporter_version")
-        self.assertEqual(code({**base, "raw_xml_sha256": "0" * 64}), "v14.raw_hash_mismatch")
-        self.assertEqual(code({**base, "raw_xml": "   "}), "v14.empty_payload")
-        self.assertEqual(code(None), "v14.boundary_missing")
-
-    def test_xml_safety_guards(self):
-        def code(xml_text: str) -> str:
-            with self.assertRaises(v14.DeclarationError) as caught:
-                v14.parse_v14_xml(xml_text)
-            return caught.exception.code
-
-        self.assertEqual(code('<?xml version="1.0"?><!DOCTYPE Link><Link></Link>'), "v14.unsafe_xml")
-        self.assertEqual(code("<!ENTITY x \"y\"><Link/>"), "v14.unsafe_xml")
-        self.assertEqual(code("<Link><Children"), "v14.malformed_xml")
-        self.assertEqual(code("<Robot/>"), "v14.root_name")
-        with mock.patch.object(v14, "MAX_PAYLOAD_BYTES", 32):
-            self.assertEqual(code(document_xml()), "v14.payload_too_large")
-        deep = "<Link>" + "<Extra>" * 8 + "</Extra>" * 8 + "</Link>"
-        with mock.patch.object(v14, "MAX_DEPTH", 5):
-            self.assertEqual(code(deep), "v14.payload_too_deep")
-        with mock.patch.object(v14, "MAX_ELEMENTS", 3):
-            self.assertEqual(code(deep), "v14.payload_too_large")
-
-    def test_namespace_tolerance_and_unknown_elements_ignored(self):
-        plain = document_xml(with_namespace=False)
-        self.assertEqual(v14.parse_v14_xml(plain)["children"][0]["name"], "tool-1")
-        extras = (
-            "<Inertial><Mass><Value>12.5</Value></Mass></Inertial>"
-            "<Visual><Geometry><Mesh filename=\"old.stl\"/></Geometry></Visual>"
-            "<Whatever attr=\"1\"/>"
-            "<SWComponentPIDs i:nil=\"true\"/>"
-        )
-        with_extras = v14.parse_v14_xml(document_xml(extra_elements=extras))
-        self.assertNotIn("inertial", with_extras)
-        self.assertNotIn("visual", with_extras)
-        # The link-level nil is the child's own SWComponentPIDs, which keeps its values.
-        self.assertEqual(with_extras["children"][0]["component_pids"], ["QUJD", "REVG"])
-
-    def test_reference_annotations_are_ignored(self):
-        doc = document_xml()
-        self.assertIn('z:Ref="i1"', doc)
-        root = v14.parse_v14_xml(doc)
-        self.assertEqual(root["children"][0]["name"], "tool-1")  # z:Ref/z:Id never followed
-        nil_children = (
-            f"<Link {NS} {XI}><Children i:nil=\"true\"/>{attr_string('NameAttribute', 'name', 'l3')}</Link>"
-        )
-        self.assertIsNone(v14.parse_v14_xml(nil_children)["children"])
-
-    def test_shared_references_resolve_and_preserve_pid_slots(self):
-        """z:Ref-only wrappers/lists resolve through the payload table; null slots stay."""
-
-        def axis_with_id(identifier: str, value_id: str) -> str:
-            return (
-                f'<Axis z:Id="{identifier}"><XYZAttribute><Attribute {NS}>'
-                "<AttributeType>xyz</AttributeType><IsRequired>true</IsRequired>"
-                f'<Value z:Id="{value_id}" i:type="a:ArrayOfdouble">'
-                "<a:double>0.0</a:double><a:double>1.0</a:double><a:double>0.0</a:double>"
-                "</Value></Attribute></XYZAttribute></Axis>"
-            )
-
-        first = (
-            f'<Link z:Id="i10">'
-            "<Children />"
-            + attr_string("NameAttribute", "name", "a-1")
-            + "<SWComponentPIDs z:Id=\"iP1\">QUJD</SWComponentPIDs>"
-            + "<SWComponentPIDs>REVG</SWComponentPIDs>"
-            + "<Joint>"
-            + attr_string("NameAttribute", "name", "j-a")
-            + attr_string("TypeAttribute", "type", "revolute")
-            + axis_with_id("iAx", "iV1")
-            + "</Joint>"
-            + "</Link>"
-        )
-        second = (
-            '<Link z:Id="i11">'
-            "<Children />"
-            + attr_string("NameAttribute", "name", "b-1")
-            + '<SWComponentPIDs z:Ref="iP1"/>'
-            + '<SWComponentPIDs i:nil="true"/>'
-            + "<Joint>"
-            + attr_string("NameAttribute", "name", "j-b")
-            + attr_string("TypeAttribute", "type", "revolute")
-            + '<Axis z:Ref="iAx"/>'
-            + "</Joint>"
-            + "</Link>"
-        )
-        third = (
-            '<Link z:Id="i12"><Children />'
-            + attr_string("NameAttribute", "name", "c-1")
-            + "<Joint>"
-            + attr_string("NameAttribute", "name", "j-c")
-            + attr_string("TypeAttribute", "type", "revolute")
-            + '<Axis><XYZAttribute><Attribute '
-            + NS
-            + "><AttributeType>xyz</AttributeType><IsRequired>true</IsRequired>"
-            + '<Value z:Ref="iV1"/></Attribute></XYZAttribute></Axis>'
-            + "</Joint></Link>"
-        )
-        doc = (
-            f'<Link {NS} {XI} {ARR} {XS} {Z} z:Id="i1">'
-            f"<Children>{first}{second}{third}</Children>"
-            + attr_string("NameAttribute", "name", "root-1")
-            + "</Link>"
-        )
-        root = v14.parse_v14_xml(doc)
-        first_link, second_link, third_link = root["children"]
-        self.assertEqual(first_link["component_pids"], ["QUJD", "REVG"])
-        # Positional preservation: the shared value resolves, the explicit null stays a slot.
-        self.assertEqual(second_link["component_pids"], ["QUJD", None])
-        self.assertEqual(first_link["joint"]["axis"], [0.0, 1.0, 0.0])
-        self.assertEqual(second_link["joint"]["axis"], [0.0, 1.0, 0.0])  # holder ref resolved
-        # A Value-level reference resolves too: the third joint points at the first's array.
-        self.assertEqual(third_link["joint"]["axis"], [0.0, 1.0, 0.0])
-
-    def test_reference_failures_are_explicit(self):
-        def code(xml_text: str) -> str:
-            with self.assertRaises(v14.DeclarationError) as caught:
-                v14.parse_v14_xml(xml_text)
-            return caught.exception.code
-
-        unresolved = (
-            f'<Link {NS} {XI} {Z}>'
-            + '<NameAttribute><Attribute '
-            + NS
-            + '><AttributeType>name</AttributeType><IsRequired>true</IsRequired>'
-            + '<Value z:Ref="i404"/></Attribute></NameAttribute>'
-            + "</Link>"
-        )
-        self.assertEqual(code(unresolved), "v14.unresolved_reference")
-        both = (
-            f'<Link {NS} {XI} {Z} z:Id="i1">'
-            + '<NameAttribute z:Id="i2" z:Ref="i1"/>'
-            + "</Link>"
-        )
-        self.assertEqual(code(both), "v14.malformed_reference")
-        cycle = (
-            f'<Link {NS} {XI} {Z} z:Id="i1"><Children><Link z:Ref="i1"/></Children>'
-            + attr_string("NameAttribute", "name", "loop-1")
-            + "</Link>"
-        )
-        self.assertEqual(code(cycle), "v14.reference_cycle")
-        duplicate = (
-            f'<Link {NS} {XI} {Z} z:Id="i1"><Children>'
-            + '<Link z:Id="i9"><Children /></Link>'
-            + '<Link z:Id="i9"><Children /></Link>'
-            + "</Children>"
-            + attr_string("NameAttribute", "name", "dup-1")
-            + "</Link>"
-        )
-        self.assertEqual(code(duplicate), "v14.reference_duplicate")
+                v14.validate_boundary({**base, **changes})
+            self.assertEqual(caught.exception.code, code)
 
 
 if __name__ == "__main__":
