@@ -390,11 +390,16 @@ def _provide_definition(endpoint: WindowsEndpoint, request: dict) -> None:
         if diagnostic:
             detail.setdefault("diagnostic_path", str(diagnostic))
         if prepared is not None:
-            detail.setdefault("findings", [dict(item) for item in prepared.findings])
-            detail.setdefault("hardware_id", prepared.hardware_id)
-            detail.setdefault("revision", prepared.revision)
-            detail.setdefault("discovery_sha256", prepared.discovery_sha256)
-            detail.setdefault("prepared_passed", prepared.passed)
+            detail.setdefault(
+                "discovery",
+                {
+                    "passed": prepared.passed,
+                    "findings": [dict(item) for item in prepared.findings],
+                    "hardware_id": prepared.hardware_id,
+                    "revision": prepared.revision,
+                    "discovery_sha256": prepared.discovery_sha256,
+                },
+            )
         detail.setdefault("work_dir", str(work))
         try:
             endpoint.abort_job(
