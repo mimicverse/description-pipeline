@@ -24,12 +24,12 @@ from packaging.utils import canonicalize_name
 
 from .. import __version__
 from ..build.archive import ZIP_EPOCH
-from ..delivery import PIPELINE_ID
+from ..delivery import PIPELINE_ID, TRANSFER_FILES
 from ..io import PipelineError, artifact_path_parts, canonical, confined, digest, file_digest, inventory, read_data
 from ..runtime import RUNTIME_VERSIONS, required_packages
 from ..sources.snapshot import verify_snapshot
 from ..sources.solidworks.revision import package_inventory
-from ..stages import CONTRACT, CONTRACT_FILE_SHA256, CONTRACT_SHA256, STAGE_IDS, VIEW_SCHEMA
+from ..stages import CONTRACT, CONTRACT_FILE_SHA256, CONTRACT_SHA256, STAGE_IDS, VIEW_SCHEMA, stage_view
 
 CAPTURE_ARCHIVE = "native-evidence.zip"
 CAPTURE_MANIFEST = "transfer-manifest.json"
@@ -167,6 +167,66 @@ def _validate_stage_receipts(view, *, run_id: str, handoff_sha256: str) -> None:
             stage.get("state") != "completed",
             f"Non-native stage {stage_id} is claimed complete in the native transfer",
         )
+    events = view.get("events")
+    _require(
+        isinstance(events, list) and events,
+        "Native stage receipts must carry the raw protocol events",
+    )
+    for event in events:
+        _require(isinstance(event, dict), "A native protocol event must be an object")
+        _require(
+            event.get("stage") in NATIVE_STAGE_SCOPE,
+            "Native stage receipts must contain only the first three stages' events",
+        )
+        _require(isinstance(event.get("at"), str) and event["at"], "A native protocol event lacks its timestamp")
+        _require(
+            event.get("state") in {"running", "completed", "failed"},
+            "A native protocol event has an unknown state",
+        )
+        check = event.get("check")
+        if check is not None:
+            _require(
+                isinstance(check, dict) and check.get("state") in {"passed", "failed"},
+                "A native protocol check event is malformed",
+            )
+    try:
+        recomputed = stage_view(
+            {
+                "run_id": run_id,
+                "request": {"handoff_sha256": handoff_sha256},
+                "result": {"execution_scope": list(NATIVE_STAGE_SCOPE)},
+                "events": events,
+            }
+        )
+    except Exception as error:  # noqa: BLE001 - a receipt that cannot be rebuilt is not evidence
+        raise PipelineError(f"Native stage receipts cannot be rebuilt from their events: {error}") from error
+    _require(
+        _receipt_projection(recomputed) == _receipt_projection(view),
+        "Native stage receipts differ from the stage view rebuilt from their own events",
+    )
+
+
+def _receipt_projection(view) -> dict:
+    """The native rows and boundary-check states a receipt must actually prove."""
+
+    stages = view.get("stages")
+    by_id = {stage.get("id"): stage for stage in stages or [] if isinstance(stage, dict)}
+    projection = {}
+    for stage_id in NATIVE_STAGE_SCOPE:
+        stage = by_id.get(stage_id) or {}
+        checks = {}
+        for boundary in ("input", "output"):
+            for item in stage.get(f"{boundary}_qc") or []:
+                if isinstance(item, dict):
+                    checks[(boundary, item.get("id"))] = item.get("state")
+        projection[stage_id] = {
+            "state": stage.get("state"),
+            "in_scope": stage.get("in_scope"),
+            "checks_passed": stage.get("checks_passed"),
+            "checks_total": stage.get("checks_total"),
+            "checks": checks,
+        }
+    return projection
 
 
 def _validate_input(root: Path, report, main_assembly: str) -> str:
@@ -186,7 +246,7 @@ def _validate_input(root: Path, report, main_assembly: str) -> str:
     return package_files[main_assembly]
 
 
-def _validate_evidence(root: Path, main_assembly: str) -> None:
+def _validate_evidence(root: Path) -> None:
     evidence = Path(root) / "evidence"
     manifest = verify_snapshot(evidence)
     scene = manifest.get("scene")
@@ -197,6 +257,10 @@ def _validate_evidence(root: Path, main_assembly: str) -> None:
     # ``freeze`` writes its evidence record inside the snapshot's own ``evidence/`` folder.
     collection = read_data(confined(evidence, "evidence/collection.json"))
     _require(isinstance(collection, dict), "Evidence collection must be an object")
+    _require(
+        collection.get("identity") == manifest.get("identity"),
+        "Evidence collection and snapshot identities differ",
+    )
     identity = collection.get("identity") if isinstance(collection.get("identity"), dict) else {}
     _require(
         isinstance(identity.get("dependency_digest"), str) and identity["dependency_digest"],
@@ -205,21 +269,50 @@ def _validate_evidence(root: Path, main_assembly: str) -> None:
     capture = collection.get("capture") if isinstance(collection.get("capture"), dict) else {}
     unchanged = capture.get("originals_unchanged")
     # ``freeze`` records a structured observation (files checked / states recorded) and raises on
-    # any change; older or hand-built fixtures may record the boolean.
+    # any change; a boolean or empty claim is not that evidence.
     _require(
-        unchanged is True or (isinstance(unchanged, dict) and int(unchanged.get("files_checked") or 0) >= 1),
+        isinstance(unchanged, dict) and int(unchanged.get("files_checked") or 0) >= 1,
         "Evidence does not prove the CAD bytes were unchanged",
     )
     source_hashes = capture.get("source_hashes")
     _require(isinstance(source_hashes, dict) and source_hashes, "Evidence lacks native source hashes")
-    assembly = identity.get("assembly")
-    _require(isinstance(assembly, str) and assembly.strip(), "Evidence identity lacks the assembly name")
-    wanted = {main_assembly.casefold(), Path(main_assembly).name.casefold(), Path(main_assembly).stem.casefold()}
-    assembly_name = Path(assembly).name.casefold()
+
+
+def _validate_native_discovery(root: Path, *, main_assembly: str, handoff_sha256: str) -> str:
+    """Bind the main assembly through the real input source and the native discovery record.
+
+    The packaged discovery record names the entry the reader opened, the handoff it was bound to,
+    and the native file inventory it hashed; the archived input must carry the same bytes.
+    """
+
+    record = read_data(confined(root, "input/discovery/native-discovery.json"))
+    _require(isinstance(record, dict), "Native discovery record must be an object")
+    identity = record.get("identity") if isinstance(record.get("identity"), dict) else {}
+    recorded = identity.get("main_assembly")
+    _require(isinstance(recorded, str) and recorded, "Native discovery record names no main assembly")
+    if recorded != main_assembly:
+        hint = " (case differs)" if recorded.casefold() == main_assembly.casefold() else ""
+        raise PipelineError(
+            f"The native discovery record opened another main assembly{hint}: {recorded!r} vs {main_assembly!r}"
+        )
+    recorded_handoff = record.get("handoff_sha256")
+    _require(_is_sha256(recorded_handoff), "Native discovery record lacks its handoff digest")
+    _require(recorded_handoff == handoff_sha256, "The native discovery record is bound to another handoff")
+    native_files = record.get("native_files")
     _require(
-        assembly_name in wanted or Path(assembly_name).stem in wanted,
-        "Evidence identity names another assembly",
+        isinstance(native_files, dict) and native_files,
+        "Native discovery record lacks its native file inventory",
     )
+    _require(
+        main_assembly in native_files,
+        f"The native discovery record does not inventory the main assembly: {main_assembly!r}",
+    )
+    digest_value = file_digest(confined(root, "input/" + main_assembly))
+    _require(
+        native_files[main_assembly] == digest_value,
+        "The archived main assembly differs from the native file inventory",
+    )
+    return digest_value
 
 
 def _validate_capture(root: Path, *, run_id: str, handoff_sha256: str, main_assembly: str, native_tool) -> dict:
@@ -234,7 +327,12 @@ def _validate_capture(root: Path, *, run_id: str, handoff_sha256: str, main_asse
         handoff_sha256=handoff_sha256,
     )
     main_assembly_sha256 = _validate_input(root, read_data(confined(root, "reports/input.json")), main_assembly)
-    _validate_evidence(root, main_assembly)
+    native_sha256 = _validate_native_discovery(root, main_assembly=main_assembly, handoff_sha256=handoff_sha256)
+    _require(
+        native_sha256 == main_assembly_sha256,
+        "The archived main assembly differs between the input report and the native inventory",
+    )
+    _validate_evidence(root)
     return {"main_assembly_sha256": main_assembly_sha256}
 
 
@@ -497,3 +595,91 @@ def admit_capture(
     finally:
         if not installed:
             shutil.rmtree(staging, ignore_errors=True)
+
+
+def verify_transfer(bundle: Path) -> dict | None:
+    """Revalidate transferred native provenance inside a delivery bundle.
+
+    Returns ``None`` for a neutral delivery that carries no transfer.  A partial triplet is
+    refused; a complete one re-hashes the sealed payload and re-reads the native tool record,
+    stage receipts, input/discovery main-assembly binding and evidence snapshot, so a resealed
+    but semantically invalid manifest cannot reach publication.
+    """
+
+    bundle = Path(bundle)
+    present = [name for name in TRANSFER_FILES if (bundle / name).is_file()]
+    if not present:
+        return None
+    missing = sorted(set(TRANSFER_FILES) - set(present))
+    _require(not missing, f"Transferred capture provenance is incomplete; missing: {missing}")
+
+    manifest = read_data(confined(bundle, CAPTURE_MANIFEST))
+    _require(isinstance(manifest, dict), "Transfer manifest must be an object")
+    _require(manifest.get("schema_version") == TRANSFER_SCHEMA, "Transfer manifest uses an unknown schema")
+    files = manifest.get("files")
+    _require(isinstance(files, dict) and files, "Transfer manifest declares no files")
+    _require(
+        manifest.get("native_stage_scope") == list(NATIVE_STAGE_SCOPE),
+        "Transfer manifest declares another native stage scope",
+    )
+    _require(manifest.get("file_count") == len(files), "Transfer manifest file count differs from its inventory")
+    for name, checksum in files.items():
+        artifact_path_parts(name)
+        _require(
+            _allowed_payload(name),
+            f"Transfer manifest lists a member outside the capture payload: {name!r}",
+        )
+        _require(_is_sha256(checksum), f"Transfer manifest hash is not a sha256: {name}")
+        _require(
+            file_digest(confined(bundle, name)) == checksum,
+            f"Delivered member differs from the transfer manifest: {name}",
+        )
+    actual_payload = {
+        path.relative_to(bundle).as_posix()
+        for path in bundle.rglob("*")
+        if path.is_file() and _allowed_payload(path.relative_to(bundle).as_posix())
+    }
+    absent = sorted(set(files) - actual_payload)
+    extra = sorted(actual_payload - set(files))
+    _require(
+        not absent and not extra,
+        f"Delivered capture inventory differs from the transfer manifest: missing={absent[:5]}, extra={extra[:5]}",
+    )
+    _require(
+        manifest.get("total_bytes") == sum(confined(bundle, name).stat().st_size for name in files),
+        "Transfer manifest size differs from its members",
+    )
+    _require(
+        manifest.get("native_tool_sha256") == digest(manifest.get("native_tool")),
+        "Transfer manifest native tool digest differs from its record",
+    )
+    _validate_native_tool(manifest.get("native_tool"))
+    _require(
+        read_data(confined(bundle, "reports/native-tool.json")) == manifest.get("native_tool"),
+        "Native tool report differs from the transfer manifest",
+    )
+    run_id = manifest.get("run_id")
+    handoff = manifest.get("handoff_sha256")
+    main_assembly = manifest.get("main_assembly")
+    _require(
+        isinstance(run_id, str) and run_id and _is_sha256(handoff) and isinstance(main_assembly, str) and main_assembly,
+        "Transfer manifest lacks its run, handoff or main assembly",
+    )
+    _validate_stage_receipts(
+        read_data(confined(bundle, "reports/native-stages.json")),
+        run_id=run_id,
+        handoff_sha256=handoff,
+    )
+    main_sha = _validate_input(bundle, read_data(confined(bundle, "reports/input.json")), main_assembly)
+    native_sha = _validate_native_discovery(bundle, main_assembly=main_assembly, handoff_sha256=handoff)
+    _require(
+        main_sha == native_sha == manifest.get("main_assembly_sha256"),
+        "The delivered main assembly differs from the transfer manifest",
+    )
+    _validate_evidence(bundle)
+    return {
+        "run_id": run_id,
+        "handoff_sha256": handoff,
+        "main_assembly": main_assembly,
+        "files": len(files),
+    }

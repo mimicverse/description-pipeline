@@ -18,7 +18,7 @@ from ..io import PipelineError, confined, file_digest, read_data, write_json
 from ..stages import STAGE_IDS, stage_view
 from ..verification.solidworks_urdf import check_bundle, require_qualified_report
 from .airflow_client import JOB_SCHEMA, validate_run_id
-from .stage_transfer import admit_capture
+from .stage_transfer import CAPTURE_MANIFEST, admit_capture
 
 STORE_SCHEMA = "solidworks-to-urdf.linux-run/v1"
 PORTABLE_STAGES = ("generate", "verify", "publish")
@@ -135,6 +135,10 @@ class LinuxStore:
 
         def finalize(meta: dict) -> dict:
             capture = self.capture_dir(run_id)
+            manifest_payload = meta.get("transfer")
+            manifest_path = capture / CAPTURE_MANIFEST
+            if isinstance(manifest_payload, dict) and not manifest_path.is_file():
+                write_json(manifest_path, manifest_payload)
             native_receipt = capture / "reports/native-stages.json"
             if native_receipt.is_file():
                 payload = read_data(native_receipt)

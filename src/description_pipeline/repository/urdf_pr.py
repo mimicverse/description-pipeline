@@ -37,7 +37,8 @@ BYTE_ATTRIBUTES = ("text", "filter", "working-tree-encoding")
 GIT_ATTRIBUTES = (
     "# Preserve verified delivery bytes in Git and on checkout.\n"
     + "".join(
-        f"/{name}{'/**' if name not in {'README.md', '.gitattributes'} else ''} -text -filter -working-tree-encoding\n"
+        f"/{name}{'/**' if name not in {'README.md', '.gitattributes', 'transfer-manifest.json'} else ''} "
+        "-text -filter -working-tree-encoding\n"
         for name in GOVERNED_PATHS
     )
 ).encode("ascii")
