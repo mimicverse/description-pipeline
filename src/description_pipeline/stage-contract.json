@@ -63,7 +63,7 @@
           "class": "frozen"
         },
         {
-          "label": "Derived definition and structural revision",
+          "label": "Derived definition; structural revision when metadata is complete",
           "path": "input/robot.yaml + input/cad-revision.json",
           "class": "derived"
         }
@@ -75,7 +75,7 @@
         },
         {
           "id": "discovery.binding",
-          "label": "Native evidence, original files, revision and routing agree"
+          "label": "Native evidence and original files agree; publication readiness recorded"
         }
       ],
       "evidence": [
@@ -99,7 +99,7 @@
       "input_qc": [
         {
           "id": "input.valid",
-          "label": "Derived definition, structural revision and archive integrity"
+          "label": "Derived definition, native provenance and archive integrity"
         },
         {
           "id": "runtime.ready",

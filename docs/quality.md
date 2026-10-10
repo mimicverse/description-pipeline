@@ -208,6 +208,11 @@ objects, and the warned facts (material coverage, usable ranges or drives) are
 not verified until the corresponding independent checks pass. Missing required
 evidence remains a failure.
 
+Source integrity is required before evidence can be used. Every imported CAD
+occurrence must bind to a file in the frozen handoff; a temporary native document
+or visible cached geometry is insufficient. Unbound or external sources remain
+errors, with the affected occurrences and reference paths retained in diagnostics.
+
 Mechanical review owns input meaning and measured authority. v1 exports visual
 meshes and physical properties; collision simplification, contact behavior,
 actuator/control interfaces and dynamic validation require separate acceptance.
