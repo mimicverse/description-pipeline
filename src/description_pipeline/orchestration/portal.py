@@ -648,8 +648,15 @@ def _automatic_summary(job: dict | None) -> dict:
         }
     if status == "failed":
         return {"state": "failed", "job_state": status, "checks": checks, "message": message}
-    if status in {"queued", "running"}:
-        return {"state": status, "job_state": status, "checks": checks}
+    if status in {"queued", "running", "native_complete"}:
+        # native_complete ends the native half only: the portable half is still the
+        # pipeline's remaining work, so the automatic view stays in progress instead of
+        # surfacing a terminal verdict or a raw protocol message.
+        return {
+            "state": "running" if status == "native_complete" else status,
+            "job_state": status,
+            "checks": checks,
+        }
     return {"state": "unverified", "job_state": status, "checks": checks, "message": message}
 
 
@@ -674,7 +681,9 @@ def _retry_assessment(run: dict, tasks: list[dict], job: dict | None, endpoint_e
         )
     if job.get("status") == "failed":
         return RetryAssessment(False, "native_terminal_failure", ())
-    if job.get("status") not in {"queued", "running", "passed"}:
+    # native_complete is the split pipeline's native boundary: the immutable evidence exists
+    # and recovery revalidates it, so it must not read as evidence-unavailable.
+    if job.get("status") not in {"queued", "running", "passed", "native_complete"}:
         return RetryAssessment(False, "endpoint_evidence_unavailable", ())
     return assessment
 
@@ -1245,7 +1254,9 @@ class PortalApp:
             job_state = str(job.get("status") or "")
             if job_state in {"queued", "running"}:
                 return "run_active", "原生作业仍在执行，结束后才能删除"
-            if job_state not in {"passed", "failed"}:
+            # native_complete is a definitive native state: the Windows half is done and only
+            # the Linux portable half may still be running (checked above).
+            if job_state not in {"passed", "failed", "native_complete"}:
                 return "unconfirmed", "无法确认原生作业状态，请稍后重试"
         return None
 

@@ -666,12 +666,17 @@ class WindowsEndpoint:
         return bytes(data)
 
     def wait(self, run_id: str, *, interval: float = 2.0, timeout: float = 600.0) -> dict:
-        """Bounded polling; returns the job dict only for the terminal passed state."""
+        """Bounded polling; returns the job dict at the native terminal boundary.
+
+        The split pipeline ends the native half at ``native_complete`` (the sealed capture
+        then transfers to Linux); a legacy end-to-end run still ends at ``passed``. Only
+        ``failed`` raises here — qualification stays with the result gates.
+        """
         deadline = self._clock() + timeout
         while True:
             job = self.get_job(run_id)
             status = job["status"]
-            if status == "passed":
+            if status in {"passed", "native_complete"}:
                 return job
             if status == "failed":
                 raise JobFailed(run_id, job)
