@@ -183,6 +183,13 @@ or one supported relative motion. Temporary fixed flags and mate names cannot
 establish motion. Unresolved entities, unsupported constraints, ambiguous motion
 and non-tree topology block derivation.
 
+Constraint reconstruction accepts concentric circular edges and cylindrical
+faces when their recorded axes are coaxial in the assembly frame. A circular
+edge coincident with a plane must lie in that plane, with aligned normals.
+Both entities require usable geometry; a missing entity cannot supply a
+constraint. Supporting an edge for mate reconstruction does not qualify it as
+the independently reread cylindrical interface required for a joint axis.
+
 Capture requires a rereadable cylindrical interface for each motion axis.
 Named axes alone do not qualify this capture path. Owned `CS_<link>` datums
 identify body frames and `CS_base_link` the root; an optional JCS must match its
