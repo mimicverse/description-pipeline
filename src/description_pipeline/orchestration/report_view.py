@@ -487,13 +487,10 @@ def _failure(job: dict, stage: dict) -> dict:
             for code, count in sorted(counts.items(), key=lambda entry: (-entry[1], entry[0]))
         ]
         structured_samples = samples
-        top = "、".join(f"{group['label_zh']}×{group['count']}" for group in structured_groups[:6])
-        remainder = "…" if len(structured_groups) > 6 else ""
         title = "结构解析检查未通过"
         meaning = (
-            f"原生结构解析未通过工程定义检查：共 {len(blocking_findings)} 项，"
-            "可能缺少必需定义，或装配约束当前不受支持。"
-            f"分类：{top}{remainder}。逐项对象与说明见问题清单（全部保留）。"
+            f"共 {len(blocking_findings)} 项检查未通过：可能缺少必需定义，也可能超出当前解析能力。"
+            "展开问题清单查看对象、原因与证据；解析不支持不等于结构设计有误。"
         )
         kind = "definition"
     elif raw_type == "CadError" and raw_detail and {"errors", "warnings"} <= set(raw_detail):
