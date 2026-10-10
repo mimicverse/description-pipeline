@@ -341,6 +341,34 @@ class DiscoveryTransferTests(unittest.TestCase):
         for name in sealed["manifest"]["files"]:
             self.assertFalse((destination / name).exists())
 
+    def test_consistently_resealed_definition_cannot_hide_blocking_findings(self) -> None:
+        prepared = self._prepared()
+        modified = self._path("blocked-package")
+        shutil.copytree(prepared.package, modified)
+        discovery_path = modified / transfer.DISCOVERY_FILE
+        payload = json.loads(discovery_path.read_bytes())
+        payload["findings"].append({"code": "discovery.axis_unresolved", "blocking": True})
+        discovery_path.write_bytes(canonical(payload))
+        findings_path = modified / transfer.FINDINGS_FILE
+        findings_document = json.loads(findings_path.read_bytes())
+        findings_document["findings"] = payload["findings"]
+        findings_path.write_bytes(canonical(findings_document))
+        polluted_identity = digest(inventory(modified))
+        sealed = self._seal_capture_request(replace(prepared, package=modified, prepared_sha256=polluted_identity))
+        destination = self._path("windows-prepared")
+        shutil.copytree(self.source, destination)
+        with self.assertRaisesRegex(PipelineError, "blocking findings"):
+            transfer.stage_capture_request(
+                Path(sealed["artifact"]["path"]),
+                destination,
+                expected_run_id=RUN_ID,
+                expected_selection=self.selection,
+                expected_record=self.payload,
+                expected_native_tool=self.tool,
+                expected_prepared_sha256=polluted_identity,
+            )
+        self.assertEqual(inventory(destination), inventory(self.source))
+
     # -- leg 1 refusals ----------------------------------------------------
 
     def test_raw_record_refusals(self) -> None:

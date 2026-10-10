@@ -3766,9 +3766,7 @@ def prepare_native_package(
     )
 
 
-def read_native_record(
-    frozen_source: Path, settings: DiscoverySettings, *, backend=None, on_activity=None
-) -> dict:
+def read_native_record(frozen_source: Path, settings: DiscoverySettings, *, backend=None, on_activity=None) -> dict:
     """Native-reading adapter: the only step that needs Windows/COM and a CAD session."""
 
     if backend is None:
@@ -3821,9 +3819,7 @@ def derive_native_package(
         )
     for name, recorded_sha in record_files.items():
         if not isinstance(recorded_sha, str) or native_files.get(str(name)) != recorded_sha:
-            raise PipelineError(
-                f"native discovery record file binding does not match the frozen directory: {name!r}"
-            )
+            raise PipelineError(f"native discovery record file binding does not match the frozen directory: {name!r}")
     identity_block = record.get("identity") if isinstance(record.get("identity"), dict) else {}
     recorded_main = identity_block.get("main_assembly")
     if not _text(recorded_main):
@@ -4020,6 +4016,12 @@ def derive_native_package(
         "generator_version": GENERATOR_VERSION,
         "handoff_sha256": handoff_sha256,
         "native_files": native_files,
+        "derivation": {
+            "frozen_names": dict(settings.frozen_names),
+            "record_roots": [str(root) for root in settings.record_roots],
+            "main_assembly": recorded_main,
+            "configuration": configuration,
+        },
         "identity": identity,
         "records": [],
         "frozen_names": derived_names,

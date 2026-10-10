@@ -70,9 +70,7 @@ def freeze_inputs(
                         "The selected main assembly case does not match the frozen handoff file: "
                         f"{main_assembly!r} vs {mismatched[0]!r}"
                     )
-                raise PipelineError(
-                    f"The selected main assembly is not part of the frozen handoff: {main_assembly!r}"
-                )
+                raise PipelineError(f"The selected main assembly is not part of the frozen handoff: {main_assembly!r}")
             detail["main_assembly"] = main_assembly
             detail["main_assembly_sha256"] = files[main_assembly]
         return detail
@@ -93,6 +91,7 @@ def discover_structure(
     configuration: dict,
     targets: dict,
     preparer=None,
+    prepared=None,
     on_event=None,
     on_activity=None,
 ):
@@ -107,14 +106,27 @@ def discover_structure(
 
     def discovery_inputs():
         _require(package_inventory(frozen) == expected_files, "Frozen engineering changed before discovery")
-        names = read_data(configuration["frozen_names_file"]) if configuration.get("frozen_names_file") else {}
+        if prepared is not None:
+            payload = read_data(prepared.discovery_path)
+            derivation = payload.get("derivation") if isinstance(payload, dict) else None
+            _require(isinstance(derivation, dict), "Prepared discovery lacks its Linux derivation settings")
+            _require(derivation.get("main_assembly") == main_assembly, "Linux derivation selected another assembly")
+            names = derivation.get("frozen_names")
+            record_roots = derivation.get("record_roots")
+            _require(
+                isinstance(record_roots, list) and all(isinstance(value, str) for value in record_roots),
+                "Prepared discovery has invalid controlled-record root identifiers",
+            )
+        else:
+            names = read_data(configuration["frozen_names_file"]) if configuration.get("frozen_names_file") else {}
+            record_roots = configuration.get("record_roots", [])
         _require(
             isinstance(names, dict)
             and all(isinstance(key, str) and isinstance(value, str) for key, value in names.items()),
             "Frozen-name registry must map native identities to interface names",
         )
         return DiscoverySettings(
-            record_roots=tuple(configuration.get("record_roots", [])),
+            record_roots=tuple(record_roots),
             frozen_names=names,
             main_assembly=main_assembly,
         )
@@ -124,6 +136,7 @@ def discover_structure(
             "handoff_sha256": expected_digest,
             "files_sha256": digest(expected_files),
             "frozen_names_sha256": digest(value.frozen_names),
+            "record_roots": [str(root) for root in value.record_roots],
         }
         if main_assembly is not None:
             described["main_assembly"] = main_assembly
@@ -137,9 +150,10 @@ def discover_structure(
         discovery_inputs,
         describe=describe_settings,
     )
-    prepared = (preparer or prepare_native_package)(
-        frozen, output, run_id, settings=settings, on_event=on_event, on_activity=on_activity
-    )
+    if prepared is None:
+        prepared = (preparer or prepare_native_package)(
+            frozen, output, run_id, settings=settings, on_event=on_event, on_activity=on_activity
+        )
     discovery = {
         "passed": prepared.passed,
         "findings": list(prepared.findings),
@@ -149,13 +163,15 @@ def discover_structure(
     }
     target = targets.get(prepared.hardware_id)
     if target is None:
-        discovery["findings"].append({
-            "code": "discovery.publication_target_missing",
-            "object": "assembly",
-            "message": "No model repository is configured for this CAD identity; publication is unavailable",
-            "blocking": False,
-            "detail": {"hardware_id": prepared.hardware_id, "publication_blocker": "repository_target"},
-        })
+        discovery["findings"].append(
+            {
+                "code": "discovery.publication_target_missing",
+                "object": "assembly",
+                "message": "No model repository is configured for this CAD identity; publication is unavailable",
+                "blocking": False,
+                "detail": {"hardware_id": prepared.hardware_id, "publication_blocker": "repository_target"},
+            }
+        )
     _state(on_event, "discover", "running", discovery=discovery)
     checked(on_event, "discover", "output", "discovery.definition", lambda: discovery)
 
@@ -225,15 +241,18 @@ def inspect_prepared_input(package: Path) -> dict:
         else:
             identity = native_metadata(package, author or {})
             missing = [
-                key for key in ("hardware_id", "revision", "owner", "change_summary", "control")
+                key
+                for key in ("hardware_id", "revision", "owner", "change_summary", "control")
                 if identity.get(key) is None
             ]
             _require(bool(missing), "Complete CAD identity requires its generated cad-revision.json")
-            report["warnings"].append({
-                "code": "input.cad_revision_pending",
-                "message": "CAD administrative identity is incomplete; publication is unavailable",
-                "detail": {"publication_blocker": "cad_revision", "missing": missing},
-            })
+            report["warnings"].append(
+                {
+                    "code": "input.cad_revision_pending",
+                    "message": "CAD administrative identity is incomplete; publication is unavailable",
+                    "detail": {"publication_blocker": "cad_revision", "missing": missing},
+                }
+            )
     except (PipelineError, OSError, ValueError) as error:
         report["errors"].append({"code": "input.cad_revision", "message": str(error), "detail": None})
         report["passed"] = False

@@ -373,13 +373,18 @@ class Jobs:
         return None
 
     @staticmethod
-    def _native_stage_rows(rows):
+    def _native_stage_rows(rows, *, reader_matches=True):
         """The native endpoint owns freeze/discover/capture; the rest runs on Linux."""
         for row in rows:
             if row.get("stage") not in NATIVE_STAGES:
                 row["eligible"] = False
                 row["reason"] = "linux_owned"
                 row["reason_zh"] = "该阶段已移至 Linux 执行；请通过交付流程重新运行"
+                row["recomputes"] = []
+            elif not reader_matches:
+                row["eligible"] = False
+                row["reason"] = "tool_changed"
+                row["reason_zh"] = "原生依赖读取器已变化；请重新提交工程并完成文件选择"
                 row["recomputes"] = []
         return rows
 
@@ -608,42 +613,13 @@ class Jobs:
             "run_id": identifier,
             "status": job.get("status"),
             "stage_reruns": self._native_stage_rows(
-                stage_reruns(job, probe=self._probe(job), tool=self._tool_state(job))
+                stage_reruns(job, probe=self._probe(job), tool=self._tool_state(job)),
+                reader_matches=job.get("native_tool") == self._tool_identity(),
             ),
         }
         with self.mutex:
             self._plans[identifier] = (key, time.monotonic(), payload)
         return payload
-
-    def preview(self, identifier):
-        """Expose only artifact bytes bound to a successful independently verified run."""
-        job = self.snapshot(identifier)
-        _require(job["status"] in {"passed", "failed"}, "URDF preview is available after verification")
-        output = self.config["output_root"] / identifier
-        files = subject_inventory(output)
-        result = job.get("result") or {}
-        quality = result.get("quality") or {}
-        _require(
-            quality.get("passed") is True and quality.get("subject_sha256") == result.get("subject_sha256"),
-            "Unverified models cannot be previewed",
-        )
-        _require(
-            any(
-                check.get("id") == "source.native_discovery" and check.get("passed") is True
-                for check in quality.get("checks", [])
-            ),
-            "Native-derived models require independent discovery verification before preview",
-        )
-        _require(digest(files) == result.get("subject_sha256"), "Delivered model differs from its verified subject")
-        assets = {name: checksum for name, checksum in files.items() if name.startswith(("urdf/", "meshes/"))}
-        _require("urdf/robot.urdf" in assets, "Verified delivery has no URDF preview")
-        return {
-            "pipeline_id": PIPELINE_ID,
-            "run_id": identifier,
-            "subject_sha256": result["subject_sha256"],
-            "urdf": "urdf/robot.urdf",
-            "files": assets,
-        }
 
     def artifact(self, identifier, name):
         job = self.snapshot(identifier)
@@ -677,20 +653,7 @@ class Jobs:
             except BaseException:
                 stream.close()
                 raise
-        preview = self.preview(identifier)
-        _require(name in preview["files"], "Only verified URDF and mesh assets are available")
-        path = confined(self.config["output_root"] / identifier, name)
-        stream = path.open("rb")
-        try:
-            _require(
-                hashlib.file_digest(stream, "sha256").hexdigest() == preview["files"][name],
-                "Preview artifact differs from its verified bytes",
-            )
-            stream.seek(0)
-            return stream, path.stat().st_size
-        except BaseException:
-            stream.close()
-            raise
+        raise RequestError("Only sealed native records and capture transfers are available", 404)
 
     def create(self, request):
         _require(isinstance(request, dict), "Expected a JSON object")
@@ -722,12 +685,16 @@ class Jobs:
                 "created_at": datetime.now(UTC).isoformat(),
             }
             if spec is not None:
-                _require(spec["from_stage"] in NATIVE_STAGES, "Portable reruns belong to the Linux host")
+                if spec["from_stage"] not in NATIVE_STAGES:
+                    raise _refusal("linux_owned", "Portable reruns belong to the Linux host")
                 parent = self.jobs.get(spec["parent_run"])
                 _require(parent is not None and parent["run_id"] != identifier, "The parent native run is unknown")
                 _require(parent.get("native_tool") == tool, "Native reader changed; start a fresh source selection")
-                if self._active_attempt(spec["parent_run"]) is not None:
-                    raise _refusal("already_active", "The selected run already has an active linked attempt")
+                active = self._active_attempt(spec["parent_run"])
+                if active is not None:
+                    raise _refusal(
+                        "already_active", "The selected run already has an active linked attempt", active_run_id=active
+                    )
                 plan = start_plan(parent, spec["from_stage"], probe=self._probe(parent), tool=self._tool_state(parent))
                 if not plan["accepted"]:
                     raise _refusal(plan["reason"], plan["reason_zh"], earliest=plan["earliest_required"])
@@ -793,17 +760,21 @@ class Jobs:
         session = self._selection(identifier)
         with self.selection_locks[identifier]:
             prior_state = session.state
+            with self.mutex:
+                if prior_state != "sealed":
+                    _require(self.jobs[identifier]["status"] == "selecting", "The source selection is no longer active")
             manifest = session.seal(request["selection"])
+            if prior_state == "sealed":
+                return self.snapshot(identifier)
             with self.condition:
                 job = self.jobs[identifier]
-                _require(job["status"] not in {"failed", "native_complete", "passed"}, "The native run is terminal")
+                _require(job["status"] == "selecting", "The source selection is no longer active")
                 job.update(
                     selection=session.snapshot(),
                     handoff_sha256=manifest["handoff_sha256"],
                     package_files=manifest["files"],
                 )
-                if prior_state != "sealed":
-                    job["status"] = "running"
+                job["status"] = "running"
                 self._save(job)
                 self.condition.notify_all()
         return self.snapshot(identifier)
@@ -971,6 +942,9 @@ class Jobs:
             if job["status"] != "awaiting_definition":
                 raise RequestError("Only a pending Linux derivation can be aborted", 409)
             job.update(copy.deepcopy(request), status="failed", client_failure=copy.deepcopy(request))
+            discovery = request["detail"].get("discovery")
+            if isinstance(discovery, dict) and discovery.get("passed") is False:
+                job["discovery"] = copy.deepcopy(discovery)
             self._clear_activity(job)
             self._save(job)
             self.condition.notify_all()
@@ -1082,7 +1056,7 @@ class Jobs:
             main_assembly=selection,
             configuration={},
             targets=self.config["targets"],
-            preparer=lambda *args, **kwargs: prepared,
+            prepared=prepared,
             on_event=lambda item: self._event(identifier, item),
             on_activity=lambda item: self._activity(identifier, item),
         )
@@ -1342,8 +1316,6 @@ def handler(jobs, token):
 
                             shutil.copyfileobj(stream, self.wfile, length=1024 * 1024)
                             self.close_connection = True
-                    elif suffix.endswith("/preview"):
-                        self._reply(200, jobs.preview(suffix[: -len("/preview")]))
                     elif suffix.endswith("/reruns"):
                         self._reply(200, jobs.plan(suffix[: -len("/reruns")]))
                     else:

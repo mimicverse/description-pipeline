@@ -648,12 +648,12 @@ def _automatic_summary(job: dict | None) -> dict:
         }
     if status == "failed":
         return {"state": "failed", "job_state": status, "checks": checks, "message": message}
-    if status in {"queued", "running", "native_complete"}:
+    if status in {"queued", "selecting", "running", "awaiting_definition", "native_complete"}:
         # native_complete ends the native half only: the portable half is still the
         # pipeline's remaining work, so the automatic view stays in progress instead of
         # surfacing a terminal verdict or a raw protocol message.
         return {
-            "state": "running" if status == "native_complete" else status,
+            "state": "queued" if status == "queued" else "running",
             "job_state": status,
             "checks": checks,
         }
@@ -683,7 +683,7 @@ def _retry_assessment(run: dict, tasks: list[dict], job: dict | None, endpoint_e
         return RetryAssessment(False, "native_terminal_failure", ())
     # native_complete is the split pipeline's native boundary: the immutable evidence exists
     # and recovery revalidates it, so it must not read as evidence-unavailable.
-    if job.get("status") not in {"queued", "running", "passed", "native_complete"}:
+    if job.get("status") not in {"queued", "selecting", "running", "awaiting_definition", "passed", "native_complete"}:
         return RetryAssessment(False, "endpoint_evidence_unavailable", ())
     return assessment
 
@@ -1252,7 +1252,7 @@ class PortalApp:
             return "unconfirmed", "暂时无法确认原生作业状态，请稍后重试"
         if isinstance(job, dict):
             job_state = str(job.get("status") or "")
-            if job_state in {"queued", "running"}:
+            if job_state in {"queued", "selecting", "running", "awaiting_definition"}:
                 return "run_active", "原生作业仍在执行，结束后才能删除"
             # native_complete is a definitive native state: the Windows half is done and only
             # the Linux portable half may still be running (checked above).
@@ -1855,22 +1855,7 @@ class PortalApp:
             with self._lock:
                 self._previews[run_id] = (now, preview)
             return preview
-        endpoint = self._endpoint()
-        try:
-            job = endpoint.get_job(run_id)
-            if str(job.get("status") or "") in {"queued", "running"}:
-                raise PortalError(HTTPStatus.NOT_FOUND, "该运行还没有可展示的已验证交付")
-            verified_result(job.get("result"))
-            preview = endpoint.get_preview(run_id)
-        except EndpointNotFound as error:
-            raise PortalError(HTTPStatus.NOT_FOUND, "该运行还没有可展示的已验证交付") from error
-        except ResultNotPublishable as error:
-            raise PortalError(HTTPStatus.CONFLICT, f"模型尚未通过独立校验：{error}") from error
-        except EndpointError as error:
-            raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
-        with self._lock:
-            self._previews[run_id] = (now, preview)
-        return preview
+        raise PortalError(HTTPStatus.NOT_FOUND, "该运行还没有可展示的已验证交付")
 
     def _preview(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
         session = self._session(environ)
@@ -1912,29 +1897,7 @@ class PortalApp:
             ]
             start_response("200 OK", _common_headers(headers, self.config))
             return [bytes(data)]
-        endpoint = self._endpoint()
-        try:
-            data = endpoint.read_artifact(
-                native_run_id(dag_run_id),
-                artifact,
-                sha256=digest,
-                limit=self.config.artifact_limit,
-            )
-        except EndpointNotFound as error:
-            raise PortalError(HTTPStatus.NOT_FOUND, "该文件不在已验证交付清单中") from error
-        except EndpointProtocolError as error:
-            log.warning("artifact verification failed run=%s name=%s: %s", dag_run_id, artifact, error)
-            raise PortalError(HTTPStatus.BAD_GATEWAY, "交付文件摘要校验失败，已拒绝提供") from error
-        except EndpointError as error:
-            raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
-        content_type = _ARTIFACT_TYPES.get(Path(artifact).suffix.lower(), "application/octet-stream")
-        headers = [
-            ("Content-Type", content_type),
-            ("Content-Length", str(len(data))),
-            ("Cache-Control", "private, max-age=300"),
-        ]
-        start_response("200 OK", _common_headers(headers, self.config))
-        return [data]
+        raise PortalError(HTTPStatus.NOT_FOUND, "该运行还没有可展示的已验证交付")
 
     # ---------------------------------------------------------------- static
     def _static(self, start_response: Callable, name: str) -> Iterable[bytes]:

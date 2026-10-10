@@ -782,12 +782,21 @@ def _build_prepared(destination: Path, manifest: dict, expected_record: Mapping[
         "prepared discovery is bound to another handoff",
     )
     _require(payload.get("raw") == dict(expected_record), "prepared discovery carries another raw record")
+    _require(
+        isinstance(payload.get("native_files"), dict) and digest(payload["native_files"]) == manifest["handoff_sha256"],
+        "prepared discovery carries another selected file inventory",
+    )
     identity = payload.get("identity") if isinstance(payload.get("identity"), Mapping) else {}
+    _require(
+        identity.get("main_assembly") == manifest["main_assembly"], "prepared discovery names another main assembly"
+    )
     findings = findings_document.get("findings") if isinstance(findings_document, Mapping) else None
     _require(
         isinstance(findings, list) and all(isinstance(item, dict) for item in findings),
         "prepared findings are unreadable",
     )
+    _require(payload.get("findings") == findings, "prepared findings disagree with the discovery evidence")
+    _require(not any(item.get("blocking", True) for item in findings), "prepared discovery contains blocking findings")
     revision_path = destination / REVISION_FILE
     revision_sha256 = hashlib.sha256(revision_path.read_bytes()).hexdigest() if revision_path.is_file() else ""
     return PreparedPackage(

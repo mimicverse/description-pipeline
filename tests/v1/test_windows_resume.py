@@ -78,7 +78,8 @@ class ResumeEndpointTests(EndpointFixture, unittest.TestCase):
         for stage in LINUX_STAGES:
             with self.assertRaises(RequestError) as caught:
                 jobs.create(self.linked_request(parent, stage))
-            self.assertEqual(caught.exception.status, 400)
+            self.assertEqual(caught.exception.status, 409)
+            self.assertEqual(caught.exception.payload["reason"], "linux_owned")
             self.assertIn("Linux", str(caught.exception))
         with self.assertRaises(RequestError):
             jobs.artifact(parent["run_id"], "urdf/robot.urdf")
