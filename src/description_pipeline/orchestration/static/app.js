@@ -1060,7 +1060,7 @@ function buildFailureCard(failure, report) {
       const hint = document.createElement("p");
       hint.className = "muted small";
       hint.textContent =
-        "源完整性未通过说明冻结的源文件与清单或采集记录不一致；逐项差异见该检查的原始证据，不代表 CAD 缺陷。";
+        "来源证据检查未通过；请依据失败检查及原始证据区分输入缺失、来源不一致或解析问题。";
       card.append(hint);
     } else {
       const detail = document.createElement("p");

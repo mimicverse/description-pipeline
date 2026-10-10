@@ -270,7 +270,7 @@ class ReportUiContractTests(unittest.TestCase):
             "buildFailureCard(report.failure, report)",
             "未通过的自动检查（",
             "failedChecks.slice(0, 5)",
-            "源完整性未通过说明",
+            "来源证据检查未通过",
             "该阶段另有",
             "警告不计为通过",
         ):
