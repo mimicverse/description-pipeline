@@ -142,14 +142,22 @@ def prepare_archive(source: Path, archive: Path) -> dict:
 
 
 def import_archive(archive: Path, store: Path) -> tuple[Path, dict]:
-    """Extract only regular, portable files; validate before installing a package."""
+    """Extract only regular, portable files, validate in place, install atomically.
+
+    The extracted tree is probed as the package itself and renamed into the
+    content-addressed store: one extraction and no second whole-package copy.
+    Every install rule is preserved - immutable target, identical-bytes reuse,
+    concurrent-install tolerance, and the mutation recheck that refuses to
+    install bytes that changed while the package was being inspected.
+    """
     if Path(archive).stat().st_size > MAX_HANDOFF_BYTES:
         raise PipelineError("Mechanical handoff transport exceeds the 16 GiB limit")
     store = _directory(Path(store), exists=False)
     store.mkdir(parents=True, exist_ok=True)
     store = _directory(store)
     with tempfile.TemporaryDirectory(prefix=".upload-", dir=store) as temporary:
-        package = Path(temporary)
+        package = Path(temporary) / "package"
+        package.mkdir()
         try:
             with zipfile.ZipFile(archive) as incoming:
                 members = incoming.infolist()
@@ -170,10 +178,26 @@ def import_archive(archive: Path, store: Path) -> tuple[Path, dict]:
                     if member.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
                         raise PipelineError("Unsupported handoff ZIP compression")
                 for member in members:
-                    target = Path(_filesystem_path(confined(package, member.filename, exists=False)))
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    with incoming.open(member) as original, target.open("xb") as output:
+                    member_path = Path(_filesystem_path(confined(package, member.filename, exists=False)))
+                    member_path.parent.mkdir(parents=True, exist_ok=True)
+                    with incoming.open(member) as original, member_path.open("xb") as output:
                         shutil.copyfileobj(original, output, length=1024 * 1024)
         except (zipfile.BadZipFile, EOFError, RuntimeError) as error:
             raise PipelineError(f"Invalid handoff ZIP: {error}") from error
-        return freeze_handoff(package, store)
+        identity = describe_handoff(package)
+        target = store / identity["handoff_sha256"]
+        if target.exists():
+            if describe_handoff(target) != identity:
+                raise PipelineError(
+                    "Managed handoff inventory was modified; retain its diagnostics and repair the store"
+                )
+            return target, identity
+        if package_inventory(package) != identity["files"]:
+            raise PipelineError("Mechanical handoff changed during import; no native job was started")
+        try:
+            os.rename(package, target)
+        except OSError:
+            # Another import may have installed these same bytes concurrently.
+            if not target.is_dir() or describe_handoff(target) != identity:
+                raise
+    return target, identity

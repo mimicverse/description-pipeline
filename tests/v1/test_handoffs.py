@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import stat
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from description_pipeline.io import PipelineError, digest
+from description_pipeline.sources.solidworks import handoff as handoff_module
 from description_pipeline.sources.solidworks.handoff import (
     describe_handoff,
     freeze_handoff,
@@ -56,6 +58,73 @@ class HandoffTests(unittest.TestCase):
         package, received = import_archive(archive, self.store)
         self.assertEqual(sent, received)
         self.assertEqual(sent["files"], package_inventory(package))
+
+    def test_zip_import_installs_without_a_second_package_copy(self):
+        archive = self.root / "transport.zip"
+        sent = prepare_archive(self.source, archive)
+        with patch.object(handoff_module.shutil, "copyfile", side_effect=AssertionError("second package copy")):
+            package, received = import_archive(archive, self.store)
+        self.assertEqual(sent, received)
+        self.assertEqual(package, self.store / sent["handoff_sha256"])
+        self.assertEqual(sent["files"], package_inventory(package))
+        # Only the content-addressed package remains; the extraction staging is gone.
+        self.assertEqual([entry.name for entry in self.store.iterdir()], [sent["handoff_sha256"]])
+
+    def test_repeat_import_reuses_the_installed_package_and_rejects_modification(self):
+        archive = self.root / "transport.zip"
+        sent = prepare_archive(self.source, archive)
+        package, _received = import_archive(archive, self.store)
+        with patch.object(handoff_module.shutil, "copyfile", side_effect=AssertionError("second package copy")):
+            again, repeated = import_archive(archive, self.store)
+        self.assertEqual((again, repeated), (package, sent))
+        (package / "零件.SLDPRT").write_bytes(b"tampered managed bytes")
+        with self.assertRaises(PipelineError) as caught:
+            import_archive(archive, self.store)
+        self.assertIn("Managed handoff inventory was modified", str(caught.exception))
+
+    def test_concurrent_identical_install_is_tolerated(self):
+        archive = self.root / "transport.zip"
+        sent = prepare_archive(self.source, archive)
+        real_rename = os.rename
+        raced = {"done": False}
+
+        def racing_rename(source_path, target_path):
+            if not raced["done"]:
+                raced["done"] = True
+                freeze_handoff(self.source, self.store)  # identical bytes win the race first
+            return real_rename(source_path, target_path)
+
+        with patch.object(handoff_module.os, "rename", side_effect=racing_rename):
+            package, received = import_archive(archive, self.store)
+        self.assertEqual(received, sent)
+        self.assertEqual(package, self.store / sent["handoff_sha256"])
+        self.assertEqual(sent["files"], package_inventory(package))
+
+    def test_mutation_between_inspection_and_install_is_refused(self):
+        archive = self.root / "transport.zip"
+        prepare_archive(self.source, archive)
+        real_describe = handoff_module.describe_handoff
+        real_inventory = handoff_module.package_inventory
+        state = {"after_describe": False}
+
+        def spy_describe(path):
+            identity = real_describe(path)
+            state["after_describe"] = True
+            return identity
+
+        def spy_inventory(path):
+            result = real_inventory(path)
+            if state["after_describe"] and result:
+                return dict.fromkeys(result, "0" * 64)
+            return result
+
+        with (
+            patch.object(handoff_module, "describe_handoff", side_effect=spy_describe),
+            patch.object(handoff_module, "package_inventory", side_effect=spy_inventory),
+            self.assertRaises(PipelineError) as caught,
+        ):
+            import_archive(archive, self.store)
+        self.assertIn("changed during import", str(caught.exception))
 
     def test_native_only_input_needs_no_authored_pipeline_files(self):
         identity = describe_handoff(self.source)
