@@ -934,7 +934,15 @@ class OracleSemanticsTests(unittest.TestCase):
             errors,
         )
 
-    def test_nested_frame_attachment_blocks(self) -> None:
+    def test_nested_self_frame_is_an_ordinary_pair_and_not_a_frame_problem(self) -> None:
+        """The scope's own frame entity is an ordinary in-scope endpoint (design contract).
+
+        A nested self-frame relation reconstructs as a normal in-scope pair and must not
+        raise the frozen-top frame-attachment block.  The undeclared material component
+        added alongside it is still caught by the independent body derivation, which is
+        a different channel and stays untouched.
+        """
+
         def mutate(raw, payload):
             raw["components"].append(self._container())
             child = copy.deepcopy(raw["components"][1])
@@ -942,7 +950,7 @@ class OracleSemanticsTests(unittest.TestCase):
             raw["components"].append(child)
             raw["mates"].append(
                 {
-                    "name": "nested_ground__coaxial",
+                    "name": "nested_self__coaxial",
                     "type": "concentric",
                     "suppressed": False,
                     "error_code": 0,
@@ -974,15 +982,12 @@ class OracleSemanticsTests(unittest.TestCase):
 
         package = self.baseline()
         self._native(package, mutate)
-        passed, errors, _checks = self.check(package)
-        self.assertFalse(passed, errors)
-        self.assertTrue(
-            any(
-                error["code"] == "discovery.frame_attachment" and "outside the frozen top assembly" in error["message"]
-                for error in errors
-            ),
+        _passed, errors, _checks = self.check(package)
+        self.assertFalse(
+            any(error["code"] == "discovery.frame_attachment" for error in errors),
             errors,
         )
+        self.assertTrue(any(error["code"] == "discovery.bodies" for error in errors), errors)
 
     def test_assembly_frame_identity_requires_the_explicit_marker(self) -> None:
         from description_pipeline.verification.native_discovery import _frame_attachment, _frames, _rows_for

@@ -107,6 +107,24 @@ def _names(mate: dict) -> list[str]:
     return out
 
 
+def _nested_self_frame_entity(entities: list[dict], scope) -> dict | None:
+    """The scope's own frame entity inside a nested self-frame relation, if present.
+
+    A mate whose scope is ``S`` may carry exactly one assembly-frame entity with
+    ``component == S``: that entity is S's own reference geometry, expressed in S's own
+    space.  In the parent record the occurrence ``S`` supplies the transform into parent
+    coordinates, so the relation is an ordinary in-scope pair -- it never takes part in
+    the frozen top attachment and never grounds anything.
+    """
+
+    if not isinstance(scope, str) or scope == "":
+        return None
+    flagged = [entity for entity in entities if entity.get("assembly_frame") is True]
+    if len(flagged) == 1 and flagged[0].get("component") == scope:
+        return flagged[0]
+    return None
+
+
 def _number(value) -> float | None:
     """A real finite JSON number; booleans, numeric strings and null are not numbers."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -651,6 +669,14 @@ def _rows_for(mate: dict, frames) -> dict | None:
     if kind not in SUPPORTED_MATES:
         return None
     entities = _entities(mate)
+    nested = _nested_self_frame_entity(entities, mate.get("scope"))
+    if nested is not None:
+        # The scope's own frame entity resolves through the scope occurrence transform,
+        # exactly like the same relation written as an ordinary in-scope pair.
+        entities = [
+            {**entity, "assembly_frame": False} if entity is nested else entity
+            for entity in entities
+        ]
     if len(entities) < 2:
         return None
     first, second = entities[0], entities[1]
@@ -1046,17 +1072,27 @@ def _frame_attachment(record: dict) -> dict:
     and every occurrence endpoint must belong to exactly one rigid cluster; that
     cluster is the only claim the frame attachment can carry.  Nested, incomplete or
     ambiguous attachments are recorded as problems, never guessed.
+
+    A nested self-frame mate (scope ``S`` with its own flagged entity ``component == S``)
+    is an ordinary in-scope pair: it is not part of this aggregate.  Problems on such
+    nested relations -- or on any mate that is not a well-formed top-scope attachment --
+    are scope-isolated diagnostics: they are reported, but only top-scope problems veto
+    the frozen-top attachment.
     """
 
     problems: list[dict] = []
+    top_problems: list[dict] = []
+    scope_problems: list[dict] = []
     seen = 0
     attached: list[str] = []
     rows_all: list[list[float]] = []
     known = _components_by_name(record)
     frames = _frames(record)
 
-    def problem(message: str, detail: dict | None = None) -> None:
-        problems.append({"code": "discovery.frame_attachment", "message": message, "detail": detail or {}})
+    def problem(target: list[dict], message: str, detail: dict | None = None) -> None:
+        item = {"code": "discovery.frame_attachment", "message": message, "detail": detail or {}}
+        problems.append(item)
+        target.append(item)
 
     for index, mate in enumerate(record.get("mates") or []):
         if not isinstance(mate, dict) or mate.get("suppressed"):
@@ -1065,13 +1101,32 @@ def _frame_attachment(record: dict) -> dict:
         flagged = [entity for entity in entities if entity.get("assembly_frame") is True]
         if not flagged:
             continue
-        seen += 1
         name = str(mate.get("name") or index)
         scope = mate.get("scope")
+        nested = _nested_self_frame_entity(entities, scope)
+        if nested is not None:
+            others = [entity for entity in entities if entity is not nested]
+            endpoint = others[0].get("component") if len(others) == 1 else None
+            if (
+                len(entities) != 2
+                or len(others) != 1
+                or scope not in known
+                or not isinstance(endpoint, str)
+                or endpoint not in known
+            ):
+                problem(
+                    scope_problems,
+                    "a frame-attached mate outside the frozen top assembly is not supported",
+                    {"mate": name, "scope": scope, "endpoint": endpoint, "entities": len(entities)},
+                )
+            continue
+        seen += 1
         if scope != "":
             # Missing, null or numeric scopes are as unsupported as a nested one: the
-            # frozen top scope must be exactly the empty string.
+            # frozen top scope must be exactly the empty string.  Scope-isolated: this
+            # never vetoes the frozen-top aggregate.
             problem(
+                scope_problems,
                 "a frame-attached mate outside the frozen top assembly is not supported",
                 {"mate": name, "scope": scope},
             )
@@ -1086,6 +1141,7 @@ def _frame_attachment(record: dict) -> dict:
             or len(others) != 1
         ):
             problem(
+                top_problems,
                 "a frame-attached mate must carry exactly one frame entity and one occurrence entity",
                 {"mate": name, "entities": len(entities)},
             )
@@ -1093,12 +1149,14 @@ def _frame_attachment(record: dict) -> dict:
         for entity in flagged:
             if entity.get("component") != "":
                 problem(
+                    top_problems,
                     "a frame entity must carry the frozen top-scope identity",
                     {"mate": name, "component": entity.get("component")},
                 )
         rows = _rows_for(mate, frames)
         if rows is None:
             problem(
+                top_problems,
                 "a frame-attached mate cannot be reconstructed from its recorded entities",
                 {"mate": name, "type": mate.get("type")},
             )
@@ -1107,32 +1165,50 @@ def _frame_attachment(record: dict) -> dict:
         for entity in others:
             component = entity.get("component")
             if not isinstance(component, str) or not component:
-                problem("a frame-attached mate names an unknown occurrence", {"mate": name, "component": component})
+                problem(
+                    top_problems,
+                    "a frame-attached mate names an unknown occurrence",
+                    {"mate": name, "component": component},
+                )
                 continue
             attached.append(component)
-    if problems:
-        return {"mates": seen, "components": sorted(set(attached)), "members": None, "rank": None, "problems": problems}
+    result = {
+        "mates": seen,
+        "components": sorted(set(attached)),
+        "members": None,
+        "rank": None,
+        "problems": problems,
+        "top_problems": top_problems,
+        "scope_problems": scope_problems,
+    }
+    if top_problems:
+        return result
     if not seen:
-        return {"mates": 0, "components": [], "members": None, "rank": None, "problems": []}
+        result["mates"] = 0
+        result["components"] = []
+        return result
     unknown = sorted(name for name in set(attached) if name not in known)
     if unknown:
-        problem("a frame-attached mate names an unknown occurrence", {"components": unknown})
+        problem(top_problems, "a frame-attached mate names an unknown occurrence", {"components": unknown})
     members, _pairs = _independent_clusters(record)
     cluster_of = {name: key for key, group in members.items() for name in group}
     keys = sorted({cluster_of[name] for name in set(attached) if name in cluster_of})
     if len(keys) != 1:
         problem(
+            top_problems,
             "frame-attached components must belong to exactly one rigid cluster",
             {"components": sorted(set(attached)), "clusters": [sorted(members[key]) for key in keys]},
         )
     rank = len(_span(rows_all))
     if rank != 6:
         problem(
+            top_problems,
             "the aggregate frame attachment does not reach full rank; the attachment is incomplete",
             {"rank": rank},
         )
     full = frozenset(members[keys[0]]) if len(keys) == 1 else None
-    return {"mates": seen, "components": sorted(set(attached)), "members": full, "rank": rank, "problems": problems}
+    result.update({"members": full, "rank": rank})
+    return result
 
 
 def _frame_attached_members(record: dict) -> frozenset[str]:
@@ -1144,7 +1220,7 @@ def _frame_attached_members(record: dict) -> frozenset[str]:
     """
 
     result = _frame_attachment(record)
-    if result["problems"] or result["members"] is None:
+    if result["top_problems"] or result["members"] is None:
         return frozenset()
     members = frozenset(result["members"])
     if _owned_datum(record, "CS_base_link", _datum_owners(members, members)) is None:
