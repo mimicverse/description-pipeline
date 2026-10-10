@@ -100,21 +100,12 @@ def run_portable_stage(
     run_id = validate_run_id(run_id)
     if stage not in PORTABLE_STAGES:
         raise PipelineError(f"stage must be one of {PORTABLE_STAGES}: {stage!r}")
-    owner = validate_run_id(source_run_id) if source_run_id else run_id
-    meta = store.meta(owner)
-    if not isinstance(meta, dict) or not store.capture_dir(owner).is_dir():
-        raise PipelineError("This run has no admitted native capture; fetch the transfer first")
-    seeds = {
-        "generate": store.capture_dir(owner),
-        "verify": store.stage_dir(owner, "generate"),
-        "publish": store.stage_dir(owner, "verify"),
-    }
+    owner = validate_run_id(source_run_id or parent_run) if source_run_id or parent_run else run_id
     outputs = {
         "generate": store.stage_dir(run_id, "generate"),
         "verify": store.stage_dir(run_id, "verify"),
         "publish": store.output_dir(run_id),
     }
-    resume = {"parent_run": validate_run_id(parent_run), "from_stage": stage} if parent_run else None
 
     def sink(event: dict) -> None:
         # Live Linux progress is persisted immediately, not only in the final receipt.
@@ -124,35 +115,48 @@ def run_portable_stage(
 
     with solidworks.output_lock(store.run_dir(run_id)):
         try:
-            store.update_meta(
-                run_id,
-                source_run_id=owner,
-                handoff_sha256=meta.get("handoff_sha256"),
-                main_assembly=meta.get("main_assembly"),
-                native_tool=meta.get("native_tool"),
-                repository_slug=meta.get("repository_slug"),
-                repository_base=meta.get("repository_base"),
-            )
+            meta = store.meta(owner)
+            if not isinstance(meta, dict):
+                raise PipelineError("This run has no admitted native capture; fetch the transfer first")
+            current = store.meta(run_id) or {}
             if owner != run_id:
-                _seed_reuse(store, run_id, owner, stage)
+                if current.get("source_run_id") not in {None, owner}:
+                    raise PipelineError("A linked attempt cannot change its parent")
+                boundary = current.get("resume_from") or stage
+                store.update_meta(
+                    run_id,
+                    source_run_id=owner,
+                    resume_from=boundary,
+                    **{key: meta.get(key) for key in (
+                        "handoff_sha256", "main_assembly", "native_tool", "repository_slug", "repository_base"
+                    )},
+                )
+                resume = {"parent_run": owner, "from_stage": boundary}
+            else:
+                boundary, resume = None, None
             if stage == "generate" and expected_subject is not None:
                 raise PipelineError("generate does not take an expected subject")
             if stage in {"verify", "publish"} and not expected_subject:
                 raise PipelineError(f"{stage} requires the recorded subject of the previous checkpoint")
             if stage == "publish" and repository is None:
                 raise PipelineError("publish requires the configured model repository checkout")
-            if stage == "generate":
-                _revalidate_capture(store, owner)
-            _portable_identity_gate(store, owner)
+            capture_owner = store.checkpoint_owner(run_id, "capture")
+            capture = store.capture_dir(capture_owner)
+            _revalidate_capture(store, capture_owner)
+            _portable_identity_gate(store, capture_owner)
+            seed_stage = {"generate": "capture", "verify": "generate", "publish": "verify"}[stage]
+            seed = store.checkpoint_dir(run_id, seed_stage)
+            if owner != run_id and boundary == stage:
+                _seed_reuse(store, run_id, owner, stage)
             receipt = solidworks.run(
-                store.capture_dir(owner),
+                capture,
                 outputs[stage],
                 repository=Path(repository) if stage == "publish" else None,
                 base=base,
                 run_id=run_id,
                 resume_from=stage,
                 stop_after=stage,
-                seed_dir=seeds[stage],
+                seed_dir=seed,
                 expected_subject=expected_subject,
                 handoff_sha256=meta.get("handoff_sha256"),
                 prior_events=store.events(run_id),
@@ -173,9 +177,12 @@ def _seed_reuse(store: LinuxStore, run_id: str, owner: str, stage: str) -> None:
     parent's evidence as reused instead of fabricating new passes.
     """
     prefix = set(STAGE_IDS[: STAGE_IDS.index(stage)])
-    reuse = {"parent_run": owner, "reused": True}
     seeded = [
-        {**event, "reuse": reuse}
+        {**event, "reuse": {
+            "parent_run": owner,
+            "source_run": (event.get("reuse") or {}).get("source_run", owner),
+            "reused": True,
+        }}
         for event in store.events(owner)
         if isinstance(event, dict) and event.get("stage") in prefix
     ]

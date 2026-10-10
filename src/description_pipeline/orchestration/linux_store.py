@@ -66,6 +66,38 @@ class LinuxStore:
     def meta_path(self, run_id: str) -> Path:
         return self.run_dir(run_id) / "meta.json"
 
+    def checkpoint_owner(self, run_id: str, stage: str) -> str:
+        """Resolve an upstream checkpoint without substituting an older attempt's output.
+
+        A linked attempt inherits only stages before its selected restart boundary.
+        Its newly generated or verified files always take precedence thereafter.
+        """
+        if stage not in {"capture", "generate", "verify"}:
+            raise PipelineError(f"Not a reusable checkpoint: {stage!r}")
+        current = validate_run_id(run_id)
+        seen = set()
+        while current not in seen:
+            seen.add(current)
+            path = self.capture_dir(current) if stage == "capture" else self.stage_dir(current, stage)
+            if path.is_dir():
+                return current
+            meta = self.meta(current) or {}
+            parent, boundary = meta.get("source_run_id"), meta.get("resume_from")
+            if (
+                not parent or parent == current or boundary not in PORTABLE_STAGES
+                or STAGE_IDS.index(stage) >= STAGE_IDS.index(boundary)
+            ):
+                raise PipelineError(f"Attempt {current} has no retained {stage} checkpoint")
+            current = validate_run_id(parent)
+        raise PipelineError("Linked checkpoint lineage contains a cycle")
+
+    def checkpoint_dir(self, run_id: str, stage: str) -> Path:
+        owner = self.checkpoint_owner(run_id, stage)
+        return self.capture_dir(owner) if stage == "capture" else self.stage_dir(owner, stage)
+
+    def checkpoint_receipt(self, run_id: str, stage: str) -> Path:
+        return self.receipt_path(self.checkpoint_owner(run_id, stage), stage)
+
     def delivery_dir(self, run_id: str) -> Path | None:
         """The newest installed delivery of this attempt (publish, verify or generate)."""
         candidates = (
