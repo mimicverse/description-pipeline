@@ -2343,9 +2343,9 @@ def prepare_native_package(
         raise PipelineError(f"frozen_source already contains authored package files: {authored[:5]}")
     if backend is None:
         from .native import SolidWorksBackend
-        from ...verification.consumer import readiness
+        from ...runtime import native_readiness
 
-        readiness()
+        native_readiness()
         backend = SolidWorksBackend()
     native_settings = {"namespace": NAMESPACE, "contract": CONTRACT}
     if settings.main_assembly:

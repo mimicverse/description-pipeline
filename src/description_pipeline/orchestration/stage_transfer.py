@@ -10,6 +10,7 @@ qualified success: verification still runs on Linux.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -19,12 +20,16 @@ import zipfile
 from contextlib import suppress
 from pathlib import Path
 
-from ..build.archive import write_zip
+from packaging.utils import canonicalize_name
+
+from .. import __version__
+from ..build.archive import ZIP_EPOCH
 from ..delivery import PIPELINE_ID
 from ..io import PipelineError, artifact_path_parts, canonical, confined, digest, file_digest, inventory, read_data
+from ..runtime import RUNTIME_VERSIONS, required_packages
 from ..sources.snapshot import verify_snapshot
 from ..sources.solidworks.revision import package_inventory
-from ..stages import CONTRACT_FILE_SHA256, CONTRACT_SHA256, STAGE_IDS, VIEW_SCHEMA
+from ..stages import CONTRACT, CONTRACT_FILE_SHA256, CONTRACT_SHA256, STAGE_IDS, VIEW_SCHEMA
 
 CAPTURE_ARCHIVE = "native-evidence.zip"
 CAPTURE_MANIFEST = "transfer-manifest.json"
@@ -37,7 +42,14 @@ MAX_TRANSFER_FILES = 100_000
 MAX_TRANSFER_BYTES = 16 * 1024**3
 MAX_MANIFEST_BYTES = 64 * 1024**2
 
-_REQUIRED_REPORTS = ("reports/input.json", "reports/native-tool.json", "reports/stages.json")
+#: The immutable native provenance reports; the live ``reports/stages.json`` view is a Linux-side
+#: artifact and is deliberately excluded from the transfer payload.
+_REQUIRED_REPORTS = ("reports/input.json", "reports/native-tool.json", "reports/native-stages.json")
+#: Known mutable receipts stamped by the endpoint; sealing ignores them, never transfers them.
+_LIVE_REPORTS = ("reports/stages.json", "reports/run.json")
+
+_TOOL_SCHEMA = "solidworks-to-urdf.tool/v1"
+_STAGE_DEFINITIONS = {stage["id"]: stage for stage in CONTRACT["stages"]}
 _READ_CHUNK = 1024 * 1024
 
 
@@ -57,12 +69,40 @@ def _is_sha256(value) -> bool:
 
 
 def _validate_native_tool(native_tool) -> None:
+    """A native tool record must pin its release and the Windows-native runtime closure."""
+
     _require(isinstance(native_tool, dict) and native_tool, "Native tool record must be a nonempty object")
+    _require(native_tool.get("schema_version") == _TOOL_SCHEMA, "Native tool record uses an unknown schema")
+    _require(native_tool.get("pipeline_id") == PIPELINE_ID, "Native tool record belongs to another pipeline")
+    _require(native_tool.get("version") == __version__, "Native tool record is from another release")
+    _require(_is_sha256(native_tool.get("source_sha256")), "Native tool record lacks its source digest")
     runtime = native_tool.get("runtime")
+    _require(isinstance(runtime, dict), "Native tool record lacks its runtime closure")
     _require(
-        isinstance(runtime, dict) and runtime.get("role") == "native",
+        runtime.get("role") == "native",
         "Native tool record must declare runtime.role = 'native'",
     )
+    _require(str(runtime.get("system") or "") == "Windows", "Native tool record must come from the Windows host")
+    _require(str(runtime.get("python") or "").startswith("3.12"), "Native tool record must pin Python 3.12")
+    packages = runtime.get("packages")
+    _require(isinstance(packages, dict) and packages, "Native tool record lacks its package pins")
+    pins = {canonicalize_name(str(name)): value for name, value in packages.items()}
+    for name in required_packages("native"):
+        _require(
+            pins.get(canonicalize_name(name)) == RUNTIME_VERSIONS.get(name),
+            f"Native tool record must pin {name} to the release version",
+        )
+    _require(
+        canonicalize_name("mujoco") not in pins,
+        "Native tool record must not include the MuJoCo consumer closure",
+    )
+    release = Path(__file__).resolve().parent.parent / "tool-release.json"
+    if release.is_file():
+        identity = read_data(release)
+        _require(
+            native_tool["source_sha256"] == identity.get("source_sha256"),
+            "Native tool record is from another release than this portable runtime",
+        )
 
 
 def _validate_stage_receipts(view, *, run_id: str, handoff_sha256: str) -> None:
@@ -89,14 +129,27 @@ def _validate_stage_receipts(view, *, run_id: str, handoff_sha256: str) -> None:
     )
     by_id = {stage["id"]: stage for stage in stages}
     for stage_id in NATIVE_STAGE_SCOPE:
+        definition = _STAGE_DEFINITIONS[stage_id]
         stage = by_id[stage_id]
-        checks = [*(stage.get("input_qc") or []), *(stage.get("output_qc") or [])]
+        received_input = stage.get("input_qc")
+        received_output = stage.get("output_qc")
+        expected_input = [item["id"] for item in definition["input_qc"]]
+        expected_output = [item["id"] for item in definition["output_qc"]]
+        _require(
+            isinstance(received_input, list)
+            and all(isinstance(item, dict) for item in received_input)
+            and [item.get("id") for item in received_input] == expected_input,
+            f"Native stage {stage_id} input checks differ from the release contract",
+        )
+        _require(
+            isinstance(received_output, list)
+            and all(isinstance(item, dict) for item in received_output)
+            and [item.get("id") for item in received_output] == expected_output,
+            f"Native stage {stage_id} output checks differ from the release contract",
+        )
+        checks = [*received_input, *received_output]
         _require(stage.get("in_scope") is True, f"Native stage {stage_id} is not in scope")
         _require(stage.get("state") == "completed", f"Native stage {stage_id} is not completed")
-        _require(
-            checks and all(isinstance(check, dict) for check in checks),
-            f"Native stage {stage_id} has no recorded boundary checks",
-        )
         _require(
             all(check.get("state") == "passed" for check in checks),
             f"Native stage {stage_id} has a failed or unrun boundary check",
@@ -141,7 +194,8 @@ def _validate_evidence(root: Path, main_assembly: str) -> None:
         isinstance(scene, str) and scene in (manifest.get("files") or {}),
         "Evidence snapshot does not bind its scene",
     )
-    collection = read_data(confined(evidence, "collection.json"))
+    # ``freeze`` writes its evidence record inside the snapshot's own ``evidence/`` folder.
+    collection = read_data(confined(evidence, "evidence/collection.json"))
     _require(isinstance(collection, dict), "Evidence collection must be an object")
     identity = collection.get("identity") if isinstance(collection.get("identity"), dict) else {}
     _require(
@@ -149,13 +203,23 @@ def _validate_evidence(root: Path, main_assembly: str) -> None:
         "Evidence identity lacks the native dependency digest",
     )
     capture = collection.get("capture") if isinstance(collection.get("capture"), dict) else {}
-    _require(capture.get("originals_unchanged") is True, "Evidence does not prove the CAD bytes were unchanged")
+    unchanged = capture.get("originals_unchanged")
+    # ``freeze`` records a structured observation (files checked / states recorded) and raises on
+    # any change; older or hand-built fixtures may record the boolean.
+    _require(
+        unchanged is True or (isinstance(unchanged, dict) and int(unchanged.get("files_checked") or 0) >= 1),
+        "Evidence does not prove the CAD bytes were unchanged",
+    )
     source_hashes = capture.get("source_hashes")
     _require(isinstance(source_hashes, dict) and source_hashes, "Evidence lacks native source hashes")
     assembly = identity.get("assembly")
     _require(isinstance(assembly, str) and assembly.strip(), "Evidence identity lacks the assembly name")
-    wanted = {main_assembly.casefold(), Path(main_assembly).stem.casefold()}
-    _require(assembly.casefold() in wanted, "Evidence identity names another assembly")
+    wanted = {main_assembly.casefold(), Path(main_assembly).name.casefold(), Path(main_assembly).stem.casefold()}
+    assembly_name = Path(assembly).name.casefold()
+    _require(
+        assembly_name in wanted or Path(assembly_name).stem in wanted,
+        "Evidence identity names another assembly",
+    )
 
 
 def _validate_capture(root: Path, *, run_id: str, handoff_sha256: str, main_assembly: str, native_tool) -> dict:
@@ -165,7 +229,7 @@ def _validate_capture(root: Path, *, run_id: str, handoff_sha256: str, main_asse
     recorded = read_data(confined(root, "reports/native-tool.json"))
     _require(recorded == native_tool, "Native tool report differs from the supplied native tool record")
     _validate_stage_receipts(
-        read_data(confined(root, "reports/stages.json")),
+        read_data(confined(root, "reports/native-stages.json")),
         run_id=run_id,
         handoff_sha256=handoff_sha256,
     )
@@ -194,8 +258,9 @@ def seal_capture(
     _require(not archive.exists(), f"Transfer archive already exists: {archive}")
 
     files = inventory(root)
-    # The archive itself and the optional sidecar manifest are sealing outputs, never payload.
-    ignored = {CAPTURE_MANIFEST}
+    # Sealing outputs (the archive, the optional sidecar manifest) and the live stage view are
+    # never payload: Linux rewrites the live view after admission.
+    ignored = {CAPTURE_MANIFEST, *_LIVE_REPORTS}
     with suppress(ValueError):
         ignored.add(archive.resolve().relative_to(root.resolve()).as_posix())
     files = {name: checksum for name, checksum in files.items() if name not in ignored}
@@ -233,15 +298,53 @@ def seal_capture(
         "total_bytes": total_bytes,
         "native_stage_scope": list(NATIVE_STAGE_SCOPE),
     }
-    entries = [(name, confined(root, name).read_bytes()) for name in sorted(files)]
-    entries.append((CAPTURE_MANIFEST, canonical(manifest)))
     archive.parent.mkdir(parents=True, exist_ok=True)
     try:
-        write_zip(archive, entries)
+        _write_streaming_zip(archive, root, files, canonical(manifest))
     except BaseException:
         archive.unlink(missing_ok=True)
         raise
     return manifest
+
+
+def _write_streaming_zip(archive: Path, root: Path, files: dict[str, str], manifest_bytes: bytes) -> None:
+    """Write the payload with fixed metadata, streaming member bytes and re-hashing them.
+
+    The inventory is verified again while streaming, so a capture that changes between the
+    inventory scan and the write is refused instead of being sealed inconsistently.
+    """
+
+    total = 0
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as target:
+        for name in sorted(files):
+            info = zipfile.ZipInfo(name, date_time=ZIP_EPOCH)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.create_system = 3
+            info.external_attr = (0o755 if name.endswith(".sh") else 0o644) << 16
+            source_path = confined(root, name)
+            expected_size = source_path.stat().st_size
+            hasher = hashlib.sha256()
+            size = 0
+            with open(source_path, "rb") as source, target.open(info, "w") as sink:
+                while True:
+                    chunk = source.read(_READ_CHUNK)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    total += len(chunk)
+                    _require(
+                        total <= MAX_TRANSFER_BYTES,
+                        "Capture exceeds the transfer size limit while sealing",
+                    )
+                    hasher.update(chunk)
+                    sink.write(chunk)
+            _require(size == expected_size, f"Capture member size changed while sealing: {name}")
+            _require(hasher.hexdigest() == files[name], f"Capture member changed while sealing: {name}")
+        manifest_info = zipfile.ZipInfo(CAPTURE_MANIFEST, date_time=ZIP_EPOCH)
+        manifest_info.compress_type = zipfile.ZIP_DEFLATED
+        manifest_info.create_system = 3
+        manifest_info.external_attr = 0o644 << 16
+        target.writestr(manifest_info, manifest_bytes)
 
 
 def _extract(archive: Path, staging: Path) -> dict:
@@ -278,8 +381,9 @@ def _extract(archive: Path, staging: Path) -> dict:
             _require(CAPTURE_MANIFEST in names, "Transfer archive lacks transfer-manifest.json")
             manifest_info = source.getinfo(CAPTURE_MANIFEST)
             _require(manifest_info.file_size <= MAX_MANIFEST_BYTES, "Transfer manifest exceeds the size limit")
+            manifest_bytes = source.read(manifest_info)
             try:
-                manifest = json.loads(source.read(manifest_info).decode("utf-8"))
+                manifest = json.loads(manifest_bytes.decode("utf-8"))
             except (UnicodeDecodeError, ValueError) as error:
                 raise PipelineError(f"Transfer manifest is not readable JSON: {error}") from error
             _require(isinstance(manifest, dict), "Transfer manifest must be an object")
@@ -341,6 +445,9 @@ def _extract(archive: Path, staging: Path) -> dict:
                     file_digest(staging.joinpath(*artifact_path_parts(name))) == checksum,
                     f"Transfer member hash differs from its manifest: {name}",
                 )
+            # The admitted root must retain the exact canonical manifest bytes for downstream
+            # seeding, subject binding and publication.
+            (staging / CAPTURE_MANIFEST).write_bytes(manifest_bytes)
             return manifest
     except zipfile.BadZipFile as error:
         raise PipelineError(f"Transfer archive is not a readable zip: {error}") from error
