@@ -191,7 +191,12 @@ def native_record() -> dict:
                 }
             },
         },
-        "files": {},
+        # The fixture's frozen bytes are the deterministic placeholders written by
+        # ``baseline``; the derive contract requires the record to bind them.
+        "files": {
+            name: hashlib.sha256(f"placeholder {name}\n".encode()).hexdigest()
+            for name in ("cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT")
+        },
     }
 
 

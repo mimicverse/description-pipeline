@@ -122,6 +122,12 @@ def raw_record() -> dict:
             "robot_name": "wire_test",
         },
         "saved_configuration": "Default",
+        # The exporter fixture's frozen bytes are the deterministic placeholder
+        # written by the preparation test; the derive contract binds them.
+        "files": {
+            name: hashlib.sha256(b"native-file-test").hexdigest()
+            for name in ("robot.SLDASM", "base.SLDPRT", "arm.SLDPRT")
+        },
         "components": [
             {
                 "name2": name,
