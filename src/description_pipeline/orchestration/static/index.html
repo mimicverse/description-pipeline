@@ -113,13 +113,14 @@
               <div id="viewer-card" hidden>
                 <div id="viewer" class="viewer"></div>
                 <p class="muted small" id="preview-meta"></p>
+                <p id="preview-diagnostic" class="viewer-note diagnostic-note" hidden></p>
                 <p class="viewer-note" id="viewer-note" hidden></p>
                 <div class="viewer-footer">
                   <div id="joint-controls" class="joint-controls"></div>
                   <button id="reset-joints" type="button" class="ghost">回到零位</button>
                 </div>
               </div>
-              <p id="viewer-placeholder" class="muted small viewer-placeholder">仅当独立校验通过的交付可用时，这里显示 URDF 预览。</p>
+              <p id="viewer-placeholder" class="muted small viewer-placeholder">交付生成后这里显示 URDF 预览；未通过独立校验的交付只会作为诊断预览并明确标注。</p>
             </div>
 
             <div class="pane pane-inspect">

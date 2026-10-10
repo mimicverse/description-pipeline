@@ -236,6 +236,7 @@ input, select, textarea { font: inherit; }
 .joint-row input[type="range"] { grid-column: 1 / span 2; width: 100%; accent-color: var(--accent); }
 .joint-row output { color: var(--muted); font-variant-numeric: tabular-nums; }
 .viewer-note { color: var(--warn); font-size: 12.5px; margin-top: 8px; }
+.diagnostic-note { white-space: pre-line; }
 
 /* inspection tabs */
 .tabs { display: flex; gap: 4px; margin-bottom: 10px; flex-wrap: wrap; }

@@ -363,6 +363,8 @@ function clearPreview() {
   $("viewer-card").hidden = true;
   $("viewer-placeholder").hidden = false;
   $("preview-meta").textContent = "";
+  $("preview-diagnostic").hidden = true;
+  $("preview-diagnostic").textContent = "";
   $("viewer-note").hidden = true;
   $("joint-controls").textContent = "";
   setError($("preview-note"), "");
@@ -1783,6 +1785,30 @@ function renderRun(run) {
   updatePreviewLayout();
 }
 
+function renderPreviewDiagnostic(preview) {
+  const node = $("preview-diagnostic");
+  if (preview.verified !== false) {
+    node.hidden = true;
+    node.textContent = "";
+    return;
+  }
+  const lines = ["未通过工程校验：该交付仅供诊断，禁止发布。"];
+  const checks = Array.isArray(preview.failing_checks) ? preview.failing_checks : [];
+  const checksTotal = Number.isInteger(preview.failing_checks_total) ? preview.failing_checks_total : checks.length;
+  if (checks.length) {
+    const shown = checks.slice(0, 8).map((check) => `${check.id}（${check.message || "检查未通过"}）`);
+    lines.push(`未通过检查：${shown.join("、")}${checksTotal > shown.length ? ` 等 ${checksTotal} 项` : ""}`);
+  }
+  const warnings = Array.isArray(preview.warnings) ? preview.warnings : [];
+  const warningsTotal = Number.isInteger(preview.warnings_total) ? preview.warnings_total : warnings.length;
+  if (warnings.length) {
+    const shown = warnings.slice(0, 6).map((item) => `${item.code || "警告"}${item.object ? `（${item.object}）` : ""}`);
+    lines.push(`警告：${shown.join("、")}${warningsTotal > shown.length ? ` 等 ${warningsTotal} 条` : ""}`);
+  }
+  node.textContent = lines.join("\n");
+  node.hidden = false;
+}
+
 async function loadPreview(dagRunId) {
   if (state.previewRequest) return;
   const request = new AbortController();
@@ -1793,6 +1819,7 @@ async function loadPreview(dagRunId) {
     if (request.signal.aborted || state.dagRunId !== dagRunId) return;
     if (state.previewSubject === preview.subject_sha256) return;
     $("preview-meta").textContent = `交付摘要 ${String(preview.subject_sha256).slice(0, 12)}… · URDF ${preview.urdf}`;
+    renderPreviewDiagnostic(preview);
     note.hidden = true;
     setError($("preview-note"), "");
     if (!state.viewer) state.viewer = createViewer($("viewer"));
@@ -1849,11 +1876,12 @@ async function poll() {
     if (state.dagRunId !== dagRunId) return;
     setError($("run-error-detail"), "");
     const verified = run.automatic && run.automatic.state === "passed";
-    if (!verified) clearPreview();
+    const diagnosable = !verified && run.state === "failed";
+    if (!verified && !diagnosable) clearPreview();
     const previous = state.lastRun;
     state.lastRun = run;
     renderRun(run);
-    if (verified) {
+    if (verified || diagnosable) {
       await loadPreview(dagRunId);
     }
     if (state.dagRunId !== dagRunId) return;

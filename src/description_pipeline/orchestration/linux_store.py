@@ -14,8 +14,8 @@ import os
 import tempfile
 from pathlib import Path
 
-from ..delivery import PIPELINE_ID, subject_digest, subject_inventory
-from ..io import PipelineError, confined, read_data, write_json
+from ..delivery import BUNDLE_SCHEMA, PIPELINE_ID, subject_digest, subject_inventory
+from ..io import PipelineError, confined, inventory, read_data, write_json
 from ..stages import STAGE_IDS, stage_view
 from ..verification.solidworks_urdf import check_bundle, require_qualified_report
 from .airflow_client import JOB_SCHEMA, validate_run_id
@@ -23,6 +23,9 @@ from .stage_transfer import CAPTURE_MANIFEST, admit_capture
 
 STORE_SCHEMA = "solidworks-to-urdf.linux-run/v1"
 PORTABLE_STAGES = ("generate", "verify", "publish")
+#: Bounds on the diagnostic preview payload; totals always report the untruncated count.
+MAX_PREVIEW_CHECKS = 60
+MAX_PREVIEW_WARNINGS = 40
 
 
 class LinuxStore:
@@ -33,10 +36,10 @@ class LinuxStore:
         if not root.is_absolute():
             raise PipelineError("Linux store root must be an absolute path")
         self.root = root
-        #: Verified previews per immutable checkpoint, keyed by path identity and mtime.
-        self._previews: dict[tuple[str, int, int], dict] = {}
-        #: The last verified preview per delivery that artifact serving may trust.
-        self._bound_previews: dict[str, dict] = {}
+        #: Bound previews per immutable checkpoint, keyed by path identity and mtime.
+        self._previews: dict[tuple[str, int, tuple], tuple[Path, dict]] = {}
+        #: The last bound preview per attempt that artifact serving may trust.
+        self._bound_previews: dict[str, tuple[Path, dict]] = {}
 
     # ------------------------------------------------------------------ paths
     def run_dir(self, run_id: str) -> Path:
@@ -325,65 +328,160 @@ class LinuxStore:
         return stage_view(self.merged_job(run_id, native_job))
 
     def preview(self, run_id: str) -> dict:
-        """Digest-bound preview of the newest verified delivery.
+        """Digest-bound preview of the newest retained delivery.
 
-        The saved report is revalidated against the delivery bytes before anything is
-        served, and the served subject is the verified report's own binding.  The
-        verification runs once per immutable checkpoint; serving a member never
-        re-runs it.
+        A delivery that passed independent verification is served exactly as before.
+        When the attempt recorded a failed verify stage, its retained failed-verify
+        checkpoint is served instead as an explicitly unverified diagnostic preview: the
+        same binding, confinement and streamed-digest rules, plus the exact failing checks
+        and warning findings.  A diagnostic preview never asserts verification and never
+        authorizes publication.  The verification runs once per immutable checkpoint;
+        serving a member never re-runs it.
         """
+        return self._preview_binding(run_id)[1]
+
+    def _preview_binding(self, run_id: str) -> tuple[Path, dict]:
+        """Resolve the single preview this attempt may serve, without assuming the outcome."""
         delivery = self.delivery_dir(run_id)
-        if delivery is None:
-            raise PipelineError("This attempt has no delivery to preview yet")
-        stat = delivery.stat()
-        cache_key = (str(delivery), stat.st_ino, _delivery_fingerprint(delivery))
-        cached = self._previews.get(cache_key)
-        if cached is not None:
-            return cached
-        report = require_qualified_report(check_bundle(delivery))
-        subject = report.get("subject_sha256")
-        if not isinstance(subject, str) or subject != subject_digest(delivery):
-            raise PipelineError("The verified report is not bound to the current delivery bytes")
+        verified_error: PipelineError | None = None
+        if delivery is not None:
+            stat = delivery.stat()
+            cache_key = (str(delivery), stat.st_ino, _delivery_fingerprint(delivery))
+            cached = self._previews.get(cache_key)
+            if cached is not None:
+                return cached
+            try:
+                report = require_qualified_report(check_bundle(delivery))
+            except PipelineError as error:
+                verified_error = error
+            else:
+                subject = report.get("subject_sha256")
+                if not isinstance(subject, str) or subject != subject_digest(delivery):
+                    raise PipelineError("The verified report is not bound to the current delivery bytes")
+                files = subject_inventory(delivery)
+                if "urdf/robot.urdf" not in files:
+                    raise PipelineError("The delivery carries no urdf/robot.urdf artifact")
+                return self._remember_preview(
+                    cache_key,
+                    run_id,
+                    delivery,
+                    {
+                        "schema_version": "solidworks-to-urdf.preview/v1",
+                        "pipeline_id": PIPELINE_ID,
+                        "run_id": run_id,
+                        "subject_sha256": subject,
+                        "urdf": "urdf/robot.urdf",
+                        "files": files,
+                        "verified": True,
+                        "state": "verified",
+                    },
+                )
+        diagnostic = self._diagnostic_delivery(run_id)
+        if diagnostic is not None:
+            stat = diagnostic.stat()
+            cache_key = (str(diagnostic), stat.st_ino, _delivery_fingerprint(diagnostic))
+            cached = self._previews.get(cache_key)
+            if cached is not None:
+                return cached
+            return self._remember_preview(cache_key, run_id, diagnostic, self._diagnostic_preview(run_id, diagnostic))
+        if verified_error is not None:
+            raise verified_error
+        raise PipelineError("This attempt has no delivery to preview yet")
+
+    def _remember_preview(self, cache_key, run_id: str, root: Path, preview: dict) -> tuple[Path, dict]:
+        self._bound_previews[run_id] = (root, preview)
+        if len(self._previews) >= 8:
+            self._previews.pop(next(iter(self._previews)))
+        self._previews[cache_key] = (root, preview)
+        return root, preview
+
+    def _diagnostic_delivery(self, run_id: str) -> Path | None:
+        """The retained failed-verify checkpoint, only when the store recorded one.
+
+        The stage receipt is the sole authority for the location: it must describe a
+        failed verify stage, its diagnostic path must stay inside this attempt, and that
+        directory must still be a stamped pipeline delivery carrying a bound failed
+        report.  A recorded location that fails any of that is an integrity error, never
+        a reason to serve something else.
+        """
+        receipt_path = self.receipt_path(run_id, "verify")
+        if not receipt_path.is_file():
+            return None
+        receipt = read_data(receipt_path)
+        if not isinstance(receipt, dict):
+            raise PipelineError("The retained verify receipt is malformed")
+        recorded = receipt.get("diagnostic_path")
+        if recorded is None:
+            return None
+        if receipt.get("stage") != "verify" or receipt.get("state") != "failed" or receipt.get("passed") is not False:
+            return None
+        if not isinstance(recorded, str) or not recorded:
+            raise PipelineError("The failed verify receipt records no diagnostic location")
+        run_root = self.run_dir(run_id).resolve()
+        candidate = Path(recorded).resolve()
+        if candidate != run_root and run_root not in candidate.parents:
+            raise PipelineError("The retained diagnostic location is outside this attempt")
+        if not _owned_delivery(candidate):
+            raise PipelineError("The retained diagnostic delivery is not a stamped pipeline output")
+        subject = receipt.get("subject_sha256")
+        if not isinstance(subject, str):
+            raise PipelineError("The failed verify receipt is not bound to a subject")
+        report = _read_optional_json(candidate / "reports/quality.json")
+        if (
+            not isinstance(report, dict)
+            or report.get("passed") is not False
+            or report.get("subject_sha256") != subject
+            or not isinstance(report.get("checks"), list)
+        ):
+            raise PipelineError("The retained diagnostic report is not a bound failed report")
+        return candidate
+
+    def _diagnostic_preview(self, run_id: str, delivery: Path) -> dict:
+        """One unverified diagnostic payload over the retained failed-verify bytes."""
+        receipt = read_data(self.receipt_path(run_id, "verify"))
+        subject = subject_digest(delivery)
+        if not isinstance(receipt, dict) or receipt.get("subject_sha256") != subject:
+            raise PipelineError("The retained diagnostic delivery is not bound to its recorded subject")
+        report = read_data(confined(delivery, "reports/quality.json"))
         files = subject_inventory(delivery)
-        urdf = next((name for name in ("urdf/robot.urdf",) if name in files), None)
-        if urdf is None:
-            raise PipelineError("The delivery carries no urdf/robot.urdf artifact")
-        preview = {
+        if "urdf/robot.urdf" not in files:
+            raise PipelineError("The retained diagnostic delivery carries no urdf/robot.urdf artifact")
+        failing = _failing_checks(report)
+        warnings = _delivery_warnings(delivery)
+        return {
             "schema_version": "solidworks-to-urdf.preview/v1",
             "pipeline_id": PIPELINE_ID,
             "run_id": run_id,
             "subject_sha256": subject,
-            "urdf": urdf,
+            "urdf": "urdf/robot.urdf",
             "files": files,
+            "verified": False,
+            "state": "unverified",
+            "reason": "verification_failed",
+            "error": str(receipt.get("error") or ""),
+            "failing_checks": failing[:MAX_PREVIEW_CHECKS],
+            "failing_checks_total": len(failing),
+            "warnings": warnings[:MAX_PREVIEW_WARNINGS],
+            "warnings_total": len(warnings),
         }
-        self._bound_previews[str(delivery)] = preview
-        if len(self._previews) >= 8:
-            self._previews.pop(next(iter(self._previews)))
-        self._previews[cache_key] = preview
-        return preview
 
-    def _bound_preview(self, run_id: str) -> dict:
-        """The last verified preview of this delivery; serving never re-runs verification."""
-        delivery = self.delivery_dir(run_id)
-        if delivery is None:
-            raise PipelineError("This attempt has no delivery to serve yet")
-        bound = self._bound_previews.get(str(delivery))
-        return bound if bound is not None else self.preview(run_id)
+    def _bound_preview(self, run_id: str) -> tuple[Path, dict]:
+        """The last bound preview of this attempt; serving never re-runs verification."""
+        bound = self._bound_previews.get(run_id)
+        return bound if bound is not None else self._preview_binding(run_id)
 
     def open_artifact(self, run_id: str, name: str, *, sha256: str):
         """Open one previewed artifact; the returned stream proves the previewed digest.
 
         The caller-supplied digest is checked against the bound preview inventory, never
-        trusted, and the opened bytes are hashed on the same stream that is served.
+        trusted, and the opened bytes are hashed on the same stream that is served.  The
+        artifact resolves inside the bound checkpoint only, whatever kind of preview it is.
         """
-        delivery = self.delivery_dir(run_id)
-        if delivery is None:
-            raise PipelineError("This attempt has no delivery to serve yet")
-        preview = self._bound_preview(run_id)
+        root, preview = self._bound_preview(run_id)
         expected = preview["files"].get(name)
         if expected is None or expected != sha256:
-            raise PipelineError("The requested artifact is not part of the verified preview")
-        path = confined(delivery, name)
+            raise PipelineError("The requested artifact is not part of the previewed delivery")
+        path = confined(root, name)
         size = path.stat().st_size
         handle = path.open("rb")
         return _BoundArtifact(handle, name=name, expected=expected, size=size), size
@@ -410,7 +508,7 @@ class _BoundArtifact:
         if not self._done:
             self._done = True
             if self._total != self._size or self._digest.hexdigest() != self._expected:
-                raise PipelineError(f"Served artifact bytes do not match the verified preview: {self._name}")
+                raise PipelineError(f"Served artifact bytes do not match the previewed digest: {self._name}")
         return chunk
 
     def close(self) -> None:
@@ -448,3 +546,85 @@ def _delivery_fingerprint(delivery: Path) -> tuple:
             stat = path.stat()
             rows.append((path.relative_to(delivery).as_posix(), stat.st_size, stat.st_mtime_ns))
     return tuple(rows)
+
+
+def _owned_delivery(path: Path) -> bool:
+    """True for a directory this pipeline stamped, with members matching its own inventory."""
+
+    path = Path(path)
+    if path.is_symlink() or path.is_junction() or not path.is_dir():
+        return False
+    if not (path / "input").is_dir() or not (path / "reports").is_dir():
+        return False
+    marker = path / "reports/run.json"
+    if not marker.is_file():
+        return False
+    try:
+        receipt = read_data(marker)
+        return (
+            isinstance(receipt, dict)
+            and receipt.get("schema_version") == BUNDLE_SCHEMA
+            and receipt.get("owned_files") == inventory(path, exclude=("reports/run.json",))
+        )
+    except (PipelineError, OSError, ValueError):
+        return False
+
+
+def _read_optional_json(path: Path) -> object | None:
+    """Best-effort read of a diagnostic input; a missing or unreadable file is not one."""
+
+    try:
+        return read_data(path)
+    except (PipelineError, OSError, ValueError):
+        return None
+
+
+def _failing_checks(report: dict) -> list[dict]:
+    """The exact failed checks as the saved failed-verify report recorded them."""
+
+    checks: list[dict] = []
+    for row in report.get("checks") or []:
+        if not isinstance(row, dict) or row.get("passed") is not False:
+            continue
+        details = row.get("details") if isinstance(row.get("details"), dict) else {}
+        checks.append(
+            {
+                "id": str(row.get("id") or ""),
+                "state": str(row.get("state") or "failed"),
+                "message": str(details.get("error") or details.get("reason") or "自动检查未通过"),
+            }
+        )
+    return checks
+
+
+def _delivery_warnings(delivery: Path) -> list[dict]:
+    """Input warnings and non-blocking discovery findings the retained delivery carries."""
+
+    warnings: list[dict] = []
+    report = _read_optional_json(delivery / "reports/input.json")
+    if isinstance(report, dict):
+        for item in report.get("warnings") or []:
+            if isinstance(item, dict) and item.get("code"):
+                warnings.append(
+                    {
+                        "source": "input",
+                        "code": str(item["code"]),
+                        "object": "",
+                        "message": str(item.get("message") or ""),
+                        "detail": item.get("detail"),
+                    }
+                )
+    findings = _read_optional_json(delivery / "input/discovery/findings.json")
+    if isinstance(findings, dict):
+        for item in findings.get("findings") or []:
+            if isinstance(item, dict) and item.get("blocking") is False:
+                warnings.append(
+                    {
+                        "source": "discovery",
+                        "code": str(item.get("code") or ""),
+                        "object": str(item.get("object") or ""),
+                        "message": str(item.get("message") or ""),
+                        "detail": item.get("detail"),
+                    }
+                )
+    return warnings
