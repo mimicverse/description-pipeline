@@ -52,21 +52,6 @@ def record(components: list[dict], mates: list[dict]) -> dict:
 
 
 class GeometryFallbackTests(unittest.TestCase):
-    def test_localized_point_does_not_inherit_an_unrecorded_line_key(self) -> None:
-        item = mate(
-            "point_on_plane",
-            "coincident",
-            {
-                "component": "A",
-                "line": {"point": [0, 0, 0], "direction": [1, 0, 0]},
-                **localized("point", point=[0, 0, 0]),
-            },
-            {"component": "B", "plane": {"normal": [0, 1, 0], "point": [0, 0, 0]}},
-        )
-        result, findings, _ = self.rows(item, [component("A"), component("B")])
-        self.assertEqual(findings, [])
-        self.assertEqual(result["rank"], 1)
-
     def rows(self, mate_item: dict, components: list[dict]) -> tuple[dict | None, list[dict], dict]:
         raw = record(components, [mate_item])
         findings: list[dict] = []

@@ -616,9 +616,6 @@ def _entity_geometry_view(entity: dict, findings: list[dict], obj: str) -> dict 
         )
         return None
     if kind == "point":
-        # Lines are supplied by localized provenance, not recorded face evidence.
-        # An unrelated raw key cannot turn the validated point into a second reference.
-        view.pop("line", None)
         if flat_point is not None:
             distance = math.sqrt(sum((flat_point[index] - values["point"][index]) ** 2 for index in range(3)))
             if distance > AXIS_OFFSET_TOL_M:
