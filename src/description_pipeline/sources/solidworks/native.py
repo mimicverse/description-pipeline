@@ -1284,8 +1284,8 @@ def _activity_object(path_value, source_root=None):
         text = relative
     else:
         text = text.replace("\\", "/")
-        if re.match(r"^[A-Za-z]:", text) or text.startswith("//"):
-            text = ntpath.basename(text)
+        if re.match(r"^[A-Za-z]:", text) or text.startswith("//") or text.startswith("/"):
+            text = posixpath.basename(text)
     parts = [part for part in text.split("/") if part]
     if not parts or any(part == ".." for part in parts):
         return None
@@ -1308,13 +1308,15 @@ class _ActivityEmitter:
     pairs, are never fabricated, and stay monotonic per (phase, action);
     totals may grow while the walk discovers sub-assembly scope but never
     shrink below ``completed``.  The collector owns timestamps and sequencing.
-    A missing or failing callback can never affect the capture.
+    Operation transitions always pass; only repeats of the current action are
+    throttled.  A missing or failing callback can never affect the capture.
     """
 
     def __init__(self, callback=None):
         self._callback = callback
         self._last_emitted: dict = {}
         self._completed: dict = {}
+        self._last_action = None
 
     def emit(
         self,
@@ -1359,14 +1361,16 @@ class _ActivityEmitter:
             record["total"] = total
         if not force:
             now = time.monotonic()
-            previous_at = self._last_emitted.get((phase, action))
-            if previous_at is not None and now - previous_at < _ACTIVITY_MIN_INTERVAL_SECONDS:
-                return
+            if (phase, action) == self._last_action:
+                previous_at = self._last_emitted.get((phase, action))
+                if previous_at is not None and now - previous_at < _ACTIVITY_MIN_INTERVAL_SECONDS:
+                    return
             self._last_emitted[(phase, action)] = now
         try:
             self._callback(record)
         except Exception:  # noqa: BLE001 - activity must never fail the capture
             return
+        self._last_action = (phase, action)
 
 
 class SolidWorksBackend(CadBackend):
@@ -3114,6 +3118,7 @@ class SolidWorksBackend(CadBackend):
                     "the selected main assembly is not present in the frozen engineering directory",
                     {"main_assembly": selection},
                 )
+        activity.emit("session_start", force=True)
         with self.session():
             if selected_path is not None:
                 # The operator named the delivered assembly: open exactly that frozen
@@ -3201,6 +3206,7 @@ class SolidWorksBackend(CadBackend):
                 raise CadError("cad_rebuild_failed", "ForceRebuild3 reported failure; the saved state is stale")
             _manager, active = _active_configuration_view(doc)
             configuration = str(_member(active, "Name") or "")
+            activity.emit("read_properties", current_object=_activity_object(main_path, source_root), force=True)
             identity_properties = _custom_properties(doc, configuration)
             entries = None
             doc = active = None
@@ -3595,18 +3601,22 @@ class SolidWorksBackend(CadBackend):
                 if values:
                     property_buckets["components"][entry["name2"]] = values
             files = {}
-            file_paths = (main_path, *[Path(item[0]) for item in by_component.values()])
-            for index, path in enumerate(file_paths):
+            hash_plan = []
+            planned = set()
+            for path in (main_path, *[Path(item[0]) for item in by_component.values()]):
                 relative = _relative_document(path, source_root)
+                if relative and relative not in planned:
+                    planned.add(relative)
+                    hash_plan.append((path, relative))
+            for index, (path, relative) in enumerate(hash_plan):
                 activity.emit(
                     "hash_sources",
-                    current_object=_activity_object(path, source_root),
+                    current_object=_activity_object(path, source_root) or relative,
                     completed=index,
-                    total=len(file_paths),
+                    total=len(hash_plan),
                 )
-                if relative and relative not in files:
-                    files[relative] = _hash(str(Path(source_root) / relative))
-            activity.emit("hash_sources", completed=len(file_paths), total=len(file_paths), force=True)
+                files[relative] = _hash(str(Path(source_root) / relative))
+            activity.emit("hash_sources", completed=len(hash_plan), total=len(hash_plan), force=True)
             activity.emit(
                 "build_record",
                 force=True,

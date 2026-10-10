@@ -57,6 +57,7 @@ class ActivityObjectTests(unittest.TestCase):
         self.assertIsNone(obj("../escape"))
         self.assertIsNone(obj("upper/../../etc"))
         self.assertEqual(obj(r"C:\Users\33985\AppData\Local\Temp\IC~~\part.step.SLDPRT"), "part.step.SLDPRT")
+        self.assertEqual(obj("/var/tmp/secret/part.step.SLDPRT"), "part.step.SLDPRT")
         self.assertEqual(obj("sub dir/child-1"), "sub dir/child-1")
         long_name = "a" * 200
         reduced = obj(long_name)
@@ -69,7 +70,7 @@ class ActivityEmissionTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             records = []
-            record = _discover(root, _scene(root), records.append)
+            record = _discover(root, _scene(root, count=2), records.append)
 
             self.assertTrue(records)
             last_completed = {}
@@ -98,6 +99,7 @@ class ActivityEmissionTests(unittest.TestCase):
                 seen.add(item["action"])
 
             for expected in (
+                "session_start",
                 "scan_documents",
                 "rebuild",
                 "read_components",
@@ -112,7 +114,32 @@ class ActivityEmissionTests(unittest.TestCase):
             self.assertEqual(component_reads[-1]["completed"], len(record["components"]))
             self.assertEqual(component_reads[-1]["total"], len(record["components"]))
             hash_reads = [item for item in records if item["action"] == "hash_sources"]
-            self.assertEqual(hash_reads[-1]["completed"], hash_reads[-1]["total"])
+            self.assertEqual(hash_reads[-1]["completed"], len(record["files"]))
+            self.assertEqual(hash_reads[-1]["total"], len(record["files"]))
+            property_events = [item for item in records if item["action"] == "read_properties"]
+            self.assertEqual(property_events[0]["current_object"], "robot.SLDASM")
+
+    def test_transitions_always_emit_even_when_repeats_are_throttled(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            arm_path = _write(root, "arm.SLDPRT")
+            sub_path = _write(root, "sub.SLDASM")
+            assembly = _write(root, "robot.SLDASM")
+            arm_doc = _Doc(arm_path)
+            child = _Component("arm-1", arm_path, doc=arm_doc)
+            sub_doc = _Doc(sub_path, doc_type=2, children=[child])
+            occurrence = _Component("sub-1", sub_path, doc=sub_doc, children=[child])
+            main_doc = _Doc(assembly, doc_type=2, children=[occurrence])
+            original = native_module._ACTIVITY_MIN_INTERVAL_SECONDS
+            try:
+                native_module._ACTIVITY_MIN_INTERVAL_SECONDS = 10_000.0
+                records = []
+                _discover(root, _App({assembly: main_doc, sub_path: sub_doc, arm_path: arm_doc}), records.append)
+            finally:
+                native_module._ACTIVITY_MIN_INTERVAL_SECONDS = original
+            opens = [item for item in records if item["action"] == "open_document"]
+            self.assertGreaterEqual(len(opens), 2)
+            self.assertIn("sub.SLDASM", [item.get("current_object") for item in opens])
 
     def test_recording_callback_never_changes_the_record(self) -> None:
         with TemporaryDirectory() as tmp:
