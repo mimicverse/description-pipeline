@@ -1118,6 +1118,147 @@ def _coordinate_system_features(doc):
     return names
 
 
+def _coordinate_system_feature(doc, name):
+    """The active coordinate-system feature with this exact name, or ``None``."""
+
+    try:
+        feature = _dynamic(_method(doc, "FirstFeature"))
+    except Exception as error:  # noqa: BLE001
+        raise CadError(
+            "cad_geometry_unreadable", "the feature tree could not be read for datums", {"error": str(error)}
+        ) from error
+    while feature is not None:
+        try:
+            type_name = str(_method(feature, "GetTypeName2") or "")
+            feature_name = _member(feature, "Name")
+        except Exception as error:  # noqa: BLE001
+            raise CadError(
+                "cad_geometry_unreadable", "a datum feature could not be classified", {"error": str(error)}
+            ) from error
+        if type_name in ("CoordSys", "CoordinateSystem") and _is_text_name(feature_name) and str(feature_name) == name:
+            return feature
+        try:
+            feature = _dynamic(_method(feature, "GetNextFeature"))
+        except Exception as error:  # noqa: BLE001
+            raise CadError("cad_geometry_unreadable", "the datum traversal failed", {"error": str(error)}) from error
+    return None
+
+
+def _entity_reference_observation(entity, source_root):
+    """Raw facts about one referenced entity; unreadable fields stay explicit."""
+
+    observation: dict = {}
+    try:
+        component = _method(entity, "GetComponent")
+    except Exception as error:  # noqa: BLE001 - additive diagnostics must not fail the capture
+        observation["unreadable"] = True
+        observation["owner_error"] = f"{type(error).__name__}: {error}"[:200]
+        return observation
+    if component is None:
+        observation["owner_component"] = None
+        observation["owner_document"] = None
+        return observation
+    try:
+        observation["owner_component"] = str(_member(component, "Name2") or "") or None
+    except Exception as error:  # noqa: BLE001
+        observation["unreadable"] = True
+        observation["owner_component_error"] = f"{type(error).__name__}: {error}"[:200]
+    try:
+        raw = str(_method(component, "GetPathName") or "")
+        observation["owner_document"] = _relative_document(raw, source_root) or normalize_document_path(raw)
+    except Exception as error:  # noqa: BLE001
+        observation["unreadable"] = True
+        observation["owner_document_error"] = f"{type(error).__name__}: {error}"[:200]
+    return observation
+
+
+def _coordinate_system_references(doc, name, *, source_root, document, configuration, scope):
+    """Raw definition-reference observations for one coordinate-system feature.
+
+    Reads ``IFeature.GetDefinition`` → ``ICoordinateSystemFeatureData`` and
+    records the origin entity, the three axis entity sets, the documented
+    native type values (``GetOriginEntityType`` / ``Get*AxisEntitiesTypes``),
+    the flip flags and each entity's owning component via the documented
+    ``IEntity.GetComponent``.  Facts are kept per entity and per axis — a
+    cross-component origin/axis set is recorded as such, never collapsed to a
+    single owner and never turned into a datum-owner or link inference.  This
+    is an additive diagnostic block: every unreadable member or entity is
+    explicit, and no failure here changes the datum record or any check.
+    """
+
+    block: dict = {
+        "source": "IFeature.GetDefinition / ICoordinateSystemFeatureData",
+        "context": {
+            "document": str(document or ""),
+            "configuration": str(configuration or ""),
+            "scope": str(scope or ""),
+        },
+    }
+
+    def read(label, reader):
+        try:
+            return reader()
+        except Exception as error:  # noqa: BLE001 - additive diagnostics stay explicit
+            block[label + "_error"] = f"{type(error).__name__}: {error}"[:200]
+            return None
+
+    try:
+        feature = _coordinate_system_feature(doc, name)
+    except Exception as error:  # noqa: BLE001
+        block["definition_error"] = f"{type(error).__name__}: {error}"[:200]
+        return block
+    if feature is None:
+        block["definition_error"] = "coordinate system feature not found in the active tree"
+        return block
+    definition = read("definition", lambda: _method(feature, "GetDefinition"))
+    if definition is None:
+        if "definition_error" not in block:
+            block["definition_error"] = "GetDefinition returned no feature data object"
+        return block
+
+    origin = read("origin", lambda: _member(definition, "OriginEntity"))
+    origin_type = read("origin_type", lambda: _method(definition, "GetOriginEntityType"))
+    block["origin"] = {
+        "entity": _entity_reference_observation(_dynamic(origin), source_root) if origin is not None else None,
+        "type_value": origin_type if type(origin_type) is int else None,
+    }
+    if origin_type is not None and type(origin_type) is not int:
+        block["origin"]["type_error"] = f"non-integer type value: {origin_type!r}"[:200]
+
+    for member, flipped_member, label in (
+        ("XAxisEntities", "XFlipped", "x_axis"),
+        ("YAxisEntities", "YFlipped", "y_axis"),
+        ("ZAxisEntities", "ZFlipped", "z_axis"),
+    ):
+        raw_entities = read(label, lambda m=member: _member(definition, m))
+        entities = []
+        if raw_entities is not None:
+            try:
+                for item in _as_list(raw_entities):
+                    entities.append(_entity_reference_observation(_dynamic(item), source_root))
+            except Exception as error:  # noqa: BLE001
+                block[label + "_list_error"] = f"{type(error).__name__}: {error}"[:200]
+        type_values = read(
+            label + "_types",
+            lambda m=member: _method(definition, "Get" + m.replace("Entities", "EntitiesTypes")),
+        )
+        types = None
+        if type_values is not None:
+            types = []
+            for value in _as_list(type_values):
+                types.append(value if type(value) is int else {"error": f"non-integer type value: {value!r}"[:200]})
+        flipped = read(label + "_flipped", lambda m=flipped_member: _member(definition, m))
+        entry: dict = {
+            "entities": entities,
+            "types": types,
+            "flipped": flipped if type(flipped) is bool else None,
+        }
+        if flipped is not None and type(flipped) is not bool:
+            entry["flipped_error"] = f"non-boolean flip state: {flipped!r}"[:200]
+        block[label] = entry
+    return block
+
+
 def _mate_specific(feature, strict=False):
     """Return ``(IMate2, entity_count)`` for a mate feature.
 
@@ -3559,7 +3700,22 @@ class SolidWorksBackend(CadBackend):
             _select_configuration(doc, configuration, "assembly")
             for name in _coordinate_system_features(doc):
                 matrix = [float(value) for value in self._coordinate_system_transform(doc, name)]
-                datums.append({"name": name, "owner": "", "array": matrix, "configuration": configuration})
+                datums.append(
+                    {
+                        "name": name,
+                        "owner": "",
+                        "array": matrix,
+                        "configuration": configuration,
+                        "references": _coordinate_system_references(
+                            doc,
+                            name,
+                            source_root=source_root,
+                            document=_relative_document(main_path, source_root),
+                            configuration=configuration,
+                            scope="",
+                        ),
+                    }
+                )
             for entry in components:
                 source = by_component.get(entry["name2"])
                 if source is None or not source[1] or entry["suppressed"]:
@@ -3585,6 +3741,14 @@ class SolidWorksBackend(CadBackend):
                             "owner": entry["name2"],
                             "array": [value for row in composed for value in row],
                             "configuration": entry["configuration"],
+                            "references": _coordinate_system_references(
+                                document,
+                                name,
+                                source_root=source_root,
+                                document=_relative_document(source[0], source_root),
+                                configuration=entry["configuration"],
+                                scope=str(entry["name2"]),
+                            ),
                         }
                     )
             property_buckets = {"document": identity_properties, "components": {}, "mates": {}}

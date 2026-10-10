@@ -169,6 +169,7 @@ class _Feature:
         first_sub=None,
         next_sub=None,
         next_feature=None,
+        definition=None,
     ):
         self.Name = name
         self._type_name = type_name
@@ -178,6 +179,7 @@ class _Feature:
         self._first_sub = first_sub
         self._next_sub = next_sub
         self._next_feature = next_feature
+        self._definition = definition
 
     def _value(self, provider):
         return provider() if callable(provider) else provider
@@ -202,6 +204,9 @@ class _Feature:
 
     def GetNextFeature(self):
         return self._value(self._next_feature)
+
+    def GetDefinition(self):
+        return self._value(self._definition)
 
 
 class _Component:
@@ -854,7 +859,7 @@ class ProducerContextTests(unittest.TestCase):
             record = _read(root, _App({assembly: main_doc, sub_path: sub_doc}))
 
             main_datum = next(datum for datum in record["datums"] if datum["owner"] == "")
-            self.assertEqual(set(main_datum), {"name", "owner", "array", "configuration"})
+            self.assertEqual(set(main_datum), {"name", "owner", "array", "configuration", "references"})
             self.assertEqual(main_datum["name"], "CS_main")
             self.assertEqual(main_datum["configuration"], "Robot")
             datums = [datum for datum in record["datums"] if datum["owner"] == "sub-1/arm-1"]
