@@ -35,6 +35,8 @@ class LinuxStore:
         self.root = root
         #: Verified previews per immutable checkpoint, keyed by path identity and mtime.
         self._previews: dict[tuple[str, int, int], dict] = {}
+        #: The last verified preview per delivery that artifact serving may trust.
+        self._bound_previews: dict[str, dict] = {}
 
     # ------------------------------------------------------------------ paths
     def run_dir(self, run_id: str) -> Path:
@@ -82,7 +84,9 @@ class LinuxStore:
         if not path.is_file():
             return []
         payload = read_data(path)
-        return [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
+        if not isinstance(payload, list):
+            raise PipelineError("events.json must be a JSON list")
+        return [item for item in payload if isinstance(item, dict)]
 
     def _write(self, path: Path, payload) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -96,6 +100,13 @@ class LinuxStore:
         except BaseException:
             Path(handle.name).unlink(missing_ok=True)
             raise
+
+    def update_meta(self, run_id: str, **fields) -> dict:
+        """Record attempt-level facts (routing, source lineage) without touching checkpoints."""
+        meta = self.meta(run_id) or {"schema_version": STORE_SCHEMA, "run_id": run_id}
+        meta.update(fields)
+        self._write(self.meta_path(run_id), meta)
+        return meta
 
     def append_events(self, run_id: str, events) -> None:
         """Append raw events, preserving timestamps; identical records are never duplicated.
@@ -138,30 +149,49 @@ class LinuxStore:
 
         def finalize(meta: dict) -> dict:
             capture = self.capture_dir(run_id)
-            manifest_payload = meta.get("transfer")
             manifest_path = capture / CAPTURE_MANIFEST
-            if isinstance(manifest_payload, dict) and not manifest_path.is_file():
+            manifest_payload = meta.get("transfer")
+            if not isinstance(manifest_payload, dict):
+                if not manifest_path.is_file():
+                    raise PipelineError(
+                        "The admitted capture has no transfer manifest; review this attempt manually"
+                    )
+                manifest_payload = read_data(manifest_path)
+                if not isinstance(manifest_payload, dict):
+                    raise PipelineError("The admitted capture transfer manifest is not an object")
+            elif not manifest_path.is_file():
                 write_json(manifest_path, manifest_payload)
             native_receipt = capture / "reports/native-stages.json"
             if native_receipt.is_file():
                 payload = read_data(native_receipt)
                 if isinstance(payload, dict):
                     self.append_events(run_id, payload.get("events"))
-            admitted = {**meta, "state": "capture_admitted"}
+            admitted = {**meta, "transfer": manifest_payload, "state": "capture_admitted"}
             self._write(self.meta_path(run_id), admitted)
             return admitted
 
         existing = self.meta(run_id)
         if isinstance(existing, dict):
-            if (
+            same = (
                 existing.get("handoff_sha256") == expected_handoff_sha256
                 and existing.get("main_assembly") == expected_main_assembly
                 and existing.get("native_tool") == expected_native_tool
-                and self.capture_dir(run_id).is_dir()
-            ):
+            )
+            if not same:
+                raise PipelineError("This attempt already admitted a different native capture")
+            state = existing.get("state")
+            if state == "importing":
+                if self.capture_dir(run_id).is_dir():
+                    return finalize(existing)
+                # A crash before the capture install: re-import the identical request below.
+            elif state == "capture_admitted":
+                if not self.capture_dir(run_id).is_dir():
+                    raise PipelineError("The admitted capture is missing; review this attempt manually")
                 return finalize(existing)
-            raise PipelineError("This attempt already admitted a different native capture")
-        if self.capture_dir(run_id).exists():
+            else:
+                # An advanced attempt (generated/verified/published/failed) is never rolled back.
+                return existing
+        elif self.capture_dir(run_id).exists():
             raise PipelineError("A capture exists without store metadata; review this attempt manually")
         provisional = {
             "schema_version": STORE_SCHEMA,
@@ -183,11 +213,7 @@ class LinuxStore:
         native_receipt = read_data(self.capture_dir(run_id) / "reports/native-stages.json")
         if isinstance(native_receipt, dict):
             self.append_events(run_id, native_receipt.get("events"))
-        meta = {
-            **provisional,
-            "transfer": dict(manifest),
-        }
-        return finalize(meta)
+        return finalize({**provisional, "transfer": dict(manifest)})
 
     def record_stage(self, run_id: str, stage: str, receipt: dict) -> None:
         """Keep one stage receipt and its raw events; the attempt is otherwise untouched."""
@@ -232,6 +258,10 @@ class LinuxStore:
             "subject_sha256": subject,
             "handoff_sha256": meta.get("handoff_sha256"),
         }
+        source = meta.get("source_run_id") or run_id
+        capture = self.capture_dir(str(source))
+        hardware = _capture_value(capture, "input/robot.yaml", "hardware_id")
+        revision = _capture_value(capture, "input/cad-revision.json", "revision")
         if submission is not None:
             result["submission"] = submission
         if (native_job or {}).get("status") == "failed":
@@ -246,8 +276,10 @@ class LinuxStore:
             "events": events,
             "result": result,
             "error": meta.get("error"),
-            "repository_slug": (native_job or {}).get("repository_slug"),
-            "repository_base": (native_job or {}).get("repository_base"),
+            "hardware_id": hardware,
+            "revision": revision,
+            "repository_slug": (native_job or {}).get("repository_slug") or meta.get("repository_slug"),
+            "repository_base": (native_job or {}).get("repository_base") or meta.get("repository_base"),
         }
 
     def view(self, run_id: str, native_job: dict | None = None) -> dict:
@@ -265,7 +297,7 @@ class LinuxStore:
         if delivery is None:
             raise PipelineError("This attempt has no delivery to preview yet")
         stat = delivery.stat()
-        cache_key = (str(delivery), stat.st_mtime_ns, stat.st_ino)
+        cache_key = (str(delivery), stat.st_ino, _delivery_fingerprint(delivery))
         cached = self._previews.get(cache_key)
         if cached is not None:
             return cached
@@ -285,10 +317,19 @@ class LinuxStore:
             "urdf": urdf,
             "files": files,
         }
+        self._bound_previews[str(delivery)] = preview
         if len(self._previews) >= 8:
             self._previews.pop(next(iter(self._previews)))
         self._previews[cache_key] = preview
         return preview
+
+    def _bound_preview(self, run_id: str) -> dict:
+        """The last verified preview of this delivery; serving never re-runs verification."""
+        delivery = self.delivery_dir(run_id)
+        if delivery is None:
+            raise PipelineError("This attempt has no delivery to serve yet")
+        bound = self._bound_previews.get(str(delivery))
+        return bound if bound is not None else self.preview(run_id)
 
     def open_artifact(self, run_id: str, name: str, *, sha256: str):
         """Open one previewed artifact; the returned stream proves the previewed digest.
@@ -299,7 +340,7 @@ class LinuxStore:
         delivery = self.delivery_dir(run_id)
         if delivery is None:
             raise PipelineError("This attempt has no delivery to serve yet")
-        preview = self.preview(run_id)
+        preview = self._bound_preview(run_id)
         expected = preview["files"].get(name)
         if expected is None or expected != sha256:
             raise PipelineError("The requested artifact is not part of the verified preview")
@@ -345,3 +386,26 @@ class _BoundArtifact:
 
     def __getattr__(self, item):
         return getattr(self._handle, item)
+
+
+def _capture_value(capture: Path, relative: str, key: str) -> str | None:
+    """One scalar from the admitted native input, or ``None`` when it is absent."""
+    path = Path(capture) / relative
+    if not path.is_file():
+        return None
+    try:
+        payload = read_data(path)
+    except (PipelineError, OSError, ValueError, TypeError):
+        return None
+    value = payload.get(key) if isinstance(payload, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
+def _delivery_fingerprint(delivery: Path) -> tuple:
+    """Content identity of a delivery checkpoint: every member's name, size and mtime."""
+    rows = []
+    for path in sorted(Path(delivery).rglob("*")):
+        if path.is_file():
+            stat = path.stat()
+            rows.append((path.relative_to(delivery).as_posix(), stat.st_size, stat.st_mtime_ns))
+    return tuple(rows)
