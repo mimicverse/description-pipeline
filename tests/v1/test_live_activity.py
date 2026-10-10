@@ -7,6 +7,7 @@ it were reporting work.
 
 from __future__ import annotations
 
+import copy
 import threading
 import time
 import unittest
@@ -19,7 +20,6 @@ from description_pipeline.orchestration import portal as portal_module
 from description_pipeline.orchestration.airflow_client import (
     EndpointConfig,
     EndpointProtocolError,
-    HandoffResolution,
     WindowsEndpoint,
     _validate_activity,
 )
@@ -179,10 +179,9 @@ class EndpointActivityTests(EndpointFixture, unittest.TestCase):
         preparing, release = threading.Event(), threading.Event()
         seen = {}
 
-        def prepare(*args, **kwargs):
-            sink = kwargs.get("on_activity")
-            self.assertIsNotNone(sink)
-            sink(
+        def reader(frozen, settings, on_activity=None):
+            self.assertIsNotNone(on_activity)
+            on_activity(
                 {
                     "phase": "discover",
                     "action": "read_components",
@@ -191,18 +190,20 @@ class EndpointActivityTests(EndpointFixture, unittest.TestCase):
                     "total": 4,
                 }
             )
-            sink({"phase": "discover", "action": "read_components", "current_object": "/etc/passwd"})
-            sink({"phase": "nonsense", "action": "read_components"})
-            sink({"phase": "discover", "action": "read_mates", "completed": 2, "total": 6})
+            on_activity({"phase": "discover", "action": "read_components", "current_object": "/etc/passwd"})
+            on_activity({"phase": "nonsense", "action": "read_components"})
+            on_activity({"phase": "discover", "action": "read_mates", "completed": 2, "total": 6})
             preparing.set()
             if not release.wait(5):
                 raise RuntimeError("test did not release the preparer")
             seen["called"] = True
-            return self.prepare(*args, **kwargs)
+            return copy.deepcopy(self.record)
 
         jobs = self.jobs(
-            runner=lambda *a, **k: self.capture_transfer_result(a[1], run_id=k["run_id"], on_event=k["on_event"]),
-            preparer=prepare,
+            runner=lambda package, output, **k: self.capture_transfer_result(
+                output, run_id=k["run_id"], on_event=k.get("on_event")
+            ),
+            native_reader=reader,
         )
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler(jobs, self.config["token"]))
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -213,10 +214,8 @@ class EndpointActivityTests(EndpointFixture, unittest.TestCase):
             EndpointConfig(f"http://127.0.0.1:{server.server_port}", self.config["token"], timeout=2)
         )
         request = self.request()
-        client.start_job(
-            run_id=request["run_id"],
-            resolution=HandoffResolution(request["package"], request["handoff_sha256"]),
-        )
+        jobs.create(request)
+        self.seal_selection(jobs, request["run_id"])
         self.assertTrue(preparing.wait(2))
         running = client.get_job(request["run_id"])
         self.assertEqual(running["status"], "running")
@@ -227,6 +226,9 @@ class EndpointActivityTests(EndpointFixture, unittest.TestCase):
             ["discover.read_components", "discover.read_mates"],
         )
         release.set()
+        state = self.wait_state_any_status(jobs, request["run_id"], {"awaiting_definition"})
+        if state["status"] == "awaiting_definition":
+            self.complete_definition(jobs, request["run_id"])
         deadline = time.time() + 5
         final = running
         while time.time() < deadline:
@@ -252,18 +254,17 @@ class EndpointActivityTests(EndpointFixture, unittest.TestCase):
     def test_stale_discovery_activity_is_retired_when_the_stage_ends(self):
         capture_running, capture_release = threading.Event(), threading.Event()
 
-        def prepare(*args, **kwargs):
-            sink = kwargs.get("on_activity")
-            sink({"phase": "discover", "action": "build_record", "params": {"components": 126}})
-            return self.prepare(*args, **kwargs)
+        def reader(frozen, settings, on_activity=None):
+            on_activity({"phase": "discover", "action": "build_record", "params": {"components": 126}})
+            return copy.deepcopy(self.record)
 
-        def runner(*args, **kwargs):
+        def runner(package, output, **kwargs):
             capture_running.set()
             if not capture_release.wait(5):
                 raise RuntimeError("test did not release the capture runner")
-            return self.capture_transfer_result(args[1], run_id=kwargs["run_id"], on_event=kwargs["on_event"])
+            return self.capture_transfer_result(output, run_id=kwargs["run_id"], on_event=kwargs.get("on_event"))
 
-        jobs = self.jobs(runner=runner, preparer=prepare)
+        jobs = self.jobs(runner=runner, native_reader=reader)
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler(jobs, self.config["token"]))
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
@@ -273,10 +274,11 @@ class EndpointActivityTests(EndpointFixture, unittest.TestCase):
             EndpointConfig(f"http://127.0.0.1:{server.server_port}", self.config["token"], timeout=2)
         )
         request = self.request()
-        client.start_job(
-            run_id=request["run_id"],
-            resolution=HandoffResolution(request["package"], request["handoff_sha256"]),
-        )
+        jobs.create(request)
+        self.seal_selection(jobs, request["run_id"])
+        state = self.wait_state_any_status(jobs, request["run_id"], {"awaiting_definition"})
+        self.assertEqual(state["status"], "awaiting_definition")
+        self.complete_definition(jobs, request["run_id"])
         self.assertTrue(capture_running.wait(2))
         snapshot = client.get_job(request["run_id"])
         self.assertEqual(snapshot["status"], "running")

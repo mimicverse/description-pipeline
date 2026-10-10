@@ -29,7 +29,6 @@ from description_pipeline.orchestration.airflow_client import (
     EndpointConfig,
     EndpointError,
     EndpointProtocolError,
-    HandoffResolution,
     WindowsEndpoint,
     capture_archive_metadata,
     check_result,
@@ -251,13 +250,6 @@ def _linked_source(retained: object, supplied) -> tuple[dict[str, str], str, str
     if main is None or main not in validated:
         raise AirflowFailException("Parent native job's retained selection names no admissible main assembly")
     return validated, upload_sha256, main
-
-
-def _resolution(request: dict) -> HandoffResolution:
-    return HandoffResolution(
-        package=request["package"],
-        handoff_sha256=request["handoff_sha256"],
-    )
 
 
 def _materialize_selection(intake: Path, files: dict[str, str], target: Path) -> Path:
@@ -492,16 +484,9 @@ def _poke(request: dict, **context) -> bool:
 
 
 def _same_request(job: dict, request: dict) -> None:
-    if "upload_files" in request:
-        expected = {key: request[key] for key in ("run_id", "upload_files", "upload_sha256", "main_assembly")}
-        if request.get("resume") is not None:
-            expected["resume"] = request["resume"]
-    else:
-        expected = {key: request[key] for key in ("run_id", "package", "handoff_sha256")}
-        if request.get("resume") is not None:
-            expected["resume"] = request["resume"]
-        if request.get("main_assembly") is not None:
-            expected["main_assembly"] = request["main_assembly"]
+    expected = {key: request[key] for key in ("run_id", "upload_files", "upload_sha256", "main_assembly")}
+    if request.get("resume") is not None:
+        expected["resume"] = request["resume"]
     if job.get("request") != expected:
         raise AirflowFailException("Endpoint job differs from the requested mechanical handoff")
 
@@ -630,20 +615,12 @@ def solidworks_to_urdf():
                 (request.get("resume") or {}).get("from_stage"),
             )
             return {**request, "status": "linux_owned"}
-        if "upload_files" in request:
-            job = _endpoint(request["conn_id"]).start_selection_job(
-                run_id=request["run_id"],
-                upload_files=request["upload_files"],
-                main_assembly=request["main_assembly"],
-                resume=request.get("resume"),
-            )
-        else:
-            job = _endpoint(request["conn_id"]).start_job(
-                run_id=request["run_id"],
-                resolution=_resolution(request),
-                resume=request.get("resume"),
-                main_assembly=request.get("main_assembly"),
-            )
+        job = _endpoint(request["conn_id"]).start_selection_job(
+            run_id=request["run_id"],
+            upload_files=request["upload_files"],
+            main_assembly=request["main_assembly"],
+            resume=request.get("resume"),
+        )
         log.info("started run_id=%s status=%s", job["run_id"], job["status"])
         return {**request, "status": job["status"]}
 

@@ -41,7 +41,6 @@ from urllib import request as urlrequest
 
 from ..delivery import PIPELINE_ID
 from ..io import PipelineError, artifact_path_parts, digest
-from ..sources.solidworks.handoff import HANDOFF_SCHEMA
 from ..sources.solidworks.selection import seal_selection, selection_plan, validate_file_index, verify_selection
 from ..stages import STAGE_IDS
 from .selection_client import prepare_selection_batch
@@ -234,10 +233,6 @@ def validate_main_assembly(value: object) -> str:
     return value
 
 
-def validate_package(value: str) -> str:
-    return _validate_relative_path(value, "package")
-
-
 def validate_artifact_name(value: str) -> str:
     return _validate_relative_path(value, "artifact name")
 
@@ -246,10 +241,6 @@ def _validate_digest(value: str, field: str) -> str:
     if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
         raise EndpointProtocolError(f"{field} must be a lowercase SHA-256 digest")
     return value
-
-
-def validate_handoff_sha(value: str) -> str:
-    return _validate_digest(value, "handoff_sha256")
 
 
 def validate_sha256(value: str) -> str:
@@ -372,34 +363,6 @@ def config_from_airflow_connection(conn_id: str, *, timeout: float = 30.0) -> En
         store_root=extra.get("store_root"),
         discovery=extra.get("discovery") or {},
     )
-
-
-@dataclass(frozen=True)
-class HandoffResolution:
-    """One operator path resolved to the mechanical handoff the endpoint will run.
-
-    The resolution carries only the managed package and its handoff digest; hardware, revision and
-    repository routing are resolved inside the serialized Windows job after CAD discovery.
-    """
-
-    package: str
-    handoff_sha256: str
-
-    @classmethod
-    def from_payload(cls, payload: dict) -> HandoffResolution:
-        if not isinstance(payload, dict):
-            raise EndpointProtocolError("handoff resolution is not a JSON object")
-        expected = {"schema_version", "pipeline_id", "package", "handoff_sha256"}
-        if set(payload) != expected:
-            raise EndpointProtocolError(f"handoff resolution must carry exactly {sorted(expected)}")
-        if payload.get("schema_version") != HANDOFF_SCHEMA:
-            raise EndpointProtocolError(f"unexpected handoff schema: {payload.get('schema_version')!r}")
-        if payload.get("pipeline_id") != PIPELINE_ID:
-            raise EndpointProtocolError(f"unexpected pipeline_id: {payload.get('pipeline_id')!r}")
-        return cls(
-            package=validate_package(payload.get("package")),
-            handoff_sha256=validate_handoff_sha(payload.get("handoff_sha256")),
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -659,32 +622,6 @@ class WindowsEndpoint:
         except (ImportError, PipelineError, TypeError, ValueError, OSError) as error:
             raise EndpointProtocolError(str(error)) from error
 
-    def resolve_handoff(self, handoff_path: str) -> HandoffResolution:
-        """Resolve one operator path; an authorized absolute POSIX folder is ZIP-imported first."""
-        path = validate_handoff_path(handoff_path)
-        if os.name == "posix" and PurePosixPath(path).is_absolute():
-            return self._import_handoff(self._authorized_handoff_dir(path))
-        return HandoffResolution.from_payload(self._request("POST", "/v1/handoffs/resolve", {"handoff_path": path}))
-
-    def _import_handoff(self, source: Path) -> HandoffResolution:
-        from ..sources.solidworks.handoff import prepare_archive
-
-        if not source.is_dir():
-            raise EndpointProtocolError(f"handoff_path is not a directory: {source}")
-        with tempfile.TemporaryDirectory(prefix="handoff-import-") as tmp:
-            archive = Path(tmp) / "handoff.zip"
-            identity = prepare_archive(source, archive)
-            size = archive.stat().st_size
-            if size <= 0:
-                raise EndpointProtocolError("handoff archive is empty")
-            with archive.open("rb") as handle:
-                payload = self._request_stream("POST", "/v1/handoffs/import", handle, size=size)
-        resolved = HandoffResolution.from_payload(payload)
-        expected = str((identity or {}).get("handoff_sha256") or "")
-        if resolved.handoff_sha256 != expected:
-            raise EndpointProtocolError("endpoint stored a different handoff digest than the uploaded archive")
-        return resolved
-
     def health(self) -> dict:
         payload = self._request("GET", "/health")
         if payload.get("pipeline_id") != PIPELINE_ID:
@@ -692,41 +629,6 @@ class WindowsEndpoint:
         if "ready" not in payload and "readiness" not in payload:
             raise EndpointProtocolError("health response must include readiness")
         return payload
-
-    def start_job(
-        self,
-        *,
-        run_id: str,
-        resolution: HandoffResolution,
-        resume: dict | None = None,
-        main_assembly: str | None = None,
-    ) -> dict:
-        """Start one native run with exactly the resolved package and its handoff digest.
-
-        ``resume`` links the new job to a terminal parent (``parent_run`` native UUID and the
-        canonical ``from_stage``); the endpoint revalidates the parent, its checkpoints and
-        the retained upload before accepting it.  ``main_assembly`` names the delivered
-        assembly explicitly; the endpoint verifies it against the frozen handoff.
-        """
-        if not isinstance(resolution, HandoffResolution):
-            raise EndpointProtocolError("start_job requires a resolved handoff")
-        payload = {
-            "run_id": validate_run_id(run_id),
-            "package": resolution.package,
-            "handoff_sha256": resolution.handoff_sha256,
-        }
-        if resume is not None:
-            payload["resume"] = validate_resume(resume, run_id=payload["run_id"])
-        if main_assembly is not None:
-            payload["main_assembly"] = validate_main_assembly(main_assembly)
-        response = self._request("POST", "/v1/jobs", payload)
-        if response.get("run_id") != payload["run_id"]:
-            raise EndpointProtocolError("endpoint returned a different run_id")
-        if response.get("status") not in RUN_STATES:
-            raise EndpointProtocolError(f"unexpected job status: {response.get('status')!r}")
-        if response.get("request") != payload:
-            raise EndpointProtocolError("Endpoint accepted a different mechanical handoff")
-        return response
 
     def authorized_intake_dir(self, handoff_path: str) -> Path:
         """The local sealed intake folder for one operator path, inside ``handoff_roots``."""
@@ -967,29 +869,6 @@ class WindowsEndpoint:
         _validate_activity(job)
         return job
 
-    def get_preview(self, run_id: str) -> dict:
-        """Preview metadata of one passed, bound delivery (operator portal entry point)."""
-        canonical = validate_run_id(run_id)
-        preview = self._request("GET", f"/v1/jobs/{canonical}/preview")
-        if preview.get("pipeline_id") != PIPELINE_ID:
-            raise EndpointProtocolError(f"unexpected pipeline_id: {preview.get('pipeline_id')!r}")
-        if preview.get("run_id") != canonical:
-            raise EndpointProtocolError("preview returned a different run_id")
-        subject = preview.get("subject_sha256")
-        if not isinstance(subject, str) or _SHA256.fullmatch(subject) is None:
-            raise EndpointProtocolError("preview must carry the subject_sha256 digest")
-        urdf = validate_artifact_name(preview.get("urdf"))
-        files = preview.get("files")
-        if not isinstance(files, dict) or not files:
-            raise EndpointProtocolError("preview must list the delivered files")
-        for name, checksum in files.items():
-            validate_artifact_name(name)
-            if not isinstance(checksum, str) or _SHA256.fullmatch(checksum) is None:
-                raise EndpointProtocolError("preview file digests must be lowercase SHA-256")
-        if urdf not in files:
-            raise EndpointProtocolError("preview urdf must be one of the delivered files")
-        return preview
-
     def open_artifact(self, run_id: str, name: str) -> Any:
         """Open one verified delivery artifact for streaming; the caller closes the response."""
         canonical = validate_run_id(run_id)
@@ -1049,33 +928,6 @@ class WindowsEndpoint:
             raise EndpointProtocolError("capture archive does not match its recorded size or digest")
         os.replace(temporary, destination)
         return destination
-
-    def read_artifact(self, run_id: str, name: str, *, sha256: str, limit: int = 64 * 1024 * 1024) -> bytes:
-        """Read one artifact into memory and require its exact digest before returning it."""
-        expected = validate_sha256(sha256)
-        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
-            raise EndpointProtocolError("artifact size limit must be a positive integer")
-        with self.open_artifact(run_id, name) as response:
-            declared = response.headers.get("Content-Length")
-            if declared is not None:
-                try:
-                    size = int(declared)
-                except (TypeError, ValueError) as error:
-                    raise EndpointProtocolError("artifact Content-Length is not an integer") from error
-                if size < 0 or size > limit:
-                    raise EndpointProtocolError(f"artifact exceeds the {limit}-byte limit")
-            data = bytearray()
-            while True:
-                chunk = response.read(65536)
-                if not chunk:
-                    break
-                data.extend(chunk)
-                if len(data) > limit:
-                    raise EndpointProtocolError(f"artifact exceeds the {limit}-byte limit")
-        digest = hashlib.sha256(bytes(data)).hexdigest()
-        if digest != expected:
-            raise EndpointProtocolError(f"artifact {name!r} does not match the preview digest")
-        return bytes(data)
 
     def wait(self, run_id: str, *, interval: float = 2.0, timeout: float = 600.0) -> dict:
         """Bounded polling; returns the job dict at the native terminal boundary.
