@@ -299,6 +299,7 @@ class LinuxSplitTests(unittest.TestCase):
 
         def fake_run(package, output, **kwargs):
             stages.append((kwargs["resume_from"], Path(kwargs["seed_dir"]), Path(output), kwargs.get("repository")))
+            Path(output).mkdir(parents=True, exist_ok=True)
             return {
                 "state": {"generate": "generated", "verify": "verified", "publish": "published"}[kwargs["resume_from"]],
                 "passed": kwargs["resume_from"] != "generate",
