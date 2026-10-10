@@ -31,6 +31,7 @@ from description_pipeline.sources.solidworks.discovery import (  # noqa: E402
     _identity,
     _mate_rows,
     _unit,
+    derive_native_package,
     prepare_native_package,
 )
 from description_pipeline.sources.solidworks.errors import CadError  # noqa: E402
@@ -2059,6 +2060,127 @@ class MateReaderTests(unittest.TestCase):
         from description_pipeline.sources.solidworks.native import _mate_specific
 
         self.assertIsNone(_mate_specific(FakeMateFeature("RefPlane"), strict=False))
+
+
+PRIVATE_M3_ROOT = Path("/home/andy/Work/reviews/incident094339")
+PRIVATE_M3_LOCKED = Path("/home/andy/Downloads/3.0 总装1008")
+
+
+class DerivationSplitTests(unittest.TestCase):
+    """The pure derivation runs without any native module or CAD session."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="sw-derive-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _scene(self) -> tuple[Path, Path]:
+        root = self.tmp / "native"
+        for name in ("cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT"):
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f"placeholder {name}\n".encode())
+        records = self.tmp / "records"
+        path = records / "joints" / "arm.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"limits": {"lower": -1.5, "upper": 1.5}, "drive": {"effort": 6.0, "velocity": 2.0}}),
+            encoding="utf-8",
+        )
+        (records / "budget.json").write_text(
+            json.dumps({"robot": {"expected_mass_kg": [0.28, 0.32], "expected_extent_m": [0.35, 0.5]}}),
+            encoding="utf-8",
+        )
+        return root, records
+
+    def test_derivation_matches_preparation_without_native_readiness(self) -> None:
+        source, records = self._scene()
+        payload = record()
+        settings = DiscoverySettings(record_roots=(records,))
+        prepared = prepare_native_package(
+            source, self.tmp / "prepared", run_id="run-1", backend=FakeBackend(payload), settings=settings
+        )
+        with mock.patch(
+            "description_pipeline.runtime.native_readiness",
+            side_effect=AssertionError("derivation must not consult the native runtime"),
+        ):
+            derived = derive_native_package(source, self.tmp / "derived", "run-1", payload, settings=settings)
+        self.assertEqual(inventory(self.tmp / "prepared"), inventory(self.tmp / "derived"))
+        self.assertEqual(prepared.prepared_sha256, derived.prepared_sha256)
+        self.assertEqual(prepared.discovery_sha256, derived.discovery_sha256)
+        self.assertEqual([f["code"] for f in prepared.findings], [f["code"] for f in derived.findings])
+        self.assertEqual(prepared.passed, derived.passed)
+        self.assertEqual(
+            (self.tmp / "prepared" / "robot.yaml").read_bytes(),
+            (self.tmp / "derived" / "robot.yaml").read_bytes(),
+        )
+
+    def test_derivation_refuses_a_selected_main_outside_the_record(self) -> None:
+        source, records = self._scene()
+        settings = DiscoverySettings(record_roots=(records,), main_assembly="other.SLDASM")
+        with self.assertRaisesRegex(PipelineError, "did not open the selected main assembly"):
+            derive_native_package(source, self.tmp / "derived", "run-1", record(), settings=settings)
+
+    def test_derivation_refuses_a_missing_main_inside_the_frozen_directory(self) -> None:
+        source, records = self._scene()
+        (source / "cad/robot.SLDASM").unlink()
+        result = derive_native_package(
+            source, self.tmp / "derived", "run-1", record(), settings=DiscoverySettings(record_roots=(records,))
+        )
+        self.assertFalse(result.passed)
+        self.assertIn("discovery.main_assembly_ambiguous", [finding["code"] for finding in result.findings])
+
+    def test_derivation_binds_the_payload_to_the_frozen_bytes_it_reads(self) -> None:
+        # The steps-level guard (frozen inventory unchanged before/during discovery)
+        # stays the refusal for a changed input; derivation itself still binds the
+        # payload to the bytes present, never to a stale record value.
+        source, records = self._scene()
+        result = derive_native_package(
+            source, self.tmp / "derived", "run-1", record(), settings=DiscoverySettings(record_roots=(records,))
+        )
+        payload = json.loads((self.tmp / "derived/discovery/native-discovery.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload["native_files"], inventory(source))
+        self.assertEqual(result.handoff_sha256, digest(inventory(source)))
+
+
+@unittest.skipUnless(
+    (PRIVATE_M3_ROOT / "7452a463-native-discovery.json").is_file() and PRIVATE_M3_LOCKED.is_dir(),
+    "private M3 evidence is not available on this host",
+)
+class PrivateM3DerivationReplayTests(unittest.TestCase):
+    """Private locked50/raw48 replay; the committed test skips without the evidence."""
+
+    def test_recorded_raw_replays_purely_and_matches_preparation(self) -> None:
+        payload = json.loads((PRIVATE_M3_ROOT / "7452a463-native-discovery.json").read_text(encoding="utf-8"))
+        raw = payload["raw"]
+        lock = json.loads((PRIVATE_M3_ROOT / "m3-input-lock.json").read_text(encoding="utf-8"))
+        tmp = Path(tempfile.mkdtemp(prefix="sw-m3-replay-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        first, second = tmp / "locked-a", tmp / "locked-b"
+        shutil.copytree(PRIVATE_M3_LOCKED, first)
+        shutil.copytree(PRIVATE_M3_LOCKED, second)
+        settings = DiscoverySettings()
+        prepared = prepare_native_package(
+            first, tmp / "prepared", run_id="m3-replay", backend=FakeBackend(raw), settings=settings
+        )
+        with mock.patch(
+            "description_pipeline.runtime.native_readiness",
+            side_effect=AssertionError("derivation must not consult the native runtime"),
+        ):
+            derived = derive_native_package(second, tmp / "derived", "m3-replay", raw, settings=settings)
+        self.assertEqual(inventory(tmp / "prepared"), inventory(tmp / "derived"))
+        self.assertEqual(prepared.prepared_sha256, derived.prepared_sha256)
+        self.assertEqual(prepared.discovery_sha256, derived.discovery_sha256)
+        self.assertEqual([f["code"] for f in prepared.findings], [f["code"] for f in derived.findings])
+        # This record carries blocking findings: both paths return the failed
+        # package without the robot document, and their definitions/findings agree.
+        self.assertFalse(prepared.passed)
+        self.assertFalse(derived.passed)
+        self.assertGreater(len(derived.findings), 0)
+        self.assertFalse((tmp / "prepared" / "robot.yaml").exists())
+        self.assertFalse((tmp / "derived" / "robot.yaml").exists())
+        derived_payload = json.loads((tmp / "derived/discovery/native-discovery.json").read_text(encoding="utf-8"))
+        self.assertEqual(derived_payload["native_files"], lock["files"])
+        self.assertEqual(inventory(first), inventory(second))
 
 
 if __name__ == "__main__":

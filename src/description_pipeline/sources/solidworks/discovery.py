@@ -3715,6 +3715,13 @@ def _guarded_sink(on_activity):
     return guarded
 
 
+def _check_derivation_paths(frozen_source: Path, output: Path) -> None:
+    if frozen_source.is_symlink() or frozen_source.is_junction() or not frozen_source.is_dir():
+        raise PipelineError("frozen_source must be an existing native engineering directory, not a link")
+    if output.exists() and any(output.iterdir()):
+        raise PipelineError("prepared output directory must be empty")
+
+
 def prepare_native_package(
     frozen_source: Path,
     output: Path,
@@ -3727,27 +3734,35 @@ def prepare_native_package(
     on_event=None,
     on_activity=None,
 ) -> PreparedPackage:
-    """Derive a prepared package from one immutable native engineering directory.
+    """Read one immutable engineering directory natively, then derive purely.
 
-    ``on_activity`` is the optional live-activity sink described by the activity
-    contract: it observes what the native read is doing right now and can never
-    change the derived record, the returned package or any failure path.
+    The native-reading adapter is the only step that needs Windows/COM; the
+    derivation below is pure and can run wherever the raw record is available.
+    ``on_activity`` observes the native read and can never change the derived
+    record, the returned package or any failure path.
     """
 
     settings = settings or DiscoverySettings()
-    frozen_source = Path(frozen_source)
-    output = Path(output)
-    if frozen_source.is_symlink() or frozen_source.is_junction() or not frozen_source.is_dir():
-        raise PipelineError("frozen_source must be an existing native engineering directory, not a link")
-    if output.exists() and any(output.iterdir()):
-        raise PipelineError("prepared output directory must be empty")
-    native_files = package_inventory(frozen_source)
-    handoff_sha256 = digest(native_files)
-    authored = sorted(
-        name for name in native_files if name in {ROBOT_FILE, REVISION_FILE} or name.startswith("discovery/")
+    _check_derivation_paths(Path(frozen_source), Path(output))
+    record = read_native_record(frozen_source, settings, backend=backend, on_activity=on_activity)
+    return derive_native_package(
+        frozen_source,
+        output,
+        run_id,
+        record,
+        settings=settings,
+        configuration=configuration,
+        assembly=assembly,
+        on_event=on_event,
+        on_activity=on_activity,
     )
-    if authored:
-        raise PipelineError(f"frozen_source already contains authored package files: {authored[:5]}")
+
+
+def read_native_record(
+    frozen_source: Path, settings: DiscoverySettings, *, backend=None, on_activity=None
+) -> dict:
+    """Native-reading adapter: the only step that needs Windows/COM and a CAD session."""
+
     if backend is None:
         from .native import SolidWorksBackend
         from ...runtime import native_readiness
@@ -3757,9 +3772,45 @@ def prepare_native_package(
     native_settings = {"namespace": NAMESPACE, "contract": CONTRACT}
     if settings.main_assembly:
         native_settings["main_assembly"] = settings.main_assembly
-    record = backend.discover_native(frozen_source, native_settings, on_activity=_guarded_sink(on_activity))
+    record = backend.discover_native(Path(frozen_source), native_settings, on_activity=_guarded_sink(on_activity))
     if not isinstance(record, dict) or record.get("schema_version") != DISCOVERY_SCHEMA:
         raise PipelineError("native discovery backend returned an unexpected record schema")
+    return record
+
+
+def derive_native_package(
+    frozen_source: Path,
+    output: Path,
+    run_id: str,
+    record: dict,
+    *,
+    settings: DiscoverySettings | None = None,
+    configuration: str | None = None,
+    assembly: str | None = None,
+    on_event=None,
+    on_activity=None,
+) -> PreparedPackage:
+    """Derive a prepared package purely from a raw native record.
+
+    No backend, COM or session import happens here: the record is validated,
+    bound to the frozen bytes and derived into the robot document, revision and
+    findings.  ``on_activity`` stays accepted for API compatibility with the
+    reading adapter; nothing in this function observes a session.
+    """
+
+    settings = settings or DiscoverySettings()
+    _check_derivation_paths(Path(frozen_source), Path(output))
+    if not isinstance(record, dict) or record.get("schema_version") != DISCOVERY_SCHEMA:
+        raise PipelineError("native discovery record has an unexpected schema")
+    frozen_source = Path(frozen_source)
+    output = Path(output)
+    native_files = package_inventory(frozen_source)
+    handoff_sha256 = digest(native_files)
+    authored = sorted(
+        name for name in native_files if name in {ROBOT_FILE, REVISION_FILE} or name.startswith("discovery/")
+    )
+    if authored:
+        raise PipelineError(f"frozen_source already contains authored package files: {authored[:5]}")
     _validate_native_record(record)
     if settings.main_assembly:
         identity_block = record.get("identity") if isinstance(record.get("identity"), dict) else {}
