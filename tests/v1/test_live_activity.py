@@ -182,7 +182,6 @@ class EndpointActivityTests(EndpointFixture, unittest.TestCase):
         def prepare(*args, **kwargs):
             sink = kwargs.get("on_activity")
             self.assertIsNotNone(sink)
-            preparing.set()
             sink(
                 {
                     "phase": "discover",
@@ -195,6 +194,7 @@ class EndpointActivityTests(EndpointFixture, unittest.TestCase):
             sink({"phase": "discover", "action": "read_components", "current_object": "/etc/passwd"})
             sink({"phase": "nonsense", "action": "read_components"})
             sink({"phase": "discover", "action": "read_mates", "completed": 2, "total": 6})
+            preparing.set()
             if not release.wait(5):
                 raise RuntimeError("test did not release the preparer")
             seen["called"] = True
