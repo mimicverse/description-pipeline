@@ -122,6 +122,14 @@ SolidWorks' vendor MathTransform layout at the COM boundary. Verification reads
 the captured protocol directly and derives zero-pose FK from the native root
 datum, independently of model provenance.
 
+Assembly reference geometry is recorded as a frame, never a physical part.
+Top-assembly datums may belong to the base body only when all assembly-frame
+mates resolve to one rigid cluster, their combined constraints have rank six,
+and that cluster owns `CS_base_link`. The generator and verifier derive this
+attachment separately from the raw observations. Partial, ambiguous and nested
+assembly-frame attachments block derivation with the affected mate and scope;
+no world joint, mass or rigid membership is inferred from an `IsFixed` flag.
+
 ## Report identity
 
 The subject digest binds every file under `input/`, `evidence/`, `model/`,
