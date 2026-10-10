@@ -197,6 +197,73 @@ def _component_document(component):
     return _modeldoc2(_method(component, "GetModelDoc2"))
 
 
+#: ``swComponentSuppressionState_e`` members (SolidWorks type library, verified in the
+#: local typelib dump api-probe-output.txt): 0 suppressed, 1 lightweight, 2 fully
+#: resolved, 3 resolved, 4 fully lightweight, 5 internal-ID mismatch.
+COMPONENT_SUPPRESSED = 0
+COMPONENT_LIGHTWEIGHT = 1
+COMPONENT_FULLY_LIGHTWEIGHT = 4
+COMPONENT_INTERNAL_ID_MISMATCH = 5
+_COMPONENT_STATES = (0, 1, 2, 3, 4)
+
+
+def _component_state(component):
+    """Raw ``IComponent2::GetSuppression2`` state, fail-closed.
+
+    The vendor type library documents ``GetSuppression2`` (no deprecated-method
+    fallback is used).  A mismatched internal-ID binding must never be treated as
+    a resolved occurrence, and an unreadable or undocumented state is reported as
+    such instead of being coerced to resolved or suppressed.
+    """
+
+    try:
+        state = _method(component, "GetSuppression2")
+    except Exception as error:  # noqa: BLE001 - precise refusal, never a guess
+        raise CadError(
+            "cad_component_state_unreadable",
+            "component suppression state could not be read",
+            {"error": f"{type(error).__name__}: {error}"[:200]},
+        ) from error
+    if type(state) is not int:
+        raise CadError(
+            "cad_component_state_unreadable",
+            "component suppression state is not an integer",
+            {"state": repr(state)[:200]},
+        )
+    if state == COMPONENT_INTERNAL_ID_MISMATCH:
+        raise CadError(
+            "cad_component_internal_id_mismatch",
+            "component is bound to a document with a different internal ID",
+            {"state": state, "enum": "swComponentInternalIdMismatch"},
+        )
+    if state not in _COMPONENT_STATES:
+        raise CadError(
+            "cad_component_state_unsupported",
+            "component suppression state is not a documented value",
+            {"state": state},
+        )
+    return state
+
+
+def _measured_component_state(component):
+    """Suppression state for a *measurement* path (mass or geometry).
+
+    A genuinely suppressed occurrence contributes no measurement and is still
+    skipped by the caller; a lightweight occurrence (state 1/4) is **not**
+    suppressed and has no fully loaded bodies or mass, so it is refused instead
+    of being silently dropped as though it were suppressed.
+    """
+
+    state = _component_state(component)
+    if state in (COMPONENT_LIGHTWEIGHT, COMPONENT_FULLY_LIGHTWEIGHT):
+        raise CadError(
+            "cad_component_lightweight_unresolved",
+            "a lightweight occurrence cannot be measured; resolve it before capture",
+            {"state": state},
+        )
+    return state
+
+
 def _hint_method(obj, name):
     """Resolve a method name once per dispatch; never cache its return values."""
     flag = getattr(obj, "_FlagAsMethod", None)
@@ -2280,7 +2347,7 @@ class SolidWorksBackend(CadBackend):
                 if raw_name is None or not str(raw_name):
                     raise CadError("cad_component_name_missing", "component instance has no Name2")
                 name = str(raw_name)
-                if _member(component, "IsSuppressed"):
+                if _measured_component_state(component) == COMPONENT_SUPPRESSED:
                     continue
                 children = list(_method(component, "GetChildren") or ())
                 component_path = str(_method(component, "GetPathName"))
@@ -2529,7 +2596,7 @@ class SolidWorksBackend(CadBackend):
         stack: list[object] = list(reversed(list(_method(root, "GetChildren") or ())))
         while stack:
             component = _component(stack.pop())
-            if _member(component, "IsSuppressed"):
+            if _measured_component_state(component) == COMPONENT_SUPPRESSED:
                 continue
             children = list(_method(component, "GetChildren") or ())
             stack.extend(reversed(children))
@@ -2678,7 +2745,7 @@ class SolidWorksBackend(CadBackend):
         record_datums(doc, "", None)
         while stack:
             comp = _component(stack.pop())
-            if _member(comp, "IsSuppressed"):
+            if _measured_component_state(comp) == COMPONENT_SUPPRESSED:
                 continue
             borrowed_components.append(comp)
             name = str(_member(comp, "Name2"))
@@ -2979,11 +3046,17 @@ class SolidWorksBackend(CadBackend):
                 name = _member(comp, "Name2")
                 if not _is_text_name(name):
                     raise ValueError("the occurrence has no readable full name")
-                suppressed = _member(comp, "IsSuppressed")
-                if not isinstance(suppressed, bool):
-                    raise ValueError("the occurrence has no readable suppression state")
-                if suppressed:
+                state = _component_state(comp)
+                if state == COMPONENT_SUPPRESSED:
                     continue
+                if phase == "geometry" and state in (COMPONENT_LIGHTWEIGHT, COMPONENT_FULLY_LIGHTWEIGHT):
+                    # Geometry capture needs loaded bodies; a lightweight
+                    # occurrence must be refused instead of exporting nothing.
+                    raise CadError(
+                        "cad_component_lightweight_unresolved",
+                        "a lightweight occurrence cannot be measured; resolve it before capture",
+                        {"component": name, "state": state, "phase": phase},
+                    )
                 if name in current or name not in self._source_components:
                     raise CadError(
                         "cad_source_changed", "the active occurrence identities changed", {"component": name}
@@ -3012,7 +3085,10 @@ class SolidWorksBackend(CadBackend):
                 current[name] = comp
                 stack.extend(_method(comp, "GetChildren") or ())
         except Exception as error:
-            if isinstance(error, CadError) and error.code == "cad_source_changed":
+            if isinstance(error, CadError) and error.code in {
+                "cad_source_changed",
+                "cad_component_internal_id_mismatch",
+            }:
                 raise
             raise CadError(
                 "cad_source_state_unreadable",
@@ -3281,7 +3357,8 @@ class SolidWorksBackend(CadBackend):
             if model is not None and document:
                 read_only_paths.add(str(document))
             referenced = _member(component, "ReferencedConfiguration")
-            suppressed = bool(_member(component, "IsSuppressed"))
+            state = _component_state(component)
+            suppressed = state == COMPONENT_SUPPRESSED
             instances.append(
                 {
                     "instance": instance,
@@ -3290,6 +3367,7 @@ class SolidWorksBackend(CadBackend):
                     "document_name": ntpath.basename(str(document)).lower() if document else None,
                     "configuration": str(referenced) if referenced is not None else None,
                     "suppressed": suppressed,
+                    "suppression_state": state,
                     "depth": depth,
                 }
             )
@@ -3595,6 +3673,10 @@ class SolidWorksBackend(CadBackend):
                         completed=components_done,
                         total=components_total,
                     )
+                    # Read the documented suppression state before any path, model or
+                    # mass traversal: a mismatched internal-ID binding must refuse the
+                    # capture, not be silently traversed as a resolved occurrence.
+                    state = _component_state(component)
                     document_path = _method(component, "GetPathName")
                     source_document = _component_source_document(component, source_root)
                     local_transform = []
@@ -3631,8 +3713,9 @@ class SolidWorksBackend(CadBackend):
                         or (normalize_document_path(str(document_path)) if _is_text_name(document_path) else ""),
                         "configuration": str(_member(component, "ReferencedConfiguration") or ""),
                         "fixed": bool(_member(component, "IsFixed")),
-                        "suppressed": bool(_member(component, "IsSuppressed")),
-                        "lightweight": None,
+                        "suppressed": state == COMPONENT_SUPPRESSED,
+                        "suppression_state": state,
+                        "lightweight": state in (1, 4),
                         "transform": transform,
                     }
                     if "source_provenance" in source_document:
@@ -3644,7 +3727,6 @@ class SolidWorksBackend(CadBackend):
                         configuration=referenced_configuration,
                         scope=prefix,
                     )
-                    notes.append(f"lightweight:{path_name}:unsupported_declared")
                     components.append(entry)
                     # Keep primitives beyond this traversal scope. Later
                     # configuration changes must not reuse borrowed occurrences.
@@ -3652,9 +3734,17 @@ class SolidWorksBackend(CadBackend):
                     by_document[path_name] = entry["document"]
                     try:
                         mass_property = _member(_member(assembly, "Extension"), "CreateMassProperty2")
+                        if mass_property is not None and entry["lightweight"]:
+                            # Informational per-component mass: a lightweight
+                            # occurrence is not measured and is never silently
+                            # reported as if it had no mass.
+                            notes.append(
+                                f"mass:{path_name}:lightweight_state_{entry['suppression_state']}_unmeasured"
+                            )
                         if (
                             mass_property is not None
                             and not entry["suppressed"]
+                            and not entry["lightweight"]
                             and not entry["document"].lower().endswith(".sldasm")
                         ):
                             mass_property.UseSystemUnits = True

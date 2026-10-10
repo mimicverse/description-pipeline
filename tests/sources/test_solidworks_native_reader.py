@@ -218,6 +218,7 @@ class _Component:
         children=(),
         doc=None,
         suppressed=False,
+        suppression=None,
         transform=SW_IDENTITY,
         configuration="Default",
         is_root=False,
@@ -229,7 +230,9 @@ class _Component:
         # component needs a real document; a missing API must be explicit.
         self._doc = doc if doc is not None else _Doc(self._path)
         self._transform = tuple(transform)
-        self.IsSuppressed = suppressed
+        #: ``swComponentSuppressionState_e`` raw state (0 suppressed, 1 lightweight,
+        #: 2 fully resolved, 3 resolved, 4 fully lightweight, 5 internal-ID mismatch).
+        self._suppression = suppression if suppression is not None else (0 if suppressed else 2)
         self.IsFixed = False
         # The read-only root-signature probe on the frozen production assembly
         # (2026-10-10) shows IsRoot as a native boolean: True on the root
@@ -239,6 +242,19 @@ class _Component:
 
     def GetPathName(self):
         return self._path
+
+    @property
+    def IsSuppressed(self):
+        return self._suppression == 0
+
+    @IsSuppressed.setter
+    def IsSuppressed(self, value):
+        # Booleans keep the documented coherence; non-boolean values are stored
+        # verbatim so tests can simulate an unreadable native state.
+        self._suppression = (0 if value else 2) if isinstance(value, bool) else value
+
+    def GetSuppression2(self):
+        return self._suppression
 
     def GetTotalTransform(self, _resolved):
         return types.SimpleNamespace(ArrayData=list(self._transform))
@@ -3322,6 +3338,139 @@ class MateEntityReferenceTests(unittest.TestCase):
                 frame_reference["geometry"],
                 {"kind": "plane", "point": [0.0, 0.0, 0.0], "normal": [0.0, 0.0, 1.0], "frame": "component-local"},
             )
+
+
+class ComponentSuppressionStateTests(unittest.TestCase):
+    """Raw ``swComponentSuppressionState_e``: emitted, coherent, fail-closed on mismatch."""
+
+    def test_helper_reads_each_documented_state_once_and_refuses_the_rest(self):
+        from description_pipeline.sources.solidworks.native import _component_state
+
+        reads = []
+        for state in (0, 1, 2, 3, 4):
+            component = types.SimpleNamespace(GetSuppression2=lambda s=state: (reads.append(s), s)[1])
+            self.assertEqual(_component_state(component), state)
+        self.assertEqual(reads, [0, 1, 2, 3, 4])
+        with self.assertRaises(CadError) as caught:
+            _component_state(types.SimpleNamespace(GetSuppression2=lambda: 5, IsSuppressed=lambda: False))
+        self.assertEqual(caught.exception.code, "cad_component_internal_id_mismatch")
+        self.assertEqual(caught.exception.detail["enum"], "swComponentInternalIdMismatch")
+        self.assertEqual(caught.exception.detail["state"], 5)
+        unreadable = (
+            types.SimpleNamespace(),
+            types.SimpleNamespace(GetSuppression2=lambda: "3"),
+            types.SimpleNamespace(GetSuppression2=lambda: True),
+            types.SimpleNamespace(GetSuppression2=_raiser(RuntimeError("unavailable"))),
+        )
+        for bad in unreadable:
+            with self.subTest(state=repr(bad)):
+                with self.assertRaises(CadError) as caught:
+                    _component_state(bad)
+                self.assertEqual(caught.exception.code, "cad_component_state_unreadable")
+        with self.assertRaises(CadError) as caught:
+            _component_state(types.SimpleNamespace(GetSuppression2=lambda: 7))
+        self.assertEqual(caught.exception.code, "cad_component_state_unsupported")
+        self.assertEqual(caught.exception.detail["state"], 7)
+
+    def test_inspect_copy_refuses_a_mismatched_binding_that_is_not_suppressed(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            bad = _Component("arm-1", _write(root, "arm.SLDPRT"), suppression=5)
+            assembly = _write(root, "robot.SLDASM")
+            documents = {assembly: _Doc(assembly, doc_type=2, children=[bad])}
+            backend = SolidWorksBackend(session_factory=lambda: _Session(_App(documents)))
+            self.assertFalse(bad.IsSuppressed)
+            with self.assertRaises(CadError) as caught:
+                backend.inspect_copy(str(assembly))
+            self.assertEqual(caught.exception.code, "cad_component_internal_id_mismatch")
+
+    def test_inspect_copy_emits_raw_state_with_coherent_flags(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            resolved = _Component("arm-1", _write(root, "arm.SLDPRT"), suppression=3)
+            shim = _Component("shim-1", _write(root, "shim.SLDPRT"), suppression=0)
+            assembly = _write(root, "robot.SLDASM")
+            documents = {assembly: _Doc(assembly, doc_type=2, children=[resolved, shim])}
+            backend = SolidWorksBackend(session_factory=lambda: _Session(_App(documents)))
+            result = backend.inspect_copy(str(assembly))
+            by_name = {item["name"]: item for item in result["instances"]}
+            self.assertEqual((by_name["arm-1"]["suppression_state"], by_name["arm-1"]["suppressed"]), (3, False))
+            self.assertEqual((by_name["shim-1"]["suppression_state"], by_name["shim-1"]["suppressed"]), (0, True))
+
+    def test_collect_scene_refuses_a_mismatched_binding(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            bad = _Component("arm-1", _write(root, "arm.SLDPRT"), suppression=5)
+            assembly = _write(root, "robot.SLDASM")
+            documents = {assembly: _Doc(assembly, doc_type=2, children=[bad])}
+            backend = _CaptureBackend(session_factory=lambda: _Session(_App(documents)))
+            with self.assertRaises(CadError) as caught:
+                backend.collect_scene(str(assembly), [])
+            self.assertEqual(caught.exception.code, "cad_component_internal_id_mismatch")
+
+    def test_measurement_paths_refuse_lightweight_occurrences(self):
+        from description_pipeline.sources.solidworks.native import _measured_component_state
+
+        for state in (1, 4):
+            with self.subTest(state=state):
+                with self.assertRaises(CadError) as caught:
+                    _measured_component_state(types.SimpleNamespace(GetSuppression2=lambda s=state: s))
+                self.assertEqual(caught.exception.code, "cad_component_lightweight_unresolved")
+                self.assertEqual(caught.exception.detail["state"], state)
+        for state in (0, 2, 3):
+            with self.subTest(state=state):
+                component = types.SimpleNamespace(GetSuppression2=lambda s=state: s)
+                self.assertEqual(_measured_component_state(component), state)
+        for state in (1, 4):
+            with self.subTest(scene_state=state), TemporaryDirectory() as tmp, _com_stubs():
+                root = Path(tmp)
+                light = _Component("arm-1", _write(root, "arm.SLDPRT"), suppression=state)
+                assembly = _write(root, "robot.SLDASM")
+                documents = {assembly: _Doc(assembly, doc_type=2, children=[light])}
+                backend = _CaptureBackend(session_factory=lambda: _Session(_App(documents)))
+                with self.assertRaises(CadError) as caught:
+                    backend.collect_scene(str(assembly), [])
+                self.assertEqual(caught.exception.code, "cad_component_lightweight_unresolved")
+
+    def test_geometry_capture_refuses_a_lightweight_occurrence_after_discovery(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            light = _Component("arm-1", _write(root, "arm.SLDPRT"), suppression=1)
+            assembly = _write(root, "robot.SLDASM")
+            documents = {assembly: _Doc(assembly, doc_type=2, children=[light])}
+            backend = _CaptureBackend(session_factory=lambda: _Session(_App(documents)))
+            with _com_stubs():
+                record = backend.discover_native(root, {"main_assembly": "robot.SLDASM"})
+                entry = next(item for item in record["components"] if item["name2"] == "arm-1")
+                self.assertEqual((entry["suppression_state"], entry["lightweight"]), (1, True))
+                with self.assertRaises(CadError) as caught:
+                    backend.collect_scene(str(assembly), [])
+            self.assertEqual(caught.exception.code, "cad_component_lightweight_unresolved")
+
+    def test_discover_native_refuses_mismatch_and_emits_raw_state_otherwise(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bad = _Component("arm-1", _write(root, "arm.SLDPRT"), suppression=5)
+            assembly = _write(root, "robot.SLDASM")
+            with self.assertRaises(CadError) as caught:
+                _read(root, _App({assembly: _Doc(assembly, doc_type=2, children=[bad])}))
+            self.assertEqual(caught.exception.code, "cad_component_internal_id_mismatch")
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            resolved = _Component("arm-1", _write(root, "arm.SLDPRT"), suppression=2)
+            lightweight = _Component("arm-2", _write(root, "arm2.SLDPRT"), suppression=1)
+            assembly = _write(root, "robot.SLDASM")
+            record = _read(
+                root, _App({assembly: _Doc(assembly, doc_type=2, children=[resolved, lightweight])})
+            )
+            by_name = {item["name2"]: item for item in record["components"]}
+
+            def triple(name):
+                item = by_name[name]
+                return (item["suppression_state"], item["suppressed"], item["lightweight"])
+
+            self.assertEqual(triple("arm-1"), (2, False, False))
+            self.assertEqual(triple("arm-2"), (1, False, True))
 
 
 if __name__ == "__main__":
