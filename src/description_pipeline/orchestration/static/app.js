@@ -933,6 +933,30 @@ function buildFailureCard(failure) {
       (failure.finding_total ? `（共 ${failure.finding_total} 项，逐项见下方问题清单，可展开查看）` : "");
     card.append(groups);
   }
+  if (Array.isArray(failure.finding_counts) && failure.finding_counts.length) {
+    const note = document.createElement("p");
+    note.className = "muted small";
+    note.textContent = "以上计数为平台报告发现与受影响实例，不代表 CAD 缺陷；逐项证据见下方问题清单（默认折叠）。";
+    card.append(note);
+    if (failure.finding_counts.some((group) => group && group.code === "discovery.link_name_missing")) {
+      const hint = document.createElement("p");
+      hint.className = "muted small";
+      hint.textContent =
+        "未识别刚体坐标系（discovery.link_name_missing）：处置方向为补齐交付定义与坐标系归属（由结构交付侧在原生工程中完成），" +
+        "不需要为每个供应商内部叶件单独添加坐标系。";
+      card.append(hint);
+      const samples = failure.finding_samples && Array.isArray(failure.finding_samples["discovery.link_name_missing"])
+        ? failure.finding_samples["discovery.link_name_missing"]
+        : [];
+      const objects = samples.map((row) => row && row.object).filter(Boolean).slice(0, 2);
+      if (objects.length) {
+        const sample = document.createElement("p");
+        sample.className = "muted small";
+        sample.textContent = `示例对象：${objects.join("、")}（完整清单见下方问题清单）`;
+        card.append(sample);
+      }
+    }
+  }
   if (failure.stage_name_zh) {
     const stage = document.createElement("p");
     stage.className = "muted small";
@@ -1692,12 +1716,24 @@ function renderRun(run) {
   orderedGroups.forEach(([code, items], index) => {
     const outer = document.createElement("li");
     const section = document.createElement("details");
-    if (index === 0) section.open = true;
     const header = document.createElement("summary");
     header.textContent = `${codeLabels.get(code) || code}（${items.length} 项）`;
     const nested = document.createElement("ul");
     nested.className = "finding-group";
-    for (const finding of items) nested.append(renderFinding(finding));
+    // Bounded first paint: a large group renders its rows only when the operator opens it.
+    let populated = false;
+    const populate = () => {
+      if (populated) return;
+      populated = true;
+      for (const finding of items) nested.append(renderFinding(finding));
+    };
+    section.addEventListener("toggle", () => {
+      if (section.open) populate();
+    });
+    if (index === 0 && items.length <= 12) {
+      section.open = true;
+      populate();
+    }
     section.append(header, nested);
     outer.append(section);
     findings.append(outer);
@@ -1854,6 +1890,10 @@ async function selectRun(dagRunId) {
   setError($("retry-error"), "");
   showRunView();
   renderRunsList();
+  // A run opened from a stale list (deep link, another tab, freshly queued) still lands in the
+  // sidebar: refresh once when the selected id is not part of the cached page.
+  const knownRun = (state.runsList || []).some((item) => item && item.dag_run_id === dagRunId);
+  if (!knownRun) void refreshRuns();
   if (state.dagRunId !== dagRunId) return;
   state.timer = window.setInterval(() => {
     void poll();

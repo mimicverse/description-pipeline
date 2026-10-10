@@ -519,5 +519,31 @@ class ActivityJsLogicTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
 
 
+class FailureDisplayUiContractTests(unittest.TestCase):
+    """Terminal-failure summary: reported-finding counts, bounded collapsible evidence."""
+
+    def test_failure_summary_counts_are_findings_not_defects(self) -> None:
+        app = (STATIC / "app.js").read_text(encoding="utf-8")
+        for token in (
+            "不代表 CAD 缺陷",
+            "discovery.link_name_missing",
+            "不需要为每个供应商内部叶件单独添加坐标系",
+            "示例对象：",
+        ):
+            self.assertIn(token, app)
+
+    def test_large_finding_groups_are_lazy_and_bounded(self) -> None:
+        app = (STATIC / "app.js").read_text(encoding="utf-8")
+        for token in (
+            "items.length <= 12",
+            "populated",
+            'section.addEventListener("toggle"',
+            "if (!knownRun) void refreshRuns();",
+        ):
+            self.assertIn(token, app)
+        # The eager pre-open that expanded hundreds of rows must stay gone.
+        self.assertNotIn("if (index === 0) section.open = true;", app)
+
+
 if __name__ == "__main__":
     unittest.main()
