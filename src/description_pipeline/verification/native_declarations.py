@@ -581,10 +581,11 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
                 if left is None or right is None or (left in descendants) == (right in descendants):
                     continue
                 residuals = [float(np.dot(row, twist)) for row in rows]
-                if any(
-                    abs(residual) > 1e-6 * max(1, float(np.linalg.norm(row)))
+                normalized = [
+                    abs(residual) / max(float(np.linalg.norm(row)), 1e-12)
                     for row, residual in zip(rows, residuals, strict=True)
-                ):
+                ]
+                if any(residual > 1e-6 for residual in normalized):
                     findings.append(
                         {
                             "code": "v14.saved_pose_restriction",
@@ -601,6 +602,9 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
                                 "declared_twist": twist.tolist(),
                                 "raw_residuals": residuals,
                                 "max_abs_residual": max(abs(value) for value in residuals),
+                                "normalized_residuals": normalized,
+                                "max_normalized_residual": max(normalized),
+                                "threshold": 1e-6,
                             },
                         }
                     )
