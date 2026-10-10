@@ -91,6 +91,12 @@ def _seed_resume(staging: Path, seed_dir: Path | None, resume_from: str) -> None
             shutil.copy2(source, target)
         else:
             raise PipelineError(f"Resume checkpoint is missing: {part}")
+    for name in ("reports/native-tool.json", "transfer-manifest.json"):
+        source = seed / name
+        if source.is_file():
+            target = staging / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
 
 
 def _install(staging: Path, target: Path) -> None:
@@ -137,6 +143,43 @@ def _keep_diagnostic(staging: Path, output: Path, receipt: dict) -> Path:
         failed.rmdir()
     _install(staging, failed)
     return failed
+
+
+def _native_tool_record() -> dict:
+    """The native-role tool identity; role-aware runtimes land with the host split."""
+
+    from .runtime import tool_record
+
+    try:
+        return tool_record(role="native")
+    except TypeError:  # pragma: no cover - transitional runtimes without role support
+        return tool_record()
+
+
+def _finish_native_capture(staging, output, receipt, *, run_id, handoff_sha256, main_assembly):
+    """Close a capture-only run: provenance reports, sealed transfer, native_complete."""
+
+    tool = _native_tool_record()
+    write_json(staging / "reports/native-tool.json", tool)
+    receipt.update(state="native_complete", passed=False, native_complete=True, native_tool=tool, stage="capture")
+    _stamp(staging, receipt)
+    from .stage_transfer import CAPTURE_ARCHIVE, CAPTURE_MANIFEST, seal_capture
+
+    archive = staging / CAPTURE_ARCHIVE
+    manifest = seal_capture(
+        staging, archive, run_id=run_id, handoff_sha256=handoff_sha256, main_assembly=main_assembly, native_tool=tool
+    )
+    write_json(staging / CAPTURE_MANIFEST, manifest)
+    receipt["capture_archive"] = {
+        "name": CAPTURE_ARCHIVE,
+        "sha256": file_digest(archive),
+        "size": archive.stat().st_size,
+        "manifest_name": CAPTURE_MANIFEST,
+        "manifest_sha256": file_digest(staging / CAPTURE_MANIFEST),
+    }
+    _stamp(staging, receipt)
+    _install(staging, output)
+    return {**receipt, "output": str(output)}
 
 
 def _event_sink(receipt, on_event=None):
@@ -194,8 +237,16 @@ def run(
     seed_dir: Path | None = None,
     expected_subject: str | None = None,
     resume: dict | None = None,
+    capture_only: bool = False,
+    main_assembly: str | None = None,
 ) -> dict:
     """Continue a prepared native job through capture, generation, verification and publication.
+
+    ``capture_only`` stops after the capture stage with a sealed ``native-evidence.zip``
+    transfer (``native_complete``, never ``passed``); the Windows endpoint uses it so the
+    Linux side owns generation, verification and publication.  The remaining arguments are
+    the portable continuation contract used by the Linux runner (``resume_from`` >=
+    ``generate`` with a seeded staging directory).
 
     ``backend`` is an internal dependency-injection seam for native regressions;
     the endpoint always uses the native SolidWorks backend. Capture or quality
@@ -214,6 +265,8 @@ def run(
         repo = Path(repository).resolve()
         if output.resolve().is_relative_to(repo) or repo.is_relative_to(output.resolve()):
             raise PipelineError("Build output and the model repository must be separate directories")
+    if capture_only and (repository is not None or resume_from not in (None, "capture")):
+        raise PipelineError("Capture-only runs cannot publish or resume past capture")
     with output_lock(output) as output:
         if not _owned_output(output):
             raise PipelineError(f"Output contains unrelated files: {output}")
@@ -228,8 +281,12 @@ def run(
             "state": "failed",
             "events": prior,
             "execution_scope": [stage for stage in STAGE_IDS if any(event.get("stage") == stage for event in prior)]
-            + [stage for stage in ("capture", "generate", "verify") if STAGE_IDS.index(stage) >= restart]
-            + (["publish"] if repository else []),
+            + (
+                ["capture"]
+                if capture_only
+                else [stage for stage in ("capture", "generate", "verify") if STAGE_IDS.index(stage) >= restart]
+                + (["publish"] if repository else [])
+            ),
         }
         if isinstance(resume, dict) and resume:
             receipt["resume"] = {"parent_run": resume.get("parent_run"), "from_stage": resume.get("from_stage")}
@@ -251,6 +308,15 @@ def run(
                     handoff_sha256=handoff_sha256,
                 )
                 receipt["cad_revision"] = input_report["cad_revision"]["revision"]
+                if capture_only:
+                    return _finish_native_capture(
+                        staging,
+                        output,
+                        receipt,
+                        run_id=receipt["run_id"],
+                        handoff_sha256=handoff_sha256,
+                        main_assembly=main_assembly,
+                    )
             else:
                 _seed_resume(staging, seed_dir, resume_from)
                 input_report = read_data(staging / "reports/input.json")
