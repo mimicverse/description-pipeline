@@ -135,14 +135,18 @@ class ConsumerTests(unittest.TestCase):
         self.assertFalse(check["passed"])
         self.assertEqual(check["details"]["stderr"], "native import failed")
 
-    def test_unready_consumer_prevents_native_process_creation(self):
+    def test_unready_native_runtime_prevents_native_process_creation(self):
         source = self.root / "engineering"
         source.mkdir()
         (source / "robot.SLDASM").write_bytes(b"neutral saved assembly")
         with (
-            patch.object(consumer, "readiness", side_effect=consumer.ConsumerError("Consumer loading failed")),
+            patch(
+                "description_pipeline.runtime.native_readiness",
+                side_effect=RuntimeError("native runtime not ready"),
+                create=True,
+            ),
             patch("description_pipeline.sources.solidworks.native.SolidWorksBackend") as native,
-            self.assertRaises(consumer.ConsumerError),
+            self.assertRaises(RuntimeError),
         ):
             prepare_native_package(source, self.root / "prepared", "probe")
         native.assert_not_called()
