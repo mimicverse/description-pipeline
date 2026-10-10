@@ -15,7 +15,9 @@ component records in the platform's controlled library supply physical and drive
 specifications. CAD references identify their approved versions.
 Each fact has one effective definition and a recorded source; conflicting or
 ambiguous definitions stop derivation. Mechanical engineers maintain these inputs;
-the pipeline generates definitions, models, meshes and reports.
+the pipeline generates definitions, models, meshes and reports within the
+[supported native constraint scope](mechanical-handoff-spec.md#52-连接与自由度).
+Unsupported or ambiguous evidence produces a diagnostic, not an inferred model.
 
 ```mermaid
 flowchart LR
