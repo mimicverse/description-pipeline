@@ -293,6 +293,8 @@ class EndpointConfig:
     #: Linux-side routing: model-repository slug to local checkout, and the attempt store.
     repositories: dict[str, Path] = dataclass_field(default_factory=dict)
     store_root: Path | None = None
+    #: Linux-side derivation controls: controlled-record roots and the frozen-name registry.
+    discovery: dict = dataclass_field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "base_url", _validate_base_url(self.base_url))
@@ -303,6 +305,8 @@ class EndpointConfig:
         object.__setattr__(self, "handoff_roots", _handoff_roots(self.handoff_roots))
         object.__setattr__(self, "repositories", _linux_repositories(self.repositories))
         object.__setattr__(self, "store_root", _linux_store_root(self.store_root))
+        if not isinstance(self.discovery, dict):
+            raise EndpointProtocolError("discovery settings must be an object")
 
 
 def _handoff_roots(values) -> tuple[Path, ...]:
@@ -366,6 +370,7 @@ def config_from_airflow_connection(conn_id: str, *, timeout: float = 30.0) -> En
         handoff_roots=extra.get("handoff_roots") or (),
         repositories=extra.get("repositories") or {},
         store_root=extra.get("store_root"),
+        discovery=extra.get("discovery") or {},
     )
 
 
@@ -533,6 +538,20 @@ def _native_record_block(record: object) -> dict:
         "manifest_sha256": manifest_sha256,
         "manifest": manifest,
     }
+
+
+def _record_block(record: AwaitingDefinition | dict) -> dict:
+    """The validated flat raw-record receipt, from either carrier form."""
+
+    if isinstance(record, AwaitingDefinition):
+        record = {
+            "name": record.record_name,
+            "sha256": record.record_sha256,
+            "size": record.record_size,
+            "manifest_sha256": digest(record.record_manifest),
+            "manifest": record.record_manifest,
+        }
+    return _native_record_block(record)
 
 
 def _awaiting_definition(job: dict, *, upload_files: dict[str, str] | None = None) -> AwaitingDefinition:
@@ -807,11 +826,11 @@ class WindowsEndpoint:
         return _awaiting_definition(job, upload_files=validated)
 
     def stream_native_record(
-        self, run_id: str, record: dict, destination: Path, *, limit: int = MAX_TRANSFER_BYTES
+        self, run_id: str, record: AwaitingDefinition | dict, destination: Path, *, limit: int = MAX_TRANSFER_BYTES
     ) -> Path:
         """Stream the raw-record artifact to disk, requiring its exact size and digest."""
 
-        metadata = _native_record_block(record)
+        metadata = _record_block(record)
         if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
             raise EndpointProtocolError("record size limit must be a positive integer")
         if metadata["size"] > limit:
@@ -870,18 +889,18 @@ class WindowsEndpoint:
             raise EndpointProtocolError(f"unexpected job status: {response.get('status')!r}")
         return response
 
-    def abort_job(self, run_id: str, *, error: str, error_code: str, detail: str | None = None) -> dict:
+    def abort_job(self, run_id: str, *, error: str, error_code: str, detail: dict | None = None) -> dict:
         """Abort one awaiting-definition job after a local derivation failure; never hangs the endpoint."""
 
         for field, value in (("error", error), ("error_code", error_code)):
             if not isinstance(value, str) or not value.strip():
                 raise EndpointProtocolError(f"abort {field} must be a non-empty string")
-        if detail is not None and not isinstance(detail, str):
-            raise EndpointProtocolError("abort detail must be a string when present")
+        if detail is not None and not isinstance(detail, dict):
+            raise EndpointProtocolError("abort detail must be an object of diagnostic fields")
         response = self._request(
             "POST",
             f"/v1/jobs/{validate_run_id(run_id)}/abort",
-            {"error": error, "error_code": error_code, "detail": detail},
+            {"error": error, "error_code": error_code, "detail": dict(detail) if detail else {}},
         )
         if not isinstance(response, dict):
             raise EndpointProtocolError("abort acknowledgement must be a job object")

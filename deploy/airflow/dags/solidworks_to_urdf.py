@@ -4,16 +4,20 @@ The DAG carries ``handoff_path`` and an optional ``main_assembly`` (the explicit
 assembly). A linked attempt (``parent_dag_run_id`` and ``resume_from``) reuses the retained
 source selection - files, index digest and main assembly - of the parent native job itself;
 a supplied selection that differs from the parent's is refused instead of silently discarded.
-Hardware, revision
-and repository routing resolve inside the serialized Windows job after CAD discovery and are
-confirmed here before publication.
+The waiting loop also serves the definition hand-off: the transferred raw record is derived
+on Linux over the sealed selection alone and the generated capture request is submitted, or
+the endpoint is aborted with a structured failure. Hardware, revision and repository routing
+resolve inside the serialized Windows job after CAD discovery and are confirmed here before
+publication.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import shutil
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -22,6 +26,8 @@ from airflow.sdk import Param, dag, task
 from airflow.sdk.exceptions import AirflowFailException
 
 from description_pipeline.orchestration.airflow_client import (
+    EndpointConfig,
+    EndpointError,
     EndpointProtocolError,
     HandoffResolution,
     WindowsEndpoint,
@@ -44,7 +50,7 @@ from description_pipeline.stages import (
     stage_log,
     stage_view,
 )
-from description_pipeline.io import PipelineError, digest
+from description_pipeline.io import PipelineError, confined, digest, inventory, read_data
 from description_pipeline.sources.solidworks.revision import package_inventory
 from description_pipeline.sources.solidworks.selection import validate_file_index
 
@@ -254,6 +260,147 @@ def _resolution(request: dict) -> HandoffResolution:
     )
 
 
+def _materialize_selection(intake: Path, files: dict[str, str], target: Path) -> Path:
+    """Copy exactly the sealed selection into one fresh run-owned directory."""
+
+    intake, target = Path(intake), Path(target)
+    if target.exists():
+        if inventory(target) == files:
+            return target
+        shutil.rmtree(target)
+    target.mkdir(parents=True)
+    for name, checksum in files.items():
+        source = Path(confined(intake, name))
+        destination = Path(confined(target, name, exists=False))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        hasher = hashlib.sha256()
+        with source.open("rb") as reader, destination.open("wb") as writer:
+            while True:
+                chunk = reader.read(1024 * 1024)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+                writer.write(chunk)
+        if hasher.hexdigest() != checksum:
+            raise AirflowFailException(f"Selected source {name!r} no longer matches the sealed selection")
+    if inventory(target) != files:
+        raise AirflowFailException("The selected source copy differs from the sealed selection")
+    return target
+
+
+def _definition_settings(config: EndpointConfig, main_assembly: str):
+    """The pinned Linux derivation settings of one definition hand-off."""
+
+    from description_pipeline.sources.solidworks.discovery import DiscoverySettings
+
+    configuration = config.discovery
+    registry = configuration.get("frozen_names_file")
+    names: dict = {}
+    if registry:
+        try:
+            names = read_data(Path(str(registry)))
+        except (OSError, PipelineError) as error:
+            raise AirflowFailException(f"Frozen-name registry is not readable: {error}") from error
+    if not isinstance(names, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str) for key, value in names.items()
+    ):
+        raise AirflowFailException("Frozen-name registry must map native identities to interface names")
+    roots = configuration.get("record_roots", [])
+    if not isinstance(roots, list) or any(not isinstance(value, str) for value in roots):
+        raise AirflowFailException("Controlled-record roots must be a list of paths")
+    return DiscoverySettings(
+        record_roots=tuple(Path(value) for value in roots),
+        frozen_names=names,
+        main_assembly=main_assembly,
+    )
+
+
+def _provide_definition(endpoint: WindowsEndpoint, request: dict) -> None:
+    """Derive the prepared package from the transferred raw record and submit it.
+
+    The derivation reads only the sealed selection copied out of the intake folder,
+    never the full upload; a local refusal aborts the waiting endpoint so it cannot
+    hang, while transport failures leave the job awaiting a retry.
+    """
+
+    from description_pipeline.orchestration.discovery_transfer import (
+        admit_raw_record_bundle,
+        derive_from_raw_bundle,
+        seal_capture_request,
+    )
+
+    run_id = request["run_id"]
+    intake = request.get("intake_dir")
+    if not isinstance(intake, str) or not intake:
+        raise AirflowFailException("Definition derivation requires the sealed intake folder of a fresh source")
+    snapshot = endpoint.definition_snapshot(run_id, upload_files=request["upload_files"])
+    manifest = snapshot.selection.manifest
+    main_assembly = manifest.get("main_assembly")
+    if not isinstance(main_assembly, str) or not main_assembly:
+        raise AirflowFailException("The sealed selection names no main assembly to derive")
+    selected = manifest.get("files")
+    if not isinstance(selected, dict) or not selected:
+        raise AirflowFailException("The sealed selection lists no files to derive")
+    settings = _definition_settings(endpoint.config, main_assembly)
+    store = _linux_store(request["conn_id"])
+    work = store.run_dir(run_id) / "definition"
+    bundle = work / "raw-record.zip"
+    derived = work / "derived"
+    capture_request = work / "capture-request.zip"
+    work.mkdir(parents=True, exist_ok=True)
+    endpoint.stream_native_record(run_id, snapshot, bundle)
+    if derived.exists():
+        shutil.rmtree(derived)
+    capture_request.unlink(missing_ok=True)
+    try:
+        frozen = _materialize_selection(Path(intake), selected, work / "selected")
+        admission = admit_raw_record_bundle(
+            bundle,
+            expected_run_id=run_id,
+            expected_selection=manifest,
+            expected_native_tool=snapshot.native_tool,
+            expected_archive_sha256=snapshot.record_sha256,
+        )
+        if admission.manifest != snapshot.record_manifest:
+            raise AirflowFailException("The admitted raw record differs from the endpoint declaration")
+        prepared = derive_from_raw_bundle(
+            bundle,
+            frozen,
+            derived,
+            expected_run_id=run_id,
+            expected_selection=manifest,
+            expected_native_tool=snapshot.native_tool,
+            expected_archive_sha256=snapshot.record_sha256,
+            settings=settings,
+        )
+        seal_capture_request(
+            prepared,
+            capture_request,
+            record=admission.record,
+            selection=manifest,
+            native_tool=snapshot.native_tool,
+        )
+    except (AirflowFailException, PipelineError, OSError) as error:
+        error_code = getattr(error, "code", None) or "definition_derivation_failed"
+        detail = dict(getattr(error, "detail", None) or {})
+        diagnostic = getattr(error, "diagnostic_path", None)
+        if diagnostic:
+            detail.setdefault("diagnostic_path", str(diagnostic))
+        detail.setdefault("work_dir", str(work))
+        try:
+            endpoint.abort_job(
+                run_id,
+                error=str(error)[:2000] or type(error).__name__,
+                error_code=str(error_code),
+                detail=detail,
+            )
+        except (EndpointError, EndpointProtocolError) as abort_error:
+            log.warning("definition abort unavailable run_id=%s error=%s", run_id, abort_error)
+        raise AirflowFailException(f"definition derivation failed: {error}") from error
+    endpoint.post_definition_archive(run_id, capture_request, prepared_sha256=prepared.prepared_sha256)
+    log.info("definition run_id=%s prepared_sha256=%s", run_id, prepared.prepared_sha256)
+
+
 def _poke(request: dict, **context) -> bool:
     if request.get("linux_owned"):
         # A linked portable attempt has no Windows job to poll.
@@ -290,6 +437,9 @@ def _poke(request: dict, **context) -> bool:
             outcome.get("state"),
             outcome.get("requested"),
         )
+        return False
+    if job.get("status") == "awaiting_definition":
+        _provide_definition(endpoint, request)
         return False
     latest = job["events"][-1] if job["events"] else {}
     log.info(
@@ -641,7 +791,9 @@ def solidworks_to_urdf():
         poke_interval=POLL_INTERVAL,
         timeout=POLL_TIMEOUT,
         doc_md=(
-            "Transport polling only. Engineering stage/QC results are in these logs and the engineering_stages XCom."
+            "Transport polling and the definition exchange (selection rounds, raw-record derivation, "
+            "capture-request submission). Engineering stage/QC results are in these logs and the "
+            "engineering_stages XCom."
         ),
     )
     def wait_for_job(request: dict, **context) -> bool:

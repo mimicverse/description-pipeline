@@ -508,7 +508,7 @@ class SelectionTransportTests(unittest.TestCase):
             self.run_id,
             error="derivation refused",
             error_code="definition_derivation_failed",
-            detail="findings retained in the Linux output",
+            detail={"findings": ["discovery.namespace_mismatch"], "work_dir": str(self.tmp)},
         )
         self.assertEqual(response["status"], "failed")
         self.assertEqual(
@@ -516,11 +516,13 @@ class SelectionTransportTests(unittest.TestCase):
             {
                 "error": "derivation refused",
                 "error_code": "definition_derivation_failed",
-                "detail": "findings retained in the Linux output",
+                "detail": {"findings": ["discovery.namespace_mismatch"], "work_dir": str(self.tmp)},
             },
         )
         with self.assertRaises(EndpointProtocolError):
             self.endpoint.abort_job(self.run_id, error="", error_code="definition_derivation_failed")
+        with self.assertRaises(EndpointProtocolError):
+            self.endpoint.abort_job(self.run_id, error="x", error_code="y", detail="findings")
 
 
 class SelectionDagTests(unittest.TestCase):
@@ -580,6 +582,40 @@ class SelectionDagTests(unittest.TestCase):
                 self.assertRaises(self.dag.AirflowFailException),
             ):
                 self.dag._linked_source(retained_payload, supplied)
+
+    def test_materialize_selection_copies_only_the_sealed_files(self) -> None:
+        root = Path(tempfile.mkdtemp(prefix="definition-selection-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        intake = _intake(root)
+        files = _upload_files(intake)
+        selected = {"总装.SLDASM": files["总装.SLDASM"], "deps/子零件.SLDPRT": files["deps/子零件.SLDPRT"]}
+        target = root / "selected"
+        self.dag._materialize_selection(intake, selected, target)
+        self.assertEqual(self.dag.package_inventory(target), selected)
+        (intake / "deps" / "子零件.SLDPRT").write_bytes(b"tampered")
+        with self.assertRaises(self.dag.AirflowFailException):
+            self.dag._materialize_selection(intake, selected, root / "selected-again")
+
+    def test_definition_settings_pin_the_registry_and_main(self) -> None:
+        from types import SimpleNamespace
+
+        root = Path(tempfile.mkdtemp(prefix="definition-settings-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        registry = root / "names.json"
+        registry.write_text(json.dumps({"平面": "base_plane"}), encoding="utf-8")
+        config = SimpleNamespace(discovery={"record_roots": [str(root)], "frozen_names_file": str(registry)})
+        settings = self.dag._definition_settings(config, "总装.SLDASM")
+        self.assertEqual(settings.main_assembly, "总装.SLDASM")
+        self.assertEqual(settings.frozen_names, {"平面": "base_plane"})
+        self.assertEqual(settings.record_roots, (root,))
+        broken = root / "broken.json"
+        broken.write_text("[1]", encoding="utf-8")
+        for discovery in ({"frozen_names_file": str(broken)}, {"record_roots": "not-a-list"}):
+            with (
+                self.subTest(discovery=discovery),
+                self.assertRaises(self.dag.AirflowFailException),
+            ):
+                self.dag._definition_settings(SimpleNamespace(discovery=discovery), "总装.SLDASM")
 
 
 if __name__ == "__main__":
