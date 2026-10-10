@@ -39,7 +39,7 @@ from description_pipeline.stages import (
     stage_log,
     stage_view,
 )
-from description_pipeline.io import digest
+from description_pipeline.io import PipelineError, digest
 
 DAG_ID = "solidworks_to_urdf"
 CONN_ID = os.environ.get("SOLIDWORKS_ENDPOINT_CONN_ID", "solidworks_windows")
@@ -76,7 +76,7 @@ def _portable_summary(receipt: dict) -> dict:
 
 def _parent_subject(store: LinuxStore, parent_run: str, stage: str) -> str:
     """The recorded subject of a parent portable checkpoint a linked rerun reuses."""
-    path = store.receipt_path(parent_run, stage)
+    path = store.checkpoint_receipt(parent_run, stage)
     if not path.is_file():
         raise AirflowFailException(f"parent attempt {parent_run} has no {stage} checkpoint to reuse")
     receipt = json.loads(path.read_text(encoding="utf-8"))
@@ -88,19 +88,10 @@ def _parent_subject(store: LinuxStore, parent_run: str, stage: str) -> str:
 
 def _root_capture(store: LinuxStore, run_id: str):
     """The admitted capture directory of an attempt, following its source lineage."""
-    seen: set[str] = set()
-    current = run_id
-    while current not in seen:
-        seen.add(current)
-        capture = store.capture_dir(current)
-        if capture.is_dir():
-            return capture
-        meta = store.meta(current) or {}
-        source = meta.get("source_run_id")
-        if not isinstance(source, str) or not source:
-            return None
-        current = source
-    return None
+    try:
+        return store.checkpoint_dir(run_id, "capture")
+    except PipelineError:
+        return None
 
 
 def _root_identity(store: LinuxStore, run_id: str) -> tuple[str | None, str | None]:
