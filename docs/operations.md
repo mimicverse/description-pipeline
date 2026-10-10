@@ -130,8 +130,13 @@ publish the review PR. Each step shows its **Input**, **Input QC**, **Output** a
 Failures show the affected object and next action first; file hashes and raw
 evidence are available in collapsed details. Without a verified URDF, the report
 uses the available workspace instead of reserving an empty preview pane.
-Warnings appear beside the stage results for engineering inspection; they never
-count as passes, and a completed stage can retain warnings.
+Warnings appear beside the stage results and never count as passes; the report
+marks the ones that need engineering attention, informational warnings (for
+example an unspecified optional design budget) create no work, and a completed
+stage can retain warnings. After a failed independent verification the retained
+artifacts stay viewable only as an explicitly unverified diagnostic preview with
+the failing checks and warnings; it never asserts verification and cannot be
+published.
 Generation-input inspection belongs to capture; it is not another operator step.
 
 During native work, the activity card shows the operation reported by the worker,
@@ -175,6 +180,7 @@ an unsupported native pattern is not proof of a mechanical design error.
 | Finding | Correction |
 |---|---|
 | Dependency, configuration or saved-state error | Repair and save the native engineering package |
+| Administrative metadata missing (hardware ID, revision, owner, control record) | Publication readiness only: measurement, capture and inspection continue; record the authored facts at their source - never invent values, and a neutral technical name is not identity |
 | Ambiguous body, joint, name or frame | Check native evidence coverage, then correct the reader or the unresolved engineering definition |
 | Zero, direction, limit or drive disagreement | Correct its mechanical definition or controlled specification; authored zero-width ranges and zero drives stay stage warnings until a usable controlled record is supplied - never fill defaults |
 | Unowned occurrence (stage warning) | Bind the occurrence in the declaration or correct the native structure; qualification still requires complete coverage and exact whole-CAD mass equality - never exclude an instance or its mass to clear the warning |

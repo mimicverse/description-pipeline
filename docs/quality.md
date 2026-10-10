@@ -178,6 +178,11 @@ Git storage and checkout, and records its hash in the publication receipt.
 Effective newline, filter or encoding overrides block publication; the native
 subject remains unchanged.
 
+A retained failed-verification checkpoint may be served as an explicitly
+unverified diagnostic preview carrying its failing checks and warnings; it never
+asserts verification and is forbidden from publication. Generation success alone
+is not verification.
+
 ## Scope of acceptance
 
 A pass establishes the listed consistency, physical arithmetic, geometry and
@@ -186,6 +191,17 @@ or degrees of freedom, physical zero or positive motion, real mechanical limits,
 drive capability, material correctness or full-range clearance. Those facts
 require engineering confirmation. Simulation, training and control require
 their own acceptance evidence.
+
+Unassigned rigid ownership and explicit zero parameters are stage warnings so
+generation can continue; complete material coverage, exact whole-CAD mass
+equality and usable motion remain strict independent qualification checks, and
+conflicting comparable authored operating limits still fail.
+
+Administrative metadata (hardware ID, revision, owner, control record) is a
+publication-readiness requirement, not a measurement blocker: capture,
+generation and inspection continue when it is absent, the raw record keeps the
+absence, and no revision, owner, hardware ID or neutral technical name is
+invented to fill it.
 
 Stage warnings never substitute for acceptance: they stay visible with their
 objects, and the warned facts (material coverage, usable ranges or drives) are

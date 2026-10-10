@@ -29,7 +29,10 @@ The page is **SolidWorks2URDF 交付操作台**.
    Automatic passes need no manual
    repetition; warnings never count as passes, and external engineering scope
    remains explicit. Inspect the verified URDF and joint limits, and open the PR
-   for engineering approval.
+   for engineering approval. A retained delivery after a failed independent
+   verification stays viewable only as an explicitly unverified diagnostic
+   preview: generation success alone is not verification, and such artifacts are
+   forbidden from publication.
 
 The picker uploads only the chosen folder; the page shows the platform's current
 upload limits (default 2 GB total, 4 096 files, 512 MB per file). Empty
@@ -41,6 +44,11 @@ If the main assembly carries the saved native URDF exporter declaration
 (`URDF Export Configuration (v1.4)`), the pipeline reads it from the CAD as
 declared link/joint evidence; zero or placeholder operating values are retained
 and flagged as warnings, never filled with defaults.
+
+Missing administrative metadata (hardware ID, revision, owner, control record)
+is a publication-readiness issue: measurement and inspection continue, the raw
+record keeps the absence, and no revision, owner, hardware ID or neutral
+technical name is treated as authored identity.
 
 Run history and details show the original submitter's Feishu username, obtained
 automatically through Feishu's authentication API.
