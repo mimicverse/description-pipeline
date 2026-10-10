@@ -229,7 +229,6 @@ class DefinitionEndpointTests(EndpointFixture, unittest.TestCase):
         self.assertEqual("native_complete", finished["status"], finished.get("error"))
 
 
-@unittest.skipUnless(hasattr(WindowsEndpoint, "start_selection_job"), "A's selection client is not integrated yet")
 class DefinitionClientLoopbackTests(EndpointFixture, unittest.TestCase):
     def test_client_drives_the_whole_native_boundary_over_loopback(self) -> None:
         jobs = self.jobs()
