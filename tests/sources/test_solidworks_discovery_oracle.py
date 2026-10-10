@@ -995,6 +995,125 @@ class OracleSemanticsTests(unittest.TestCase):
         self.assertEqual(_datum_owners(frozenset({"arm-1"}), frozenset({"base-1"})), {"arm-1"})
         self.assertEqual(_datum_owners(frozenset(), frozenset()), set())
 
+    def test_frame_marker_requires_the_exact_empty_component(self) -> None:
+        missing = object()
+
+        def mutate(raw, payload, value):
+            mate = frame_ground_mates()[0]
+            for entity in mate["entities"]:
+                if entity.get("assembly_frame") is True:
+                    if value is missing:
+                        entity.pop("component", None)
+                    else:
+                        entity["component"] = value
+            raw["mates"].append(mate)
+
+        for label, value in (("missing", missing), ("null", None), ("zero", 0)):
+            with self.subTest(component=label):
+                package = self.baseline()
+                self._native(package, lambda raw, payload, value=value: mutate(raw, payload, value))
+                passed, errors, _checks = self.check(package)
+                self.assertFalse(passed, errors)
+                self.assertTrue(
+                    any(
+                        error["code"] == "discovery.graph" and "names an unknown component" in error["message"]
+                        for error in errors
+                    ),
+                    errors,
+                )
+
+    def test_frame_mate_requires_exactly_one_frame_and_one_occurrence(self) -> None:
+        def three_entities(raw, payload):
+            mate = frame_ground_mates()[0]
+            mate["entities"].append(copy.deepcopy(mate["entities"][0]))
+            raw["mates"].append(mate)
+
+        def two_frame_entities(raw, payload):
+            mate = frame_ground_mates()[0]
+            mate["entities"][0].update({"component": "", "assembly_frame": True})
+            raw["mates"].append(mate)
+
+        for label, mutate in (("three_entities", three_entities), ("two_frame_entities", two_frame_entities)):
+            with self.subTest(case=label):
+                package = self.baseline()
+                self._native(package, mutate)
+                passed, errors, _checks = self.check(package)
+                self.assertFalse(passed, errors)
+                self.assertTrue(
+                    any(
+                        error["code"] == "discovery.frame_attachment"
+                        and "exactly one frame entity and one occurrence entity" in error["message"]
+                        for error in errors
+                    ),
+                    errors,
+                )
+
+    def test_top_owned_interface_datum_binds_the_proven_base(self) -> None:
+        def publish_frame(package: Path, parent: str) -> None:
+            robot_path = package / "robot.yaml"
+            robot = yaml.safe_load(robot_path.read_text(encoding="utf-8"))
+            robot["source"].setdefault("frames", [])
+            robot["source"]["frames"].append(
+                {"name": "tool", "parent": parent, "coordinate_system": "TCP_tool"}
+            )
+            robot_path.write_text(yaml.safe_dump(robot, sort_keys=False), encoding="utf-8")
+
+        def add_tool_datum(raw, payload):
+            raw["datums"].append({"name": "TCP_tool", "owner": "", "array": copy.deepcopy(IDENTITY)})
+
+        def ground_base(raw, payload):
+            add_tool_datum(raw, payload)
+            raw["mates"].extend(frame_ground_mates())
+
+        def ground_moving_body(raw, payload):
+            add_tool_datum(raw, payload)
+            raw["mates"].extend(frame_ground_mates("arm-1"))
+
+        # Positive: the proven base attachment resolves the top-owned TCP interface.
+        package = self.baseline()
+        self._native(package, ground_base)
+        publish_frame(package, "base_link")
+        passed, errors, checks = self.check(package)
+        self.assertTrue(passed, errors)
+        self.assertTrue(checks["discovery.frames"]["passed"], checks["discovery.frames"])
+        self.assertEqual(checks["discovery.frames"]["details"]["frames"], 1)
+
+        # Control: without a proven attachment the ownerless channel stays closed.
+        package = self.baseline()
+        self._native(package, add_tool_datum)
+        publish_frame(package, "base_link")
+        passed, errors, _checks = self.check(package)
+        self.assertFalse(passed, errors)
+        self.assertTrue(
+            any(
+                error["code"] == "discovery.frames" and "not owned by any body" in error["message"]
+                for error in errors
+            ),
+            errors,
+        )
+
+        # Control: an attachment on a moving body never becomes the top datum owner.
+        package = self.baseline()
+        self._native(package, ground_moving_body)
+        publish_frame(package, "arm_link")
+        passed, errors, _checks = self.check(package)
+        self.assertFalse(passed, errors)
+        self.assertTrue(
+            any(
+                error["code"] == "discovery.frame_attachment"
+                and "must become the CS_base_link body" in error["message"]
+                for error in errors
+            ),
+            errors,
+        )
+        self.assertTrue(
+            any(
+                error["code"] == "discovery.frames" and "not owned by any body" in error["message"]
+                for error in errors
+            ),
+            errors,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
