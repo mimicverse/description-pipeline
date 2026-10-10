@@ -77,6 +77,47 @@ def _portable_summary(receipt: dict, *, stage: str) -> dict:
     }
 
 
+def _portable_report(receipt: dict, *, stage: str, context: dict | None = None) -> dict:
+    """Log one Linux stage's recorded checks and retain its bounded stage summary.
+
+    The summary renders only the receipt's own events, so a failing stage reports its actual
+    boundary results and is pushed to ``engineering_stages`` before the domain failure is
+    raised.  Unrecorded checks stay ``not_run``; nothing is invented for the log or the XCom.
+    """
+    stages = stage_view(
+        {
+            "run_id": receipt.get("run_id"),
+            "events": [event for event in receipt.get("events") or [] if isinstance(event, dict)],
+            "result": receipt,
+        }
+    )
+    row = next((item for item in stages["stages"] if item["id"] == stage), None)
+    if row is None:  # pragma: no cover - the installed contract always names all six stages
+        return stages
+    log.info(
+        "portable stage=%s state=%s checks=%s/%s subject=%s",
+        stage,
+        row["state"],
+        row["checks_passed"],
+        row["checks_total"],
+        stages.get("subject_sha256"),
+    )
+    for line in stage_log({"stages": [row]}):
+        log.info("portable result=%s", line)
+    if row["state"] == "failed":
+        # Report an unexpected failure only from what the receipt actually carries.
+        failure = {
+            key: receipt[key]
+            for key in ("error", "error_code", "detail", "diagnostic_path")
+            if receipt.get(key) is not None
+        }
+        log.error("portable stage=%s failure=%s", stage, failure)
+    ti = (context or {}).get("ti")
+    if ti is not None:
+        ti.xcom_push(key="engineering_stages", value=compact_view(stages))
+    return stages
+
+
 def _parent_subject(store: LinuxStore, parent_run: str, stage: str) -> str:
     """The recorded subject of a parent portable checkpoint a linked rerun reuses."""
     path = store.checkpoint_receipt(parent_run, stage)
@@ -235,7 +276,8 @@ def _same_request(job: dict, request: dict) -> None:
         "`run_publish` log Linux stage results. Their `engineering_stages` XComs retain stage summaries, "
         "including failures. The operator page shows "
         "inputs, checks, outputs and evidence per stage; `reports/stages.json` retains the detailed receipt. "
-        "Engineering confirmations remain pending until approved in the bound review records."
+        "Engineering review scope stays with the bound review records; the platform reports it without "
+        "claiming approvals are pending or complete."
     ),
     params={
         "handoff_path": Param(
@@ -398,7 +440,7 @@ def solidworks_to_urdf():
         return {"request": request, **binding}
 
     @task(doc_md="Generate the model on Linux; this checkpoint is intentionally unverified.")
-    def run_generate(binding: dict) -> dict:
+    def run_generate(binding: dict, **context) -> dict:
         if binding.get("from_stage") in {"verify", "publish"}:
             # The linked attempt resumes past generation: reuse the parent checkpoint.
             store = _linux_store(binding["request"]["conn_id"])
@@ -408,10 +450,11 @@ def solidworks_to_urdf():
         receipt = run_portable_stage(
             store, binding["run_id"], "generate", source_run_id=binding.get("source_run_id")
         )
+        _portable_report(receipt, stage="generate", context=context)
         return {**binding, "generate": _portable_summary(receipt, stage="generate")}
 
     @task(doc_md="Independent verification on Linux, including the MuJoCo consumer.")
-    def run_verify(generated: dict) -> dict:
+    def run_verify(generated: dict, **context) -> dict:
         if generated.get("from_stage") == "publish":
             # The linked attempt resumes past verification: reuse the parent checkpoint.
             store = _linux_store(generated["request"]["conn_id"])
@@ -428,10 +471,11 @@ def solidworks_to_urdf():
             expected_subject=subject,
             source_run_id=generated.get("source_run_id"),
         )
+        _portable_report(receipt, stage="verify", context=context)
         return {**generated, "verify": _portable_summary(receipt, stage="verify")}
 
     @task(doc_md="Publish the verified delivery from Linux; no repository work happens on Windows.")
-    def run_publish(verified: dict) -> dict:
+    def run_publish(verified: dict, **context) -> dict:
         subject = (verified.get("verify") or {}).get("subject_sha256")
         if not subject:
             raise AirflowFailException("verify produced no subject to publish")
@@ -449,6 +493,7 @@ def solidworks_to_urdf():
             base=base,
             source_run_id=verified.get("source_run_id"),
         )
+        _portable_report(receipt, stage="publish", context=context)
         return {**verified, "publish": _portable_summary(receipt, stage="publish")}
 
     @task(doc_md="Confirm the six-stage receipt and the verified candidate PR from the Linux store.")
