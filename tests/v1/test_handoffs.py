@@ -144,6 +144,25 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual(inventory(package), received["files"])
         self.assertEqual(package_inventory(package), received["files"])
 
+    def test_unrelated_file_after_inspection_fails_instead_of_being_deleted(self):
+        archive = self.root / "transport.zip"
+        prepare_archive(self.source, archive)
+        real_describe = handoff_module.describe_handoff
+
+        def spy_describe(path):
+            identity = real_describe(path)
+            (path / "extra.SLDPRT").write_bytes(b"unexpected addition")
+            return identity
+
+        with (
+            patch.object(handoff_module, "describe_handoff", side_effect=spy_describe),
+            self.assertRaises(PipelineError) as caught,
+        ):
+            import_archive(archive, self.store)
+        self.assertIn("changed during import", str(caught.exception))
+        # Nothing was installed and nothing was silently dropped.
+        self.assertEqual(list(self.store.iterdir()), [])
+
     def test_native_only_input_needs_no_authored_pipeline_files(self):
         identity = describe_handoff(self.source)
         self.assertNotIn("kind", identity)
