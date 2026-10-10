@@ -18,8 +18,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import ntpath
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import yaml
 
@@ -1562,6 +1563,127 @@ def verify_discovery(package: Path) -> dict:
             )
         return {"native_files": len(native), "cad_files": len(observed)}
 
+    def imported_sources():
+        """Every recorded imported occurrence must bind to a frozen native source.
+
+        The accepted class mirrors the declared-member rule: a resolved native imported
+        document whose GetImportedPath names the captured document inside the frozen
+        root and whose bytes equal the frozen inventory. Nothing is guessed from raw
+        paths, and temp or external roots never qualify; every other recorded
+        occurrence yields a precise discovery.imported_source_unbound failure.
+        """
+
+        payload = state["payload"]
+        raw = payload.get("raw") or {}
+        native = payload.get("native_files") or {}
+        raw_files = raw.get("files") or {}
+        unbound: list[dict] = []
+        observed = 0
+        for component in raw.get("components") or []:
+            if not isinstance(component, dict):
+                continue
+            provenance = component.get("source_provenance")
+            if provenance is None:
+                continue
+            observed += 1
+            document = component.get("document")
+            observation = component.get("solver_observation")
+            context = observation.get("context") if isinstance(observation, dict) else None
+            entry = {
+                "occurrence": str(component.get("name2") or ""),
+                "document": document,
+                "containing_document": context.get("document") if isinstance(context, dict) else None,
+                "native_path": provenance.get("native_document_path") if isinstance(provenance, dict) else None,
+                "imported_path": provenance.get("imported_path") if isinstance(provenance, dict) else None,
+            }
+            if not isinstance(provenance, dict):
+                unbound.append({**entry, "state": None, "reason": "imported provenance is not an object"})
+                continue
+            reason = None
+            if provenance.get("state") != "resolved":
+                reason = f"imported source state is {provenance.get('state') or 'unread'}"
+            elif provenance.get("kind") != "native_imported_document":
+                reason = "imported provenance is not a native imported document"
+            elif (
+                provenance.get("used_api")
+                != "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual"
+            ):
+                reason = "imported provenance used an unexpected native API"
+            elif provenance.get("document") != document:
+                reason = "imported provenance document differs from the occurrence document"
+            elif (
+                not isinstance(document, str)
+                or not document
+                or PurePosixPath(document).is_absolute()
+                or PurePosixPath(document).as_posix() != document
+                or ".." in PurePosixPath(document).parts
+                or "\\" in document
+                or ":" in document
+            ):
+                reason = "the occurrence document is not a canonical confined package path"
+            elif provenance.get("is_virtual") is not False:
+                reason = (
+                    "virtual imported documents are outside the handoff contract"
+                    if provenance.get("is_virtual") is True
+                    else "the imported virtual state is unread"
+                )
+            else:
+                sha = provenance.get("sha256")
+                recorded = raw_files.get(document)
+                if not (
+                    isinstance(sha, str)
+                    and _HEX.match(sha)
+                    and native.get(document) == sha
+                    and (recorded is None or recorded == sha)
+                ):
+                    reason = "imported bytes are not bound to the frozen native inventory"
+                else:
+                    origin, root = provenance.get("imported_path"), provenance.get("source_root")
+                    if not (
+                        isinstance(origin, str)
+                        and ntpath.isabs(origin)
+                        and isinstance(root, str)
+                        and ntpath.isabs(root)
+                    ):
+                        reason = "the imported-source confinement evidence is incomplete"
+                    else:
+                        try:
+                            relative = ntpath.relpath(origin, root)
+                        except ValueError:
+                            reason = "imported path and frozen root are on different drives"
+                        else:
+                            if (
+                                relative == ".."
+                                or relative.startswith("..\\")
+                                or ntpath.normcase(relative) != ntpath.normcase(document.replace("/", "\\"))
+                            ):
+                                reason = "GetImportedPath does not name the captured source inside the frozen root"
+            if reason is not None:
+                unbound.append(
+                    {
+                        **entry,
+                        "state": provenance.get("state"),
+                        "reason": reason,
+                        "error": provenance.get("error"),
+                    }
+                )
+        if unbound:
+            _require(
+                False,
+                "discovery.imported_source_unbound",
+                "recorded imported occurrences are not bound to frozen native sources",
+                {
+                    "unbound": len(unbound),
+                    "observations": observed,
+                    "occurrences": [item["occurrence"] for item in unbound],
+                    "imported_paths": sorted(
+                        {str(item["imported_path"]) for item in unbound if item["imported_path"]}
+                    ),
+                    "samples": unbound[:20],
+                },
+            )
+        return {"imported_occurrences": observed}
+
     def identity():
         payload, robot = state["payload"], state["robot"]
         authored = _authored_identity(payload.get("raw") or {}, str(payload.get("namespace") or "dp"))
@@ -2620,6 +2742,7 @@ def verify_discovery(package: Path) -> dict:
     bound = check("discovery.binding", binding)
     dependent = (
         ("discovery.files", files),
+        ("discovery.imported_sources", imported_sources),
         ("discovery.identity", identity),
         ("discovery.revision", revision),
         ("discovery.budgets", budgets),
@@ -2639,6 +2762,7 @@ def verify_discovery(package: Path) -> dict:
         # external design budget; never invent nominal mass or extent ranges.
         dependent = (
             ("discovery.files", files),
+            ("discovery.imported_sources", imported_sources),
             ("discovery.identity", identity),
             ("discovery.revision", revision),
             ("discovery.budgets", budgets),
