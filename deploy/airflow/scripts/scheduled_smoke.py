@@ -5,12 +5,14 @@ then triggers one DAG run the way the operator page does: through the portal's A
 a real authorized operator JWT.  Requires an installed environment; writes nothing outside
 AIRFLOW_HOME.
 
-The mocked Windows delivery is the sealed control fixture: the real freeze/discover/capture
-producer runs on the fixture CAD backend and the mocked endpoint serves that exact transfer at the
-``native_complete`` boundary.  The Linux half then executes the real generate stage and the real
-verify stage, which must reject the control fixture on its documented limits while publication
-never executes.  This is an expected rejection proof of the scheduled transport, never native CAD
-qualification, and the report states that class explicitly.
+The mocked Windows delivery is the sealed control fixture, served through the one supported
+two-leg contract: the endpoint answers the selection rounds from the staged intake, seals the raw
+native record bundle that Linux admits, accepts the generated text definition, and only then
+reports the sealed capture transfer at the ``native_complete`` boundary.  The Linux half derives
+the prepared package with the real pure derivation, then executes the real generate stage and the
+real verify stage, which must reject the control fixture on its documented limits while
+publication never executes.  This is an expected rejection proof of the scheduled transport,
+never native CAD qualification, and the report states that class explicitly.
 
 When the venv is wired to the checkout by PYTHONPATH alone its metadata carries no
 ``airflow.plugins`` entry point, so the isolated home receives a plugin-folder shim for the same
@@ -21,8 +23,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
+import io
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -30,6 +35,7 @@ import sys
 import threading
 import time
 import uuid
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib import error as urlerror
@@ -45,8 +51,7 @@ FEISHU_SECRET = "smoke-app-secret"
 JWT_SECRET = "scheduled-smoke-" + "0" * 48
 DAG_ID = "solidworks_to_urdf"
 PIPELINE_ID = "solidworks-to-urdf"
-#: The strict native resolution: the endpoint names only the managed package and its digest.
-RESOLVED_PACKAGE = "handoff/m3.0"
+#: One relative operator path inside the connection's intake allowlist.
 HANDOFF_PATH = "handoff/m3.0"
 REPOSITORY_SLUG = "example/m3.0"
 REPOSITORY_BASE = "feature/m3.0"
@@ -61,39 +66,33 @@ def _read_json(path: Path) -> dict:
 
 
 def _view(job: dict) -> dict:
-    """The job document as served: everything but the test-only poke counter."""
-    return {key: value for key, value in job.items() if key != "pokes"}
+    """The job document as served: no test-only poke counter or mock-private bookkeeping."""
+
+    return {key: value for key, value in job.items() if key != "pokes" and not key.startswith("_")}
 
 
-def _native_complete_job(fixture: dict, request: dict) -> dict:
-    """The endpoint job snapshot of the sealed fixture: native_complete, nothing more."""
-    return {
-        "schema_version": "solidworks-to-urdf.job/v1",
-        "pipeline_id": PIPELINE_ID,
-        "run_id": request["run_id"],
-        "request": dict(request),
-        "main_assembly": request.get("main_assembly") or fixture["main_assembly"],
-        "hardware_id": fixture["hardware_id"],
-        "revision": fixture["revision"],
-        "repository_slug": REPOSITORY_SLUG,
-        "repository_base": REPOSITORY_BASE,
-        "status": "native_complete",
-        "events": [
-            *fixture["native_stages"]["events"],
-            {"stage": "job", "state": "native_complete", "at": "t0"},
-        ],
-        "result": {
-            "native_complete": True,
-            "native_tool": fixture["native_tool"],
-            "capture_archive": dict(fixture["receipt"]),
-        },
-        "error": None,
+def _native_record(fixture_root: Path) -> dict:
+    """The exact raw native record the prepared control fixture was derived from."""
+
+    payload = json.loads((fixture_root / "prepared/discovery/native-discovery.json").read_text(encoding="utf-8"))
+    return payload["raw"]
+
+
+def _mock_endpoint(
+    fixture: dict, *, run_id: str, upload_files: dict[str, str], record: dict, bundle_dir: Path
+) -> tuple[ThreadingHTTPServer, dict]:
+    """The two-leg endpoint contract: selection, raw record, definition, capture."""
+
+    from description_pipeline.io import digest  # noqa: PLC0415 - the checkout arrives via --root
+    from description_pipeline.orchestration import discovery_transfer  # noqa: PLC0415
+
+    main_assembly = fixture["main_assembly"]
+    dependencies = sorted(name for name in upload_files if name != main_assembly)
+    observations = {
+        main_assembly: {"sha256": upload_files[main_assembly], "references": list(dependencies)},
+        **{name: {"sha256": upload_files[name], "references": []} for name in dependencies},
     }
-
-
-def _mock_endpoint(fixture: dict) -> tuple[ThreadingHTTPServer, dict]:
-    """The Windows endpoint contract, serving exactly one sealed control-fixture delivery."""
-    state = {"jobs": {}, "resolved_paths": [], "artifact_paths": [], "expected": None}
+    state = {"jobs": {}, "artifact_paths": [], "definition_posts": [], "rounds": 0}
     archive = Path(fixture["archive"]).read_bytes()
 
     class Handler(BaseHTTPRequestHandler):
@@ -126,81 +125,178 @@ def _mock_endpoint(fixture: dict) -> tuple[ThreadingHTTPServer, dict]:
                 self._send(404, {"error": "unknown"})
                 return
             if len(segments) >= 2 and segments[1] == "artifacts":
-                if urlparse.unquote("/".join(segments[2:])) != fixture["receipt"]["name"]:
-                    self._send(404, {"error": "only the sealed native capture transfer is available"})
+                name = urlparse.unquote("/".join(segments[2:]))
+                data = (job.get("_artifacts") or {}).get(name)
+                if data is None:
+                    self._send(404, {"error": "only sealed transfers are available"})
                     return
                 state["artifact_paths"].append(self.path)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/zip")
-                self.send_header("Content-Length", str(len(archive)))
+                self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
-                self.wfile.write(archive)
+                self.wfile.write(data)
+                return
+            if len(segments) != 1:
+                self._send(404, {"error": "unknown"})
                 return
             job["pokes"] += 1
-            if job["status"] == "queued":
-                job["status"] = "running"
-            if job["pokes"] >= 2 and job["status"] == "running":
-                sealed = _native_complete_job(fixture, job["request"])
-                sealed["pokes"] = job["pokes"]
-                job.update(sealed)
             self._send(200, _view(job))
 
         def do_POST(self) -> None:
             if not self._auth():
                 return
-            payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
-            if self.path == "/v1/handoffs/resolve":
-                path = payload.get("handoff_path")
-                if not isinstance(path, str) or not path.strip():
-                    self._send(400, {"error": "handoff_path is required"})
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length)
+            segments = self.path[len("/v1/jobs/") :].split("/") if self.path.startswith("/v1/jobs/") else []
+            job = state["jobs"].get(segments[0]) if segments and segments[0] else None
+            if self.path == "/v1/jobs":
+                payload = json.loads(body or b"{}")
+                fresh = {
+                    "run_id": run_id,
+                    "upload_files": upload_files,
+                    "upload_sha256": digest(upload_files),
+                    "main_assembly": main_assembly,
+                }
+                if (
+                    set(payload) - {"run_id", "upload_files", "upload_sha256", "main_assembly", "resume"}
+                    or {key: payload.get(key) for key in fresh} != fresh
+                ):
+                    self._send(409, {"error": "selection request differs from the staged intake"})
                     return
-                state["resolved_paths"].append(path)
-                state["expected"] = {"package": RESOLVED_PACKAGE, "handoff_sha256": fixture["handoff_sha256"]}
-                self._send(
-                    200,
-                    {
-                        "schema_version": "solidworks-to-urdf.handoff/v1",
-                        "pipeline_id": PIPELINE_ID,
-                        "package": RESOLVED_PACKAGE,
-                        "handoff_sha256": fixture["handoff_sha256"],
+                existing = state["jobs"].get(fresh["run_id"])
+                if existing is not None:
+                    if existing["request"] != payload:
+                        self._send(409, {"error": "run_id is bound to a different request"})
+                        return
+                    self._send(200, _view(existing))
+                    return
+                job = {
+                    "schema_version": "solidworks-to-urdf.job/v1",
+                    "pipeline_id": PIPELINE_ID,
+                    "run_id": fresh["run_id"],
+                    "request": dict(payload),
+                    "native_tool": fixture["native_tool"],
+                    "status": "selecting",
+                    "events": [{"stage": "job", "state": "selecting", "at": "t0"}],
+                    "selection": {
+                        "state": "awaiting_files",
+                        "round_id": hashlib.sha256(b"start").hexdigest(),
+                        "reader_sha256": fixture["native_tool"]["source_sha256"],
+                        "staged_files": {},
+                        "requested_files": {main_assembly: upload_files[main_assembly]},
+                        "observations": {},
                     },
-                )
+                    "result": None,
+                    "error": None,
+                    "_artifacts": {},
+                    "pokes": 0,
+                }
+                state["jobs"][fresh["run_id"]] = job
+                self._send(202, _view(job))
                 return
-            if self.path != "/v1/jobs":
-                self._send(404, {"error": "not found"})
+            if job is None:
+                self._send(404, {"error": "unknown run_id"})
                 return
-            expected = state["expected"] or {}
-            wanted = {
-                "run_id": fixture["run_id"],
-                "package": expected.get("package"),
-                "handoff_sha256": expected.get("handoff_sha256"),
-            }
-            if (
-                set(payload) - {"run_id", "package", "handoff_sha256", "main_assembly"}
-                or {key: payload.get(key) for key in wanted} != wanted
-            ):
-                self._send(409, {"error": "job request differs from the resolved handoff"})
-                return
-            existing = state["jobs"].get(wanted["run_id"])
-            if existing is not None:
-                if existing["request"] != payload:
-                    self._send(409, {"error": "run_id is bound to a different request"})
+            if len(segments) == 2 and segments[1] == "files":
+                block = job["selection"]
+                if block["state"] != "awaiting_files" or self.headers.get("X-Selection-Round") != block["round_id"]:
+                    self._send(409, {"error": "stale selection round"})
                     return
-                self._send(200, _view(existing))
+                try:
+                    with zipfile.ZipFile(io.BytesIO(body)) as source:
+                        members = {info.filename: source.read(info) for info in source.infolist()}
+                except (OSError, ValueError, zipfile.BadZipFile):
+                    self._send(400, {"error": "selection batch is not a readable ZIP"})
+                    return
+                requested = block["requested_files"]
+                if set(members) != set(requested) or any(
+                    hashlib.sha256(members[name]).hexdigest() != checksum for name, checksum in requested.items()
+                ):
+                    self._send(409, {"error": "selection batch differs from the requested staged bytes"})
+                    return
+                staged = {**block["staged_files"], **requested}
+                observed = {**block["observations"], **{name: observations[name] for name in requested}}
+                remaining = sorted(name for name in dependencies if name not in staged)
+                block.update(
+                    state="awaiting_files" if remaining else "ready",
+                    round_id=hashlib.sha256(json.dumps(sorted(staged)).encode()).hexdigest(),
+                    staged_files=staged,
+                    requested_files={name: upload_files[name] for name in remaining},
+                    observations=observed,
+                )
+                state["rounds"] += 1
+                self._send(200, _view(job))
                 return
-            job = {
-                "schema_version": "solidworks-to-urdf.job/v1",
-                "pipeline_id": PIPELINE_ID,
-                "run_id": wanted["run_id"],
-                "request": dict(payload),
-                "status": "queued",
-                "events": [{"stage": "job", "state": "queued", "at": "t0"}],
-                "result": None,
-                "error": None,
-                "pokes": 0,
-            }
-            state["jobs"][wanted["run_id"]] = job
-            self._send(202, _view(job))
+            if len(segments) == 2 and segments[1] == "seal":
+                payload = json.loads(body or b"{}")
+                manifest = payload.get("selection")
+                block = job["selection"]
+                if (
+                    set(payload) != {"selection"}
+                    or block["state"] != "ready"
+                    or block["requested_files"]
+                    or not isinstance(manifest, dict)
+                    or manifest.get("files") != block["staged_files"]
+                ):
+                    self._send(409, {"error": "selection is not ready to seal"})
+                    return
+                block.update(state="sealed", requested_files={}, manifest=manifest)
+                # The one supported server shape records the frozen handoff on the job.
+                job.update(
+                    handoff_sha256=manifest["handoff_sha256"],
+                    package_files=dict(block["staged_files"]),
+                )
+                sealed = discovery_transfer.seal_raw_record_bundle(
+                    record,
+                    bundle_dir / "raw-record.zip",
+                    run_id=run_id,
+                    selection=manifest,
+                    native_tool=fixture["native_tool"],
+                )
+                job["_artifacts"][sealed["artifact"]["name"]] = (bundle_dir / "raw-record.zip").read_bytes()
+                job["native_record"] = {
+                    "name": sealed["artifact"]["name"],
+                    "sha256": sealed["artifact"]["sha256"],
+                    "size": sealed["artifact"]["bytes"],
+                    "manifest_sha256": digest(sealed["manifest"]),
+                    "manifest": sealed["manifest"],
+                }
+                job["status"] = "awaiting_definition"
+                job["events"] = [
+                    *fixture["native_stages"]["events"],
+                    {"stage": "job", "state": "awaiting_definition", "at": "t0"},
+                ]
+                self._send(200, _view(job))
+                return
+            if len(segments) == 2 and segments[1] == "definition":
+                prepared = self.headers.get("X-Prepared-SHA256") or ""
+                if not body or len(prepared) != 64 or any(item not in "0123456789abcdef" for item in prepared):
+                    self._send(400, {"error": "definition binding is invalid"})
+                    return
+                state["definition_posts"].append({"prepared_sha256": prepared, "size": len(body)})
+                job["_artifacts"][fixture["receipt"]["name"]] = archive
+                job["status"] = "native_complete"
+                job["events"] = [
+                    *fixture["native_stages"]["events"],
+                    {"stage": "job", "state": "native_complete", "at": "t0"},
+                ]
+                job["result"] = {
+                    "native_complete": True,
+                    "native_tool": fixture["native_tool"],
+                    "capture_archive": dict(fixture["receipt"]),
+                }
+                job["error"] = None
+                self._send(200, _view(job))
+                return
+            if len(segments) == 2 and segments[1] == "abort":
+                payload = json.loads(body or b"{}")
+                job["status"] = "failed"
+                job["error"] = str(payload.get("error") or "derivation refused")
+                job["events"] = [*job.get("events", []), {"stage": "job", "state": "failed", "at": "t0"}]
+                self._send(200, _view(job))
+                return
+            self._send(404, {"error": "not found"})
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -313,6 +409,7 @@ def main() -> int:
     from description_pipeline.orchestration.airflow_client import native_run_id  # noqa: PLC0415
     from description_pipeline.orchestration.linux_store import LinuxStore  # noqa: PLC0415
     from description_pipeline.orchestration.portal import AirflowApi  # noqa: PLC0415
+    from description_pipeline.sources.solidworks.revision import package_inventory  # noqa: PLC0415
     from tests.v1.split_capture_fixture import (  # noqa: PLC0415
         CONTROL_LIMITS,
         QUALIFICATION,
@@ -330,7 +427,18 @@ def main() -> int:
         return 1
 
     api_port = args.api_port or _free_port()
-    server, state = _mock_endpoint(fixture)
+    intake_root = args.airflow_home / "smoke" / "intake"
+    intake = intake_root / HANDOFF_PATH
+    shutil.copytree(fixture_root / "native", intake)
+    upload_files = package_inventory(intake)
+    record = _native_record(fixture_root)
+    server, state = _mock_endpoint(
+        fixture,
+        run_id=native_id,
+        upload_files=upload_files,
+        record=record,
+        bundle_dir=args.airflow_home / "smoke" / "definition",
+    )
     port = server.server_address[1]
     store_root = args.airflow_home / "smoke-store"
     connection = json.dumps(
@@ -342,6 +450,8 @@ def main() -> int:
             "extra": {
                 "store_root": str(store_root),
                 "repositories": {REPOSITORY_SLUG: str(args.airflow_home / "smoke-repository")},
+                "handoff_roots": [str(intake_root)],
+                "discovery": {"record_roots": [str(fixture_root / "records")]},
             },
         }
     )
@@ -364,6 +474,11 @@ def main() -> int:
     problem = _plugin_preflight(args.venv, env, args.airflow_home)
     if problem is not None:
         print(json.dumps({"ok": False, "stage": "plugin_missing", "error": problem}))
+        server.close()
+        return 1
+    migrate = _run(args.venv, env, "db", "migrate")
+    if migrate.returncode != 0:
+        print(json.dumps({"ok": False, "stage": "db_migrate", "stderr": migrate.stderr[-500:]}))
         server.close()
         return 1
     log_dir = args.airflow_home / "logs" / "smoke"
@@ -424,7 +539,7 @@ def main() -> int:
         airflow = AirflowApi(f"http://127.0.0.1:{api_port}")
         token = _operator_jwt(args.venv, env)
         try:
-            airflow.trigger_dag_run(token, DAG_ID, run_id, {"handoff_path": HANDOFF_PATH})
+            airflow.trigger_dag_run(token, DAG_ID, run_id, {"handoff_path": str(intake)})
         except Exception as error:  # noqa: BLE001 - the smoke reports the exact stage
             print(json.dumps({"ok": False, "stage": "portal_trigger", "error": str(error)}))
             return 1
@@ -518,8 +633,12 @@ def main() -> int:
         jobs = list(state["jobs"].values())
         if len(jobs) != 1 or jobs[0].get("status") != "native_complete":
             problems.append("the mocked endpoint did not serve exactly one native_complete job")
-        if not state["artifact_paths"]:
-            problems.append("the sealed capture transfer was never streamed")
+        if state["rounds"] < 2:
+            problems.append("the selection rounds did not stage the fixture closure")
+        if not state["definition_posts"]:
+            problems.append("the generated text definition was never submitted")
+        if len(state["artifact_paths"]) < 2:
+            problems.append("the raw record and the sealed capture transfer were not both streamed")
         if meta.get("last_stage") != "verify":
             problems.append(f"the attempt advanced past verification: last_stage={meta.get('last_stage')!r}")
 
@@ -536,7 +655,8 @@ def main() -> int:
                     "triggering_user_name": triggering_user_name,
                     "dag_state": dag_state,
                     "task_states": task_states,
-                    "resolved_paths": state["resolved_paths"],
+                    "selection_rounds": state["rounds"],
+                    "definition_posts": state["definition_posts"],
                     "artifact_paths": state["artifact_paths"],
                     "handoff_sha256": fixture["handoff_sha256"],
                     "generate": {"state": generated.get("state"), "subject_sha256": generated.get("subject_sha256")},
