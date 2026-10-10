@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import unittest
 import zipfile
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -32,12 +33,13 @@ def stage_events(stage_id: str) -> list[dict]:
         for item in definition[key]:
             events.append(
                 {
+                    "at": datetime.now(UTC).isoformat(),
                     "stage": stage_id,
                     "state": "running",
                     "check": {"id": item["id"], "boundary": boundary, "state": "passed", "details": {}},
                 }
             )
-    events.append({"stage": stage_id, "state": "completed"})
+    events.append({"at": datetime.now(UTC).isoformat(), "stage": stage_id, "state": "completed"})
     return events
 
 
@@ -111,8 +113,13 @@ class StopAfterRunTests(unittest.TestCase):
         self.assertTrue((self.output / "reports/stages.json").is_file())
         native_stages = self.output / "reports" / "native-stages.json"
         self.assertTrue(native_stages.is_file())
-        self.assertEqual(native_stages.read_bytes(), (self.output / "reports/stages.json").read_bytes())
         receipt = json.loads((self.output / "reports/run.json").read_text(encoding="utf-8"))
+        native_view = json.loads(native_stages.read_text(encoding="utf-8"))
+        rendered = json.loads((self.output / "reports/stages.json").read_text(encoding="utf-8"))
+        self.assertEqual({key: value for key, value in native_view.items() if key != "events"}, rendered)
+        self.assertEqual(native_view["events"], receipt["events"])
+        self.assertTrue(native_view["events"])
+        self.assertTrue(all(isinstance(event.get("at"), str) and event["at"] for event in native_view["events"]))
         self.assertEqual(receipt["state"], "native_complete")
         self.assertIs(receipt["passed"], False)
         self.assertEqual(receipt["capture_archive"], info)
