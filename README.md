@@ -4,9 +4,11 @@ One engineering folder, one operator page, one verified model PR.
 
 `solidworks-to-urdf` freezes native SolidWorks engineering, derives the robot
 model, generates URDF and meshes, independently verifies the delivery, and
-creates or updates its review PR. Airflow coordinates native CAD capture on Windows and generation, independent
-MuJoCo verification and PR publication on Linux. Windows requires licensed
-SolidWorks; it does not require MuJoCo or GitHub credentials.
+creates or updates its review PR. Airflow coordinates native CAD capture and
+structure derivation on Windows, and generation, independent MuJoCo verification
+and PR publication on Linux. Windows requires licensed SolidWorks; it runs no
+URDF generation, MuJoCo verification or Git operations, and needs no GitHub
+credentials.
 
 ## Use
 
@@ -23,16 +25,22 @@ The page is **SolidWorks2URDF 交付操作台**.
    assembly is selected automatically. The choice is recorded with the run and its
    evidence, is kept by retries and reruns, and only fixes the entry point —
    identity and physical checks still run on the native data.
-3. Review each step's actual check results and any failure diagnosis. Automatic
-   passes need no manual repetition; external engineering scope remains explicit.
-   Inspect the verified URDF and joint
-   limits, and open the PR for engineering approval.
+3. Review each step's actual check results, the warnings flagged for engineering
+   inspection, and any failure diagnosis. Automatic passes need no manual
+   repetition; warnings never count as passes, and external engineering scope
+   remains explicit. Inspect the verified URDF and joint limits, and open the PR
+   for engineering approval.
 
 The picker uploads only the chosen folder; the page shows the platform's current
 upload limits (default 2 GB total, 4 096 files, 512 MB per file). Empty
 subfolders are not representable; temporary SolidWorks lock files (`~$…`) must
 be removed first — the platform rejects any selection containing them. Generated platform inputs such as `robot.yaml` and
 `cad-revision.json` must not be included — the platform generates them.
+
+If the main assembly carries the saved native URDF exporter declaration
+(`URDF Export Configuration (v1.4)`), the pipeline reads it from the CAD as
+declared link/joint evidence; zero or placeholder operating values are retained
+and flagged as warnings, never filled with defaults.
 
 Run history and details show the original submitter's Feishu username, obtained
 automatically through Feishu's authentication API.
@@ -68,7 +76,8 @@ With the recorded Linux verification environment installed, recheck it:
 description check /path/to/delivery
 ```
 
-A pass establishes the [verification gates](docs/quality.md). Model approval,
+A pass establishes the [verification gates](docs/quality.md) and is required for
+publication. Model approval,
 simulation, training and hardware control require their own evidence. The pipeline
 exports visual geometry and physical properties; it does not generate
 collision models or control interfaces.

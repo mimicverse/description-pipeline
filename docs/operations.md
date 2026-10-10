@@ -10,8 +10,9 @@ Follow the [mechanical specification](mechanical-handoff-spec.md). Establish
 scope, names, rigid connections, motion, datums, zero, signed directions,
 limits, materials and component identities in the native engineering model.
 
-Resolve drive specifications and independent mass/dimension budgets through
-CAD references to approved, versioned records in the platform's controlled library.
+Resolve drive specifications, and independent mass/dimension budgets when
+supplied, through CAD references to approved, versioned records in the platform's
+controlled library.
 Mechanical engineers maintain these references in SolidWorks; copying a record
 into the submitted folder does not override the library. Responsible engineers confirm
 facts that automatic consistency checks cannot establish, including actual
@@ -129,6 +130,8 @@ publish the review PR. Each step shows its **Input**, **Input QC**, **Output** a
 Failures show the affected object and next action first; file hashes and raw
 evidence are available in collapsed details. Without a verified URDF, the report
 uses the available workspace instead of reserving an empty preview pane.
+Warnings appear beside the stage results for engineering inspection; they never
+count as passes, and a completed stage can retain warnings.
 Generation-input inspection belongs to capture; it is not another operator step.
 
 During native work, the activity card shows the operation reported by the worker,
@@ -173,7 +176,8 @@ an unsupported native pattern is not proof of a mechanical design error.
 |---|---|
 | Dependency, configuration or saved-state error | Repair and save the native engineering package |
 | Ambiguous body, joint, name or frame | Check native evidence coverage, then correct the reader or the unresolved engineering definition |
-| Zero, direction, limit or drive disagreement | Correct its mechanical definition or controlled specification |
+| Zero, direction, limit or drive disagreement | Correct its mechanical definition or controlled specification; authored zero-width ranges and zero drives stay stage warnings until a usable controlled record is supplied - never fill defaults |
+| Unowned occurrence (stage warning) | Bind the occurrence in the declaration or correct the native structure; qualification still requires complete coverage and exact whole-CAD mass equality - never exclude an instance or its mass to clear the warning |
 | Material, mass or inertia disagreement | Correct material assignments, scope or the documented physical source |
 | Independent verification disagreement | Trace the native evidence and generation rule; preserve the failed diagnostics |
 | Infrastructure error | Restore the service; continue transport or rerun from the earliest valid engineering step shown |

@@ -45,7 +45,7 @@
       "name_zh": "解析结构",
       "inputs": [
         {
-          "label": "Frozen handoff and versioned component records",
+          "label": "Frozen handoff and explicitly referenced component records",
           "path": "handoff/",
           "class": "frozen"
         }
@@ -71,7 +71,7 @@
       "output_qc": [
         {
           "id": "discovery.definition",
-          "label": "Unambiguous identity, bodies, motion, names and references"
+          "label": "Resolvable model definition with explicit inspection warnings"
         },
         {
           "id": "discovery.binding",
