@@ -266,6 +266,31 @@ input, select, textarea { font: inherit; }
 .chip.failed { border-color: var(--bad); color: var(--bad); background: var(--bad-soft); }
 .chip.blocked { border-color: var(--line-strong); color: var(--muted); background: var(--panel); }
 .chip.pending, .chip.queued, .chip.scheduled, .chip.running { border-color: var(--warn); color: var(--warn); background: var(--warn-soft); }
+
+/* Live activity card: one prominent but compact block; the state rides the left border. */
+.activity-host { margin: 0 0 10px; }
+.activity-host:empty { margin: 0; }
+.activity-card {
+  border: 1px solid var(--line-strong);
+  border-left: 3px solid var(--warn);
+  background: var(--card);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  box-shadow: var(--shadow);
+}
+.activity-card.state-queued { border-left-color: var(--warn); }
+.activity-card.state-busy { border-left-color: var(--accent); }
+.activity-card.state-waiting, .activity-card.state-none { border-left-color: var(--line-strong); background: var(--panel); }
+.activity-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.activity-head strong { font-size: 13.5px; }
+.activity-action { margin: 8px 0 0; font-weight: 600; }
+.activity-object { margin: 2px 0 0; overflow-wrap: anywhere; }
+.activity-meta { margin: 6px 0 0; overflow-wrap: anywhere; }
+.activity-meta.stale { color: var(--warn); }
+.activity-note { margin: 6px 0 0; }
+.activity-recent { list-style: none; margin: 8px 0 0; padding: 8px 0 0; border-top: 1px dashed var(--line); display: grid; gap: 4px; }
+.activity-recent li { display: flex; gap: 8px; color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
+.activity-recent time { font-family: var(--mono); font-size: 11.5px; flex: none; }
 .badge { display: inline-block; border-radius: 999px; padding: 3px 10px; font-size: 12.5px; border: 1px solid var(--line); }
 .badge.ok { border-color: var(--ok); color: var(--ok); background: var(--ok-soft); }
 .badge.bad { border-color: var(--bad); color: var(--bad); background: var(--bad-soft); }

@@ -2,6 +2,7 @@
 // module only talks to the portal's own JSON API and the digest-verified artifact routes.
 import { buildJointControls, createViewer, disposeRobot, loadRobot } from "/static/viewer.js";
 import { menuAction, overlayRun, resolveDeleted, resolveTitle } from "/static/run_history.js";
+import { activityPlacement, activityView } from "/static/activity.js";
 
 const state = {
   csrf: null,
@@ -21,6 +22,7 @@ const state = {
   viewer: null,
   controls: null,
   timer: null,
+  activityTimer: null,
   retryingRunId: null,
   tabsInitializedFor: null,
   rerunningRunId: null,
@@ -383,6 +385,7 @@ function clearSession() {
   $("stage-rerun").hidden = true;
   if (state.timer) window.clearInterval(state.timer);
   state.timer = null;
+  stopActivityTimer();
   $("workspace").hidden = true;
   $("account").hidden = true;
   $("login-card").hidden = false;
@@ -1087,6 +1090,114 @@ function updatePreviewLayout() {
   workspace.classList.toggle("no-preview", !has);
 }
 
+function stopActivityTimer() {
+  if (state.activityTimer) window.clearInterval(state.activityTimer);
+  state.activityTimer = null;
+}
+
+// Local 1 s ticker: only re-renders elapsed/freshness text; the network poll stays at 3 s and
+// a successful poll is never treated as liveness.
+function startActivityTimer() {
+  if (state.activityTimer) return;
+  state.activityTimer = window.setInterval(() => {
+    const run = state.lastRun;
+    if (!run || run.dag_run_id !== state.dagRunId) return;
+    if (run.state === "success" || run.state === "failed") return;
+    renderActivity(run);
+  }, 1000);
+}
+
+function buildActivityCard(view) {
+  const card = document.createElement("section");
+  card.className = `activity-card state-${view.state}`;
+  card.setAttribute("aria-label", "实时活动");
+  const head = document.createElement("div");
+  head.className = "activity-head";
+  const dot = document.createElement("span");
+  dot.className = `dot ${view.state === "busy" || view.state === "queued" ? "run" : "idle"}`;
+  const title = document.createElement("strong");
+  title.textContent = "实时活动";
+  const chip = document.createElement("span");
+  chip.className = `chip ${view.state === "busy" ? "running" : view.state === "queued" ? "queued" : "blocked"}`;
+  chip.textContent = view.stateText;
+  head.append(dot, title, chip);
+  if (view.stageText) {
+    const stage = document.createElement("span");
+    stage.className = "muted small";
+    stage.textContent = `阶段：${view.stageText}`;
+    head.append(stage);
+  }
+  card.append(head);
+  if (view.actionText) {
+    const action = document.createElement("p");
+    action.className = "activity-action";
+    action.textContent = view.actionText;
+    card.append(action);
+  }
+  if (view.objectText) {
+    const object = document.createElement("p");
+    object.className = "activity-object muted small";
+    object.textContent = `当前对象：${view.objectText}`;
+    card.append(object);
+  }
+  const metaParts = [view.elapsedText, view.countsText, view.freshnessText].filter(Boolean);
+  if (metaParts.length) {
+    const meta = document.createElement("p");
+    meta.className = view.stale ? "activity-meta muted small stale" : "activity-meta muted small";
+    meta.textContent = metaParts.join("　•　");
+    card.append(meta);
+  }
+  if (view.note) {
+    const note = document.createElement("p");
+    note.className = "activity-note muted small";
+    note.textContent = view.note;
+    card.append(note);
+  }
+  if (view.recent.length) {
+    const list = document.createElement("ul");
+    list.className = "activity-recent";
+    for (const row of view.recent) {
+      const item = document.createElement("li");
+      const time = document.createElement("time");
+      time.textContent = row.timeText || "—";
+      const text = document.createElement("span");
+      text.textContent = row.object ? `${row.text} · ${row.object}` : row.text;
+      item.append(time, text);
+      list.append(item);
+    }
+    card.append(list);
+  }
+  return card;
+}
+
+function renderActivity(run) {
+  const overview = $("activity-overview");
+  const stageHost = $("activity-stage");
+  if (!overview || !stageHost) return;
+  overview.textContent = "";
+  stageHost.textContent = "";
+  if (!run || run.dag_run_id !== state.dagRunId) return;
+  const view = activityView(run.activity, { runState: run.state, nowMs: Date.now() });
+  if (view.visible) overview.append(buildActivityCard(view));
+  const selected = Array.isArray(state.stages) && Number.isInteger(state.selectedStage)
+    ? state.stages[state.selectedStage] || null
+    : null;
+  const mode = activityPlacement(view, {
+    stageId: selected ? selected.id : "",
+    stageRunning: Boolean(selected && selected.state === "running"),
+  });
+  if (mode === "live") {
+    stageHost.append(buildActivityCard(view));
+  } else if (mode === "note") {
+    const note = document.createElement("p");
+    note.className = "activity-note muted small";
+    note.textContent = view.state === "busy" && view.stageText && selected && view.stage !== selected.id
+      ? `当前活动阶段为「${view.stageText}」，此阶段暂无详细进度。`
+      : "此阶段暂无详细进度可用。";
+    stageHost.append(note);
+  }
+}
+
 function renderStepper() {
   const stepper = $("stages");
   stepper.textContent = "";
@@ -1429,6 +1540,7 @@ function renderRun(run) {
   state.selectedStage = chooseStageIndex(state.stages, runId);
   renderStepper();
   renderStageDetail();
+  renderActivity(run);
 
   const automatic = $("automatic");
   automatic.textContent = "";
@@ -1694,6 +1806,7 @@ async function poll() {
     if ((run.state === "success" || run.state === "failed") && jobDone && (!verified || state.previewSubject)) {
       if (state.timer) window.clearInterval(state.timer);
       state.timer = null;
+      stopActivityTimer();
     }
     const terminalNow = run.state === "success" || run.state === "failed";
     if (terminalNow && !(previous && (previous.state === "success" || previous.state === "failed"))) {
@@ -1714,6 +1827,7 @@ async function poll() {
       state.tabsInitializedFor = null;
       if (state.timer) window.clearInterval(state.timer);
       state.timer = null;
+      stopActivityTimer();
       $("retry-panel").hidden = true;
       showUploadView();
       await refreshRuns();
@@ -1727,6 +1841,7 @@ async function poll() {
 async function selectRun(dagRunId) {
   if (state.timer) window.clearInterval(state.timer);
   state.timer = null;
+  stopActivityTimer();
   clearPreview();
   state.dagRunId = dagRunId;
   state.lastRun = null;
@@ -1743,6 +1858,7 @@ async function selectRun(dagRunId) {
   state.timer = window.setInterval(() => {
     void poll();
   }, 3000);
+  startActivityTimer();
   await poll();
 }
 
@@ -1761,6 +1877,7 @@ async function retryRun() {
     await api(`/api/runs/${encodeURIComponent(dagRunId)}/retry`, { method: "POST", body: {} });
     if (state.dagRunId !== dagRunId) return;
     if (!state.timer) state.timer = window.setInterval(() => { void poll(); }, 3000);
+    startActivityTimer();
     await poll();
     await refreshRuns();
   } catch (error) {

@@ -457,5 +457,67 @@ class RunHistoryJsLogicTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
 
 
+class ActivityUiContractTests(unittest.TestCase):
+    """Live-activity card: mounts, wording, and the no-fabrication hard rules."""
+
+    def activity(self) -> str:
+        return (STATIC / "activity.js").read_text(encoding="utf-8")
+
+    def test_page_mounts_the_card_in_overview_and_running_stage(self) -> None:
+        html = (STATIC / "index.html").read_text(encoding="utf-8")
+        self.assertIn('id="activity-overview"', html)
+        self.assertIn('id="activity-stage"', html)
+        app = (STATIC / "app.js").read_text(encoding="utf-8")
+        for token in (
+            'from "/static/activity.js"',
+            "renderActivity(run);",
+            "activityView(run.activity",
+            "activityPlacement(",
+            "startActivityTimer()",
+            "stopActivityTimer()",
+        ):
+            self.assertIn(token, app)
+
+    def test_wording_states_and_hard_rules_are_pinned(self) -> None:
+        source = self.activity()
+        for token in (
+            "暂无详细进度",
+            "暂无新更新",
+            "刚刚更新",
+            "已处理",
+            "updated_at",
+            "queued",
+            "waiting",
+            "busy",
+            "finished",
+        ):
+            self.assertIn(token, source)
+        # No percentage figures in any rendered text (modulo arithmetic outside strings is
+        # fine), no forecasts, no HTML injection surface.
+        self.assertIsNone(re.search(r'"[^"\n]*%[^"\n]*"', source), "percent in double-quoted text")
+        self.assertIsNone(re.search(r"`[^`\n]*%[^`\n]*`", source), "percent in template text")
+        self.assertNotIn("预计", source)
+        self.assertNotIn("剩余", source)
+        self.assertNotIn("innerHTML", source)
+        app = (STATIC / "app.js").read_text(encoding="utf-8")
+        self.assertIn("buildActivityCard", app)
+        self.assertNotIn("innerHTML", app)
+
+
+class ActivityJsLogicTests(unittest.TestCase):
+    """Focused Node regression for the pure live-activity view helpers."""
+
+    @unittest.skipUnless(shutil.which("node"), "node is required to run the JS logic regression")
+    def test_activity_logic_regression(self) -> None:
+        script = ROOT / "tests" / "js" / "activity_logic_test.mjs"
+        result = subprocess.run(
+            [shutil.which("node"), str(script)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
+
+
 if __name__ == "__main__":
     unittest.main()
