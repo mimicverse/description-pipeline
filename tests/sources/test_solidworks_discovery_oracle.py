@@ -1048,6 +1048,59 @@ class OracleSemanticsTests(unittest.TestCase):
                     errors,
                 )
 
+    def test_frame_mate_scope_must_be_exactly_the_frozen_top(self) -> None:
+        missing = object()
+
+        def mutate(raw, payload, value):
+            mate = frame_ground_mates()[0]
+            if value is missing:
+                mate.pop("scope", None)
+            else:
+                mate["scope"] = value
+            raw["mates"].append(mate)
+
+        for label, value in (("missing", missing), ("null", None), ("zero", 0), ("nested", "sub-1")):
+            with self.subTest(scope=label):
+                package = self.baseline()
+                self._native(package, lambda raw, payload, value=value: mutate(raw, payload, value))
+                passed, errors, _checks = self.check(package)
+                self.assertFalse(passed, errors)
+                self.assertTrue(
+                    any(
+                        error["code"] == "discovery.frame_attachment"
+                        and "outside the frozen top assembly" in error["message"]
+                        for error in errors
+                    ),
+                    errors,
+                )
+
+    def test_datum_owner_must_be_an_occurrence_or_the_top_assembly(self) -> None:
+        missing = object()
+
+        def mutate(raw, payload, value):
+            for datum in raw["datums"]:
+                if datum["name"] == "CS_arm_link":
+                    if value is missing:
+                        datum.pop("owner", None)
+                    else:
+                        datum["owner"] = value
+
+        for label, value in (("missing", missing), ("null", None), ("zero", 0)):
+            with self.subTest(owner=label):
+                package = self.baseline()
+                self._native(package, lambda raw, payload, value=value: mutate(raw, payload, value))
+                passed, errors, _checks = self.check(package)
+                self.assertFalse(passed, errors)
+                self.assertTrue(
+                    any(
+                        error["code"] == "discovery.graph"
+                        and "datum owner must be a known occurrence name or the frozen top assembly"
+                        in error["message"]
+                        for error in errors
+                    ),
+                    errors,
+                )
+
     def test_top_owned_interface_datum_binds_the_proven_base(self) -> None:
         def publish_frame(package: Path, parent: str) -> None:
             robot_path = package / "robot.yaml"
