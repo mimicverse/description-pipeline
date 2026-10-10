@@ -86,8 +86,16 @@ class ScheduledSmokeTests(unittest.TestCase):
         self.assertEqual(report["verify"]["unexpected_gates"], [])
         self.assertEqual(report["verify"]["missing_required_gates"], [])
         self.assertEqual(report["qualification"], QUALIFICATION)
-        self.assertEqual(report["resolved_paths"], ["handoff/m3.0"])
-        self.assertEqual(len(report["artifact_paths"]), 1)
+
+        # The one supported two-leg transfer: both selection rounds, exactly one generated
+        # definition post, and both sealed artifacts (raw record and native capture) streamed.
+        self.assertEqual(report["selection_rounds"], 2)
+        self.assertEqual(len(report["definition_posts"]), 1)
+        self.assertEqual(len(report["definition_posts"][0]["prepared_sha256"]), 64)
+        self.assertGreater(report["definition_posts"][0]["size"], 0)
+        self.assertEqual(len(report["artifact_paths"]), 2)
+        self.assertTrue(any(path.endswith("/artifacts/raw-record.zip") for path in report["artifact_paths"]))
+        self.assertTrue(any(path.endswith("/artifacts/native-evidence.zip") for path in report["artifact_paths"]))
 
         # The api-server runs the real Feishu manager with a configured smoke app, and the run was
         # submitted through the portal client, so Airflow recorded the compound audit identity.
