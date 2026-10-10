@@ -942,7 +942,8 @@ function buildFailureCard(failure) {
       const hint = document.createElement("p");
       hint.className = "muted small";
       hint.textContent =
-        "未识别刚体坐标系（discovery.link_name_missing）：处置方向为补齐交付定义与坐标系归属（由结构交付侧在原生工程中完成），" +
+        "未识别刚体坐标系（discovery.link_name_missing）：记录表示刚体归属与命名尚未证明，并不代表 CAD 中不存在坐标系；" +
+        "处置方向为补齐交付定义与坐标系归属（由结构交付侧在原生工程中完成），" +
         "不需要为每个供应商内部叶件单独添加坐标系。";
       card.append(hint);
       const samples = failure.finding_samples && Array.isArray(failure.finding_samples["discovery.link_name_missing"])
@@ -1675,11 +1676,21 @@ function renderRun(run) {
   const codeLabels = new Map(
     ((failure && failure.finding_counts) || []).map((group) => [group.code, group.label_zh || group.code]),
   );
+  const findingNameValue = (finding) => {
+    const evidence = finding && finding.evidence && typeof finding.evidence === "object" ? finding.evidence : {};
+    const detail = evidence.detail && typeof evidence.detail === "object" ? evidence.detail : {};
+    const value = typeof detail.name === "string" ? detail.name.trim() : "";
+    return value || null;
+  };
   const renderFinding = (finding) => {
     const item = document.createElement("li");
     if (finding.severity && finding.severity !== "error") item.className = "warn";
     const message = document.createElement("div");
-    message.textContent = finding.message || "未提供说明";
+    // A missing robot name is not a malformed name; keep the two cases distinct.
+    message.textContent =
+      finding.id === "discovery.robot_name_invalid" && findingNameValue(finding) === null
+        ? "未读取到机器人名称（detail.name 为空）。"
+        : finding.message || "未提供说明";
     const context = document.createElement("div");
     context.className = "object";
     context.textContent = [finding.id, finding.stage, finding.object].filter(Boolean).join(" · ") || "—";
@@ -1717,7 +1728,12 @@ function renderRun(run) {
     const outer = document.createElement("li");
     const section = document.createElement("details");
     const header = document.createElement("summary");
-    header.textContent = `${codeLabels.get(code) || code}（${items.length} 项）`;
+    let groupLabel = codeLabels.get(code) || code;
+    if (code === "discovery.robot_name_invalid") {
+      const missing = items.filter((finding) => findingNameValue(finding) === null).length;
+      if (missing === items.length) groupLabel = "缺少机器人名称";
+    }
+    header.textContent = `${groupLabel}（${items.length} 项）`;
     const nested = document.createElement("ul");
     nested.className = "finding-group";
     // Bounded first paint: a large group renders its rows only when the operator opens it.

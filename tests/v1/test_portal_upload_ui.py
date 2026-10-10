@@ -527,8 +527,11 @@ class FailureDisplayUiContractTests(unittest.TestCase):
         for token in (
             "不代表 CAD 缺陷",
             "discovery.link_name_missing",
+            "并不代表 CAD 中不存在坐标系",
             "不需要为每个供应商内部叶件单独添加坐标系",
             "示例对象：",
+            "未读取到机器人名称",
+            "缺少机器人名称",
         ):
             self.assertIn(token, app)
 
