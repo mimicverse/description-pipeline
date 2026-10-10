@@ -94,8 +94,13 @@ def discover_structure(
     targets: dict,
     preparer=None,
     on_event=None,
+    on_activity=None,
 ):
-    """Derive mechanical semantics and bind their native observations to the handoff."""
+    """Derive mechanical semantics and bind their native observations to the handoff.
+
+    ``on_activity`` observes the long native read for the live-activity view; it
+    never changes the checks, the derived package or any failure path.
+    """
     from .sources.solidworks.discovery import DiscoverySettings, prepare_native_package
 
     _state(on_event, "discover", "running")
@@ -132,7 +137,9 @@ def discover_structure(
         discovery_inputs,
         describe=describe_settings,
     )
-    prepared = (preparer or prepare_native_package)(frozen, output, run_id, settings=settings, on_event=on_event)
+    prepared = (preparer or prepare_native_package)(
+        frozen, output, run_id, settings=settings, on_event=on_event, on_activity=on_activity
+    )
     discovery = {
         "passed": prepared.passed,
         "findings": list(prepared.findings),

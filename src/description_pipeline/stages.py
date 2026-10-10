@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import copy
 import json
+import re
+import unicodedata
 from pathlib import Path
 
 from .delivery import PIPELINE_ID
@@ -24,6 +26,231 @@ HOST_BY_STAGE = {stage["id"]: stage.get("host") for stage in CONTRACT["stages"]}
 if set(HOST_BY_STAGE.values()) - set(HOST_IDS) or any(host is None for host in HOST_BY_STAGE.values()):
     raise PipelineError("Every engineering stage must declare exactly one execution host")
 VIEW_SCHEMA = "solidworks-to-urdf.stages/v1"
+
+# ---------------------------------------------------------------------------
+# Live activity — what a running stage is doing right now.  This is deliberately
+# separate from the check/stage evidence above: activity is observation, never
+# completed work, and it never feeds quality, receipts or terminal state.
+# ---------------------------------------------------------------------------
+
+#: Bounded history of (phase, action) transitions kept alongside the latest activity.
+ACTIVITY_HISTORY_LIMIT = 40
+#: Bounded number of recent transitions exposed in the run view.
+ACTIVITY_RECENT_LIMIT = 5
+_ACTIVITY_TOKEN = re.compile(r"[a-z][a-z0-9_]{0,31}\Z")
+
+
+def _activity_token(value) -> str | None:
+    return value if isinstance(value, str) and _ACTIVITY_TOKEN.fullmatch(value) else None
+
+
+def _activity_text(value, limit: int) -> str | None:
+    """Control-free text up to ``limit`` characters, or ``None`` when unusable."""
+
+    if not isinstance(value, str):
+        return None
+    cleaned = "".join(ch for ch in unicodedata.normalize("NFC", value) if unicodedata.category(ch)[0] != "C")
+    cleaned = cleaned.strip()
+    if not cleaned or len(cleaned) > limit:
+        return None
+    return cleaned
+
+
+def _activity_object(value) -> str | None:
+    """A safe relative posix name; absolute paths and traversals are refused."""
+
+    cleaned = _activity_text(value, 160)
+    if cleaned is None:
+        return None
+    name = cleaned.replace("\\", "/")
+    if name.startswith("/") or re.match(r"^[A-Za-z]:", name):
+        return None
+    parts = [part for part in name.split("/") if part not in ("", ".")]
+    if not parts or any(part == ".." for part in parts):
+        return None
+    return "/".join(parts)
+
+
+def normalize_activity(record) -> dict | None:
+    """Validate one emitted activity record; unusable records are ignored, never defaulted.
+
+    The emitter reports only what it knows (``phase``/``action`` and optional
+    ``params``/``current_object``/``completed``+``total``/``unit``); everything
+    else — timestamps, sequence and history — is added by the collector.  A
+    malformed record is dropped: activity must never fabricate or fail a run.
+    """
+
+    if not isinstance(record, dict):
+        return None
+    phase = _activity_token(record.get("phase"))
+    action = _activity_token(record.get("action"))
+    if phase is None or phase not in STAGE_IDS or action is None:
+        return None
+    normalized: dict = {"phase": phase, "action": action}
+    params = record.get("params")
+    if params is not None:
+        if not isinstance(params, dict) or not params or len(params) > 6:
+            return None
+        clean_params = {}
+        for key, value in params.items():
+            if _activity_token(key) is None:
+                return None
+            if isinstance(value, bool) or type(value) is int:
+                clean_params[key] = value
+            elif isinstance(value, str):
+                text = _activity_text(value, 120)
+                if text is None:
+                    return None
+                clean_params[key] = text
+            else:
+                return None
+        normalized["params"] = clean_params
+    if record.get("current_object") is not None:
+        safe_object = _activity_object(record.get("current_object"))
+        if safe_object is None:
+            return None
+        normalized["current_object"] = safe_object
+    completed, total = record.get("completed"), record.get("total")
+    if completed is not None or total is not None:
+        # Counts exist together or not at all; a growing total is honest scope
+        # discovery, a shrinking completed count never is.
+        if type(completed) is not int or type(total) is not int or completed < 0 or total < completed:
+            return None
+        normalized["completed"], normalized["total"] = completed, total
+    if record.get("unit") is not None:
+        unit = _activity_token(record.get("unit"))
+        if unit is None:
+            return None
+        normalized["unit"] = unit
+    return normalized
+
+
+def merge_activity(previous, record, *, at: str) -> tuple[dict, dict | None]:
+    """Fold one normalized record into the latest activity.
+
+    A repeated (phase, action) keeps the run's identity (``started_at``/``seq``)
+    while the record REPLACES the observed fields: omitted optional fields are
+    cleared rather than carried over, so a stale object or count can never leak
+    into a later batch and a legitimate per-document reset is reported as the
+    emitter sent it.  A new pair starts a fresh run and one bounded history
+    entry.
+    """
+
+    previous = previous if isinstance(previous, dict) else {}
+    same = previous.get("phase") == record.get("phase") and previous.get("action") == record.get("action")
+    merged = dict(record)
+    merged["at"] = at
+    merged["started_at"] = previous.get("started_at") if same else at
+    merged["updated_at"] = at
+    merged["seq"] = int(previous.get("seq") or 0) + 1 if same else 1
+    history = None
+    if not same:
+        history = {"at": at, "code": f"{merged['phase']}.{merged['action']}", "object": merged.get("current_object")}
+    return merged, history
+
+
+def _stage_started_at(job: dict, phase: str | None) -> str | None:
+    """The true start of the current stage execution, from stage-state events only.
+
+    Check records also carry ``state: running`` but describe a check, not the
+    stage: they are excluded so the rendered elapsed time never resets per
+    check.  The first stage-state ``running`` event of the execution is the
+    start; a completed/failed transition leaves no current execution start.
+    """
+
+    if not phase:
+        return None
+    started = None
+    for event in job.get("events") or []:
+        if not isinstance(event, dict) or event.get("stage") != phase or "check" in event:
+            continue
+        at = event.get("at")
+        if not isinstance(at, str):
+            continue
+        if event.get("state") == "running":
+            if started is None:
+                started = at
+        else:
+            started = None
+    return started
+
+
+def activity_view(job) -> dict:
+    """The run-view activity object; always present, explicit about absence.
+
+    ``available`` is true only when recorded telemetry exists: a live record
+    (``busy``) or a finished run with its final observation/history
+    (``finished``).  Stages without an emitter — a queued run, a running run
+    whose current stage reports nothing, legacy attempts — stay explicitly
+    unavailable (``available: false``) instead of implying an action.
+    ``stage_started_at`` is the true stage start from recorded stage events;
+    ``action_started_at`` is when the current action began.  Timestamps come
+    from the recorder only — a successful poll never refreshes freshness.
+    """
+
+    view = {
+        "available": False,
+        "state": "none",
+        "stage": None,
+        "stage_started_at": None,
+        "action_started_at": None,
+        "updated_at": None,
+        "action": None,
+        "object": None,
+        "counts": None,
+        "recent": [],
+    }
+    if not isinstance(job, dict):
+        return view
+    status = str(job.get("status") or "")
+    recent = []
+    for entry in job.get("activity_history") or []:
+        if not isinstance(entry, dict):
+            continue
+        code, at = entry.get("code"), entry.get("at")
+        if not isinstance(code, str) or not isinstance(at, str):
+            continue
+        recent.append(
+            {"at": at, "code": code, "object": entry.get("object") if isinstance(entry.get("object"), str) else None}
+        )
+    view["recent"] = recent[-ACTIVITY_RECENT_LIMIT:][::-1]
+
+    def describe(source: dict) -> None:
+        phase, action = source.get("phase"), source.get("action")
+        view["stage"] = phase if isinstance(phase, str) else None
+        view["stage_started_at"] = _stage_started_at(job, view["stage"])
+        view["action_started_at"] = source.get("started_at")
+        view["updated_at"] = source.get("updated_at")
+        if isinstance(phase, str) and isinstance(action, str):
+            params = source.get("params") if isinstance(source.get("params"), dict) else {}
+            view["action"] = {"code": f"{phase}.{action}", "params": params}
+        view["object"] = source.get("current_object")
+        if type(source.get("completed")) is int and type(source.get("total")) is int:
+            counts = {"done": source["completed"], "total": source["total"]}
+            if isinstance(source.get("unit"), str):
+                counts["unit"] = source["unit"]
+            view["counts"] = counts
+
+    final = job.get("activity_final") if isinstance(job.get("activity_final"), dict) else None
+    if status in {"passed", "failed", "native_complete"}:
+        view["state"] = "finished"
+        if final is not None or view["recent"]:
+            view["available"] = True
+            describe(final or {})
+        return view
+    if status == "queued":
+        view["state"] = "queued"
+        return view
+    if status != "running":
+        return view
+    activity = job.get("activity") if isinstance(job.get("activity"), dict) else None
+    if activity is None:
+        view["state"] = "waiting"
+        return view
+    view["state"] = "busy"
+    view["available"] = True
+    describe(activity)
+    return view
 
 
 def stage_host(stage_id: str) -> str:

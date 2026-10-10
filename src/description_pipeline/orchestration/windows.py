@@ -47,7 +47,7 @@ from ..io import (
 from ..sources.snapshot import verify_snapshot
 from ..sources.solidworks.revision import package_inventory
 from ..runtime import tool_record
-from ..stages import STAGE_IDS, stage_view
+from ..stages import ACTIVITY_HISTORY_LIMIT, STAGE_IDS, merge_activity, normalize_activity, stage_view
 from .stage_transfer import CAPTURE_MANIFEST as CAPTURE_MANIFEST_NAME
 from .recovery import stage_reruns, start_plan
 from ..sources.solidworks.handoff import HANDOFF_SCHEMA, MAX_HANDOFF_BYTES, freeze_handoff, import_archive
@@ -883,7 +883,68 @@ class Jobs:
             job["events"].append(entry)
             if isinstance(entry.get("discovery"), dict):
                 job["discovery"] = entry["discovery"]
+            self._retire_activity(job, entry)
             self._save(job)
+
+    @staticmethod
+    def _retire_activity(job, event) -> None:
+        """A stage transition retires telemetry that belongs to another or an ended stage.
+
+        Without this, a stale discovery action would keep rendering as busy while
+        capture (which reports nothing) runs, until the job turns terminal.  Check
+        records describe a check rather than a transition and never retire.
+        """
+
+        if not isinstance(event, dict) or "check" in event:
+            return
+        activity = job.get("activity")
+        if not isinstance(activity, dict):
+            return
+        stage, state = event.get("stage"), event.get("state")
+        if not isinstance(stage, str) or state not in {"running", "completed", "failed"}:
+            return
+        if stage == activity.get("phase") and state == "running":
+            return
+        job["activity_final"] = activity
+        job["activity"] = None
+
+    def _activity(self, identifier, record):
+        """Persist one live-activity update; malformed or stale records are ignored.
+
+        Activity is observation only: it never touches events, checks, results
+        or the job status, and a broken emitter can never fail a run.  Every
+        accepted update is saved immediately so the poll API sees it while the
+        native job is still blocking.
+        """
+
+        normalized = normalize_activity(record)
+        if normalized is None:
+            return
+        with self.mutex:
+            job = self.jobs.get(identifier)
+            if job is None:
+                return
+            result = merge_activity(job.get("activity"), normalized, at=datetime.now(UTC).isoformat())
+            if result is None:
+                return
+            activity, history_entry = result
+            job["activity"] = activity
+            if history_entry is not None:
+                history = list(job.get("activity_history") or [])
+                history.append(history_entry)
+                job["activity_history"] = history[-ACTIVITY_HISTORY_LIMIT:]
+            self._save(job)
+
+    @staticmethod
+    def _clear_activity(job) -> None:
+        """Terminal statuses retire the live record but keep the final observation."""
+
+        if not isinstance(job, dict):
+            return
+        activity = job.get("activity")
+        if isinstance(activity, dict):
+            job["activity_final"] = activity
+        job["activity"] = None
 
     def _prepare_native(self, identifier, frozen, selection=None):
         from ..steps import discover_structure
@@ -900,6 +961,7 @@ class Jobs:
             targets=self.config["targets"],
             preparer=self.native_preparer,
             on_event=lambda item: self._event(identifier, item),
+            on_activity=lambda item: self._activity(identifier, item),
         )
         with self.mutex:
             job.update(
@@ -1031,17 +1093,20 @@ class Jobs:
                     if result.get("native_complete") is True and result.get("passed") is False and archive:
                         verified = self._verified_capture_archive(identifier, archive)
                         job.update(status="native_complete", error=None, capture_archive=verified)
+                        self._clear_activity(job)
                     elif result.get("native_complete") is True or result.get("passed") is True:
                         job.update(
                             status="failed",
                             error="Native result shape is not a sealed capture transfer; "
                             "the run cannot be qualified",
                         )
+                        self._clear_activity(job)
                         if result.get("error_code"):
                             job["error_code"] = str(result["error_code"])
                     else:
                         # A genuinely failed native run keeps its own diagnostics.
                         job.update(status="failed", error=result.get("error") or "Native capture failed")
+                        self._clear_activity(job)
                         if result.get("error_code"):
                             job["error_code"] = str(result["error_code"])
                         for key in ("detail", "diagnostic_path"):
@@ -1050,6 +1115,7 @@ class Jobs:
             except Exception as error:
                 with self.mutex:
                     job.update(status="failed", error=f"{type(error).__name__}: {error}")
+                    self._clear_activity(job)
                     code = getattr(error, "code", None)
                     if code:
                         job["error_code"] = str(code)

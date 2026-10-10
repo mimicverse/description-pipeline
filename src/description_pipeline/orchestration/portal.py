@@ -37,7 +37,7 @@ from urllib import parse as urlparse
 from urllib import request as urlrequest
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
-from ..stages import CONTRACT, stage_view
+from ..stages import CONTRACT, activity_view, stage_view
 from .airflow_client import (
     EndpointConfig,
     EndpointError,
@@ -1356,6 +1356,7 @@ class PortalApp:
             "stage_view": stage_view_payload,
             "report": report,
             "findings": _findings(job),
+            "activity": activity_view(job),
             "automatic": _automatic_summary(job),
             "coverage": _coverage_report(job, report),
             "pr": pr,
@@ -1980,7 +1981,14 @@ class PortalApp:
             native = None
         store = self._store()
         if store is not None and isinstance(store.meta(run_id), dict):
-            return store.merged_job(run_id, native)
+            merged = store.merged_job(run_id, native)
+            if isinstance(native, dict):
+                # The native job owns the live record while its half blocks; the
+                # merged store snapshot must not drop it.
+                for key in ("activity", "activity_final", "activity_history"):
+                    if key in native:
+                        merged[key] = native[key]
+            return merged
         return native
 
     def _body(self, environ: dict) -> dict:
