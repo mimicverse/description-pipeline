@@ -218,6 +218,23 @@ class StageTransferTests(unittest.TestCase):
         seal(self.root, second)
         self.assertEqual(first.read_bytes(), second.read_bytes())
 
+    def test_seal_ignores_its_own_outputs_and_rejects_stray_files(self) -> None:
+        inside = self.root / transfer.CAPTURE_ARCHIVE
+        manifest = seal(self.root, inside)
+        self.assertTrue(inside.is_file())
+        self.assertNotIn(transfer.CAPTURE_ARCHIVE, manifest["files"])
+
+        with_sidecar = capture_root(self.base / "sidecar")
+        write_json(with_sidecar / transfer.CAPTURE_MANIFEST, {"stale": True})
+        manifest = seal(with_sidecar, self.base / "sidecar.zip")
+        self.assertNotIn(transfer.CAPTURE_MANIFEST, manifest["files"])
+        self.assertIn("reports/stages.json", manifest["files"])
+
+        stray = capture_root(self.base / "stray")
+        (stray / "stray.txt").write_bytes(b"stray")
+        with self.assertRaisesRegex(PipelineError, "outside the transfer payload"):
+            seal(stray, self.base / "stray.zip")
+
     def test_existing_archive_or_destination_is_refused(self) -> None:
         seal(self.root, self.archive)
         with self.assertRaises(PipelineError):
@@ -261,6 +278,13 @@ class StageTransferTests(unittest.TestCase):
         repack(self.archive, broken, {"reports/stages.json": canonical(view)})
         with self.assertRaisesRegex(PipelineError, "receipts are incomplete"):
             admit(broken, self.base / "out-stages")
+
+    def test_self_consistent_stray_member_is_refused(self) -> None:
+        seal(self.root, self.archive)
+        broken = self.base / "stray-member.zip"
+        repack(self.archive, broken, {"reports/extra.json": b"{}"})
+        with self.assertRaisesRegex(PipelineError, "outside the capture payload"):
+            admit(broken, self.base / "out-stray-member")
 
     def test_self_consistent_evidence_tamper_is_refused(self) -> None:
         seal(self.root, self.archive)
