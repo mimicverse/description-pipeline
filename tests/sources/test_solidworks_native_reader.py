@@ -3427,7 +3427,7 @@ class ComponentSuppressionStateTests(unittest.TestCase):
                 light = _Component("arm-1", _write(root, "arm.SLDPRT"), suppression=state)
                 assembly = _write(root, "robot.SLDASM")
                 documents = {assembly: _Doc(assembly, doc_type=2, children=[light])}
-                backend = _CaptureBackend(session_factory=lambda: _Session(_App(documents)))
+                backend = _CaptureBackend(session_factory=lambda documents=documents: _Session(_App(documents)))
                 with self.assertRaises(CadError) as caught:
                     backend.collect_scene(str(assembly), [])
                 self.assertEqual(caught.exception.code, "cad_component_lightweight_unresolved")
