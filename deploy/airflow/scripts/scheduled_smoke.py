@@ -176,6 +176,7 @@ def _mock_endpoint(
                     "pipeline_id": PIPELINE_ID,
                     "run_id": fresh["run_id"],
                     "request": dict(payload),
+                    "main_assembly": main_assembly,
                     "native_tool": fixture["native_tool"],
                     "status": "selecting",
                     "events": [{"stage": "job", "state": "selecting", "at": "t0"}],
