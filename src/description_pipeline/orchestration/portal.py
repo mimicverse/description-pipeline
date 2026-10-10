@@ -1505,6 +1505,11 @@ class PortalApp:
                 eligible=bool(ready),
                 reason="linux_ready" if ready else "linux_checkpoint_missing",
                 reason_zh="可在 Linux 便携端重跑" if ready else "缺少可在 Linux 重跑的检查点",
+                # The native plan's prerequisite summary describes the Windows half only
+                # (its receipt accounting cannot see post-capture evidence); for the
+                # portable surface the verdict above is proven by the local checkpoints.
+                # Clear it instead of inventing Linux receipt evidence.
+                prerequisites=[],
             )
         return rows
 

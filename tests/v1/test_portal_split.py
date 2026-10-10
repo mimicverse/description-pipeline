@@ -45,6 +45,7 @@ class _EndpointSlot:
 
     def __init__(self) -> None:
         self.job: dict | None = None
+        self.plan: dict | None = None
         self.calls = 0
 
     def get_job(self, run_id):
@@ -55,6 +56,8 @@ class _EndpointSlot:
 
     def rerun_plan(self, run_id):
         self.calls += 1
+        if self.plan is not None:
+            return self.plan
         raise EndpointError("windows down")
 
 
@@ -189,6 +192,43 @@ class PortalSplitTests(unittest.TestCase):
         # ... and an unrecognized native status still fails closed.
         self.windows.job = {"status": "unexpected"}
         self.assertEqual(self.app._delete_refusal(session, {"state": "success"}, RUN)[0], "unconfirmed")
+
+    def test_portable_rows_clear_stale_native_prerequisites(self) -> None:
+        native_prerequisites = {
+            "inputs": "ok",
+            "tool": "ok",
+            "receipt": "absent",
+            "earliest_required": "generate",
+        }
+        self.windows.plan = {
+            "stage_reruns": [
+                {
+                    "stage": stage["id"],
+                    "name_zh": stage["name_zh"],
+                    "eligible": False,
+                    "reason": "native",
+                    "reason_zh": "原生端",
+                    "recomputes": [stage["id"]],
+                    "retains": [],
+                    "prerequisites": dict(native_prerequisites),
+                    "target_changed": False,
+                }
+                for stage in portal_module.CONTRACT["stages"]
+            ]
+        }
+        rows = {row["stage"]: row for row in self.app._rerun_rows(RUN)}
+        # The Windows plan cannot describe the portable surface: its stale prerequisite
+        # summary must not survive on the three Linux-owned rows ...
+        for stage in ("generate", "verify", "publish"):
+            self.assertEqual(rows[stage]["prerequisites"], [], stage)
+            self.assertNotIn("absent", str(rows[stage]["prerequisites"]), stage)
+        self.assertTrue(rows["generate"]["eligible"])
+        self.assertTrue(rows["verify"]["eligible"])
+        self.assertFalse(rows["publish"]["eligible"])
+        self.assertEqual(rows["publish"]["reason"], "linux_checkpoint_missing")
+        # ... while every native-stage row keeps its own plan untouched.
+        self.assertEqual(rows["capture"]["prerequisites"], native_prerequisites)
+        self.assertEqual(rows["capture"]["reason"], "native")
 
     def test_unauthorized_linked_rerun_is_refused_before_side_effects(self) -> None:
         upload_root = self.tmp / "uploads"
