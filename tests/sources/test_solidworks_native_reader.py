@@ -198,6 +198,7 @@ class _Component:
         suppressed=False,
         transform=SW_IDENTITY,
         configuration="Default",
+        is_root=False,
     ):
         self.Name2 = name
         self._path = str(path)
@@ -208,6 +209,10 @@ class _Component:
         self._transform = tuple(transform)
         self.IsSuppressed = suppressed
         self.IsFixed = False
+        # The read-only root-signature probe on the frozen production assembly
+        # (2026-10-10) shows IsRoot as a native boolean: True on the root
+        # reference, False on part references.  Mocks default to the part case.
+        self.IsRoot = is_root
         self.ReferencedConfiguration = configuration
 
     def GetPathName(self):
@@ -2662,7 +2667,7 @@ class AssemblyFrameMateTests(unittest.TestCase):
             base = _write(root, "base.SLDPRT")
             component = _Component("base-1", base)
             assembly = _write(root, "robot.SLDASM")
-            root_reference = _Component("robot", assembly)
+            root_reference = _Component("robot", assembly, is_root=True)
             mate = _mate(
                 "ground_pin",
                 0,
@@ -2689,7 +2694,7 @@ class AssemblyFrameMateTests(unittest.TestCase):
             sub_path = _write(root, "sub.SLDASM")
             arm_doc = _Doc(arm_path)
             arm_component = _Component("arm-1", arm_path, doc=arm_doc)
-            sub_reference = _Component("sub", sub_path)
+            sub_reference = _Component("sub", sub_path, is_root=True)
             nested = _mate(
                 "nested_ground_pin",
                 0,
@@ -2788,6 +2793,139 @@ class AssemblyFrameMateTests(unittest.TestCase):
             with self.assertRaises(CadError) as caught:
                 _read(root, _App({assembly: doc}))
             self.assertEqual(caught.exception.code, "cad_mate_scope_ambiguous")
+
+    def test_unreadable_is_root_is_not_the_root(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            assembly = _write(root, "robot.SLDASM")
+            unreadable = _Component("robot", assembly, is_root=True)
+            del unreadable.IsRoot
+            mate = _mate(
+                "unreadable_seat",
+                0,
+                [
+                    _MateEntity(component, "Face1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0))),
+                    _MateEntity(unreadable, "Face2", _Plane((0.0, 0.0, -1.0), (0.0, 0.0, 0.0))),
+                ],
+            )
+            group = _Feature("MateGroup", "MateGroup", first_sub=mate)
+            doc = _Doc(assembly, first_feature=group, children=[component])
+
+            with self.assertRaises(CadError) as caught:
+                _read(root, _App({assembly: doc}))
+            self.assertEqual(caught.exception.code, "cad_mate_scope_ambiguous")
+            self.assertEqual(caught.exception.detail.get("component"), "robot")
+
+    def test_non_boolean_is_root_is_not_the_root(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            assembly = _write(root, "robot.SLDASM")
+            not_bool = _Component("robot", assembly, is_root=True)
+            not_bool.IsRoot = 1
+            mate = _mate(
+                "non_boolean_seat",
+                0,
+                [
+                    _MateEntity(component, "Face1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0))),
+                    _MateEntity(not_bool, "Face2", _Plane((0.0, 0.0, -1.0), (0.0, 0.0, 0.0))),
+                ],
+            )
+            group = _Feature("MateGroup", "MateGroup", first_sub=mate)
+            doc = _Doc(assembly, first_feature=group, children=[component])
+
+            with self.assertRaises(CadError) as caught:
+                _read(root, _App({assembly: doc}))
+            self.assertEqual(caught.exception.code, "cad_mate_scope_ambiguous")
+            self.assertEqual(caught.exception.detail.get("component"), "robot")
+
+    def test_bare_name_document_match_is_not_the_root(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            assembly = _write(root, "robot.SLDASM")
+            bare = _Component("robot", "robot.SLDASM", is_root=True)
+            mate = _mate(
+                "bare_name_seat",
+                0,
+                [
+                    _MateEntity(component, "Face1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0))),
+                    _MateEntity(bare, "Face2", _Plane((0.0, 0.0, -1.0), (0.0, 0.0, 0.0))),
+                ],
+            )
+            group = _Feature("MateGroup", "MateGroup", first_sub=mate)
+            doc = _Doc(assembly, first_feature=group, children=[component])
+
+            with self.assertRaises(CadError) as caught:
+                _read(root, _App({assembly: doc}))
+            self.assertEqual(caught.exception.code, "cad_mate_scope_ambiguous")
+            self.assertEqual(caught.exception.detail.get("component"), "robot")
+
+
+class ReferenceCycleTests(unittest.TestCase):
+    """A containment chain or mate that repeats a document is a reference cycle."""
+
+    def test_self_contained_occurrence_is_a_reference_cycle(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            assembly = _write(root, "robot.SLDASM")
+            inner = _Component("inner-1", base)
+            self_occurrence = _Component("robot-2", assembly, children=[inner])
+            doc = _Doc(assembly, children=[self_occurrence])
+
+            with self.assertRaises(CadError) as caught:
+                _read(root, _App({assembly: doc}))
+            self.assertEqual(caught.exception.code, "cad_reference_cycle")
+            self.assertEqual(caught.exception.detail.get("component"), "robot-2")
+
+    def test_ancestor_document_repeat_is_a_reference_cycle(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            assembly = _write(root, "robot.SLDASM")
+            sub_path = _write(root, "sub.SLDASM")
+            inner = _Component("inner-1", base)
+            ancestor_copy = _Component("robot-2", assembly, children=[inner])
+            sub_doc = _Doc(sub_path, children=[ancestor_copy])
+            sub_component = _Component("b-1", sub_path, children=[ancestor_copy], doc=sub_doc)
+            main_doc = _Doc(assembly, children=[sub_component])
+
+            with self.assertRaises(CadError) as caught:
+                _read(
+                    root,
+                    _App({assembly: main_doc, sub_path: sub_doc}),
+                    settings={"main_assembly": "robot.SLDASM"},
+                )
+            self.assertEqual(caught.exception.code, "cad_reference_cycle")
+            self.assertEqual(caught.exception.detail.get("component"), "b-1/robot-2")
+
+    def test_mate_to_a_self_instance_occurrence_is_a_reference_cycle(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            assembly = _write(root, "robot.SLDASM")
+            leaf_self = _Component("robot-2", assembly)
+            mate = _mate(
+                "self_seat",
+                0,
+                [
+                    _MateEntity(component, "Face1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0))),
+                    _MateEntity(leaf_self, "Face2", _Plane((0.0, 0.0, -1.0), (0.0, 0.0, 0.0))),
+                ],
+            )
+            group = _Feature("MateGroup", "MateGroup", first_sub=mate)
+            doc = _Doc(assembly, first_feature=group, children=[component, leaf_self])
+
+            with self.assertRaises(CadError) as caught:
+                _read(root, _App({assembly: doc}))
+            self.assertEqual(caught.exception.code, "cad_reference_cycle")
+            self.assertEqual(caught.exception.detail.get("component"), "robot-2")
 
 
 if __name__ == "__main__":
