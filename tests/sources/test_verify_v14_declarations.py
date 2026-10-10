@@ -246,6 +246,109 @@ class V14DeclarationDecoderTests(unittest.TestCase):
         )
         self.assertIsNone(v14.parse_v14_xml(nil_children)["children"])
 
+    def test_shared_references_resolve_and_preserve_pid_slots(self):
+        """z:Ref-only wrappers/lists resolve through the payload table; null slots stay."""
+
+        def axis_with_id(identifier: str, value_id: str) -> str:
+            return (
+                f'<Axis z:Id="{identifier}"><XYZAttribute><Attribute {NS}>'
+                "<AttributeType>xyz</AttributeType><IsRequired>true</IsRequired>"
+                f'<Value z:Id="{value_id}" i:type="a:ArrayOfdouble">'
+                "<a:double>0.0</a:double><a:double>1.0</a:double><a:double>0.0</a:double>"
+                "</Value></Attribute></XYZAttribute></Axis>"
+            )
+
+        first = (
+            f'<Link z:Id="i10">'
+            "<Children />"
+            + attr_string("NameAttribute", "name", "a-1")
+            + "<SWComponentPIDs z:Id=\"iP1\">QUJD</SWComponentPIDs>"
+            + "<SWComponentPIDs>REVG</SWComponentPIDs>"
+            + "<Joint>"
+            + attr_string("NameAttribute", "name", "j-a")
+            + attr_string("TypeAttribute", "type", "revolute")
+            + axis_with_id("iAx", "iV1")
+            + "</Joint>"
+            + "</Link>"
+        )
+        second = (
+            '<Link z:Id="i11">'
+            "<Children />"
+            + attr_string("NameAttribute", "name", "b-1")
+            + '<SWComponentPIDs z:Ref="iP1"/>'
+            + '<SWComponentPIDs i:nil="true"/>'
+            + "<Joint>"
+            + attr_string("NameAttribute", "name", "j-b")
+            + attr_string("TypeAttribute", "type", "revolute")
+            + '<Axis z:Ref="iAx"/>'
+            + "</Joint>"
+            + "</Link>"
+        )
+        third = (
+            '<Link z:Id="i12"><Children />'
+            + attr_string("NameAttribute", "name", "c-1")
+            + "<Joint>"
+            + attr_string("NameAttribute", "name", "j-c")
+            + attr_string("TypeAttribute", "type", "revolute")
+            + '<Axis><XYZAttribute><Attribute '
+            + NS
+            + "><AttributeType>xyz</AttributeType><IsRequired>true</IsRequired>"
+            + '<Value z:Ref="iV1"/></Attribute></XYZAttribute></Axis>'
+            + "</Joint></Link>"
+        )
+        doc = (
+            f'<Link {NS} {XI} {ARR} {XS} {Z} z:Id="i1">'
+            f"<Children>{first}{second}{third}</Children>"
+            + attr_string("NameAttribute", "name", "root-1")
+            + "</Link>"
+        )
+        root = v14.parse_v14_xml(doc)
+        first_link, second_link, third_link = root["children"]
+        self.assertEqual(first_link["component_pids"], ["QUJD", "REVG"])
+        # Positional preservation: the shared value resolves, the explicit null stays a slot.
+        self.assertEqual(second_link["component_pids"], ["QUJD", None])
+        self.assertEqual(first_link["joint"]["axis"], [0.0, 1.0, 0.0])
+        self.assertEqual(second_link["joint"]["axis"], [0.0, 1.0, 0.0])  # holder ref resolved
+        # A Value-level reference resolves too: the third joint points at the first's array.
+        self.assertEqual(third_link["joint"]["axis"], [0.0, 1.0, 0.0])
+
+    def test_reference_failures_are_explicit(self):
+        def code(xml_text: str) -> str:
+            with self.assertRaises(v14.DeclarationError) as caught:
+                v14.parse_v14_xml(xml_text)
+            return caught.exception.code
+
+        unresolved = (
+            f'<Link {NS} {XI} {Z}>'
+            + '<NameAttribute><Attribute '
+            + NS
+            + '><AttributeType>name</AttributeType><IsRequired>true</IsRequired>'
+            + '<Value z:Ref="i404"/></Attribute></NameAttribute>'
+            + "</Link>"
+        )
+        self.assertEqual(code(unresolved), "v14.unresolved_reference")
+        both = (
+            f'<Link {NS} {XI} {Z} z:Id="i1">'
+            + '<NameAttribute z:Id="i2" z:Ref="i1"/>'
+            + "</Link>"
+        )
+        self.assertEqual(code(both), "v14.malformed_reference")
+        cycle = (
+            f'<Link {NS} {XI} {Z} z:Id="i1"><Children><Link z:Ref="i1"/></Children>'
+            + attr_string("NameAttribute", "name", "loop-1")
+            + "</Link>"
+        )
+        self.assertEqual(code(cycle), "v14.reference_cycle")
+        duplicate = (
+            f'<Link {NS} {XI} {Z} z:Id="i1"><Children>'
+            + '<Link z:Id="i9"><Children /></Link>'
+            + '<Link z:Id="i9"><Children /></Link>'
+            + "</Children>"
+            + attr_string("NameAttribute", "name", "dup-1")
+            + "</Link>"
+        )
+        self.assertEqual(code(duplicate), "v14.reference_duplicate")
+
 
 if __name__ == "__main__":
     unittest.main()

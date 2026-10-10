@@ -10,9 +10,20 @@ Value}`` and wrapped values carrying ``i:type`` annotations.
 
 This module extracts only the declared identity, membership, topology and kinematics
 facts the verifier needs.  Missing-vs-zero is preserved exactly as serialized: an absent
-element or ``i:nil`` is ``None``, a present zero is ``0``.  Nothing is defaulted or
-invented (no metadata, limits, drives, physics), references (``z:Ref``) are never
-followed, and no type is deserialized.
+element is ``None``, ``i:nil`` is an explicit null (a null list item is preserved as
+``None`` in place), and a present zero is ``0``.  Nothing is defaulted or invented (no
+metadata, limits, drives, physics) and no type is deserialized.
+
+DataContract references: the serializer emits ``z:Id`` on the first occurrence of a
+shared object and ``z:Ref`` on later ones.  Reference-only elements are resolved through
+a bounded, cycle-checked in-payload table; a reference that cannot be resolved, forms a
+cycle, carries both ``z:Id`` and ``z:Ref``, or exceeds the hop bound is an explicit
+refusal (``v14.unresolved_reference`` / ``v14.reference_cycle`` /
+``v14.malformed_reference`` / ``v14.reference_too_deep``) -- a reference-only
+declaration is never silently treated as an absent field or a default value.
+
+Platform: Linux-safe -- the Python standard library only, no COM, no pywin32, and no new
+Windows dependencies; the payload is plain text captured on the Windows side.
 
 XML safety: the payload is size-capped, DOCTYPE/entity declarations are refused before
 parsing, and the stdlib parser is used (no external entity resolution).
@@ -31,8 +42,11 @@ SUPPORTED_EXPORTER_VERSIONS = (1.4,)
 MAX_PAYLOAD_BYTES = 16 * 1024 * 1024
 MAX_DEPTH = 64
 MAX_ELEMENTS = 200_000
+MAX_REF_HOPS = 16
 
 _XSI_NIL = "{http://www.w3.org/2001/XMLSchema-instance}nil"
+_DC_ID = "{http://schemas.microsoft.com/2003/10/Serialization/}Id"
+_DC_REF = "{http://schemas.microsoft.com/2003/10/Serialization/}Ref"
 
 
 class DeclarationError(Exception):
@@ -52,15 +66,60 @@ def _localname(tag: object) -> str:
     return str(tag).rsplit("}", 1)[-1]
 
 
-def _first(element: ET.Element, name: str) -> ET.Element | None:
+class _Resolver:
+    """The payload's own bounded z:Id -> element table (no external resolution)."""
+
+    def __init__(self) -> None:
+        self.table: dict[str, ET.Element] = {}
+
+    def register(self, element: ET.Element) -> None:
+        identifier = element.get(_DC_ID)
+        if identifier is None:
+            return
+        if identifier in self.table:
+            _refuse("v14.reference_duplicate", "a z:Id appears twice in the payload", {"id": identifier})
+        self.table[identifier] = element
+
+    def deref(self, element: ET.Element | None) -> ET.Element | None:
+        if element is None:
+            return None
+        seen: set[str] = set()
+        hops = 0
+        while True:
+            reference = element.get(_DC_REF)
+            if reference is None:
+                return element
+            if element.get(_DC_ID) is not None:
+                _refuse(
+                    "v14.malformed_reference",
+                    "an element carries both z:Id and z:Ref",
+                    {"id": element.get(_DC_ID), "ref": reference},
+                )
+            if reference in seen:
+                _refuse("v14.reference_cycle", "the payload's references form a cycle", {"id": reference})
+            seen.add(reference)
+            hops += 1
+            if hops > MAX_REF_HOPS:
+                _refuse("v14.reference_too_deep", "the payload's reference chain is too deep")
+            target = self.table.get(reference)
+            if target is None:
+                _refuse("v14.unresolved_reference", "a z:Ref has no matching z:Id in the payload", {"ref": reference})
+            element = target
+
+
+def _first(element: ET.Element, name: str, resolver: _Resolver) -> ET.Element | None:
     for child in element:
         if _localname(child.tag) == name:
-            return child
+            return resolver.deref(child)
     return None
 
 
-def _all(element: ET.Element, name: str) -> list[ET.Element]:
-    return [child for child in element if _localname(child.tag) == name]
+def _all(element: ET.Element, name: str, resolver: _Resolver) -> list[ET.Element | None]:
+    out: list[ET.Element | None] = []
+    for child in element:
+        if _localname(child.tag) == name:
+            out.append(resolver.deref(child))
+    return out
 
 
 def _is_nil(element: ET.Element) -> bool:
@@ -88,27 +147,26 @@ def _number_value(holder: ET.Element | None, *, label: str) -> float | None:
     return value
 
 
-def _attribute_value(owner: ET.Element, field: str) -> ET.Element | None:
+def _attribute_value(owner: ET.Element, field: str, resolver: _Resolver) -> ET.Element | None:
     """The ``Value`` element of a wrapped ``URDFAttribute`` field, or None when absent."""
 
-    holder = _first(owner, field)
+    holder = _first(owner, field, resolver)
     if holder is None or _is_nil(holder):
         return None
-    attribute = _first(holder, "Attribute")
+    attribute = _first(holder, "Attribute", resolver)
     if attribute is None or _is_nil(attribute):
         return None
-    value = _first(attribute, "Value")
-    return value
+    return _first(attribute, "Value", resolver)
 
 
-def _attribute_string(owner: ET.Element, field: str) -> str | None:
-    return _string_value(_attribute_value(owner, field))
+def _attribute_string(owner: ET.Element, field: str, resolver: _Resolver) -> str | None:
+    return _string_value(_attribute_value(owner, field, resolver))
 
 
-def _attribute_numbers(owner: ET.Element, field: str) -> float | list[float] | None:
+def _attribute_numbers(owner: ET.Element, field: str, resolver: _Resolver) -> float | list[float] | None:
     """A wrapped numeric value: arrays carry element children, scalars carry text."""
 
-    value = _attribute_value(owner, field)
+    value = _attribute_value(owner, field, resolver)
     if value is None or _is_nil(value):
         return None
     items = list(value)
@@ -120,12 +178,12 @@ def _attribute_numbers(owner: ET.Element, field: str) -> float | list[float] | N
     return _number_value(value, label=field)
 
 
-def _direct_string(owner: ET.Element, field: str) -> str | None:
-    return _string_value(_first(owner, field))
+def _direct_string(owner: ET.Element, field: str, resolver: _Resolver) -> str | None:
+    return _string_value(_first(owner, field, resolver))
 
 
-def _direct_bool(owner: ET.Element, field: str) -> bool | None:
-    holder = _first(owner, field)
+def _direct_bool(owner: ET.Element, field: str, resolver: _Resolver) -> bool | None:
+    holder = _first(owner, field, resolver)
     if holder is None or _is_nil(holder):
         return None
     text = (holder.text or "").strip().lower()
@@ -137,77 +195,86 @@ def _direct_bool(owner: ET.Element, field: str) -> bool | None:
     return None
 
 
-def _direct_base64(owner: ET.Element, field: str) -> str | None:
-    return _string_value(_first(owner, field))
+def _direct_base64(owner: ET.Element, field: str, resolver: _Resolver) -> str | None:
+    return _string_value(_first(owner, field, resolver))
 
 
-def _direct_base64_list(owner: ET.Element, field: str) -> list[str] | None:
-    holders = _all(owner, field)
+def _direct_base64_list(owner: ET.Element, field: str, resolver: _Resolver) -> list[str | None] | None:
+    """Individual base64 PID entries are preserved positionally; a null entry stays None."""
+
+    holders = _all(owner, field, resolver)
     if not holders:
         return None
-    values = []
-    for holder in holders:
-        text = _string_value(holder)
-        if text is not None:
-            values.append(text)
-    return values
+    return [_string_value(holder) for holder in holders]
 
 
-def _limit_record(element: ET.Element) -> dict | None:
+def _limit_record(element: ET.Element | None, resolver: _Resolver) -> dict | None:
     if element is None or _is_nil(element):
         return None
     return {
-        "lower": _attribute_numbers(element, "LowerAttribute"),
-        "upper": _attribute_numbers(element, "UpperAttribute"),
-        "effort": _attribute_numbers(element, "EffortAttribute"),
-        "velocity": _attribute_numbers(element, "VelocityAttribute"),
+        "lower": _attribute_numbers(element, "LowerAttribute", resolver),
+        "upper": _attribute_numbers(element, "UpperAttribute", resolver),
+        "effort": _attribute_numbers(element, "EffortAttribute", resolver),
+        "velocity": _attribute_numbers(element, "VelocityAttribute", resolver),
     }
 
 
-def _origin_record(element: ET.Element) -> dict | None:
+def _origin_record(element: ET.Element | None, resolver: _Resolver) -> dict | None:
     if element is None or _is_nil(element):
         return None
     return {
-        "xyz": _attribute_numbers(element, "XYZAttribute"),
-        "rpy": _attribute_numbers(element, "RPYAttribute"),
+        "xyz": _attribute_numbers(element, "XYZAttribute", resolver),
+        "rpy": _attribute_numbers(element, "RPYAttribute", resolver),
     }
 
 
-def _joint_record(element: ET.Element) -> dict | None:
+def _joint_record(element: ET.Element | None, resolver: _Resolver) -> dict | None:
     if element is None or _is_nil(element):
         return None
-    parent = _first(element, "Parent")
-    child = _first(element, "Child")
-    axis = _first(element, "Axis")
+    parent = _first(element, "Parent", resolver)
+    child = _first(element, "Child", resolver)
+    axis = _first(element, "Axis", resolver)
     return {
-        "name": _attribute_string(element, "NameAttribute"),
-        "type": _attribute_string(element, "TypeAttribute"),
-        "origin": _origin_record(_first(element, "Origin")),
-        "parent_link": _attribute_string(parent, "NameAttribute") if parent is not None else None,
-        "child_link": _attribute_string(child, "NameAttribute") if child is not None else None,
-        "axis": _attribute_numbers(axis, "XYZAttribute") if axis is not None else None,
-        "limit": _limit_record(_first(element, "Limit")),
-        "coordinate_system_name": _direct_string(element, "CoordinateSystemName"),
-        "axis_name": _direct_string(element, "AxisName"),
+        "name": _attribute_string(element, "NameAttribute", resolver),
+        "type": _attribute_string(element, "TypeAttribute", resolver),
+        "origin": _origin_record(_first(element, "Origin", resolver), resolver),
+        "parent_link": _attribute_string(parent, "NameAttribute", resolver) if parent is not None else None,
+        "child_link": _attribute_string(child, "NameAttribute", resolver) if child is not None else None,
+        "axis": _attribute_numbers(axis, "XYZAttribute", resolver) if axis is not None else None,
+        "limit": _limit_record(_first(element, "Limit", resolver), resolver),
+        "coordinate_system_name": _direct_string(element, "CoordinateSystemName", resolver),
+        "axis_name": _direct_string(element, "AxisName", resolver),
     }
 
 
-def _link_record(element: ET.Element) -> dict:
-    children_holder = _first(element, "Children")
+def _link_record(
+    element: ET.Element, resolver: _Resolver, ancestors: frozenset[str] = frozenset()
+) -> dict:
+    identifier = element.get(_DC_ID)
+    if identifier is not None:
+        if identifier in ancestors:
+            _refuse("v14.reference_cycle", "a link reference cycles into its own subtree", {"id": identifier})
+        ancestors = ancestors | {identifier}
+    children_holder = _first(element, "Children", resolver)
     if children_holder is None or _is_nil(children_holder):
         children = None
     else:
-        children = [_link_record(item) for item in _all(children_holder, "Link")]
-    joint_holder = _first(element, "Joint")
+        children = []
+        for item in _all(children_holder, "Link", resolver):
+            if item is None:
+                children.append(None)
+                continue
+            children.append(_link_record(item, resolver, ancestors))
+    joint_holder = _first(element, "Joint", resolver)
     return {
-        "name": _attribute_string(element, "NameAttribute"),
+        "name": _attribute_string(element, "NameAttribute", resolver),
         "children": children,
-        "joint": _joint_record(joint_holder) if joint_holder is not None else None,
-        "main_component_pid": _direct_base64(element, "SWMainComponentPID"),
-        "component_pids": _direct_base64_list(element, "SWComponentPIDs"),
-        "is_fixed_frame": _direct_bool(element, "isFixedFrame"),
-        "is_incomplete": _direct_bool(element, "isIncomplete"),
-        "stl_quality_fine": _direct_bool(element, "STLQualityFine"),
+        "joint": _joint_record(joint_holder, resolver) if joint_holder is not None else None,
+        "main_component_pid": _direct_base64(element, "SWMainComponentPID", resolver),
+        "component_pids": _direct_base64_list(element, "SWComponentPIDs", resolver),
+        "is_fixed_frame": _direct_bool(element, "isFixedFrame", resolver),
+        "is_incomplete": _direct_bool(element, "isIncomplete", resolver),
+        "stl_quality_fine": _direct_bool(element, "STLQualityFine", resolver),
     }
 
 
@@ -225,7 +292,7 @@ def _guard_payload(xml_text: str) -> bytes:
     return data
 
 
-def _guard_tree(root: ET.Element) -> None:
+def _guard_tree(root: ET.Element, resolver: _Resolver) -> None:
     count = 0
     stack = [(root, 1)]
     while stack:
@@ -235,6 +302,7 @@ def _guard_tree(root: ET.Element) -> None:
             _refuse("v14.payload_too_large", "the declaration payload has too many elements")
         if depth > MAX_DEPTH:
             _refuse("v14.payload_too_deep", "the declaration payload is nested too deeply")
+        resolver.register(element)
         for child in element:
             stack.append((child, depth + 1))
 
@@ -249,8 +317,12 @@ def parse_v14_xml(xml_text: str) -> dict:
         _refuse("v14.malformed_xml", f"the declaration payload is not well-formed XML: {error}")
     if _localname(root.tag) != "Link":
         _refuse("v14.root_name", "the declaration root is not a Link", {"root": _localname(root.tag)})
-    _guard_tree(root)
-    return _link_record(root)
+    resolver = _Resolver()
+    _guard_tree(root, resolver)
+    root = resolver.deref(root)
+    if root is None:
+        _refuse("v14.unresolved_reference", "the declaration root is an unresolvable reference")
+    return _link_record(root, resolver)
 
 
 def validate_boundary(block: dict) -> dict:
