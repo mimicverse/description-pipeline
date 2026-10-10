@@ -62,17 +62,17 @@ _DISCOVERY_CODE_LABELS_ZH = {
     "discovery.revision_missing": "缺少结构修订记录",
     "discovery.owner_missing": "缺少修订责任人",
     "discovery.summary_missing": "缺少变更说明",
-    "discovery.control_missing": "缺少控制参考系定义",
+    "discovery.control_missing": "缺少交付版本控制引用（system/reference）",
     "discovery.configuration_missing": "缺少交付配置声明",
     "discovery.robot_name_invalid": "机器人名称不是 snake_case",
     "discovery.design_budget_missing": "缺少设计预算记录",
-    "discovery.link_name_missing": "刚体缺少 CS_<link> 坐标系",
+    "discovery.link_name_missing": "未识别刚体坐标系",
     "discovery.joint_unsupported_pattern": "装配约束未形成单一关节运动",
     "discovery.joint_axis_sign_missing": "缺少 dp.joint.axis_sign（±1）",
     "discovery.joint_axis_selector_missing": "缺少可读取的关节轴选择器",
     "discovery.mate_entities_unsupported": "配合实体缺少可重建方向",
     "discovery.frame_attachment": "坐标系挂接配合无法重建",
-    "discovery.root_missing": "缺少 owning CS_base_link 的根刚体",
+    "discovery.root_missing": "未确定根刚体坐标系归属",
     "discovery.inputs": "解析输入（原生文件夹可用）",
     "discovery.main_assembly_ambiguous": "无法唯一确定主装配",
 }
@@ -473,7 +473,7 @@ def _failure(job: dict, stage: dict) -> dict:
             "多个装配声明交付身份时须明确唯一入口，流水线不会按文件名或大小猜测。"
         )
         kind = "definition"
-    elif blocking_findings:
+    elif stage.get("id") == "discover" and "discovery.definition" in raw_error and blocking_findings:
         counts: dict[str, int] = {}
         samples: dict[str, list[dict]] = {}
         for item in blocking_findings:

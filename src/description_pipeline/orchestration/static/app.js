@@ -1578,13 +1578,17 @@ function renderRun(run) {
     (a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]),
   );
   orderedGroups.forEach(([code, items], index) => {
+    const outer = document.createElement("li");
     const section = document.createElement("details");
     if (index === 0) section.open = true;
     const header = document.createElement("summary");
     header.textContent = `${codeLabels.get(code) || code}（${items.length} 项）`;
-    section.append(header);
-    for (const finding of items) section.append(renderFinding(finding));
-    findings.append(section);
+    const nested = document.createElement("ul");
+    nested.className = "finding-group";
+    for (const finding of items) nested.append(renderFinding(finding));
+    section.append(header, nested);
+    outer.append(section);
+    findings.append(outer);
   });
 
   const pr = $("pr");

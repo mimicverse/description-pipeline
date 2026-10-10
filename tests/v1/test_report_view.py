@@ -255,7 +255,7 @@ class ReportViewTests(unittest.TestCase):
         self.assertEqual(failure["discovery_sha256"], "c" * 64)
         self.assertEqual(
             failure["finding_counts"][0],
-            {"code": "discovery.link_name_missing", "label_zh": "刚体缺少 CS_<link> 坐标系", "count": 4},
+            {"code": "discovery.link_name_missing", "label_zh": "未识别刚体坐标系", "count": 4},
         )
         labels = {group["code"]: group["label_zh"] for group in failure["finding_counts"]}
         self.assertEqual(labels["discovery.unknown_code"], "discovery.unknown_code")
@@ -263,6 +263,26 @@ class ReportViewTests(unittest.TestCase):
         self.assertIn("共 6 项", failure["meaning_zh"])
         for word in ("损坏", "输入有误", "错误"):
             self.assertNotIn(word, failure["meaning_zh"])
+
+    def test_later_runtime_failure_is_not_overridden_by_stale_discovery_findings(self) -> None:
+        job = passed_job()
+        job["status"] = "failed"
+        job["events"] = protocol_events(subject=SHA, failed_stage="capture")
+        job["error"] = "CadError: C:\\packages\\imports\\x\\robot.SLDASM"
+        job["detail"] = {"errors": 2, "warnings": 0}
+        job["discovery"] = {
+            "passed": False,
+            "discovery_sha256": "c" * 64,
+            "findings": [
+                {"code": "discovery.link_name_missing", "object": "body:a", "message": "no CS", "blocking": True}
+            ],
+        }
+        failure = build_report(job)["failure"]
+        self.assertEqual(failure["stage"], "capture")
+        self.assertEqual(failure["title_zh"], "原生 CAD 打开失败")
+        self.assertEqual(failure["kind"], "runtime")
+        self.assertNotIn("finding_counts", failure)
+        self.assertNotIn("finding_total", failure)
 
     def test_discovery_failure_without_findings_keeps_the_generic_fallback(self) -> None:
         job = passed_job()
