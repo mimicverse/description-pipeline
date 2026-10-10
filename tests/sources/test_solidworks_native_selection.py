@@ -408,9 +408,11 @@ class SealedOpenGuardTests(unittest.TestCase):
     def test_guard_rejection_never_reaches_the_cad_runtime(self) -> None:
         backend = SolidWorksBackend()
         backend.seal_documents(["/stage/main.SLDASM"])
-        with mock.patch("description_pipeline.sources.solidworks.native._win32") as win32:
-            with self.assertRaises(CadError):
-                backend.open_document("/stage/other.SLDASM")
+        with (
+            mock.patch("description_pipeline.sources.solidworks.native._win32") as win32,
+            self.assertRaises(CadError),
+        ):
+            backend.open_document("/stage/other.SLDASM")
         win32.assert_not_called()
 
 

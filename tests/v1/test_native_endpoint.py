@@ -8,7 +8,7 @@ import unittest
 from description_pipeline.io import PipelineError
 from description_pipeline.orchestration.windows import RequestError
 from description_pipeline.sources.solidworks.errors import CadError
-from .endpoint_support import MAIN, PART, EndpointFixture, source_bytes
+from .endpoint_support import MAIN, PART, EndpointFixture
 
 
 class NativeEndpointTests(EndpointFixture, unittest.TestCase):
@@ -20,9 +20,8 @@ class NativeEndpointTests(EndpointFixture, unittest.TestCase):
             {"main_assembly": PART},
             {"upload_files": {MAIN: "0" * 64}},
         ):
-            with self.subTest(mutation=sorted(mutation)):
-                with self.assertRaises(PipelineError):
-                    jobs.create({**self.request(), **mutation})
+            with self.subTest(mutation=sorted(mutation)), self.assertRaises(PipelineError):
+                jobs.create({**self.request(), **mutation})
         created = jobs.create(self.request())[0]
         self.assertEqual("awaiting_files", created["selection"]["state"])
         self.assertEqual({MAIN: self.upload_files[MAIN]}, created["selection"]["requested_files"])
@@ -51,7 +50,7 @@ class NativeEndpointTests(EndpointFixture, unittest.TestCase):
                     return record
 
                 jobs = self.jobs(
-                    lambda *args, **kwargs: calls.append(args),
+                    lambda *args, calls=calls, **kwargs: calls.append(args),
                     config=config,
                     native_reader=native_reader,
                 )
