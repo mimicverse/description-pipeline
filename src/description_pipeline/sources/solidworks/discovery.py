@@ -2676,6 +2676,14 @@ def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], f
                         "discovery.joint_limits_unexpected", obj, "a continuous joint declares position limits", limits
                     )
                 )
+        declared_axis = None
+        raw_axis = declared.get("axis")
+        if (
+            isinstance(raw_axis, (list, tuple))
+            and len(raw_axis) == 3
+            and all(type(value) in (int, float) and math.isfinite(value) for value in raw_axis)
+        ):
+            declared_axis = [float(value) for value in raw_axis]
         joints.append(
             {
                 "mate": f"exporter:{declared['name']}",
@@ -2687,6 +2695,7 @@ def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], f
                 "child": link["name"],
                 "components": [link["parent"], link["name"]],
                 "axis": axis,
+                "declared_axis": declared_axis,
                 "axis_reference": selector,
                 "limits": limits,
                 "limit_evidence": None,
@@ -4054,6 +4063,7 @@ def _robot_document(
             if body["components"]
         ],
         "joints": [],
+        "frames": [],
         "material_source": "cad",
     }
     if frames:
@@ -4085,6 +4095,20 @@ def _robot_document(
         axis = _axis_in_child(joint, datum) if datum is not None else None
         if axis is None:
             raise PipelineError(f"joint {joint['name']!r} has no usable child frame")
+        if joint.get("axis", {}).get("source") == "exporter":
+            # The authored declaration is the source claim once the native
+            # geometry and its sign were proved consistent above; emitting the
+            # reprojected native line here would add float noise that the
+            # independent declaration check rejects.  The native line stays
+            # independently verified from the reference-axis evidence.
+            declared_axis = joint.get("declared_axis")
+            if (
+                not isinstance(declared_axis, (list, tuple))
+                or len(declared_axis) != 3
+                or not all(type(value) in (int, float) and math.isfinite(value) for value in declared_axis)
+            ):
+                raise PipelineError(f"joint {joint['name']!r} has no exact authored axis")
+            axis = [float(value) for value in declared_axis]
         entry: dict[str, Any] = {
             "id": joint["name"],
             "name": joint["name"],

@@ -697,9 +697,26 @@ class ExporterDiscoveryTests(unittest.TestCase):
         identity = {**raw["identity"], "delivery_configuration": raw["saved_configuration"]}
         document = _robot_document(identity, bodies, joints, raw, None, [], None, [], "wire-run", "a" * 64, "b" * 64)
         self.assertEqual(document["source"]["joints"][0]["limits"], limits)
+        self.assertEqual(document["source"]["joints"][0]["axis"], [0.0, 0.0, 1.0])
+        # One clear schema shape: a legitimate no-interface-frame delivery binds as [].
+        self.assertEqual(document["source"]["frames"], [])
         self.assertEqual(document["source"]["joints"][0]["axis_reference"]["kind"], "reference_axis")
         self.assertEqual(document["source"]["material_source"], "cad")
         self.assertNotIn("old/manual.stl", str(document))
+
+    def test_authored_axis_is_emitted_exactly_instead_of_the_reprojected_native_line(self):
+        raw = raw_record()
+        raw["reference_axes"][0]["axis_direction"] = [1e-9, 0.0, 1.0]
+        raw["reference_axes"][0]["raw_endpoints_m"] = [0, 0, 0, 1e-9, 0, 1]
+        bodies, joints, findings = self.derive(raw)
+        self.assertFalse([item for item in findings if item["blocking"]])
+        self.assertEqual(joints[0]["declared_axis"], [0.0, 0.0, 1.0])
+        identity = {**raw["identity"], "delivery_configuration": raw["saved_configuration"]}
+        document = _robot_document(identity, bodies, joints, raw, None, [], None, [], "wire-run", "a" * 64, "b" * 64)
+        # The independent declaration check compares exactly, so the source
+        # claim is the authored vector, not the reprojected native line.
+        self.assertEqual(document["source"]["joints"][0]["axis"], [0.0, 0.0, 1.0])
+        self.assertEqual(document["source"]["joints"][0]["axis_reference"], joints[0]["axis_reference"])
         self.assertEqual(
             document["source"]["joints"][0]["limit_evidence"],
             {
