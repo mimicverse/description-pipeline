@@ -1107,6 +1107,10 @@ class Jobs:
                             "reason_zh": "该阶段已移至 Linux 执行；请通过交付流程重新运行",
                         },
                     )
+                # A replayed linked run must name a retained parent before any deeper
+                # validator runs: a removed parent record must not surface as a bare
+                # KeyError from the checkpoint lookup below.
+                _require(spec is None or spec["parent_run"] in self.jobs, "The parent native run is unknown")
                 with self.mutex:
                     _require(not self._stopping, "Endpoint is closing")
                     job["started_at"] = datetime.now(UTC).isoformat()
@@ -1119,6 +1123,12 @@ class Jobs:
                 from ..steps import freeze_inputs
 
                 package = self._source_dir(job)
+                # The retained selected tree must still exist; without it the inventory
+                # validators would report an empty selection instead of the real cause.
+                _require(
+                    package.is_dir(),
+                    "The retained selected source is no longer available; start a new run",
+                )
                 _require(
                     job.get("main_assembly") == job["request"]["main_assembly"]
                     and job["selection"]["manifest"]["main_assembly"] == job["request"]["main_assembly"],
