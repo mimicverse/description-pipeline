@@ -288,6 +288,7 @@ class Jobs:
                         status="failed",
                         error="Endpoint restarted during native execution; inspect diagnostics and use a new run_id",
                     )
+                    self._clear_activity(job)
                     self._save(job)
                 elif job["status"] == "queued":
                     self.queue.put(identifier)
