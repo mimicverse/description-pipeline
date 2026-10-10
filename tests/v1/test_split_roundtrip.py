@@ -8,6 +8,7 @@ portable role).  The control fixture is explicitly NOT native CAD qualification.
 from __future__ import annotations
 
 import json
+import shutil
 import tempfile
 import unittest
 from datetime import UTC, datetime
@@ -15,7 +16,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from description_pipeline import solidworks, steps
-from description_pipeline.io import digest
+from description_pipeline.io import digest, write_json
 from description_pipeline.orchestration import stage_transfer as transfer
 from description_pipeline.orchestration import linux_runner
 from description_pipeline.orchestration.linux_store import LinuxStore
@@ -77,8 +78,8 @@ class SplitRoundtripTests(unittest.TestCase):
         self.handoff = digest(package_inventory(self.handoff_dir))
         self.run_id = "3f2c1f7a-9d4e-4d0a-9f11-2b6c5a7e8d90"
 
-    def test_real_freeze_seals_and_the_real_tail_verifies(self) -> None:
-        events: list[dict] = []
+    def _prepare(self, events: list[dict]) -> tuple[Path, dict, dict]:
+        """Freeze and discover the control handoff; the shared setup for capture and resume."""
 
         def record(event: dict) -> None:
             # The endpoint stamps events as it records them; mirror that contract here.
@@ -106,6 +107,10 @@ class SplitRoundtripTests(unittest.TestCase):
         self.assertTrue(prepared.hardware_id)
         self.assertEqual(target["repository_slug"], "mimicverse/description")
         self.assertTrue(any(event.get("stage") == "discover" for event in events))
+        return prepared_package, target, prepared_files
+
+    def _capture(self, events: list[dict], prepared_package: Path, prepared_files: dict) -> dict:
+        """Run the real capture phase on the native role and return its stage receipt."""
 
         backend = AxisFixtureBackend(
             prepared_package / "cad/robot.SLDASM",
@@ -153,6 +158,12 @@ class SplitRoundtripTests(unittest.TestCase):
         native_stages = json.loads((self.capture_output / "reports/native-stages.json").read_text(encoding="utf-8"))
         self.assertEqual(native_stages["execution_scope"], ["freeze", "discover", "capture"])
         self.assertTrue(native_stages["events"])
+        return native_stages
+
+    def test_real_freeze_seals_and_the_real_tail_verifies(self) -> None:
+        events: list[dict] = []
+        prepared_package, _target, prepared_files = self._prepare(events)
+        native_stages = self._capture(events, prepared_package, prepared_files)
 
         # The real Linux boundary: store admission seeds the raw native events, then the
         # portable runner drives generate and verify as their own staged checkpoints with
@@ -160,7 +171,7 @@ class SplitRoundtripTests(unittest.TestCase):
         store = LinuxStore(self.root / "linux-store")
         admitted = store.import_capture(
             self.run_id,
-            archive,
+            self.capture_output / transfer.CAPTURE_ARCHIVE,
             expected_handoff_sha256=self.handoff,
             expected_main_assembly="cad/robot.SLDASM",
             expected_native_tool=native_tool(),
@@ -223,6 +234,76 @@ class SplitRoundtripTests(unittest.TestCase):
         self.assertTrue((diagnostic / "reports/native-tool.json").is_file())
         carried = json.loads((diagnostic / "reports/native-stages.json").read_text(encoding="utf-8"))
         self.assertEqual(carried["events"], native_stages["events"])
+
+    def _windows_resume_seed(
+        self, events: list[dict], prepared_package: Path, prepared_files: dict
+    ) -> tuple[Path, Path]:
+        """A generate seed whose frozen receipt carries the producing host's absolute root.
+
+        The seed is a real capture delivery; everything matches the produced report byte for
+        byte except ``resolved_package_root``, which keeps the absolute Windows path a
+        genuine native capture records, while the archived Linux inputs stay identical.
+        """
+
+        self._capture(events, prepared_package, prepared_files)
+        seed = self.root / "resume-seed"
+        shutil.copytree(self.capture_output, seed)
+        sealed_receipt = seed / "reports/input.json"
+        report = json.loads(sealed_receipt.read_text(encoding="utf-8"))
+        report["input_receipt"]["resolved_package_root"] = (
+            rf"C:\description-v1-review\acc-24801e2\state\prepared\{self.run_id}"
+        )
+        write_json(sealed_receipt, report)
+        return seed, sealed_receipt
+
+    def test_windows_rooted_receipt_resumes_from_the_local_archived_input(self) -> None:
+        events: list[dict] = []
+        prepared_package, _target, prepared_files = self._prepare(events)
+        seed, sealed_receipt = self._windows_resume_seed(events, prepared_package, prepared_files)
+        frozen = sealed_receipt.read_bytes()
+
+        output = self.root / "portable-generate"
+        result = solidworks.run(
+            seed,
+            output,
+            resume_from="generate",
+            stop_after="generate",
+            seed_dir=seed,
+            run_id=self.run_id,
+            handoff_sha256=self.handoff,
+            prior_events=events,
+        )
+        self.assertEqual(result.get("state"), "generated", result.get("error"))
+        self.assertTrue(result.get("subject_sha256"))
+        # The frozen native report is evidence and stays byte-for-byte unchanged ...
+        self.assertEqual(sealed_receipt.read_bytes(), frozen)
+        # ... and the generated checkpoint carries that archived report, not a local replay:
+        # accidentally handing generate_model the replayed report would fail here.
+        self.assertEqual((output / "reports/input.json").read_bytes(), frozen)
+
+    def test_altered_captured_input_still_refuses_the_resume(self) -> None:
+        events: list[dict] = []
+        prepared_package, _target, prepared_files = self._prepare(events)
+        seed, _sealed_receipt = self._windows_resume_seed(events, prepared_package, prepared_files)
+        altered = seed / "input/cad/base.SLDPRT"
+        altered.write_bytes(altered.read_bytes() + b"tamper")
+
+        output = self.root / "portable-generate-tampered"
+        result = solidworks.run(
+            seed,
+            output,
+            resume_from="generate",
+            stop_after="generate",
+            seed_dir=seed,
+            run_id=self.run_id,
+            handoff_sha256=self.handoff,
+            prior_events=events,
+        )
+        # A refused continuation returns the failed receipt and installs nothing.
+        self.assertEqual(result.get("state"), "failed")
+        self.assertIs(result.get("passed"), False)
+        self.assertIn("Retained native inputs no longer pass static validation", str(result.get("error")))
+        self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

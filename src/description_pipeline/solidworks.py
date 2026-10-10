@@ -354,7 +354,12 @@ def run(
                 receipt_rows = (input_report.get("input_receipt") or {}).get("inventory")
                 if receipt_rows and (replayed.get("input_receipt") or {}).get("inventory") != receipt_rows:
                     raise PipelineError("Retained input inspection receipt does not match its archived native inputs")
-                definition = resolve_package(input_report)
+                # Resolve from the fresh inspection of the archived input: its receipt root is
+                # this host's local package directory, while the frozen report records the
+                # producing host's absolute root (a Windows path on a portable continuation).
+                # The equality checks above already bound the replay to the frozen report and
+                # its inventory rows, so no inventory check is skipped.
+                definition = resolve_package(replayed)
                 receipt["cad_revision"] = input_report["cad_revision"]["revision"]
             if resume_from in (None, "capture", "generate"):
                 generated_subject = generate_model(staging, definition, input_report, on_event=event)
