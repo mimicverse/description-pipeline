@@ -147,8 +147,10 @@ no world joint, mass or rigid membership is inferred from an `IsFixed` flag.
 
 The subject digest binds every file under `input/`, `evidence/`, `model/`,
 `urdf/`, `meshes/`, plus `README.md`, `reports/input.json` and
-`reports/tool.json`. The quality report refers to that subject and cannot hash
-itself. Local run/PR receipts are also outside the subject and are not published
+`reports/tool.json`. Transferred captures also bind `reports/native-tool.json`,
+`reports/native-stages.json` and `transfer-manifest.json`; a partial set fails.
+Independent verification rechecks the manifest and native provenance from the
+delivered files. The quality report refers to that subject and cannot hash itself. Local run/PR receipts are also outside the subject and are not published
 as model evidence. `reports/stages.json` is also a run receipt: it records
 the subject and contract hashes, and its own file hash is retained in
 `reports/run.json`. It stays outside the subject to avoid circular hashes and
