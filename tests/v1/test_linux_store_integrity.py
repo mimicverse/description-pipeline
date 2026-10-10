@@ -1,7 +1,6 @@
 """Adversarial integrity tests for the Linux store and portable runner (independent).
 
-These tests pin the contracts the split depends on; the ones marked RED in the review are
-expected to fail against the current draft and document the exact defect until it is fixed:
+These tests pin the capture-transfer and portable-execution contracts:
 
 * the portable runtime identity is enforced for every stage (verify included);
 * generate re-validates the admitted capture before consuming it;
@@ -10,7 +9,6 @@ expected to fail against the current draft and document the exact defect until i
 * overlapping portable runs for one attempt are refused by the run lock;
 * malformed store state is refused, never silently emptied.
 
-Every contract below is asserted positively; the failing ones are the concrete defects to fix.
 """
 
 from __future__ import annotations
@@ -100,7 +98,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
     # ------------------------------------------------------------ roles / drift
 
     def test_verify_refuses_a_runtime_that_drifted_from_the_native_capture(self) -> None:
-        """RED until the identity gate also covers verify: a drifted host must not re-verify."""
+        """A drifted host must not re-verify a retained checkpoint."""
 
         drifted = portable_twin(self.tool, source_sha256="0" * 64)
         with (
@@ -122,7 +120,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
     # ------------------------------------------------------------ frozen source
 
     def test_generate_refuses_a_capture_tampered_after_admission(self) -> None:
-        """RED until the runner re-validates the admitted capture before consuming it."""
+        """Revalidate admitted capture before consuming it."""
 
         (self.store.capture_dir(RUN) / "input/robot.yaml").write_text('{"hardware_id": "tampered"}\n', encoding="utf-8")
         with (
@@ -135,7 +133,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
     # ------------------------------------------------------------ failed runs
 
     def test_raised_stage_is_recorded_as_a_visible_failure(self) -> None:
-        """RED until a raising delegate still leaves a failed receipt and meta entry."""
+        """A raising delegate must leave a failed receipt and metadata entry."""
 
         with (
             mock.patch.object(linux_runner, "tool_record", return_value=portable_twin(self.tool)),
@@ -191,7 +189,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         }
 
     def test_fetch_capture_enforces_the_declared_archive_digest(self) -> None:
-        """RED until the runner (not only the client) checks bytes against the declared digest."""
+        """The runner must enforce the declared digest independently of its client."""
 
         source = capture_root(self.tmp / "fresh", run_id=FRESH)
         fresh_archive = self.tmp / "fresh.zip"
@@ -252,7 +250,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
     # ------------------------------------------------------------ malformed state
 
     def test_malformed_state_is_refused_not_silently_emptied(self) -> None:
-        """RED for events: a non-list events file must raise, not read as an empty stream."""
+        """Reject malformed events instead of treating them as an empty stream."""
 
         write_json(self.store.events_path(RUN), {"stage": "generate", "state": "running"})
         with self.assertRaises(PipelineError):
@@ -275,7 +273,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         }
 
     def test_retry_after_an_early_crash_recovers_the_identical_import(self) -> None:
-        """RED: a crash before the capture install leaves state=importing; the retry must proceed."""
+        """Recover an interrupted import with the same capture binding."""
 
         other = LinuxStore(self.tmp / "store-retry")
         write_json(other.meta_path(RUN), self._provisional())
@@ -290,7 +288,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         self.assertTrue((other.capture_dir(RUN) / "transfer-manifest.json").is_file())
 
     def test_retry_after_a_crash_before_the_meta_write_finalizes_the_transfer(self) -> None:
-        """RED: a capture installed without the transfer metadata must be finalized, not half-admitted."""
+        """Recover metadata after an atomic capture install."""
 
         other = LinuxStore(self.tmp / "store-finalize")
         other.import_capture(
@@ -314,7 +312,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         self.assertIn("files", transfer)
 
     def test_retry_never_rolls_back_an_advanced_state(self) -> None:
-        """RED: re-importing an identical admission must not reset published state to capture_admitted."""
+        """Repeated admission must preserve a later publication state."""
 
         meta = self.store.meta(RUN) or {}
         meta["state"] = "published"
@@ -332,7 +330,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
     # ------------------------------------------------------------ recorded-digest binding
 
     def test_generate_refuses_a_self_consistent_manifest_tamper(self) -> None:
-        """RED: revalidation compares the inventory count, so a manifest-consistent tamper passes."""
+        """Bind the entire admitted digest map even when the replacement manifest is internally consistent."""
 
         capture = self.store.capture_dir(RUN)
         report_path = capture / "reports/input.json"
@@ -370,7 +368,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         return verify
 
     def test_preview_revalidates_in_place_report_edits(self) -> None:
-        """RED: the preview cache key is the directory mtime, so an in-place report edit is missed."""
+        """An in-place quality-report edit must invalidate the cached preview."""
 
         from description_pipeline.delivery import subject_digest
         from description_pipeline.orchestration import linux_store as store_module
@@ -403,7 +401,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
                 self.store.preview(RUN)
 
     def test_preview_revalidates_in_place_member_edits(self) -> None:
-        """RED: an in-place member edit must invalidate the preview (and never serve stale bytes)."""
+        """An in-place member edit must invalidate the preview."""
 
         from description_pipeline.delivery import subject_digest
         from description_pipeline.orchestration import linux_store as store_module
