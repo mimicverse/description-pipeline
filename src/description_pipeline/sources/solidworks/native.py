@@ -1284,7 +1284,7 @@ def _activity_object(path_value, source_root=None):
         text = relative
     else:
         text = text.replace("\\", "/")
-        if re.match(r"^[A-Za-z]:", text) or text.startswith("//") or text.startswith("/"):
+        if re.match(r"^[A-Za-z]:", text) or text.startswith("/"):
             text = posixpath.basename(text)
     parts = [part for part in text.split("/") if part]
     if not parts or any(part == ".." for part in parts):
@@ -1350,9 +1350,7 @@ class _ActivityEmitter:
                     break
                 if not isinstance(name, str):
                     continue
-                if type(value) in (bool, int, float):
-                    clean[name] = value
-                elif isinstance(value, str) and len(value) <= 120:
+                if type(value) in (bool, int) or (isinstance(value, str) and len(value) <= 120):
                     clean[name] = value
             if clean:
                 record["params"] = clean
