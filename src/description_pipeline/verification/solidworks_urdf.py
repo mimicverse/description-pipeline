@@ -143,10 +143,15 @@ def required_checks(definition=None):
         "urdf.topology",
         "geometry.coverage",
         "geometry.assets",
-        "geometry.expected_extent",
-        "physics.expected_mass",
         "consumer.urdf",
     }
+    expectations = (definition or {}).get("checks") or {}
+    for key, identifier in (
+        ("expected_mass_kg", "physics.expected_mass"),
+        ("expected_extent_m", "geometry.expected_extent"),
+    ):
+        if key in expectations:
+            identifiers.add(identifier)
     source = (definition or {}).get("source") or {}
     for body in source.get("bodies", []):
         identifiers.update(("inertia." + body["name"], "geometry." + body["name"]))
@@ -741,9 +746,17 @@ def _verify_model(root, gates, definition, model, raw):
                 used.extend(captured[0])
                 points.append(captured[1])
     gates.add("geometry.assets", lambda: _assets(root, used))
-    gates.add("geometry.expected_extent", lambda: _extent(points, definition["checks"]["expected_extent_m"]))
-    gates.add("physics.expected_mass", lambda: _mass(model, definition["checks"]["expected_mass_kg"]))
+    _author_expectations(gates, definition, model, points)
     gates.add("consumer.urdf", lambda: load_consumer(root))
+
+
+def _author_expectations(gates, definition, model, points):
+    """Execute only supplied design expectations; absence is not a passed check."""
+    expectations = definition.get("checks") or {}
+    if "expected_extent_m" in expectations:
+        gates.add("geometry.expected_extent", lambda: _extent(points, expectations["expected_extent_m"]))
+    if "expected_mass_kg" in expectations:
+        gates.add("physics.expected_mass", lambda: _mass(model, expectations["expected_mass_kg"]))
 
 
 def _physics(root, source, model, verifier):
@@ -797,6 +810,7 @@ def _assets(root, used):
 
 
 def _extent(points, bounds):
+    bounds = _expectation_bounds(bounds)
     _require(bool(points), "No verified geometry")
     points = np.concatenate(points)
     extent = points.max(axis=0) - points.min(axis=0)
@@ -806,9 +820,20 @@ def _extent(points, bounds):
 
 
 def _mass(model, bounds):
+    bounds = _expectation_bounds(bounds)
     mass = sum(link["inertial"]["mass"] for link in model["links"])
     _require(bounds[0] <= mass <= bounds[1], f"Mass {mass:.9g} kg is outside author bounds {bounds}")
     return {"mass_kg": mass, "expected_kg": bounds}
+
+
+def _expectation_bounds(bounds):
+    _require(isinstance(bounds, (list, tuple)) and len(bounds) == 2, "Expected a two-number design range")
+    _require(
+        all(type(value) in (int, float) and math.isfinite(value) for value in bounds),
+        "Design bounds must be finite numbers",
+    )
+    _require(0 <= bounds[0] < bounds[1], "Design bounds must be nonnegative and strictly ordered")
+    return list(bounds)
 
 
 def check_bundle(root: Path) -> dict:

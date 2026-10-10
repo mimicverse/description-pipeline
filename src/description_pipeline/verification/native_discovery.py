@@ -1539,6 +1539,10 @@ def verify_discovery(package: Path) -> dict:
             _require(
                 isinstance(item, (list, tuple))
                 and isinstance(declared, (list, tuple))
+                and len(item) == len(declared) == 2
+                and all(_number(number) is not None for number in (*item, *declared))
+                and 0 <= item[0] < item[1]
+                and 0 <= declared[0] < declared[1]
                 and _close([float(declared[0]), float(declared[1])], [float(item[0]), float(item[1])], 1e-12),
                 "discovery.budgets",
                 f"the {key} capture window differs from the design budget record",
@@ -2517,9 +2521,18 @@ def verify_discovery(package: Path) -> dict:
         dependent = (
             ("discovery.files", files),
             ("discovery.revision", revision),
+            ("discovery.budgets", budgets),
             ("discovery.masses", masses),
             ("discovery.declarations", declarations),
         )
+    if bound["passed"]:
+        payload = state["payload"]
+        document_properties = (payload.get("raw", {}).get("properties") or {}).get("document") or {}
+        budget_reference = str(payload.get("namespace") or "dp") + ".design_budget_record"
+        expectations = state["robot"].get("checks") or {}
+        if ("budget" not in payload and budget_reference not in document_properties
+                and not any(key in expectations for key in ("expected_mass_kg", "expected_extent_m"))):
+            dependent = tuple(item for item in dependent if item[0] != "discovery.budgets")
     if bound["passed"]:
         for identifier, callback in dependent:
             check(identifier, callback)

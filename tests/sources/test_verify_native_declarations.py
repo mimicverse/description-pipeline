@@ -305,6 +305,31 @@ class NativeDeclarationsTests(unittest.TestCase):
             self.assertEqual((report["bodies"], report["joints"]), (2, 1))
             self.assertIn("discovery.declarations", {check["id"] for check in report["checks"]})
             self.assertNotIn("discovery.budgets", {check["id"] for check in report["checks"]})
+
+            def reseal():
+                data = json.dumps(payload).encode()
+                (package / "discovery/native-discovery.json").write_bytes(data)
+                robot["provenance"]["discovery_sha256"] = hashlib.sha256(data).hexdigest()
+                (package / "robot.yaml").write_text(json.dumps(robot))
+
+            payload["budget"] = None
+            reseal()
+            malformed = verify_discovery(package)
+            self.assertIn("discovery.budgets", {item["code"] for item in malformed["errors"]})
+            budget = {"expected_mass_kg": [1, 5], "expected_extent_m": [0, 1]}
+            budget_bytes = json.dumps(budget).encode()
+            (package / "budget.json").write_bytes(budget_bytes)
+            payload["budget"] = {
+                "package_file": "budget.json",
+                "key": "",
+                "sha256": hashlib.sha256(budget_bytes).hexdigest(),
+            }
+            robot["checks"] = budget
+            reseal()
+            self.assertTrue(verify_discovery(package)["passed"])
+            (package / "budget.json").write_bytes(budget_bytes + b" ")
+            changed_budget = verify_discovery(package)
+            self.assertIn("discovery.record", {item["code"] for item in changed_budget["errors"]})
             (package / "robot.SLDASM").write_bytes(native + b"tampered")
             changed = verify_discovery(package)
             self.assertFalse(changed["passed"])

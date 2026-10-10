@@ -370,3 +370,53 @@ class UrdfMassEqualityTests(unittest.TestCase):
                 path.write_text(original.replace('<mass value="1.0"/>', replacement, 1))
                 with self.assertRaises(PipelineError):
                     verify_urdf_mass_equality(self.root)
+
+
+class OptionalDesignExpectationTests(unittest.TestCase):
+    def test_absent_expectations_do_not_execute_or_require_a_passing_placeholder(self):
+        definition = {"checks": {}}
+        gates = quality._Gates()
+        quality._author_expectations(gates, definition, {}, [])
+        self.assertEqual(gates.checks, [])
+        required = quality.required_checks(definition)
+        self.assertNotIn("physics.expected_mass", required)
+        self.assertNotIn("geometry.expected_extent", required)
+        for core in [
+            "physics.mass_closure_equality",
+            "physics.independent",
+            "model.schema",
+            "geometry.coverage",
+            "geometry.assets",
+            "source.integrity",
+        ]:
+            self.assertIn(core, required)
+        report = {
+            "passed": True,
+            "required_checks": required,
+            "checks": [{"id": key, "state": "passed", "passed": True} for key in required],
+        }
+        quality.require_qualified_report(report)
+        removed = copy.deepcopy(report)
+        removed["checks"] = [row for row in removed["checks"] if row["id"] != "physics.mass_closure_equality"]
+        removed["required_checks"].remove("physics.mass_closure_equality")
+        with self.assertRaises(PipelineError):
+            quality.require_qualified_report(removed)
+
+    def test_supplied_expectations_are_required_evaluated_and_not_defaulted(self):
+        model = {"links": [{"inertial": {"mass": 2.0}}]}
+        points = [np.array([[0, 0, 0], [0.5, 0.2, 0.1]])]
+        definition = {"checks": {"expected_mass_kg": [1, 3], "expected_extent_m": [0.4, 0.6]}}
+        gates = quality._Gates()
+        quality._author_expectations(gates, definition, model, points)
+        self.assertEqual({row["id"] for row in gates.checks}, {"physics.expected_mass", "geometry.expected_extent"})
+        self.assertTrue(all(row["passed"] for row in gates.checks))
+        required = quality.required_checks(definition)
+        self.assertIn("physics.expected_mass", required)
+        self.assertIn("geometry.expected_extent", required)
+        for value in [None, [3, 4], [2, 2], [1, float("nan")], [True, 3], ["1", "3"], [1, 2, 3]]:
+            candidate = {"checks": {"expected_mass_kg": value}}
+            gates = quality._Gates()
+            quality._author_expectations(gates, candidate, model, points)
+            self.assertIn("physics.expected_mass", quality.required_checks(candidate))
+            self.assertEqual(len(gates.checks), 1)
+            self.assertFalse(gates.checks[0]["passed"], value)
