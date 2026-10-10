@@ -515,6 +515,47 @@ class InputPackageTests(unittest.TestCase):
 
                 self._assert_code(self._package(mutate), "input.joint_axis_reference_invalid")
 
+    def test_named_native_axis_keeps_its_exact_occurrence_scope(self):
+        for owner in ("", "upper-1", "drive-1/shaft-2"):
+            with self.subTest(owner=owner):
+                reference = {"kind": "reference_axis", "component": owner, "feature_name": "shaft_axis"}
+
+                def mutate(document, reference=reference):
+                    document["source"]["joints"][0]["axis_reference"] = reference
+
+                loaded = load_package(self._package(mutate))
+                self.assertEqual(loaded["source"]["joints"][0]["axis_reference"], reference)
+
+    def test_named_axis_refuses_missing_scope_and_mixed_geometry_selectors(self):
+        valid = {"kind": "reference_axis", "component": "", "feature_name": "shaft_axis"}
+        malformed = [
+            {key: value for key, value in valid.items() if key != "component"},
+            {**valid, "component": None},
+            {**valid, "component": " \t "},
+            {**valid, "feature_name": ""},
+            {**valid, "feature_name": "shaft\naxis"},
+            {**valid, "face_index": 0},
+            {**valid, "body_type": "solid"},
+            {**valid, "kind": "plane"},
+            {**valid, "kind": {}},
+        ]
+        for reference in malformed:
+            with self.subTest(reference=reference):
+                def mutate(document, reference=reference):
+                    document["source"]["joints"][0]["axis_reference"] = reference
+
+                self._assert_code(self._package(mutate), "input.joint_axis_reference_invalid")
+
+    def test_named_axis_does_not_qualify_zero_operating_limits(self):
+        def mutate(document):
+            joint = document["source"]["joints"][0]
+            joint["axis_reference"] = {
+                "kind": "reference_axis", "component": "", "feature_name": "shaft_axis",
+            }
+            joint["limits"] = {"lower": 0, "upper": 0, "effort": 0, "velocity": 0}
+
+        self._assert_code(self._package(mutate), "input.joint_limits_invalid")
+
     def test_joint_axis_and_limits_are_strict_si(self):
         def axis(document):
             document["source"]["joints"][0]["axis"] = [0.0, 0.0, 2.0]

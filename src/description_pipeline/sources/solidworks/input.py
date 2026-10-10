@@ -672,14 +672,36 @@ def _validate_source(
             continue
         reference = joint.get("axis_reference")
         if not isinstance(reference, dict):
-            # Free text carries no numeric evidence; a moving joint must name
-            # the native component/face that the capture resolves.
             report.error(
                 "input.joint_axis_reference_invalid",
                 f"{where}.axis_reference must be a structured native selector "
-                "(component + face_index) for a movable joint",
+                "for a saved reference axis or cylindrical face",
                 {"joint": name, "axis_reference": reference},
             )
+        elif reference.get("kind") == "reference_axis":
+            # A saved reference axis is native line evidence in its own right.
+            # The empty occurrence names the top assembly, never an inferred part.
+            _unknown_keys(
+                reference,
+                {"kind", "component", "feature_name", "note"},
+                report,
+                "input.joint_axis_reference_invalid",
+                f"{where}.axis_reference",
+            )
+            component = reference.get("component")
+            if not isinstance(component, str) or (component != "" and not _is_text(component)):
+                report.error(
+                    "input.joint_axis_reference_invalid",
+                    f"{where}.axis_reference.component must be an occurrence name "
+                    "or an empty string for the top assembly",
+                    {"joint": name, "component": component},
+                )
+            if not _is_text(reference.get("feature_name")):
+                report.error(
+                    "input.joint_axis_reference_invalid",
+                    f"{where}.axis_reference.feature_name must name a saved reference axis",
+                    {"joint": name, "feature_name": reference.get("feature_name")},
+                )
         else:
             if isinstance(reference, dict):
                 _unknown_keys(
