@@ -103,7 +103,7 @@
         },
         {
           "id": "runtime.ready",
-          "label": "Native platform and isolated URDF consumer readiness"
+          "label": "Native Windows, COM and SolidWorks prerequisites"
         }
       ],
       "outputs": [
