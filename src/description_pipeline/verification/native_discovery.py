@@ -44,6 +44,12 @@ SUPPORTED_MATES = {
 
 AXIS_OFFSET_TOL_M = 5e-5
 TOL = 1e-6
+#: Conflict tolerances of the delivery contract: 0.05 mm and 0.05 degrees.
+_CONFLICT_POS_TOL_M = 5e-5
+_CONFLICT_ANGLE_EPS = 1.0 - math.cos(math.radians(0.05))
+_CONFLICT_PERP_EPS = math.sin(math.radians(0.05))
+#: Kinds a localized fallback may surface; a cylinder must exist as recorded face evidence.
+_LOCALIZED_KINDS = ("point", "line", "plane")
 
 _SNAKE = re.compile(r"^[a-z][a-z0-9_]*$")
 INTERFACE_PREFIXES = ("CS_", "TCP_", "SCS_")
@@ -320,46 +326,262 @@ def _axis_entity(entity: dict) -> bool:
     return isinstance(entity.get("cylinder"), dict) or isinstance(entity.get("circle"), dict)
 
 
+def _kind(entity: dict) -> str | None:
+    """The entity's effective kind: recorded face first, then a licensed localization.
+
+    Mirrors :func:`_geometry`'s resolution order so branch selection and geometry always
+    agree; a failed localization (``mate_entity_reference.error``) never supplies a kind.
+    """
+
+    for known in ("cylinder", "circle", "plane", "line"):
+        if isinstance(entity.get(known), dict):
+            return known
+    if isinstance(entity.get("point"), (list, tuple)):
+        return "point"
+    reference = entity.get("mate_entity_reference")
+    if isinstance(reference, dict) and reference.get("error") is None:
+        geometry = reference.get("geometry")
+        if isinstance(geometry, dict) and geometry.get("frame") == "component-local":
+            kind = str(geometry.get("kind") or "")
+            if kind in _LOCALIZED_KINDS or kind == "cylinder":
+                return kind
+    return None
+
+
+def _recorded_geometry(entity: dict, frame):
+    """Recorded face evidence in the assembly frame as ``(kind, point, direction)``.
+
+    ``(None, None, None)`` means no recorded kind exists.  ``("invalid", None, None)``
+    means a recorded kind exists but is unusable: the caller must fail closed rather
+    than silently falling back to localized provenance.
+    """
+
+    def finish(kind: str, source, direction):
+        point = _apply_point(source, frame) if source is not None else None
+        if point is None or direction is None or not all(math.isfinite(value) for value in point):
+            return "invalid", None, None
+        return kind, point, direction
+
+    if isinstance(entity.get("cylinder"), dict):
+        source = _finite_triple(entity["cylinder"].get("point"))
+        return finish(
+            "cylinder",
+            source,
+            _unit_vector(_apply_vector(entity["cylinder"].get("direction") or (), frame)),
+        )
+    if isinstance(entity.get("circle"), dict):
+        source = _finite_triple(entity["circle"].get("center"))
+        return finish(
+            "circle",
+            source,
+            _unit_vector(_apply_vector(entity["circle"].get("normal") or (), frame)),
+        )
+    if isinstance(entity.get("plane"), dict):
+        source = _finite_triple(entity["plane"].get("point"))
+        return finish(
+            "plane",
+            source,
+            _unit_vector(_apply_vector(entity["plane"].get("normal") or (), frame)),
+        )
+    if isinstance(entity.get("line"), dict):
+        source = _finite_triple(entity["line"].get("point"))
+        return finish(
+            "line",
+            source,
+            _unit_vector(_apply_vector(entity["line"].get("direction") or (), frame)),
+        )
+    if isinstance(entity.get("point"), (list, tuple)):
+        source = _finite_triple(entity["point"])
+        point = _apply_point(source, frame) if source is not None else None
+        if point is None or not all(math.isfinite(value) for value in point):
+            return "invalid", None, None
+        return "point", point, None
+    return None, None, None
+
+
+def _geometry_agrees(kind: str, recorded: dict, localized: dict) -> bool:
+    """Undirected agreement between recorded face evidence and localized provenance.
+
+    Planes, lines and cylinders are undirected geometry: a flipped normal or direction
+    describes the same reference, while a different plane/axis, a moved point or a
+    changed cylinder radius blocks.
+    """
+
+    def point(value):
+        return _finite_triple(value or ())
+
+    def flat_distance(value, origin, direction) -> float:
+        offset = [value[index] - origin[index] for index in range(3)]
+        cross = _cross(offset, direction)
+        return math.sqrt(sum(item * item for item in cross))
+
+    if kind == "plane":
+        recorded_normal = _unit_vector(recorded.get("normal") or ())
+        localized_normal = _unit_vector(localized.get("normal") or ())
+        recorded_point, localized_point = point(recorded.get("point")), point(localized.get("point"))
+        if None in (recorded_normal, localized_normal, recorded_point, localized_point):
+            return False
+        if abs(abs(_dot(recorded_normal, localized_normal)) - 1.0) > _CONFLICT_ANGLE_EPS:
+            return False
+        return (
+            abs(
+                sum(
+                    (localized_point[index] - recorded_point[index]) * recorded_normal[index]
+                    for index in range(3)
+                )
+            )
+            <= _CONFLICT_POS_TOL_M
+        )
+    if kind == "line":
+        recorded_direction = _unit_vector(recorded.get("direction") or ())
+        localized_direction = _unit_vector(localized.get("direction") or ())
+        recorded_point, localized_point = point(recorded.get("point")), point(localized.get("point"))
+        if None in (recorded_direction, localized_direction, recorded_point, localized_point):
+            return False
+        if abs(abs(_dot(recorded_direction, localized_direction)) - 1.0) > _CONFLICT_ANGLE_EPS:
+            return False
+        return (
+            flat_distance(localized_point, recorded_point, recorded_direction) <= _CONFLICT_POS_TOL_M
+            and flat_distance(recorded_point, localized_point, localized_direction) <= _CONFLICT_POS_TOL_M
+        )
+    if kind == "cylinder":
+        recorded_direction = _unit_vector(recorded.get("direction") or recorded.get("normal") or ())
+        localized_direction = _unit_vector(localized.get("direction") or ())
+        recorded_point = point(recorded.get("point") or recorded.get("center"))
+        localized_point = point(localized.get("point"))
+        recorded_radius, localized_radius = recorded.get("radius"), localized.get("radius")
+        if None in (recorded_direction, localized_direction, recorded_point, localized_point):
+            return False
+        if not isinstance(recorded_radius, (int, float)) or not isinstance(localized_radius, (int, float)):
+            return False
+        if abs(float(recorded_radius) - float(localized_radius)) > _CONFLICT_POS_TOL_M:
+            return False
+        if abs(abs(_dot(recorded_direction, localized_direction)) - 1.0) > _CONFLICT_ANGLE_EPS:
+            return False
+        return (
+            flat_distance(localized_point, recorded_point, recorded_direction) <= _CONFLICT_POS_TOL_M
+            and flat_distance(recorded_point, localized_point, localized_direction) <= _CONFLICT_POS_TOL_M
+        )
+    return False
+
+
+def _localized_values(geometry):
+    """One localized shape in component coordinates, or ``None`` when it must block.
+
+    The provenance must be component-local, the kind must be a supported fallback kind
+    (a localized cylinder is carried only for agreement with recorded face evidence)
+    and the shape must be complete and finite.
+    """
+
+    def strict_triple(values):
+        if isinstance(values, (str, bytes)) or not hasattr(values, "__iter__"):
+            return None
+        items = list(values)
+        if len(items) != 3 or any(
+            not isinstance(item, (int, float)) or isinstance(item, bool) for item in items
+        ):
+            return None
+        numbers = [float(item) for item in items]
+        if not all(math.isfinite(item) for item in numbers):
+            return None
+        return numbers
+
+    def strict_unit(values):
+        numbers = strict_triple(values)
+        return _unit_vector(numbers) if numbers is not None else None
+
+    if not isinstance(geometry, dict) or geometry.get("frame") != "component-local":
+        return None
+    kind = str(geometry.get("kind") or "")
+    if kind not in _LOCALIZED_KINDS and kind != "cylinder":
+        return None
+    values = {"kind": kind}
+    if kind == "point":
+        point = strict_triple(geometry.get("point") or ())
+        if point is None:
+            return None
+        values["point"] = point
+        return values
+    if kind == "line":
+        point, direction = strict_triple(geometry.get("point") or ()), strict_unit(
+            geometry.get("direction") or ()
+        )
+    elif kind == "plane":
+        point, direction = strict_triple(geometry.get("point") or ()), strict_unit(geometry.get("normal") or ())
+    else:  # cylinder
+        radius = geometry.get("radius")
+        if not isinstance(radius, (int, float)) or isinstance(radius, bool) or not math.isfinite(float(radius)):
+            return None
+        values["radius"] = float(radius)
+        point, direction = strict_triple(geometry.get("point") or ()), strict_unit(
+            geometry.get("direction") or ()
+        )
+    if point is None or direction is None:
+        return None
+    values["point"], values["direction"] = point, direction
+    if kind == "plane":
+        # Canonical plane field: agreement checks compare the localized normal explicitly.
+        values["normal"] = direction
+    return values
+
+
 def _geometry(entity: dict, frames):
     frame = _frame_for(entity, frames)
     if frame is None:
         return None, None
-    if isinstance(entity.get("cylinder"), dict):
-        source = _finite_triple(entity["cylinder"].get("point"))
-        if source is None:
-            return None, None
-        direction = _unit_vector(_apply_vector(entity["cylinder"].get("direction") or (), frame))
-        point = _apply_point(source, frame)
-        if not all(math.isfinite(value) for value in point):
+    recorded_kind, point, direction = _recorded_geometry(entity, frame)
+    if recorded_kind == "invalid":
+        return None, None
+    reference = entity.get("mate_entity_reference")
+    if reference is None:
+        return (point, direction) if recorded_kind is not None else (None, None)
+    if not isinstance(reference, dict):
+        # Malformed provenance never blocks recorded face evidence.
+        return (point, direction) if recorded_kind is not None else (None, None)
+    if reference.get("error") is not None:
+        # A failed localization is never trusted; valid recorded face evidence stays primary.
+        return (point, direction) if recorded_kind is not None else (None, None)
+    geometry = reference.get("geometry")
+    if geometry is None:
+        # No localized provenance: recorded face evidence stays the only source.
+        return (point, direction) if recorded_kind is not None else (None, None)
+    values = _localized_values(geometry)
+    if values is None:
+        # Missing or malformed provenance never blocks recorded face evidence.
+        return (point, direction) if recorded_kind is not None else (None, None)
+    kind = values["kind"]
+    if kind == "cylinder":
+        # A shaft is face evidence or it does not exist; localization never fabricates one.
+        if recorded_kind != "cylinder" or not _geometry_agrees("cylinder", entity["cylinder"], values):
             return None, None
         return point, direction
-    if isinstance(entity.get("circle"), dict):
-        source = _finite_triple(entity["circle"].get("center"))
-        if source is None:
-            return None, None
-        direction = _unit_vector(_apply_vector(entity["circle"].get("normal") or (), frame))
-        point = _apply_point(source, frame)
-        if not all(math.isfinite(value) for value in point):
+    if kind == "point":
+        if recorded_kind == "point":
+            stored = _finite_triple(entity.get("point") or ())
+            if stored is None or any(
+                abs(left - right) > _CONFLICT_POS_TOL_M
+                for left, right in zip(stored, values["point"], strict=True)
+            ):
+                return None, None
+            return point, None
+        if recorded_kind is None:
+            surface = _apply_point(values["point"], frame)
+            if not all(math.isfinite(value) for value in surface):
+                return None, None
+            return surface, None
+        return point, direction
+    if recorded_kind == kind:
+        if not _geometry_agrees(kind, entity[kind], values):
             return None, None
         return point, direction
-    if isinstance(entity.get("plane"), dict):
-        source = _finite_triple(entity["plane"].get("point"))
-        if source is None:
+    if recorded_kind is None:
+        surface_point = _apply_point(values["point"], frame)
+        surface_direction = _unit_vector(_apply_vector(values["direction"], frame))
+        if surface_direction is None or not all(math.isfinite(value) for value in surface_point):
             return None, None
-        direction = _unit_vector(_apply_vector(entity["plane"].get("normal") or (), frame))
-        point = _apply_point(source, frame)
-        if not all(math.isfinite(value) for value in point):
-            return None, None
-        return point, direction
-    if isinstance(entity.get("point"), (list, tuple)):
-        source = _finite_triple(entity["point"])
-        if source is None:
-            return None, None
-        point = _apply_point(source, frame)
-        if not all(math.isfinite(value) for value in point):
-            return None, None
-        return point, None
-    return None, None
+        return surface_point, surface_direction
+    # A recorded face of another kind stays primary; the localized key is not consulted.
+    return point, direction
 
 
 def _rows_for(mate: dict, frames) -> dict | None:
@@ -425,8 +647,8 @@ def _rows_for(mate: dict, frames) -> dict | None:
         if (
             left_axis is not None
             and right_axis is not None
-            and isinstance(first.get("plane"), dict)
-            and isinstance(second.get("plane"), dict)
+            and _kind(first) == "plane"
+            and _kind(second) == "plane"
         ):
             if abs(abs(_dot(left_axis, right_axis)) - 1.0) > TOL:
                 return None
@@ -436,7 +658,7 @@ def _rows_for(mate: dict, frames) -> dict | None:
                 return None
             rows = [_translation_row(normal, left_point)] + [_rotation_row(direction) for direction in plane]
             return {"rows": rows, "limits": limits, "axis": None, "point": left_point}
-        if isinstance(first.get("circle"), dict) and isinstance(second.get("circle"), dict):
+        if _kind(first) == "circle" and _kind(second) == "circle":
             if left_axis is None or right_axis is None or abs(abs(_dot(left_axis, right_axis)) - 1.0) > TOL:
                 return None
             separation = math.sqrt(sum((left_point[i] - right_point[i]) ** 2 for i in range(3)))
@@ -448,13 +670,13 @@ def _rows_for(mate: dict, frames) -> dict | None:
                 "axis": None,
                 "point": left_point,
             }
-        if (isinstance(first.get("circle"), dict) and isinstance(second.get("plane"), dict)) or (
-            isinstance(second.get("circle"), dict) and isinstance(first.get("plane"), dict)
+        if (_kind(first) == "circle" and _kind(second) == "plane") or (
+            _kind(second) == "circle" and _kind(first) == "plane"
         ):
             # A circular edge coincident with a plane: the circle's plane is the
             # plane (two tilts locked) and its centre lies in it (one translation
             # locked); sliding and spinning in the plane stay free.
-            circle_entity, plane_entity = (first, second) if isinstance(first.get("circle"), dict) else (second, first)
+            circle_entity, plane_entity = (first, second) if _kind(first) == "circle" else (second, first)
             circle_point, circle_axis = _geometry(circle_entity, frames)
             plane_point, plane_axis = _geometry(plane_entity, frames)
             if (
@@ -474,23 +696,48 @@ def _rows_for(mate: dict, frames) -> dict | None:
                 return None
             rows = [_translation_row(normal, circle_point)] + [_rotation_row(direction) for direction in plane]
             return {"rows": rows, "limits": limits, "axis": None, "point": circle_point}
-        if isinstance(first.get("point"), (list, tuple)) and isinstance(second.get("point"), (list, tuple)):
+        def line_plane_rows(line_entity: dict, plane_entity: dict):
+            # A line coincident with a plane lies in that plane: the recorded solved state
+            # must already show the direction perpendicular to the normal and the line's
+            # point on the plane; only then are exactly those two constraint rows emitted.
+            line_point, line_direction = _geometry(line_entity, frames)
+            plane_point, plane_normal = _geometry(plane_entity, frames)
+            if None in (line_point, line_direction, plane_point, plane_normal):
+                return None
+            if abs(_dot(line_direction, plane_normal)) > TOL:
+                return None
+            separation = abs(
+                sum((line_point[index] - plane_point[index]) * plane_normal[index] for index in range(3))
+            )
+            if separation > AXIS_OFFSET_TOL_M:
+                return None
+            pivot = _unit_vector(_cross(line_direction, plane_normal))
+            rows = ([_rotation_row(pivot)] if pivot is not None else []) + [
+                _translation_row(plane_normal, line_point)
+            ]
+            return {"rows": rows, "limits": limits, "axis": None, "point": line_point}
+
+        if _kind(first) == "line" and _kind(second) == "plane":
+            return line_plane_rows(first, second)
+        if _kind(first) == "plane" and _kind(second) == "line":
+            return line_plane_rows(second, first)
+        if _kind(first) == "point" and _kind(second) == "point":
             rows = [_translation_row(axis, left_point) for axis in axes]
             return {"rows": rows, "limits": limits, "axis": None, "point": left_point}
         # Only the explicit plane-plus-vertex form remains: the face side must be a
         # recorded plane and the other side an explicit point.  A missing entity, a
         # cylinder, a circle, or any unrelated geometry is never treated as a vertex.
         if (
-            isinstance(first.get("plane"), dict)
+            _kind(first) == "plane"
             and left_axis is not None
-            and isinstance(second.get("point"), (list, tuple))
+            and _kind(second) == "point"
             and right_point is not None
         ):
             normal, point = left_axis, right_point
         elif (
-            isinstance(second.get("plane"), dict)
+            _kind(second) == "plane"
             and right_axis is not None
-            and isinstance(first.get("point"), (list, tuple))
+            and _kind(first) == "point"
             and left_point is not None
         ):
             normal, point = right_axis, left_point
@@ -504,8 +751,8 @@ def _rows_for(mate: dict, frames) -> dict | None:
         _first_point, first_axis = _geometry(first, frames)
         _second_point, second_axis = _geometry(second, frames)
         if (
-            isinstance(first.get("plane"), dict)
-            and isinstance(second.get("plane"), dict)
+            _kind(first) == "plane"
+            and _kind(second) == "plane"
             and first_axis is not None
             and second_axis is not None
             and abs(abs(_dot(first_axis, second_axis)) - 1.0) <= TOL
@@ -524,7 +771,7 @@ def _rows_for(mate: dict, frames) -> dict | None:
     if kind == "distance":
         left_point, left_axis = _geometry(first, frames)
         right_point, right_axis = _geometry(second, frames)
-        if isinstance(first.get("point"), (list, tuple)) and isinstance(second.get("point"), (list, tuple)):
+        if _kind(first) == "point" and _kind(second) == "point":
             direction = _unit_vector([right_point[i] - left_point[i] for i in range(3)])
             point = [(left_point[i] + right_point[i]) / 2.0 for i in range(3)]
         else:
@@ -534,6 +781,24 @@ def _rows_for(mate: dict, frames) -> dict | None:
             return None
         return {"rows": [_translation_row(direction, point)], "limits": limits, "axis": None, "point": point}
     if kind == "parallel":
+        kinds = [_kind(first), _kind(second)]
+        if "line" in kinds and "plane" in kinds:
+            # A line parallel to a plane is one rotational freedom: the solved state must
+            # already show the line direction perpendicular to the plane normal.
+            line_entity, plane_entity = (first, second) if kinds[0] == "line" else (second, first)
+            _line_point, line_direction = _geometry(line_entity, frames)
+            _plane_point, plane_normal = _geometry(plane_entity, frames)
+            if line_direction is None or plane_normal is None:
+                return None
+            if abs(_dot(line_direction, plane_normal)) > _CONFLICT_PERP_EPS:
+                return None
+            pivot = _unit_vector(_cross(line_direction, plane_normal))
+            if pivot is None:
+                return None
+            return {"rows": [_rotation_row(pivot)], "limits": limits, "axis": None, "point": None}
+        if kinds.count("line") == 1:
+            # A line paired with a cylinder or point stays outside the supported scope.
+            return None
         axis = None
         for entity in (first, second):
             _point, direction = _geometry(entity, frames)
@@ -555,6 +820,10 @@ def _rows_for(mate: dict, frames) -> dict | None:
             "axis": None,
             "point": None,
         }
+    for entity in (first, second):
+        if _kind(entity) == "line":
+            # Lines stay outside the angle/perpendicular supported scope.
+            return None
     _first_point, first_axis = _geometry(first, frames)
     _second_point, second_axis = _geometry(second, frames)
     if first_axis is None or second_axis is None:
