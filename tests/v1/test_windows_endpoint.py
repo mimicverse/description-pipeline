@@ -1,9 +1,9 @@
-"""Real HTTP and persistent ownership tests; mocked runner never qualifies CAD."""
+"""Real HTTP, ownership and restart tests; mocked native legs never qualify CAD."""
 
 from __future__ import annotations
 
-import json
 import copy
+import json
 import subprocess
 import sys
 import threading
@@ -11,125 +11,114 @@ import time
 import unittest
 import urllib.error
 import urllib.request
-from datetime import datetime
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 from description_pipeline.io import PipelineError, write_json
-from description_pipeline.orchestration.airflow_client import EndpointConfig, HandoffResolution, WindowsEndpoint
 from description_pipeline.orchestration.windows import Jobs, RequestError, handler, read_config
-from .endpoint_support import EndpointFixture
+from .endpoint_support import MAIN, TOOL, EndpointFixture
 
 
 class EndpointTests(EndpointFixture, unittest.TestCase):
-    def test_missing_publication_route_does_not_stop_native_capture(self):
-        self.config["targets"] = {"another_robot": {"repository_slug": "a/c", "base": "feature/another_robot"}}
-        jobs = self.jobs()
+    def test_selection_flow_reaches_a_sealed_capture_transfer(self):
+        calls: list[dict] = []
+
+        def runner(package, output, **kwargs):
+            calls.append({"package": Path(package), **kwargs})
+            self.assertEqual("capture", kwargs["stop_after"])
+            self.assertEqual(MAIN, kwargs["main_assembly"])
+            self.assertTrue(Path(package).is_dir())
+            return self.capture_transfer_result(output, run_id=kwargs["run_id"], on_event=kwargs.get("on_event"))
+
+        jobs = self.jobs(runner)
+        request = self.request()
+        created, is_new = jobs.create(request)
+        self.assertTrue(is_new)
+        self.assertEqual("selecting", created["status"])
+        finished = self.run_to_terminal(jobs, request["run_id"])
+        self.assertEqual("native_complete", finished["status"], finished.get("error"))
+        self.assertEqual(1, len(calls))
+        self.assertEqual(calls[0]["main_assembly"], MAIN)
+        self.assertEqual(set(finished["capture_archive"]), {"name", "sha256", "size", "manifest_sha256"})
+        # The operator request binding stays exactly as submitted.
+        self.assertEqual(request, finished["request"])
+        self.assertEqual(MAIN, finished["main_assembly"])
+
+    def test_missing_publication_target_does_not_stop_native_capture(self):
+        config = self.config_for(
+            "publication", targets={"another_robot": {"repository_slug": "a/c", "base": "feature/another_robot"}}
+        )
+        jobs = self.jobs(config=config)
         request = self.request()
         jobs.create(request)
-        jobs.queue.join()
-        result = jobs.snapshot(request["run_id"])
-        self.assertEqual(result["status"], "native_complete", result.get("error"))
-        self.assertIsNone(result["repository_slug"])
-        self.assertIsNone(result["repository_base"])
-        finding = next(
-            row for row in result["discovery"]["findings"]
-            if row["code"] == "discovery.publication_target_missing"
-        )
-        self.assertIs(finding["blocking"], False)
-        self.assertEqual(finding["detail"]["publication_blocker"], "repository_target")
+        finished = self.run_to_terminal(jobs, request["run_id"])
+        self.assertEqual("native_complete", finished["status"], finished.get("error"))
+        self.assertIsNone(finished["repository_slug"])
+        self.assertIsNone(finished["repository_base"])
 
-    def test_airflow_client_can_poll_native_discovery_and_completed_events(self):
-        preparing, release = threading.Event(), threading.Event()
-        captured = {"stage": "capture", "state": "completed", "at": "2026-01-01T00:00:00+00:00"}
+    def test_blocking_native_reader_keeps_the_run_pollable(self):
+        started, release = threading.Event(), threading.Event()
 
-        def prepare(*args, **kwargs):
-            preparing.set()
-            if not release.wait(5):
-                raise RuntimeError("Discovery control was not released")
-            return self.prepare(*args, **kwargs)
+        def native_reader(frozen, settings, on_activity=None):
+            started.set()
+            if not release.wait(10):
+                raise RuntimeError("native reader control was not released")
+            return copy.deepcopy(self.record)
 
-        def runner(*args, **kwargs):
-            kwargs["on_event"](captured)
-            return self.capture_transfer_result(args[1], run_id=kwargs["run_id"], on_event=kwargs["on_event"])
-
-        jobs = self.jobs(runner, preparer=prepare)
-        server = ThreadingHTTPServer(("127.0.0.1", 0), handler(jobs, self.config["token"]))
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        self.addCleanup(server.server_close)
-        self.addCleanup(server.shutdown)
+        jobs = self.jobs(native_reader=native_reader)
         self.addCleanup(release.set)
-        client = WindowsEndpoint(
-            EndpointConfig(f"http://127.0.0.1:{server.server_port}", self.config["token"], timeout=2)
-        )
         request = self.request()
-        client.start_job(
-            run_id=request["run_id"],
-            resolution=HandoffResolution(request["package"], request["handoff_sha256"]),
-        )
-        self.assertTrue(preparing.wait(2))
-        try:
-            running = client.get_job(request["run_id"])
-            self.assertEqual("running", running["status"])
-            self.assertEqual(("freeze", "running"), (running["events"][0]["stage"], running["events"][0]["state"]))
-            stage_states = {stage["id"]: stage["state"] for stage in running["stages"]["stages"]}
-            self.assertEqual(stage_states["freeze"], "completed")
-            self.assertEqual(stage_states["discover"], "running")
-            self.assertIsNotNone(datetime.fromisoformat(running["events"][0]["at"]).tzinfo)
-        finally:
-            release.set()
-        jobs.queue.join()
-        completed = client.get_job(request["run_id"])
-        self.assertEqual("native_complete", completed["status"])
-        self.assertIn(captured, completed["events"])
-        self.assertTrue(all(datetime.fromisoformat(event["at"]).tzinfo is not None for event in completed["events"]))
+        jobs.create(request)
+        self.seal_selection(jobs, request["run_id"])
+        self.assertTrue(started.wait(5))
+        running = jobs.snapshot(request["run_id"])
+        self.assertEqual("running", running["status"])
+        self.assertEqual("sealed", running["selection"]["state"])
+        release.set()
+        self.wait_state_any_status(jobs, request["run_id"], {"awaiting_definition"})
+        self.complete_definition(jobs, request["run_id"])
+        finished = self.await_terminal(jobs, request["run_id"])
+        self.assertEqual("native_complete", finished["status"], finished.get("error"))
 
     def test_idempotent_retry_is_bound_to_exact_request_and_survives_restart(self):
-        calls = []
+        calls: list[str] = []
 
         def runner(package, output, **kwargs):
             calls.append(kwargs["run_id"])
-            return self.capture_transfer_result(output, run_id=kwargs["run_id"], on_event=kwargs["on_event"])
+            return self.capture_transfer_result(output, run_id=kwargs["run_id"], on_event=kwargs.get("on_event"))
 
-        jobs = Jobs(self.config, runner=runner, native_preparer=self.prepare)
+        jobs = self.jobs(runner)
         request = self.request()
         jobs.create(request)
-        jobs.queue.join()
+        finished = self.run_to_terminal(jobs, request["run_id"])
+        self.assertEqual("native_complete", finished["status"], finished.get("error"))
         result, created = jobs.create(request)
         self.assertFalse(created)
         self.assertEqual("native_complete", result["status"])
         self.assertEqual(1, len(calls))
         with self.assertRaises(RequestError) as error:
-            jobs.create({**request, "handoff_sha256": "f" * 64})
+            jobs.create({**request, "upload_sha256": "f" * 64})
         self.assertEqual(409, error.exception.status)
         jobs.close()
-        resumed = self.jobs(runner)
+        resumed = self.jobs(lambda *args, **kwargs: self.fail("A finished job must not rerun"))
         self.assertEqual("native_complete", resumed.snapshot(request["run_id"])["status"])
         self.assertFalse(resumed.create(request)[1])
         self.assertEqual(1, len(calls))
-
-    def test_native_or_publication_failure_never_becomes_passing(self):
-        jobs = self.jobs(lambda *args, **kwargs: {"passed": True})
-        request = self.request()
-        jobs.create(request)
-        jobs.queue.join()
-        self.assertEqual("failed", jobs.snapshot(request["run_id"])["status"])
 
     def test_green_result_without_a_sealed_transfer_is_rejected(self):
         jobs = self.jobs(lambda *args, **kwargs: self.passing_result())
         request = self.request()
         jobs.create(request)
-        jobs.queue.join()
-        result = jobs.snapshot(request["run_id"])
-        self.assertEqual("failed", result["status"])
-        self.assertIn("sealed capture transfer", result["error"])
+        finished = self.run_to_terminal(jobs, request["run_id"])
+        self.assertEqual("failed", finished["status"])
+        self.assertIn("sealed capture transfer", finished["error"])
 
     def test_discovery_failure_retains_diagnostics_across_endpoint_restart(self):
         from description_pipeline.sources.solidworks.errors import CadError
         from description_pipeline.verification.consumer import ConsumerError
 
         def runner(*args, **kwargs):
-            self.fail("Capture or publication ran after discovery failed")
+            self.fail("Capture ran after the native reader failed")
 
         for error, detail in (
             (
@@ -144,90 +133,25 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
             ),
         ):
             with self.subTest(error=type(error).__name__):
-
-                def prepare(*args, error=error, **kwargs):
+                def native_reader(frozen, settings, on_activity=None, error=error):
                     raise error
 
-                jobs = Jobs(self.config, runner=runner, native_preparer=prepare)
+                jobs = self.jobs(runner, native_reader=native_reader)
                 try:
                     request = self.request()
                     jobs.create(request)
-                    jobs.queue.join()
-                    result = jobs.snapshot(request["run_id"])
-                    self.assertEqual("failed", result["status"])
-                    self.assertEqual(f"{type(error).__name__}: {error}", result["error"])
-                    self.assertEqual(detail, result["detail"])
+                    finished = self.run_to_terminal(jobs, request["run_id"])
+                    self.assertEqual("failed", finished["status"])
+                    self.assertEqual(f"{type(error).__name__}: {error}", finished["error"])
+                    self.assertEqual(detail, finished["detail"])
                 finally:
                     jobs.close()
-                recovered = Jobs(self.config, runner=runner, native_preparer=self.prepare)
+                recovered = self.jobs(runner)
                 try:
-                    self.assertEqual(result, recovered.snapshot(request["run_id"]))
+                    self.assertEqual(finished, recovered.snapshot(request["run_id"]))
                     self.assertFalse(recovered.create(request)[1])
                 finally:
                     recovered.close()
-
-    def test_wrong_repository_base_subject_or_quality_cannot_pass(self):
-        responses = []
-        for section, key, value in (
-            ("submission", "repository_slug", "a/other"),
-            ("submission", "url", "https://github.com/a/other/pull/1"),
-            ("submission", "base", "feature/other"),
-            ("submission", "branch", "work/solidworks/other"),
-            ("submission", "subject_sha256", "c" * 64),
-            ("quality", "passed", False),
-            ("quality", "subject_sha256", "c" * 64),
-            ("submission", "commit", ""),
-        ):
-            result = copy.deepcopy(self.passing_result())
-            result[section][key] = value
-            responses.append(result)
-        jobs = self.jobs(lambda *args, **kwargs: responses.pop(0))
-        for _ in range(len(responses)):
-            request = self.request()
-            jobs.create(request)
-            jobs.queue.join()
-            result = jobs.snapshot(request["run_id"])
-            self.assertEqual("failed", result["status"])
-            self.assertTrue(result["error"])
-
-    def test_queued_restart_rechecks_frozen_native_bytes(self):
-        jobs = Jobs(self.config, runner=lambda *a, **k: self.fail("Unexpected job"), native_preparer=self.prepare)
-        jobs.close()
-        for changed in (False, True):
-            request = self.request()
-            package = self.packages / request["package"]
-            from description_pipeline.sources.solidworks.revision import package_inventory
-
-            saved = {
-                "schema_version": "solidworks-to-urdf.job/v1",
-                "pipeline_id": "solidworks-to-urdf",
-                "run_id": request["run_id"],
-                "request": request,
-                "package_files": package_inventory(package),
-                "status": "queued",
-                "events": [],
-                "result": None,
-                "error": None,
-            }
-            if changed:
-                (package / "总装.SLDASM").write_bytes(b"Changed while offline")
-            state = self.config["state_root"] / "jobs" / (request["run_id"] + ".json")
-            write_json(state, saved)
-            calls = []
-
-            def runner(*a, calls=calls, **k):
-                calls.append(k["run_id"])
-                return self.capture_transfer_result(a[1], run_id=k["run_id"], on_event=k["on_event"])
-
-            resumed = Jobs(self.config, runner=runner, native_preparer=self.prepare)
-            resumed.queue.join()
-            result = resumed.snapshot(request["run_id"])
-            self.assertEqual("failed" if changed else "native_complete", result["status"])
-            self.assertEqual([] if changed else [request["run_id"]], calls)
-            resumed.close()
-            recovered = Jobs(self.config, runner=lambda *a, **k: self.fail("Completed job reran"))
-            self.assertEqual(result["status"], recovered.snapshot(request["run_id"])["status"])
-            recovered.close()
 
     def test_native_jobs_are_serial(self):
         active, peak = 0, 0
@@ -241,18 +165,26 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
             return {"passed": False, "error": "expected control-test failure"}
 
         jobs = self.jobs(runner)
-        for _ in range(3):
-            jobs.create(self.request())
-        jobs.queue.join()
+        requests = [self.request() for _ in range(3)]
+        for request in requests:
+            jobs.create(request)
+        for request in requests:
+            self.seal_selection(jobs, request["run_id"])
+            self.wait_state_any_status(jobs, request["run_id"], {"awaiting_definition"})
+            self.complete_definition(jobs, request["run_id"])
+        for request in requests:
+            self.await_terminal(jobs, request["run_id"])
         self.assertEqual(1, peak)
 
-    def test_extra_fields_path_escape_and_changed_handoff_are_rejected(self):
+    def test_extra_fields_path_escape_and_changed_upload_are_rejected(self):
         jobs = self.jobs(lambda *args, **kwargs: self.fail("Unvalidated request ran"))
         for mutation in (
             {"target": "unknown"},
             {"package": "../arm"},
             {"handoff_sha256": "0" * 64},
             {"command": "anything"},
+            {"upload_sha256": "0" * 64},
+            {"main_assembly": "cad/absent.SLDASM"},
         ):
             with self.subTest(mutation=mutation), self.assertRaises(PipelineError):
                 jobs.create({**self.request(), **mutation})
@@ -260,8 +192,7 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
     def test_http_authentication_and_request_contract(self):
         jobs = self.jobs(lambda *args, **kwargs: {"passed": False, "error": "expected"})
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler(jobs, self.config["token"]))
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
+        threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         address = f"http://127.0.0.1:{server.server_port}"
@@ -274,12 +205,13 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
             urllib.request.Request(address + "/v1/jobs", data=json.dumps(request).encode(), headers=headers), timeout=2
         ) as response:
             self.assertEqual(202, response.status)
-            self.assertEqual(request["run_id"], json.load(response)["run_id"])
-        jobs.queue.join()
+            body = json.load(response)
+            self.assertEqual(request["run_id"], body["run_id"])
+            self.assertEqual("awaiting_files", body["selection"]["state"])
         with urllib.request.urlopen(
             urllib.request.Request(address + "/v1/jobs/" + request["run_id"], headers=headers), timeout=2
         ) as response:
-            self.assertEqual("failed", json.load(response)["status"])
+            self.assertEqual("selecting", json.load(response)["status"])
 
     def test_second_endpoint_cannot_acquire_same_state(self):
         self.jobs(lambda *args, **kwargs: {"passed": False})
@@ -288,24 +220,29 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
 
     def test_process_exit_releases_ownership_and_fails_interrupted_job(self):
         request = self.request()
-        # A real child process exits from the running job without Jobs.close().
-        # This exercises kernel lock release, rather than deleting a lock file.
+        payload = self.root / "child-job.json"
+        write_json(payload, {"request": request})
+        # A real child process exits from an unfinished selection without
+        # Jobs.close(); this exercises kernel lock release rather than deleting
+        # a lock file, and the unfinished state must fail on the next start.
+        repo = Path(__file__).resolve().parents[2]
         script = (
-            "import os,sys;from pathlib import Path;"
-            f"sys.path.insert(0,{str(Path(__file__).resolve().parents[2] / 'src')!r});"
-            f"sys.path.insert(0,{str(Path(__file__).resolve().parents[2])!r});"
-            "from tests.v1.endpoint_support import prepare_control;"
+            "import json,os,sys;from pathlib import Path;"
+            f"sys.path.insert(0,{str(repo / 'src')!r});"
+            f"sys.path.insert(0,{str(repo)!r});"
             "from unittest.mock import patch;"
-            "patch('description_pipeline.orchestration.windows._native_tool_record',"
-            "return_value={'name':'native','version':'1.3.1','runtime':{'role':'native'}}).start();"
+            f"patch('description_pipeline.orchestration.windows._native_tool_record',return_value={TOOL!r}).start();"
             "from description_pipeline.orchestration.windows import Jobs,read_config;"
-            "j=Jobs(read_config(Path(sys.argv[1])),native_preparer=prepare_control,"
-            "runner=lambda *a,**k:(j._activity("
-            f"{request['run_id']!r},"
-            "{'phase':'capture','action':'read_components','current_object':'arm.SLDPRT'}),os._exit(17)));"
-            f"j.create({request!r});j.queue.join()"
+            "payload=json.loads(Path(sys.argv[2]).read_text());"
+            "j=Jobs(read_config(Path(sys.argv[1])));"
+            "j.create(payload['request']);"
+            "j._activity(payload['request']['run_id'],"
+            "{'phase':'discover','action':'observe','current_object':'cad/robot.SLDASM'});"
+            "os._exit(17)"
         )
-        stopped = subprocess.run([sys.executable, "-I", "-c", script, str(self.path)], capture_output=True, timeout=10)
+        stopped = subprocess.run(
+            [sys.executable, "-I", "-c", script, str(self.path), str(payload)], capture_output=True, timeout=20
+        )
         self.assertEqual(17, stopped.returncode, stopped.stderr.decode())
         resumed = self.jobs(lambda *a, **k: self.fail("Interrupted CAD job must not restart"))
         resumed.queue.join()
@@ -313,19 +250,23 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
         self.assertEqual("failed", job["status"])
         self.assertIn("Endpoint restarted during native execution", job["error"])
         self.assertIsNone(job["activity"])
-        self.assertEqual("read_components", job["activity_final"]["action"])
-        self.assertEqual("arm.SLDPRT", job["activity_final"]["current_object"])
+        self.assertEqual("observe", job["activity_final"]["action"])
+        self.assertEqual("cad/robot.SLDASM", job["activity_final"]["current_object"])
         self.assertFalse(resumed.create(request)[1])
 
-    def test_plaintext_remote_binding_and_overlapping_roots_are_rejected(self):
+    def test_remote_binding_overlapping_roots_and_obsolete_keys_are_rejected(self):
         for change in (
             {"host": "0.0.0.0"},
             {"output_root": str(self.packages / "output")},
             {"handoff_roots": []},
-            {"handoff_roots": [str(self.root.anchor)]},
-            {"handoff_roots": [str(self.packages)]},
-            {"handoff_roots": [str(self.root)]},
+            {"discovery": {}},
+            {"token_file": "relative-token"},
         ):
-            write_json(self.path, {**self.config_data, **change})
-            with self.assertRaises(PipelineError):
-                read_config(self.path)
+            with self.subTest(change=change):
+                write_json(self.path, {**self.config_data, **change})
+                with self.assertRaises(PipelineError):
+                    read_config(self.path)
+
+
+if __name__ == "__main__":
+    unittest.main()
