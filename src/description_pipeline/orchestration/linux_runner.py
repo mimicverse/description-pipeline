@@ -11,12 +11,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from packaging.utils import canonicalize_name
+
 from .. import solidworks
-from ..io import PipelineError
-from ..runtime import RUNTIME_VERSIONS, tool_record
+from ..io import PipelineError, read_data
+from ..runtime import RUNTIME_VERSIONS, required_packages, tool_record
 from .airflow_client import capture_archive_metadata, validate_run_id
 from .linux_store import PORTABLE_STAGES, LinuxStore
-from .stage_transfer import CAPTURE_ARCHIVE
+from .stage_transfer import CAPTURE_ARCHIVE, verify_transfer
 
 
 def _portable_identity_gate(store: LinuxStore, run_id: str) -> dict:
@@ -26,17 +28,54 @@ def _portable_identity_gate(store: LinuxStore, run_id: str) -> dict:
     if not isinstance(native_tool, dict) or not native_tool:
         raise PipelineError("The admitted capture carries no native tool record")
     portable = tool_record(role="portable")
-    if portable.get("runtime", {}).get("role") != "portable":
+    runtime = portable.get("runtime") or {}
+    if runtime.get("role") != "portable":
         raise PipelineError("The portable runtime did not identify itself as role=portable")
+    if runtime.get("system") != "Linux":
+        raise PipelineError("The portable runtime must execute on Linux")
+    if not str(runtime.get("python") or "").startswith("3.12"):
+        raise PipelineError("The portable runtime must execute on the pinned Python 3.12")
     for key in ("pipeline_id", "version", "source_sha256"):
         if portable.get(key) != native_tool.get(key):
             raise PipelineError(f"The portable runtime differs from the native capture in {key}; refusing to continue")
     if portable.get("release") != native_tool.get("release"):
         raise PipelineError("The portable release identity differs from the native capture; refusing to continue")
-    pin = RUNTIME_VERSIONS.get("mujoco")
-    if (portable.get("runtime", {}).get("packages") or {}).get("mujoco") != pin:
-        raise PipelineError("The portable runtime does not carry the pinned MuJoCo")
+    packages = {canonicalize_name(str(name)): value for name, value in (runtime.get("packages") or {}).items()}
+    for name in required_packages("portable"):
+        if packages.get(canonicalize_name(name)) != RUNTIME_VERSIONS.get(name):
+            raise PipelineError(f"The portable runtime does not carry the pinned {name}")
     return portable
+
+
+def _revalidate_capture(store: LinuxStore, run_id: str) -> None:
+    """Revalidate the admitted payload against its sealed transfer at point of use."""
+    meta = store.meta(run_id) or {}
+    recorded = meta.get("transfer") or {}
+    capture = store.capture_dir(run_id)
+    summary = verify_transfer(capture)
+    if not isinstance(summary, dict):
+        raise PipelineError("The admitted capture carries no sealed transfer to revalidate")
+    for key in ("run_id", "handoff_sha256", "main_assembly"):
+        if summary.get(key) != recorded.get(key):
+            raise PipelineError(f"Admitted capture provenance differs from the recorded admission: {key}")
+    files = recorded.get("files")
+    if not isinstance(files, dict) or summary.get("files") != len(files):
+        raise PipelineError("Admitted capture inventory differs from the recorded admission")
+    if read_data(capture / "reports/native-tool.json") != recorded.get("native_tool"):
+        raise PipelineError("Admitted capture native tool record differs from the recorded admission")
+
+
+def _failure_receipt(store: LinuxStore, run_id: str, stage: str, error: Exception) -> dict:
+    return {
+        "run_id": run_id,
+        "state": "failed",
+        "passed": False,
+        "stage": stage,
+        "error": f"{type(error).__name__}: {error}",
+        "error_code": getattr(error, "code", None),
+        "detail": getattr(error, "detail", None) or getattr(error, "details", None),
+        "events": store.events(run_id),
+    }
 
 
 def run_portable_stage(
@@ -57,14 +96,6 @@ def run_portable_stage(
     meta = store.meta(run_id)
     if not isinstance(meta, dict) or not store.capture_dir(run_id).is_dir():
         raise PipelineError("This run has no admitted native capture; fetch the transfer first")
-    if stage == "generate" and expected_subject is not None:
-        raise PipelineError("generate does not take an expected subject")
-    if stage in {"verify", "publish"} and not expected_subject:
-        raise PipelineError(f"{stage} requires the recorded subject of the previous checkpoint")
-    if stage == "publish" and repository is None:
-        raise PipelineError("publish requires the configured model repository checkout")
-    if stage in {"generate", "publish"}:
-        _portable_identity_gate(store, run_id)
     seeds = {
         "generate": store.capture_dir(run_id),
         "verify": store.stage_dir(run_id, "generate"),
@@ -84,29 +115,41 @@ def run_portable_stage(
             on_event(event)
 
     with solidworks.output_lock(store.run_dir(run_id)):
-        receipt = solidworks.run(
-            store.capture_dir(run_id),
-            outputs[stage],
-            repository=Path(repository) if stage == "publish" else None,
-            base=base,
-            run_id=run_id,
-            resume_from=stage,
-            stop_after=stage,
-            seed_dir=seeds[stage],
-            expected_subject=expected_subject,
-            handoff_sha256=meta.get("handoff_sha256"),
-            prior_events=store.events(run_id),
-            resume=resume,
-            on_event=sink,
-        )
-    store.record_stage(run_id, stage, receipt)
+        try:
+            if stage == "generate" and expected_subject is not None:
+                raise PipelineError("generate does not take an expected subject")
+            if stage in {"verify", "publish"} and not expected_subject:
+                raise PipelineError(f"{stage} requires the recorded subject of the previous checkpoint")
+            if stage == "publish" and repository is None:
+                raise PipelineError("publish requires the configured model repository checkout")
+            if stage == "generate":
+                _revalidate_capture(store, run_id)
+            _portable_identity_gate(store, run_id)
+            receipt = solidworks.run(
+                store.capture_dir(run_id),
+                outputs[stage],
+                repository=Path(repository) if stage == "publish" else None,
+                base=base,
+                run_id=run_id,
+                resume_from=stage,
+                stop_after=stage,
+                seed_dir=seeds[stage],
+                expected_subject=expected_subject,
+                handoff_sha256=meta.get("handoff_sha256"),
+                prior_events=store.events(run_id),
+                resume=resume,
+                on_event=sink,
+            )
+        except Exception as error:
+            store.record_stage(run_id, stage, _failure_receipt(store, run_id, stage, error))
+            raise
+        store.record_stage(run_id, stage, receipt)
     return receipt
 
 
 def fetch_capture(store: LinuxStore, endpoint, run_id: str, job: dict) -> dict:
     """Download the sealed native capture and admit it into the Linux store."""
     run_id = validate_run_id(run_id)
-    archive = capture_archive_metadata(job)
     result = job.get("result") if isinstance(job.get("result"), dict) else {}
     native_tool = result.get("native_tool")
     if not isinstance(native_tool, dict) or not native_tool:
@@ -116,6 +159,25 @@ def fetch_capture(store: LinuxStore, endpoint, run_id: str, job: dict) -> dict:
     if not isinstance(handoff, str) or not handoff:
         raise PipelineError("The native job carries no frozen handoff digest")
     main_assembly = job.get("main_assembly") or request.get("main_assembly")
+    meta = store.meta(run_id)
+    if (
+        isinstance(meta, dict)
+        and meta.get("state") == "capture_admitted"
+        and meta.get("handoff_sha256") == handoff
+        and meta.get("main_assembly") == main_assembly
+        and meta.get("native_tool") == native_tool
+        and store.capture_dir(run_id).is_dir()
+    ):
+        # A committed identical admission is returned without re-downloading the archive.
+        return {
+            "run_id": run_id,
+            "store_root": str(store.root),
+            "capture_dir": str(store.capture_dir(run_id)),
+            "handoff_sha256": handoff,
+            "main_assembly": main_assembly,
+            "state": meta.get("state"),
+        }
+    archive = capture_archive_metadata(job)
     store.run_dir(run_id).mkdir(parents=True, exist_ok=True)
     archive_path = store.run_dir(run_id) / CAPTURE_ARCHIVE
     endpoint.stream_capture_archive(run_id, archive, archive_path)
