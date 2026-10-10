@@ -101,7 +101,7 @@ class ActivityEmissionTests(unittest.TestCase):
             for expected in (
                 "session_start",
                 "scan_documents",
-                "rebuild",
+                "read_document_state",
                 "read_components",
                 "read_mates",
                 "read_datums",

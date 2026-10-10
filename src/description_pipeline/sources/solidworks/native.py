@@ -294,6 +294,36 @@ def _active_configuration(doc):
     return str(name) if name else None
 
 
+def _discovery_document_state(doc):
+    """Observe saved/rebuild status; never refresh or rewrite engineering data."""
+
+    state = {}
+    for name, reader, expected in (
+        ("save_flag", lambda: _method(doc, "GetSaveFlag"), bool),
+        ("needs_rebuild2_value", lambda: _member(_member(doc, "Extension"), "NeedsRebuild2"), int),
+        ("read_only", lambda: _member(doc, "IsOpenedReadOnly"), bool),
+    ):
+        try:
+            value = reader()
+            if type(value) is not expected:
+                raise ValueError(f"unexpected native value: {value!r}")
+            state[name] = value
+        except Exception as error:  # noqa: BLE001 - unread state is explicit, never assumed clean
+            state[name] = None
+            state[name + "_error"] = f"{type(error).__name__}: {error}"[:300]
+    try:
+        _manager, active = _active_configuration_view(doc)
+        state["configuration"] = str(_member(active, "Name") or "")
+        value = _member(active, "NeedsRebuild")
+        if type(value) is not bool:
+            raise ValueError(f"unexpected native value: {value!r}")
+        state["configuration_needs_rebuild"] = value
+    except Exception as error:  # noqa: BLE001
+        state["configuration_needs_rebuild"] = None
+        state["configuration_needs_rebuild_error"] = f"{type(error).__name__}: {error}"[:300]
+    return state
+
+
 def _select_configuration(doc, configuration, occurrence):
     """Select and check the configuration before reading a shared document."""
     detail = {"component": occurrence, "configuration": configuration}
@@ -1472,6 +1502,7 @@ def _component_source_document(component, source_root):
         return {"document": relative}
     provenance = {
         "state": "unread",
+        "source_root": str(Path(source_root).resolve()),
         "native_document_path": native_path,
         "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
     }
@@ -3498,15 +3529,8 @@ class SolidWorksBackend(CadBackend):
                 )
             doc = main_entry["doc"]
             notes: list[str] = []
-            activity.emit("rebuild", current_object=_activity_object(main_path, source_root), force=True)
-            try:
-                rebuilt = bool(_member(doc, "ForceRebuild3", False))
-            except Exception as error:  # noqa: BLE001
-                raise CadError(
-                    "cad_rebuild_failed", "the assembly could not be rebuilt before capture", {"error": str(error)}
-                ) from error
-            if not rebuilt:
-                raise CadError("cad_rebuild_failed", "ForceRebuild3 reported failure; the saved state is stale")
+            activity.emit("read_document_state", current_object=_activity_object(main_path, source_root), force=True)
+            document_state_before = _discovery_document_state(doc)
             _manager, active = _active_configuration_view(doc)
             configuration = str(_member(active, "Name") or "")
             if not configuration:
@@ -3973,6 +3997,11 @@ class SolidWorksBackend(CadBackend):
                 "generator": "solidworks-native-reader",
                 "solidworks": dict(self.environment()),
                 "saved_configuration": configuration,
+                "document_state": {
+                    "before": document_state_before,
+                    "after": _discovery_document_state(self._document_by_path(str(main_path))),
+                    "used_api": "IModelDoc2.GetSaveFlag/IModelDocExtension.NeedsRebuild2/IConfiguration.NeedsRebuild",
+                },
                 "identity": {
                     "hardware_id": identity_properties.get("dp.hardware_id"),
                     "revision": identity_properties.get("dp.revision"),

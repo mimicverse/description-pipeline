@@ -208,6 +208,22 @@ class ReferenceAxisReadTests(unittest.TestCase):
 
 
 class ImportedSourceBindingTests(unittest.TestCase):
+    def test_discovery_records_staleness_without_rebuilding_the_saved_model(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assembly = _write(root, "robot.SLDASM")
+            doc = _Doc(assembly)
+            doc.ForceRebuild3 = _raiser(AssertionError("saved-state discovery must never rebuild"))
+            doc.GetSaveFlag = lambda: False
+            doc.Extension.NeedsRebuild2 = 1
+            app = _App({assembly: doc})
+            backend = N.SolidWorksBackend(session_factory=lambda: _Session(app))
+            with _com_stubs():
+                record = backend.discover_native(root, {"main_assembly": "robot.SLDASM"})
+        self.assertIs(record["document_state"]["before"]["save_flag"], False)
+        self.assertEqual(record["document_state"]["before"]["needs_rebuild2_value"], 1)
+        self.assertIs(record["document_state"]["after"]["save_flag"], False)
+
     def test_discovery_binds_and_hashes_the_import_source_not_the_generated_temp_file(self):
         with TemporaryDirectory() as tmp, TemporaryDirectory() as native_tmp:
             root = Path(tmp)
@@ -237,6 +253,7 @@ class ImportedSourceBindingTests(unittest.TestCase):
                 IsVirtual=False,
             )
             result = N._component_source_document(component, root)
+            self.assertEqual(result["source_provenance"]["source_root"], str(root.resolve()))
         self.assertEqual(result["document"], "battery.step")
         provenance = result["source_provenance"]
         self.assertEqual(provenance["state"], "resolved")
