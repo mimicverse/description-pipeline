@@ -75,6 +75,15 @@ def fixture():
                 "used_api": "IFeature.GetSpecificFeature2/IRefAxis.GetRefAxisParams",
             }
         ],
+        "identity": {
+            "hardware_id": "fixture",
+            "revision": "r1",
+            "parent_revision": None,
+            "owner": "test-owner",
+            "change_summary": "native verification fixture",
+            "control": {"system": "handoff", "reference": "fixture"},
+            "robot_name": "fixture",
+        },
         "mates": [],
     }
     for key, name in [("41424344", "base_part"), ("414243", "module-1"), ("444546", "module-1/tool_part")]:
@@ -326,6 +335,7 @@ class NativeDeclarationsTests(unittest.TestCase):
                 "contract": "native-discovery/v1",
                 "raw": raw,
                 "native_files": native_files,
+                "identity": copy.deepcopy(raw["identity"]),
             }
             data = json.dumps(payload).encode()
             (package / "discovery").mkdir()
@@ -344,9 +354,14 @@ class NativeDeclarationsTests(unittest.TestCase):
                     "native_inventory_sha256": hashlib.sha256(inventory).hexdigest(),
                 },
             }
+            robot["source"]["robot_name"] = "fixture"
             (package / "robot.yaml").write_text(json.dumps(robot))
             (package / "cad-revision.json").write_text(
-                json.dumps({"hardware_id": "fixture", "cad_files": native_files})
+                json.dumps({
+                    "schema_version": "solidworks-to-urdf.cad-revision/v1",
+                    **{key: value for key, value in raw["identity"].items() if key != "robot_name"},
+                    "cad_files": native_files,
+                })
             )
             report = verify_discovery(package)
             self.assertTrue(report["passed"], report["errors"])
@@ -359,6 +374,48 @@ class NativeDeclarationsTests(unittest.TestCase):
                 (package / "discovery/native-discovery.json").write_bytes(data)
                 robot["provenance"]["discovery_sha256"] = hashlib.sha256(data).hexdigest()
                 (package / "robot.yaml").write_text(json.dumps(robot))
+
+            authored = copy.deepcopy(raw["identity"])
+            manifest = (package / "cad-revision.json").read_bytes()
+            (package / "cad-revision.json").unlink()
+            self.assertIn("discovery.revision", {item["code"] for item in verify_discovery(package)["errors"]})
+            raw["identity"] = dict.fromkeys(authored)
+            payload["identity"] = copy.deepcopy(raw["identity"])
+            robot["hardware_id"] = None
+            robot["source"]["robot_name"] = "robot"
+            reseal()
+            unsealed = verify_discovery(package)
+            self.assertTrue(unsealed["passed"], unsealed["errors"])
+            self.assertNotIn("discovery.revision", {item["id"] for item in unsealed["checks"]})
+            self.assertEqual(
+                [item["code"] for item in unsealed["diagnostics"]],
+                ["discovery.publication_metadata_incomplete", "discovery.revision_not_sealed"],
+            )
+            self.assertTrue(all(item["blocking"] is False for item in unsealed["diagnostics"]))
+            for mutate in (
+                lambda: robot.update(hardware_id="fabricated"),
+                lambda: raw["identity"].update(owner=42),
+                lambda: raw["identity"].update(control={"system": "unknown", "reference": None}),
+                lambda: raw["identity"].update(control={"system": "git", "reference": "short-hash"}),
+                lambda: robot["source"].update(robot_name="fabricated"),
+                lambda: payload["identity"].update(revision="fabricated"),
+            ):
+                mutate()
+                reseal()
+                self.assertIn("discovery.identity", {item["code"] for item in verify_discovery(package)["errors"]})
+                raw["identity"] = dict.fromkeys(authored)
+                payload["identity"] = copy.deepcopy(raw["identity"])
+                robot["hardware_id"] = None
+                robot["source"]["robot_name"] = "robot"
+            (package / "cad-revision.json").write_bytes(manifest)
+            reseal()
+            self.assertIn("discovery.revision", {item["code"] for item in verify_discovery(package)["errors"]})
+            raw["identity"] = authored
+            payload["identity"] = copy.deepcopy(authored)
+            robot["hardware_id"] = "fixture"
+            robot["source"]["robot_name"] = "fixture"
+            reseal()
+            self.assertTrue(verify_discovery(package)["passed"])
 
             payload["budget"] = None
             reseal()

@@ -193,17 +193,47 @@ def require_qualified_report(report):
     return report
 
 
-def _input(root):
+def _input(root, diagnostics=None):
+    """Bind the archived input; an absent publication seal is a readiness warning, not a failure.
+
+    A supplied cad-revision.json stays strictly validated (malformed or tampered metadata
+    fails).  When the seal is absent the delivery is only acceptable while the authored
+    administrative identity is incomplete; engineering evidence is bound to the archived
+    native record and the captured package inventory instead.
+    """
+
+    from .native_discovery import REVISION_FILE
+
+    diagnostics = [] if diagnostics is None else diagnostics
     report = inspect_package(root / "input")
     _require(report.get("passed") is True, str(report.get("errors")))
     definition = report["input"]
-    revision = read_revision(root / "input", hardware_id=definition["hardware_id"])
     saved = read_data(confined(root, "reports/input.json"))
     _require(
         saved.get("passed") is True and saved.get("input") == definition,
         "Input report does not bind the author definition",
     )
-    _require(saved.get("cad_revision") == revision, "Input report has another CAD revision")
+    seal = root / "input" / REVISION_FILE
+    _require(not seal.is_symlink(), "The revision manifest cannot be a symlink")
+    if seal.is_file():
+        revision = read_revision(root / "input", hardware_id=definition.get("hardware_id"))
+        _require(saved.get("cad_revision") == revision, "Input report has another CAD revision")
+    else:
+        _require(
+            not definition.get("hardware_id"),
+            "Missing generated cad-revision.json for a fully identified delivery",
+        )
+        diagnostics.append(
+            {
+                "code": "input.cad_revision_not_sealed",
+                "blocking": False,
+                "message": (
+                    "cad-revision.json is absent while authored publication metadata is incomplete; "
+                    "engineering checks bind the archived native evidence instead"
+                ),
+                "detail": {"hardware_id": definition.get("hardware_id")},
+            }
+        )
     files = package_inventory(root / "input")
     _require(saved.get("package_files") == files, "Archived input differs from the captured package")
     return definition
@@ -224,7 +254,7 @@ def _native(root, manifest):
     return {"solidworks_revision": revision, "configuration": manifest["identity"]["configuration"]}
 
 
-def _native_discovery(package):
+def _native_discovery(package, diagnostics=None):
     """Mandatory native-discovery gate: an authored or stripped package fails.
 
     Every current v1 delivery carries the generated provenance block and the
@@ -234,6 +264,7 @@ def _native_discovery(package):
 
     from .native_discovery import verify_discovery
 
+    diagnostics = [] if diagnostics is None else diagnostics
     report = verify_discovery(Path(package))
     if report.get("passed") is not True:
         failures = report.get("errors") or [{"code": "discovery.missing", "message": "no native discovery record"}]
@@ -246,6 +277,16 @@ def _native_discovery(package):
             ]
         }
         raise error
+    for item in report.get("diagnostics") or []:
+        if isinstance(item, dict) and item.get("code"):
+            diagnostics.append(
+                {
+                    "code": item.get("code"),
+                    "blocking": False,
+                    "message": str(item.get("message") or ""),
+                    "detail": item.get("detail"),
+                }
+            )
     return {
         "contract": report.get("contract"),
         "discovery_sha256": report.get("discovery_sha256"),
@@ -262,7 +303,7 @@ def _dependencies(root, definition):
     _require(bool(original) and bool(closure["mapping"]), "Missing dependency mapping")
     actual = {"source/" + name: checksum for name, checksum in inventory(root / "evidence/source").items()}
     _require(actual == closure["copy_files"], "Collected CAD changed")
-    original_hashes = set(read_revision(root / "input")["cad_files"].values())
+    original_hashes = _handoff_native_hashes(root / "input")
     _require(set(original.values()) <= original_hashes, "Capture used CAD outside the mechanical handoff")
     top = [row for row in closure["mapping"] if row["instance"] == "top_level"]
     _require(len(top) == 1, "Missing unique top assembly mapping")
@@ -282,6 +323,29 @@ def _dependencies(root, definition):
         "collected_documents": len(actual),
         "suppressed_instances": closure["suppressed_instances"],
     }
+
+
+def _handoff_native_hashes(input_root: Path) -> set[str]:
+    """Hashes of the frozen handoff bytes from archived native evidence.
+
+    The publication seal is optional while authored metadata is incomplete; every
+    captured dependency still has to match the archived native-file and raw-record
+    inventories. A supplied seal stays strictly validated and adds its own binding.
+    """
+
+    from .native_discovery import DISCOVERY_FILE, REVISION_FILE
+
+    payload = read_data(confined(input_root, DISCOVERY_FILE))
+    native = payload.get("native_files") if isinstance(payload, dict) else None
+    _require(isinstance(native, dict) and bool(native), "The archived native file inventory is missing")
+    hashes = {str(checksum) for checksum in native.values()}
+    raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
+    hashes.update(str(checksum) for checksum in (raw.get("files") or {}).values())
+    seal = input_root / REVISION_FILE
+    _require(not seal.is_symlink(), "The revision manifest cannot be a symlink")
+    if seal.is_file():
+        hashes.update(read_revision(input_root)["cad_files"].values())
+    return hashes
 
 
 def _entities(source, raw, model):
@@ -330,7 +394,9 @@ def _xml(root, definition, model):
         b"<!DOCTYPE" not in payload.upper() and b"<!ENTITY" not in payload.upper(), "XML declarations are forbidden"
     )
     document = ET.fromstring(payload)
-    _require(document.tag == "robot" and document.get("name") == definition["hardware_id"], "Wrong URDF robot identity")
+    robot_name = (definition.get("source") or {}).get("robot_name")
+    _require(isinstance(robot_name, str) and bool(robot_name), "The input definition carries no robot label")
+    _require(document.tag == "robot" and document.get("name") == robot_name, "Wrong URDF robot identity")
     _require({child.tag for child in document} <= {"link", "joint"}, "Unexpected top-level URDF extension")
     links = document.findall("link")
     joints = document.findall("joint")
@@ -582,10 +648,11 @@ def _geometry(root, body, node, model_link, geometry, components, body_pose, urd
 def evaluate_bundle(root: Path) -> dict:
     """Recompute the quality report without reading the saved quality decision."""
     root = Path(root)
+    diagnostics: list[dict] = []
     gates = _Gates()
     subject = gates.add("bundle.subject", lambda: {"sha256": subject_digest(root)})
-    definition = gates.add("input.valid", lambda: _input(root))
-    gates.add("source.native_discovery", lambda: _native_discovery(root / "input"))
+    definition = gates.add("input.valid", lambda: _input(root, diagnostics))
+    gates.add("source.native_discovery", lambda: _native_discovery(root / "input", diagnostics))
     gates.add("tool.identity", lambda: _tool(root))
     manifest = gates.add("source.integrity", lambda: verify_snapshot(root / "evidence"))
     if manifest is not None:
@@ -634,6 +701,7 @@ def evaluate_bundle(root: Path) -> dict:
         "passed": bool(gates.checks) and all(check["passed"] for check in gates.checks),
         "checks": gates.checks,
         "required_checks": required,
+        "diagnostics": diagnostics,
     }
 
 

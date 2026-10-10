@@ -7,7 +7,7 @@ It runs without Windows or SolidWorks: everything it needs (the raw record, the
 embedded controlled records and the generated contract files) is inside the
 package.
 
-Only three facts are taken from the package as *claims*: ``robot.yaml``, the
+Only three facts are taken from the package as *claims*: ``robot.yaml``, a supplied
 ``cad-revision.json`` seal and the discovery payload itself.  The payload is
 bound by digest to the package's provenance block; every derived value is
 recomputed here before it is accepted.
@@ -78,6 +78,68 @@ def _read_yaml(path: Path) -> dict:
 
 def _read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _authored_identity(raw: dict, namespace: str) -> dict:
+    """Read optional authored metadata without inventing a publication identity."""
+    identity = raw.get("identity")
+    properties = (raw.get("properties") or {}).get("document") or {}
+    _require(identity is None or isinstance(identity, dict), "discovery.identity", "raw identity is not an object")
+    _require(isinstance(properties, dict), "discovery.identity", "document properties are not an object")
+    identity = identity or {}
+    control = identity.get("control")
+    _require(
+        control is None or (isinstance(control, dict) and not set(control) - {"system", "reference"}),
+        "discovery.identity", "authored control metadata is malformed",
+    )
+
+    def value(key):
+        direct = (control or {}).get(key.split(".")[1]) if key.startswith("control.") else identity.get(key)
+        stored = properties.get(namespace + "." + key)
+        normalized = []
+        for candidate in (direct, stored):
+            if candidate is None:
+                continue
+            _require(
+                isinstance(candidate, str) and bool(candidate.strip())
+                and not any(ord(char) < 32 or ord(char) == 127 for char in candidate),
+                "discovery.identity", "supplied metadata must be non-empty text", {"field": key},
+            )
+            normalized.append(candidate.strip())
+        _require(
+            len(set(normalized)) <= 1, "discovery.identity", "native metadata readings disagree", {"field": key},
+        )
+        return normalized[0] if normalized else None
+
+    fields = ("hardware_id", "revision", "parent_revision", "owner", "change_summary", "robot_name")
+    authored = {key: value(key) for key in fields}
+    for key in ("hardware_id", "revision", "parent_revision"):
+        _require(
+            authored[key] is None or _ID.fullmatch(authored[key]),
+            "discovery.identity", "supplied metadata is not an ASCII identifier", {"field": key},
+        )
+    _require(
+        authored["parent_revision"] is None or authored["parent_revision"] != authored["revision"],
+        "discovery.identity", "a revision cannot name itself as its parent",
+    )
+    _require(
+        authored["robot_name"] is None or _SNAKE.fullmatch(authored["robot_name"]),
+        "discovery.identity", "authored robot name is not snake_case",
+    )
+    system, reference = value("control.system"), value("control.reference")
+    _require(
+        system is None or system in {"git", "pdm", "handoff"},
+        "discovery.identity", "supplied control system is unsupported",
+    )
+    _require(
+        system != "git" or reference is None or re.search(r"\b[0-9a-f]{40}(?:[0-9a-f]{24})?\b", reference),
+        "discovery.identity", "Git control reference lacks a full commit hash",
+    )
+    authored["control"] = {"system": system, "reference": reference} if system and reference else None
+    authored["missing"] = [
+        key for key in ("hardware_id", "revision", "owner", "change_summary", "control") if authored[key] is None
+    ]
+    return authored
 
 
 def _digest_files(root: Path) -> dict[str, str]:
@@ -1357,6 +1419,7 @@ def verify_discovery(package: Path) -> dict:
     package = Path(package)
     checks: list[dict] = []
     errors: list[dict] = []
+    diagnostics: list[dict] = []
     state: dict = {}
 
     def check(identifier, callback):
@@ -1448,11 +1511,6 @@ def verify_discovery(package: Path) -> dict:
             "the native inventory digest does not match provenance",
         )
         _require(robot.get("schema_version") == INPUT_SCHEMA, "discovery.binding", "robot.yaml schema changed")
-        _require(
-            _ID.match(str(robot.get("hardware_id") or "")),
-            "discovery.binding",
-            "hardware_id is not an ASCII identifier",
-        )
         state["robot"] = robot
         state["payload"] = payload
         state["provenance"] = provenance
@@ -1498,10 +1556,63 @@ def verify_discovery(package: Path) -> dict:
             )
         return {"native_files": len(native), "cad_files": len(observed)}
 
+    def identity():
+        payload, robot = state["payload"], state["robot"]
+        authored = _authored_identity(payload.get("raw") or {}, str(payload.get("namespace") or "dp"))
+        state["authored_identity"] = authored
+        claimed = payload.get("identity")
+        _require(isinstance(claimed, dict), "discovery.identity", "generated identity claims are absent")
+        for key in ("hardware_id", "revision", "parent_revision", "owner", "change_summary", "control"):
+            _require(
+                claimed.get(key) == authored[key],
+                "discovery.identity",
+                "generated metadata differs from native evidence",
+                {"field": key},
+            )
+        _require(
+            robot.get("hardware_id") == authored["hardware_id"],
+            "discovery.identity", "robot.yaml hardware_id differs from authored native metadata",
+        )
+        technical_name = authored["robot_name"]
+        label_source = "authored_robot_name"
+        if technical_name is None:
+            label_source = "hardware_id" if authored["hardware_id"] is not None else "technical_default"
+            technical_name = re.sub(r"[^0-9A-Za-z]+", "_", authored["hardware_id"] or "robot").strip("_").lower()
+        _require(
+            (robot.get("source") or {}).get("robot_name") == technical_name,
+            "discovery.identity", "generated robot label differs from its recorded naming source",
+        )
+        if authored["missing"]:
+            diagnostics.append({
+                "code": "discovery.publication_metadata_incomplete", "blocking": False,
+                "message": "engineering evidence is inspectable; authored publication metadata is incomplete",
+                "detail": {"missing": authored["missing"]},
+            })
+        return {"missing_publication_fields": authored["missing"], "technical_label": technical_name,
+                "label_source": label_source}
+
     def revision():
         robot = state["robot"]
+        _require(not revision_path.is_symlink(), "discovery.revision", "cad-revision.json must be a regular file")
         _require(revision_path.is_file(), "discovery.revision", "cad-revision.json is missing")
         revision = _read_json(revision_path)
+        fields = {"schema_version", "hardware_id", "revision", "parent_revision", "owner", "change_summary",
+                  "control", "cad_files"}
+        _require(
+            isinstance(revision, dict) and not set(revision) - fields
+            and revision.get("schema_version") == "solidworks-to-urdf.cad-revision/v1",
+            "discovery.revision", "the supplied revision manifest is malformed",
+        )
+        authored = state.get("authored_identity")
+        _require(
+            authored is not None and not authored["missing"],
+            "discovery.revision", "the revision manifest lacks complete native author metadata",
+        )
+        for key in ("hardware_id", "revision", "parent_revision", "owner", "change_summary", "control"):
+            _require(
+                revision.get(key) == authored[key], "discovery.revision",
+                "revision metadata differs from native author metadata", {"field": key},
+            )
         _require(
             revision.get("hardware_id") == robot.get("hardware_id"),
             "discovery.revision",
@@ -2503,6 +2614,7 @@ def verify_discovery(package: Path) -> dict:
     bound = check("discovery.binding", binding)
     dependent = (
         ("discovery.files", files),
+        ("discovery.identity", identity),
         ("discovery.revision", revision),
         ("discovery.budgets", budgets),
         ("discovery.graph", graph),
@@ -2521,6 +2633,7 @@ def verify_discovery(package: Path) -> dict:
         # external design budget; never invent nominal mass or extent ranges.
         dependent = (
             ("discovery.files", files),
+            ("discovery.identity", identity),
             ("discovery.revision", revision),
             ("discovery.budgets", budgets),
             ("discovery.masses", masses),
@@ -2536,6 +2649,22 @@ def verify_discovery(package: Path) -> dict:
             dependent = tuple(item for item in dependent if item[0] != "discovery.budgets")
     if bound["passed"]:
         for identifier, callback in dependent:
+            if identifier == "discovery.revision":
+                authored = state.get("authored_identity") or {}
+                if not revision_path.exists() and not revision_path.is_symlink() and authored.get("missing"):
+                    # Native file/provenance checks still bind every captured byte. The
+                    # absent publication seal is a readiness warning, never a passed check.
+                    diagnostics.append(
+                        {
+                            "code": "discovery.revision_not_sealed",
+                            "blocking": False,
+                            "message": (
+                                "cad-revision.json is absent while authored publication metadata is incomplete"
+                            ),
+                            "detail": {"state": "not_sealed", "missing": list(authored.get("missing") or [])},
+                        }
+                    )
+                    continue
             check(identifier, callback)
     else:
         for identifier, _callback in dependent:
@@ -2552,6 +2681,7 @@ def verify_discovery(package: Path) -> dict:
         "passed": passed,
         "checks": checks,
         "errors": errors,
+        "diagnostics": diagnostics,
     }
     if checks and checks[0]["passed"]:
         report["discovery_sha256"] = checks[0]["details"].get("discovery_sha256")
