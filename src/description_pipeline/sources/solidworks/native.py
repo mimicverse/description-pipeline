@@ -446,6 +446,71 @@ def resolve_dependency_path(value, document_path):
     return module.normpath(module.join(base, text))
 
 
+def closed_document_dependencies(
+    app,
+    document_path,
+    *,
+    traverse=False,
+    search=False,
+    add_read_only_info=False,
+    max_documents=4096,
+):
+    """Dependencies of a saved document **without opening it**.
+
+    ``ISldWorks::GetDocumentDependencies2`` reads a closed document's stored
+    references; with ``search=False`` SolidWorks looks "where the documents
+    were last saved" instead of applying the File Locations search rules, and
+    ``traverse=False`` returns the first level only (walk per file for a
+    closure).  Each document contributes two strings (file name, location) or
+    three when read-only info is requested; bare names are joined against the
+    document directory with :func:`resolve_dependency_path`.
+
+    No document is opened, no geometry is read and no folder search happens.
+    """
+
+    raw = list(
+        _method(
+            app,
+            "GetDocumentDependencies2",
+            str(document_path),
+            bool(traverse),
+            bool(search),
+            bool(add_read_only_info),
+        )
+        or ()
+    )
+    width = 3 if add_read_only_info else 2
+    if len(raw) % width:
+        raise CadError(
+            "dependency_list_invalid",
+            str(document_path),
+            {"entries": len(raw), "width": width},
+        )
+    documents = len(raw) // width
+    if documents > max_documents:
+        raise CadError(
+            "dependency_list_too_large",
+            str(document_path),
+            {"documents": documents, "limit": max_documents},
+        )
+    entries = []
+    for index in range(0, len(raw), width):
+        name = raw[index]
+        if not isinstance(name, str) or not name.strip():
+            raise CadError("dependency_list_invalid", str(document_path), {"index": index})
+        location = raw[index + 1]
+        if location is not None and not isinstance(location, str):
+            raise CadError("dependency_list_invalid", str(document_path), {"index": index + 1})
+        entry = {
+            "name": name,
+            "path": resolve_dependency_path(str(location or name), str(document_path)),
+        }
+        if width == 3:
+            entry["read_only"] = bool(raw[index + 2])
+        entries.append(entry)
+    return entries
+
+
 def normalize_document_path(path):
     return (path or "").replace("/", "\\").strip().lower()
 
