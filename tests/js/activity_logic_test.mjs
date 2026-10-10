@@ -160,7 +160,7 @@ const EMITTED_ACTIONS = [
   ["discover.scan_documents", "扫描工程文件"],
   ["discover.open_document", "打开文档"],
   ["discover.select_configuration", "切换配置"],
-  ["discover.rebuild", "重建模型"],
+  ["discover.read_document_state", "读取已保存的模型状态"],
   ["discover.read_components", "读取装配组件"],
   ["discover.read_mates", "读取配合关系"],
   ["discover.read_datums", "读取基准与坐标系"],
