@@ -45,10 +45,10 @@ from ..io import (
     write_json,
 )
 from ..sources.snapshot import verify_snapshot
-from ..sources.solidworks.revision import package_inventory, read_revision
-from ..repository.urdf_pr import _origin_slug, _slug_hardware
+from ..sources.solidworks.revision import package_inventory
 from ..runtime import tool_record
 from ..stages import STAGE_IDS, stage_view
+from .stage_transfer import CAPTURE_MANIFEST as CAPTURE_MANIFEST_NAME
 from .recovery import stage_reruns, start_plan
 from ..sources.solidworks.handoff import HANDOFF_SCHEMA, MAX_HANDOFF_BYTES, freeze_handoff, import_archive
 
@@ -56,6 +56,15 @@ _SHA = re.compile(r"^[0-9a-f]{64}$")
 _HARDWARE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
 JOB_SCHEMA = "solidworks-to-urdf.job/v1"
 CONFIG_SCHEMA = "solidworks-to-urdf.endpoint/v1"
+
+#: Stages the Windows endpoint owns; generation, verification and publication run on Linux.
+NATIVE_STAGES = tuple(STAGE_IDS[:3])
+
+
+def _native_tool_record() -> dict:
+    """The native-role tool identity for the sealed capture provenance."""
+
+    return tool_record(role="native")
 
 
 class RequestError(PipelineError):
@@ -188,16 +197,19 @@ def read_config(path):
             isinstance(hardware, str)
             and _HARDWARE.fullmatch(hardware) is not None
             and isinstance(target, dict)
-            and set(target) == {"repository", "base"},
-            "Each hardware identity needs a repository and base",
+            and set(target) == {"repository_slug", "base"},
+            "Each hardware identity needs a repository slug and base",
         )
-        target["repository"] = _root(target["repository"])
-        _require(target["repository"].is_dir(), "Target repository does not exist")
+        _require(
+            isinstance(target["repository_slug"], str)
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", target["repository_slug"])
+            is not None,
+            "Target repository slug must be owner/name",
+        )
         _require(
             isinstance(target["base"], str) and target["base"].startswith("feature/"),
             "Model PR base must be feature/<hardware>",
         )
-        roots.append(target["repository"])
     for index, first in enumerate(roots):
         for second in roots[index + 1 :]:
             _require(
@@ -366,6 +378,37 @@ class Jobs:
         failed = output.with_name(output.name + ".failed")
         return failed if failed.is_dir() else None
 
+    def _verified_capture_archive(self, identifier, archive):
+        """Re-hash the sealed transfer; native_complete is refused on any mismatch."""
+        output = self.config["output_root"] / identifier
+        name = archive.get("name")
+        _require(isinstance(name, str) and bool(name), "Capture archive name is missing")
+        for key in ("sha256", "manifest_sha256"):
+            _require(
+                isinstance(archive.get(key), str) and _SHA.fullmatch(archive[key]) is not None,
+                f"Capture archive {key} is missing",
+            )
+        archive_path = confined(output, name)
+        manifest_path = confined(output, CAPTURE_MANIFEST_NAME)
+        _require(
+            archive_path.is_file() and manifest_path.is_file(),
+            "Sealed capture transfer files are missing from the run output",
+        )
+        _require(
+            file_digest(archive_path) == archive["sha256"],
+            "Capture archive differs from its recorded digest",
+        )
+        _require(
+            file_digest(manifest_path) == archive["manifest_sha256"],
+            "Transfer manifest differs from its recorded digest",
+        )
+        return {
+            "name": name,
+            "sha256": archive["sha256"],
+            "size": archive_path.stat().st_size,
+            "manifest_sha256": archive["manifest_sha256"],
+        }
+
     @staticmethod
     def _recorded_subject(job):
         result = job.get("result") if isinstance(job.get("result"), dict) else {}
@@ -420,10 +463,21 @@ class Jobs:
         }
 
     @staticmethod
+    def _native_stage_rows(rows):
+        """The native endpoint owns freeze/discover/capture; the rest runs on Linux."""
+        for row in rows:
+            if row.get("stage") not in NATIVE_STAGES:
+                row["eligible"] = False
+                row["reason"] = "linux_owned"
+                row["reason_zh"] = "该阶段已移至 Linux 执行；请通过交付流程重新运行"
+                row["recomputes"] = []
+        return rows
+
+    @staticmethod
     def _tool_identity():
         """The full installed tool record; identity is compared as a whole."""
         try:
-            return tool_record()
+            return _native_tool_record()
         except (PipelineError, OSError, ValueError):
             return None
 
@@ -570,7 +624,7 @@ class Jobs:
         ):
             probe["target"] = (
                 "ok"
-                if _origin_slug(target["repository"]) == job["repository_slug"]
+                if target.get("repository_slug") == job["repository_slug"]
                 and target["base"] == job["repository_base"]
                 else "changed"
             )
@@ -579,7 +633,7 @@ class Jobs:
     def _tool_state(self, job):
         """Whether the installed tool still matches the tool recorded for this job."""
         try:
-            current = tool_record()
+            current = _native_tool_record()
         except (PipelineError, OSError, ValueError):
             return "unknown"
         recorded = job.get("tool")
@@ -644,8 +698,8 @@ class Jobs:
     def plan(self, identifier):
         """Memoized linked-run plan for the run detail route; create() probes afresh."""
         job = self.snapshot(identifier)
-        if job.get("status") not in {"passed", "failed"}:
-            rows = stage_reruns(job, probe={}, tool="ok")
+        if job.get("status") not in {"passed", "failed", "native_complete"}:
+            rows = self._native_stage_rows(stage_reruns(job, probe={}, tool="ok"))
             return {"run_id": identifier, "status": job.get("status"), "stage_reruns": rows}
         key = (job.get("status"), job.get("completed_at"))
         with self.mutex:
@@ -655,7 +709,9 @@ class Jobs:
         payload = {
             "run_id": identifier,
             "status": job.get("status"),
-            "stage_reruns": stage_reruns(job, probe=self._probe(job), tool=self._tool_state(job)),
+            "stage_reruns": self._native_stage_rows(
+                stage_reruns(job, probe=self._probe(job), tool=self._tool_state(job))
+            ),
         }
         with self.mutex:
             self._plans[identifier] = (key, time.monotonic(), payload)
@@ -692,6 +748,25 @@ class Jobs:
         }
 
     def artifact(self, identifier, name):
+        job = self.snapshot(identifier)
+        archive = job.get("capture_archive") if isinstance(job.get("capture_archive"), dict) else None
+        if job.get("status") == "native_complete" and archive:
+            if name == archive.get("name"):
+                expected = archive.get("sha256")
+            elif name == CAPTURE_MANIFEST_NAME:
+                expected = archive.get("manifest_sha256")
+            else:
+                raise RequestError("Only the sealed native capture transfer is available for this run", 404)
+            path = confined(self.config["output_root"] / identifier, name)
+            stream = path.open("rb")
+            try:
+                if hashlib.file_digest(stream, "sha256").hexdigest() != expected:
+                    raise RequestError("Transfer artifact differs from its bound digest", 409)
+                stream.seek(0)
+                return stream, path.stat().st_size
+            except BaseException:
+                stream.close()
+                raise
         preview = self.preview(identifier)
         _require(name in preview["files"], "Only verified URDF and mesh assets are available")
         path = confined(self.config["output_root"] / identifier, name)
@@ -718,6 +793,12 @@ class Jobs:
                 return self.snapshot(identifier), False
             package = self.validate(request)
             spec = _resume_spec(request)
+            if spec is not None and spec["from_stage"] not in NATIVE_STAGES:
+                raise _refusal(
+                    "linux_owned",
+                    "该阶段已移至 Linux 执行；请通过交付流程重新运行",
+                    from_stage=spec["from_stage"],
+                )
             events = []
             inherited = {}
             if spec is not None:
@@ -830,7 +911,7 @@ class Jobs:
             job.update(
                 hardware_id=prepared.hardware_id,
                 revision=prepared.revision,
-                repository_slug=_origin_slug(target["repository"]),
+                repository_slug=target["repository_slug"],
                 repository_base=target["base"],
                 prepared_files=files,
                 prepared_dir=str(package),
@@ -848,6 +929,15 @@ class Jobs:
             spec = None
             try:
                 spec = _resume_spec(job["request"])
+                if spec is not None and spec["from_stage"] not in NATIVE_STAGES:
+                    raise RequestError(
+                        "The requested stage is owned by the Linux delivery flow",
+                        409,
+                        payload={
+                            "reason": "linux_owned",
+                            "reason_zh": "该阶段已移至 Linux 执行；请通过交付流程重新运行",
+                        },
+                    )
                 with self.mutex:
                     job.update(status="running", started_at=datetime.now(UTC).isoformat())
                     self._save(job)
@@ -912,19 +1002,16 @@ class Jobs:
                 _require(
                     isinstance(job.get("repository_slug"), str)
                     and bool(job["repository_slug"])
+                    and job["repository_slug"] == target["repository_slug"]
                     and job.get("repository_base") == target["base"],
                     "Persisted job lacks matching repository metadata; review it and use a new run_id",
-                )
-                _require(
-                    _origin_slug(target["repository"]) == job["repository_slug"],
-                    "Configured repository origin changed while the job was queued",
                 )
                 result = self.runner(
                     package,
                     self.config["output_root"] / identifier,
-                    repository=target["repository"],
-                    base=target["base"],
                     run_id=identifier,
+                    stop_after="capture",
+                    main_assembly=selection,
                     on_event=lambda event, identifier=identifier: self._event(identifier, event),
                     prior_events=list(job["events"]),
                     expected_inputs=job["prepared_files"],
@@ -933,45 +1020,26 @@ class Jobs:
                 )
                 with self.mutex:
                     job["result"] = result
-                    submission = result.get("submission", {})
-                    quality = result.get("quality", {})
-                    subject = result.get("subject_sha256")
-                    passed = (
-                        result.get("passed") is True
-                        and quality.get("passed") is True
-                        and isinstance(subject, str)
-                        and _SHA.fullmatch(subject) is not None
-                        and quality.get("subject_sha256") == subject
-                        and submission.get("passed") is True
-                        and submission.get("subject_sha256") == subject
-                        and submission.get("repository_slug") == job["repository_slug"]
-                        and submission.get("base") == target["base"]
-                        and submission.get("branch")
-                        == "work/solidworks/" + _slug_hardware(read_revision(package)["hardware_id"])
-                        and submission.get("state") in {"published", "updated", "noop"}
-                        and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", str(submission.get("commit", "")))
-                        is not None
-                        and re.fullmatch(
-                            r"https://github\.com/" + re.escape(job["repository_slug"]) + r"/pull/[1-9][0-9]*",
-                            str(submission.get("url", "")),
+                    archive = result.get("capture_archive") if isinstance(result.get("capture_archive"), dict) else None
+                    if result.get("native_complete") is True and result.get("passed") is False and archive:
+                        verified = self._verified_capture_archive(identifier, archive)
+                        job.update(status="native_complete", error=None, capture_archive=verified)
+                    elif result.get("native_complete") is True or result.get("passed") is True:
+                        job.update(
+                            status="failed",
+                            error="Native result shape is not a sealed capture transfer; "
+                            "the run cannot be qualified",
                         )
-                        is not None
-                        and _origin_slug(target["repository"]) == job["repository_slug"]
-                        and any(
-                            check.get("id") == "source.native_discovery" and check.get("passed") is True
-                            for check in quality.get("checks", [])
-                        )
-                    )
-                    if passed:
-                        from ..stages import require_complete
-
-                        require_complete(stage_view(job))
-                    job.update(
-                        status="passed" if passed else "failed",
-                        error=None if passed else result.get("error") or "Incomplete or mismatched publication receipt",
-                    )
-                    if not passed and result.get("error_code"):
-                        job["error_code"] = str(result["error_code"])
+                        if result.get("error_code"):
+                            job["error_code"] = str(result["error_code"])
+                    else:
+                        # A genuinely failed native run keeps its own diagnostics.
+                        job.update(status="failed", error=result.get("error") or "Native capture failed")
+                        if result.get("error_code"):
+                            job["error_code"] = str(result["error_code"])
+                        for key in ("detail", "diagnostic_path"):
+                            if result.get(key) is not None:
+                                job[key] = result[key]
             except Exception as error:
                 with self.mutex:
                     job.update(status="failed", error=f"{type(error).__name__}: {error}")

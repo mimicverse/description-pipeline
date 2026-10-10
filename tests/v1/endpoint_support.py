@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import shutil
-import subprocess
 import tempfile
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from description_pipeline.io import digest, file_digest, write_json
 from description_pipeline.sources.solidworks.handoff import freeze_handoff
@@ -45,6 +45,17 @@ def prepare_control(source, output, run_id, **kwargs):
 
 class EndpointFixture:
     def setUp(self):
+        # The endpoint only runs on the native host; simulate its role identity here.
+        identity = patch(
+            "description_pipeline.orchestration.windows._native_tool_record",
+            return_value={
+                "name": "solidworks-native-reader",
+                "version": "1.3.1",
+                "runtime": {"role": "native", "python": "3.12.10", "packages": {"numpy": "2.5.3"}},
+            },
+        )
+        identity.start()
+        self.addCleanup(identity.stop)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
@@ -53,12 +64,6 @@ class EndpointFixture:
         (self.source / "总装.SLDASM").write_bytes(b"Synthetic native-boundary control; not actual CAD")
         self.packages = self.root / "packages"
         self.packages.mkdir()
-        repository = self.root / "repository"
-        repository.mkdir()
-        subprocess.run(["git", "init", "-q", str(repository)], check=True)
-        subprocess.run(
-            ["git", "-C", str(repository), "remote", "add", "origin", "https://github.com/a/b.git"], check=True
-        )
         token = self.root / "token"
         token.write_text("t" * 64)
         self.path = self.root / "endpoint.json"
@@ -69,7 +74,7 @@ class EndpointFixture:
             "output_root": str(self.root / "outputs"),
             "state_root": str(self.root / "state"),
             "token_file": str(token),
-            "targets": {"arm": {"repository": str(repository), "base": "feature/arm"}},
+            "targets": {"arm": {"repository_slug": "a/b", "base": "feature/arm"}},
         }
         write_json(self.path, self.config_data)
         self.config = read_config(self.path)
@@ -89,10 +94,40 @@ class EndpointFixture:
         jobs = Jobs(
             self.config,
             native_preparer=preparer or self.prepare,
-            runner=runner or (lambda *args, **kwargs: self.passing_result(on_event=kwargs["on_event"])),
+            runner=runner
+            or (
+                lambda package, output, **kwargs: self.capture_transfer_result(
+                    output, run_id=kwargs["run_id"], on_event=kwargs["on_event"]
+                )
+            ),
         )
         self.addCleanup(jobs.close)
         return jobs
+
+    def capture_transfer_result(self, output, *, run_id, on_event=None):
+        """A sealed capture-transfer result: native_complete, never qualified success."""
+
+        output = Path(output)
+        output.mkdir(parents=True, exist_ok=True)
+        archive = output / "native-evidence.zip"
+        manifest = output / "transfer-manifest.json"
+        archive.write_bytes(b"PK\x03\x04synthetic-transfer")
+        write_json(manifest, {"schema_version": "solidworks-to-urdf.transfer/v1", "run_id": run_id})
+        if on_event is not None:
+            for event in protocol_events(stages=("freeze", "discover", "capture")):
+                on_event(event)
+        return {
+            "native_complete": True,
+            "passed": False,
+            "state": "native_complete",
+            "run_id": run_id,
+            "capture_archive": {
+                "name": "native-evidence.zip",
+                "sha256": file_digest(archive),
+                "size": archive.stat().st_size,
+                "manifest_sha256": file_digest(manifest),
+            },
+        }
 
     def passing_result(self, *, on_event=None):
         subject = "a" * 64

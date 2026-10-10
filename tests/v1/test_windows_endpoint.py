@@ -34,7 +34,7 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
 
         def runner(*args, **kwargs):
             kwargs["on_event"](captured)
-            return self.passing_result(on_event=kwargs["on_event"])
+            return self.capture_transfer_result(args[1], run_id=kwargs["run_id"], on_event=kwargs["on_event"])
 
         jobs = self.jobs(runner, preparer=prepare)
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler(jobs, self.config["token"]))
@@ -63,7 +63,7 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
             release.set()
         jobs.queue.join()
         completed = client.get_job(request["run_id"])
-        self.assertEqual("passed", completed["status"])
+        self.assertEqual("native_complete", completed["status"])
         self.assertIn(captured, completed["events"])
         self.assertTrue(all(datetime.fromisoformat(event["at"]).tzinfo is not None for event in completed["events"]))
 
@@ -72,7 +72,7 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
 
         def runner(package, output, **kwargs):
             calls.append(kwargs["run_id"])
-            return self.passing_result(on_event=kwargs["on_event"])
+            return self.capture_transfer_result(output, run_id=kwargs["run_id"], on_event=kwargs["on_event"])
 
         jobs = Jobs(self.config, runner=runner, native_preparer=self.prepare)
         request = self.request()
@@ -80,14 +80,14 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
         jobs.queue.join()
         result, created = jobs.create(request)
         self.assertFalse(created)
-        self.assertEqual("passed", result["status"])
+        self.assertEqual("native_complete", result["status"])
         self.assertEqual(1, len(calls))
         with self.assertRaises(RequestError) as error:
             jobs.create({**request, "handoff_sha256": "f" * 64})
         self.assertEqual(409, error.exception.status)
         jobs.close()
         resumed = self.jobs(runner)
-        self.assertEqual("passed", resumed.snapshot(request["run_id"])["status"])
+        self.assertEqual("native_complete", resumed.snapshot(request["run_id"])["status"])
         self.assertFalse(resumed.create(request)[1])
         self.assertEqual(1, len(calls))
 
@@ -98,14 +98,14 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
         jobs.queue.join()
         self.assertEqual("failed", jobs.snapshot(request["run_id"])["status"])
 
-    def test_green_publication_without_recorded_boundary_checks_is_rejected(self):
+    def test_green_result_without_a_sealed_transfer_is_rejected(self):
         jobs = self.jobs(lambda *args, **kwargs: self.passing_result())
         request = self.request()
         jobs.create(request)
         jobs.queue.join()
         result = jobs.snapshot(request["run_id"])
         self.assertEqual("failed", result["status"])
-        self.assertIn("Engineering stages are incomplete", result["error"])
+        self.assertIn("sealed capture transfer", result["error"])
 
     def test_discovery_failure_retains_diagnostics_across_endpoint_restart(self):
         from description_pipeline.sources.solidworks.errors import CadError
@@ -200,12 +200,12 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
 
             def runner(*a, calls=calls, **k):
                 calls.append(k["run_id"])
-                return self.passing_result(on_event=k["on_event"])
+                return self.capture_transfer_result(a[1], run_id=k["run_id"], on_event=k["on_event"])
 
             resumed = Jobs(self.config, runner=runner, native_preparer=self.prepare)
             resumed.queue.join()
             result = resumed.snapshot(request["run_id"])
-            self.assertEqual("failed" if changed else "passed", result["status"])
+            self.assertEqual("failed" if changed else "native_complete", result["status"])
             self.assertEqual([] if changed else [request["run_id"]], calls)
             resumed.close()
             recovered = Jobs(self.config, runner=lambda *a, **k: self.fail("Completed job reran"))
@@ -278,6 +278,9 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
             f"sys.path.insert(0,{str(Path(__file__).resolve().parents[2] / 'src')!r});"
             f"sys.path.insert(0,{str(Path(__file__).resolve().parents[2])!r});"
             "from tests.v1.endpoint_support import prepare_control;"
+            "from unittest.mock import patch;"
+            "patch('description_pipeline.orchestration.windows._native_tool_record',"
+            "return_value={'name':'native','version':'1.3.1','runtime':{'role':'native'}}).start();"
             "from description_pipeline.orchestration.windows import Jobs,read_config;"
             "j=Jobs(read_config(Path(sys.argv[1])),native_preparer=prepare_control,runner=lambda *a,**k:os._exit(17));"
             f"j.create({request!r});j.queue.join()"
