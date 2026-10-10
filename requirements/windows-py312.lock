@@ -1,19 +1,12 @@
-# Windows x86_64, CPython 3.12 runtime closure.
-absl-py==2.5.0
+# Windows native capture, x86_64, CPython 3.12 runtime closure.
 attrs==26.1.0
-etils==1.14.0
-fsspec==2026.9.0
-glfw==2.10.2
 jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
-mujoco==3.13.0
 numpy==2.5.3
 packaging==26.3
-pyopengl==3.1.10
 python-multipart==0.0.32
 pyyaml==6.0.3
 referencing==0.37.0
 rpds-py==2026.6.3
 typing-extensions==4.16.0
 pywin32==311
-zipp==4.1.0
