@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import shutil
 import tempfile
 import unittest
@@ -67,6 +68,18 @@ def _translated(x: float, y: float, z: float) -> list[float]:
         0.0,
         1.0,
     ]
+
+
+def _matrix4(values: list[float]) -> list[list[float]]:
+    return [values[0:4], values[4:8], values[8:12], values[12:16]]
+
+
+def _in_span(vector: list[float], basis: list[list[float]], tolerance: float = 1e-9) -> bool:
+    residual = [float(value) for value in vector]
+    for item in basis:
+        weight = sum(one * two for one, two in zip(residual, item, strict=True))
+        residual = [one - weight * two for one, two in zip(residual, item, strict=True)]
+    return math.sqrt(sum(value * value for value in residual)) <= tolerance
 
 
 def native_record() -> dict:
@@ -468,7 +481,9 @@ class OracleSemanticsTests(unittest.TestCase):
 
     # -------------------------------------------------- shaft and circle semantics
 
-    def test_concentric_mate_requires_true_cylinders(self) -> None:
+    def test_concentric_circles_reconstruct_constraints_but_never_evidence_the_shaft(self) -> None:
+        """Circles are axis geometry for reconstruction; the final shaft gate stays cylindrical."""
+
         def circles(raw, payload):
             for entity in raw["mates"][0]["entities"]:
                 cylinder = entity.pop("cylinder")
@@ -478,7 +493,18 @@ class OracleSemanticsTests(unittest.TestCase):
                     "radius": cylinder["radius"],
                 }
 
-        self.reject(circles, "outside the supported constraint scope")
+        package = self.baseline()
+        self._native(package, circles)
+        passed, errors, _checks = self.check(package)
+        self.assertFalse(passed, errors)
+        self.assertTrue(
+            any(
+                error["code"] == "discovery.joints"
+                and "no cylindrical mate entity carries the joint shaft" in error["message"]
+                for error in errors
+            ),
+            errors,
+        )
 
     def test_coincident_circles_must_share_one_centre(self) -> None:
         def far_apart(raw, payload):
@@ -1175,6 +1201,283 @@ class OracleSemanticsTests(unittest.TestCase):
             ),
             errors,
         )
+
+    # ------------------------------------------- circle constraint reconstruction
+
+    def test_circle_circle_concentric_reconstructs_locked_tilts_and_free_spin(self) -> None:
+        from description_pipeline.verification.native_discovery import _null_space, _rows_for, _span
+
+        frames = {"a-1": _matrix4(IDENTITY), "b-1": _matrix4(IDENTITY)}
+        mate = {
+            "name": "circle_axis__coaxial",
+            "type": "concentric",
+            "suppressed": False,
+            "error_code": 0,
+            "scope": "",
+            "limits": None,
+            "entities": [
+                {
+                    "component": "a-1",
+                    "feature": "Edge1",
+                    "circle": {"center": [0.0, 0.0, 0.02], "normal": [0.0, 0.0, 1.0], "radius": 0.003},
+                },
+                {
+                    "component": "b-1",
+                    "feature": "Edge2",
+                    "circle": {"center": [0.0, 0.0, 0.05], "normal": [0.0, 0.0, 1.0], "radius": 0.004},
+                },
+            ],
+        }
+
+        rows = _rows_for(mate, frames)
+        self.assertIsNotNone(rows)
+        self.assertEqual(len(rows["rows"]), 4)
+        self.assertEqual(len(_span(rows["rows"])), 4)
+        # No cylinder anywhere: the constraint reconstructs, the shaft gate stays shut.
+        self.assertIsNone(rows["axis"])
+
+        free = _null_space(rows["rows"])
+        self.assertEqual(len(free), 2)
+        # Free: slide along the axis and spin about it.  (Whether the CAD locks the
+        # spin via LockRotation is not carried by the record; the row model assumes not.)
+        self.assertTrue(_in_span([0.0, 0.0, 1.0, 0.0, 0.0, 0.0], free))
+        self.assertTrue(_in_span([0.0, 0.0, 0.0, 0.0, 0.0, 1.0], free))
+        # Locked: tilting out of the axis is constrained.
+        self.assertFalse(_in_span([0.0, 0.0, 0.0, 1.0, 0.0, 0.0], free))
+
+    def test_circle_cylinder_concentric_keeps_the_shaft_evidence(self) -> None:
+        from description_pipeline.verification.native_discovery import _independent_clusters, _rows_for
+
+        frames = {"a-1": _matrix4(IDENTITY), "b-1": _matrix4(IDENTITY)}
+        circle = {"center": [0.0, 0.0, 0.02], "normal": [0.0, 0.0, 1.0], "radius": 0.003}
+        second_circle = {"center": [0.0, 0.0, 0.05], "normal": [0.0, 0.0, 1.0], "radius": 0.004}
+        cylinder = {"point": [0.0, 0.0, 0.05], "direction": [0.0, 0.0, 1.0], "radius": 0.004}
+
+        def mate(second_geometry: dict) -> dict:
+            entity = {"component": "b-1", "feature": "F2"}
+            entity.update(copy.deepcopy(second_geometry))
+            return {
+                "name": "mixed_axis__coaxial",
+                "type": "concentric",
+                "suppressed": False,
+                "error_code": 0,
+                "scope": "",
+                "limits": None,
+                "entities": [
+                    {"component": "a-1", "feature": "Edge1", "circle": copy.deepcopy(circle)},
+                    entity,
+                ],
+            }
+
+        mixed = _rows_for(mate({"cylinder": copy.deepcopy(cylinder)}), frames)
+        self.assertIsNotNone(mixed)
+        self.assertEqual(mixed["axis"], [0.0, 0.0, 1.0])
+        self.assertEqual(mixed["point"], [0.0, 0.0, 0.05])
+
+        circle_only = _rows_for(mate({"circle": copy.deepcopy(second_circle)}), frames)
+        self.assertIsNotNone(circle_only)
+        self.assertEqual(len(circle_only["rows"]), 4)
+        self.assertIsNone(circle_only["axis"])
+
+        # The independent pair derivation keeps the same distinction: rows from circle-only
+        # mates count, but they never carry the shaft the interface gate looks for.
+        components = [
+            {
+                "name2": name,
+                "instance_id": name,
+                "document": f"cad/{name}.SLDPRT",
+                "configuration": "Default",
+                "fixed": False,
+                "suppressed": False,
+                "transform": list(IDENTITY),
+            }
+            for name in ("a-1", "b-1")
+        ]
+        _members, pairs = _independent_clusters({"components": components, "mates": [mate({"cylinder": cylinder})]})
+        self.assertEqual(pairs[("a-1", "b-1")]["axis"], [0.0, 0.0, 1.0])
+        _members, pairs = _independent_clusters({"components": components, "mates": [mate({"circle": second_circle})]})
+        self.assertEqual(pairs[("a-1", "b-1")]["rank"], 4)
+        self.assertIsNone(pairs[("a-1", "b-1")]["axis"])
+
+    def test_concentric_axis_entities_are_compared_in_the_assembly_frame(self) -> None:
+        from description_pipeline.verification.native_discovery import _rows_for
+
+        # b's circle is authored in a frame rotated +90° about X and translated z+0.05:
+        # local normal (0,1,0) becomes the assembly axis (0,0,1); the centre maps to (0,0,0.05).
+        rotated = [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, -1.0, 0.0,
+            0.0, 1.0, 0.0, 0.05,
+            0.0, 0.0, 0.0, 1.0,
+        ]
+        frames = {"a-1": _matrix4(IDENTITY), "b-1": _matrix4(rotated)}
+
+        def mate(normal: list[float]) -> dict:
+            return {
+                "name": "framed_axis__coaxial",
+                "type": "concentric",
+                "suppressed": False,
+                "error_code": 0,
+                "scope": "",
+                "limits": None,
+                "entities": [
+                    {
+                        "component": "a-1",
+                        "feature": "Edge1",
+                        "circle": {"center": [0.0, 0.0, 0.02], "normal": [0.0, 0.0, 1.0], "radius": 0.003},
+                    },
+                    {
+                        "component": "b-1",
+                        "feature": "Edge2",
+                        "circle": {"center": [0.0, 0.0, 0.0], "normal": normal, "radius": 0.004},
+                    },
+                ],
+            }
+
+        self.assertIsNotNone(_rows_for(mate([0.0, 1.0, 0.0]), frames))
+        self.assertIsNone(_rows_for(mate([1.0, 0.0, 0.0]), frames))
+
+    def test_circle_plane_coincident_locks_tilts_and_leaves_in_plane_motion(self) -> None:
+        from description_pipeline.verification.native_discovery import _null_space, _rows_for, _span
+
+        frames = {"a-1": _matrix4(IDENTITY), "b-1": _matrix4(IDENTITY)}
+
+        def mate(plane_point: list[float], plane_normal: list[float]) -> dict:
+            return {
+                "name": "edge_in_plane__locate",
+                "type": "coincident",
+                "suppressed": False,
+                "error_code": 0,
+                "scope": "",
+                "limits": None,
+                "entities": [
+                    {
+                        "component": "a-1",
+                        "feature": "Edge1",
+                        "circle": {
+                            "center": [0.01, 0.02, 0.05],
+                            "normal": [0.0, 0.0, 1.0],
+                            "radius": 0.003,
+                        },
+                    },
+                    {
+                        "component": "b-1",
+                        "feature": "Plane1",
+                        "plane": {"point": plane_point, "normal": plane_normal},
+                    },
+                ],
+            }
+
+        rows = _rows_for(mate([0.0, 0.0, 0.05], [0.0, 0.0, -1.0]), frames)
+        self.assertIsNotNone(rows)
+        self.assertEqual(len(rows["rows"]), 3)
+        self.assertEqual(len(_span(rows["rows"])), 3)
+        self.assertIsNone(rows["axis"])
+
+        free = _null_space(rows["rows"])
+        self.assertEqual(len(free), 3)
+        # Free: slide in the plane and spin about the normal; locked: both tilts.
+        self.assertTrue(_in_span([1.0, 0.0, 0.0, 0.0, 0.0, 0.0], free))
+        self.assertTrue(_in_span([0.0, 1.0, 0.0, 0.0, 0.0, 0.0], free))
+        self.assertTrue(_in_span([0.02, -0.01, 0.0, 0.0, 0.0, 1.0], free))
+        self.assertFalse(_in_span([0.0, 0.0, 0.0, 1.0, 0.0, 0.0], free))
+
+        # Solved-state consistency: a skew plane or a centre off the plane blocks.
+        self.assertIsNone(_rows_for(mate([0.0, 0.0, 0.05], [1.0, 0.0, 0.0]), frames))
+        self.assertIsNone(_rows_for(mate([0.0, 0.0, 0.051], [0.0, 0.0, -1.0]), frames))
+
+    def test_concentric_rejects_planes_and_unusable_geometry(self) -> None:
+        from description_pipeline.verification.native_discovery import _rows_for
+
+        frames = {"a-1": _matrix4(IDENTITY), "b-1": _matrix4(IDENTITY)}
+
+        def mate(first_entity: dict, second_entity: dict) -> dict:
+            return {
+                "name": "probe__coaxial",
+                "type": "concentric",
+                "suppressed": False,
+                "error_code": 0,
+                "scope": "",
+                "limits": None,
+                "entities": [first_entity, second_entity],
+            }
+
+        circle = {"component": "a-1", "feature": "Edge1",
+                  "circle": {"center": [0.0, 0.0, 0.02], "normal": [0.0, 0.0, 1.0], "radius": 0.003}}
+        # A plane is not an axis-bearing entity, even with usable geometry.
+        plane = {"component": "b-1", "feature": "Plane1",
+                 "plane": {"point": [0.0, 0.0, 0.05], "normal": [0.0, 0.0, 1.0]}}
+        self.assertIsNone(_rows_for(mate(copy.deepcopy(circle), plane), frames))
+
+        zero_normal = copy.deepcopy(circle)
+        zero_normal["circle"]["normal"] = [0.0, 0.0, 0.0]
+        cylinder = {"component": "b-1", "feature": "Cyl1",
+                    "cylinder": {"point": [0.0, 0.0, 0.05], "direction": [0.0, 0.0, 1.0], "radius": 0.004}}
+        self.assertIsNone(_rows_for(mate(zero_normal, cylinder), frames))
+
+        infinite_centre = copy.deepcopy(circle)
+        infinite_centre["circle"]["center"] = [float("inf"), 0.0, 0.0]
+        self.assertIsNone(_rows_for(mate(infinite_centre, copy.deepcopy(cylinder)), frames))
+
+    def test_coincident_plane_with_missing_geometry_is_not_a_vertex(self) -> None:
+        from description_pipeline.verification.native_discovery import _rows_for
+
+        frames = {"a-1": _matrix4(IDENTITY), "b-1": _matrix4(IDENTITY)}
+        plane = {
+            "component": "a-1",
+            "feature": "Plane1",
+            "plane": {"point": [0.0, 0.0, 0.05], "normal": [0.0, 1.0, 0.0]},
+        }
+
+        def mate(second_entity: dict) -> dict:
+            return {
+                "name": "plane_probe__locate",
+                "type": "coincident",
+                "suppressed": False,
+                "error_code": 0,
+                "scope": "",
+                "limits": None,
+                "entities": [copy.deepcopy(plane), second_entity],
+            }
+
+        # Regression for the M3 重合115 shape: a plane plus an entity that recorded no
+        # geometry at all must fail closed, never become a vertex-on-face constraint.
+        self.assertIsNone(_rows_for(mate({"component": "b-1", "feature": None}), frames))
+
+        # Regression for the M3 重合16 shape (scope headM3.0-1): the part-side entity
+        # recorded no geometry next to a plane; the scope itself is irrelevant here.
+        nested = mate({"component": "headM3.0-1/PDA Camera - Parametric Parts-1", "feature": None})
+        nested["scope"] = "headM3.0-1"
+        self.assertIsNone(_rows_for(nested, frames))
+
+        # Only an explicit plane-plus-point form is a constraint; a cylinder or a
+        # circle must never be treated as the vertex side.
+        cylinder_entity = {
+            "component": "b-1",
+            "feature": "Cyl1",
+            "cylinder": {"point": [0.0, 0.0, 0.06], "direction": [0.0, 1.0, 0.0], "radius": 0.004},
+        }
+        self.assertIsNone(_rows_for(mate(cylinder_entity), frames))
+        circle_entity = {
+            "component": "b-1",
+            "feature": "Edge1",
+            "circle": {"center": [0.0, 0.0, 0.06], "normal": [0.0, 1.0, 0.0], "radius": 0.003},
+        }
+        # A circle opposite a plane is the supported circle-in-plane constraint (the
+        # M3 重合35 change), never a vertex interpretation.
+        in_plane = _rows_for(mate(circle_entity), frames)
+        self.assertIsNotNone(in_plane)
+        self.assertEqual(len(in_plane["rows"]), 3)
+
+        # Malformed point records do not become vertices.
+        self.assertIsNone(_rows_for(mate({"component": "b-1", "feature": "V", "point": [0.0, 0.0]}), frames))
+        self.assertIsNone(_rows_for(mate({"component": "b-1", "feature": "V", "point": [0.0, 0.0, "x"]}), frames))
+        self.assertIsNone(_rows_for(mate({"component": "b-1", "feature": "V", "point": None}), frames))
+
+        # The legitimate vertex-on-face fallback still works when both sides contribute.
+        vertex = _rows_for(mate({"component": "b-1", "feature": "Vertex1", "point": [0.0, 0.0, 0.06]}), frames)
+        self.assertIsNotNone(vertex)
+        self.assertEqual(len(vertex["rows"]), 1)
 
 
 if __name__ == "__main__":

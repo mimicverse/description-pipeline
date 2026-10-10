@@ -314,6 +314,12 @@ def _null_space(rows, dim: int = 6) -> list[list[float]]:
     return basis
 
 
+def _axis_entity(entity: dict) -> bool:
+    """An entity that defines an axis: a cylindrical face or a circular edge."""
+
+    return isinstance(entity.get("cylinder"), dict) or isinstance(entity.get("circle"), dict)
+
+
 def _geometry(entity: dict, frames):
     frame = _frame_for(entity, frames)
     if frame is None:
@@ -379,11 +385,24 @@ def _rows_for(mate: dict, frames) -> dict | None:
         rows = [_translation_row(axis, point) for axis in axes] + [_rotation_row(axis) for axis in axes]
         return {"rows": rows, "limits": limits, "axis": None, "point": point}
     if kind == "concentric":
-        if not isinstance(first.get("cylinder"), dict) or not isinstance(second.get("cylinder"), dict):
+        if not _axis_entity(first) or not _axis_entity(second):
             return None
         left_point, left_axis = _geometry(first, frames)
         right_point, right_axis = _geometry(second, frames)
-        if left_axis is None or right_axis is None or abs(abs(_dot(left_axis, right_axis)) - 1.0) > TOL:
+        if (
+            left_point is None
+            or right_point is None
+            or left_axis is None
+            or right_axis is None
+            or abs(abs(_dot(left_axis, right_axis)) - 1.0) > TOL
+        ):
+            return None
+        # Solved-state consistency: the recorded axes must be coaxial, not merely
+        # parallel, exactly as the constraint requires of the solved assembly.
+        delta = [right_point[index] - left_point[index] for index in range(3)]
+        along = _dot(delta, left_axis)
+        radial = [delta[index] - along * left_axis[index] for index in range(3)]
+        if math.sqrt(_dot(radial, radial)) > AXIS_OFFSET_TOL_M:
             return None
         plane = _plane_basis(left_axis)
         if len(plane) != 2:
@@ -391,7 +410,15 @@ def _rows_for(mate: dict, frames) -> dict | None:
         rows = [_translation_row(direction, left_point) for direction in plane] + [
             _rotation_row(direction) for direction in plane
         ]
-        return {"rows": rows, "limits": limits, "axis": left_axis, "point": left_point}
+        # Circle axes reconstruct the constraint but never evidence the shaft: the
+        # independent interface gate must keep requiring a real cylindrical entity.
+        shaft = None
+        shaft_point = None
+        for entity, point, axis in ((first, left_point, left_axis), (second, right_point, right_axis)):
+            if isinstance(entity.get("cylinder"), dict):
+                shaft, shaft_point = axis, point
+                break
+        return {"rows": rows, "limits": limits, "axis": shaft, "point": shaft_point}
     if kind == "coincident":
         left_point, left_axis = _geometry(first, frames)
         right_point, right_axis = _geometry(second, frames)
@@ -421,12 +448,55 @@ def _rows_for(mate: dict, frames) -> dict | None:
                 "axis": None,
                 "point": left_point,
             }
+        if (isinstance(first.get("circle"), dict) and isinstance(second.get("plane"), dict)) or (
+            isinstance(second.get("circle"), dict) and isinstance(first.get("plane"), dict)
+        ):
+            # A circular edge coincident with a plane: the circle's plane is the
+            # plane (two tilts locked) and its centre lies in it (one translation
+            # locked); sliding and spinning in the plane stay free.
+            circle_entity, plane_entity = (
+                (first, second) if isinstance(first.get("circle"), dict) else (second, first)
+            )
+            circle_point, circle_axis = _geometry(circle_entity, frames)
+            plane_point, plane_axis = _geometry(plane_entity, frames)
+            if (
+                circle_point is None
+                or plane_point is None
+                or circle_axis is None
+                or plane_axis is None
+                or abs(abs(_dot(circle_axis, plane_axis)) - 1.0) > TOL
+            ):
+                return None
+            normal = plane_axis if _dot(circle_axis, plane_axis) >= 0 else [-value for value in plane_axis]
+            offset = abs(sum((circle_point[index] - plane_point[index]) * normal[index] for index in range(3)))
+            if offset > AXIS_OFFSET_TOL_M:
+                return None
+            plane = _plane_basis(normal)
+            if len(plane) != 2:
+                return None
+            rows = [_translation_row(normal, circle_point)] + [_rotation_row(direction) for direction in plane]
+            return {"rows": rows, "limits": limits, "axis": None, "point": circle_point}
         if isinstance(first.get("point"), (list, tuple)) and isinstance(second.get("point"), (list, tuple)):
             rows = [_translation_row(axis, left_point) for axis in axes]
             return {"rows": rows, "limits": limits, "axis": None, "point": left_point}
-        normal = left_axis or right_axis
-        point = left_point if left_axis is not None else right_point
-        if normal is None or point is None:
+        # Only the explicit plane-plus-vertex form remains: the face side must be a
+        # recorded plane and the other side an explicit point.  A missing entity, a
+        # cylinder, a circle, or any unrelated geometry is never treated as a vertex.
+        if (
+            isinstance(first.get("plane"), dict)
+            and left_axis is not None
+            and isinstance(second.get("point"), (list, tuple))
+            and right_point is not None
+        ):
+            normal, point = left_axis, right_point
+        elif (
+            isinstance(second.get("plane"), dict)
+            and right_axis is not None
+            and isinstance(first.get("point"), (list, tuple))
+            and left_point is not None
+        ):
+            normal, point = right_axis, left_point
+        else:
             return None
         # A vertex on a face removes one translation only.
         return {"rows": [_translation_row(normal, point)], "limits": limits, "axis": None, "point": point}
