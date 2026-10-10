@@ -76,7 +76,7 @@ class SelectionClientTests(unittest.TestCase):
     def test_empty_request_is_rejected(self) -> None:
         with self.assertRaises(PipelineError) as caught:
             prepare_selection_batch(self.source, self.archive, {}, expected_upload=self.upload)
-        self.assertIn("nonempty", str(caught.exception))
+        self.assertEqual(getattr(caught.exception, "code", ""), "selection_inventory_invalid")
 
     def test_oversized_and_overcount_batches_are_rejected(self) -> None:
         requested = self._request("总装.SLDASM", "零件.SLDPRT")
@@ -106,9 +106,10 @@ class SelectionClientTests(unittest.TestCase):
         requested = self._request("零件.SLDPRT")
         real_write = selection_client._write_member
 
-        def tamper_after_write(output, path, name):
-            result = real_write(output, path, name)
-            Path(path).write_bytes(b"mutated during archiving")
+        def tamper_after_write(output, path, name, *, limit):
+            result = real_write(output, path, name, limit=limit)
+            original = Path(path).read_bytes()
+            Path(path).write_bytes(bytes(len(original)))
             return result
 
         with (
@@ -135,8 +136,9 @@ class SelectionClientTests(unittest.TestCase):
 
     def test_nonportable_or_aliased_names_are_rejected(self) -> None:
         requested = self._request("零件.SLDPRT")
-        with self.assertRaises(PipelineError):
+        with self.assertRaises(PipelineError) as caught:
             prepare_selection_batch(self.source, self.archive, requested, expected_upload={"../evil": "0" * 64})
+        self.assertEqual(getattr(caught.exception, "code", ""), "selection_path_invalid")
         with self.assertRaises(PipelineError) as caught:
             prepare_selection_batch(
                 self.source,
@@ -144,7 +146,49 @@ class SelectionClientTests(unittest.TestCase):
                 requested,
                 expected_upload={**self.upload, "DECOY.SLDPRT": "0" * 64, "decoy.SLDPRT": "0" * 64},
             )
-        self.assertIn("casefold duplicate", str(caught.exception))
+        self.assertEqual(getattr(caught.exception, "code", ""), "selection_path_collision")
+
+    def test_oversized_preflight_reads_no_content(self) -> None:
+        requested = self._request("总装.SLDASM", "零件.SLDPRT")
+        with (
+            patch.object(selection_client, "MAX_BATCH_BYTES", 4),
+            patch.object(selection_client, "_disk_digest", side_effect=AssertionError("content read")),
+            self.assertRaises(PipelineError) as caught,
+        ):
+            prepare_selection_batch(self.source, self.archive, requested, expected_upload=self.upload)
+        self.assertIn("byte cap", str(caught.exception))
+        self.assertFalse(self.archive.exists())
+
+    def test_growth_beyond_the_recorded_size_is_bounded(self) -> None:
+        path = self.source / "零件.SLDPRT"
+        with self.assertRaises(PipelineError) as caught:
+            selection_client._disk_digest(path, limit=4)
+        self.assertIn("recorded size", str(caught.exception))
+        probe = self.root / "probe.zip"
+        with zipfile.ZipFile(probe, "x", compression=zipfile.ZIP_STORED) as output:
+            with self.assertRaises(PipelineError) as caught:
+                selection_client._write_member(output, path, "零件.SLDPRT", limit=4)
+            self.assertIn("recorded size", str(caught.exception))
+
+    def test_source_under_linked_parent_is_rejected(self) -> None:
+        real = self.root / "real"
+        (real / "intake").mkdir(parents=True)
+        link = self.root / "link"
+        os.symlink(real, link)
+        with self.assertRaises(PipelineError) as caught:
+            prepare_selection_batch(
+                link / "intake", self.archive, self._request("零件.SLDPRT"), expected_upload=self.upload
+            )
+        self.assertIn("links or junctions", str(caught.exception))
+
+    def test_existing_archive_is_never_clobbered(self) -> None:
+        self.archive.write_bytes(b"pre-existing bytes")
+        with self.assertRaises(PipelineError) as caught:
+            prepare_selection_batch(
+                self.source, self.archive, self._request("零件.SLDPRT"), expected_upload=self.upload
+            )
+        self.assertIn("already exists", str(caught.exception))
+        self.assertEqual(self.archive.read_bytes(), b"pre-existing bytes")
 
 
 if __name__ == "__main__":
