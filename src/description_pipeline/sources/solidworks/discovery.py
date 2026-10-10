@@ -369,6 +369,292 @@ def _null_space(rows: Sequence[Sequence[float]], dim: int = 6) -> list[list[floa
     return basis
 
 
+#: Orientation agreement bound for evidence cross-checks: the quality contract's
+#: 0.05 degrees; positions use the same contract's 0.05 mm (``AXIS_OFFSET_TOL_M``).
+_ORIENTATION_TOL_RAD = math.radians(0.05)
+#: Flat face-evidence kinds the record may carry; a flat point is a bare 3-vector by API.
+_FLAT_FACE_KINDS = ("plane", "cylinder", "circle")
+#: Comparable localized kinds; a localized cylinder is only ever cross-checked, never created.
+_LOCALIZED_GEOMETRY_FIELDS = {
+    "point": ("point",),
+    "line": ("point", "direction"),
+    "plane": ("point", "normal"),
+    "cylinder": ("point", "direction", "radius"),
+}
+
+
+def _finite_vector(value: Any, length: int) -> list[float] | None:
+    """A finite numeric vector of the exact length; booleans, NaN and Infinity fail."""
+    if isinstance(value, (str, bytes, dict)) or value is None:
+        return None
+    try:
+        items = list(value)
+    except TypeError:
+        return None
+    if len(items) != length:
+        return None
+    numbers: list[float] = []
+    for item in items:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            return None
+        number = float(item)
+        if not math.isfinite(number):
+            return None
+        numbers.append(number)
+    return numbers
+
+
+def _unit_vector(value: Any) -> list[float] | None:
+    numbers = _finite_vector(value, 3)
+    if numbers is None:
+        return None
+    norm = math.sqrt(sum(number * number for number in numbers))
+    if norm <= 0 or not math.isfinite(norm):
+        return None
+    return [number / norm for number in numbers]
+
+
+def _undirected_angle(first, second) -> float | None:
+    """Angle between two undirected directions, in radians, or ``None`` when unusable."""
+    dot = sum(one * two for one, two in zip(first, second, strict=True))
+    return math.acos(min(1.0, abs(dot)))
+
+
+def _same_geometry(kind: str, recorded: dict, localized: dict) -> bool:
+    """Agreement between flat face evidence and localized provenance within contract bounds.
+
+    The quality numerical contract's position (0.05 mm) and orientation (0.05 degrees) bounds
+    are the cross-check bounds.  Planes and axes are undirected: a flipped normal or direction
+    describes the same reference; a plane is compared by orientation and offset rather than by
+    arbitrary point equality.
+    """
+
+    def plane_offset(p, o, n) -> float:
+        return abs(sum((p[index] - o[index]) * n[index] for index in range(3)))
+
+    def axis_offset(p, o, d) -> float:
+        offset = [p[index] - o[index] for index in range(3)]
+        cross = _cross(offset, d)
+        return math.sqrt(sum(value * value for value in cross))
+
+    if kind == "plane":
+        recorded_normal, localized_normal = _unit_vector(recorded.get("normal")), _unit_vector(localized.get("normal"))
+        recorded_point, localized_point = _finite_vector(recorded.get("point"), 3), _finite_vector(
+            localized.get("point"), 3
+        )
+        if None in (recorded_normal, localized_normal, recorded_point, localized_point):
+            return False
+        angle = _undirected_angle(recorded_normal, localized_normal)
+        if angle is None or angle > _ORIENTATION_TOL_RAD:
+            return False
+        return plane_offset(localized_point, recorded_point, recorded_normal) <= AXIS_OFFSET_TOL_M
+    if kind in {"line", "cylinder"}:
+        recorded_direction, localized_direction = _unit_vector(recorded.get("direction")), _unit_vector(
+            localized.get("direction")
+        )
+        recorded_point, localized_point = _finite_vector(recorded.get("point"), 3), _finite_vector(
+            localized.get("point"), 3
+        )
+        if None in (recorded_direction, localized_direction, recorded_point, localized_point):
+            return False
+        angle = _undirected_angle(recorded_direction, localized_direction)
+        if angle is None or angle > _ORIENTATION_TOL_RAD:
+            return False
+        if kind == "cylinder":
+            recorded_radius, localized_radius = recorded.get("radius"), localized.get("radius")
+            if (
+                isinstance(recorded_radius, bool)
+                or isinstance(localized_radius, bool)
+                or not isinstance(recorded_radius, (int, float))
+                or not isinstance(localized_radius, (int, float))
+                or not math.isfinite(float(recorded_radius))
+                or not math.isfinite(float(localized_radius))
+                or abs(float(recorded_radius) - float(localized_radius)) > AXIS_OFFSET_TOL_M
+            ):
+                return False
+        return (
+            axis_offset(localized_point, recorded_point, recorded_direction) <= AXIS_OFFSET_TOL_M
+            and axis_offset(recorded_point, localized_point, localized_direction) <= AXIS_OFFSET_TOL_M
+        )
+    return False
+
+
+def _entity_geometry_view(entity: dict, findings: list[dict], obj: str) -> dict | None:
+    """One mate entity with its validated geometry, or ``None`` when it must block.
+
+    Recorded face evidence (a flat plane/cylinder/circle, or the bare-list point) stays
+    primary: missing, unverifiable or irrelevant localized provenance never blocks it, while a
+    comparable localized reference that contradicts the face evidence does.  When no face
+    evidence exists, a component-local localized point/line/plane is validated and surfaced as
+    the fallback; a needed reference that is malformed, non-component-local or of any other
+    kind blocks, and a localized cylinder is never turned into face evidence.
+    """
+
+    view = dict(entity)
+    flat: dict[str, dict] = {}
+    malformed: list[str] = []
+    for face_kind in _FLAT_FACE_KINDS:
+        value = entity.get(face_kind)
+        if value is None:
+            continue
+        if isinstance(value, dict):
+            flat[face_kind] = value
+        else:
+            malformed.append(face_kind)
+    raw_point = entity.get("point")
+    flat_point = None
+    if raw_point is not None:
+        flat_point = _finite_vector(raw_point, 3)
+        if flat_point is None:
+            malformed.append("point")
+    if malformed:
+        # A recorded primary that is malformed is refused, never silently substituted by
+        # provenance; the same evidence rule applies to the independent oracle.
+        findings.append(
+            _finding(
+                "discovery.mate_entities_unsupported",
+                obj,
+                "recorded mate entity geometry is malformed",
+                {"kinds": sorted(set(malformed))},
+            )
+        )
+        return None
+    usable_flat = bool(flat) or flat_point is not None
+    reference = entity.get("mate_entity_reference")
+    if reference is None:
+        return view
+    if not isinstance(reference, dict):
+        if usable_flat:
+            return view
+        findings.append(
+            _finding("discovery.mate_entities_unsupported", obj, "mate entity reference is not an object")
+        )
+        return None
+    if reference.get("error") is not None:
+        # A failed decode cannot create new evidence; recorded face evidence stays usable.
+        if usable_flat:
+            return view
+        findings.append(
+            _finding(
+                "discovery.mate_entities_unsupported",
+                obj,
+                "localized mate entity geometry failed to decode",
+                {"error": str(reference.get("error"))[:200]},
+            )
+        )
+        return None
+    geometry = reference.get("geometry")
+    if not isinstance(geometry, dict):
+        # No localized provenance to validate: the branches report missing geometry themselves.
+        return view
+    kind = str(geometry.get("kind") or "")
+    if geometry.get("frame") != "component-local":
+        if usable_flat:
+            return view
+        findings.append(
+            _finding(
+                "discovery.mate_entities_unsupported",
+                obj,
+                "localized mate entity geometry lacks component-local provenance",
+            )
+        )
+        return None
+    if kind == "cylinder" and "cylinder" not in flat:
+        # A shaft is face evidence or it does not exist; localization never fabricates one.
+        findings.append(
+            _finding(
+                "discovery.mate_entities_unsupported",
+                obj,
+                "localized cylinder geometry has no recorded face evidence",
+                {"feature": entity.get("feature")},
+            )
+        )
+        return None
+    if kind not in _LOCALIZED_GEOMETRY_FIELDS:
+        if usable_flat:
+            return view
+        findings.append(
+            _finding(
+                "discovery.mate_entities_unsupported",
+                obj,
+                "localized mate entity geometry carries an unsupported kind",
+                {"kind": kind},
+            )
+        )
+        return None
+    values: dict[str, Any] = {}
+    for part in _LOCALIZED_GEOMETRY_FIELDS[kind]:
+        raw_value = geometry.get(part)
+        if part == "radius":
+            if (
+                isinstance(raw_value, bool)
+                or not isinstance(raw_value, (int, float))
+                or not math.isfinite(float(raw_value))
+                or float(raw_value) <= 0
+            ):
+                break
+            values[part] = float(raw_value)
+            continue
+        numbers = _finite_vector(raw_value, 3)
+        if numbers is None or (part in ("direction", "normal") and not any(number != 0.0 for number in numbers)):
+            break
+        values[part] = numbers
+    if set(values) != set(_LOCALIZED_GEOMETRY_FIELDS[kind]):
+        if usable_flat:
+            return view
+        findings.append(
+            _finding(
+                "discovery.mate_entities_unsupported",
+                obj,
+                "localized mate entity geometry is malformed",
+                {"kind": kind},
+            )
+        )
+        return None
+    if kind == "point":
+        if flat_point is not None:
+            distance = math.sqrt(sum((flat_point[index] - values["point"][index]) ** 2 for index in range(3)))
+            if distance > AXIS_OFFSET_TOL_M:
+                findings.append(
+                    _finding(
+                        "discovery.mate_entities_unsupported",
+                        obj,
+                        "localized mate entity geometry contradicts recorded face evidence",
+                        {"kind": kind},
+                    )
+                )
+                return None
+            return view
+        # A recorded point is a bare 3-vector, matching ``point_of`` and the existing API.
+        view["point"] = values["point"]
+        return view
+    if kind in flat:
+        if not _same_geometry(kind, flat[kind], values):
+            findings.append(
+                _finding(
+                    "discovery.mate_entities_unsupported",
+                    obj,
+                    "localized mate entity geometry contradicts recorded face evidence",
+                    {"kind": kind},
+                )
+            )
+            return None
+        return view
+    if usable_flat:
+        # A different comparable geometry than the recorded face evidence is a contradiction.
+        findings.append(
+            _finding(
+                "discovery.mate_entities_unsupported",
+                obj,
+                "localized mate entity geometry contradicts recorded face evidence",
+                {"kind": kind},
+            )
+        )
+        return None
+    view[kind] = values
+    return view
+
+
 def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict | None:
     """Reconstruct a mate's constraints as twists at the assembly origin.
 
@@ -394,7 +680,10 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
     if len(entities) < 2:
         findings.append(_finding("discovery.mate_entities_unsupported", obj, "mate has fewer than two entity records"))
         return None
-    first, second = entities[0], entities[1]
+    first = _entity_geometry_view(entities[0], findings, obj)
+    second = _entity_geometry_view(entities[1], findings, obj)
+    if first is None or second is None:
+        return None
     limits = mate.get("limits") if isinstance(mate.get("limits"), dict) else None
 
     def fail(code: str, message: str, detail: Any = None) -> None:
@@ -449,6 +738,27 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
             fail(
                 "discovery.mate_entities_unsupported",
                 "recorded cylinder is not usable",
+                {"feature": entity.get("feature")},
+            )
+            return None
+        return point, direction
+
+    def line_of(entity: dict):
+        """A recorded line/axis reference as (point, unit direction) in the assembly frame."""
+
+        frame = frame_of(entity)
+        line = entity.get("line")
+        if frame is None or not isinstance(line, dict):
+            return None
+        direction = _unit(_vector(line.get("direction") or (), frame))
+        try:
+            point = _point([float(value) for value in line.get("point") or ()], frame)
+        except (TypeError, ValueError):
+            point = None
+        if direction is None or point is None or len(point) != 3:
+            fail(
+                "discovery.mate_entities_unsupported",
+                "recorded line is not usable",
                 {"feature": entity.get("feature")},
             )
             return None
@@ -629,6 +939,37 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
             return circle_plane_rows(first, second)
         if isinstance(first.get("plane"), dict) and isinstance(second.get("circle"), dict):
             return circle_plane_rows(second, first)
+
+        def line_plane_rows(line_entity: dict, plane_entity: dict):
+            # A line coincident with a plane lies in that plane: the recorded solved state
+            # must already show the direction perpendicular to the normal and the point on
+            # the plane; only then are exactly those two constraint rows emitted.
+            line = line_of(line_entity)
+            plane = plane_of(plane_entity)
+            if line is None or plane is None:
+                return None
+            point, direction = line
+            normal = plane[1]
+            if abs(_dot(direction, normal)) > _TOL:
+                return fail(
+                    "discovery.mate_geometry_mismatch", "solved coincident line and plane are not coplanar"
+                )
+            separation = abs(_dot([point[index] - plane[0][index] for index in range(3)], normal))
+            if separation > AXIS_OFFSET_TOL_M:
+                return fail(
+                    "discovery.mate_geometry_mismatch",
+                    "solved coincident line and plane are not co-located",
+                    {"separation_m": separation},
+                )
+            pivot = _unit(_cross(direction, normal))
+            rows = [_rotation_row(pivot)] if pivot is not None else []
+            rows.append(_translation_row(normal, point))
+            return {"rows": rows, "limits": limits, "axis": None, "point": point, "entity": None}
+
+        if isinstance(first.get("line"), dict) and isinstance(second.get("plane"), dict):
+            return line_plane_rows(first, second)
+        if isinstance(first.get("plane"), dict) and isinstance(second.get("line"), dict):
+            return line_plane_rows(second, first)
         if left_point is not None and right_point is not None:
             rows = [_translation_row(axis, left_point) for axis in (basis_x, basis_y, basis_z)]
             return {"rows": rows, "limits": limits, "axis": None, "point": left_point, "entity": None}
@@ -713,17 +1054,50 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
                 cylinder = cylinder_of(entity)
                 axis = cylinder[1] if cylinder is not None else None
                 break
-        if axis is None:
-            plane = plane_of(first)
-            other = plane_of(second)
-            if plane is None or other is None:
+        if axis is not None:
+            rows = [_rotation_row(direction) for direction in _orthogonal_basis(axis)]
+            return {"rows": rows, "limits": limits, "axis": None, "point": None, "entity": None}
+        first_is_line = isinstance(first.get("line"), dict)
+        second_is_line = isinstance(second.get("line"), dict)
+        if first_is_line and second_is_line:
+            # Two axes: their directions must be parallel (two rotational constraints).
+            line, other = line_of(first), line_of(second)
+            if line is None or other is None:
                 return fail("discovery.mate_entities_unsupported", "parallel mate entities carry no direction")
-            if abs(abs(_dot(plane[1], other[1])) - 1.0) > _TOL:
+            if abs(abs(_dot(line[1], other[1])) - 1.0) > _TOL:
                 return fail(
                     "discovery.mate_geometry_mismatch", "solved parallel mate does not record parallel directions"
                 )
-            axis = plane[1]
-        rows = [_rotation_row(direction) for direction in _orthogonal_basis(axis)]
+            rows = [_rotation_row(direction) for direction in _orthogonal_basis(line[1])]
+            return {"rows": rows, "limits": limits, "axis": None, "point": None, "entity": None}
+        if first_is_line != second_is_line:
+            # One axis and one plane: parallel means the axis lies parallel to the plane, which
+            # removes exactly one rotational freedom (axis perpendicular to the plane normal) --
+            # never the two a parallel axis pair removes.  Validate the solved state first.
+            line_entity, plane_entity = (first, second) if first_is_line else (second, first)
+            line, plane = line_of(line_entity), plane_of(plane_entity)
+            if line is None or plane is None:
+                return fail("discovery.mate_entities_unsupported", "parallel mate entities carry no direction")
+            direction, normal = line[1], plane[1]
+            if abs(_dot(direction, normal)) > math.sin(_ORIENTATION_TOL_RAD):
+                return fail(
+                    "discovery.mate_geometry_mismatch", "solved parallel line and plane are not parallel"
+                )
+            pivot = _unit(_cross(direction, normal))
+            if pivot is None:
+                return fail(
+                    "discovery.mate_geometry_mismatch", "solved parallel line and plane are not parallel"
+                )
+            return {"rows": [_rotation_row(pivot)], "limits": limits, "axis": None, "point": None, "entity": None}
+        plane = plane_of(first)
+        other = plane_of(second)
+        if plane is None or other is None:
+            return fail("discovery.mate_entities_unsupported", "parallel mate entities carry no direction")
+        if abs(abs(_dot(plane[1], other[1])) - 1.0) > _TOL:
+            return fail(
+                "discovery.mate_geometry_mismatch", "solved parallel mate does not record parallel directions"
+            )
+        rows = [_rotation_row(direction) for direction in _orthogonal_basis(plane[1])]
         return {"rows": rows, "limits": limits, "axis": None, "point": None, "entity": None}
     directions = []
     for entity in (first, second):
