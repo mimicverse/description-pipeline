@@ -1460,6 +1460,13 @@ class PortalApp:
         store = self._store()
         if store is None or not isinstance(store.meta(native_id), dict):
             return rows
+
+        def checkpoint(stage: str) -> Path | None:
+            try:
+                return store.checkpoint_dir(native_id, stage)
+            except PipelineError:
+                return None
+
         if rows is None:
             # A linked Linux attempt has no Windows plan of its own: the rows describe the
             # portable restart surface while the native stages remain reused evidence.
@@ -1477,16 +1484,12 @@ class PortalApp:
                 }
                 for stage in CONTRACT["stages"]
             ]
-        seeds = {
-            "generate": store.capture_dir(native_id),
-            "verify": store.stage_dir(native_id, "generate"),
-            "publish": store.stage_dir(native_id, "verify"),
-        }
+        seeds = {"generate": checkpoint("capture"), "verify": checkpoint("generate"), "publish": checkpoint("verify")}
         for row in rows:
             stage = row.get("stage")
             if stage not in seeds:
                 continue
-            ready = stage == "generate" or (seeds[stage] / "input").is_dir()
+            ready = seeds[stage] is not None
             row.update(
                 eligible=bool(ready),
                 reason="linux_ready" if ready else "linux_checkpoint_missing",
