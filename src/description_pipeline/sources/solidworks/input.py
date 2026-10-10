@@ -920,8 +920,14 @@ def _validate_checks(
         "input.checks_invalid",
         "checks",
     )
-    mass_range = _range2(mapping.get("expected_mass_kg"), report, "input.checks_invalid", "checks.expected_mass_kg")
-    extent_range = _range2(mapping.get("expected_extent_m"), report, "input.checks_invalid", "checks.expected_extent_m")
+    # Design targets are optional assertions, separate from the mandatory
+    # comparison of the delivered geometry and physics with native CAD evidence.
+    # An absent target must not be manufactured from the measured CAD value.
+    ranges = {
+        key: _range2(mapping[key], report, "input.checks_invalid", f"checks.{key}")
+        for key in ("expected_mass_kg", "expected_extent_m")
+        if key in mapping
+    }
     exclusions: dict[str, dict[str, Any]] = {}
     raw_exclusions = mapping.get("documented_exclusions") or []
     if not isinstance(raw_exclusions, list):
@@ -961,8 +967,7 @@ def _validate_checks(
             "evidence": evidence,
         }
     return {
-        "expected_mass_kg": list(mass_range) if mass_range is not None else None,
-        "expected_extent_m": list(extent_range) if extent_range is not None else None,
+        **{key: list(value) for key, value in ranges.items() if value is not None},
         "documented_exclusions": exclusions,
     }, exclusions
 
@@ -1086,7 +1091,7 @@ def inspect_package(path: Path) -> dict[str, Any]:
         if source is not None:
             resolved, source_mapping = _validate_source(source, root=root, hashes=hashes, report=report)
             checks, exclusions = _validate_checks(
-                data.get("checks"),
+                data.get("checks", {}),
                 root=root,
                 hashes=hashes,
                 owned_components=set(resolved.get("owned_components") or []),

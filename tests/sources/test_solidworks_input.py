@@ -742,15 +742,36 @@ class InputPackageTests(unittest.TestCase):
 
         self._assert_code(self._package(negative), "input.checks_invalid")
 
-        def missing(document):
-            document.pop("checks")
-
-        self._assert_code(self._package(missing), "input.checks_invalid")
-
         def unknown(document):
             document["checks"]["expected_mass"] = [0.5, 1.0]
 
         self._assert_code(self._package(unknown), "input.checks_invalid")
+
+    def test_design_targets_are_optional_without_invented_ranges(self):
+        for supplied in (None, {}, {"expected_mass_kg": [0.5, 2.0]}):
+            with self.subTest(checks=supplied):
+                def optional(document, supplied=supplied):
+                    if supplied is None:
+                        document.pop("checks")
+                    else:
+                        document["checks"] = supplied
+
+                report = inspect_package(self._package(optional))
+                self.assertTrue(report["passed"], report["errors"])
+                targets = report["resolved"]["checks"]
+                self.assertNotIn("expected_extent_m", targets)
+                if not supplied:
+                    self.assertNotIn("expected_mass_kg", targets)
+                else:
+                    self.assertEqual(targets["expected_mass_kg"], supplied["expected_mass_kg"])
+
+    def test_explicit_invalid_design_targets_still_fail(self):
+        for key in ("expected_mass_kg", "expected_extent_m"):
+            with self.subTest(target=key):
+                def invalid(document, key=key):
+                    document["checks"] = {key: None}
+
+                self._assert_code(self._package(invalid), "input.checks_invalid")
 
     def test_joint_limits_must_be_strictly_ordered(self):
         def equal_bounds(document):

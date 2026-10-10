@@ -394,7 +394,7 @@ def verify_delivery(staging: Path, generated_subject: str, *, on_event=None) -> 
 def publish_model(
     bundle: Path, repository: Path, *, base: str | None = None, message: str | None = None, on_event=None
 ) -> dict:
-    """Recheck and submit a frozen delivery from either Windows or Linux."""
+    """Recheck and submit the frozen delivery on the Linux publication stage."""
 
     from .repository.urdf_pr import submit_bundle
 
