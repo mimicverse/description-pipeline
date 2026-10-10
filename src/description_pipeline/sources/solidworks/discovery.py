@@ -825,6 +825,23 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
             )
             return None
 
+    def concentric_point_of(entity: dict):
+        """A *pure* point reference for a point-on-axis concentric mate, or ``None``.
+
+        Only a validated point view qualifies — a bare recorded point or a point
+        that already passed the component-local localized-provenance checks.
+        Planes, lines, cylinders and circles never do, so the axis of the relation
+        can only ever come from the other entity's recorded cylinder/circular-edge
+        evidence; the point's own ``EntityParams`` contribute no direction and no
+        radius.  An unusable point frame keeps failing closed through ``point_of``.
+        """
+
+        if any(isinstance(entity.get(shape), dict) for shape in ("plane", "cylinder", "circle", "line")):
+            return None
+        if not isinstance(entity.get("point"), (list, tuple)):
+            return None
+        return point_of(entity)
+
     basis_x = [1.0, 0.0, 0.0]
     basis_y = [0.0, 1.0, 0.0]
     basis_z = [0.0, 0.0, 1.0]
@@ -843,6 +860,35 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
         left = axial_geometry_of(first)
         right = axial_geometry_of(second)
         if left is None or right is None:
+            if (left is None) != (right is None):
+                # One recorded axis plus one pure point reference is a point-on-axis
+                # relation, not an axis alignment: the solved state must already place
+                # the point on the axis, and the relation removes exactly the two
+                # translations perpendicular to the axis.  The constraint rows are the
+                # point's velocity projections applied AT the recorded point, so the
+                # angular moment arms (point x direction) stay in the twist convention
+                # used by this module ([translation, rotation] at the assembly origin)
+                # — a displaced point is never reduced to origin translations.
+                axis_geometry = right if left is None else left
+                point_entity = first if left is None else second
+                point = concentric_point_of(point_entity)
+                if point is not None:
+                    offset = [point[index] - axis_geometry[0][index] for index in range(3)]
+                    along = _dot(offset, axis_geometry[1])
+                    radial = [offset[index] - along * axis_geometry[1][index] for index in range(3)]
+                    radial_gap = math.sqrt(_dot(radial, radial))
+                    if radial_gap > AXIS_OFFSET_TOL_M:
+                        return fail(
+                            "discovery.mate_geometry_mismatch",
+                            "solved concentric point is off the recorded axis",
+                            {"radial_gap_m": radial_gap, "tolerance_m": AXIS_OFFSET_TOL_M},
+                        )
+                    rows = [
+                        _translation_row(direction, point) for direction in _orthogonal_basis(axis_geometry[1])
+                    ]
+                    # No shaft selector and no joint: point-on-axis is a two-row
+                    # relation, never a four-row axis alignment.
+                    return {"rows": rows, "limits": limits, "axis": None, "point": point, "entity": None}
             return fail(
                 "discovery.mate_entities_unsupported",
                 "concentric mate needs two recorded cylinders or circular edges",
