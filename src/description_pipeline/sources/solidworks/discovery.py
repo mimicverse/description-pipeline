@@ -1284,54 +1284,97 @@ def _clusters(record: dict, findings: list[dict]) -> _Clusters:
             # rigid cluster; it is never a component pair, invented grounding or
             # a mass.  Only a complete top-scope mate with one identity frame
             # entity and one recorded occurrence can take part.
-            frame_mates.append(obj)
             scope = mate.get("scope")
-            if scope != "":
-                frame_problem(
-                    "a frame-attached mate outside the frozen top assembly is not supported",
-                    {"mate": mate.get("name"), "scope": scope},
-                    obj=obj,
-                )
-                continue
             flagged = [entity for entity in entities if entity.get("assembly_frame") is True]
-            occurrence = [entity for entity in entities if entity.get("assembly_frame") is not True]
-            if not occurrence:
-                frame_problem("a frame-attached mate has no occurrence endpoint", {"mate": mate.get("name")}, obj=obj)
-                continue
-            raw_entities = mate.get("entities")
-            if not isinstance(raw_entities, list) or len(raw_entities) != 2 or len(entities) != 2:
-                frame_problem(
-                    "a frame-attached mate must record exactly one frozen top-frame entity and one occurrence",
-                    {"mate": mate.get("name"), "entities": len(entities), "frame_entities": len(flagged)},
-                    obj=obj,
+            nested_self = scope != "" and len(flagged) == 1 and flagged[0].get("component") == scope
+            if scope == "":
+                frame_mates.append(obj)
+            elif nested_self:
+                # A nested sub-assembly's own frame is a definition-internal relation.
+                # The reader binds its component to the mate's scope, validates that the
+                # scope occurrence and document match at capture time, and localizes the
+                # parameters with inv(F_scope) x F_scope, so the recorded scope-local
+                # geometry is mapped back exactly by the recorded occurrence transform.
+                # It is therefore reconstructed by the ordinary pair machinery below:
+                # it can never ground anything and never vetoes the frozen top aggregate.
+                others = [entity for entity in entities if entity.get("assembly_frame") is not True]
+                endpoints = [str(entity.get("component") or "") for entity in others]
+                if (
+                    len(endpoints) != 1
+                    or not endpoints[0]
+                    or endpoints[0] not in components
+                    or scope not in components
+                ):
+                    findings.append(
+                        _finding(
+                            "discovery.frame_attachment",
+                            obj,
+                            "a frame-attached mate outside the frozen top assembly is not supported",
+                            {
+                                "mate": mate.get("name"),
+                                "scope": scope,
+                                "components": [str(entity.get("component")) for entity in entities],
+                            },
+                        )
+                    )
+                    continue
+            else:
+                # Ambiguous or foreign frame identity: fail closed with its own finding,
+                # scope-isolated from the frozen top aggregate gate.
+                findings.append(
+                    _finding(
+                        "discovery.frame_attachment",
+                        obj,
+                        "a frame-attached mate outside the frozen top assembly is not supported",
+                        {
+                            "mate": mate.get("name"),
+                            "scope": scope,
+                            "components": [str(entity.get("component")) for entity in entities],
+                        },
+                    )
                 )
                 continue
-            if flagged[0].get("component") != "":
-                frame_problem(
-                    "a frame entity must carry the frozen top-scope identity",
-                    {"mate": mate.get("name"), "component": flagged[0].get("component")},
-                    obj=obj,
-                )
+            if scope == "":
+                occurrence = [entity for entity in entities if entity.get("assembly_frame") is not True]
+                if not occurrence:
+                    frame_problem(
+                        "a frame-attached mate has no occurrence endpoint", {"mate": mate.get("name")}, obj=obj
+                    )
+                    continue
+                raw_entities = mate.get("entities")
+                if not isinstance(raw_entities, list) or len(raw_entities) != 2 or len(entities) != 2:
+                    frame_problem(
+                        "a frame-attached mate must record exactly one frozen top-frame entity and one occurrence",
+                        {"mate": mate.get("name"), "entities": len(entities), "frame_entities": len(flagged)},
+                        obj=obj,
+                    )
+                    continue
+                if flagged[0].get("component") != "":
+                    frame_problem(
+                        "a frame entity must carry the frozen top-scope identity",
+                        {"mate": mate.get("name"), "component": flagged[0].get("component")},
+                        obj=obj,
+                    )
+                    continue
+                component = occurrence[0].get("component")
+                if not isinstance(component, str) or component == "" or component not in components:
+                    frame_problem(
+                        "a frame-attached mate names an unknown occurrence",
+                        {"mate": mate.get("name"), "component": component, "scope": scope},
+                        obj=obj,
+                    )
+                    continue
+                rows = _mate_rows(mate, frames, findings, obj)
+                if rows is None:
+                    frame_problem(
+                        "a frame-attached mate cannot be reconstructed from its recorded entities",
+                        {"mate": mate.get("name"), "type": mate.get("type"), "scope": scope},
+                        obj=obj,
+                    )
+                    continue
+                frame_rows.extend(rows["rows"])
+                frame_endpoints.append(component)
                 continue
-            component = occurrence[0].get("component")
-            if not isinstance(component, str) or component == "" or component not in components:
-                frame_problem(
-                    "a frame-attached mate names an unknown occurrence",
-                    {"mate": mate.get("name"), "component": component, "scope": scope},
-                    obj=obj,
-                )
-                continue
-            rows = _mate_rows(mate, frames, findings, obj)
-            if rows is None:
-                frame_problem(
-                    "a frame-attached mate cannot be reconstructed from its recorded entities",
-                    {"mate": mate.get("name"), "type": mate.get("type"), "scope": scope},
-                    obj=obj,
-                )
-                continue
-            frame_rows.extend(rows["rows"])
-            frame_endpoints.append(component)
-            continue
         rows = _mate_rows(mate, frames, findings, obj)
         for left, right in _mate_pairs(mate):
             if left not in components or right not in components:
