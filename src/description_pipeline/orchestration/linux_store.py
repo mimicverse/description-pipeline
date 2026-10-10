@@ -8,17 +8,18 @@ attempt that reads its parent only as a seed.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
 from pathlib import Path
 
 from ..delivery import PIPELINE_ID, subject_digest, subject_inventory
-from ..io import PipelineError, confined, file_digest, read_data, write_json
+from ..io import PipelineError, confined, read_data, write_json
 from ..stages import STAGE_IDS, stage_view
 from ..verification.solidworks_urdf import check_bundle, require_qualified_report
 from .airflow_client import JOB_SCHEMA, validate_run_id
-from .stage_transfer import admit_capture
+from .stage_transfer import CAPTURE_MANIFEST, admit_capture
 
 STORE_SCHEMA = "solidworks-to-urdf.linux-run/v1"
 PORTABLE_STAGES = ("generate", "verify", "publish")
@@ -32,6 +33,8 @@ class LinuxStore:
         if not root.is_absolute():
             raise PipelineError("Linux store root must be an absolute path")
         self.root = root
+        #: Verified previews per immutable checkpoint, keyed by path identity and mtime.
+        self._previews: dict[tuple[str, int, int], dict] = {}
 
     # ------------------------------------------------------------------ paths
     def run_dir(self, run_id: str) -> Path:
@@ -135,6 +138,10 @@ class LinuxStore:
 
         def finalize(meta: dict) -> dict:
             capture = self.capture_dir(run_id)
+            manifest_payload = meta.get("transfer")
+            manifest_path = capture / CAPTURE_MANIFEST
+            if isinstance(manifest_payload, dict) and not manifest_path.is_file():
+                write_json(manifest_path, manifest_payload)
             native_receipt = capture / "reports/native-stages.json"
             if native_receipt.is_file():
                 payload = read_data(native_receipt)
@@ -250,11 +257,18 @@ class LinuxStore:
         """Digest-bound preview of the newest verified delivery.
 
         The saved report is revalidated against the delivery bytes before anything is
-        served, and the served subject is the verified report's own binding.
+        served, and the served subject is the verified report's own binding.  The
+        verification runs once per immutable checkpoint; serving a member never
+        re-runs it.
         """
         delivery = self.delivery_dir(run_id)
         if delivery is None:
             raise PipelineError("This attempt has no delivery to preview yet")
+        stat = delivery.stat()
+        cache_key = (str(delivery), stat.st_mtime_ns, stat.st_ino)
+        cached = self._previews.get(cache_key)
+        if cached is not None:
+            return cached
         report = require_qualified_report(check_bundle(delivery))
         subject = report.get("subject_sha256")
         if not isinstance(subject, str) or subject != subject_digest(delivery):
@@ -263,7 +277,7 @@ class LinuxStore:
         urdf = next((name for name in ("urdf/robot.urdf",) if name in files), None)
         if urdf is None:
             raise PipelineError("The delivery carries no urdf/robot.urdf artifact")
-        return {
+        preview = {
             "schema_version": "solidworks-to-urdf.preview/v1",
             "pipeline_id": PIPELINE_ID,
             "run_id": run_id,
@@ -271,9 +285,17 @@ class LinuxStore:
             "urdf": urdf,
             "files": files,
         }
+        if len(self._previews) >= 8:
+            self._previews.pop(next(iter(self._previews)))
+        self._previews[cache_key] = preview
+        return preview
 
     def open_artifact(self, run_id: str, name: str, *, sha256: str):
-        """Open one previewed artifact whose bytes still match the previewed digest."""
+        """Open one previewed artifact; the returned stream proves the previewed digest.
+
+        The caller-supplied digest is checked against the bound preview inventory, never
+        trusted, and the opened bytes are hashed on the same stream that is served.
+        """
         delivery = self.delivery_dir(run_id)
         if delivery is None:
             raise PipelineError("This attempt has no delivery to serve yet")
@@ -282,6 +304,44 @@ class LinuxStore:
         if expected is None or expected != sha256:
             raise PipelineError("The requested artifact is not part of the verified preview")
         path = confined(delivery, name)
-        if file_digest(path) != expected:
-            raise PipelineError("The artifact bytes changed after verification; refusing to serve")
-        return path.open("rb"), path.stat().st_size  # noqa: SIM115 - the caller closes the stream
+        size = path.stat().st_size
+        handle = path.open("rb")
+        return _BoundArtifact(handle, name=name, expected=expected, size=size), size
+
+
+class _BoundArtifact:
+    """Read-only stream that proves the served bytes are exactly the previewed ones."""
+
+    def __init__(self, handle, *, name: str, expected: str, size: int):
+        self._handle = handle
+        self._name = name
+        self._expected = expected
+        self._size = size
+        self._digest = hashlib.sha256()
+        self._total = 0
+        self._done = False
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = self._handle.read(size)
+        if chunk:
+            self._total += len(chunk)
+            self._digest.update(chunk)
+            return chunk
+        if not self._done:
+            self._done = True
+            if self._total != self._size or self._digest.hexdigest() != self._expected:
+                raise PipelineError(f"Served artifact bytes do not match the verified preview: {self._name}")
+        return chunk
+
+    def close(self) -> None:
+        self._handle.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def __getattr__(self, item):
+        return getattr(self._handle, item)

@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from packaging.utils import canonicalize_name
+
 from description_pipeline.io import PipelineError
 from description_pipeline.orchestration import linux_runner
 from description_pipeline.orchestration.linux_store import LinuxStore
 from description_pipeline.orchestration.stage_transfer import seal_capture
+from description_pipeline.runtime import RUNTIME_VERSIONS, required_packages
 from description_pipeline.stages import STAGE_IDS
 
 from .test_stage_transfer import HANDOFF, MAIN_ASSEMBLY, capture_root, native_tool
@@ -22,11 +26,14 @@ RUN = "7c9b44b3-0b9c-5ffe-9f4f-4bbdafb4a865"
 
 def portable_record(native: dict, *, source_sha256: str | None = None, mujoco: str = "3.13.0") -> dict:
     record = json.loads(json.dumps(native))
+    packages = {canonicalize_name(name): RUNTIME_VERSIONS[name] for name in required_packages("portable")}
+    packages["mujoco"] = mujoco
     record["runtime"] = {
         **record.get("runtime", {}),
         "role": "portable",
         "system": "Linux",
-        "packages": {"mujoco": mujoco},
+        "python": "3.12.14",
+        "packages": packages,
     }
     if source_sha256 is not None:
         record["source_sha256"] = source_sha256
@@ -162,19 +169,43 @@ class LinuxSplitTests(unittest.TestCase):
         (verify / "urdf/robot.urdf").write_text("<robot/>\n", encoding="utf-8")
         subject = subject_digest(verify)
         report = {"passed": True, "subject_sha256": subject}
+        calls = {"bundle": 0}
+
+        def counting_check(bundle):
+            calls["bundle"] += 1
+            return report
+
         with (
-            mock.patch.object(store_module, "check_bundle", return_value=report),
+            mock.patch.object(store_module, "check_bundle", side_effect=counting_check),
             mock.patch.object(store_module, "require_qualified_report", return_value=report),
         ):
             preview = self.store.preview(self.run_id)
             self.assertEqual(preview["subject_sha256"], subject)
+            self.assertIs(self.store.preview(self.run_id), preview)
             digest = preview["files"]["urdf/robot.urdf"]
             stream, size = self.store.open_artifact(self.run_id, "urdf/robot.urdf", sha256=digest)
             with stream:
                 self.assertEqual(stream.read(), b"<robot/>\n")
+                self.assertEqual(stream.read(), b"")
             self.assertEqual(size, len(b"<robot/>\n"))
+            second, _second_size = self.store.open_artifact(self.run_id, "urdf/robot.urdf", sha256=digest)
+            with second:
+                self.assertEqual(second.read(), b"<robot/>\n")
             with self.assertRaises(PipelineError):
                 self.store.open_artifact(self.run_id, "urdf/robot.urdf", sha256="c" * 64)
+            # The preview is verified once for immutable checkpoint serving.
+            self.assertEqual(calls["bundle"], 1)
+            # Bytes changed after verification (same length, checkpoint identity held)
+            # must be refused on the served stream itself.
+            before = verify.stat()
+            (verify / "urdf/robot.urdf").write_text("<roboX/>\n", encoding="utf-8")
+            os.utime(verify, ns=(before.st_atime_ns, before.st_mtime_ns))
+            tampered, _tampered_size = self.store.open_artifact(self.run_id, "urdf/robot.urdf", sha256=digest)
+            with tampered:
+                self.assertEqual(tampered.read(), b"<roboX/>\n")
+                with self.assertRaises(PipelineError):
+                    tampered.read()
+        os.utime(verify)  # a new checkpoint identity forces re-verification
         with (
             mock.patch.object(store_module, "check_bundle", side_effect=PipelineError("report bytes changed")),
             self.assertRaises(PipelineError),
@@ -197,11 +228,72 @@ class LinuxSplitTests(unittest.TestCase):
                 self.assertRaises(PipelineError),
             ):
                 linux_runner.run_portable_stage(self.store, self.run_id, "generate")
+            with (
+                mock.patch.object(linux_runner, "tool_record", return_value=drifted),
+                mock.patch.object(linux_runner.solidworks, "run", side_effect=AssertionError("must not run")),
+                self.assertRaises(PipelineError),
+            ):
+                linux_runner.run_portable_stage(
+                    self.store, self.run_id, "verify", expected_subject="a" * 64
+                )
         with (
             mock.patch.object(linux_runner.solidworks, "run", side_effect=AssertionError("must not run")),
             self.assertRaises(PipelineError),
         ):
             linux_runner.run_portable_stage(self.store, "0e4f3f74-0e7e-4c31-a1ad-6e5a4a1f0000", "generate")
+
+    def test_capture_is_revalidated_before_generate(self) -> None:
+        self.admit()
+        target = self.store.capture_dir(self.run_id) / "input/robot.yaml"
+        target.write_bytes(target.read_bytes() + b"tampered")
+        with (
+            mock.patch.object(linux_runner, "tool_record", return_value=portable_record(self.tool)),
+            mock.patch.object(linux_runner.solidworks, "run", side_effect=AssertionError("must not run")),
+            self.assertRaises(PipelineError),
+        ):
+            linux_runner.run_portable_stage(self.store, self.run_id, "generate")
+        receipt = json.loads(self.store.receipt_path(self.run_id, "generate").read_text())
+        self.assertEqual(receipt["state"], "failed")
+        self.assertEqual((self.store.meta(self.run_id) or {}).get("state"), "failed")
+
+    def test_driver_failure_leaves_a_failed_receipt(self) -> None:
+        self.admit()
+
+        def explode(*args, **kwargs):
+            kwargs["on_event"]({"stage": "generate", "state": "running", "at": "2026-10-10T04:00:00+00:00"})
+            raise RuntimeError("driver exploded")
+
+        with (
+            mock.patch.object(linux_runner, "tool_record", return_value=portable_record(self.tool)),
+            mock.patch.object(linux_runner.solidworks, "run", side_effect=explode),
+            self.assertRaises(RuntimeError),
+        ):
+            linux_runner.run_portable_stage(self.store, self.run_id, "generate")
+        receipt = json.loads(self.store.receipt_path(self.run_id, "generate").read_text())
+        self.assertEqual(receipt["state"], "failed")
+        self.assertIn("driver exploded", receipt["error"])
+        self.assertEqual((self.store.meta(self.run_id) or {}).get("state"), "failed")
+        job = self.store.merged_job(self.run_id)
+        self.assertEqual(job["status"], "failed")
+        self.assertIn("driver exploded", job.get("error") or "")
+        self.assertTrue(
+            any(event.get("state") == "running" for event in self.store.events(self.run_id)),
+            self.store.events(self.run_id),
+        )
+
+    def test_fetch_short_circuits_a_committed_admission(self) -> None:
+        self.admit()
+        endpoint = mock.Mock()
+        endpoint.stream_capture_archive.side_effect = AssertionError("must not re-download")
+        job = {
+            "status": "native_complete",
+            "request": {"handoff_sha256": HANDOFF, "main_assembly": MAIN_ASSEMBLY},
+            "result": {"native_complete": True, "native_tool": self.tool},
+        }
+        binding = linux_runner.fetch_capture(self.store, endpoint, self.run_id, job)
+        self.assertEqual(binding["state"], "capture_admitted")
+        self.assertEqual(binding["capture_dir"], str(self.store.capture_dir(self.run_id)))
+        endpoint.stream_capture_archive.assert_not_called()
 
     def test_verify_and_publish_seed_from_the_previous_checkpoints(self) -> None:
         self.admit()
