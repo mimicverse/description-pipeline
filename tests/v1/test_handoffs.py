@@ -10,7 +10,7 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from description_pipeline.io import PipelineError, digest
+from description_pipeline.io import PipelineError, digest, inventory
 from description_pipeline.sources.solidworks import handoff as handoff_module
 from description_pipeline.sources.solidworks.handoff import (
     describe_handoff,
@@ -104,7 +104,7 @@ class HandoffTests(unittest.TestCase):
         archive = self.root / "transport.zip"
         prepare_archive(self.source, archive)
         real_describe = handoff_module.describe_handoff
-        real_inventory = handoff_module.package_inventory
+        real_inventory = handoff_module.inventory
         state = {"after_describe": False}
 
         def spy_describe(path):
@@ -120,11 +120,29 @@ class HandoffTests(unittest.TestCase):
 
         with (
             patch.object(handoff_module, "describe_handoff", side_effect=spy_describe),
-            patch.object(handoff_module, "package_inventory", side_effect=spy_inventory),
+            patch.object(handoff_module, "inventory", side_effect=spy_inventory),
             self.assertRaises(PipelineError) as caught,
         ):
             import_archive(archive, self.store)
         self.assertIn("changed during import", str(caught.exception))
+
+    def test_incoming_solidworks_locks_are_excluded_from_the_installed_package(self):
+        archive = self.root / "transport.zip"
+        sent = prepare_archive(self.source, archive)
+        with zipfile.ZipFile(archive, "a") as incoming:
+            incoming.writestr("~$零件.SLDPRT", b"incoming editor lock")
+        package, received = import_archive(archive, self.store)
+        self.assertEqual(received, sent)
+        self.assertFalse((package / "~$零件.SLDPRT").exists())
+        # Physical inventory, not the lock-ignoring handoff inventory, must match.
+        self.assertEqual(inventory(package), received["files"])
+
+    def test_imported_package_physical_inventory_matches_identity(self):
+        archive = self.root / "transport.zip"
+        prepare_archive(self.source, archive)
+        package, received = import_archive(archive, self.store)
+        self.assertEqual(inventory(package), received["files"])
+        self.assertEqual(package_inventory(package), received["files"])
 
     def test_native_only_input_needs_no_authored_pipeline_files(self):
         identity = describe_handoff(self.source)

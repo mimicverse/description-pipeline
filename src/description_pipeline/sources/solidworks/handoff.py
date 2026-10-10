@@ -9,7 +9,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-from ...io import PipelineError, _filesystem_path, artifact_path_parts, confined, digest
+from ...io import PipelineError, _filesystem_path, artifact_path_parts, confined, digest, inventory
 from .revision import package_inventory
 
 HANDOFF_SCHEMA = "solidworks-to-urdf.handoff/v1"
@@ -185,6 +185,15 @@ def import_archive(archive: Path, store: Path) -> tuple[Path, dict]:
         except (zipfile.BadZipFile, EOFError, RuntimeError) as error:
             raise PipelineError(f"Invalid handoff ZIP: {error}") from error
         identity = describe_handoff(package)
+        # The old install copied only the bound inventory, so incoming SolidWorks
+        # lock transients were dropped.  A direct rename would install them as
+        # unbound physical files; remove exactly the files the handoff inventory
+        # ignores before the physical-inventory proof below.
+        installed = identity["files"]
+        for name in sorted(set(inventory(package)) - set(installed)):
+            Path(_filesystem_path(confined(package, name))).unlink()
+        if inventory(package) != installed:
+            raise PipelineError("Mechanical handoff changed during import; no native job was started")
         target = store / identity["handoff_sha256"]
         if target.exists():
             if describe_handoff(target) != identity:
@@ -192,8 +201,6 @@ def import_archive(archive: Path, store: Path) -> tuple[Path, dict]:
                     "Managed handoff inventory was modified; retain its diagnostics and repair the store"
                 )
             return target, identity
-        if package_inventory(package) != identity["files"]:
-            raise PipelineError("Mechanical handoff changed during import; no native job was started")
         try:
             os.rename(package, target)
         except OSError:
