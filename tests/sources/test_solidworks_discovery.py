@@ -77,6 +77,80 @@ def _translated(x: float, y: float, z: float) -> list[float]:
     ]
 
 
+def _grounding_mates() -> list[dict]:
+    """The M3-shaped grounding set: concentric + coincident + parallel, rank 6.
+
+    Every mate grounds ``base-1`` to the frozen top assembly's own frame; each
+    frame entity carries the exact ``component: ""`` identity marker.
+    """
+
+    return [
+        {
+            "name": "base_ground_axis",
+            "type": "concentric",
+            "suppressed": False,
+            "error_code": 0,
+            "scope": "",
+            "limits": None,
+            "entities": [
+                {
+                    "component": "base-1",
+                    "feature": "Cyl1",
+                    "cylinder": {"point": [0.0, 0.0, 0.0], "direction": [0.0, 0.0, 1.0], "radius": 0.006},
+                },
+                {
+                    "component": "",
+                    "assembly_frame": True,
+                    "feature": "Axis1",
+                    "cylinder": {"point": [0.0, 0.0, 0.0], "direction": [0.0, 0.0, 1.0], "radius": 0.006},
+                },
+            ],
+        },
+        {
+            "name": "base_ground_plane",
+            "type": "coincident",
+            "suppressed": False,
+            "error_code": 0,
+            "scope": "",
+            "limits": None,
+            "entities": [
+                {
+                    "component": "base-1",
+                    "feature": "Plane1",
+                    "plane": {"point": [0.0, 0.0, 0.0], "normal": [0.0, 0.0, 1.0]},
+                },
+                {
+                    "component": "",
+                    "assembly_frame": True,
+                    "feature": "Plane2",
+                    "plane": {"point": [0.0, 0.0, 0.0], "normal": [0.0, 0.0, -1.0]},
+                },
+            ],
+        },
+        {
+            "name": "base_ground_parallel",
+            "type": "parallel",
+            "suppressed": False,
+            "error_code": 0,
+            "scope": "",
+            "limits": None,
+            "entities": [
+                {
+                    "component": "base-1",
+                    "feature": "Side1",
+                    "plane": {"point": [0.0, 0.0, 0.0], "normal": [0.0, 1.0, 0.0]},
+                },
+                {
+                    "component": "",
+                    "assembly_frame": True,
+                    "feature": "Axis2",
+                    "cylinder": {"point": [0.0, 0.0, 0.0], "direction": [1.0, 0.0, 0.0], "radius": 0.006},
+                },
+            ],
+        },
+    ]
+
+
 def record() -> dict:
     """Two rigid bodies and one hinge: concentric shaft plus a coincident plane."""
 
@@ -528,17 +602,20 @@ class DiscoveryTests(unittest.TestCase):
 
         result, _source, _output = self._prepare(mutate=mutate)
         codes = [finding["code"] for finding in result.findings]
-        self.assertIn("discovery.mate_assembly_frame_unsupported", codes)
+        self.assertIn("discovery.frame_attachment", codes)
         self.assertFalse(result.passed)
         self.assertNotIn("discovery.component_transform_missing", codes)
+        rank = next(finding for finding in result.findings if "full rank" in finding["message"])
+        self.assertEqual(rank["detail"]["rank"], 3)
 
         findings: list[dict] = []
         with_mate = _clusters({**record(), "mates": [*record()["mates"], ground_mate()]}, findings)
         control = _clusters(record(), [])
         self.assertEqual(with_mate.members, control.members)
         self.assertEqual(set(with_mate.pairs), set(control.pairs))
+        self.assertIsNone(with_mate.frame)
         self.assertNotIn("", with_mate.of)
-        self.assertTrue(any(item["code"] == "discovery.mate_assembly_frame_unsupported" for item in findings))
+        self.assertTrue(any(item["code"] == "discovery.frame_attachment" for item in findings))
 
     def test_mate_rows_resolve_the_assembly_frame_as_identity(self):
         mate = {
@@ -596,7 +673,273 @@ class DiscoveryTests(unittest.TestCase):
         rows = _mate_rows(mate, frames, findings, "mate:unmarked_empty")
         self.assertIsNone(rows)
         self.assertTrue(any(item["code"] == "discovery.component_transform_missing" for item in findings))
-        self.assertFalse(any(item["code"] == "discovery.mate_assembly_frame_unsupported" for item in findings))
+        self.assertFalse(any(item["code"] == "discovery.frame_attachment" for item in findings))
+
+    def test_top_frame_attachment_grounds_the_base_and_binds_ownerless_datums(self):
+        def mutate(payload):
+            payload["mates"].extend(_grounding_mates())
+            payload["datums"][0] = {"name": "CS_base_link", "owner": "", "array": copy.deepcopy(IDENTITY)}
+            payload["datums"].append({"name": "SCS_tool_flange", "owner": "", "array": _translated(0.0, 0.0, 0.2)})
+
+        findings: list[dict] = []
+        clusters = _clusters({**record(), "mates": [*record()["mates"], *_grounding_mates()]}, findings)
+        self.assertFalse(findings, findings)
+        self.assertIsNotNone(clusters.frame)
+        self.assertEqual(clusters.frame.components, ("base-1",))
+        self.assertEqual(clusters.frame.members, frozenset({"base-1"}))
+        self.assertEqual(clusters.frame.rank, 6)
+
+        result, _source, output = self._prepare(mutate=mutate)
+        self.assertTrue(result.passed, result.findings)
+        document = yaml.safe_load((output / "robot.yaml").read_text(encoding="utf-8"))
+        bodies = {body["name"]: body for body in document["source"]["bodies"]}
+        self.assertEqual(bodies["base_link"]["components"], ["base-1"])
+        self.assertEqual(bodies["base_link"]["frame"]["coordinate_system"], "CS_base_link")
+        self.assertEqual(bodies["arm_link"]["components"], ["arm-1"])
+        frames = {frame["name"]: frame for frame in document["source"]["frames"]}
+        self.assertEqual(
+            frames["tool_flange"],
+            {
+                "id": "tool_flange",
+                "name": "tool_flange",
+                "parent": "base_link",
+                "coordinate_system": "SCS_tool_flange",
+            },
+        )
+        joints = document["source"]["joints"]
+        self.assertEqual(len(joints), 1)
+        self.assertEqual((joints[0]["parent"], joints[0]["child"]), ("base_link", "arm_link"))
+        # The grounding mates add no joint and never rewrite the raw evidence.
+        raw = json.loads((output / "discovery" / "native-discovery.json").read_text(encoding="utf-8"))["raw"]
+        self.assertEqual(
+            [datum["name"] for datum in raw["datums"]], ["CS_base_link", "CS_arm_link", "SCS_tool_flange"]
+        )
+        self.assertEqual([datum["owner"] for datum in raw["datums"]], ["", "arm-1", ""])
+        frame_entity = next(
+            entity
+            for mate in raw["mates"]
+            if mate["name"] == "base_ground_parallel"
+            for entity in mate["entities"]
+            if entity.get("assembly_frame")
+        )
+        self.assertEqual(frame_entity["component"], "")
+
+    def test_frame_attachment_must_reach_exactly_one_rigid_cluster(self):
+        def mutate(payload):
+            mates = _grounding_mates()
+            mates.append(
+                {
+                    "name": "arm_ground_axis",
+                    "type": "concentric",
+                    "suppressed": False,
+                    "error_code": 0,
+                    "scope": "",
+                    "limits": None,
+                    "entities": [
+                        {
+                            "component": "arm-1",
+                            "feature": "Cyl2",
+                            "cylinder": {
+                                "point": [0.0, 0.0, 0.1],
+                                "direction": [0.0, 0.0, 1.0],
+                                "radius": 0.006,
+                            },
+                        },
+                        {
+                            "component": "",
+                            "assembly_frame": True,
+                            "feature": "Axis1",
+                            "cylinder": {"point": [0.0, 0.0, 0.1], "direction": [0.0, 0.0, 1.0], "radius": 0.006},
+                        },
+                    ],
+                }
+            )
+            payload["mates"].extend(mates)
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        self.assertEqual(self._codes(result), ["discovery.frame_attachment"])
+        finding = result.findings[0]
+        self.assertIn("exactly one rigid cluster", finding["message"])
+        self.assertEqual(finding["detail"]["components"], ["arm-1", "base-1"])
+        self.assertEqual(len(finding["detail"]["clusters"]), 2)
+
+    def test_frame_entity_identity_is_the_exact_empty_string(self):
+        for component in (None, 0, "base-1"):
+
+            def mutate(payload, component=component):
+                mates = _grounding_mates()
+                mates[2]["entities"][1] = {
+                    "component": component,
+                    "assembly_frame": True,
+                    "feature": "Axis2",
+                    "cylinder": {"point": [0.0, 0.0, 0.0], "direction": [1.0, 0.0, 0.0], "radius": 0.006},
+                }
+                payload["mates"].extend(mates)
+
+            with self.subTest(component=component):
+                result, _source, _output = self._prepare(mutate=mutate)
+                self.assertEqual([item["code"] for item in result.findings], ["discovery.frame_attachment"])
+                self.assertIn("frozen top-scope identity", result.findings[0]["message"])
+                self.assertFalse(any("full rank" in item["message"] for item in result.findings))
+
+    def test_frame_attachment_arity_and_endpoints_are_exact(self):
+        def extra_occurrence(payload):
+            mates = _grounding_mates()
+            mates[2]["entities"].insert(
+                1,
+                {
+                    "component": "base-1",
+                    "feature": "Cyl9",
+                    "cylinder": {"point": [0.0, 0.0, 0.0], "direction": [1.0, 0.0, 0.0], "radius": 0.006},
+                },
+            )
+            payload["mates"].extend(mates)
+
+        def frame_only(payload):
+            payload["mates"].append(
+                {
+                    "name": "base_ground_only_frame",
+                    "type": "coincident",
+                    "suppressed": False,
+                    "error_code": 0,
+                    "scope": "",
+                    "limits": None,
+                    "entities": [
+                        {
+                            "component": "",
+                            "assembly_frame": True,
+                            "feature": "Plane1",
+                            "plane": {"point": [0.0, 0.0, 0.0], "normal": [0.0, 0.0, 1.0]},
+                        }
+                    ],
+                }
+            )
+
+        def two_frame_entities(payload):
+            payload["mates"].append(
+                {
+                    "name": "base_ground_two_frames",
+                    "type": "coincident",
+                    "suppressed": False,
+                    "error_code": 0,
+                    "scope": "",
+                    "limits": None,
+                    "entities": [
+                        {
+                            "component": "",
+                            "assembly_frame": True,
+                            "feature": "Plane1",
+                            "plane": {"point": [0.0, 0.0, 0.0], "normal": [0.0, 0.0, 1.0]},
+                        },
+                        {
+                            "component": "",
+                            "assembly_frame": True,
+                            "feature": "Plane2",
+                            "plane": {"point": [0.0, 0.0, 0.0], "normal": [0.0, 0.0, -1.0]},
+                        },
+                    ],
+                }
+            )
+
+        def unknown_occurrence(payload):
+            mates = _grounding_mates()
+            mates[0]["entities"][0]["component"] = "ghost-1"
+            payload["mates"].extend(mates)
+
+        def unreconstructable(payload):
+            payload["mates"].append(
+                {
+                    "name": "base_ground_vertex",
+                    "type": "coincident",
+                    "suppressed": False,
+                    "error_code": 0,
+                    "scope": "",
+                    "limits": None,
+                    "entities": [
+                        {"component": "base-1", "feature": "Vertex1"},
+                        {
+                            "component": "",
+                            "assembly_frame": True,
+                            "feature": "Plane2",
+                            "plane": {"point": [0.0, 0.0, 0.0], "normal": [0.0, 0.0, 1.0]},
+                        },
+                    ],
+                }
+            )
+
+        cases = {
+            "extra_occurrence": (extra_occurrence, "exactly one frozen top-frame entity and one occurrence"),
+            "frame_only": (frame_only, "no occurrence endpoint"),
+            "two_frame_entities": (two_frame_entities, "no occurrence endpoint"),
+            "unknown_occurrence": (unknown_occurrence, "names an unknown occurrence"),
+            "unreconstructable": (unreconstructable, "cannot be reconstructed"),
+        }
+        for name, (mutate, fragment) in cases.items():
+            with self.subTest(name=name):
+                result, _source, _output = self._prepare(mutate=mutate)
+                self.assertFalse(result.passed)
+                self.assertTrue(
+                    any(
+                        item["code"] == "discovery.frame_attachment" and fragment in item["message"]
+                        for item in result.findings
+                    ),
+                    result.findings,
+                )
+
+    def test_nested_frame_attachment_remains_blocking(self):
+        for scope in ("sub-1", None):
+
+            def mutate(payload, scope=scope):
+                mates = _grounding_mates()
+                for mate in mates:
+                    if scope is None:
+                        mate.pop("scope")
+                    else:
+                        mate["scope"] = scope
+                payload["mates"].extend(mates)
+
+            with self.subTest(scope=scope):
+                result, _source, _output = self._prepare(mutate=mutate)
+                self.assertFalse(result.passed)
+                findings = [item for item in result.findings if item["code"] == "discovery.frame_attachment"]
+                self.assertEqual(len(findings), 3)
+                self.assertTrue(all("outside the frozen top assembly" in item["message"] for item in findings))
+                self.assertTrue(all(item["detail"]["scope"] == scope for item in findings))
+
+    def test_frame_attachment_without_cs_base_link_keeps_the_ownerless_channel_closed(self):
+        def mutate(payload):
+            payload["mates"].extend(_grounding_mates())
+            payload["datums"][0] = {"name": "CS_torso", "owner": "base-1", "array": copy.deepcopy(IDENTITY)}
+            payload["datums"][1] = {"name": "CS_base_link", "owner": "arm-1", "array": _translated(0.0, 0.0, 0.1)}
+            payload["datums"].append({"name": "SCS_tool_flange", "owner": "", "array": _translated(0.0, 0.0, 0.2)})
+
+        result, _source, output = self._prepare(mutate=mutate)
+        codes = self._codes(result)
+        self.assertIn("discovery.frame_attachment", codes)
+        self.assertIn("discovery.interface_unowned", codes)
+        must_become = next(item for item in result.findings if item["code"] == "discovery.frame_attachment")
+        self.assertIn("must become the CS_base_link body", must_become["message"])
+        self.assertEqual(must_become["detail"]["datum"], "CS_torso")
+        self.assertFalse(any("full rank" in item["message"] for item in result.findings))
+        derived = json.loads((output / "discovery" / "native-discovery.json").read_text(encoding="utf-8"))["derived"]
+        self.assertEqual(
+            {tuple(body["components"]): body["name"] for body in derived["bodies"]},
+            {("arm-1",): "base_link", ("base-1",): "torso"},
+        )
+
+    def test_suppressed_frame_attachment_cannot_ground_the_record(self):
+        def mutate(payload):
+            mates = _grounding_mates()
+            for mate in mates:
+                mate["suppressed"] = True
+            payload["mates"].extend(mates)
+            payload["datums"][0] = {"name": "CS_base_link", "owner": "", "array": copy.deepcopy(IDENTITY)}
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        codes = self._codes(result)
+        self.assertNotIn("discovery.frame_attachment", codes)
+        self.assertIn("discovery.link_name_missing", codes)
+        self.assertIn("discovery.interface_unowned", codes)
 
     def test_container_datum_requires_solved_rigidity_and_excludes_container_material(self):
         for connected in (True, False):

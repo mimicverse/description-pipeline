@@ -29,6 +29,10 @@ the backend and re-read by the independent verifier:
     ``{name, type, entities: [{component, feature, face_index, cylinder}],
     alignment, limits: {lower, upper, unit}, suppressed}`` with each cylinder
     given in its component frame (``point``/``direction``/``radius``).
+    A mate entity may instead be the frozen top assembly's own frame:
+    ``{component: "", assembly_frame: true, ...}`` with geometry recorded in the
+    assembly frame.  Such mates only ground exactly one rigid cluster when they
+    reach full rank, and only that cluster may become ``CS_base_link``.
 ``datums``
     ``{name, owner, array: [16 floats]}`` coordinate systems with the
     transform expressed in the assembly frame (owner ``""`` is assembly
@@ -396,7 +400,7 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
         return None
 
     def frame_of(entity: dict):
-        if str(entity.get("component") or "") == "" and entity.get("assembly_frame") is True:
+        if entity.get("component") == "" and entity.get("assembly_frame") is True:
             # The owning assembly's own frame: a real constraint against the assembly
             # origin (the global frame for the frozen root), not a component identity.
             return _ASSEMBLY_FRAME
@@ -682,6 +686,20 @@ def _union_find(pairs: Sequence[tuple[str, str]], nodes: Sequence[str]) -> dict[
     return {node: find(node) for node in nodes}
 
 
+@dataclass(frozen=True)
+class _FrameAttachment:
+    """The proven frozen top assembly-frame attachment.
+
+    ``members`` is the complete occurrence set of the one rigid cluster all
+    frame-attached mates ground; only that cluster may act as the base body.
+    """
+
+    members: frozenset[str]
+    components: tuple[str, ...]
+    mates: tuple[str, ...]
+    rank: int
+
+
 @dataclass
 class _Clusters:
     members: dict[str, list[str]]
@@ -689,6 +707,9 @@ class _Clusters:
     #: Per component pair: the intersection of its mates' allowed motions and
     #: the mate indices that take part in it.
     pairs: dict[tuple[str, str], dict]
+    #: The proven top assembly-frame attachment, or ``None`` when absent, nested
+    #: or incomplete; only the proven cluster may bind top-assembly datums.
+    frame: _FrameAttachment | None = None
 
 
 def _clusters(record: dict, findings: list[dict]) -> _Clusters:
@@ -713,6 +734,16 @@ def _clusters(record: dict, findings: list[dict]) -> _Clusters:
     names = sorted(components)
     frames = _component_frames(record, findings)
     pairs: dict[tuple[str, str], dict] = {}
+    frame_rows: list[list[float]] = []
+    frame_endpoints: list[str] = []
+    frame_mates: list[str] = []
+    frame_ok = True
+
+    def frame_problem(message: str, detail: Any = None, *, obj: str = "assembly") -> None:
+        nonlocal frame_ok
+        frame_ok = False
+        findings.append(_finding("discovery.frame_attachment", obj, message, detail))
+
     for index, mate in enumerate(record.get("mates") or []):
         if not isinstance(mate, dict) or mate.get("suppressed"):
             continue
@@ -727,21 +758,59 @@ def _clusters(record: dict, findings: list[dict]) -> _Clusters:
                 )
             )
             continue
-        mate_entities = mate.get("entities")
-        if isinstance(mate_entities, list) and any(
-            isinstance(item, dict) and item.get("assembly_frame") is True for item in mate_entities
-        ):
-            # The mate constrains a component against the assembly's own frame.  Its
-            # rows would not form a component pair, so it must be an explicit blocker
-            # rather than silently dropped or turned into invented grounding.
-            findings.append(
-                _finding(
-                    "discovery.mate_assembly_frame_unsupported",
-                    obj,
-                    "the mate constrains a component to its assembly frame; world-anchor solving is not justified",
-                    {"mate": mate.get("name"), "scope": mate.get("scope")},
+        entities = _mate_entities(mate)
+        if any(entity.get("assembly_frame") is True for entity in entities):
+            # A mate to the frozen top assembly's own frame grounds exactly one
+            # rigid cluster; it is never a component pair, invented grounding or
+            # a mass.  Only a complete top-scope mate with one identity frame
+            # entity and one recorded occurrence can take part.
+            frame_mates.append(obj)
+            scope = mate.get("scope")
+            if scope != "":
+                frame_problem(
+                    "a frame-attached mate outside the frozen top assembly is not supported",
+                    {"mate": mate.get("name"), "scope": scope},
+                    obj=obj,
                 )
-            )
+                continue
+            flagged = [entity for entity in entities if entity.get("assembly_frame") is True]
+            occurrence = [entity for entity in entities if entity.get("assembly_frame") is not True]
+            if not occurrence:
+                frame_problem("a frame-attached mate has no occurrence endpoint", {"mate": mate.get("name")}, obj=obj)
+                continue
+            raw_entities = mate.get("entities")
+            if not isinstance(raw_entities, list) or len(raw_entities) != 2 or len(entities) != 2:
+                frame_problem(
+                    "a frame-attached mate must record exactly one frozen top-frame entity and one occurrence",
+                    {"mate": mate.get("name"), "entities": len(entities), "frame_entities": len(flagged)},
+                    obj=obj,
+                )
+                continue
+            if flagged[0].get("component") != "":
+                frame_problem(
+                    "a frame entity must carry the frozen top-scope identity",
+                    {"mate": mate.get("name"), "component": flagged[0].get("component")},
+                    obj=obj,
+                )
+                continue
+            component = occurrence[0].get("component")
+            if not isinstance(component, str) or component == "" or component not in components:
+                frame_problem(
+                    "a frame-attached mate names an unknown occurrence",
+                    {"mate": mate.get("name"), "component": component, "scope": scope},
+                    obj=obj,
+                )
+                continue
+            rows = _mate_rows(mate, frames, findings, obj)
+            if rows is None:
+                frame_problem(
+                    "a frame-attached mate cannot be reconstructed from its recorded entities",
+                    {"mate": mate.get("name"), "type": mate.get("type"), "scope": scope},
+                    obj=obj,
+                )
+                continue
+            frame_rows.extend(rows["rows"])
+            frame_endpoints.append(component)
             continue
         rows = _mate_rows(mate, frames, findings, obj)
         for left, right in _mate_pairs(mate):
@@ -785,6 +854,28 @@ def _clusters(record: dict, findings: list[dict]) -> _Clusters:
     members: dict[str, list[str]] = {}
     for node, root in mapping.items():
         members.setdefault(root, []).append(node)
+    attachment: _FrameAttachment | None = None
+    if frame_mates and frame_ok:
+        rank = _rank(frame_rows)
+        if rank != 6:
+            frame_problem(
+                "the aggregate frame attachment does not reach full rank; the attachment is incomplete",
+                {"rank": rank, "mates": list(frame_mates), "components": sorted(set(frame_endpoints))},
+            )
+        else:
+            keys = sorted({mapping[name] for name in frame_endpoints})
+            if len(keys) != 1:
+                frame_problem(
+                    "frame-attached components must belong to exactly one rigid cluster",
+                    {"components": sorted(set(frame_endpoints)), "clusters": [sorted(members[key]) for key in keys]},
+                )
+            else:
+                attachment = _FrameAttachment(
+                    members=frozenset(members[keys[0]]),
+                    components=tuple(sorted(set(frame_endpoints))),
+                    mates=tuple(frame_mates),
+                    rank=rank,
+                )
     clusters = _Clusters(
         members={key: sorted(value) for key, value in members.items()},
         of=mapping,
@@ -800,6 +891,7 @@ def _clusters(record: dict, findings: list[dict]) -> _Clusters:
             }
             for key, group in pairs.items()
         },
+        frame=attachment,
     )
     return clusters
 
@@ -882,10 +974,16 @@ def _resolve_record(settings: DiscoverySettings, reference: str, findings: list[
 
 
 def _datum(record: dict, name: str | None, owners: Sequence[str]) -> dict | None:
+    """The single datum of that name owned by one of ``owners``.
+
+    Ownership compares the recorded owner exactly: an absent or non-string
+    owner never aliases into a component or the frozen top assembly scope.
+    """
+
     matches = [
         datum
         for datum in record.get("datums") or []
-        if isinstance(datum, dict) and str(datum.get("name")) == str(name) and str(datum.get("owner") or "") in owners
+        if isinstance(datum, dict) and str(datum.get("name")) == str(name) and datum.get("owner") in owners
     ]
     return matches[0] if len(matches) == 1 else None
 
@@ -1272,8 +1370,10 @@ def _body_records(
     properties = (record.get("properties") or {}).get("components") or {}
     frozen = settings.frozen_names or {}
     datums = [item for item in record.get("datums") or [] if isinstance(item, dict) and _text(item.get("name"))]
+    attached = clusters.frame.members if clusters.frame is not None else None
     bodies: list[dict] = []
     for root, members in sorted(clusters.members.items()):
+        proven = attached is not None and frozenset(members) == attached
         material = [
             member
             for member in members
@@ -1305,13 +1405,21 @@ def _body_records(
             for datum in datums
             if str(datum.get("owner") or "") in members and str(datum.get("name")).startswith("CS_")
         ]
+        # The frozen top assembly's own CS_base_link may name this body only when
+        # the frame-attachment proof selected exactly this cluster as the base.
+        ownerless = (
+            [datum for datum in datums if datum.get("owner") == "" and str(datum.get("name")) == "CS_base_link"]
+            if proven
+            else []
+        )
         if explicit is not None:
-            candidate = _datum(record, explicit, members)
+            scope = [*members, *([""] if proven and explicit == "CS_base_link" else [])]
+            candidate = _datum(record, explicit, scope)
             if candidate is None:
                 foreign = [
                     datum
                     for datum in datums
-                    if str(datum.get("name")) == explicit and str(datum.get("owner") or "") not in members
+                    if str(datum.get("name")) == explicit and datum.get("owner") not in scope
                 ]
                 findings.append(
                     _finding(
@@ -1325,23 +1433,35 @@ def _body_records(
             datum = candidate
         elif len(owned) == 1:
             datum = owned[0]
-        elif not owned:
-            findings.append(
-                _finding(
-                    "discovery.link_name_missing",
-                    f"body:{root}",
-                    "no CS_<link> coordinate system is owned by this body",
-                    {"components": members},
-                )
-            )
-            continue
-        else:
+        elif owned:
             findings.append(
                 _finding(
                     "discovery.link_name_conflict",
                     f"body:{root}",
                     "several CS_<link> coordinate systems are owned by one body",
                     {"datums": sorted(str(datum["name"]) for datum in owned)},
+                )
+            )
+            continue
+        elif len(ownerless) == 1:
+            datum = ownerless[0]
+        elif ownerless:
+            findings.append(
+                _finding(
+                    "discovery.link_name_conflict",
+                    f"body:{root}",
+                    "several CS_<link> coordinate systems are owned by one body",
+                    {"datums": sorted(str(datum["name"]) for datum in ownerless)},
+                )
+            )
+            continue
+        else:
+            findings.append(
+                _finding(
+                    "discovery.link_name_missing",
+                    f"body:{root}",
+                    "no CS_<link> coordinate system is owned by this body",
+                    {"components": members},
                 )
             )
             continue
@@ -1423,6 +1543,7 @@ def _interface_frames(
     record: dict,
     clusters: _Clusters,
     bodies: list[dict],
+    base: dict | None,
     findings: list[dict],
 ) -> list[dict]:
     """Every recognised named native interface becomes a source frame.
@@ -1437,6 +1558,13 @@ def _interface_frames(
         for component in body["owners"]:
             body_of_component[component] = body
     link_datums = {(owner, str(body.get("datum"))) for body in bodies for owner in body["owners"]}
+    if base is not None and not any(
+        str(datum.get("name")) == str(base.get("datum")) and str(datum.get("owner") or "") in base["owners"]
+        for datum in record.get("datums") or []
+        if isinstance(datum, dict)
+    ):
+        # The proven base's own CS_base_link sits at the frozen top assembly scope.
+        link_datums.add(("", str(base.get("datum"))))
     frames: list[dict] = []
     seen: dict[str, str] = {}
     for datum in record.get("datums") or []:
@@ -1445,17 +1573,20 @@ def _interface_frames(
         name = str(datum.get("name") or "")
         if not name.startswith(INTERFACE_PREFIXES):
             continue
-        owner = str(datum.get("owner") or "")
-        if (owner, name) in link_datums:
+        owner = datum.get("owner")
+        if isinstance(owner, str) and (owner, name) in link_datums:
             continue
-        body = body_of_component.get(owner)
+        body = body_of_component.get(str(owner or ""))
+        if body is None and base is not None and owner == "":
+            # Only the proven base binds the frozen top assembly's own datums.
+            body = base
         if body is None:
             findings.append(
                 _finding(
                     "discovery.interface_unowned",
                     f"datum:{name}",
                     "recognised interface datum is not owned by any body",
-                    {"owner": owner},
+                    {"owner": str(owner or "")},
                 )
             )
             continue
@@ -1502,7 +1633,9 @@ def _interface_frames(
     return frames
 
 
-def _jcs_check(record: dict, joints: list[dict], by_name: dict[str, dict], findings: list[dict]) -> None:
+def _jcs_check(
+    record: dict, joints: list[dict], by_name: dict[str, dict], base: dict | None, findings: list[dict]
+) -> None:
     """``JCS_<joint>`` must alias the child body datum the compiler uses.
 
     The current compiler places the joint frame at the child body's datum; a
@@ -1528,17 +1661,20 @@ def _jcs_check(record: dict, joints: list[dict], by_name: dict[str, dict], findi
             )
             continue
         child = by_name.get(str(joint["child"]))
-        if child is not None and str(datum.get("owner") or "") not in child["owners"]:
-            findings.append(
-                _finding(
-                    "discovery.jcs_owner_mismatch",
-                    f"datum:{name}",
-                    "JCS_ datum is not owned by the child body's components",
-                    {"owner": datum.get("owner"), "child": joint["child"]},
+        owners: list[str] | None = None
+        if child is not None:
+            owners = [*child["owners"], *([""] if base is not None and child is base else [])]
+            if datum.get("owner") not in owners:
+                findings.append(
+                    _finding(
+                        "discovery.jcs_owner_mismatch",
+                        f"datum:{name}",
+                        "JCS_ datum is not owned by the child body's components",
+                        {"owner": datum.get("owner"), "child": joint["child"]},
+                    )
                 )
-            )
-            continue
-        child_datum = _datum(record, child["datum"], child["owners"]) if child else None
+                continue
+        child_datum = _datum(record, child["datum"], owners) if child is not None and owners is not None else None
         alias = [float(value) for value in datum.get("array") or ()]
         reference = [float(value) for value in (child_datum or {}).get("array") or ()]
         if (
@@ -1593,6 +1729,67 @@ def _root_body(
         )
     )
     return None
+
+
+def _attached_base(clusters: _Clusters, bodies: list[dict], root: dict | None) -> dict | None:
+    """The proven base body the frozen top assembly's ownerless datums may use.
+
+    The frame attachment, the resolved ``CS_base_link`` body and the base body
+    must be the same cluster: an attachment on any other rigid body never gains
+    the assembly scope's ownerless datum channel.
+    """
+
+    frame = clusters.frame
+    if frame is None or root is None:
+        return None
+    body = next((item for item in bodies if frozenset(item["owners"]) == frame.members), None)
+    if body is None or root.get("root") != body.get("root") or str(body.get("datum")) != "CS_base_link":
+        return None
+    return body
+
+
+def _frame_attachment_findings(record: dict, clusters: _Clusters, bodies: list[dict], findings: list[dict]) -> None:
+    """A proven attachment must become the published ``CS_base_link`` body."""
+
+    frame = clusters.frame
+    if frame is None:
+        return
+    components = {str(item.get("name2")): item for item in record.get("components") or [] if isinstance(item, dict)}
+    material = [
+        name
+        for name in sorted(frame.members)
+        if not str((components.get(name) or {}).get("document") or "").lower().endswith(".sldasm")
+    ]
+    if not material:
+        findings.append(
+            _finding(
+                "discovery.frame_attachment",
+                "assembly",
+                "the frame-attached cluster has no material body",
+                {"components": sorted(frame.members)},
+            )
+        )
+        return
+    body = next((item for item in bodies if frozenset(item["owners"]) == frame.members), None)
+    if body is None:
+        findings.append(
+            _finding(
+                "discovery.frame_attachment",
+                "assembly",
+                "the frame-attached cluster has no published body",
+                {"components": material},
+            )
+        )
+        return
+    if str(body.get("datum")) != "CS_base_link":
+        findings.append(
+            _finding(
+                "discovery.frame_attachment",
+                f"body:{body['root']}",
+                "the frame-attached cluster must become the CS_base_link body",
+                {"body": body.get("name"), "datum": body.get("datum")},
+            )
+        )
 
 
 def _orient(
@@ -1780,12 +1977,17 @@ def _axis_in_child(joint: dict, datum: dict) -> list[float] | None:
     return [value / norm for value in local]
 
 
-def _frame_checks(joints: list[dict], by_name: dict[str, dict], record: dict, findings: list[dict]) -> None:
+def _frame_checks(
+    joints: list[dict], by_name: dict[str, dict], record: dict, base: dict | None, findings: list[dict]
+) -> None:
     for joint in joints:
         if "child" not in joint or joint["axis"].get("source") != "mate":
             continue
         body = by_name.get(joint["child"])
-        datum = _datum(record, body["datum"], body["owners"]) if body else None
+        owners: list[str] | None = None
+        if body is not None:
+            owners = [*body["owners"], *([""] if base is not None and body is base else [])]
+        datum = _datum(record, body["datum"], owners) if body is not None and owners is not None else None
         if datum is None:
             continue
         try:
@@ -2080,11 +2282,27 @@ def prepare_native_package(
                 f"({recorded_main!r} != {settings.main_assembly!r})"
             )
     findings: list[dict] = []
+    known_occurrences = {
+        str(item.get("name2"))
+        for item in record.get("components") or []
+        if isinstance(item, dict) and _text(item.get("name2"))
+    }
     datum_ids: set[tuple[str, str]] = set()
     for datum in record.get("datums") or []:
         if not isinstance(datum, dict):
             continue
-        key = (str(datum.get("owner") or ""), str(datum.get("name") or ""))
+        name = str(datum.get("name") or "")
+        owner = datum.get("owner")
+        if not isinstance(owner, str) or (owner and owner not in known_occurrences):
+            findings.append(
+                _finding(
+                    "discovery.datum_owner_invalid",
+                    f"datum:{name}",
+                    "a datum owner must be a known occurrence name or the frozen top assembly",
+                    {"owner": owner},
+                )
+            )
+        key = (str(datum.get("owner") or ""), name)
         if key in datum_ids:
             findings.append(
                 _finding(
@@ -2146,6 +2364,8 @@ def prepare_native_package(
             }
         )
         by_root = {item["root"]: item for item in bodies}
+    base = _attached_base(clusters, bodies, root)
+    _frame_attachment_findings(record, clusters, bodies, findings)
     _orient(joints, bodies, by_root, root, findings)
     derived_names = _joint_names(joints, settings, findings)
     for body in bodies:
@@ -2165,9 +2385,9 @@ def prepare_native_package(
         else:
             seen_names[body["name"]] = body["root"]
     by_name = {body["name"]: body for body in bodies}
-    _frame_checks(joints, by_name, record, findings)
-    frames = _interface_frames(record, clusters, bodies, findings)
-    _jcs_check(record, joints, by_name, findings)
+    _frame_checks(joints, by_name, record, base, findings)
+    frames = _interface_frames(record, clusters, bodies, base, findings)
+    _jcs_check(record, joints, by_name, base, findings)
     blocking = [item for item in findings if item["blocking"]]
     output.mkdir(parents=True, exist_ok=True)
     discovery_path = output / DISCOVERY_FILE
