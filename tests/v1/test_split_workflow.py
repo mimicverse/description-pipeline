@@ -111,6 +111,19 @@ class SplitWorkflowTests(unittest.TestCase):
                 with self.assertRaises(ResultNotPublishable):
                     confirm({"request": request})
 
+    def test_engineering_failure_fails_its_airflow_task_even_with_a_retained_subject(self):
+        from airflow.sdk.exceptions import AirflowFailException
+
+        module = self.module()
+        failed = {"state": "failed", "passed": False, "subject_sha256": "a" * 64, "error": "quality gate failed"}
+        for stage in ("generate", "verify", "publish"):
+            with self.subTest(stage=stage), self.assertRaisesRegex(AirflowFailException, "quality gate failed"):
+                module._portable_summary(failed, stage=stage)
+        generated = module._portable_summary(
+            {"state": "generated", "passed": False, "subject_sha256": "b" * 64}, stage="generate"
+        )
+        self.assertEqual(generated["state"], "generated")
+
 
 if __name__ == "__main__":
     unittest.main()

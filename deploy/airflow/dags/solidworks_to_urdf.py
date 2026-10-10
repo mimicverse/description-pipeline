@@ -64,7 +64,10 @@ def _linux_store(conn_id: str) -> LinuxStore:
     return LinuxStore(config.store_root)
 
 
-def _portable_summary(receipt: dict) -> dict:
+def _portable_summary(receipt: dict, *, stage: str) -> dict:
+    expected = {"generate": {"generated"}, "verify": {"verified"}, "publish": {"published", "updated", "noop"}}
+    if receipt.get("state") not in expected[stage] or (stage != "generate" and receipt.get("passed") is not True):
+        raise AirflowFailException(receipt.get("error") or f"{stage} did not complete its required checks")
     return {
         "state": receipt.get("state"),
         "passed": receipt.get("passed"),
@@ -403,7 +406,7 @@ def solidworks_to_urdf():
         receipt = run_portable_stage(
             store, binding["run_id"], "generate", source_run_id=binding.get("source_run_id")
         )
-        return {**binding, "generate": _portable_summary(receipt)}
+        return {**binding, "generate": _portable_summary(receipt, stage="generate")}
 
     @task(doc_md="Independent verification on Linux, including the MuJoCo consumer.")
     def run_verify(generated: dict) -> dict:
@@ -423,7 +426,7 @@ def solidworks_to_urdf():
             expected_subject=subject,
             source_run_id=generated.get("source_run_id"),
         )
-        return {**generated, "verify": _portable_summary(receipt)}
+        return {**generated, "verify": _portable_summary(receipt, stage="verify")}
 
     @task(doc_md="Publish the verified delivery from Linux; no repository work happens on Windows.")
     def run_publish(verified: dict) -> dict:
@@ -444,7 +447,7 @@ def solidworks_to_urdf():
             base=base,
             source_run_id=verified.get("source_run_id"),
         )
-        return {**verified, "publish": _portable_summary(receipt)}
+        return {**verified, "publish": _portable_summary(receipt, stage="publish")}
 
     @task(doc_md="Confirm the six-stage receipt and the verified candidate PR from the Linux store.")
     def confirm_job(published: dict) -> dict:
