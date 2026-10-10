@@ -65,7 +65,7 @@ class StopAfterRunTests(unittest.TestCase):
     def _fake_capture(calls):
         def fake_capture(package, staging, *, backend=None, on_event=None, expected_inputs=None, handoff_sha256=None):
             calls["capture"] += 1
-            fixture = build_capture_root(Path(staging).parent / "fixture")
+            fixture = build_capture_root(Path(staging).parent / "fixture", handoff=handoff_sha256)
             shutil.copytree(fixture, Path(staging), dirs_exist_ok=True)
             if on_event is not None:
                 for event in stage_events("capture"):
