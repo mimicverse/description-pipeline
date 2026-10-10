@@ -205,6 +205,7 @@ class LinuxSplitTests(unittest.TestCase):
                 self.assertEqual(tampered.read(), b"<roboX/>\n")
                 with self.assertRaises(PipelineError):
                     tampered.read()
+        os.utime(verify)  # a new checkpoint identity forces re-verification
         with (
             mock.patch.object(store_module, "check_bundle", side_effect=PipelineError("report bytes changed")),
             self.assertRaises(PipelineError),
