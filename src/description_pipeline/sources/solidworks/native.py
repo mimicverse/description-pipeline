@@ -822,6 +822,267 @@ def _feature_name(target):
         return None
 
 
+#: Geometric classes of a mate entity reference read from the native
+#: ``ReferenceType`` member for the documented point/line/plane/cylinder/cone
+#: kinds; every other value is recorded raw so no class is ever guessed.
+MATE_ENTITY_REFERENCE_TYPES = {
+    0: "Point",
+    1: "Line",
+    3: "Plane",
+    4: "Cylinder",
+    7: "Cone",
+}
+
+#: Minimum documented ``EntityParams`` length per geometric class.  Published
+#: contract (IMateEntity2.EntityParams, with the layout remarks on
+#: IGetEntityParams): the array is ``[point xyz, vector ijk, radius1,
+#: radius2]`` and all coordinate information is in the owning (mate)
+#: assembly's model space — the vector is the line direction, the plane
+#: normal, or the cylinder/cone axis.  Documented property:
+#: https://help.solidworks.com/2026/english/api/sldworksapi/SOLIDWORKS.Interop.sldworks~SOLIDWORKS.Interop.sldworks.IMateEntity2~EntityParams.html  # noqa: E501
+MATE_ENTITY_PARAM_MINIMUMS = {
+    0: 3,
+    1: 6,
+    3: 6,
+    4: 7,
+    7: 8,
+}
+
+_IDENTITY_FRAME = (
+    (1.0, 0.0, 0.0, 0.0),
+    (0.0, 1.0, 0.0, 0.0),
+    (0.0, 0.0, 1.0, 0.0),
+    (0.0, 0.0, 0.0, 1.0),
+)
+
+
+def _decode_mate_entity_params(reference_type, params):
+    """Decode the documented EntityParams layout; nothing is guessed."""
+
+    minimum = MATE_ENTITY_PARAM_MINIMUMS.get(reference_type)
+    if minimum is None:
+        return None, None
+    if len(params) < minimum:
+        return None, (
+            "EntityParams has "
+            + str(len(params))
+            + " values; the documented layout for "
+            + MATE_ENTITY_REFERENCE_TYPES[reference_type]
+            + " needs at least "
+            + str(minimum)
+        )
+    point = params[0:3]
+    if reference_type == 0:
+        return {"kind": "point", "point": point}, None
+    vector = params[3:6]
+    norm = math.hypot(*vector)
+    if norm <= 0:
+        return None, "EntityParams vector is zero-length"
+    unit = [value / norm for value in vector]
+    if reference_type == 1:
+        return {"kind": "line", "point": point, "direction": unit}, None
+    if reference_type == 3:
+        return {"kind": "plane", "point": point, "normal": unit}, None
+    radius = params[6]
+    if radius <= 0:
+        return None, "EntityParams radius is not positive"
+    if reference_type == 4:
+        return {"kind": "cylinder", "point": point, "direction": unit, "radius": radius}, None
+    radius2 = params[7]
+    if radius2 <= 0:
+        return None, "EntityParams second radius is not positive"
+    return {"kind": "cone", "point": point, "direction": unit, "radius": radius, "radius2": radius2}, None
+
+
+def _mate_entity_reference(entity):
+    """Documented mate-entity provenance and geometry for one entity.
+
+    ``EntityParams`` is the published ``[point xyz, vector ijk, radius1,
+    radius2]`` array in the owning assembly's model space; the layout is
+    decoded only for the documented point/line/plane/cylinder/cone kinds and
+    geometric classes are never conflated.  ``ReferenceType`` (legacy
+    geometric class) and ``ReferenceType2`` are recorded as provenance.  A
+    missing or malformed reading is recorded explicitly and never silently
+    dropped; decoded geometry is withheld whenever any reading is malformed.
+    """
+
+    record = {
+        "source": "mate-entity-params",
+        "reference_type": None,
+        "reference_type_name": None,
+        "reference_type2": None,
+        "reference_type2_error": None,
+        "space": "mate-assembly",
+        "params": None,
+        "geometry": None,
+        "error": None,
+    }
+    try:
+        reference_type = _member(entity, "ReferenceType")
+    except Exception as error:  # noqa: BLE001 - provenance must not abort the entity read
+        reference_type = None
+        record["error"] = f"{type(error).__name__}: {error}"
+    try:
+        reference_type2 = _member(entity, "ReferenceType2")
+    except Exception as error:  # noqa: BLE001 - provenance-only reading
+        reference_type2 = None
+        record["reference_type2_error"] = f"{type(error).__name__}: {error}"
+    try:
+        raw_params = _member(entity, "EntityParams")
+    except Exception as error:  # noqa: BLE001 - provenance must not abort the entity read
+        raw_params = None
+        if record["error"] is None:
+            record["error"] = f"{type(error).__name__}: {error}"
+    if type(reference_type) is int:
+        record["reference_type"] = reference_type
+        record["reference_type_name"] = MATE_ENTITY_REFERENCE_TYPES.get(reference_type, f"raw:{reference_type}")
+    else:
+        record["error"] = record["error"] or f"ReferenceType is not a native integer ({type(reference_type).__name__})"
+    if type(reference_type2) is int:
+        record["reference_type2"] = reference_type2
+    else:
+        record["reference_type2_error"] = (
+            record["reference_type2_error"]
+            or f"ReferenceType2 is not a native integer ({type(reference_type2).__name__})"
+        )
+    if raw_params is None:
+        if record["error"] is None:
+            record["error"] = "EntityParams is unavailable"
+        return record
+    values = []
+    for item in _as_list(raw_params):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            if record["error"] is None:
+                record["error"] = f"EntityParams contains a non-numeric value ({type(item).__name__})"
+            return record
+        number = float(item)
+        if not math.isfinite(number):
+            if record["error"] is None:
+                record["error"] = "EntityParams contains a non-finite value"
+            return record
+        values.append(number)
+    record["params"] = values
+    if record["error"] is None:
+        record["geometry"], record["error"] = _decode_mate_entity_params(record["reference_type"], values)
+    return record
+
+
+def _frame_matrix(values):
+    """Recorded flattened 4x4 occurrence transform, or None when unusable.
+
+    Only a proper rigid placement is accepted: finite 16 values, a final
+    ``[0, 0, 0, 1]`` row, an orthonormal rotation block and a right-handed
+    (determinant +1) rotation — the same conditions ``transform_from_solidworks``
+    proves at capture time.
+    """
+
+    try:
+        numbers = [float(value) for value in values or ()]
+    except (TypeError, ValueError):
+        return None
+    if len(numbers) != 16 or not all(math.isfinite(value) for value in numbers):
+        return None
+    rows = [numbers[0:4], numbers[4:8], numbers[8:12], numbers[12:16]]
+    if any(abs(rows[3][i] - (1.0 if i == 3 else 0.0)) > 1e-9 for i in range(4)):
+        return None
+    rotation = [[rows[i][j] for j in range(3)] for i in range(3)]
+    if any(
+        abs(sum(rotation[k][i] * rotation[k][j] for k in range(3)) - (1.0 if i == j else 0.0)) > 1e-9
+        for i in range(3)
+        for j in range(3)
+    ):
+        return None
+    determinant = (
+        rotation[0][0] * (rotation[1][1] * rotation[2][2] - rotation[1][2] * rotation[2][1])
+        - rotation[0][1] * (rotation[1][0] * rotation[2][2] - rotation[1][2] * rotation[2][0])
+        + rotation[0][2] * (rotation[1][0] * rotation[2][1] - rotation[1][1] * rotation[2][0])
+    )
+    if abs(determinant - 1.0) > 1e-9:
+        return None
+    return rows
+
+
+def _compose_frames(left, right):
+    """Column-vector 4x4 product of two row-major frames."""
+
+    return [[sum(left[row][k] * right[k][column] for k in range(4)) for column in range(4)] for row in range(4)]
+
+
+def _rigid_inverse(frame):
+    """Inverse of a rigid row-major [R|t] frame."""
+
+    rotation = [[frame[i][j] for j in range(3)] for i in range(3)]
+    translation = [frame[i][3] for i in range(3)]
+    inverse_rotation = [[rotation[j][i] for j in range(3)] for i in range(3)]
+    inverse_translation = [-sum(inverse_rotation[i][k] * translation[k] for k in range(3)) for i in range(3)]
+    return [
+        [inverse_rotation[0][0], inverse_rotation[0][1], inverse_rotation[0][2], inverse_translation[0]],
+        [inverse_rotation[1][0], inverse_rotation[1][1], inverse_rotation[1][2], inverse_translation[1]],
+        [inverse_rotation[2][0], inverse_rotation[2][1], inverse_rotation[2][2], inverse_translation[2]],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
+def _frame_point(frame, point):
+    return [
+        frame[0][0] * point[0] + frame[0][1] * point[1] + frame[0][2] * point[2] + frame[0][3],
+        frame[1][0] * point[0] + frame[1][1] * point[1] + frame[1][2] * point[2] + frame[1][3],
+        frame[2][0] * point[0] + frame[2][1] * point[1] + frame[2][2] * point[2] + frame[2][3],
+    ]
+
+
+def _frame_vector(frame, vector):
+    return [
+        frame[0][0] * vector[0] + frame[0][1] * vector[1] + frame[0][2] * vector[2],
+        frame[1][0] * vector[0] + frame[1][1] * vector[1] + frame[1][2] * vector[2],
+        frame[2][0] * vector[0] + frame[2][1] * vector[1] + frame[2][2] * vector[2],
+    ]
+
+
+def _localize_mate_entity_reference(block, component, owner, frames):
+    """Re-express EntityParams geometry in the referenced component's frame.
+
+    Documented EntityParams coordinates are in the owning (mate) assembly's
+    model space; the record protocol stores decoded entity geometry in the
+    referenced component's local frame (discovery applies the recorded
+    component frame to recover assembly coordinates).  The conversion is
+    ``local = inv(frame(component)) composed with frame(owner)`` with the
+    frozen root (``""``) as identity, so a frame entity (component == owner)
+    keeps its parameters unchanged.  A missing or non-finite occurrence frame
+    rejects the geometry instead of guessing.
+    """
+
+    if not isinstance(block, dict) or block.get("error") is not None or block.get("geometry") is None:
+        return block
+    component_frame = frames.get(component) if component else _IDENTITY_FRAME
+    owner_frame = frames.get(owner) if owner else _IDENTITY_FRAME
+    if component_frame is None or owner_frame is None:
+        block["geometry"] = None
+        block["error"] = "the recorded occurrence frame for this reference is unavailable"
+        return block
+    local = _compose_frames(_rigid_inverse(component_frame), owner_frame)
+    geometry = dict(block["geometry"])
+    if "point" in geometry:
+        point = _frame_point(local, [float(value) for value in geometry["point"]])
+        if not all(math.isfinite(value) for value in point):
+            block["geometry"] = None
+            block["error"] = "the localized reference point is not finite"
+            return block
+        geometry["point"] = point
+    for key in ("direction", "normal"):
+        if key in geometry:
+            value = _frame_vector(local, [float(value) for value in geometry[key]])
+            norm = math.hypot(*value)
+            if norm <= 0 or not all(math.isfinite(item) for item in value):
+                block["geometry"] = None
+                block["error"] = "the recorded reference direction is unusable"
+                return block
+            geometry[key] = [item / norm for item in value]
+    geometry["frame"] = "component-local"
+    block["geometry"] = geometry
+    return block
+
+
 def _coordinate_system_features(doc):
     """Active datums only; suppressed features remain in the native tree."""
     names = []
@@ -2622,6 +2883,19 @@ class SolidWorksBackend(CadBackend):
         ``cad_mate_scope_ambiguous``; containment chains that repeat a document
         and occurrences holding the owning assembly's own document raise
         ``cad_reference_cycle`` instead of being traversed or bound.
+        Every mate entity also carries ``mate_entity_reference`` — the
+        documented ``IMateEntity2`` readings ``ReferenceType`` /
+        ``ReferenceType2`` as provenance plus ``EntityParams``
+        (``[point xyz, vector ijk, radius1, radius2]`` in the owning
+        assembly's model space), decoded only for the documented
+        point/line/plane/cylinder/cone kinds — never conflating geometric
+        classes — and re-expressed in the referenced component's local frame
+        (frame entities keep their owning-assembly parameters).  A missing or
+        malformed reading is recorded explicitly with the decoded geometry
+        withheld.
+        The block is additive evidence: the existing plane/cylinder/circle/point
+        keys and every derivation consumer are unchanged by it, so recorded
+        geometry gaps are not resolved until a consumer update is reviewed.
         """
 
         source_root = Path(frozen_source).resolve()
@@ -2931,6 +3205,7 @@ class SolidWorksBackend(CadBackend):
                                 "assembly_frame": bool(assembly_frame),
                                 "feature": _feature_name(target),
                                 "face_index": None,
+                                "mate_entity_reference": _mate_entity_reference(entity),
                                 **_plane_or_cylinder(target),
                             }
                         )
@@ -3002,6 +3277,7 @@ class SolidWorksBackend(CadBackend):
             # Top-level mates can name descendants that are visited later.
             # Resolve the full scoped occurrence; leaf-name matching loses
             # identity when the same part is inserted more than once.
+            entity_frames = {str(entry.get("name2")): _frame_matrix(entry.get("transform")) for entry in components}
             for mate in mates:
                 for entity in mate["entities"]:
                     reference_name = entity.pop("reference_name")
@@ -3023,6 +3299,9 @@ class SolidWorksBackend(CadBackend):
                             )
                         entity["component"] = scope
                         entity["assembly_frame"] = True
+                        entity["mate_entity_reference"] = _localize_mate_entity_reference(
+                            entity.get("mate_entity_reference"), scope, scope, entity_frames
+                        )
                         continue
                     scoped_name = (
                         f"{scope}/{reference_name}"
@@ -3046,6 +3325,9 @@ class SolidWorksBackend(CadBackend):
                             {"mate": mate["name"], "component": reference_name, "scope": scope},
                         )
                     entity["component"] = scoped_name
+                    entity["mate_entity_reference"] = _localize_mate_entity_reference(
+                        entity.get("mate_entity_reference"), scoped_name, scope, entity_frames
+                    )
             datums = []
             doc = self._document_by_path(str(main_path))
             _select_configuration(doc, configuration, "assembly")
