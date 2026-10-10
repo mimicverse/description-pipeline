@@ -2,8 +2,9 @@
 
 The fake endpoint implements the frozen selection contract: POST /v1/jobs with
 the upload index, GET snapshots, exact-batch pushes bound by X-Selection-Round,
-and a seal that re-hashes its own stage. The tests drive the real client and the
-real DAG poke loop against it; no SolidWorks, no deployed services.
+a seal that re-hashes its own stage, and the awaiting-definition leg (raw-record
+artifact download, definition submission, abort). The tests drive the real client
+and the real DAG poke loop against it; no SolidWorks, no deployed services.
 """
 
 from __future__ import annotations
@@ -80,7 +81,17 @@ class _FakeSelection:
         return self.snapshot(job)
 
     def snapshot(self, job: dict) -> dict:
-        return {
+        selection = {
+            "state": job["state"],
+            "round_id": _round_id(job["requested"]),
+            "reader_sha256": job["reader"],
+            "observations": {name: dict(record) for name, record in job["observations"].items()},
+            "staged_files": dict(job["staged"]),
+            "requested_files": dict(job["requested"]),
+        }
+        if job.get("manifest") is not None:
+            selection["manifest"] = job["manifest"]
+        snapshot = {
             "schema_version": "solidworks-to-urdf.job/v1",
             "pipeline_id": "solidworks-to-urdf",
             "run_id": job["request"]["run_id"],
@@ -88,15 +99,11 @@ class _FakeSelection:
             "events": [],
             "request": dict(job["request"]),
             "native_tool": {"source_sha256": job["reader"], "role": "native"},
-            "selection": {
-                "state": job["state"],
-                "round_id": _round_id(job["requested"]),
-                "reader_sha256": job["reader"],
-                "observations": {name: dict(record) for name, record in job["observations"].items()},
-                "staged_files": dict(job["staged"]),
-                "requested_files": dict(job["requested"]),
-            },
+            "selection": selection,
         }
+        if job.get("record") is not None:
+            snapshot["native_record"] = job["record"]
+        return snapshot
 
     def _settle(self, job: dict) -> None:
         if job["state"] != "reading":
@@ -161,7 +168,43 @@ class _FakeSelection:
             raise ValueError("seal differs from the endpoint graph")
         job["state"] = "sealed"
         job["requested"] = {}
-        job["status"] = "queued"
+        job["status"] = "awaiting_definition"
+        job["manifest"] = expected
+        record_manifest = {
+            "schema_version": "solidworks-to-urdf.raw-record/v1",
+            "run_id": job["request"]["run_id"],
+            "selection_sha256": expected["selection_sha256"],
+            "files": {"record.json": "e" * 64},
+        }
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as bundle:
+            bundle.writestr("record.json", json.dumps({"run_id": job["request"]["run_id"], "fixture": True}))
+            bundle.writestr("manifest.json", json.dumps(record_manifest))
+        blob = buffer.getvalue()
+        job["record_blob"] = blob
+        job["record"] = {
+            "name": "raw-record.zip",
+            "sha256": hashlib.sha256(blob).hexdigest(),
+            "size": len(blob),
+            "manifest_sha256": digest(record_manifest),
+            "manifest": record_manifest,
+        }
+        return self.snapshot(job)
+
+    def definition(self, run_id: str, prepared_sha256: str, members: dict) -> dict:
+        job = self.jobs[run_id]
+        if job["status"] != "awaiting_definition":
+            raise ValueError("job does not await a definition")
+        job["definition"] = {"prepared_sha256": prepared_sha256, "members": sorted(members)}
+        job["status"] = "running"
+        return self.snapshot(job)
+
+    def abort(self, run_id: str, payload: dict) -> dict:
+        job = self.jobs[run_id]
+        if job["status"] != "awaiting_definition":
+            raise ValueError("job does not await a definition")
+        job["abort"] = payload
+        job["status"] = "failed"
         return self.snapshot(job)
 
 
@@ -205,6 +248,21 @@ def _handler(state: _FakeSelection):
                     manifest = json.loads(self._body())["selection"]
                     self._reply(200, state.seal(run_id, manifest))
                     return
+                if len(parts) == 4 and parts[3] == "definition":
+                    if self.headers.get("Content-Type", "").split(";")[0] != "application/zip":
+                        raise _Conflict("definition body must be a zip")
+                    prepared = self.headers.get("X-Prepared-SHA256")
+                    if prepared is None:
+                        raise _Conflict("missing prepared digest header")
+                    members = {}
+                    with zipfile.ZipFile(io.BytesIO(self._body())) as archive:
+                        for name in archive.namelist():
+                            members[name] = archive.read(name)
+                    self._reply(202, state.definition(run_id, prepared, members))
+                    return
+                if len(parts) == 4 and parts[3] == "abort":
+                    self._reply(200, state.abort(run_id, json.loads(self._body())))
+                    return
             except _Conflict as error:
                 self._reply(409, {"error": str(error)})
                 return
@@ -215,6 +273,18 @@ def _handler(state: _FakeSelection):
 
         def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler API
             parts = self.path.strip("/").split("/")
+            if len(parts) == 5 and parts[0] == "v1" and parts[1] == "jobs" and parts[3] == "artifacts":
+                job = state.jobs.get(parts[2])
+                if job is None or parts[4] != "raw-record.zip" or "record_blob" not in job:
+                    self._reply(404, {"error": "no such artifact"})
+                    return
+                blob = job["record_blob"]
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Length", str(len(blob)))
+                self.end_headers()
+                self.wfile.write(blob)
+                return
             if len(parts) == 3 and parts[0] == "v1" and parts[1] == "jobs":
                 try:
                     self._reply(200, state.get(parts[2]))
@@ -380,6 +450,77 @@ class SelectionTransportTests(unittest.TestCase):
             for _ in range(4):
                 previous = self._drive(previous).get("progress")
         self.assertIn("Missing artifact", str(caught.exception))
+
+    def _sealed_manifest(self) -> dict:
+        self._start()
+        previous = None
+        for _ in range(8):
+            outcome = self._drive(previous)
+            previous = outcome.get("progress")
+            if outcome["action"] == "sealed":
+                return outcome["manifest"]
+        self.fail("selection did not reach a sealed manifest")
+
+    def test_definition_snapshot_and_record_transport(self) -> None:
+        manifest = self._sealed_manifest()
+        snapshot = self.endpoint.definition_snapshot(self.run_id, upload_files=self.upload)
+        job = self.state.jobs[self.run_id]
+        self.assertEqual(snapshot.record_name, "raw-record.zip")
+        self.assertEqual(snapshot.record_sha256, job["record"]["sha256"])
+        self.assertEqual(snapshot.record_size, job["record"]["size"])
+        self.assertEqual(snapshot.record_manifest, job["record"]["manifest"])
+        self.assertEqual(snapshot.selection.manifest, manifest)
+        destination = self.tmp / "raw-record.zip"
+        self.endpoint.stream_native_record(self.run_id, job["record"], destination)
+        self.assertEqual(destination.read_bytes(), job["record_blob"])
+        self.assertEqual(hashlib.sha256(destination.read_bytes()).hexdigest(), job["record"]["sha256"])
+
+    def test_definition_hand_off_refuses_broken_blocks(self) -> None:
+        self._start()
+        with self.assertRaises(EndpointProtocolError):
+            self.endpoint.definition_snapshot(self.run_id)
+        self._sealed_manifest()
+        record = self.state.jobs[self.run_id]["record"]
+        for tampered in (
+            {**record, "manifest_sha256": "0" * 64},
+            {**record, "name": "native-evidence.zip"},
+            {**record, "size": 0},
+            {**record, "manifest": {}},
+        ):
+            with self.subTest(tampered=str(tampered)[:60]), self.assertRaises(EndpointProtocolError):
+                self.endpoint.stream_native_record(self.run_id, tampered, self.tmp / "tampered.zip")
+
+    def test_definition_submission_carries_the_prepared_digest(self) -> None:
+        self._sealed_manifest()
+        archive = self.tmp / "capture-request.zip"
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.writestr("robot.yaml", "robot:\n  name: fixture\n")
+        prepared = "f" * 64
+        response = self.endpoint.post_definition_archive(self.run_id, archive, prepared_sha256=prepared)
+        self.assertEqual(response["status"], "running")
+        accepted = self.state.jobs[self.run_id]["definition"]
+        self.assertEqual(accepted["prepared_sha256"], prepared)
+        self.assertEqual(accepted["members"], ["robot.yaml"])
+
+    def test_abort_reports_the_local_derivation_failure(self) -> None:
+        self._sealed_manifest()
+        response = self.endpoint.abort_job(
+            self.run_id,
+            error="derivation refused",
+            error_code="definition_derivation_failed",
+            detail="findings retained in the Linux output",
+        )
+        self.assertEqual(response["status"], "failed")
+        self.assertEqual(
+            self.state.jobs[self.run_id]["abort"],
+            {
+                "error": "derivation refused",
+                "error_code": "definition_derivation_failed",
+                "detail": "findings retained in the Linux output",
+            },
+        )
+        with self.assertRaises(EndpointProtocolError):
+            self.endpoint.abort_job(self.run_id, error="", error_code="definition_derivation_failed")
 
 
 class SelectionDagTests(unittest.TestCase):

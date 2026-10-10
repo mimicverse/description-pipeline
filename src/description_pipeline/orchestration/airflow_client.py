@@ -57,6 +57,8 @@ EVENT_KEYS = ("stage", "state", "at")
 RUN_STATES = {"queued", "selecting", "running", "awaiting_definition", "native_complete", "passed", "failed"}
 #: Selection transport states of a ``selecting`` job (frozen contract).
 SELECTION_STATES = ("awaiting_files", "reading", "ready", "sealed")
+#: The fixed artifact name of the native raw-record bundle (mirrors discovery_transfer).
+NATIVE_RECORD_ARCHIVE = "raw-record.zip"
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _PULL_URL = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/pull/[1-9]\d*\Z")
@@ -405,6 +407,7 @@ class SelectionSnapshot:
     observations: dict[str, dict]
     staged_files: dict[str, str]
     requested_files: dict[str, str]
+    manifest: dict | None = None
 
 
 def _selection_files(value: object, label: str) -> dict[str, str]:
@@ -470,6 +473,11 @@ def _selection_block(
     staged = _selection_files(block.get("staged_files"), "staged_files")
     requested = _selection_files(block.get("requested_files"), "requested_files")
     observations = _selection_observations(block.get("observations"), staged)
+    manifest = block.get("manifest")
+    if manifest is not None and (not isinstance(manifest, dict) or not manifest):
+        raise EndpointProtocolError("selection manifest must be a non-empty object")
+    if state == "sealed" and manifest is None:
+        raise EndpointProtocolError("a sealed selection must carry its manifest")
     if upload_files is not None:
         for name, checksum in (*staged.items(), *requested.items()):
             if upload_files.get(name) != checksum:
@@ -483,6 +491,69 @@ def _selection_block(
         observations=observations,
         staged_files=staged,
         requested_files=requested,
+        manifest=manifest,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class AwaitingDefinition:
+    """Validated ``awaiting_definition`` snapshot: raw-record receipt and sealed selection."""
+
+    record_name: str
+    record_sha256: str
+    record_size: int
+    record_manifest: dict
+    native_tool: dict
+    selection: SelectionSnapshot
+
+
+def _native_record_block(record: object) -> dict:
+    """The flat raw-record artifact receipt the frozen transport contract declares."""
+
+    expected = {"name", "sha256", "size", "manifest_sha256", "manifest"}
+    if not isinstance(record, dict) or set(record) != expected:
+        raise EndpointProtocolError("native_record must carry exactly name, sha256, size, manifest_sha256 and manifest")
+    name = validate_artifact_name(record.get("name"))
+    if name != NATIVE_RECORD_ARCHIVE:
+        raise EndpointProtocolError("native_record name differs from the transport contract")
+    checksum = validate_sha256(record.get("sha256"))
+    manifest_sha256 = validate_sha256(record.get("manifest_sha256"))
+    size = record.get("size")
+    if type(size) is not int or size <= 0 or size > MAX_TRANSFER_BYTES:
+        raise EndpointProtocolError("native_record size must be a positive integer within the transfer bound")
+    manifest = record.get("manifest")
+    if not isinstance(manifest, dict) or not manifest:
+        raise EndpointProtocolError("native_record carries no bundle manifest")
+    if digest(manifest) != manifest_sha256:
+        raise EndpointProtocolError("native_record manifest does not match its recorded digest")
+    return {
+        "name": name,
+        "sha256": checksum,
+        "size": size,
+        "manifest_sha256": manifest_sha256,
+        "manifest": manifest,
+    }
+
+
+def _awaiting_definition(job: dict, *, upload_files: dict[str, str] | None = None) -> AwaitingDefinition:
+    """Parse and validate one job's definition hand-off against the frozen contract."""
+
+    if not isinstance(job, dict) or job.get("status") != "awaiting_definition":
+        raise EndpointProtocolError("the job does not await a definition")
+    record = _native_record_block(job.get("native_record"))
+    tool = job.get("native_tool")
+    if not isinstance(tool, dict) or not tool:
+        raise EndpointProtocolError("definition job carries no native tool record")
+    selection = _selection_block(job, upload_files=upload_files)
+    if selection.state != "sealed" or selection.manifest is None:
+        raise EndpointProtocolError("the definition job carries no sealed selection manifest")
+    return AwaitingDefinition(
+        record_name=record["name"],
+        record_sha256=record["sha256"],
+        record_size=record["size"],
+        record_manifest=record["manifest"],
+        native_tool=tool,
+        selection=selection,
     )
 
 
@@ -726,6 +797,98 @@ class WindowsEndpoint:
         snapshot = _selection_block(response)
         if snapshot.state != "sealed" or snapshot.requested_files:
             raise EndpointProtocolError("endpoint did not seal the validated selection")
+        return response
+
+    def definition_snapshot(self, run_id: str, *, upload_files: dict[str, str] | None = None) -> AwaitingDefinition:
+        """Fetch and validate the definition hand-off; never trusts a partial contract."""
+
+        job = self.get_job(run_id)
+        validated = None if upload_files is None else validate_file_index(upload_files)
+        return _awaiting_definition(job, upload_files=validated)
+
+    def stream_native_record(
+        self, run_id: str, record: dict, destination: Path, *, limit: int = MAX_TRANSFER_BYTES
+    ) -> Path:
+        """Stream the raw-record artifact to disk, requiring its exact size and digest."""
+
+        metadata = _native_record_block(record)
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+            raise EndpointProtocolError("record size limit must be a positive integer")
+        if metadata["size"] > limit:
+            raise EndpointProtocolError("native record exceeds the configured size limit")
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        hasher = hashlib.sha256()
+        total = 0
+        with (
+            self.open_artifact(run_id, metadata["name"]) as response,
+            tempfile.NamedTemporaryFile(prefix=".native-record-", dir=destination.parent, delete=False) as handle,
+        ):
+            temporary = Path(handle.name)
+            try:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > limit:
+                        raise EndpointProtocolError("native record exceeds the configured size limit")
+                    hasher.update(chunk)
+                    handle.write(chunk)
+            except BaseException:
+                with suppress(OSError):
+                    temporary.unlink()
+                raise
+        if total != metadata["size"] or hasher.hexdigest() != metadata["sha256"]:
+            with suppress(OSError):
+                temporary.unlink()
+            raise EndpointProtocolError("native record does not match its recorded size or digest")
+        os.replace(temporary, destination)
+        return destination
+
+    def post_definition_archive(self, run_id: str, archive: Path, *, prepared_sha256: str) -> dict:
+        """Submit the sealed capture request; the endpoint rebuilds the prepared package."""
+
+        prepared = validate_sha256(prepared_sha256)
+        archive = Path(archive)
+        size = archive.stat().st_size
+        if not 0 < size <= MAX_TRANSFER_BYTES:
+            raise EndpointProtocolError("definition archive has an invalid size")
+        with archive.open("rb") as handle:
+            response = self._request_stream(
+                "POST",
+                f"/v1/jobs/{validate_run_id(run_id)}/definition",
+                handle,
+                size=size,
+                headers={"X-Prepared-SHA256": prepared},
+            )
+        if not isinstance(response, dict):
+            raise EndpointProtocolError("definition acknowledgement must be a job object")
+        if response.get("run_id", run_id) != run_id:
+            raise EndpointProtocolError("endpoint acknowledged a different definition run")
+        if "status" in response and response["status"] not in RUN_STATES:
+            raise EndpointProtocolError(f"unexpected job status: {response.get('status')!r}")
+        return response
+
+    def abort_job(self, run_id: str, *, error: str, error_code: str, detail: str | None = None) -> dict:
+        """Abort one awaiting-definition job after a local derivation failure; never hangs the endpoint."""
+
+        for field, value in (("error", error), ("error_code", error_code)):
+            if not isinstance(value, str) or not value.strip():
+                raise EndpointProtocolError(f"abort {field} must be a non-empty string")
+        if detail is not None and not isinstance(detail, str):
+            raise EndpointProtocolError("abort detail must be a string when present")
+        response = self._request(
+            "POST",
+            f"/v1/jobs/{validate_run_id(run_id)}/abort",
+            {"error": error, "error_code": error_code, "detail": detail},
+        )
+        if not isinstance(response, dict):
+            raise EndpointProtocolError("abort acknowledgement must be a job object")
+        if response.get("run_id", run_id) != run_id:
+            raise EndpointProtocolError("endpoint acknowledged a different abort run")
+        if "status" in response and response["status"] not in RUN_STATES:
+            raise EndpointProtocolError(f"unexpected job status: {response.get('status')!r}")
         return response
 
     def rerun_plan(self, run_id: str) -> dict:
