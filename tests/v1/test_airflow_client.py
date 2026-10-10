@@ -626,6 +626,133 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(config.handoff_roots, (root.resolve(),))
             self.assertEqual(config.base_url, "http://127.0.0.1:18765")
 
+    def test_capture_archive_receipt_is_validated_exactly(self) -> None:
+        from description_pipeline.orchestration.airflow_client import capture_archive_metadata
+        from description_pipeline.orchestration.stage_transfer import CAPTURE_ARCHIVE, CAPTURE_MANIFEST
+
+        archive = {
+            "name": CAPTURE_ARCHIVE,
+            "sha256": "a" * 64,
+            "size": 1024,
+            "manifest_name": CAPTURE_MANIFEST,
+            "manifest_sha256": "b" * 64,
+        }
+        job = {"status": "native_complete", "result": {"native_complete": True, "capture_archive": archive}}
+        self.assertEqual(capture_archive_metadata(job), archive)
+        for broken in (
+            {"status": "passed", "result": {"native_complete": True, "capture_archive": archive}},
+            {"status": "native_complete", "result": {"capture_archive": archive}},
+            {
+                "status": "native_complete",
+                "result": {"native_complete": True, "capture_archive": {**archive, "name": "other.zip"}},
+            },
+            {
+                "status": "native_complete",
+                "result": {"native_complete": True, "capture_archive": {**archive, "manifest_name": "other.json"}},
+            },
+            {
+                "status": "native_complete",
+                "result": {"native_complete": True, "capture_archive": {**archive, "sha256": "A" * 64}},
+            },
+            {
+                "status": "native_complete",
+                "result": {"native_complete": True, "capture_archive": {**archive, "size": 0}},
+            },
+            {
+                "status": "native_complete",
+                "result": {"native_complete": True, "capture_archive": {**archive, "extra": 1}},
+            },
+        ):
+            with self.subTest(job=broken), self.assertRaises(EndpointProtocolError):
+                capture_archive_metadata(broken)
+
+    def test_linux_routing_map_and_store_root_are_validated(self) -> None:
+        config = EndpointConfig(
+            base_url="http://127.0.0.1",
+            token=TOKEN,
+            repositories={"mimicverse/description": "/home/andy/Work/description"},
+            store_root="/home/andy/operator/runs",
+        )
+        self.assertEqual(config.repositories, {"mimicverse/description": Path("/home/andy/Work/description")})
+        self.assertEqual(config.store_root, Path("/home/andy/operator/runs"))
+        for kwargs in (
+            {"repositories": {"noslug": "/srv/repo"}},
+            {"repositories": {"owner/repo": "relative/repo"}},
+            {"repositories": ["owner/repo"]},
+            {"store_root": "relative/store"},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(EndpointProtocolError):
+                EndpointConfig(base_url="http://127.0.0.1", token=TOKEN, **kwargs)
+
+    def test_connection_extra_supplies_linux_routing(self) -> None:
+        class FakeConnection:
+            host = "127.0.0.1"
+            port = 18765
+            password = "token"
+
+            def __init__(self) -> None:
+                self.extra_dejson = {
+                    "repositories": {"owner/repo": "/srv/repo"},
+                    "store_root": "/srv/store",
+                }
+
+        class FakeBaseHook:
+            @staticmethod
+            def get_connection(conn_id):
+                return FakeConnection()
+
+        airflow = types.ModuleType("airflow")
+        hooks = types.ModuleType("airflow.hooks")
+        base = types.ModuleType("airflow.hooks.base")
+        base.BaseHook = FakeBaseHook
+        hooks.base = base
+        airflow.hooks = hooks
+        with mock.patch.dict(sys.modules, {"airflow": airflow, "airflow.hooks": hooks, "airflow.hooks.base": base}):
+            config = config_from_airflow_connection("solidworks_windows")
+        self.assertEqual(config.repositories, {"owner/repo": Path("/srv/repo")})
+        self.assertEqual(config.store_root, Path("/srv/store"))
+
+    def test_stream_capture_archive_verifies_size_and_digest(self) -> None:
+        import io as io_module
+
+        from description_pipeline.orchestration.airflow_client import WindowsEndpoint
+        from description_pipeline.orchestration.stage_transfer import CAPTURE_ARCHIVE, CAPTURE_MANIFEST
+
+        payload = b"PK\x03\x04fixture-capture-archive"
+        archive = {
+            "name": CAPTURE_ARCHIVE,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size": len(payload),
+            "manifest_name": CAPTURE_MANIFEST,
+            "manifest_sha256": "b" * 64,
+        }
+
+        class Response:
+            def __init__(self, data: bytes) -> None:
+                self._stream = io_module.BytesIO(data)
+
+            def read(self, size: int = -1) -> bytes:
+                return self._stream.read(size)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        endpoint = WindowsEndpoint(
+            EndpointConfig(base_url="http://127.0.0.1", token=TOKEN),
+            opener=lambda request, timeout: Response(payload),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / CAPTURE_ARCHIVE
+            self.assertEqual(endpoint.stream_capture_archive(RUN_ID, archive, destination), destination)
+            self.assertEqual(destination.read_bytes(), payload)
+            for broken in ({**archive, "sha256": "c" * 64}, {**archive, "size": len(payload) + 1}):
+                with self.assertRaises(EndpointProtocolError):
+                    endpoint.stream_capture_archive(RUN_ID, broken, destination)
+            self.assertEqual(destination.read_bytes(), payload)
+
     def test_native_run_id_is_canonical_and_stable(self) -> None:
         expected = str(uuid.uuid5(uuid.NAMESPACE_URL, f"solidworks_to_urdf:{RUN_ID}"))
         self.assertEqual(native_run_id(RUN_ID), expected)
