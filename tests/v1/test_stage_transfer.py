@@ -100,7 +100,7 @@ def capture_root(base: Path, *, run_id: str = RUN_ID, handoff: str = HANDOFF, ma
         evidence_class="cad",
     )
     write_json(root / "reports/native-tool.json", native_tool())
-    write_json(root / "reports/stages.json", stage_view(run_id=run_id, handoff=handoff))
+    write_json(root / "reports/native-stages.json", stage_view(run_id=run_id, handoff=handoff))
     return root
 
 
@@ -228,7 +228,7 @@ class StageTransferTests(unittest.TestCase):
         write_json(with_sidecar / transfer.CAPTURE_MANIFEST, {"stale": True})
         manifest = seal(with_sidecar, self.base / "sidecar.zip")
         self.assertNotIn(transfer.CAPTURE_MANIFEST, manifest["files"])
-        self.assertIn("reports/stages.json", manifest["files"])
+        self.assertIn("reports/native-stages.json", manifest["files"])
 
         stray = capture_root(self.base / "stray")
         (stray / "stray.txt").write_bytes(b"stray")
@@ -249,7 +249,7 @@ class StageTransferTests(unittest.TestCase):
     def test_missing_or_extra_members_are_refused(self) -> None:
         seal(self.root, self.archive)
         for label, arguments in (
-            ("missing", {"remove": ("reports/stages.json",)}),
+            ("missing", {"remove": ("reports/native-stages.json",)}),
             ("extra", {"add": {"reports/extra.json": b"{}"}}),
         ):
             with self.subTest(case=label):
@@ -275,7 +275,7 @@ class StageTransferTests(unittest.TestCase):
             if stage["id"] == "capture":
                 stage["checks_passed"] = 0
         broken = self.base / "stages.zip"
-        repack(self.archive, broken, {"reports/stages.json": canonical(view)})
+        repack(self.archive, broken, {"reports/native-stages.json": canonical(view)})
         with self.assertRaisesRegex(PipelineError, "receipts are incomplete"):
             admit(broken, self.base / "out-stages")
 
@@ -391,12 +391,12 @@ class StageTransferTests(unittest.TestCase):
         cases.append(("portable-tool", portable, "reports/native-tool.json", "runtime.role", portable))
 
         wide_scope = stage_view(scope=("freeze", "discover", "capture", "generate"))
-        cases.append(("wide-scope", wide_scope, "reports/stages.json", "native execution scope"))
+        cases.append(("wide-scope", wide_scope, "reports/native-stages.json", "native execution scope"))
 
         failed_check = stage_view()
         failed_check["stages"][2]["output_qc"][0]["state"] = "failed"
         failed_check["stages"][2]["checks_passed"] = failed_check["stages"][2]["checks_total"] - 1
-        cases.append(("failed-check", failed_check, "reports/stages.json", "failed or unrun"))
+        cases.append(("failed-check", failed_check, "reports/native-stages.json", "failed or unrun"))
 
         for case in cases:
             label, payload, target, expected = case[:4]

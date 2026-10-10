@@ -37,7 +37,11 @@ MAX_TRANSFER_FILES = 100_000
 MAX_TRANSFER_BYTES = 16 * 1024**3
 MAX_MANIFEST_BYTES = 64 * 1024**2
 
-_REQUIRED_REPORTS = ("reports/input.json", "reports/native-tool.json", "reports/stages.json")
+#: Interim alignment with the agreed native-stages binding (root 2026-10-10): the sealed
+#: payload carries the immutable native stage receipt; live delivery stamps stay behind on
+#: the native host.  C reconciles this in the stage-transfer branch.
+_REQUIRED_REPORTS = ("reports/input.json", "reports/native-tool.json", "reports/native-stages.json")
+_SEALING_OUTPUTS = ("reports/run.json", "reports/stages.json")
 _READ_CHUNK = 1024 * 1024
 
 
@@ -165,7 +169,7 @@ def _validate_capture(root: Path, *, run_id: str, handoff_sha256: str, main_asse
     recorded = read_data(confined(root, "reports/native-tool.json"))
     _require(recorded == native_tool, "Native tool report differs from the supplied native tool record")
     _validate_stage_receipts(
-        read_data(confined(root, "reports/stages.json")),
+        read_data(confined(root, "reports/native-stages.json")),
         run_id=run_id,
         handoff_sha256=handoff_sha256,
     )
@@ -198,7 +202,11 @@ def seal_capture(
     ignored = {CAPTURE_MANIFEST}
     with suppress(ValueError):
         ignored.add(archive.resolve().relative_to(root.resolve()).as_posix())
-    files = {name: checksum for name, checksum in files.items() if name not in ignored}
+    files = {
+        name: checksum
+        for name, checksum in files.items()
+        if name not in ignored and name not in _SEALING_OUTPUTS
+    }
     _require(files, "Capture root contains no files to seal")
     _require(len(files) <= MAX_TRANSFER_FILES, "Capture exceeds the transfer file limit")
     total_bytes = sum(confined(root, name).stat().st_size for name in files)

@@ -1,41 +1,44 @@
-"""Per-stage stop boundaries: capture seal, generated checkpoint, verified, publish."""
+"""Per-stage stop boundaries: capture seal roundtrip, generated checkpoint, verified."""
 
 from __future__ import annotations
 
 import json
-import sys
+import shutil
 import tempfile
-import types
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
 from description_pipeline import solidworks, steps
 from description_pipeline.io import PipelineError, file_digest
+from description_pipeline.orchestration import stage_transfer as transfer
+from description_pipeline.stages import CONTRACT
 
 from .test_native_resume_runner import REPLAYED_INSPECTION, make_seed
+from .test_stage_transfer import capture_root as build_capture_root
+from .test_stage_transfer import native_tool as build_native_tool
+
+HANDOFF = "b" * 64
+MAIN = "robot.SLDASM"
 
 
-def install_stub_transfer() -> types.ModuleType:
-    """Minimal stand-in for C's stage_transfer until it lands."""
+def stage_events(stage_id: str) -> list[dict]:
+    """Contract-valid boundary-check events for one stage, then completion."""
 
-    module = types.ModuleType("description_pipeline.stage_transfer")
-    module.CAPTURE_ARCHIVE = "native-evidence.zip"
-    module.CAPTURE_MANIFEST = "transfer-manifest.json"
-
-    def seal_capture(root, archive, *, run_id, handoff_sha256, main_assembly, native_tool):
-        Path(archive).write_bytes(b"PK\x03\x04stub")
-        return {
-            "schema_version": "solidworks-to-urdf.transfer/v1",
-            "run_id": run_id,
-            "handoff_sha256": handoff_sha256,
-            "main_assembly": main_assembly,
-            "native_tool_source_sha256": native_tool.get("source_sha256"),
-            "files": {"input/robot.yaml": file_digest(Path(root) / "input/robot.yaml")},
-        }
-
-    module.seal_capture = seal_capture
-    return module
+    definition = next(stage for stage in CONTRACT["stages"] if stage["id"] == stage_id)
+    events = []
+    for boundary, key in (("input", "input_qc"), ("output", "output_qc")):
+        for item in definition[key]:
+            events.append(
+                {
+                    "stage": stage_id,
+                    "state": "running",
+                    "check": {"id": item["id"], "boundary": boundary, "state": "passed", "details": {}},
+                }
+            )
+    events.append({"stage": stage_id, "state": "completed"})
+    return events
 
 
 def forbid(calls, name):
@@ -55,24 +58,17 @@ class StopAfterRunTests(unittest.TestCase):
         self.package.mkdir()
         (self.package / "assembly.SLDASM").write_bytes(b"control")
         self.output = self.root / "delivery"
-        self.transfer = install_stub_transfer()
 
     @staticmethod
     def _fake_capture(calls):
         def fake_capture(package, staging, *, backend=None, on_event=None, expected_inputs=None, handoff_sha256=None):
             calls["capture"] += 1
-            staging = Path(staging)
-            (staging / "input").mkdir(parents=True)
-            (staging / "input" / "robot.yaml").write_text("hardware_id: arm\n", encoding="utf-8")
-            (staging / "evidence").mkdir()
-            (staging / "evidence" / "manifest.json").write_text("{}\n", encoding="utf-8")
-            (staging / "reports").mkdir(parents=True)
-            (staging / "reports" / "input.json").write_text(
-                json.dumps({"cad_revision": {"revision": "r1"}}) + "\n", encoding="utf-8"
-            )
+            fixture = build_capture_root(Path(staging).parent / "fixture")
+            shutil.copytree(fixture, Path(staging), dirs_exist_ok=True)
             if on_event is not None:
-                on_event({"stage": "capture", "state": "completed"})
-            return {"hardware_id": "arm"}, {"cad_revision": {"revision": "r1"}, "package_files": {}}
+                for event in stage_events("capture"):
+                    on_event(event)
+            return {"hardware_id": "robot"}, {"cad_revision": {"revision": "r1"}, "package_files": {}}
 
         return fake_capture
 
@@ -80,7 +76,7 @@ class StopAfterRunTests(unittest.TestCase):
         calls = {"capture": 0, "generate": 0, "verify": 0, "publish": 0}
 
         with (
-            patch.dict(sys.modules, {"description_pipeline.stage_transfer": self.transfer}),
+            patch.object(solidworks, "_native_tool_record", return_value=build_native_tool()),
             patch.object(steps, "capture_evidence", side_effect=self._fake_capture(calls)),
             patch.object(steps, "generate_model", side_effect=forbid(calls, "generate")),
             patch.object(steps, "verify_delivery", side_effect=forbid(calls, "verify")),
@@ -92,37 +88,54 @@ class StopAfterRunTests(unittest.TestCase):
                 stop_after="capture",
                 backend=object(),
                 run_id="7c9b44b3-0b9c-5ffe-9f4f-4bbdafb4a865",
-                handoff_sha256="b" * 64,
-                main_assembly="3.0 总装1008.SLDASM",
-                prior_events=[
-                    {"stage": "freeze", "state": "completed"},
-                    {"stage": "discover", "state": "completed"},
-                ],
+                handoff_sha256=HANDOFF,
+                main_assembly=MAIN,
+                prior_events=[*stage_events("freeze"), *stage_events("discover")],
             )
         self.assertIs(result["native_complete"], True)
         self.assertIs(result["passed"], False)
         self.assertEqual(result["state"], "native_complete")
         self.assertEqual(result["execution_scope"], ["freeze", "discover", "capture"])
-        archive = self.output / "native-evidence.zip"
-        manifest = self.output / "transfer-manifest.json"
+        archive = self.output / transfer.CAPTURE_ARCHIVE
+        manifest = self.output / transfer.CAPTURE_MANIFEST
         self.assertTrue(archive.is_file())
         self.assertTrue(manifest.is_file())
         info = result["capture_archive"]
         self.assertEqual(set(info), {"name", "sha256", "size", "manifest_sha256"})
-        self.assertEqual(info["name"], "native-evidence.zip")
+        self.assertEqual(info["name"], transfer.CAPTURE_ARCHIVE)
         self.assertEqual(info["sha256"], file_digest(archive))
         self.assertEqual(info["size"], archive.stat().st_size)
         self.assertEqual(info["manifest_sha256"], file_digest(manifest))
         self.assertEqual(calls, {"capture": 1, "generate": 0, "verify": 0, "publish": 0})
         self.assertTrue((self.output / "reports/native-tool.json").is_file())
         self.assertTrue((self.output / "reports/stages.json").is_file())
-        native_stages = self.output / "reports/native-stages.json"
+        native_stages = self.output / "reports" / "native-stages.json"
         self.assertTrue(native_stages.is_file())
         self.assertEqual(native_stages.read_bytes(), (self.output / "reports/stages.json").read_bytes())
         receipt = json.loads((self.output / "reports/run.json").read_text(encoding="utf-8"))
         self.assertEqual(receipt["state"], "native_complete")
         self.assertIs(receipt["passed"], False)
         self.assertEqual(receipt["capture_archive"], info)
+
+        # Real-sealer roundtrip: seal → admit, and only the immutable native receipt travels.
+        with zipfile.ZipFile(archive) as opened:
+            names = opened.namelist()
+        self.assertIn("reports/native-stages.json", names)
+        self.assertNotIn("reports/stages.json", names)
+        self.assertNotIn("reports/run.json", names)
+        destination = self.root / "admitted"
+        transfer.admit_capture(
+            archive,
+            destination,
+            expected_run_id=result["run_id"],
+            expected_handoff_sha256=HANDOFF,
+            expected_main_assembly=MAIN,
+            expected_native_tool=build_native_tool(),
+        )
+        self.assertEqual(
+            (destination / "reports" / "native-stages.json").read_bytes(),
+            native_stages.read_bytes(),
+        )
 
     def test_generate_stop_installs_unverified_checkpoint(self) -> None:
         seed = make_seed(self.root)

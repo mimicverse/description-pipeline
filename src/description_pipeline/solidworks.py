@@ -1,4 +1,8 @@
-"""One local path from a saved CAD package to an independently checked URDF."""
+"""One stage-bounded path from a saved CAD package to an independently checked URDF.
+
+The native host freezes, discovers and captures; the sealed transfer then continues on the
+portable host through generation, independent verification and publication.
+"""
 
 from __future__ import annotations
 
@@ -146,14 +150,11 @@ def _keep_diagnostic(staging: Path, output: Path, receipt: dict) -> Path:
 
 
 def _native_tool_record() -> dict:
-    """The native-role tool identity; role-aware runtimes land with the host split."""
+    """The native-role tool identity for the sealed capture provenance."""
 
     from .runtime import tool_record
 
-    try:
-        return tool_record(role="native")
-    except TypeError:  # pragma: no cover - transitional runtimes without role support
-        return tool_record()
+    return tool_record(role="native")
 
 
 def _executed_stages(restart: int, stop_after: str | None, repository) -> list[str]:
@@ -178,7 +179,7 @@ def _finish_native_capture(staging, output, receipt, *, run_id, handoff_sha256, 
     _stamp(staging, receipt)
     # The native receipt must stay stable even when Linux rewrites reports/stages.json.
     shutil.copy2(staging / "reports/stages.json", staging / "reports/native-stages.json")
-    from .stage_transfer import CAPTURE_ARCHIVE, CAPTURE_MANIFEST, seal_capture
+    from .orchestration.stage_transfer import CAPTURE_ARCHIVE, CAPTURE_MANIFEST, seal_capture
 
     archive = staging / CAPTURE_ARCHIVE
     manifest = seal_capture(
