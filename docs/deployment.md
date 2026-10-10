@@ -217,14 +217,14 @@ Keep the list empty until an administrator is explicitly selected. User IDs
 from another app cannot be reused. Apply configuration through the supported
 installation and restart steps below.
 
-Membership in an approved tenant grants workflow operator access; administrators
-must also appear in the explicit admin list. Operator access covers starting new
-runs and viewing shared results; the run's initiator (stable authenticated
-identity) and platform administrators can retry that run through the single
-contextual Retry action for positively classified transport recovery, which
-continues the same DAG run and native job without recapturing or editing frozen
-inputs or artifacts. Native terminal failures require a new run after correcting
-inputs or configuration. The owner check ships with the platform package; no
+Membership in an approved tenant grants access to start runs and view shared
+results; administrators must also appear in the explicit admin list. Only the
+initiator and platform administrators may change a run. **从此步骤重新运行** creates
+a linked attempt from an eligible retained checkpoint and executes that step and
+its successors. Generation, verification and publication reruns stay on Linux;
+they do not reopen CAD. Changed source files require a new upload.
+**继续原作业** recovers an interrupted transport connection within the same run;
+it does not repeat engineering work. The owner check ships with the platform package; no
 separate credential or install-time flag is required, and operator run changes
 are refused when that guard is absent. Each run's history and details show the
 original submitter's Feishu username from the authenticated API response.
@@ -253,7 +253,8 @@ bash deploy/operator/operatorctl.sh health --env-file "$description_env"
 ```
 
 Installation provisions the pinned Python toolchain, PostgreSQL 14, Airflow
-3.3.2, the matching tool wheel, proxy and service configuration. It starts the
+3.3.2, the matching tool wheel with its verification runtime, proxy and service
+configuration. The Linux runtime check must pass before database migration. It starts the
 managed database before migration; `start` launches the remaining services.
 Installation creates the sole `solidworks_windows` Connection with the endpoint
 token, Linux source allowlist, run store and model routing. Operators need no
@@ -290,16 +291,13 @@ Commission the complete workflow with actual native CAD and live Feishu:
    explicit admin assignment and denied unauthorized users. Confirm an approved
    operator can start new pipeline runs and view shared results from other
    operators.
-3. As the run's initiator, confirm the Retry action appears only for a
-   positively classified transport failure and continues the same DAG run and
-   native job without recapturing or editing frozen inputs or artifacts, and is
-   absent for native terminal failures. Confirm a platform administrator can
-   also retry that run, that another approved user can view the run but cannot
-   retry it, and that the Retry request
-   (`POST /api/v2/dags/{dag_id}/dagRuns/{dag_run_id}/clear` with
-   `dry_run`, `only_failed: true`, `only_new: false`,
-   `run_on_latest_version: false`) is accepted for the initiator and refused
-   for another approved user.
+3. Verify that the initiator and administrators can start a linked attempt from
+   every eligible engineering step, including a completed step. Earlier work is
+   reused only after its checkpoint checks pass. A verification rerun must not
+   reopen CAD or regenerate the model; a publication rerun must independently
+   recheck the retained delivery before submitting. Other operators may view
+   results but cannot initiate these changes. Separately exercise **继续原作业**
+   for a recoverable transport failure and confirm it retains the same run.
 4. In the operator page, choose the complete engineering folder once (Chrome or
    Edge); the browser uploads its files to the platform's Linux intake and
    `Start` creates the run. No server path, YAML, branch, hardware or
@@ -321,8 +319,8 @@ Commission the complete workflow with actual native CAD and live Feishu:
    diagnostics; a PR-service failure preserves verified preview.
 9. After the complete service restart described below, select a completed run
    and choose **从此步骤重新运行** from verification or publication. Require a
-   new linked run with the selected starting step recorded in the endpoint
-   request. Upstream results must show **复用已验证结果**, retain their original
+   new linked run with the selected starting step recorded in its request.
+   These Linux stages must not submit a new Windows job. Upstream results must show **复用已验证结果**, retain their original
    timestamps and producing-run identity, and trigger no new CAD capture.
    Confirm that only the selected step and its downstream steps execute again,
    and that the original run and evidence remain unchanged. Verify access for

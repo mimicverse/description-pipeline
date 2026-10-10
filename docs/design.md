@@ -159,12 +159,12 @@ restricts tenant and workflow permissions and keeps credentials server-side.
 Approved Feishu users may start new pipeline runs and view shared results. Each
 run records its initiator's stable authenticated identity and displays that
 operator's original Feishu username. The run's initiator and platform
-administrators can retry that run through one contextual Retry action for
-positively classified transport recovery; retrying continues the same DAG run
-and native job with the frozen inputs, and captured evidence and delivered
-artifacts are never edited. Every terminal native failure requires a new run
-after correcting the inputs or configuration. Administrators retain broader
-platform administration beyond this action.
+administrators may start a linked attempt from any step whose retained inputs
+pass validation. Earlier results are reused with their original evidence;
+the selected step and its successors execute again. The original run remains
+unchanged. Recoverable transport interruption has a separate continuation action
+within the same run. Changed CAD requires a new upload. Administrators retain
+broader platform administration.
 
 Maintainers configure storage roots and hardware routing once; operators choose
 one complete engineering folder on their own computer in the page, and the
