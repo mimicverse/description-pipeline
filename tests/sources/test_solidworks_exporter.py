@@ -584,7 +584,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
         self.assertEqual([item["code"] for item in findings], ["discovery.mate_entities_unsupported"])
         self.assertFalse(findings[0]["blocking"])
 
-    def test_native_limit_difference_does_not_replace_the_declared_range(self):
+    def test_conflicting_native_limits_block_without_replacing_the_declared_range(self):
         raw = raw_record()
         limits = {"unit": "rad", "lower": -2, "upper": 2}
         raw["mates"] = [
@@ -598,13 +598,13 @@ class ExporterDiscoveryTests(unittest.TestCase):
             }
         ]
         _, joints, findings = self.derive(raw)
-        observed = next(item for item in findings if item["code"] == "discovery.exporter_native_limits_difference")
+        observed = next(item for item in findings if item["code"] == "discovery.joint_limits_conflict")
         self.assertEqual(observed["detail"]["mate"], "cad_limit")
         self.assertEqual(observed["detail"]["native"], limits)
         self.assertEqual(observed["detail"]["declared"], joints[0]["limits"])
         self.assertEqual(joints[0]["limits"]["lower"], 0)
         self.assertEqual(joints[0]["limits"]["upper"], 0)
-        self.assertFalse(any(item["blocking"] for item in findings))
+        self.assertTrue(observed["blocking"])
 
     def test_structural_declaration_errors_remain_blocking(self):
         for mutate, code in (

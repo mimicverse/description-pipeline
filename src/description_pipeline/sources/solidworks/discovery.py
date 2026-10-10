@@ -2407,11 +2407,10 @@ def _exporter_constraint_checks(
                 ):
                     findings.append(
                         _finding(
-                            "discovery.exporter_native_limits_difference",
+                            "discovery.joint_limits_conflict",
                             f"joint:{joint['name']}",
-                            "native mate position limits differ from the saved joint declaration",
+                            "native mate position limits disagree with the saved joint declaration",
                             {**detail, "native": limits, "declared": declared},
-                            blocking=False,
                         )
                     )
 
