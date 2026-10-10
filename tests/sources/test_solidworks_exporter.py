@@ -251,8 +251,69 @@ class ExporterDiscoveryTests(unittest.TestCase):
         self.assertEqual(joints[0]["limits"], dict.fromkeys(("lower", "upper", "effort", "velocity"), 0.0))
         self.assertEqual(
             {finding["code"] for finding in findings},
-            {"discovery.joint_limits_invalid", "discovery.joint_drive_invalid"},
+            {"discovery.joint_limits_degenerate", "discovery.joint_drive_unspecified"},
         )
+        self.assertFalse(any(item["blocking"] for item in findings))
+        self.assertEqual(
+            {item["detail"]["qualification_blocker"] for item in findings},
+            {"usable_joint_range", "usable_joint_drive"},
+        )
+
+    def test_equal_bounds_and_zero_drives_are_preserved_as_stage_warnings(self):
+        for values, expected in (
+            ({"lower": -1, "upper": -1, "effort": 2, "velocity": 3}, "discovery.joint_limits_degenerate"),
+            ({"lower": -1, "upper": 1, "effort": 0, "velocity": 3}, "discovery.joint_drive_unspecified"),
+            ({"lower": -1, "upper": 1, "effort": 2, "velocity": 0}, "discovery.joint_drive_unspecified"),
+        ):
+            raw = raw_record()
+            raw["exporter"]["raw_xml"] = wire_xml(values)
+            _, joints, findings = self.derive(raw)
+            self.assertEqual(joints[0]["limits"], values)
+            self.assertEqual([item["code"] for item in findings], [expected])
+            self.assertFalse(findings[0]["blocking"])
+            self.assertIn("qualification_blocker", findings[0]["detail"])
+
+    def test_missing_nonfinite_negative_drive_and_reversed_bounds_still_block(self):
+        for changes, code in (
+            ({"lower": None}, "discovery.joint_limits_invalid"),
+            ({"upper": float("nan")}, "discovery.joint_limits_invalid"),
+            ({"lower": 2, "upper": 1}, "discovery.joint_limits_invalid"),
+            ({"effort": None}, "discovery.joint_drive_invalid"),
+            ({"velocity": float("inf")}, "discovery.joint_drive_invalid"),
+            ({"effort": -1}, "discovery.joint_drive_invalid"),
+            ({"velocity": -1}, "discovery.joint_drive_invalid"),
+        ):
+            raw = raw_record()
+            declaration = decode_exporter_v14(raw["exporter"]["raw_xml"], 1.4)
+            bodies, _ = _exporter_memberships(raw, declaration, [])
+            declaration["links"][1]["joint"]["limits"] = {
+                "lower": -1,
+                "upper": 1,
+                "effort": 2,
+                "velocity": 3,
+                **changes,
+            }
+            findings = []
+            _exporter_joint_facts(raw, declaration, bodies, findings)
+            self.assertIn(code, {item["code"] for item in findings if item["blocking"]})
+        with self.assertRaises(ExporterDeclarationError):
+            decode_exporter_v14(wire_xml({"velocity": float("nan")}), 1.4)
+
+    def test_uncovered_material_warning_preserves_exact_occurrence_without_assignment(self):
+        raw = raw_record()
+        raw["components"].append({**raw["components"][0], "name2": "unselected-1"})
+        bodies, _, findings = self.derive(raw)
+        coverage = next(item for item in findings if item["code"] == "discovery.exporter_membership_uncovered")
+        self.assertFalse(coverage["blocking"])
+        self.assertEqual(
+            coverage["detail"],
+            {
+                "components": ["unselected-1"],
+                "qualification_blocker": "complete_material_coverage",
+            },
+        )
+        self.assertFalse(any("unselected-1" in body["components"] for body in bodies))
+        self.assertIn("unselected-1", {item["name2"] for item in raw["components"]})
 
     def test_moving_selected_subtree_is_not_absorbed_by_parent_selection(self):
         raw = raw_record()
@@ -407,8 +468,9 @@ class ExporterDiscoveryTests(unittest.TestCase):
             self.assertIsNone(_exporter_declaration(raw, identity, findings))
             self.assertEqual([item["code"] for item in findings], [] if expected is None else [expected])
 
-    def test_preparation_persists_actual_declared_zeroes_and_observed_configuration(self):
+    def test_preparation_preserves_declared_zero_warnings_when_another_gate_blocks(self):
         raw = raw_record()
+        raw["identity"]["owner"] = None
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "input"
             source.mkdir()
@@ -428,8 +490,11 @@ class ExporterDiscoveryTests(unittest.TestCase):
         self.assertNotIn("budget", payload)
         self.assertEqual(
             {item["code"] for item in result.findings if item["blocking"]},
-            {"discovery.joint_limits_invalid", "discovery.joint_drive_invalid"},
+            {"discovery.owner_missing"},
         )
+        zero_findings = [item for item in result.findings if item["code"].startswith("discovery.joint_")]
+        self.assertEqual(len(zero_findings), 2)
+        self.assertTrue(all(not item["blocking"] and item["detail"]["qualification_blocker"] for item in zero_findings))
 
     def test_valid_declarations_generate_named_axis_input_without_stale_derived_values(self):
         raw = raw_record()

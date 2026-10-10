@@ -2117,8 +2117,10 @@ def _exporter_memberships(record: dict, declaration: dict, findings: list[dict])
             _finding(
                 "discovery.exporter_membership_uncovered",
                 "assembly",
-                "active material occurrences are not covered by exactly one declared selection",
-                {"components": uncovered},
+                "active material occurrences remain unassigned; capture retains their CAD geometry and mass, "
+                "but complete material coverage is not qualified",
+                {"components": uncovered, "qualification_blocker": "complete_material_coverage"},
+                blocking=False,
             )
         )
     bodies = []
@@ -2563,27 +2565,47 @@ def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], f
             if kind != "continuous" and (
                 not isinstance(limits, dict)
                 or not all(valid(limits.get(key)) for key in ("lower", "upper"))
-                or limits["lower"] >= limits["upper"]
+                or limits["lower"] > limits["upper"]
             ):
                 findings.append(
                     _finding(
                         "discovery.joint_limits_invalid",
                         obj,
-                        "saved position limits must be finite and strictly increasing; "
-                        "explicit zeros are not a usable range",
+                        "saved position limits must be finite and ordered",
                         limits,
                     )
                 )
+            elif kind != "continuous" and limits["lower"] == limits["upper"]:
+                findings.append(
+                    _finding(
+                        "discovery.joint_limits_degenerate",
+                        obj,
+                        "equal authored position bounds are retained for capture and generation; "
+                        "a usable joint range is not qualified",
+                        {"limits": limits, "qualification_blocker": "usable_joint_range"},
+                        blocking=False,
+                    )
+                )
             if not isinstance(limits, dict) or not all(
-                valid(limits.get(key)) and limits[key] > 0 for key in ("effort", "velocity")
+                valid(limits.get(key)) and limits[key] >= 0 for key in ("effort", "velocity")
             ):
                 findings.append(
                     _finding(
                         "discovery.joint_drive_invalid",
                         obj,
-                        "saved effort and velocity must be finite and positive; "
-                        "explicit zeros are not drive specifications",
+                        "saved effort and velocity must be finite and nonnegative",
                         limits,
+                    )
+                )
+            elif any(limits[key] == 0 for key in ("effort", "velocity")):
+                findings.append(
+                    _finding(
+                        "discovery.joint_drive_unspecified",
+                        obj,
+                        "authored zero effort or velocity is retained for capture and generation; "
+                        "a usable drive specification is not qualified",
+                        {"limits": limits, "qualification_blocker": "usable_joint_drive"},
+                        blocking=False,
                     )
                 )
             if (
