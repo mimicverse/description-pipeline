@@ -8,6 +8,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
@@ -24,7 +25,7 @@ from description_pipeline.sources.solidworks.selection import (  # noqa: E402
     selection_plan,
 )
 
-FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures" / "native_selection_m3_shape.json"
+FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures" / "native_selection_external_references.json"
 
 
 def stage_fixture() -> dict:
@@ -139,7 +140,7 @@ class NativeSelectionObservationTests(unittest.TestCase):
         self.assertNotIn("parts/link.SLDPRT", json.dumps(error.detail))
         self.assertEqual(application.calls, [self.path("assembly.SLDASM")])
 
-    def test_m3_shape_fixture_refuses_with_verbatim_evidence(self) -> None:
+    def test_external_reference_fixture_refuses_with_verbatim_evidence(self) -> None:
         fixture = stage_fixture()
         upload = dict(fixture["upload_files"])
         digests = write_stage(self.tmp, {"assembly.SLDASM": b"main"})
@@ -280,23 +281,58 @@ class NativeSelectionRefusalOrderTests(unittest.TestCase):
         digests = write_stage(self.tmp, {"assembly.SLDASM": b"main"})
         application = FakeApplication({})
 
-        # A digest map without a root is metadata, not proof that bytes exist.
-        with self.assertRaises(SelectionError) as no_root:
+        # A digest map is metadata, not proof that bytes exist.
+        with self.assertRaises(SelectionError) as mapped:
             observe(application, digests, {"assembly.SLDASM": digests["assembly.SLDASM"]}, digests)
-        self.assertEqual(no_root.exception.code, "selection_stage_invalid")
+        self.assertEqual(mapped.exception.code, "selection_stage_invalid")
+
+        # A stage object with extra attributes is not a path either.
+        fake = type("Stage", (), {"root": str(self.tmp), "files": {"absent.SLDASM": "8" * 64}})()
+        with self.assertRaises(SelectionError) as attributed:
+            observe(application, fake, {"assembly.SLDASM": digests["assembly.SLDASM"]}, digests)
+        self.assertEqual(attributed.exception.code, "selection_stage_invalid")
 
         missing_root = self.tmp / "outside-stage"
         with self.assertRaises(SelectionError) as unreadable:
             observe(application, missing_root, {"assembly.SLDASM": digests["assembly.SLDASM"]}, digests)
         self.assertEqual(unreadable.exception.code, "selection_stage_invalid")
-
-        # A mapping that claims a staged digest cannot stand in for the bytes.
-        lying = type("Stage", (), {"root": str(self.tmp), "files": {"absent.SLDASM": "8" * 64}})()
-        upload = {"absent.SLDASM": "8" * 64}
-        with self.assertRaises(SelectionError) as not_staged:
-            observe(application, lying, {"absent.SLDASM": "8" * 64}, upload)
-        self.assertEqual(not_staged.exception.code, "selection_document_not_staged")
         self.assertEqual(application.calls, [])
+
+    def test_stage_with_a_linked_parent_is_refused(self) -> None:
+        real = self.tmp / "real"
+        digests = write_stage(real, {"assembly.SLDASM": b"main"})
+        link = self.tmp / "linked"
+        os.symlink(real, link)
+        application = FakeApplication({})
+        with self.assertRaises(SelectionError) as caught:
+            observe(application, link, {"assembly.SLDASM": digests["assembly.SLDASM"]}, digests)
+        self.assertEqual(caught.exception.code, "selection_stage_invalid")
+        self.assertEqual(application.calls, [])
+
+    def test_pending_names_must_match_the_upload_index_exactly(self) -> None:
+        digests = write_stage(self.tmp, {"assembly.SLDASM": b"main"})
+        application = FakeApplication({})
+        wrong_keys = ("./assembly.SLDASM", "Assembly.SLDASM", "/assembly.SLDASM", "assembly.SLDASM ")
+        for key in (*wrong_keys, Path("assembly.SLDASM")):
+            with self.subTest(key=str(key)), self.assertRaises(SelectionError) as caught:
+                observe(application, self.tmp, {key: digests["assembly.SLDASM"]}, digests)
+            self.assertEqual(caught.exception.code, "selection_request_unknown")
+        self.assertEqual(application.calls, [])
+
+    def test_bytes_mutated_during_the_query_refuse_without_observation(self) -> None:
+        digests = write_stage(self.tmp, {"assembly.SLDASM": b"main"})
+        staged = self.path("assembly.SLDASM")
+
+        class MutatingApplication(FakeApplication):
+            def GetDocumentDependencies2(self, path, traverse, search, read_only):  # noqa: N802
+                Path(staged).write_bytes(b"mutated-during-query")
+                return super().GetDocumentDependencies2(path, traverse, search, read_only)
+
+        application = MutatingApplication({staged: [("frame", "parts/frame.SLDASM")]})
+        upload = {**digests, "parts/frame.SLDASM": "a" * 64}
+        with self.assertRaises(SelectionError) as caught:
+            observe(application, self.tmp, {"assembly.SLDASM": digests["assembly.SLDASM"]}, upload)
+        self.assertEqual(caught.exception.code, "selection_source_changed")
 
 
 class NativeSelectionPlanIntegrationTests(unittest.TestCase):
@@ -362,6 +398,20 @@ class SealedOpenGuardTests(unittest.TestCase):
         with self.assertRaises(CadError) as caught:
             backend.seal_documents(["  "])
         self.assertEqual(caught.exception.code, "document_seal_invalid")
+
+    def test_seal_rejects_relative_documents(self) -> None:
+        backend = SolidWorksBackend()
+        with self.assertRaises(CadError) as caught:
+            backend.seal_documents(["stage/main.SLDASM"])
+        self.assertEqual(caught.exception.code, "document_seal_invalid")
+
+    def test_guard_rejection_never_reaches_the_cad_runtime(self) -> None:
+        backend = SolidWorksBackend()
+        backend.seal_documents(["/stage/main.SLDASM"])
+        with mock.patch("description_pipeline.sources.solidworks.native._win32") as win32:
+            with self.assertRaises(CadError):
+                backend.open_document("/stage/other.SLDASM")
+        win32.assert_not_called()
 
 
 if __name__ == "__main__":

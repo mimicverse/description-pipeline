@@ -1844,7 +1844,9 @@ class SolidWorksBackend(CadBackend):
         ``inspect_copy``.
 
         This gates which documents may be opened; it is not OS file-access
-        sandboxing, which the owned session does not provide.  Pass absolute
+        sandboxing.  It blocks backend opens only: once an open is permitted,
+        SolidWorks itself reads the reference files it resolves, and the owned
+        session provides no OS-level file-access isolation.  Pass absolute
         document paths and receive the sorted normalized sealed set as
         evidence.
         """
@@ -1855,6 +1857,10 @@ class SolidWorksBackend(CadBackend):
             if not isinstance(text, str) or not text.strip():
                 raise CadError(
                     "document_seal_invalid", "Sealed documents must be non-empty paths", {"document": repr(document)}
+                )
+            if not os.path.isabs(text):
+                raise CadError(
+                    "document_seal_invalid", "Sealed documents must be absolute paths", {"document": text}
                 )
             sealed.add(normalize_document_path(os.path.abspath(text)))
         self._sealed_documents = sealed

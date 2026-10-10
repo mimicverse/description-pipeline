@@ -45,6 +45,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from ...io import PipelineError, _filesystem_path, artifact_path_parts, confined
+from .handoff import MAX_HANDOFF_BYTES, _directory
 from .selection import MAX_SELECTION_FILES, SelectionError, validate_file_index
 
 __all__ = ["MAX_SELECTION_FILES", "NativeSelectionReader"]
@@ -67,125 +68,82 @@ def _module_for(*values: str):
     return posixpath
 
 
-def _hash_file(path: Path) -> str:
+def _staged_sha256(path: Path, name: str) -> str:
+    """Hash staged bytes bounded by their recorded size and the handoff limit."""
+
+    try:
+        size = path.stat().st_size
+    except OSError as error:
+        raise SelectionError(
+            "selection_source_changed", "Staged document could not be read", path=name, error=str(error)
+        ) from error
+    if size > MAX_HANDOFF_BYTES:
+        raise SelectionError(
+            "selection_document_too_large",
+            "Staged document exceeds the handoff input limit",
+            path=name,
+            size=size,
+            limit=MAX_HANDOFF_BYTES,
+        )
     hasher = hashlib.sha256()
-    with open(_filesystem_path(path), "rb") as stream:
-        for block in iter(lambda: stream.read(_READ_CHUNK), b""):
-            hasher.update(block)
+    read = 0
+    try:
+        with open(_filesystem_path(path), "rb") as stream:
+            for block in iter(lambda: stream.read(_READ_CHUNK), b""):
+                read += len(block)
+                if read > size:
+                    raise SelectionError(
+                        "selection_source_changed", "Staged document changed while hashing", path=name
+                    )
+                hasher.update(block)
+    except OSError as error:
+        raise SelectionError(
+            "selection_source_changed", "Staged document could not be read", path=name, error=str(error)
+        ) from error
     return hasher.hexdigest()
 
 
-def _stage_root(stage) -> str | None:
-    if isinstance(stage, (str, os.PathLike)):
-        return os.fspath(stage) or None
-    if isinstance(stage, Mapping):
-        return None
-    for attribute in ("root", "stage_root", "path"):
-        value = getattr(stage, attribute, None)
-        if isinstance(value, (str, os.PathLike)) and os.fspath(value):
-            return os.fspath(value)
-    return None
+def _stage_root(stage) -> Path:
+    """The real staged tree, validated by the handoff directory rules."""
 
-
-def _stage_digest_probe(stage):
-    """Callables/mappings the stage offers as the exact staged inventory."""
-
-    if isinstance(stage, Mapping):
-        return stage, None
-    inventory = None
-    for attribute in ("files", "inventory", "staged"):
-        value = getattr(stage, attribute, None)
-        if isinstance(value, Mapping):
-            inventory = value
-            break
-    probe = None
-    for attribute in ("sha256", "staged_sha256"):
-        value = getattr(stage, attribute, None)
-        if callable(value):
-            probe = value
-            break
-    return inventory, probe
-
-
-def _inventory_digest(inventory: Mapping, name: str) -> str | None:
-    if name in inventory:
-        value = inventory[name]
-    else:
-        folded = name.casefold()
-        matches = [key for key in inventory if isinstance(key, str) and key.casefold() == folded]
-        if len(matches) != 1:
-            return None
-        value = inventory[matches[0]]
-    if not isinstance(value, str) or _SHA.fullmatch(value) is None:
-        raise SelectionError("selection_stage_invalid", "Staged inventory entries must be SHA-256 digests", path=name)
-    return value
-
-
-def _staged_digest(stage, name: str) -> str | None:
-    """The staged digest of ``name``, or None when the bytes are not staged.
-
-    The staged bytes are authoritative: the stage root must be a readable
-    directory on this host and the file's digest is hashed here.  Inventory
-    mappings or ``sha256(name)`` probes the stage also offers are cross-checked
-    only - they can never stand in for bytes that do not exist.
-    """
-
-    root = _stage_root(stage)
-    if root is None:
-        raise SelectionError("selection_stage_invalid", "The stage must expose its root directory", path=name)
-    local_root = Path(root)
-    if not local_root.is_dir():
-        raise SelectionError(
-            "selection_stage_invalid", "The stage root is not a readable directory", root=root, path=name
-        )
+    if not isinstance(stage, (str, os.PathLike)):
+        raise SelectionError("selection_stage_invalid", "The stage must be a directory path", stage=repr(stage))
+    value = os.fspath(stage)
+    if not isinstance(value, str) or not value.strip():
+        raise SelectionError("selection_stage_invalid", "The stage must be a directory path", stage=repr(stage))
     try:
-        path = confined(local_root, name, exists=False)
+        return _directory(Path(value))
+    except PipelineError as error:
+        raise SelectionError("selection_stage_invalid", str(error), stage=value) from error
+
+
+def _staged_digest(root: Path, name: str) -> str | None:
+    """The staged digest of ``name``, or None when the bytes are not staged."""
+
+    try:
+        path = confined(root, name, exists=False)
     except PipelineError as error:
         raise SelectionError("selection_stage_invalid", str(error), path=name) from error
     if not path.is_file():
         return None
-    actual = _hash_file(path)
-    inventory, probe = _stage_digest_probe(stage)
-    if inventory is not None:
-        value = _inventory_digest(inventory, name)
-        if value is not None and value != actual:
-            raise SelectionError("selection_source_changed", "Stage inventory disagrees with the bytes", path=name)
-    if probe is not None:
-        try:
-            value = probe(name)
-        except Exception as error:  # noqa: BLE001 - a broken probe refuses, never guesses
-            raise SelectionError("selection_stage_invalid", "The stage probe failed", path=name) from error
-        if value is not None:
-            if not isinstance(value, str) or _SHA.fullmatch(value) is None:
-                raise SelectionError("selection_stage_invalid", "Staged entries must be SHA-256 digests", path=name)
-            if value != actual:
-                raise SelectionError("selection_source_changed", "Stage probe disagrees with the bytes", path=name)
-    return actual
+    return _staged_sha256(path, name)
 
 
-def _document_path(root: str | None, name: str) -> str:
-    if root is None:
-        return name
-    module = _module_for(root)
-    return module.join(module.normpath(root), *name.split("/"))
+def _document_path(root: Path, name: str) -> str:
+    module = _module_for(str(root))
+    return module.join(module.normpath(str(root)), *name.split("/"))
 
 
-def _canonical_requested(value, files: Mapping[str, str]) -> str:
-    text = os.fspath(value) if isinstance(value, os.PathLike) else value
-    if not isinstance(text, str) or not text.strip():
-        raise SelectionError("selection_request_invalid", "Requested documents must be names", path=repr(value))
-    name = text.replace("\\", "/").lstrip("/")
-    if name.startswith("./"):
-        name = name[2:]
-    if name in files:
-        return name
-    folded = name.casefold()
-    matches = [candidate for candidate in files if candidate.casefold() == folded]
-    if len(matches) == 1:
-        return matches[0]
-    raise SelectionError(
-        "selection_request_unknown", "The requested document is not authorized by the upload index", path=name
-    )
+def _pending_name(value, files: Mapping[str, str]) -> str:
+    """Exactly the canonical upload-index name; nothing is normalized or guessed."""
+
+    if not isinstance(value, str) or value not in files:
+        raise SelectionError(
+            "selection_request_unknown",
+            "The pending document is not exactly an upload index name",
+            path=repr(value),
+        )
+    return value
 
 
 def _import_artifact(name: str, location: str) -> bool:
@@ -223,6 +181,15 @@ def _canonical_reference(module, stage_root: str, document_path: str, location: 
 
 
 def _index_name(files: Mapping[str, str], canonical: str) -> str | None:
+    """The index spelling of an in-namespace reference.
+
+    SolidWorks stores Windows paths with the case it saw, while the delivered
+    name is authoritative.  ``validate_file_index`` already refuses two names
+    that differ only by case, so a case-insensitive match is unique - this is
+    deliberately narrow and applies to stored references only, never to
+    pending names or to any basename.
+    """
+
     if canonical in files:
         return canonical
     folded = canonical.casefold()
@@ -347,7 +314,7 @@ class NativeSelectionReader:
             raise SelectionError("selection_request_invalid", "Pending documents must be a name-to-digest mapping")
         asked: dict[str, str] = {}
         for value, digest in pending.items():
-            name = _canonical_requested(value, files)
+            name = _pending_name(value, files)
             if not isinstance(digest, str) or _SHA.fullmatch(digest) is None:
                 raise SelectionError("selection_request_invalid", "Pending entries must be SHA-256 digests", path=name)
             if name in asked and asked[name] != digest:
@@ -360,6 +327,7 @@ class NativeSelectionReader:
 
         root = _stage_root(stage)
         document_paths: dict[str, str] = {}
+        staged: dict[str, str] = {}
         for name, digest in asked.items():
             if digest != files[name]:
                 raise SelectionError(
@@ -369,26 +337,28 @@ class NativeSelectionReader:
                 raise SelectionError(
                     "selection_request_unsupported", "Only native SolidWorks documents can be observed", path=name
                 )
-            actual = _staged_digest(stage, name)
+            actual = _staged_digest(root, name)
             if actual is None:
                 raise SelectionError("selection_document_not_staged", "The pending document is not staged", path=name)
             if actual != files[name]:
                 raise SelectionError("selection_source_changed", "Staged bytes differ from the upload index", path=name)
+            staged[name] = actual
             document_paths[name] = _document_path(root, name)
-
-        if root is None and asked:
-            raise SelectionError(
-                "selection_stage_invalid",
-                "Observing documents requires the stage namespace root",
-                paths=sorted(asked),
-            )
 
         observations: dict[str, dict] = {}
         problems: list[dict] = []
         for name in asked:
+            entries = self._read(document_paths[name]) or ()
+            # The bytes must still be the verified ones before any observation
+            # is emitted; a document that changed while SolidWorks read it
+            # cannot enter the sealed selection.
+            if _staged_digest(root, name) != staged[name]:
+                raise SelectionError(
+                    "selection_source_changed", "Staged bytes changed during the native query", path=name
+                )
             references: set[str] = set()
-            for entry in self._read(document_paths[name]) or ():
-                outcome = _classify_reference(entry, name, document_paths[name], root, files)
+            for entry in entries:
+                outcome = _classify_reference(entry, name, document_paths[name], str(root), files)
                 if isinstance(outcome, str):
                     references.add(outcome)
                 else:
@@ -401,7 +371,7 @@ class NativeSelectionReader:
             raise SelectionError(
                 "selection_dependencies_refused",
                 "Stored references cannot be admitted into the staged selection",
-                stage_root=root,
+                stage_root=str(root),
                 problems=problems,
                 count=len(problems),
             )
