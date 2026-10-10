@@ -25,6 +25,9 @@ from description_pipeline.sources.solidworks.discovery import (  # noqa: E402
     CONTRACT,
     DISCOVERY_SCHEMA,
     DiscoverySettings,
+    _clusters,
+    _component_frames,
+    _mate_rows,
     _unit,
     prepare_native_package,
 )
@@ -495,6 +498,77 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(document["source"]["joints"][0]["parent"], "base_link")
         report = verify_discovery(output)
         self.assertTrue(report["passed"], report["errors"])
+
+    def test_assembly_frame_mate_is_blocked_explicitly_and_never_silently_dropped(self):
+        def ground_mate() -> dict:
+            return {
+                "name": "base_ground_pin",
+                "type": "coincident",
+                "suppressed": False,
+                "error_code": 0,
+                "scope": "",
+                "limits": None,
+                "entities": [
+                    {
+                        "component": "base-1",
+                        "feature": "Plane1",
+                        "plane": {"point": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, -1.0]},
+                    },
+                    {
+                        "component": "",
+                        "assembly_frame": True,
+                        "feature": "Plane2",
+                        "plane": {"point": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0]},
+                    },
+                ],
+            }
+
+        def mutate(payload):
+            payload["mates"].append(ground_mate())
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        codes = [finding["code"] for finding in result.findings]
+        self.assertIn("discovery.mate_assembly_frame_unsupported", codes)
+        self.assertFalse(result.passed)
+        self.assertNotIn("discovery.component_transform_missing", codes)
+
+        findings: list[dict] = []
+        with_mate = _clusters({**record(), "mates": [*record()["mates"], ground_mate()]}, findings)
+        control = _clusters(record(), [])
+        self.assertEqual(with_mate.members, control.members)
+        self.assertEqual(set(with_mate.pairs), set(control.pairs))
+        self.assertNotIn("", with_mate.of)
+        self.assertTrue(any(item["code"] == "discovery.mate_assembly_frame_unsupported" for item in findings))
+
+    def test_mate_rows_resolve_the_assembly_frame_as_identity(self):
+        mate = {
+            "name": "base_ground_pin",
+            "type": "coincident",
+            "suppressed": False,
+            "error_code": 0,
+            "scope": "",
+            "limits": None,
+            "entities": [
+                {
+                    "component": "base-1",
+                    "feature": "Plane1",
+                    "plane": {"point": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, -1.0]},
+                },
+                {
+                    "component": "",
+                    "assembly_frame": True,
+                    "feature": "Plane2",
+                    "plane": {"point": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0]},
+                },
+            ],
+        }
+        findings: list[dict] = []
+        frames = _component_frames(record(), findings)
+        self.assertFalse(findings)
+        rows = _mate_rows(mate, frames, findings, "mate:base_ground_pin")
+        self.assertIsNotNone(rows)
+        self.assertFalse(findings)
+        self.assertTrue(rows["rows"])
 
     def test_container_datum_requires_solved_rigidity_and_excludes_container_material(self):
         for connected in (True, False):

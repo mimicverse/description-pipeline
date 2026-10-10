@@ -2649,5 +2649,96 @@ class ExplicitSelectionTests(unittest.TestCase):
             self.assertEqual("native_discovery_selection_missing", missing.exception.code)
 
 
+class AssemblyFrameMateTests(unittest.TestCase):
+    """Mate entities on the assembly's own geometry bind to that assembly's frame."""
+
+    def test_top_level_mate_to_the_assembly_frame_binds_to_the_root(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            assembly = _write(root, "robot.SLDASM")
+            root_reference = _Component("robot", assembly)
+            mate = _mate(
+                "ground_pin",
+                0,
+                [
+                    _MateEntity(component, "Face1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0))),
+                    _MateEntity(root_reference, "Face2", _Plane((0.0, 0.0, -1.0), (0.0, 0.0, 0.0))),
+                ],
+            )
+            group = _Feature("MateGroup", "MateGroup", first_sub=mate)
+            doc = _Doc(assembly, first_feature=group, children=[component])
+
+            record = _read(root, _App({assembly: doc}))
+
+            entities = record["mates"][0]["entities"]
+            self.assertEqual(entities[0]["component"], "base-1")
+            self.assertEqual(entities[1]["component"], "")
+            self.assertIs(entities[1]["assembly_frame"], True)
+            self.assertNotIn("reference_name", entities[1])
+
+    def test_nested_mate_to_the_sub_assembly_frame_binds_to_its_occurrence(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            arm_path = _write(root, "arm.SLDPRT")
+            sub_path = _write(root, "sub.SLDASM")
+            arm_doc = _Doc(arm_path)
+            arm_component = _Component("arm-1", arm_path, doc=arm_doc)
+            sub_reference = _Component("sub", sub_path)
+            nested = _mate(
+                "nested_ground_pin",
+                0,
+                [
+                    _MateEntity(arm_component, "Face1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0))),
+                    _MateEntity(sub_reference, "Face2", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0))),
+                ],
+            )
+            sub_group = _Feature("MateGroup", "MateGroup", first_sub=nested)
+            sub_doc = _Doc(
+                sub_path,
+                first_feature=sub_group,
+                children=[arm_component],
+                configuration="Sub",
+                configuration_children={"Sub": [arm_component]},
+            )
+            sub_component = _Component("sub-1", sub_path, children=[arm_component], doc=sub_doc, configuration="Sub")
+            assembly = _write(root, "robot.SLDASM")
+            main_doc = _Doc(assembly, children=[sub_component])
+
+            record = _read(root, _App({assembly: main_doc, sub_path: sub_doc}))
+
+            nested_mate = record["mates"][0]
+            self.assertEqual(nested_mate["scope"], "sub-1")
+            entities = nested_mate["entities"]
+            self.assertEqual(entities[0]["component"], "sub-1/arm-1")
+            self.assertEqual(entities[1]["component"], "sub-1")
+            self.assertIs(entities[1]["assembly_frame"], True)
+
+    def test_unrecorded_reference_still_fails_closed(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            orphan_path = _write(root, "orphan.SLDPRT")
+            component = _Component("base-1", base)
+            orphan = _Component("orphan-1", orphan_path)
+            mate = _mate(
+                "dangling_seat",
+                0,
+                [
+                    _MateEntity(component, "Face1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0))),
+                    _MateEntity(orphan, "Face2", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0))),
+                ],
+            )
+            group = _Feature("MateGroup", "MateGroup", first_sub=mate)
+            assembly = _write(root, "robot.SLDASM")
+            doc = _Doc(assembly, first_feature=group, children=[component])
+
+            with self.assertRaises(CadError) as caught:
+                _read(root, _App({assembly: doc}))
+            self.assertEqual(caught.exception.code, "cad_mate_scope_ambiguous")
+            self.assertEqual(caught.exception.detail.get("component"), "orphan-1")
+
+
 if __name__ == "__main__":
     unittest.main()

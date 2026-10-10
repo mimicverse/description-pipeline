@@ -2568,6 +2568,12 @@ class SolidWorksBackend(CadBackend):
         authoritative: exactly that frozen entry is opened (without scanning
         unrelated candidates) and the default marker/unique-root selection is
         skipped.
+
+        Mate entities that lie on the owning assembly's own reference geometry
+        (assembly planes/axes) are recorded with ``component`` equal to that
+        assembly's scope — ``""`` for the frozen root, or the sub-assembly
+        occurrence path for a nested frame — and ``assembly_frame: true``.
+        They bind to the assembly frame, never to a component occurrence name.
         """
 
         source_root = Path(frozen_source).resolve()
@@ -2833,8 +2839,13 @@ class SolidWorksBackend(CadBackend):
                         try:
                             entity = _dynamic(_method(specific, "MateEntity", entity_index))
                             reference = _component(_member(entity, "ReferenceComponent"))
+                            reference_full = str(_method(reference, "GetPathName") or "")
                             reference_name = str(_member(reference, "Name2") or "")
-                            reference_path = _relative_document(_method(reference, "GetPathName"), source_root)
+                            reference_path = _relative_document(reference_full, source_root)
+                            # An entity may lie on the owning assembly's own reference
+                            # geometry (assembly planes/axes): it has no component
+                            # occurrence identity and belongs to that assembly's frame.
+                            assembly_frame = document_paths_match(str(assembly_path), reference_full)
                             # EXEMPT (untyped multi-type return): IMateEntity2.Reference
                             # is a VT_DISPATCH spanning multiple native geometry kinds
                             # with no single declared view, so the generic dispatch
@@ -2851,6 +2862,7 @@ class SolidWorksBackend(CadBackend):
                             {
                                 "reference_name": reference_name,
                                 "reference_document": reference_path,
+                                "assembly_frame": bool(assembly_frame),
                                 "feature": _feature_name(target),
                                 "face_index": None,
                                 **_plane_or_cylinder(target),
@@ -2928,7 +2940,24 @@ class SolidWorksBackend(CadBackend):
                 for entity in mate["entities"]:
                     reference_name = entity.pop("reference_name")
                     reference_document = entity.pop("reference_document")
+                    assembly_frame = bool(entity.pop("assembly_frame", False))
                     scope = mate["scope"]
+                    if assembly_frame:
+                        # The entity is the owning assembly's own frame.  Bind it to that
+                        # assembly scope ("" is the frozen root, i.e. the global frame);
+                        # a nested sub-assembly must still be a recorded occurrence.
+                        if scope and (
+                            scope not in by_component
+                            or (reference_document is not None and by_document[scope] != reference_document)
+                        ):
+                            raise CadError(
+                                "cad_mate_scope_ambiguous",
+                                "a mate entity does not resolve to its exact scoped occurrence",
+                                {"mate": mate["name"], "component": reference_name, "scope": scope},
+                            )
+                        entity["component"] = scope
+                        entity["assembly_frame"] = True
+                        continue
                     scoped_name = (
                         f"{scope}/{reference_name}"
                         if scope and not reference_name.startswith(scope + "/")

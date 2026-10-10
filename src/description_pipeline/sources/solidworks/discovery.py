@@ -293,6 +293,16 @@ def _component_frames(record: dict, findings: list[dict]) -> dict[str, list[list
     return frames
 
 
+#: The frozen assembly's own frame: identity at the assembly origin.  A mate entity
+#: marked ``assembly_frame`` binds here (component ``""``) instead of to a component.
+_ASSEMBLY_FRAME = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+]
+
+
 def _point(row, frame) -> list[float]:
     x, y, z = (float(value) for value in row)
     return [
@@ -386,6 +396,10 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
         return None
 
     def frame_of(entity: dict):
+        if str(entity.get("component") or "") == "":
+            # The owning assembly's own frame: a real constraint against the assembly
+            # origin (the global frame for the frozen root), not a component identity.
+            return _ASSEMBLY_FRAME
         frame = frames.get(str(entity.get("component")))
         if frame is None:
             fail(
@@ -710,6 +724,22 @@ def _clusters(record: dict, findings: list[dict]) -> _Clusters:
                     obj,
                     "the saved mate reports a native error or an unreadable solve state",
                     {"error_code": mate.get("error_code")},
+                )
+            )
+            continue
+        mate_entities = mate.get("entities")
+        if isinstance(mate_entities, list) and any(
+            isinstance(item, dict) and item.get("assembly_frame") is True for item in mate_entities
+        ):
+            # The mate constrains a component against the assembly's own frame.  Its
+            # rows would not form a component pair, so it must be an explicit blocker
+            # rather than silently dropped or turned into invented grounding.
+            findings.append(
+                _finding(
+                    "discovery.mate_assembly_frame_unsupported",
+                    obj,
+                    "the mate constrains a component to its assembly frame; world-anchor solving is not justified",
+                    {"mate": mate.get("name"), "scope": mate.get("scope")},
                 )
             )
             continue
