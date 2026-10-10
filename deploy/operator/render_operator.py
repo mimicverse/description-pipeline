@@ -306,7 +306,11 @@ def main() -> int:
         if not isinstance(repositories, dict):
             die("MODEL_REPOSITORIES_FILE must map repository slugs to Linux checkout paths")
         for slug, checkout in repositories.items():
-            if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", slug) or not isinstance(checkout, str):
+            if (
+                not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", slug)
+                or any(part in {".", ".."} for part in slug.split("/"))
+                or not isinstance(checkout, str)
+            ):
                 die("MODEL_REPOSITORIES_FILE requires owner/name keys and absolute Linux paths")
             directory = private_dir(checkout, "model checkout")
             if directory in BROAD_ROOTS or any(parent.is_symlink() for parent in directory.parents):

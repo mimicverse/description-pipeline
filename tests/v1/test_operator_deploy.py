@@ -93,6 +93,8 @@ class RenderTests(unittest.TestCase):
             rejected = render(state, MODEL_REPOSITORIES_FILE=str(mapping))
             self.assertNotEqual(rejected.returncode, 0)
             self.assertIn("overlap", rejected.stderr)
+            mapping.write_text(json.dumps({"../robot": str(root / "models/robot")}))
+            self.assertNotEqual(render(state, MODEL_REPOSITORIES_FILE=str(mapping)).returncode, 0)
 
     def test_render_private_idempotent_and_shell_safe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
