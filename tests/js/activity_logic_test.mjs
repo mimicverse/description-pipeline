@@ -127,6 +127,49 @@ assert.equal(
   false,
 );
 
+// A preserved last activity at terminal stays visible as a compact final block.
+const finalView = activityView(
+  {
+    available: true,
+    state: "finished",
+    stage: "capture",
+    stage_started_at: null,
+    updated_at: new Date(nowMs - 300000).toISOString(),
+    action: null,
+    object: null,
+    counts: null,
+    recent: [{ at: new Date(nowMs - 300000).toISOString(), code: "discover.read_mates", object: null }],
+  },
+  { runState: "failed", nowMs },
+);
+assert.equal(finalView.visible, true);
+assert.equal(finalView.final, true);
+assert.equal(finalView.stateText, "已结束");
+assert.ok(finalView.freshnessText.startsWith("最后活动："), finalView.freshnessText);
+assert.equal(finalView.recent.length, 1);
+assert.equal(activityPlacement(finalView, { stageId: "capture", stageRunning: false, stageFailed: true }), "final");
+assert.equal(activityPlacement(finalView, { stageId: "capture", stageRunning: false, stageFailed: false }), "hidden");
+assert.equal(activityPlacement(finalView, { stageId: "discover", stageRunning: false, stageFailed: true }), "hidden");
+
+// The full emitted vocabulary maps to concrete labels (a slow open/rebuild call must not stay
+// at a blind 进行中); unknown codes keep the neutral fallback.
+const EMITTED_ACTIONS = [
+  ["discover.scan_documents", "扫描工程文件"],
+  ["discover.open_document", "打开文档"],
+  ["discover.select_configuration", "切换配置"],
+  ["discover.rebuild", "重建模型"],
+  ["discover.read_components", "读取装配组件"],
+  ["discover.read_mates", "读取配合关系"],
+  ["discover.read_datums", "读取基准与坐标系"],
+  ["discover.read_properties", "读取属性与交付定义"],
+  ["discover.hash_sources", "计算文件摘要"],
+  ["discover.build_record", "生成发现记录"],
+];
+assert.equal(EMITTED_ACTIONS.length, 10);
+for (const [code, label] of EMITTED_ACTIONS) {
+  assert.equal(actionText(code, "discover"), label, code);
+}
+
 // Unknown codes fall back to a neutral stage phrase, never an invented specific.
 assert.equal(actionText("discover.something_new", "discover"), "解析结构进行中");
 assert.equal(actionText(null, null), "进行中");

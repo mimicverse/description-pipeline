@@ -1141,7 +1141,7 @@ function buildActivityCard(view) {
   const dot = document.createElement("span");
   dot.className = `dot ${view.state === "busy" || view.state === "queued" ? "run" : "idle"}`;
   const title = document.createElement("strong");
-  title.textContent = "实时活动";
+  title.textContent = view.final ? "最后活动" : "实时活动";
   const chip = document.createElement("span");
   chip.className = `chip ${view.state === "busy" ? "running" : view.state === "queued" ? "queued" : "blocked"}`;
   chip.textContent = view.stateText;
@@ -1165,7 +1165,9 @@ function buildActivityCard(view) {
     object.textContent = `当前对象：${view.objectText}`;
     card.append(object);
   }
-  const metaParts = [view.elapsedText, view.countsText, view.freshnessText].filter(Boolean);
+  const metaParts = view.final
+    ? [view.freshnessText].filter(Boolean)
+    : [view.elapsedText, view.countsText, view.freshnessText].filter(Boolean);
   if (metaParts.length) {
     const meta = document.createElement("p");
     meta.className = view.stale ? "activity-meta muted small stale" : "activity-meta muted small";
@@ -1210,8 +1212,9 @@ function renderActivity(run) {
   const mode = activityPlacement(view, {
     stageId: selected ? selected.id : "",
     stageRunning: Boolean(selected && selected.state === "running"),
+    stageFailed: Boolean(selected && selected.state === "failed"),
   });
-  if (mode === "live") {
+  if (mode === "live" || mode === "final") {
     stageHost.append(buildActivityCard(view));
   } else if (mode === "note") {
     const note = document.createElement("p");

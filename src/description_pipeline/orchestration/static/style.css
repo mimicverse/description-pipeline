@@ -281,6 +281,7 @@ input, select, textarea { font: inherit; }
 .activity-card.state-queued { border-left-color: var(--warn); }
 .activity-card.state-busy { border-left-color: var(--accent); }
 .activity-card.state-waiting, .activity-card.state-none { border-left-color: var(--line-strong); background: var(--panel); }
+.activity-card.state-finished { border-left-color: var(--line-strong); background: var(--panel); }
 .activity-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .activity-head strong { font-size: 13.5px; }
 .activity-action { margin: 8px 0 0; font-weight: 600; }

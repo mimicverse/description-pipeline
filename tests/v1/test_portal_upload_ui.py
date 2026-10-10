@@ -490,6 +490,10 @@ class ActivityUiContractTests(unittest.TestCase):
             "waiting",
             "busy",
             "finished",
+            "最后活动",
+            "打开文档",
+            "重建模型",
+            "discover.open_document",
         ):
             self.assertIn(token, source)
         # No percentage figures in any rendered text (modulo arithmetic outside strings is

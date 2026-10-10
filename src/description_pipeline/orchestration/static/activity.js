@@ -32,8 +32,13 @@ const STAGE_TEXT = {
 // are never turned into invented specifics.
 const ACTION_TEXT = {
   "discover.scan_documents": "扫描工程文件",
+  "discover.open_document": "打开文档",
+  "discover.select_configuration": "切换配置",
+  "discover.rebuild": "重建模型",
   "discover.read_components": "读取装配组件",
   "discover.read_mates": "读取配合关系",
+  "discover.read_datums": "读取基准与坐标系",
+  "discover.read_properties": "读取属性与交付定义",
   "discover.hash_sources": "计算文件摘要",
   "discover.build_record": "生成发现记录",
 };
@@ -105,6 +110,15 @@ function clockText(ms) {
   return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
+function absoluteStamp(value) {
+  const at = typeof value === "string" ? Date.parse(value) : NaN;
+  if (!Number.isFinite(at)) return "";
+  const date = new Date(at);
+  const pad = (item) => String(item).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+    `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
 // Newest first, at most five rows; entries without a usable timestamp sort last.
 export function recentRows(activity) {
   const list = activity && Array.isArray(activity.recent) ? activity.recent : [];
@@ -131,6 +145,7 @@ export function activityView(activity, { runState = "", nowMs = Date.now() } = {
   const stage = record && typeof record.stage === "string" ? record.stage : "";
   const empty = {
     visible: false,
+    final: false,
     state: "none",
     stateText: ACTIVITY_STATE_TEXT.none,
     stage: "",
@@ -146,8 +161,25 @@ export function activityView(activity, { runState = "", nowMs = Date.now() } = {
   };
   const terminalRun = runState === "success" || runState === "failed";
   if (terminalRun || rawState === "finished") {
-    // Terminal runs never render running visuals.
-    return { ...empty, state: "finished", stateText: ACTIVITY_STATE_TEXT.finished };
+    // Terminal runs keep at most a compact 最后活动 record for diagnosis: the live visuals
+    // (dot animation, elapsed ticking, staleness nagging) are gone. Legacy terminal runs
+    // without any preserved record stay hidden.
+    const recent = recentRows(record || {});
+    const stamp = record && typeof record.updated_at === "string" ? absoluteStamp(record.updated_at) : "";
+    if (!recent.length && !stamp) {
+      return { ...empty, state: "finished", stateText: ACTIVITY_STATE_TEXT.finished };
+    }
+    return {
+      ...empty,
+      visible: true,
+      final: true,
+      state: "finished",
+      stateText: ACTIVITY_STATE_TEXT.finished,
+      stage,
+      stageText: stageText(stage),
+      freshnessText: stamp ? `最后活动：${stamp}` : "",
+      recent,
+    };
   }
   const freshness = record ? freshnessText(record.updated_at, nowMs) : { text: "", stale: false };
   const base = {
@@ -195,8 +227,11 @@ export function activityView(activity, { runState = "", nowMs = Date.now() } = {
 
 // Where the card belongs on the stage pane: only the running stage shows live activity for
 // itself ("live"), anything else degrades to an explicit note ("note") or hides ("hidden").
-export function activityPlacement(view, { stageId = "", stageRunning = false } = {}) {
+export function activityPlacement(view, { stageId = "", stageRunning = false, stageFailed = false } = {}) {
   if (!view || view.visible !== true) return "hidden";
+  if (view.final === true) {
+    return stageFailed && (!view.stage || view.stage === stageId) ? "final" : "hidden";
+  }
   if (!stageRunning) return "hidden";
   if (view.state === "busy" && view.stage && stageId && view.stage === stageId) return "live";
   return "note";
