@@ -658,6 +658,18 @@ class FeishuAuthManagerTests(unittest.TestCase):
         self.assertTrue(start_retry.eligible)
         self.assertEqual(start_retry.cleared_tasks, ("start_job", "wait_for_job"))
 
+    def test_split_transport_retry_preserves_the_engineering_boundary(self) -> None:
+        classify = run_ownership.classify_transport_retry
+        tasks = dict.fromkeys(run_ownership.KNOWN_TASKS, "upstream_failed")
+        tasks.update(resolve_handoff="success", start_job="success", wait_for_job="failed")
+        self.assertTrue(classify("failed", tasks).eligible)
+        tasks.update(wait_for_job="success", fetch_capture="failed")
+        self.assertTrue(classify("failed", tasks).eligible)
+        for stage in ("run_generate", "run_verify", "run_publish"):
+            with self.subTest(stage=stage):
+                changed = {**tasks, "fetch_capture": "success", stage: "failed"}
+                self.assertFalse(classify("failed", changed).eligible)
+
     def test_clear_body_candidate_matrix_and_replay(self) -> None:
         evaluate = request_context.evaluate_clear_candidate
         safe = b'{"dry_run": false, "only_failed": true, "only_new": false, "run_on_latest_version": false}'

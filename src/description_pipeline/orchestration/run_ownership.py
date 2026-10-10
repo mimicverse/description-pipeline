@@ -8,7 +8,7 @@ Linked-run creation additionally checks the stored parent actor. Missing, damage
 authority values deny; they never grant.
 
 Eligibility is a positive transport classification: the run must be failed, the failed task set
-must be ``wait_for_job`` or ``start_job`` (the latter only with a positively successful
+must be submission, polling or sealed-capture transfer (only with a positively successful
 ``resolve_handoff``, whose service-side create is idempotent for the identical frozen request and
 refuses a changed one), with any other failed instance merely upstream-failed. Resolution,
 publication, unknown or mapped-ambiguous failures always require a new run.
@@ -34,16 +34,15 @@ DAG_RUN_ROUTES_MODULE = "airflow.api_fastapi.core_api.routes.public.dag_run"
 MANUAL_CREATE_ENDPOINT = "trigger_dag_run"
 SINGLE_RUN_CLEAR_ENDPOINT = "clear_dag_run"
 
-#: The DAG's tasks and their roles in one immutable retry. Only a failed ``wait_for_job`` is a
-#: positively proven transport recovery: a failed resolution/capture, an ambiguous failed
-#: ``start_job`` and a real publication failure all require a new run. ``confirm_job`` may only
-#: be present as upstream-failed, never as a real failure.
+#: Transport retries retain the same frozen request and revalidate capture digests.
+#: Engineering failures use a linked attempt; their downstream tasks may be upstream-failed.
 RESOLUTION_TASK = "resolve_handoff"
 START_TASK = "start_job"
 TRANSPORT_TASK = "wait_for_job"
 PUBLICATION_TASK = "confirm_job"
-KNOWN_TASKS = frozenset({RESOLUTION_TASK, START_TASK, TRANSPORT_TASK, PUBLICATION_TASK})
-ALLOWED_FAILED_TASKS = frozenset({START_TASK, TRANSPORT_TASK, PUBLICATION_TASK})
+FETCH_TASK = "fetch_capture"
+TRANSPORT_TASKS = frozenset({START_TASK, TRANSPORT_TASK, FETCH_TASK})
+KNOWN_TASKS = TRANSPORT_TASKS | {RESOLUTION_TASK, PUBLICATION_TASK, "run_generate", "run_verify", "run_publish"}
 FAILED_STATES = frozenset({"failed", "upstream_failed"})
 #: Sentinel for a task id that appears with several map indices; eligibility is then unprovable.
 AMBIGUOUS_TASK_STATE = "ambiguous_mapped_indices"
@@ -135,8 +134,8 @@ def _state_value(state: object) -> str | None:
 def classify_transport_retry(run_state: object, task_states: dict[str, object]) -> RetryAssessment:
     """Classify one run as positive transport recovery, or name the reason it is not.
 
-    Resolution must be successful. Only submission or polling may fail; confirmation may be
-    upstream-failed. Missing or ambiguous tasks, failed resolution or confirmation, active or
+    Resolution must be successful. Only submission, polling or capture transfer may fail;
+    downstream tasks may be upstream-failed. Failed resolution or engineering work, active or
     successful runs and an empty failed set refuse. The portal additionally checks native status.
     """
     state = _state_value(run_state)
@@ -157,12 +156,14 @@ def classify_transport_retry(run_state: object, task_states: dict[str, object]) 
         # No positively successful resolution means no proven frozen input to replay.
         return RetryAssessment(False, "resolution_not_success", ())
     real_failed = {task for task in failed if normalized[task] == "failed"}
-    if PUBLICATION_TASK in real_failed:
+    if real_failed & {PUBLICATION_TASK, "run_publish"}:
         return RetryAssessment(False, "publication_failed", ())
-    if not real_failed & {START_TASK, TRANSPORT_TASK}:
+    if not real_failed & TRANSPORT_TASKS:
         return RetryAssessment(False, "no_failed_transport_task", ())
-    if real_failed - {START_TASK, TRANSPORT_TASK}:
+    if real_failed - TRANSPORT_TASKS:
         return RetryAssessment(False, "native_terminal_failure", ())
+    if FETCH_TASK in real_failed and normalized.get(TRANSPORT_TASK) != "success":
+        return RetryAssessment(False, "no_failed_transport_task", ())
     return RetryAssessment(True, "transport_recovery", tuple(sorted(failed)))
 
 
