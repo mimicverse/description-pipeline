@@ -244,9 +244,8 @@ def _boundary_summary(identifier: object, details: dict) -> dict | None:
     if name == "runtime.ready":
         return {
             "scope_zh": "原生运行环境",
-            "expected": "读取器与原生平台就绪",
-            "actual": f"{details.get('reader') or '读取器未记录'} 环境自检模型："
-            f"{details.get('bodies', '未记录')} 个刚体、{details.get('joints', '未记录')} 个关节",
+            "expected": "原生平台与 SolidWorks 就绪",
+            "actual": "已检查 Windows、COM 与 SolidWorks 前置条件；实际 CAD 访问与文档就绪由采集会话验证",
         }
     if name == "capture.integrity":
         files = details.get("files")
