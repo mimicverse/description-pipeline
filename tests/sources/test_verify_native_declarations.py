@@ -205,6 +205,43 @@ class NativeDeclarationsTests(unittest.TestCase):
         raw = fixture()
         raw["exporter"]["pid_bindings"][0]["error_code"] = 2
         self.assertIn("v14.pid_unread", self.errors(raw))
+
+    def test_imported_source_requires_native_path_confinement_and_bound_bytes(self):
+        raw = fixture()
+        proof = {
+            "state": "resolved",
+            "kind": "native_imported_document",
+            "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
+            "source_root": "C:\\locked-copy",
+            "imported_path": "C:\\locked-copy\\source.step",
+            "native_document_path": "C:\\temp\\generated.sldprt",
+            "document": "source.step",
+            "sha256": "a" * 64,
+            "is_virtual": False,
+        }
+        row = raw["exporter"]["pid_bindings"][2]
+        item = next(item for item in raw["components"] if item["name2"] == row["name2"])
+        row.update(document="source.step", source_provenance=copy.deepcopy(proof))
+        item.update(document="source.step", source_provenance=copy.deepcopy(proof))
+        raw["files"] = {"source.step": "a" * 64}
+        self.assertTrue(verify_declarations(raw)["passed"])
+        for patch in [
+            {"imported_path": "C:\\outside\\source.step"},
+            {"sha256": "b" * 64},
+            {"source_root": None},
+            {"state": "unread"},
+            {"used_api": "basename_guess"},
+        ]:
+            candidate = copy.deepcopy(raw)
+            candidate["exporter"]["pid_bindings"][2]["source_provenance"].update(patch)
+            native = next(item for item in candidate["components"] if item["name2"] == row["name2"])
+            native["source_provenance"].update(patch)
+            self.assertIn("v14.imported_binding", self.errors(candidate), patch)
+        candidate = fixture()
+        candidate["exporter"]["pid_bindings"][2]["document"] = None
+        native = next(item for item in candidate["components"] if item["name2"] == row["name2"])
+        native.update(document=None, virtual=True)
+        self.assertIn("v14.pid_document_unread", self.errors(candidate))
         raw = fixture()
         raw["exporter"]["pid_bindings"][0]["name2"] = "foreign"
         self.assertIn("v14.pid_unread", self.errors(raw))

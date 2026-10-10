@@ -9,6 +9,8 @@ saved zero operating parameters remain zero, and serialized physics is ignored.
 from __future__ import annotations
 
 import math
+import ntpath
+from pathlib import PurePosixPath
 import re
 
 import numpy as np
@@ -47,6 +49,76 @@ def _leaves(components):
 
 def _expanded(name, leaves):
     return {leaf for leaf in leaves if leaf == name or leaf.startswith(name + "/")}
+
+
+def _pid_occurrence(row, components, raw):
+    _require(
+        row is not None and row["error_code"] == 0 and row["name2"] in components,
+        "v14.pid_unread",
+        "a saved component PID did not resolve in this capture",
+    )
+    component = components[row["name2"]]
+    _require(
+        row["configuration"] == component.get("configuration"),
+        "v14.pid_binding",
+        "the PID resolved another occurrence configuration",
+        component=row["name2"],
+    )
+    document = row["document"]
+    _require(
+        isinstance(document, str) and bool(document) and document == component.get("document"),
+        "v14.pid_document_unread",
+        "the PID lacks a proven occurrence document",
+        component=row["name2"],
+    )
+    _require(
+        not PurePosixPath(document).is_absolute()
+        and ".." not in PurePosixPath(document).parts
+        and "\\" not in document
+        and ":" not in document,
+        "v14.pid_binding",
+        "the occurrence document is not a confined package path",
+        component=row["name2"],
+    )
+    left, right = row.get("source_provenance"), component.get("source_provenance")
+    if left is not None or right is not None:
+        fields = ("state", "kind", "used_api", "document", "sha256", "is_virtual", "source_root", "imported_path")
+        _require(
+            isinstance(left, dict)
+            and isinstance(right, dict)
+            and all(left.get(key) == right.get(key) for key in fields),
+            "v14.imported_binding",
+            "PID and occurrence imported-source proofs differ",
+            component=row["name2"],
+        )
+        _require(
+            left.get("state") == "resolved"
+            and left.get("kind") == "native_imported_document"
+            and left.get("used_api") == "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual"
+            and left.get("document") == document
+            and type(left.get("is_virtual")) is bool
+            and isinstance(left.get("sha256"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", left["sha256"])
+            and (raw.get("files") or {}).get(document) == left["sha256"],
+            "v14.imported_binding",
+            "the imported document is not bound to captured file bytes",
+            component=row["name2"],
+        )
+        origin, root = left.get("imported_path"), left.get("source_root")
+        _require(
+            isinstance(origin, str) and ntpath.isabs(origin) and isinstance(root, str) and ntpath.isabs(root),
+            "v14.imported_binding",
+            "the imported-source confinement evidence is incomplete",
+        )
+        relative = ntpath.relpath(origin, root)
+        _require(
+            relative != ".."
+            and not relative.startswith("..\\")
+            and ntpath.normcase(relative) == ntpath.normcase(document.replace("/", "\\")),
+            "v14.imported_binding",
+            "GetImportedPath does not name the captured source inside the frozen root",
+        )
+    return component
 
 
 def _valid_mate(mate, components):
@@ -267,34 +339,7 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
                 )
                 pids[key] = name
                 row = bindings.get(key)
-                _require(
-                    row is not None and row["error_code"] == 0 and row["name2"] in components,
-                    "v14.pid_unread",
-                    "a saved component PID did not resolve in this capture",
-                    link=name,
-                    pid_hex=key,
-                )
-                component = components[row["name2"]]
-                _require(
-                    row["configuration"] == component.get("configuration"),
-                    "v14.pid_binding",
-                    "the PID resolved another occurrence configuration",
-                    component=row["name2"],
-                )
-                if row["document"] is not None:
-                    _require(
-                        row["document"] == component.get("document"),
-                        "v14.pid_binding",
-                        "the PID resolved another occurrence document",
-                        component=row["name2"],
-                    )
-                else:
-                    _require(
-                        component.get("virtual") is True or component.get("document") is None,
-                        "v14.pid_document_unread",
-                        "the PID document identity needs native virtual-component proof",
-                        component=row["name2"],
-                    )
+                component = _pid_occurrence(row, components, raw)
                 if component["suppressed"]:
                     suppressed.append(row["name2"])
                     continue
@@ -318,9 +363,7 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
                 claimed[leaf] = name
         for name, key in main_pids.items():
             row = bindings[key]
-            _require(
-                row["error_code"] == 0 and row["name2"] in components, "v14.pid_unread", "main PID did not resolve"
-            )
+            _pid_occurrence(row, components, raw)
             material = _expanded(row["name2"], leaves)
             _require(
                 bool(material) and material <= members[name],
