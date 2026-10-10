@@ -227,11 +227,13 @@ def _same_request(job: dict, request: dict) -> None:
     tags=["solidworks", "urdf", "windows"],
     default_args={"retries": 2, "retry_delay": timedelta(seconds=15)},
     doc_md=(
-        "# SolidWorks to URDF\n\nSix engineering stages execute in one serialized Windows job. "
-        "The graph below transports that job; polling is not an engineering stage.\n\n"
+        "# SolidWorks to URDF\n\nWindows freezes inputs, discovers the assembly and captures native evidence. "
+        "Linux receives the sealed capture, generates the URDF, independently verifies it and publishes the PR. "
+        "The graph coordinates these six engineering stages; transport and polling are orchestration tasks.\n\n"
         + contract_markdown()
-        + "\n\nRun results: `wait_for_job` logs every stage and terminal QC details, including failures. "
-        "Its `engineering_stages` XCom contains the terminal summary. The operator page shows "
+        + "\n\nRun results: `wait_for_job` logs native stage checks; `run_generate`, `run_verify` and "
+        "`run_publish` log Linux stage results. Their `engineering_stages` XComs retain stage summaries, "
+        "including failures. The operator page shows "
         "inputs, checks, outputs and evidence per stage; `reports/stages.json` retains the detailed receipt. "
         "Engineering confirmations remain pending until approved in the bound review records."
     ),

@@ -79,7 +79,7 @@ Save `C:\description-state\endpoint.json`:
   "handoff_roots": ["C:/cad-handoffs"],
   "package_root": "C:/description-packages",
   "output_root": "C:/description-deliveries",
-  "state_root": "C:/description-state/jobs",
+  "state_root": "C:/description-state",
   "token_file": "C:/description-secrets/endpoint.token",
   "host": "127.0.0.1",
   "port": 8765,
