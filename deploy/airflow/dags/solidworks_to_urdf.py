@@ -1,9 +1,10 @@
 """Submit one engineering folder to the Windows SolidWorks execution endpoint.
 
 The DAG carries ``handoff_path`` and an optional ``main_assembly`` (the explicit delivered
-assembly). A linked attempt (``parent_dag_run_id`` and ``resume_from``) derives the retained
-package, digest and selection from the parent native job itself; a supplied selection that
-differs from the parent's is refused instead of being silently discarded. Hardware, revision
+assembly). A linked attempt (``parent_dag_run_id`` and ``resume_from``) reuses the retained
+source selection - files, index digest and main assembly - of the parent native job itself;
+a supplied selection that differs from the parent's is refused instead of silently discarded.
+Hardware, revision
 and repository routing resolve inside the serialized Windows job after CAD discovery and are
 confirmed here before publication.
 """
@@ -13,17 +14,21 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from airflow.sdk import Param, dag, task
 from airflow.sdk.exceptions import AirflowFailException
 
 from description_pipeline.orchestration.airflow_client import (
+    EndpointProtocolError,
     HandoffResolution,
     WindowsEndpoint,
     capture_archive_metadata,
     check_result,
     config_from_airflow_connection,
+    drive_selection_round,
     native_run_id,
     resolved_routing,
     validate_main_assembly,
@@ -40,6 +45,8 @@ from description_pipeline.stages import (
     stage_view,
 )
 from description_pipeline.io import PipelineError, digest
+from description_pipeline.sources.solidworks.revision import package_inventory
+from description_pipeline.sources.solidworks.selection import validate_file_index
 
 DAG_ID = "solidworks_to_urdf"
 CONN_ID = os.environ.get("SOLIDWORKS_ENDPOINT_CONN_ID", "solidworks_windows")
@@ -181,6 +188,21 @@ def _param_selection(context) -> str | None:
     return validate_main_assembly(value)
 
 
+def _selection_main(upload_files: dict[str, str], requested: str | None) -> str:
+    """The explicit selection, or the sole ``.SLDASM`` of the sealed intake - never a scan."""
+
+    if requested is not None:
+        if requested not in upload_files:
+            raise AirflowFailException(f"main assembly {requested!r} is not part of the sealed intake")
+        return requested
+    assemblies = sorted(name for name in upload_files if name.lower().endswith(".sldasm"))
+    if len(assemblies) != 1:
+        raise AirflowFailException(
+            f"Select a main assembly explicitly; the sealed intake holds {len(assemblies)} .SLDASM files"
+        )
+    return assemblies[0]
+
+
 def _linked_selection(parent_value, supplied) -> str | None:
     """A linked attempt's effective selection: inherit the parent, or an explicitly equal value.
 
@@ -201,6 +223,30 @@ def _linked_selection(parent_value, supplied) -> str | None:
     return supplied
 
 
+def _linked_source(retained: object, supplied) -> tuple[dict[str, str], str, str]:
+    """The retained source selection a linked native rerun reuses exactly.
+
+    The endpoint compares the rerun's source fields against the parent's own request, so the
+    client first re-validates the parent's echoed selection and refuses anything inconsistent.
+    """
+
+    request = retained if isinstance(retained, dict) else {}
+    upload_files = request.get("upload_files")
+    upload_sha256 = request.get("upload_sha256")
+    if not isinstance(upload_files, dict) or not upload_files or not isinstance(upload_sha256, str):
+        raise AirflowFailException("Parent native job carries no retained selection payload to resume")
+    try:
+        validated = validate_file_index(upload_files)
+    except PipelineError as error:
+        raise AirflowFailException(f"Parent native job's retained selection payload is invalid: {error}") from error
+    if digest(validated) != upload_sha256:
+        raise AirflowFailException("Parent native job's retained selection payload is inconsistent")
+    main = _linked_selection(request.get("main_assembly"), supplied)
+    if main is None or main not in validated:
+        raise AirflowFailException("Parent native job's retained selection names no admissible main assembly")
+    return validated, upload_sha256, main
+
+
 def _resolution(request: dict) -> HandoffResolution:
     return HandoffResolution(
         package=request["package"],
@@ -212,8 +258,39 @@ def _poke(request: dict, **context) -> bool:
     if request.get("linux_owned"):
         # A linked portable attempt has no Windows job to poll.
         return True
-    job = _endpoint(request["conn_id"]).get_job(request["run_id"])
+    endpoint = _endpoint(request["conn_id"])
+    job = endpoint.get_job(request["run_id"])
     _same_request(job, request)
+    if request.get("upload_files") and job.get("status") == "selecting":
+        intake = request.get("intake_dir")
+        if not isinstance(intake, str) or not intake:
+            raise AirflowFailException("Selection rounds require the sealed intake folder of a fresh source")
+        ti = context.get("ti")
+        previous = ti.xcom_pull(task_ids="wait_for_job", key="selection_progress") if ti is not None else None
+        try:
+            outcome = drive_selection_round(
+                endpoint,
+                run_id=request["run_id"],
+                upload_files=request["upload_files"],
+                main_assembly=request["main_assembly"],
+                intake_dir=Path(intake),
+                batch_dir=Path(tempfile.gettempdir()) / f"selection-{request['run_id']}",
+                previous=previous,
+            )
+        except (EndpointProtocolError, PipelineError) as error:
+            raise AirflowFailException(f"selection transport failed: {error}") from error
+        if ti is not None:
+            ti.xcom_push(key="selection_progress", value=outcome.get("progress"))
+            if outcome.get("action") == "sealed":
+                ti.xcom_push(key="selection_manifest", value=outcome["manifest"])
+        log.info(
+            "selection run_id=%s action=%s state=%s requested=%s",
+            request["run_id"],
+            outcome.get("action"),
+            outcome.get("state"),
+            outcome.get("requested"),
+        )
+        return False
     latest = job["events"][-1] if job["events"] else {}
     log.info(
         "native run_id=%s status=%s stage=%s stage_state=%s",
@@ -251,11 +328,16 @@ def _poke(request: dict, **context) -> bool:
 
 
 def _same_request(job: dict, request: dict) -> None:
-    expected = {key: request[key] for key in ("run_id", "package", "handoff_sha256")}
-    if request.get("resume") is not None:
-        expected["resume"] = request["resume"]
-    if request.get("main_assembly") is not None:
-        expected["main_assembly"] = request["main_assembly"]
+    if "upload_files" in request:
+        expected = {key: request[key] for key in ("run_id", "upload_files", "upload_sha256", "main_assembly")}
+        if request.get("resume") is not None:
+            expected["resume"] = request["resume"]
+    else:
+        expected = {key: request[key] for key in ("run_id", "package", "handoff_sha256")}
+        if request.get("resume") is not None:
+            expected["resume"] = request["resume"]
+        if request.get("main_assembly") is not None:
+            expected["main_assembly"] = request["main_assembly"]
     if job.get("request") != expected:
         raise AirflowFailException("Endpoint job differs from the requested mechanical handoff")
 
@@ -324,61 +406,56 @@ def solidworks_to_urdf():
                     "resume": linked,
                     "linux_owned": True,
                 }
-                selection = _linked_selection(
-                    parent_meta.get("main_assembly"), context["params"].get("main_assembly")
-                )
+                selection = _linked_selection(parent_meta.get("main_assembly"), context["params"].get("main_assembly"))
                 if selection is not None:
                     request["main_assembly"] = selection
                 return request
-            # The parent native job is the only authority for the retained upload;
-            # client-supplied package or digest values are never trusted.
+            # The parent native job is the only authority for the retained source
+            # selection; the rerun reuses its exact files, digest and main assembly.
             parent = _endpoint(CONN_ID).get_job(linked["parent_run"])
             retained = parent.get("request") if isinstance(parent.get("request"), dict) else {}
-            package, digest_value = retained.get("package"), retained.get("handoff_sha256")
-            if not isinstance(package, str) or not package or not isinstance(digest_value, str) or not digest_value:
-                raise AirflowFailException(f"Parent job {linked['parent_run']} has no retained mechanical handoff")
+            upload_files, upload_sha256, main = _linked_source(retained, context["params"].get("main_assembly"))
             log.info(
-                "linked attempt parent_run=%s from_stage=%s package=%s endpoint_conn=%s",
+                "linked attempt parent_run=%s from_stage=%s files=%d upload_sha256=%s main_assembly=%s conn=%s",
                 linked["parent_run"],
                 linked["from_stage"],
-                package,
+                len(upload_files),
+                upload_sha256,
+                main,
                 CONN_ID,
             )
-            request = {
+            return {
                 "run_id": _run_uuid(context),
-                "package": package,
-                "handoff_sha256": digest_value,
-                "conn_id": CONN_ID,
+                "upload_files": upload_files,
+                "upload_sha256": upload_sha256,
+                "main_assembly": main,
                 "resume": linked,
+                "conn_id": CONN_ID,
             }
-            selection = _linked_selection(retained.get("main_assembly"), context["params"].get("main_assembly"))
-            if selection is not None:
-                request["main_assembly"] = selection
-                log.info("linked attempt main_assembly=%s", selection)
-            return request
         handoff_path = str(context["params"]["handoff_path"]).strip()
         if not handoff_path:
             raise AirflowFailException("handoff_path is required")
         selection = _param_selection(context)
-        resolved = _endpoint(CONN_ID).resolve_handoff(handoff_path)
+        intake = _endpoint(CONN_ID).authorized_intake_dir(handoff_path)
+        upload_files = validate_file_index(package_inventory(intake))
+        main = _selection_main(upload_files, selection)
         run_id = _run_uuid(context)
         log.info(
-            "resolved handoff_path=%s package=%s handoff_sha256=%s endpoint_conn=%s",
-            handoff_path,
-            resolved.package,
-            resolved.handoff_sha256,
+            "selection intake=%s files=%d upload_sha256=%s main_assembly=%s endpoint_conn=%s",
+            intake,
+            len(upload_files),
+            digest(upload_files),
+            main,
             CONN_ID,
         )
-        request = {
+        return {
             "run_id": run_id,
-            "package": resolved.package,
-            "handoff_sha256": resolved.handoff_sha256,
+            "upload_files": upload_files,
+            "upload_sha256": digest(upload_files),
+            "main_assembly": main,
+            "intake_dir": str(intake),
             "conn_id": CONN_ID,
         }
-        if selection is not None:
-            request["main_assembly"] = selection
-            log.info("resolved main_assembly=%s", selection)
-        return request
 
     @task(doc_md="Submit the same UUID and frozen handoff to the serial Windows queue; retries never replay CAD.")
     def start_job(request: dict) -> dict:
@@ -389,12 +466,20 @@ def solidworks_to_urdf():
                 (request.get("resume") or {}).get("from_stage"),
             )
             return {**request, "status": "linux_owned"}
-        job = _endpoint(request["conn_id"]).start_job(
-            run_id=request["run_id"],
-            resolution=_resolution(request),
-            resume=request.get("resume"),
-            main_assembly=request.get("main_assembly"),
-        )
+        if "upload_files" in request:
+            job = _endpoint(request["conn_id"]).start_selection_job(
+                run_id=request["run_id"],
+                upload_files=request["upload_files"],
+                main_assembly=request["main_assembly"],
+                resume=request.get("resume"),
+            )
+        else:
+            job = _endpoint(request["conn_id"]).start_job(
+                run_id=request["run_id"],
+                resolution=_resolution(request),
+                resume=request.get("resume"),
+                main_assembly=request.get("main_assembly"),
+            )
         log.info("started run_id=%s status=%s", job["run_id"], job["status"])
         return {**request, "status": job["status"]}
 
@@ -447,9 +532,7 @@ def solidworks_to_urdf():
             subject = _parent_subject(store, binding["source_run_id"], "generate")
             return {**binding, "generate": {"state": "reused", "passed": True, "subject_sha256": subject}}
         store = _linux_store(binding["request"]["conn_id"])
-        receipt = run_portable_stage(
-            store, binding["run_id"], "generate", source_run_id=binding.get("source_run_id")
-        )
+        receipt = run_portable_stage(store, binding["run_id"], "generate", source_run_id=binding.get("source_run_id"))
         _portable_report(receipt, stage="generate", context=context)
         return {**binding, "generate": _portable_summary(receipt, stage="generate")}
 
@@ -516,9 +599,15 @@ def solidworks_to_urdf():
         view = stage_view(snapshot)
         require_complete(view)
         routing = resolved_routing(snapshot)
+        if request.get("linux_owned"):
+            source = {"package": request["package"], "handoff_sha256": request["handoff_sha256"]}
+        else:
+            selected = native.get("handoff_sha256")
+            if not isinstance(selected, str) or not selected:
+                raise AirflowFailException(f"native job {run_id} carries no sealed handoff digest")
+            source = {"upload_sha256": request.get("upload_sha256"), "handoff_sha256": selected}
         handoff = {
-            "package": request["package"],
-            "handoff_sha256": request["handoff_sha256"],
+            **source,
             "hardware_id": routing["hardware_id"],
             "revision": routing["revision"],
             "repository_slug": routing["repository_slug"],
@@ -546,6 +635,7 @@ def solidworks_to_urdf():
 
     request = resolve_handoff()
     started = start_job(request)
+
     @task.sensor(
         mode=SENSOR_MODE,
         poke_interval=POLL_INTERVAL,
