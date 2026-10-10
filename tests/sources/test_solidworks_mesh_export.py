@@ -65,6 +65,10 @@ class FakeComponent:
         self.IsSuppressed = False
         self.body_calls = []
 
+    def GetSuppression2(self):  # noqa: N802 - SolidWorks API name
+        # Documented IComponent2 state; 2 = swComponentFullyResolved.
+        return 2
+
     def GetModelDoc2(self):  # noqa: N802 - SolidWorks API name
         raise AssertionError("mesh export must not acquire the shared part document")
 

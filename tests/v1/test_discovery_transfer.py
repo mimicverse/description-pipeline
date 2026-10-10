@@ -354,6 +354,36 @@ class DiscoveryTransferTests(unittest.TestCase):
             )
         self.assertEqual(inventory(destination), inventory(self.source))
 
+    def test_resealed_record_with_invalid_suppression_state_is_refused(self) -> None:
+        """The semantic check fires on a validly resealed bundle, not a digest mismatch."""
+
+        cases = (
+            ("state5", lambda payload: payload["components"][0].update(suppression_state=5)),
+            ("missing", lambda payload: payload["components"][0].pop("suppression_state")),
+            ("boolean", lambda payload: payload["components"][0].update(suppression_state=True)),
+            ("incoherent", lambda payload: payload["components"][0].update(suppressed=True)),
+        )
+        for label, mutate in cases:
+            with self.subTest(case=label):
+                payload = json.loads(json.dumps(self.payload))
+                mutate(payload)
+                sealed = self._seal_record_bundle(payload=payload)
+                prepared = transfer.derive_from_raw_bundle(
+                    Path(sealed["artifact"]["path"]),
+                    self.source,
+                    self._path("prepared"),
+                    expected_run_id=RUN_ID,
+                    expected_selection=self.selection,
+                    expected_native_tool=self.tool,
+                    settings=self._settings(),
+                )
+                self.assertFalse(prepared.passed)
+                codes = {finding["code"] for finding in prepared.findings}
+                self.assertTrue(
+                    codes & {"discovery.suppression_state_invalid", "discovery.suppression_state_incoherent"},
+                    codes,
+                )
+
     # -- leg 1 refusals ----------------------------------------------------
 
     def test_raw_record_refusals(self) -> None:

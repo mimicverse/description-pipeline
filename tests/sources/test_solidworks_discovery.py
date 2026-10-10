@@ -180,6 +180,8 @@ def record() -> dict:
                 "configuration": "Default",
                 "fixed": True,
                 "suppressed": False,
+                "lightweight": False,
+                "suppression_state": 2,
                 "transform": copy.deepcopy(IDENTITY),
             },
             {
@@ -189,6 +191,8 @@ def record() -> dict:
                 "configuration": "Default",
                 "fixed": False,
                 "suppressed": False,
+                "lightweight": False,
+                "suppression_state": 2,
                 "transform": copy.deepcopy(IDENTITY),
             },
         ],
@@ -2064,6 +2068,63 @@ class MateReaderTests(unittest.TestCase):
         from description_pipeline.sources.solidworks.native import _mate_specific
 
         self.assertIsNone(_mate_specific(FakeMateFeature("RefPlane"), strict=False))
+
+
+class SuppressionStateTests(unittest.TestCase):
+    """The documented raw GetSuppression2 state is required, admitted and coherent."""
+
+    def test_valid_record_states_pass_the_verifier_gate(self) -> None:
+        from description_pipeline.verification.native_discovery import _require_suppression_states
+
+        _require_suppression_states(record())
+
+    def test_shape_checks_are_not_vacuous(self) -> None:
+        from description_pipeline.verification.native_discovery import _Failure, _require_suppression_states
+
+        for label, value in (
+            ("no_components", {"components": None}),
+            ("missing_components", {}),
+            ("non_dict_entry", {"components": [None]}),
+        ):
+            with self.subTest(case=label), self.assertRaises(_Failure):
+                _require_suppression_states(value)
+        # An empty component list is allowed by the existing graph check.
+        _require_suppression_states({"components": []})
+
+    def test_verifier_refuses_invalid_or_incoherent_states(self) -> None:
+        from description_pipeline.verification.native_discovery import _Failure, _require_suppression_states
+
+        for label, state, suppressed in (
+            ("state5", 5, None),
+            ("missing", None, None),
+            ("boolean", True, None),
+            ("unknown", 7, None),
+            ("incoherent-suppressed", 2, True),
+            ("incoherent-lightweight", 2, None),
+        ):
+            with self.subTest(case=label):
+                payload = record()
+                component = payload["components"][0]
+                if label == "missing":
+                    component.pop("suppression_state")
+                else:
+                    component["suppression_state"] = state
+                if suppressed is not None:
+                    component["suppressed"] = suppressed
+                if label == "incoherent-lightweight":
+                    component["lightweight"] = True
+                with self.assertRaises(_Failure):
+                    _require_suppression_states(payload)
+
+    def test_verifier_refuses_a_lightweight_occurrence_for_measurement(self) -> None:
+        from description_pipeline.verification.native_discovery import _Failure, _require_suppression_states
+
+        for state in (1, 4):
+            with self.subTest(state=state):
+                payload = record()
+                payload["components"][0].update(suppression_state=state, suppressed=False, lightweight=True)
+                with self.assertRaises(_Failure):
+                    _require_suppression_states(payload)
 
 
 class DerivationSplitTests(unittest.TestCase):

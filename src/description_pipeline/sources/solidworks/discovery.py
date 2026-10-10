@@ -23,8 +23,14 @@ the backend and re-read by the independent verifier:
     (``system``/``reference``), ``delivery_configuration``, ``main_assembly``
     (package-relative), ``robot_name``.
 ``components``
-    ``{name2, document, configuration, fixed, suppressed, lightweight}`` for
-    every component occurrence.
+    ``{name2, document, configuration, fixed, suppressed, lightweight,
+    suppression_state}`` for every component occurrence; ``suppression_state``
+    is the raw documented ``GetSuppression2`` integer (0 suppressed, 1
+    lightweight, 2 fully resolved, 3 resolved, 4 fully lightweight).  State 5
+    (internal-ID mismatch) and any missing, boolean or undocumented value is
+    refused, and both emitted flags are required booleans that must agree with
+    the state (``suppressed == (state == 0)``, ``lightweight == (state in
+    {1, 4})``).
 ``mates``
     ``{name, type, entities: [{component, feature, face_index, cylinder}],
     alignment, limits: {lower, upper, unit}, suppressed}`` with each cylinder
@@ -3847,6 +3853,65 @@ def derive_native_package(
         if str(configuration) != str(recorded_configuration):
             raise PipelineError("the requested configuration does not match the recorded delivery configuration")
     findings: list[dict] = []
+    components = record.get("components")
+    if not isinstance(components, list):
+        findings.append(
+            _finding(
+                "discovery.suppression_state_invalid",
+                "assembly",
+                "the native record carries no component list to classify",
+                {"components": type(components).__name__},
+            )
+        )
+    for item in components if isinstance(components, list) else []:
+        if not isinstance(item, dict):
+            findings.append(
+                _finding(
+                    "discovery.suppression_state_invalid",
+                    "assembly",
+                    "a raw component entry is not an object",
+                    {"entry": repr(item)[:200]},
+                )
+            )
+            continue
+        name = str(item.get("name2") or "?")
+        state = item.get("suppression_state")
+        if type(state) is not int or state not in {0, 1, 2, 3, 4}:
+            findings.append(
+                _finding(
+                    "discovery.suppression_state_invalid",
+                    f"component:{name}",
+                    "every component must carry the documented raw suppression state "
+                    "(integer 0..4); state 5 and missing, boolean or undocumented values are refused",
+                    {"suppression_state": state},
+                )
+            )
+            continue
+        suppressed = item.get("suppressed")
+        lightweight = item.get("lightweight")
+        if type(suppressed) is not bool or type(lightweight) is not bool:
+            findings.append(
+                _finding(
+                    "discovery.suppression_state_invalid",
+                    f"component:{name}",
+                    "every component must carry boolean suppressed and lightweight flags",
+                    {"suppressed": suppressed, "lightweight": lightweight},
+                )
+            )
+            continue
+        if suppressed != (state == 0) or lightweight != (state in {1, 4}):
+            findings.append(
+                _finding(
+                    "discovery.suppression_state_incoherent",
+                    f"component:{name}",
+                    "the emitted suppression flags must agree with the raw suppression state",
+                    {
+                        "suppression_state": state,
+                        "suppressed": suppressed,
+                        "lightweight": lightweight,
+                    },
+                )
+            )
     known_occurrences = {
         str(item.get("name2"))
         for item in record.get("components") or []

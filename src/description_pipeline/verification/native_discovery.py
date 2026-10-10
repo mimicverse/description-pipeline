@@ -326,7 +326,76 @@ def _frame_for(entity: dict, frames):
     return frames.get(component) if isinstance(component, str) else None
 
 
+def _require_suppression_states(record: dict) -> None:
+    """Every component must carry the documented raw suppression state.
+
+    The raw ``GetSuppression2`` integer is authoritative: 0 suppressed, 1
+    lightweight, 2 fully resolved, 3 resolved, 4 fully lightweight.  State 5
+    (internal-ID mismatch), missing, boolean, undocumented and incoherent
+    values are refused, and a lightweight occurrence (1/4) cannot be
+    independently measured, so it is refused instead of being counted as
+    suppressed.  Both emitted flags are required booleans that must agree with
+    the state; the legacy raw ``IsSuppressed`` boolean is never consulted.
+    """
+
+    _require(
+        isinstance(record, dict),
+        "discovery.suppression_state",
+        "the raw record is not an object",
+        {"record": type(record).__name__},
+    )
+    components = record.get("components")
+    _require(
+        isinstance(components, list),
+        "discovery.suppression_state",
+        "the raw record carries no component list",
+        {"components": type(components).__name__},
+    )
+    for item in components:
+        _require(
+            isinstance(item, dict),
+            "discovery.suppression_state",
+            "a raw component entry is not an object",
+            {"entry": repr(item)[:200]},
+        )
+        name = str(item.get("name2") or "?")
+        state = item.get("suppression_state")
+        _require(
+            type(state) is int and state in {0, 1, 2, 3, 4},
+            "discovery.suppression_state",
+            "a component does not carry the documented raw suppression state (integer 0..4)",
+            {"component": name, "suppression_state": state},
+        )
+        suppressed = item.get("suppressed")
+        lightweight = item.get("lightweight")
+        _require(
+            type(suppressed) is bool and type(lightweight) is bool,
+            "discovery.suppression_state",
+            "a component must carry boolean suppressed and lightweight flags",
+            {"component": name, "suppressed": suppressed, "lightweight": lightweight},
+        )
+        _require(
+            suppressed == (state == 0) and lightweight == (state in {1, 4}),
+            "discovery.suppression_state",
+            "the emitted suppression flags do not agree with the raw suppression state",
+            {
+                "component": name,
+                "suppression_state": state,
+                "suppressed": suppressed,
+                "lightweight": lightweight,
+            },
+        )
+        if state in {1, 4}:
+            _require(
+                False,
+                "discovery.suppression_lightweight",
+                "a lightweight component cannot be independently measured; the native capture must fully load it",
+                {"component": name, "suppression_state": state},
+            )
+
+
 def _frames(record: dict) -> dict[str, list[list[float]] | None]:
+    _require_suppression_states(record)
     frames: dict[str, list[list[float]] | None] = {}
     for item in record.get("components") or []:
         if not isinstance(item, dict):
@@ -1043,6 +1112,7 @@ def _find(nodes: list[str], parent: dict[str, str], node: str) -> str:
 
 
 def _independent_clusters(record: dict):
+    _require_suppression_states(record)
     components = {
         str(item.get("name2")): item
         for item in record.get("components") or []
@@ -2740,7 +2810,12 @@ def verify_discovery(package: Path) -> dict:
         }
 
     bound = check("discovery.binding", binding)
+
+    def suppression():
+        return _require_suppression_states((state.get("payload") or {}).get("raw") or {})
+
     dependent = (
+        ("discovery.suppression_state", suppression),
         ("discovery.files", files),
         ("discovery.imported_sources", imported_sources),
         ("discovery.identity", identity),
@@ -2755,12 +2830,15 @@ def verify_discovery(package: Path) -> dict:
         ("discovery.tree", tree),
         ("discovery.frames", frames),
     )
-    if bound["passed"] and "exporter" in state["payload"].get("raw", {}):
+    raw_block = (state.get("payload") or {}).get("raw")
+    raw_block = raw_block if isinstance(raw_block, dict) else None
+    if bound["passed"] and raw_block is not None and "exporter" in raw_block:
         # Explicit native declarations do not require incomplete mate inference to
         # rediscover memberships or impose unrelated CS_/dp.* naming conventions.
         # Capture/file/mass binding remains mandatory. A declaration carries no
         # external design budget; never invent nominal mass or extent ranges.
         dependent = (
+            ("discovery.suppression_state", suppression),
             ("discovery.files", files),
             ("discovery.imported_sources", imported_sources),
             ("discovery.identity", identity),
@@ -2771,7 +2849,9 @@ def verify_discovery(package: Path) -> dict:
         )
     if bound["passed"]:
         payload = state["payload"]
-        document_properties = (payload.get("raw", {}).get("properties") or {}).get("document") or {}
+        raw_block = payload.get("raw")
+        raw_block = raw_block if isinstance(raw_block, dict) else {}
+        document_properties = (raw_block.get("properties") or {}).get("document") or {}
         budget_reference = str(payload.get("namespace") or "dp") + ".design_budget_record"
         expectations = state["robot"].get("checks") or {}
         if ("budget" not in payload and budget_reference not in document_properties

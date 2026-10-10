@@ -30,6 +30,8 @@ def component(name, document=None):
         "name2": name,
         "configuration": "Default",
         "suppressed": False,
+        "lightweight": False,
+        "suppression_state": 2,
         "document": document or name.replace("/", "_") + ".SLDPRT",
         "transform": list(IDENTITY),
     }

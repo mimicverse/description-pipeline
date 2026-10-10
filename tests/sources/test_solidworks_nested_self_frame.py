@@ -41,7 +41,13 @@ def flat(matrix):
 
 
 def component(name, document):
-    return {"name2": name, "document": document, "suppressed": False}
+    return {
+        "name2": name,
+        "document": document,
+        "suppressed": False,
+        "lightweight": False,
+        "suppression_state": 2,
+    }
 
 
 def record(components, mates):

@@ -54,12 +54,10 @@ def foreign_component(name, *, containing=None):
         "name2": name,
         "document": rf"{TEMP}\HD-1910-C001-20260902.stp.SLDASM",
         "suppressed": False,
+        "lightweight": False,
+        "suppression_state": 2,
         "source_provenance": foreign_provenance(),
-        **(
-            {"solver_observation": {"context": {"document": containing}}}
-            if containing is not None
-            else {}
-        ),
+        **({"solver_observation": {"context": {"document": containing}}} if containing is not None else {}),
     }
 
 
@@ -115,6 +113,85 @@ class ImportedSourceTests(unittest.TestCase):
     def _unbound(report):
         return next(item for item in report["errors"] if item["code"] == "discovery.imported_source_unbound")
 
+    def test_resealed_evidence_suppression_states_are_refused_by_verification(self) -> None:
+        """Independently resealed raw evidence cannot hide an invalid suppression state."""
+
+        content = b"frozen step bytes"
+        sha = hashlib.sha256(content).hexdigest()
+        baseline = {
+            "name2": "NP-F550.step-1",
+            "document": "NP-F550.step",
+            "suppressed": False,
+            "lightweight": False,
+            "suppression_state": 2,
+            "source_provenance": accepted_provenance("NP-F550.step", sha),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            package = self._package(directory, {"NP-F550.step": content}, [json.loads(json.dumps(baseline))])
+            report = verify_discovery(package)
+            sealed_hash = hashlib.sha256((package / "discovery/native-discovery.json").read_bytes()).hexdigest()
+        # The binding check stays first so the passed report keeps its sealed provenance hash.
+        self.assertEqual(report["checks"][0]["id"], "discovery.binding")
+        self.assertEqual(report["discovery_sha256"], sealed_hash)
+        self.assertTrue(
+            next(item for item in report["checks"] if item["id"] == "discovery.suppression_state")["passed"]
+        )
+        cases = {
+            "missing_state": lambda item: item.pop("suppression_state"),
+            "state5": lambda item: item.update(suppression_state=5),
+            "unknown": lambda item: item.update(suppression_state=7),
+            "boolean_state": lambda item: item.update(suppression_state=True),
+            "flag_missing": lambda item: item.pop("lightweight"),
+            "flag_nonbool": lambda item: item.update(lightweight=0),
+            "flag_mismatch": lambda item: item.update(suppressed=True),
+            "lightweight": lambda item: item.update(suppression_state=1, lightweight=True),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(case=label):
+                component = json.loads(json.dumps(baseline))
+                mutate(component)
+                with tempfile.TemporaryDirectory() as directory:
+                    package = self._package(directory, {"NP-F550.step": content}, [component])
+                    report = verify_discovery(package)
+                failed = next(item for item in report["checks"] if item["id"] == "discovery.suppression_state")
+                self.assertFalse(failed["passed"], label)
+                self.assertIn(
+                    failed["details"]["code"],
+                    {"discovery.suppression_state", "discovery.suppression_lightweight"},
+                )
+                self.assertTrue(
+                    any(str(item["code"]).startswith("discovery.suppression") for item in report["errors"])
+                )
+
+    def test_resealed_malformed_raw_fails_precisely_without_a_crash(self) -> None:
+        """A None raw record fails the suppression check instead of crashing route selection."""
+
+        content = b"frozen step bytes"
+        sha = hashlib.sha256(content).hexdigest()
+        component = {
+            "name2": "NP-F550.step-1",
+            "document": "NP-F550.step",
+            "suppressed": False,
+            "lightweight": False,
+            "suppression_state": 2,
+            "source_provenance": accepted_provenance("NP-F550.step", sha),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            package = self._package(directory, {"NP-F550.step": content}, [component])
+            record_path = package / "discovery/native-discovery.json"
+            payload = json.loads(record_path.read_bytes())
+            payload["raw"] = None
+            record = json.dumps(payload).encode()
+            record_path.write_bytes(record)
+            robot = json.loads((package / "robot.yaml").read_bytes())
+            robot["provenance"]["discovery_sha256"] = hashlib.sha256(record).hexdigest()
+            (package / "robot.yaml").write_text(json.dumps(robot))
+            report = verify_discovery(package)
+        self.assertFalse(report["passed"])
+        failed = next(item for item in report["checks"] if item["id"] == "discovery.suppression_state")
+        self.assertFalse(failed["passed"])
+        self.assertEqual(failed["details"]["code"], "discovery.suppression_state")
+
     def test_resolved_frozen_source_class_is_preserved(self):
         content = b"frozen step bytes"
         sha = hashlib.sha256(content).hexdigest()
@@ -122,6 +199,8 @@ class ImportedSourceTests(unittest.TestCase):
             "name2": "NP-F550.step-1",
             "document": "NP-F550.step",
             "suppressed": False,
+            "lightweight": False,
+            "suppression_state": 2,
             "source_provenance": accepted_provenance("NP-F550.step", sha),
         }
         with tempfile.TemporaryDirectory() as directory:
@@ -137,6 +216,8 @@ class ImportedSourceTests(unittest.TestCase):
             "name2": "NP-F550.step-1",
             "document": "NP-F550.step",
             "suppressed": False,
+            "lightweight": False,
+            "suppression_state": 2,
             "source_provenance": accepted_provenance("NP-F550.step", sha),
         }
         with tempfile.TemporaryDirectory() as directory:
@@ -147,7 +228,13 @@ class ImportedSourceTests(unittest.TestCase):
     def test_foreign_imported_ancestor_under_selected_container_fails(self):
         contents = {"module.SLDASM": b"module bytes", "tool_part.SLDPRT": b"tool bytes"}
         ancestor = foreign_component("module-1", containing="module.SLDASM")
-        child = {"name2": "module-1/tool_part", "document": "tool_part.SLDPRT", "suppressed": False}
+        child = {
+            "name2": "module-1/tool_part",
+            "document": "tool_part.SLDPRT",
+            "suppressed": False,
+            "lightweight": False,
+            "suppression_state": 2,
+        }
         with tempfile.TemporaryDirectory() as directory:
             package = self._package(directory, contents, [ancestor, child])
             report = verify_discovery(package)
@@ -189,13 +276,13 @@ class ImportedSourceTests(unittest.TestCase):
         for patch, token in cases:
             provenance = accepted_provenance("NP-F550.step", sha)
             provenance.update(patch)
-            component_document = (
-                "./NP-F550.step" if patch.get("document") == "./NP-F550.step" else "NP-F550.step"
-            )
+            component_document = "./NP-F550.step" if patch.get("document") == "./NP-F550.step" else "NP-F550.step"
             component = {
                 "name2": "NP-F550.step-1",
                 "document": component_document,
                 "suppressed": False,
+                "lightweight": False,
+                "suppression_state": 2,
                 "source_provenance": provenance,
             }
             with tempfile.TemporaryDirectory() as directory:
@@ -213,6 +300,8 @@ class ImportedSourceTests(unittest.TestCase):
             "name2": "NP-F550.step-1",
             "document": "NP-F550.step",
             "suppressed": False,
+            "lightweight": False,
+            "suppression_state": 2,
             "source_provenance": accepted_provenance("NP-F550.step", sha),
         }
         with tempfile.TemporaryDirectory() as directory:

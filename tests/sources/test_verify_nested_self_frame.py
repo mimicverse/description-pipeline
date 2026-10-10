@@ -90,6 +90,8 @@ class NestedSelfFrameTests(unittest.TestCase):
             "name2": name,
             "document": document,
             "suppressed": False,
+            "lightweight": False,
+            "suppression_state": 2,
             "transform": transform16(rotation_matrix, translation),
         }
 

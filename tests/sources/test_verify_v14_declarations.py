@@ -258,6 +258,9 @@ class V14DeclarationDecoderTests(unittest.TestCase):
             {
                 "pid_hex": "414243",
                 "name2": "part-1",
+                "suppressed": False,
+                "lightweight": False,
+                "suppression_state": 2,
                 "error_code": 0,
                 "document": "part.SLDPRT",
                 "configuration": "Default",

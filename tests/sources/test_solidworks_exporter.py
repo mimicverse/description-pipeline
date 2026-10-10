@@ -135,6 +135,8 @@ def raw_record() -> dict:
                 "configuration": "Default",
                 "transform": IDENTITY.copy(),
                 "suppressed": False,
+                "lightweight": False,
+                "suppression_state": 2,
             }
             for name, document in (("base-1", "base.SLDPRT"), ("arm-1", "arm.SLDPRT"))
         ],

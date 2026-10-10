@@ -289,6 +289,7 @@ class ConfigurationPrimitiveTests(unittest.TestCase):
         child = types.SimpleNamespace(
             Name2="arm-1",
             IsSuppressed=False,
+            GetSuppression2=lambda: 2,
             GetChildren=Mock(spec=lambda: None, return_value=[]),
             GetPathName=Mock(spec=lambda: None, return_value="C:/captures/arm.SLDPRT"),
         )
@@ -368,12 +369,14 @@ class ConfigurationPrimitiveTests(unittest.TestCase):
         ok_child = types.SimpleNamespace(
             Name2="ok-1",
             IsSuppressed=False,
+            GetSuppression2=lambda: 2,
             GetChildren=Mock(spec=lambda: None, return_value=[]),
             GetPathName=Mock(spec=lambda: None, return_value="C:/captures/ok.SLDPRT"),
         )
         bad_child = types.SimpleNamespace(
             Name2="bad-2",
             IsSuppressed=False,
+            GetSuppression2=lambda: 2,
             GetChildren=Mock(spec=lambda: None, return_value=[]),
             GetPathName=Mock(spec=lambda: None, side_effect=RuntimeError("RPC_S_UNKNOWN_IF")),
         )
@@ -621,7 +624,11 @@ class ReturnViewRegistryTests(unittest.TestCase):
         self.assertNotIn('"IsLightweight"', source)
         self.assertIn('state["lightweight"] = None', source)
         self.assertIn('state["unsupported"] = ["lightweight"]', source)
-        self.assertIn("lightweight:{path_name}:unsupported_declared", source)
+        # The per-component lightweight member is now declared by the supported
+        # GetSuppression2 state; the retired unsupported-declared note is gone and
+        # the state-based mass note reports an unmeasured lightweight occurrence.
+        self.assertNotIn("unsupported_declared", source)
+        self.assertIn("lightweight_state_", source)
 
     def test_document_state_reports_unsupported_lightweight_without_probing(self):
         doc = types.SimpleNamespace(

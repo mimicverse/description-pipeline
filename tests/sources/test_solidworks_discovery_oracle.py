@@ -101,6 +101,8 @@ def native_record() -> dict:
         "components": [
             {
                 "name2": "base-1",
+                "lightweight": False,
+                "suppression_state": 2,
                 "instance_id": "base-1",
                 "document": "cad/base.SLDPRT",
                 "configuration": "Default",
@@ -110,6 +112,8 @@ def native_record() -> dict:
             },
             {
                 "name2": "arm-1",
+                "lightweight": False,
+                "suppression_state": 2,
                 "instance_id": "arm-1",
                 "document": "cad/arm.SLDPRT",
                 "configuration": "Default",
@@ -600,6 +604,8 @@ class OracleSemanticsTests(unittest.TestCase):
     def _container(name: str = "sub-1", document: str = "cad/sub.SLDASM") -> dict:
         return {
             "name2": name,
+            "lightweight": False,
+            "suppression_state": 2,
             "instance_id": name,
             "document": document,
             "configuration": "Default",
@@ -1288,6 +1294,8 @@ class OracleSemanticsTests(unittest.TestCase):
         components = [
             {
                 "name2": name,
+                "lightweight": False,
+                "suppression_state": 2,
                 "instance_id": name,
                 "document": f"cad/{name}.SLDPRT",
                 "configuration": "Default",
