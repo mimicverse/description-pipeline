@@ -86,6 +86,40 @@ def _parent_subject(store: LinuxStore, parent_run: str, stage: str) -> str:
     return subject
 
 
+def _root_capture(store: LinuxStore, run_id: str):
+    """The admitted capture directory of an attempt, following its source lineage."""
+    seen: set[str] = set()
+    current = run_id
+    while current not in seen:
+        seen.add(current)
+        capture = store.capture_dir(current)
+        if capture.is_dir():
+            return capture
+        meta = store.meta(current) or {}
+        source = meta.get("source_run_id")
+        if not isinstance(source, str) or not source:
+            return None
+        current = source
+    return None
+
+
+def _root_identity(store: LinuxStore, run_id: str) -> tuple[str | None, str | None]:
+    """Hardware and revision of the admitted delivery, read from its JSON revision record."""
+    capture = _root_capture(store, run_id)
+    if capture is None:
+        return None, None
+    path = capture / "input/cad-revision.json"
+    if not path.is_file():
+        return None, None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    hardware = payload.get("hardware_id")
+    revision = payload.get("revision")
+    return (
+        hardware if isinstance(hardware, str) and hardware else None,
+        revision if isinstance(revision, str) and revision else None,
+    )
+
+
 def _run_uuid(context) -> str:
     return native_run_id(context["dag_run"].run_id)
 
@@ -239,17 +273,14 @@ def solidworks_to_urdf():
                 # contacts Windows: the parent store already holds the admitted capture.
                 store = _linux_store(CONN_ID)
                 parent_meta = store.meta(linked["parent_run"])
-                if (
-                    not isinstance(parent_meta, dict)
-                    or not parent_meta.get("handoff_sha256")
-                    or not store.capture_dir(linked["parent_run"]).is_dir()
-                ):
+                parent_capture = _root_capture(store, linked["parent_run"])
+                if not isinstance(parent_meta, dict) or not parent_meta.get("handoff_sha256") or parent_capture is None:
                     raise AirflowFailException(
                         f"Linked parent {linked['parent_run']} has no admitted Linux capture to resume"
                     )
                 request = {
                     "run_id": _run_uuid(context),
-                    "package": str(store.capture_dir(linked["parent_run"])),
+                    "package": str(parent_capture),
                     "handoff_sha256": str(parent_meta["handoff_sha256"]),
                     "conn_id": CONN_ID,
                     "resume": linked,
@@ -337,6 +368,7 @@ def solidworks_to_urdf():
         if request.get("linux_owned"):
             parent_run = resume["parent_run"]
             parent_meta = store.meta(parent_run) or {}
+            hardware, revision = _root_identity(store, parent_run)
             binding = {
                 "run_id": run_id,
                 "source_run_id": parent_run,
@@ -345,6 +377,8 @@ def solidworks_to_urdf():
                 "main_assembly": parent_meta.get("main_assembly"),
                 "repository_slug": parent_meta.get("repository_slug"),
                 "repository_base": parent_meta.get("repository_base"),
+                "hardware_id": hardware,
+                "revision": revision,
                 "state": "linked",
             }
         else:
@@ -356,6 +390,7 @@ def solidworks_to_urdf():
             binding = fetch_native_capture(store, _endpoint(request["conn_id"]), run_id, job)
             binding["repository_slug"] = job.get("repository_slug")
             binding["repository_base"] = job.get("repository_base")
+            binding["hardware_id"], binding["revision"] = _root_identity(store, run_id)
             binding["source_run_id"] = None
             binding["from_stage"] = None
         log.info(
@@ -432,6 +467,11 @@ def solidworks_to_urdf():
                 raise AirflowFailException(f"native job {run_id} failed: {native.get('error')}")
         store = _linux_store(request["conn_id"])
         snapshot = store.merged_job(run_id, native)
+        for key in ("hardware_id", "revision", "repository_slug", "repository_base"):
+            if not isinstance(snapshot.get(key), str) or not snapshot.get(key):
+                value = published.get(key)
+                if isinstance(value, str) and value:
+                    snapshot[key] = value
         view = stage_view(snapshot)
         require_complete(view)
         routing = resolved_routing(snapshot)

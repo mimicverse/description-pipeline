@@ -227,7 +227,20 @@ def fetch_capture(store: LinuxStore, endpoint, run_id: str, job: dict) -> dict:
     )
     slug = job.get("repository_slug")
     base = job.get("repository_base")
-    store.update_meta(run_id, repository_slug=slug, repository_base=base)
+    hardware = revision = None
+    revision_path = store.capture_dir(run_id) / "input/cad-revision.json"
+    if revision_path.is_file():
+        payload = read_data(revision_path)
+        if isinstance(payload, dict):
+            hardware = payload.get("hardware_id")
+            revision = payload.get("revision")
+    store.update_meta(
+        run_id,
+        repository_slug=slug,
+        repository_base=base,
+        hardware_id=hardware if isinstance(hardware, str) and hardware else None,
+        revision=revision if isinstance(revision, str) and revision else None,
+    )
     return {
         "run_id": run_id,
         "store_root": str(store.root),
@@ -237,4 +250,6 @@ def fetch_capture(store: LinuxStore, endpoint, run_id: str, job: dict) -> dict:
         "state": meta.get("state"),
         "repository_slug": slug,
         "repository_base": base,
+        "hardware_id": hardware,
+        "revision": revision,
     }

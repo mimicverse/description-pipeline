@@ -1448,18 +1448,35 @@ class PortalApp:
     def _rerun_rows(self, native_id: str) -> list[dict] | None:
         """Finished stage-rerun availability rows; unavailable data is omitted, never faked."""
         plan = getattr(self._endpoint(), "rerun_plan", None)
-        if plan is None:
-            return None
-        try:
-            payload = plan(native_id)
-        except (EndpointNotFound, EndpointError):
-            return None
-        rows = payload.get("stage_reruns") if isinstance(payload, dict) else None
+        rows = None
+        if plan is not None:
+            try:
+                payload = plan(native_id)
+                rows = payload.get("stage_reruns") if isinstance(payload, dict) else None
+            except (EndpointNotFound, EndpointError):
+                rows = None
         if not isinstance(rows, list) or not rows:
-            return None
+            rows = None
         store = self._store()
         if store is None or not isinstance(store.meta(native_id), dict):
             return rows
+        if rows is None:
+            # A linked Linux attempt has no Windows plan of its own: the rows describe the
+            # portable restart surface while the native stages remain reused evidence.
+            rows = [
+                {
+                    "stage": stage["id"],
+                    "name_zh": stage["name_zh"],
+                    "eligible": False,
+                    "reason": "linux_owned",
+                    "reason_zh": "该阶段由 Windows 原生端提供或已复用",
+                    "recomputes": [stage["id"]],
+                    "retains": [],
+                    "prerequisites": [],
+                    "target_changed": False,
+                }
+                for stage in CONTRACT["stages"]
+            ]
         seeds = {
             "generate": store.capture_dir(native_id),
             "verify": store.stage_dir(native_id, "generate"),
@@ -1853,26 +1870,28 @@ class PortalApp:
         store_run_id = native_run_id(dag_run_id)
         if store is not None and isinstance(store.meta(store_run_id), dict):
             try:
-                stream, size = store.open_artifact(store_run_id, artifact, sha256=digest)
+                stream, _size = store.open_artifact(store_run_id, artifact, sha256=digest)
             except PipelineError as error:
                 raise PortalError(HTTPStatus.NOT_FOUND, str(error)) from error
-            content_type = _ARTIFACT_TYPES.get(Path(artifact).suffix.lower(), "application/octet-stream")
-            headers = [
-                ("Content-Type", content_type),
-                ("Content-Length", str(size)),
-                ("Cache-Control", "private, max-age=300"),
-            ]
-            start_response("200 OK", _common_headers(headers, self.config))
-
-            def chunks():
+            data = bytearray()
+            try:
                 with stream:
                     while True:
                         chunk = stream.read(1024 * 1024)
                         if not chunk:
                             break
-                        yield chunk
-
-            return chunks()
+                        data.extend(chunk)
+            except PipelineError as error:
+                # The stream verifies the digest at EOF; nothing may reach the browser first.
+                raise PortalError(HTTPStatus.BAD_GATEWAY, "交付文件摘要校验失败，已拒绝提供") from error
+            content_type = _ARTIFACT_TYPES.get(Path(artifact).suffix.lower(), "application/octet-stream")
+            headers = [
+                ("Content-Type", content_type),
+                ("Content-Length", str(len(data))),
+                ("Cache-Control", "private, max-age=300"),
+            ]
+            start_response("200 OK", _common_headers(headers, self.config))
+            return [bytes(data)]
         endpoint = self._endpoint()
         try:
             data = endpoint.read_artifact(
@@ -1937,7 +1956,8 @@ class PortalApp:
         native = None
         try:
             native = endpoint.get_job(run_id)
-        except EndpointNotFound:
+        except (EndpointNotFound, EndpointError):
+            # An admitted Linux attempt stays readable even when Windows is unreachable.
             native = None
         store = self._store()
         if store is not None and isinstance(store.meta(run_id), dict):
