@@ -12,7 +12,7 @@ The endpoint contract is fixed and carries no shell or local paths:
   sealed, the manifest; ``awaiting_definition`` exposes the raw-record artifact, and
   ``POST /v1/jobs/<uuid>/definition`` submits the sealed capture request carrying
   ``X-Prepared-SHA256``; ``POST /v1/jobs/<uuid>/abort`` reports one local derivation failure;
-* ``GET /v1/jobs/<uuid>/artifacts/<name>`` streams one verified delivery artifact;
+* ``GET /v1/jobs/<uuid>/artifacts/<name>`` streams one bound raw-record or native capture artifact;
 * ``GET /health`` exposes only ``pipeline_id`` and readiness.
 
 Plaintext HTTP is allowed only for loopback hosts; anything remote requires TLS.
@@ -152,15 +152,15 @@ def _error_payload(error: urlerror.HTTPError) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
-def _http_refusal(error: urlerror.HTTPError) -> EndpointError:
+def _http_refusal(error: urlerror.HTTPError, *, context: str | None = None) -> EndpointError:
     """One request refusal that keeps the server's structured body for callers."""
     payload = _error_payload(error)
     if error.code in {401, 403}:
         failure: EndpointError = EndpointAuthError(f"endpoint rejected the bearer token ({error.code})")
     elif error.code == 404:
-        failure = EndpointNotFound("endpoint has no record of the requested resource")
+        failure = EndpointNotFound(context or "endpoint has no record of the requested resource")
     elif error.code == 409:
-        failure = EndpointConflict(f"run_id already bound to a different request ({error.code})")
+        failure = EndpointConflict(f"request conflict ({error.code})")
     else:
         failure = EndpointError(f"endpoint returned HTTP {error.code}")
     message = payload.get("error")
@@ -168,6 +168,7 @@ def _http_refusal(error: urlerror.HTTPError) -> EndpointError:
         failure.args = (f"{failure.args[0]}: {message}",)
     failure.status = error.code
     failure.payload = payload
+    failure.code = payload.get("error_code") if isinstance(payload.get("error_code"), str) else None
     for field in ("error_code", "reason", "reason_zh", "earliest_required", "active_run_id", "detail"):
         setattr(failure, field, payload.get(field))
     return failure
@@ -953,11 +954,7 @@ class WindowsEndpoint:
         try:
             return self._opener(request, timeout=self.config.timeout)
         except urlerror.HTTPError as error:
-            if error.code in {401, 403}:
-                raise EndpointAuthError(f"endpoint rejected the bearer token ({error.code})") from error
-            if error.code == 404:
-                raise EndpointNotFound(f"artifact {artifact!r} is not part of run {canonical}") from error
-            raise EndpointError(f"endpoint returned HTTP {error.code}") from error
+            raise _http_refusal(error, context=f"artifact {artifact!r} is not part of run {canonical}") from error
         except urlerror.URLError as error:
             raise EndpointError(f"endpoint unreachable: {error.reason}") from error
 

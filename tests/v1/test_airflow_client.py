@@ -940,10 +940,12 @@ class ClientTests(unittest.TestCase):
             start_selection(endpoint)
         failure = caught.exception
         self.assertEqual(failure.status, 409)
+        self.assertEqual(failure.code, "already_active")
         self.assertEqual(failure.error_code, "already_active")
         self.assertEqual(failure.active_run_id, RUN_ID)
         self.assertEqual(failure.earliest_required, "2026-10-11T00:00:00Z")
         self.assertEqual(failure.detail, {"stage": "capture"})
+        self.assertIn("request conflict (409)", str(failure))
         self.assertIn("selection is bound to another run", str(failure))
 
     def test_start_rejects_a_different_echoed_request(self) -> None:
