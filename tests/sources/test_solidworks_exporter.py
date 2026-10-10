@@ -654,7 +654,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
             self.assertIsNone(_exporter_declaration(raw, identity, findings))
             self.assertEqual([item["code"] for item in findings], [] if expected is None else [expected])
 
-    def test_preparation_preserves_declared_zero_warnings_when_another_gate_blocks(self):
+    def test_preparation_preserves_declared_zero_warnings_when_publication_metadata_is_deferred(self):
         raw = raw_record()
         raw["identity"]["owner"] = None
         with tempfile.TemporaryDirectory() as directory:
@@ -662,9 +662,14 @@ class ExporterDiscoveryTests(unittest.TestCase):
             source.mkdir()
             for name in ("robot.SLDASM", "base.SLDPRT", "arm.SLDPRT"):
                 (source / name).write_bytes(b"native-file-test")
-            result = prepare_native_package(source, Path(directory) / "prepared", "wire-run", backend=FakeBackend(raw))
-            self.assertFalse(result.passed)
+            prepared = Path(directory) / "prepared"
+            result = prepare_native_package(source, prepared, "wire-run", backend=FakeBackend(raw))
+            self.assertTrue(result.passed, result.findings)
+            self.assertEqual(result.revision_sha256, "")
+            self.assertFalse((prepared / "cad-revision.json").exists())
+            self.assertTrue((prepared / "robot.yaml").is_file())
             payload = json.loads(result.discovery_path.read_text())
+            self.assertEqual(result.source["hardware_id"], "wire_test")
         self.assertEqual(payload["identity"]["delivery_configuration"], "Default")
         self.assertEqual(payload["raw"]["identity"].get("delivery_configuration"), None)
         self.assertEqual(payload["derived"]["joints"][0]["limits"]["upper"], 0.0)
@@ -674,10 +679,10 @@ class ExporterDiscoveryTests(unittest.TestCase):
         budget = next(item for item in result.findings if item["code"] == "discovery.design_budget_unspecified")
         self.assertFalse(budget["blocking"])
         self.assertNotIn("budget", payload)
-        self.assertEqual(
-            {item["code"] for item in result.findings if item["blocking"]},
-            {"discovery.owner_missing"},
-        )
+        owner = next(item for item in result.findings if item["code"] == "discovery.owner_missing")
+        self.assertFalse(owner["blocking"])
+        self.assertEqual(owner["detail"]["publication_blocker"], "owner")
+        self.assertFalse([item for item in result.findings if item["blocking"]])
         zero_findings = [item for item in result.findings if item["code"].startswith("discovery.joint_")]
         self.assertEqual(len(zero_findings), 2)
         self.assertTrue(all(not item["blocking"] and item["detail"]["qualification_blocker"] for item in zero_findings))

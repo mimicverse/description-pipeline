@@ -92,6 +92,8 @@ AXIS_OFFSET_TOL_M = 5e-5
 CONTROL_SYSTEMS = ("git", "pdm", "handoff")
 
 _SNAKE = re.compile(r"^[a-z][a-z0-9_]*$")
+_IDENTITY_ID = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
+_GIT_COMMIT = re.compile(r"\b[0-9a-f]{40}(?:[0-9a-f]{24})?\b")
 
 #: Datum name spaces the spec recognises: link frames, tool/sensor interfaces
 #: and joint frames.  A datum is ``<PREFIX>_<snake_case>``: the suffix must be
@@ -159,6 +161,12 @@ class PreparedPackage:
 
 def _text(value: Any) -> bool:
     return isinstance(value, str) and value.strip() != ""
+
+
+def _authored_text(value: Any) -> bool:
+    """Non-empty text without control characters, as the revision manifest requires."""
+
+    return isinstance(value, str) and value.strip() != "" and not any(ord(c) < 32 or ord(c) == 127 for c in value)
 
 
 def _snake(value: Any) -> str | None:
@@ -3437,28 +3445,89 @@ def _identity(
     assembly: str | None,
     native_files: Mapping[str, str],
 ) -> dict:
+    """Read authored identity, deferring absent administrative metadata to publication.
+
+    Absent hardware, revision, owner, change summary, control or robot name is a
+    publication-readiness gap: it is recorded as a nonblocking finding carrying
+    ``detail.publication_blocker``, the raw record keeps the absence and nothing
+    is invented.  Malformed or conflicting supplied values still block.
+    """
+
     namespace = NAMESPACE
+
+    def deferred(code: str, field: str, message: str, detail: dict | None = None) -> None:
+        payload = {"publication_blocker": field}
+        if detail:
+            payload.update(detail)
+        findings.append(_finding(code, "assembly", message, payload, blocking=False))
+
     hardware = _identity_value(record, namespace, "hardware_id")
-    if not _text(hardware):
-        findings.append(
-            _finding("discovery.identity_missing", "assembly", "hardware identity is not recorded in the CAD records")
-        )
     hardware = str(hardware).strip() if _text(hardware) else None
-    revision = _identity_value(record, namespace, "revision")
-    if not _text(revision):
-        findings.append(
-            _finding("discovery.revision_missing", "assembly", "structural revision is not recorded in the CAD records")
+    if hardware is None:
+        deferred(
+            "discovery.identity_missing",
+            "hardware_id",
+            "hardware identity is not recorded in the CAD records; publication readiness requires it",
         )
-    revision = str(revision).strip() if _text(revision) else None
-    owner = _identity_value(record, namespace, "owner")
-    if not _text(owner):
+    elif _IDENTITY_ID.fullmatch(hardware) is None:
         findings.append(
-            _finding("discovery.owner_missing", "assembly", "revision owner is not recorded in the CAD records")
+            _finding(
+                "discovery.identity_invalid",
+                "assembly",
+                "recorded hardware identity must be an ASCII identifier of at most 64 characters",
+                {"value": hardware},
+            )
+        )
+    revision = _identity_value(record, namespace, "revision")
+    revision = str(revision).strip() if _text(revision) else None
+    if revision is None:
+        deferred(
+            "discovery.revision_missing",
+            "revision",
+            "structural revision is not recorded in the CAD records; publication readiness requires it",
+        )
+    elif _IDENTITY_ID.fullmatch(revision) is None:
+        findings.append(
+            _finding(
+                "discovery.revision_invalid",
+                "assembly",
+                "recorded structural revision must be an ASCII identifier of at most 64 characters",
+                {"value": revision},
+            )
+        )
+    owner = _identity_value(record, namespace, "owner")
+    owner = str(owner).strip() if _text(owner) else None
+    if owner is None:
+        deferred(
+            "discovery.owner_missing",
+            "owner",
+            "revision owner is not recorded in the CAD records; publication readiness requires it",
+        )
+    elif not _authored_text(owner):
+        findings.append(
+            _finding(
+                "discovery.owner_invalid",
+                "assembly",
+                "recorded revision owner must be non-empty text without control characters",
+                {"value": owner},
+            )
         )
     summary = _identity_value(record, namespace, "change_summary")
-    if not _text(summary):
+    summary = str(summary).strip() if _text(summary) else None
+    if summary is None:
+        deferred(
+            "discovery.summary_missing",
+            "change_summary",
+            "change summary is not recorded in the CAD records; publication readiness requires it",
+        )
+    elif not _authored_text(summary):
         findings.append(
-            _finding("discovery.summary_missing", "assembly", "change summary is not recorded in the CAD records")
+            _finding(
+                "discovery.summary_invalid",
+                "assembly",
+                "recorded change summary must be non-empty text without control characters",
+                {"value": summary},
+            )
         )
     control = (record.get("identity") or {}).get("control")
     if not isinstance(control, dict):
@@ -3466,21 +3535,37 @@ def _identity(
             "system": _scalar(record, namespace, "control.system"),
             "reference": _scalar(record, namespace, "control.reference"),
         }
-    if not _text(control.get("system")) or not _text(control.get("reference")):
-        findings.append(
-            _finding("discovery.control_missing", "assembly", "CAD control system/reference are not recorded")
+    system = str(control["system"]).strip() if _text(control.get("system")) else None
+    reference = str(control["reference"]).strip() if _text(control.get("reference")) else None
+    if system is None or reference is None:
+        deferred(
+            "discovery.control_missing",
+            "control",
+            "CAD control system/reference are not recorded; publication readiness requires both",
         )
         control = None
-    elif str(control["system"]) not in CONTROL_SYSTEMS:
+    elif system not in CONTROL_SYSTEMS:
         findings.append(
             _finding(
                 "discovery.control_invalid",
                 "assembly",
                 "CAD control system must be git, pdm or handoff",
-                {"system": control["system"]},
+                {"system": system},
             )
         )
         control = None
+    elif system == "git" and _GIT_COMMIT.search(reference) is None:
+        findings.append(
+            _finding(
+                "discovery.control_invalid",
+                "assembly",
+                "Git CAD control reference must contain the full commit hash",
+                {"reference": reference},
+            )
+        )
+        control = None
+    else:
+        control = {"system": system, "reference": reference}
     delivery = (
         configuration
         or _identity_value(record, namespace, "delivery_configuration")
@@ -3502,23 +3587,40 @@ def _identity(
                 {"assembly": main},
             )
         )
-    robot_name = _identity_value(record, namespace, "robot_name")
-    robot_name = str(robot_name).strip() if _text(robot_name) else _snake(hardware)
-    if not _text(robot_name) or _SNAKE.fullmatch(str(robot_name)) is None:
+    authored_name = _identity_value(record, namespace, "robot_name")
+    if _text(authored_name):
+        robot_name = str(authored_name).strip()
+        if _SNAKE.fullmatch(robot_name) is None:
+            findings.append(
+                _finding("discovery.robot_name_invalid", "assembly", "robot name is not snake_case", {"name": robot_name})
+            )
+        technical_name = None
+    else:
+        technical = _snake(hardware) if hardware else None
+        technical_name = technical if technical and _SNAKE.fullmatch(technical) else "robot"
+        robot_name = None
         findings.append(
-            _finding("discovery.robot_name_invalid", "assembly", "robot name is not snake_case", {"name": robot_name})
+            _finding(
+                "discovery.robot_name_missing",
+                "assembly",
+                f"no authored robot name is recorded; the technical label {technical_name!r} is used for "
+                "generation and the native identity stays null",
+                {"technical_name": technical_name, "authored": False},
+                blocking=False,
+            )
         )
     parent = _identity_value(record, namespace, "parent_revision")
     return {
         "hardware_id": hardware,
         "revision": revision,
         "parent_revision": str(parent).strip() if _text(parent) else None,
-        "owner": str(owner).strip() if _text(owner) else None,
-        "change_summary": str(summary).strip() if _text(summary) else None,
-        "control": {"system": str(control["system"]), "reference": str(control["reference"])} if control else None,
+        "owner": owner,
+        "change_summary": summary,
+        "control": control,
         "delivery_configuration": delivery,
         "main_assembly": main,
-        "robot_name": str(robot_name) if _text(robot_name) else None,
+        "robot_name": robot_name,
+        "robot_name_technical": technical_name,
     }
 
 
@@ -3880,16 +3982,26 @@ def prepare_native_package(
         identity, bodies, joints, record, settings, records, checks, frames, run_id, discovery_sha256, handoff_sha256
     )
     _write_yaml(output / ROBOT_FILE, document)
-    seal_revision(
-        output,
-        hardware_id=identity["hardware_id"],
-        revision=identity["revision"],
-        owner=identity["owner"],
-        system=identity["control"]["system"],
-        reference=identity["control"]["reference"],
-        summary=identity["change_summary"],
-        parent_revision=identity["parent_revision"],
+    # A partial administrative identity cannot seal a revision manifest.  The
+    # prepared package still proceeds so measurement and inspection continue;
+    # publication readiness stays deferred with the nonblocking findings above.
+    sealed_identity = all(
+        identity[field] is not None for field in ("hardware_id", "revision", "owner", "change_summary", "control")
     )
+    if sealed_identity:
+        seal_revision(
+            output,
+            hardware_id=identity["hardware_id"],
+            revision=identity["revision"],
+            owner=identity["owner"],
+            system=identity["control"]["system"],
+            reference=identity["control"]["reference"],
+            summary=identity["change_summary"],
+            parent_revision=identity["parent_revision"],
+        )
+        revision_sha256 = hashlib.sha256((output / REVISION_FILE).read_bytes()).hexdigest()
+    else:
+        revision_sha256 = ""
     from .input import load_package
 
     loaded = load_package(output)
@@ -3899,7 +4011,7 @@ def prepare_native_package(
         package=output,
         handoff_sha256=handoff_sha256,
         prepared_sha256=digest(inventory(output)),
-        revision_sha256=hashlib.sha256((output / REVISION_FILE).read_bytes()).hexdigest(),
+        revision_sha256=revision_sha256,
         hardware_id=identity["hardware_id"],
         revision=identity["revision"],
         source=loaded,
@@ -3926,7 +4038,7 @@ def _robot_document(
     by_name = {body["name"]: body for body in bodies}
     source: dict[str, Any] = {
         "provider": "solidworks",
-        "robot_name": identity["robot_name"],
+        "robot_name": identity.get("robot_name") or identity.get("robot_name_technical") or "robot",
         "assembly": identity["main_assembly"],
         "configuration": identity["delivery_configuration"],
         "bodies": [

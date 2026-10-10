@@ -28,6 +28,7 @@ from description_pipeline.sources.solidworks.discovery import (  # noqa: E402
     _budgets,
     _clusters,
     _component_frames,
+    _identity,
     _mate_rows,
     _unit,
     prepare_native_package,
@@ -1017,13 +1018,138 @@ class DiscoveryTests(unittest.TestCase):
 
     # ----------------------------------------------------------------- blocking
 
-    def test_missing_identity_blocks_the_package(self):
+    def test_missing_identity_defers_to_publication_readiness(self):
         result, _source, output = self._prepare(mutate=lambda payload: payload["identity"].pop("hardware_id"))
-        codes = self._codes(result)
-        self.assertIn("discovery.identity_missing", codes)
-        self.assertFalse((output / "robot.yaml").exists())
+        self.assertTrue(result.passed, result.findings)
+        finding = next(item for item in result.findings if item["code"] == "discovery.identity_missing")
+        self.assertFalse(finding["blocking"])
+        self.assertEqual(finding["detail"]["publication_blocker"], "hardware_id")
+        self.assertEqual(result.revision_sha256, "")
+        self.assertFalse((output / "cad-revision.json").exists())
+        self.assertTrue((output / "robot.yaml").is_file())
         self.assertTrue((output / "discovery/native-discovery.json").is_file())
         self.assertTrue((output / "discovery/findings.json").is_file())
+        payload = json.loads(result.discovery_path.read_text())
+        self.assertIsNone(payload["identity"]["hardware_id"])
+        self.assertIsNone(result.source["hardware_id"])
+
+    def test_each_absent_administrative_field_defers_publication(self):
+        complete = {
+            "identity": {
+                "hardware_id": "wire_test",
+                "revision": "r1",
+                "owner": "owner",
+                "change_summary": "summary",
+                "control": {"system": "handoff", "reference": "ref"},
+                "robot_name": "wire_test",
+            },
+            "properties": {"document": {}},
+        }
+        for field, code, blocker in (
+            ("hardware_id", "discovery.identity_missing", "hardware_id"),
+            ("revision", "discovery.revision_missing", "revision"),
+            ("owner", "discovery.owner_missing", "owner"),
+            ("change_summary", "discovery.summary_missing", "change_summary"),
+            ("control", "discovery.control_missing", "control"),
+        ):
+            with self.subTest(field=field):
+                record = copy.deepcopy(complete)
+                record["identity"].pop(field)
+                findings: list[dict] = []
+                identity = _identity(
+                    record,
+                    DiscoverySettings(),
+                    findings,
+                    configuration="Default",
+                    assembly="robot.SLDASM",
+                    native_files={"robot.SLDASM": "0" * 64},
+                )
+                item = next(finding for finding in findings if finding["code"] == code)
+                self.assertFalse(item["blocking"])
+                self.assertEqual(item["detail"]["publication_blocker"], blocker)
+                self.assertFalse([finding for finding in findings if finding["blocking"]])
+                if field == "control":
+                    self.assertIsNone(identity["control"])
+                else:
+                    self.assertIsNone(identity[field])
+        record = copy.deepcopy(complete)
+        record["identity"].pop("robot_name")
+        findings = []
+        identity = _identity(
+            record,
+            DiscoverySettings(),
+            findings,
+            configuration="Default",
+            assembly="robot.SLDASM",
+            native_files={"robot.SLDASM": "0" * 64},
+        )
+        item = next(finding for finding in findings if finding["code"] == "discovery.robot_name_missing")
+        self.assertFalse(item["blocking"])
+        self.assertEqual(item["detail"], {"technical_name": "wire_test", "authored": False})
+        self.assertIsNone(identity["robot_name"])
+        self.assertEqual(identity["robot_name_technical"], "wire_test")
+        self.assertFalse([finding for finding in findings if finding["blocking"]])
+
+    def test_absent_identity_fields_use_a_technical_robot_name(self):
+        findings: list[dict] = []
+        identity = _identity(
+            {"identity": {}, "properties": {"document": {}}},
+            DiscoverySettings(),
+            findings,
+            configuration="Default",
+            assembly="robot.SLDASM",
+            native_files={"robot.SLDASM": "0" * 64},
+        )
+        self.assertIsNone(identity["robot_name"])
+        self.assertEqual(identity["robot_name_technical"], "robot")
+        item = next(finding for finding in findings if finding["code"] == "discovery.robot_name_missing")
+        self.assertEqual(item["detail"], {"technical_name": "robot", "authored": False})
+        findings = []
+        identity = _identity(
+            {"identity": {"hardware_id": "Wrist_Drive-2"}, "properties": {"document": {}}},
+            DiscoverySettings(),
+            findings,
+            configuration="Default",
+            assembly="robot.SLDASM",
+            native_files={"robot.SLDASM": "0" * 64},
+        )
+        self.assertIsNone(identity["robot_name"])
+        self.assertEqual(identity["robot_name_technical"], "wrist_drive_2")
+
+    def test_malformed_supplied_identity_still_blocks(self):
+        complete = {
+            "identity": {
+                "hardware_id": "wire_test",
+                "revision": "r1",
+                "owner": "owner",
+                "change_summary": "summary",
+                "control": {"system": "handoff", "reference": "ref"},
+                "robot_name": "wire_test",
+            },
+            "properties": {"document": {}},
+        }
+        for field, value, code in (
+            ("hardware_id", "1bad", "discovery.identity_invalid"),
+            ("revision", "bad rev", "discovery.revision_invalid"),
+            ("owner", "bad\x01owner", "discovery.owner_invalid"),
+            ("change_summary", "\x7f", "discovery.summary_invalid"),
+            ("robot_name", "Bad Name", "discovery.robot_name_invalid"),
+            ("control", {"system": "svn", "reference": "ref"}, "discovery.control_invalid"),
+            ("control", {"system": "git", "reference": "branch-main"}, "discovery.control_invalid"),
+        ):
+            with self.subTest(field=field, value=value):
+                record = copy.deepcopy(complete)
+                record["identity"][field] = value
+                findings: list[dict] = []
+                _identity(
+                    record,
+                    DiscoverySettings(),
+                    findings,
+                    configuration="Default",
+                    assembly="robot.SLDASM",
+                    native_files={"robot.SLDASM": "0" * 64},
+                )
+                self.assertIn(code, [finding["code"] for finding in findings if finding["blocking"]])
 
     def test_unknown_mate_type_blocks_instead_of_going_rigid(self):
         result, _source, output = self._prepare(
