@@ -309,7 +309,13 @@ def _tool(root):
     for version in runtime["packages"].values():
         _require(isinstance(version, str), "Invalid dependency versions")
         Version(version)
-    return {"version": tool["version"], "source_sha256": tool["source_sha256"]}
+    from ..orchestration.stage_transfer import verify_transfer
+
+    result = {"version": tool["version"], "source_sha256": tool["source_sha256"]}
+    provenance = verify_transfer(root)
+    if provenance is not None:
+        result["transfer"] = provenance
+    return result
 
 
 def _xml(root, definition, model):
