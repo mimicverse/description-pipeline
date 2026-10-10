@@ -515,10 +515,43 @@ class ClientTests(unittest.TestCase):
             with self.subTest(roots=roots), self.assertRaises(EndpointProtocolError):
                 EndpointConfig(base_url="http://127.0.0.1", token=TOKEN, handoff_roots=roots)
 
+    def test_discovery_settings_are_validated_and_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            records = root / "records"
+            records.mkdir()
+            registry = root / "names.json"
+            registry.write_text("{}", encoding="utf-8")
+            config = EndpointConfig(
+                base_url="http://127.0.0.1",
+                token=TOKEN,
+                discovery={"record_roots": [str(records)], "frozen_names_file": str(registry)},
+            )
+            self.assertEqual(config.discovery["record_roots"], (records,))
+            self.assertEqual(config.discovery["frozen_names_file"], registry)
+            for bad in (
+                {"record_roots": ["relative/root"]},
+                {"record_roots": [str(root / "missing")]},
+                {"frozen_names_file": str(records)},
+                {"record_roots": "records"},
+                {"unknown": []},
+                "records",
+            ):
+                with self.subTest(bad=str(bad)), self.assertRaises(EndpointProtocolError):
+                    EndpointConfig(base_url="http://127.0.0.1", token=TOKEN, discovery=bad)
+            link = root / "linked"
+            link.symlink_to(records, target_is_directory=True)
+            with self.assertRaises(EndpointProtocolError):
+                EndpointConfig(base_url="http://127.0.0.1", token=TOKEN, discovery={"record_roots": [str(link)]})
+
     def test_connection_extra_supplies_handoff_roots(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "handoffs"
             root.mkdir()
+            records = Path(tmp) / "records"
+            records.mkdir()
+            registry = Path(tmp) / "names.json"
+            registry.write_text("{}", encoding="utf-8")
 
             class FakeConnection:
                 host = "127.0.0.1"
@@ -526,7 +559,11 @@ class ClientTests(unittest.TestCase):
                 password = "token"
 
                 def __init__(self) -> None:
-                    self.extra_dejson = {"timeout": 5, "handoff_roots": [str(root)]}
+                    self.extra_dejson = {
+                        "timeout": 5,
+                        "handoff_roots": [str(root)],
+                        "discovery": {"record_roots": [str(records)], "frozen_names_file": str(registry)},
+                    }
 
             class FakeBaseHook:
                 @staticmethod
@@ -543,6 +580,8 @@ class ClientTests(unittest.TestCase):
                 config = config_from_airflow_connection("solidworks_windows")
             self.assertEqual(config.handoff_roots, (root.resolve(),))
             self.assertEqual(config.base_url, "http://127.0.0.1:18765")
+            self.assertEqual(config.discovery["record_roots"], (records,))
+            self.assertEqual(config.discovery["frozen_names_file"], registry)
 
     def test_capture_archive_receipt_is_validated_exactly(self) -> None:
         from description_pipeline.orchestration.airflow_client import capture_archive_metadata

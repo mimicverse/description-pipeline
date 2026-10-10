@@ -296,8 +296,7 @@ class EndpointConfig:
         object.__setattr__(self, "handoff_roots", _handoff_roots(self.handoff_roots))
         object.__setattr__(self, "repositories", _linux_repositories(self.repositories))
         object.__setattr__(self, "store_root", _linux_store_root(self.store_root))
-        if not isinstance(self.discovery, dict):
-            raise EndpointProtocolError("discovery settings must be an object")
+        object.__setattr__(self, "discovery", _linux_discovery(self.discovery))
 
 
 def _handoff_roots(values) -> tuple[Path, ...]:
@@ -340,6 +339,42 @@ def _linux_store_root(value) -> Path | None:
     if not candidate.is_absolute():
         raise EndpointProtocolError("store_root must be an absolute Linux path")
     return candidate
+
+
+def _discovery_path(value, label: str) -> Path:
+    if not isinstance(value, (str, Path)) or not str(value):
+        raise EndpointProtocolError(f"discovery {label} must be an absolute path")
+    candidate = Path(str(value))
+    if not candidate.is_absolute():
+        raise EndpointProtocolError(f"discovery {label} must be an absolute path")
+    if candidate.is_symlink() or candidate.is_junction():
+        raise EndpointProtocolError(f"discovery {label} must not be a link")
+    return candidate
+
+
+def _linux_discovery(values) -> dict:
+    """Validate the Linux derivation settings: controlled-record roots and the registry."""
+    if values in (None, "", {}):
+        return {}
+    if not isinstance(values, dict) or not set(values) <= {"record_roots", "frozen_names_file"}:
+        raise EndpointProtocolError("discovery must carry only record_roots and frozen_names_file")
+    settings: dict = {}
+    roots = values.get("record_roots", ())
+    if not isinstance(roots, (list, tuple)):
+        raise EndpointProtocolError("discovery record_roots must be a list of absolute directories")
+    checked = []
+    for value in roots:
+        candidate = _discovery_path(value, "record root")
+        if not candidate.is_dir():
+            raise EndpointProtocolError(f"discovery record root is not a directory: {candidate}")
+        checked.append(candidate)
+    settings["record_roots"] = tuple(checked)
+    if "frozen_names_file" in values:
+        registry = _discovery_path(values["frozen_names_file"], "frozen-name registry")
+        if not registry.is_file():
+            raise EndpointProtocolError(f"discovery frozen-name registry is not a file: {registry}")
+        settings["frozen_names_file"] = registry
+    return settings
 
 
 def config_from_airflow_connection(conn_id: str, *, timeout: float = 30.0) -> EndpointConfig:

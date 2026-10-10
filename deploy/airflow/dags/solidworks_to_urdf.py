@@ -297,8 +297,8 @@ def _definition_settings(config: EndpointConfig, main_assembly: str):
         not isinstance(key, str) or not isinstance(value, str) for key, value in names.items()
     ):
         raise AirflowFailException("Frozen-name registry must map native identities to interface names")
-    roots = configuration.get("record_roots", [])
-    if not isinstance(roots, list) or any(not isinstance(value, str) for value in roots):
+    roots = configuration.get("record_roots", ())
+    if not isinstance(roots, (list, tuple)):
         raise AirflowFailException("Controlled-record roots must be a list of paths")
     return DiscoverySettings(
         record_roots=tuple(Path(value) for value in roots),
