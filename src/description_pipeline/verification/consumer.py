@@ -34,6 +34,15 @@ def _inputs(root):
 
 def load(root: Path) -> dict:
     """Use the current locked interpreter without inheriting producer Python state."""
+    from ..runtime import RUNTIME_VERSIONS
+
+    installed_version = importlib.metadata.version("mujoco")
+    if installed_version != RUNTIME_VERSIONS["mujoco"]:
+        raise ConsumerError(
+            "Consumer version differs from the pinned verification runtime",
+            actual=installed_version,
+            expected=RUNTIME_VERSIONS["mujoco"],
+        )
     root = Path(root).resolve()
     inputs = _inputs(root)
     document = ET.parse(root / "urdf/robot.urdf").getroot()
@@ -60,7 +69,7 @@ def load(root: Path) -> dict:
         raise ConsumerError("Consumer input hashes differ from delivered bytes")
     if (
         report.get("reader") != "mujoco"
-        or report.get("version") != importlib.metadata.version("mujoco")
+        or report.get("version") != installed_version
         or type(report.get("bodies")) is not int
         or report["bodies"] != len(bodies) + 1
         or type(report.get("joints")) is not int
@@ -73,7 +82,7 @@ def load(root: Path) -> dict:
 
 
 def readiness() -> dict:
-    """Exercise the same loader on a neutral model before starting native work."""
+    """Exercise the Linux verification runtime on a neutral model."""
     with tempfile.TemporaryDirectory(prefix="description-consumer-probe-") as directory:
         root = Path(directory)
         (root / "urdf").mkdir()

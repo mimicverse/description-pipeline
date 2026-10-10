@@ -54,6 +54,15 @@ class RuntimeRoleTests(unittest.TestCase):
         ):
             self.assertFalse(solidworks.doctor()["passed"])
 
+    def test_wrong_consumer_version_blocks_loading_without_doctor(self):
+        with (
+            patch.object(consumer.importlib.metadata, "version", return_value="0.0.0"),
+            patch.object(consumer.subprocess, "run") as process,
+            self.assertRaisesRegex(consumer.ConsumerError, "pinned verification runtime"),
+        ):
+            consumer.load(Path("unused-delivery"))
+        process.assert_not_called()
+
     def test_native_probe_never_opens_cad_and_checks_com_imports(self):
         with (
             patch.object(runtime.sys, "platform", "win32"),
