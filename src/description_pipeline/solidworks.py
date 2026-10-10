@@ -18,7 +18,7 @@ from . import __version__
 from .delivery import BUNDLE_SCHEMA, PIPELINE_ID, subject_inventory
 from .io import PipelineError, acquire_process_lock, digest, file_digest, inventory, read_data, write_json
 
-from .runtime import RUNTIME_PACKAGES
+from .runtime import RUNTIME_VERSIONS, native_readiness, required_packages, runtime_role
 from .stages import STAGE_IDS, stage_view
 
 
@@ -529,40 +529,49 @@ def submit(bundle: Path, repository: Path, *, base=None, message=None):
 
 
 def doctor() -> dict:
-    """Check the runtime; native capture availability is a separate explicit fact."""
-
+    """Check the pinned runtime and readiness required by this host's role."""
+    role = runtime_role()
     results = [{"id": "python", "passed": sys.version_info[:2] == (3, 12), "actual": platform.python_version()}]
-    for name in RUNTIME_PACKAGES:
+    for name in required_packages(role):
+        expected = RUNTIME_VERSIONS[name]
         try:
-            results.append({"id": name, "passed": True, "actual": importlib.metadata.version(name)})
+            actual = importlib.metadata.version(name)
+            results.append({"id": name, "passed": actual == expected, "actual": actual, "expected": expected})
         except importlib.metadata.PackageNotFoundError:
             results.append({"id": name, "passed": False, "message": "Reinstall the pinned release runtime"})
-    from .verification.consumer import readiness
-
-    try:
-        consumer = readiness()
-        results.append({"id": "consumer.urdf", "passed": True, "details": consumer})
-    except Exception as error:
-        results.append(
-            {"id": "consumer.urdf", "passed": False, "message": str(error), "details": getattr(error, "details", {})}
-        )
     native = False
-    native_detail = "Native CAD capture requires Windows with licensed SolidWorks"
-    if sys.platform == "win32":
-        from .sources.solidworks.isolation import registered_executable
-
+    native_detail = "Native CAD capture runs on the Windows worker"
+    if role == "native":
         try:
-            native_detail = registered_executable()
-            native = True
+            detail = native_readiness()
+            native, native_detail = True, detail["solidworks_executable"]
+            results.append({"id": "native.solidworks", "passed": True, "details": detail})
         except Exception as error:
             native_detail = str(error)
-    return {
+            results.append({"id": "native.solidworks", "passed": False, "message": str(error)})
+    else:
+        from .verification.consumer import readiness
+
+        try:
+            results.append({"id": "consumer.urdf", "passed": True, "details": readiness()})
+        except Exception as error:
+            results.append(
+                {
+                    "id": "consumer.urdf", "passed": False,
+                    "message": str(error), "details": getattr(error, "details", {}),
+                }
+            )
+    result = {
         "pipeline_id": PIPELINE_ID,
         "version": __version__,
+        "role": role,
         "passed": all(item["passed"] for item in results),
         "checks": results,
         "native_capture_available": native,
         "native_capture_detail": native_detail,
-        "git_available": shutil.which("git") is not None,
-        "github_cli_available": shutil.which("gh") is not None,
     }
+    if role == "portable":
+        result.update(
+            git_available=shutil.which("git") is not None, github_cli_available=shutil.which("gh") is not None
+        )
+    return result

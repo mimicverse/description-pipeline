@@ -25,7 +25,7 @@ class ToolIdentityTests(unittest.TestCase):
             return SimpleNamespace(metadata={"Name": name}, version="1.0", requires=rows[name])
 
         with (
-            patch.object(runtime, "RUNTIME_PACKAGES", ("reader",)),
+            patch.object(runtime, "required_packages", return_value=("reader",)),
             patch.object(runtime.sys, "platform", "linux"),
             patch.object(runtime.importlib.metadata, "distribution", distribution),
         ):
