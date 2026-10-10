@@ -40,6 +40,9 @@ class SelectionTests(unittest.TestCase):
             "sources/shape.step": self.observed("sources/shape.step", []),
         }
 
+    def selected(self):
+        return {name: self.files[name] for name in self.graph()}
+
     def test_initial_request_is_only_the_selected_assembly(self):
         plan = selection_plan(self.files, self.main, {})
         self.assertEqual(plan["state"], "requesting")
@@ -65,7 +68,7 @@ class SelectionTests(unittest.TestCase):
             {"sources/shape.step": self.files["sources/shape.step"]},
         )
         with self.assertRaises(SelectionError) as caught:
-            seal_selection(self.files, self.main, graph, reader_sha256=self.reader)
+            seal_selection(self.files, self.main, graph, selected_files=self.selected(), reader_sha256=self.reader)
         self.assertEqual(caught.exception.code, "selection_incomplete")
 
     def test_unrelated_observation_is_not_authorized_by_the_upload_index(self):
@@ -98,22 +101,44 @@ class SelectionTests(unittest.TestCase):
     def test_graph_cycles_are_finite_file_dependencies_not_a_kinematic_claim(self):
         graph = self.graph()
         graph["parts/link.SLDPRT"]["references"].append(self.main)
-        manifest = seal_selection(self.files, self.main, graph, reader_sha256=self.reader)
+        manifest = seal_selection(
+            self.files, self.main, graph, selected_files=self.selected(), reader_sha256=self.reader
+        )
         self.assertEqual(set(manifest["files"]), set(graph))
 
     def test_seal_binds_upload_selected_files_and_graph_separately(self):
         graph = self.graph()
-        manifest = seal_selection(self.files, self.main, graph, reader_sha256=self.reader)
+        manifest = seal_selection(
+            self.files, self.main, graph, selected_files=self.selected(), reader_sha256=self.reader
+        )
         self.assertEqual(manifest["upload_sha256"], digest(self.files))
         self.assertEqual(manifest["handoff_sha256"], digest(manifest["files"]))
         self.assertNotEqual(manifest["upload_sha256"], manifest["handoff_sha256"])
         self.assertEqual(set(manifest["excluded_files"]), {"unused.SLDASM", "manual.urdf", "notes.md"})
         self.assertEqual(verify_selection(manifest, self.files, manifest["files"], reader_sha256=self.reader), manifest)
         reordered = dict(reversed(list(self.files.items())))
-        self.assertEqual(seal_selection(reordered, self.main, graph, reader_sha256=self.reader), manifest)
+        self.assertEqual(
+            seal_selection(reordered, self.main, graph, selected_files=self.selected(), reader_sha256=self.reader),
+            manifest,
+        )
+
+    def test_complete_observations_cannot_seal_untransferred_or_extra_files(self):
+        graph = self.graph()
+        self.assertEqual(selection_plan(self.files, self.main, graph)["state"], "complete")
+        stages = (
+            {self.main: self.files[self.main]},
+            {**self.selected(), "notes.md": self.files["notes.md"]},
+            {**self.selected(), "parts/link.SLDPRT": "0" * 64},
+        )
+        for staged in stages:
+            with self.subTest(staged=staged), self.assertRaises(SelectionError) as caught:
+                seal_selection(self.files, self.main, graph, selected_files=staged, reader_sha256=self.reader)
+            self.assertEqual(caught.exception.code, "selection_inventory_changed")
 
     def test_added_missing_or_changed_transferred_bytes_fail(self):
-        manifest = seal_selection(self.files, self.main, self.graph(), reader_sha256=self.reader)
+        manifest = seal_selection(
+            self.files, self.main, self.graph(), selected_files=self.selected(), reader_sha256=self.reader
+        )
         extra = {**manifest["files"], "manual.urdf": self.files["manual.urdf"]}
         missing = {name: checksum for name, checksum in manifest["files"].items() if name != self.main}
         changed = {**manifest["files"], self.main: "0" * 64}
@@ -123,7 +148,9 @@ class SelectionTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "selection_inventory_changed")
 
     def test_forged_scope_reader_digest_or_exclusion_is_rejected(self):
-        manifest = seal_selection(self.files, self.main, self.graph(), reader_sha256=self.reader)
+        manifest = seal_selection(
+            self.files, self.main, self.graph(), selected_files=self.selected(), reader_sha256=self.reader
+        )
         for field, value in (
             ("scope", "active_configuration"),
             ("reader_sha256", "0" * 64),
@@ -153,6 +180,7 @@ class SelectionTests(unittest.TestCase):
             {"x.SLDASM": "not a hash"},
             {"x.SLDASM": "a" * 64, "X.SLDASM": "b" * 64},
             {"X": "a" * 64, "x/child": "b" * 64},
+            {"Parts/a.SLDPRT": "a" * 64, "parts/b.SLDPRT": "b" * 64},
             {"CON.SLDPRT": "a" * 64},
             {"~$x.SLDASM": "a" * 64},
             {"cad//x.SLDASM": "a" * 64},

@@ -456,6 +456,8 @@ def closed_document_dependencies(app, document_path, *, max_documents=4096):
     (the stored file name and the stored location).  The stored fields are
     preserved verbatim; a missing or empty location is refused instead of
     being guessed from the name, because a name is not an authoritative path.
+    The returned ``path`` is a normalized convenience value, not proof that
+    the reference belongs to the admitted source inventory.
 
     No document is opened, no search rules run, no geometry is read.
     """

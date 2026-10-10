@@ -48,6 +48,7 @@ def validate_file_index(files: Mapping[str, str]) -> dict[str, str]:
         raise SelectionError("selection_inventory_invalid", "Selection inventory is empty or exceeds its limit")
     result: dict[str, str] = {}
     aliases: dict[str, str] = {}
+    directories: dict[str, str] = {}
     for name, checksum in files.items():
         name = _path(name)
         if not isinstance(checksum, str) or _SHA.fullmatch(checksum) is None:
@@ -58,6 +59,14 @@ def validate_file_index(files: Mapping[str, str]) -> dict[str, str]:
                 "selection_path_collision", "Selection paths differ only by case", paths=[aliases[folded], name]
             )
         aliases[folded] = name
+        parts = name.split("/")
+        for index in range(1, len(parts)):
+            parent = "/".join(parts[:index])
+            prior = directories.setdefault(parent.casefold(), parent)
+            if prior != parent:
+                raise SelectionError(
+                    "selection_path_collision", "Selection directories differ only by case", paths=[prior, parent]
+                )
         result[name] = checksum
     for folded, name in aliases.items():
         parts = folded.split("/")
@@ -138,9 +147,19 @@ def selection_plan(upload_files: Mapping[str, str], main_assembly: str, observat
 
 
 def seal_selection(
-    upload_files: Mapping[str, str], main_assembly: str, observations: Mapping[str, dict], *, reader_sha256: str
+    upload_files: Mapping[str, str],
+    main_assembly: str,
+    observations: Mapping[str, dict],
+    *,
+    selected_files: Mapping[str, str],
+    reader_sha256: str,
 ) -> dict:
-    """Seal a complete file graph; this does not qualify CAD geometry or motion."""
+    """Seal a complete graph bound to the actual staged file inventory.
+
+    Observations alone do not prove transfer. The caller must inventory the
+    staged bytes and supply that result, independently of the dependency graph.
+    This file selection does not qualify CAD geometry or motion.
+    """
 
     if not isinstance(reader_sha256, str) or _SHA.fullmatch(reader_sha256) is None:
         raise SelectionError("selection_reader_invalid", "Selection requires a pinned native reader identity")
@@ -149,6 +168,8 @@ def seal_selection(
         raise SelectionError(
             "selection_incomplete", "Dependency queries remain outstanding", paths=sorted(plan["requested_files"])
         )
+    if validate_file_index(selected_files) != plan["selected_files"]:
+        raise SelectionError("selection_inventory_changed", "Transferred files differ from the assembly selection")
     files = validate_file_index(upload_files)
     manifest = {
         "schema_version": SELECTION_SCHEMA,
@@ -172,10 +193,12 @@ def verify_selection(
     if not isinstance(manifest, dict):
         raise SelectionError("selection_manifest_invalid", "Selection manifest must be an object")
     expected = seal_selection(
-        upload_files, manifest.get("main_assembly"), manifest.get("observations"), reader_sha256=reader_sha256
+        upload_files,
+        manifest.get("main_assembly"),
+        manifest.get("observations"),
+        selected_files=selected_files,
+        reader_sha256=reader_sha256,
     )
     if manifest != expected:
         raise SelectionError("selection_manifest_changed", "Selection manifest differs from its recorded graph")
-    if validate_file_index(selected_files) != expected["files"]:
-        raise SelectionError("selection_inventory_changed", "Transferred files differ from the assembly selection")
     return expected

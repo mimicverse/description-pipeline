@@ -12,7 +12,7 @@ from description_pipeline.sources.solidworks.native import (  # noqa: E402
 )
 
 BS = chr(92)
-MAIN = BS.join(("C:", "packages", "262ed241", "3.0 总装1008.SLDASM"))
+MAIN = BS.join(("C:", "packages", "fixture", "总装.SLDASM"))
 
 
 class FakeApp:
@@ -39,14 +39,20 @@ class ClosedDocumentDependencyTests(unittest.TestCase):
         )
 
     def test_stored_name_and_location_are_preserved_verbatim(self) -> None:
-        location = BS.join(
-            ("D:", "M2.2(9.17) DengJingjie - 副本", "change11", "HD-1910-C001-20260902.stp")
-        )
-        app = FakeApp(["HD-1910-C001-20260902.stp", location])
+        location = BS.join(("D:", "旧工程 - 副本", "components", "external-shape.stp"))
+        app = FakeApp(["external-shape.stp", location])
         entries = closed_document_dependencies(app, MAIN)
-        self.assertEqual(entries[0]["name"], "HD-1910-C001-20260902.stp")
+        self.assertEqual(entries[0]["name"], "external-shape.stp")
         self.assertEqual(entries[0]["location"], location)
         self.assertEqual(entries[0]["path"], location)
+
+    def test_com_tuple_result_preserves_each_dependency(self) -> None:
+        location = BS.join(("C:", "pkg", "part.SLDPRT"))
+        app = FakeApp(("part.SLDPRT", location))
+        self.assertEqual(
+            closed_document_dependencies(app, MAIN),
+            [{"name": "part.SLDPRT", "location": location, "path": location}],
+        )
 
     def test_the_query_options_are_not_parameters(self) -> None:
         app = FakeApp([])
@@ -60,7 +66,7 @@ class ClosedDocumentDependencyTests(unittest.TestCase):
         entries = closed_document_dependencies(app, MAIN)
         self.assertEqual(
             entries[0]["path"],
-            BS.join(("C:", "packages", "262ed241", "000_femur.SLDPRT")),
+            BS.join(("C:", "packages", "fixture", "000_femur.SLDPRT")),
         )
         self.assertEqual(entries[0]["name"], "000_femur.SLDPRT")
         self.assertEqual(entries[0]["location"], "000_femur.SLDPRT")
