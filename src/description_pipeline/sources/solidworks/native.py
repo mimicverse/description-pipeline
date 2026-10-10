@@ -17,6 +17,7 @@ import shutil
 import struct
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -1258,6 +1259,114 @@ def _solver_observation(component, defining_document, source_root, *, configurat
             lambda: _method(component, "GetConstrainedStatus"),
         ),
     }
+
+
+_ACTIVITY_ACTION = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+_ACTIVITY_OBJECT_LIMIT = 160
+_ACTIVITY_MIN_INTERVAL_SECONDS = 0.25
+
+
+def _activity_object(path_value, source_root=None):
+    """Safe relative object name for activity records, or ``None``.
+
+    Prefers the path relative to the frozen source root; an absolute or temp
+    path falls back to its bare leaf name so the public UI never receives a
+    machine path.  Drive letters, ``..`` segments and ``:`` never pass.
+    """
+
+    if path_value is None:
+        return None
+    text = str(path_value).strip()
+    if not text:
+        return None
+    relative = _relative_document(path_value, source_root) if source_root is not None else None
+    if relative is not None:
+        text = relative
+    else:
+        text = text.replace("\\", "/")
+        if re.match(r"^[A-Za-z]:", text) or text.startswith("//"):
+            text = ntpath.basename(text)
+    parts = [part for part in text.split("/") if part]
+    if not parts or any(part == ".." for part in parts):
+        return None
+    text = "/".join(parts)
+    if ":" in text:
+        return None
+    if len(text) > _ACTIVITY_OBJECT_LIMIT:
+        keep_head = _ACTIVITY_OBJECT_LIMIT // 2
+        keep_tail = _ACTIVITY_OBJECT_LIMIT - keep_head - 1
+        text = text[:keep_head] + "…" + text[-keep_tail:]
+    return text
+
+
+class _ActivityEmitter:
+    """Best-effort bounded activity emission for one ``discover_native`` call.
+
+    Emits only the contract's emitter-side fields — ``phase``, ``action`` and
+    the optional ``params`` / ``current_object`` / ``completed``+``total`` —
+    through an optional callback.  Counts are emitted only as known integer
+    pairs, are never fabricated, and stay monotonic per (phase, action);
+    totals may grow while the walk discovers sub-assembly scope but never
+    shrink below ``completed``.  The collector owns timestamps and sequencing.
+    A missing or failing callback can never affect the capture.
+    """
+
+    def __init__(self, callback=None):
+        self._callback = callback
+        self._last_emitted: dict = {}
+        self._completed: dict = {}
+
+    def emit(
+        self,
+        action: str,
+        *,
+        phase: str = "discover",
+        current_object=None,
+        completed=None,
+        total=None,
+        params=None,
+        force: bool = False,
+    ) -> None:
+        if self._callback is None or not isinstance(action, str) or not _ACTIVITY_ACTION.match(action):
+            return
+        if (completed is None) != (total is None):
+            return
+        if completed is not None:
+            if type(completed) is not int or type(total) is not int or completed < 0 or total < completed:
+                return
+            previous = self._completed.get((phase, action))
+            if previous is not None and completed < previous:
+                return
+            self._completed[(phase, action)] = completed
+        record: dict = {"phase": phase, "action": action}
+        if current_object is not None:
+            record["current_object"] = current_object
+        if params:
+            clean: dict = {}
+            for name, value in params.items():
+                if len(clean) >= 6:
+                    break
+                if not isinstance(name, str):
+                    continue
+                if type(value) in (bool, int, float):
+                    clean[name] = value
+                elif isinstance(value, str) and len(value) <= 120:
+                    clean[name] = value
+            if clean:
+                record["params"] = clean
+        if completed is not None:
+            record["completed"] = completed
+            record["total"] = total
+        if not force:
+            now = time.monotonic()
+            previous_at = self._last_emitted.get((phase, action))
+            if previous_at is not None and now - previous_at < _ACTIVITY_MIN_INTERVAL_SECONDS:
+                return
+            self._last_emitted[(phase, action)] = now
+        try:
+            self._callback(record)
+        except Exception:  # noqa: BLE001 - activity must never fail the capture
+            return
 
 
 class SolidWorksBackend(CadBackend):
@@ -2899,7 +3008,7 @@ class SolidWorksBackend(CadBackend):
             },
         )
 
-    def discover_native(self, frozen_source: Path, settings: dict) -> dict:
+    def discover_native(self, frozen_source: Path, settings: dict, *, on_activity=None) -> dict:
         """Read the raw native record for CAD-only discovery (owned session).
 
         Opens the immutable engineering directory read-only inside this
@@ -2959,6 +3068,7 @@ class SolidWorksBackend(CadBackend):
         """
 
         source_root = Path(frozen_source).resolve()
+        activity = _ActivityEmitter(on_activity)
         selection = settings.get("main_assembly") if isinstance(settings, dict) else None
         if selection is not None and (not isinstance(selection, str) or not selection.strip()):
             raise CadError(
@@ -3009,6 +3119,7 @@ class SolidWorksBackend(CadBackend):
                 # The operator named the delivered assembly: open exactly that frozen
                 # entry (no unrelated candidate scan); every engineering check below
                 # is unchanged.
+                activity.emit("open_document", current_object=_activity_object(selected_path, source_root), force=True)
                 main_entry = self._candidate_entry(selected_path)
                 main_entry["selection_mode"] = "explicit"
             else:
@@ -3021,7 +3132,17 @@ class SolidWorksBackend(CadBackend):
                     raise CadError(
                         "native_discovery_assembly_missing", "no SolidWorks assembly in the engineering directory"
                     )
-                entries = [self._candidate_entry(candidate) for candidate in candidates]
+                entries = []
+                for index, candidate in enumerate(candidates):
+                    activity.emit(
+                        "scan_documents",
+                        current_object=_activity_object(candidate, source_root),
+                        completed=index,
+                        total=len(candidates),
+                        force=True,
+                    )
+                    entries.append(self._candidate_entry(candidate))
+                activity.emit("scan_documents", completed=len(candidates), total=len(candidates), force=True)
                 referenced = set()
                 for entry in entries:
                     doc = entry.get("doc")
@@ -3069,6 +3190,7 @@ class SolidWorksBackend(CadBackend):
                 )
             doc = main_entry["doc"]
             notes: list[str] = []
+            activity.emit("rebuild", current_object=_activity_object(main_path, source_root), force=True)
             try:
                 rebuilt = bool(_member(doc, "ForceRebuild3", False))
             except Exception as error:  # noqa: BLE001
@@ -3087,6 +3209,10 @@ class SolidWorksBackend(CadBackend):
             by_document: dict[str, str] = {}
             masses = []
             mates: list[dict] = []
+            components_total = 0
+            components_done = 0
+            mates_total = 0
+            mates_done = 0
             stack = [
                 (
                     str(main_path),
@@ -3098,14 +3224,23 @@ class SolidWorksBackend(CadBackend):
             ]
             while stack:
                 assembly_path, prefix, referenced_configuration, parent_matrix, ancestor_paths = stack.pop()
+                activity.emit("open_document", current_object=_activity_object(assembly_path, source_root))
                 assembly = self._document_by_path(assembly_path)
+                activity.emit(
+                    "select_configuration",
+                    current_object=_activity_object(assembly_path, source_root),
+                    params={"configuration": str(referenced_configuration or "")},
+                )
                 _select_configuration(assembly, referenced_configuration, prefix or "assembly")
                 _manager, active_config = _active_configuration_view(assembly)
                 root = _component(_member(active_config, "GetRootComponent3", True))
-                for raw in list(_method(root, "GetChildren") or []):
+                root_children = list(_method(root, "GetChildren") or [])
+                components_total += len(root_children)
+                for raw in root_children:
                     component = _component(raw)
                     name = str(_member(component, "Name2") or "")
                     if not name:
+                        components_done += 1
                         continue
                     path_name = f"{prefix}/{name}" if prefix else name
                     if path_name in by_component:
@@ -3114,6 +3249,12 @@ class SolidWorksBackend(CadBackend):
                             "two native occurrences have the same scoped identity",
                             {"component": path_name, "configuration": referenced_configuration},
                         )
+                    activity.emit(
+                        "read_components",
+                        current_object=_activity_object(path_name),
+                        completed=components_done,
+                        total=components_total,
+                    )
                     document_path = _method(component, "GetPathName")
                     relative = _relative_document(document_path, source_root) if _is_text_name(document_path) else None
                     local_transform = []
@@ -3225,8 +3366,17 @@ class SolidWorksBackend(CadBackend):
                                     (*ancestor_paths, document_key),
                                 )
                             )
-                for feature, specific, entity_count in _mate_features(assembly):
+                    components_done += 1
+                mate_list = list(_mate_features(assembly))
+                mates_total += len(mate_list)
+                for feature, specific, entity_count in mate_list:
                     name = str(_member(feature, "Name") or "")
+                    activity.emit(
+                        "read_mates",
+                        current_object=_activity_object(name),
+                        completed=mates_done,
+                        total=mates_total,
+                    )
                     try:
                         type_index = _method(specific, "Type")
                         if type(type_index) is not int:
@@ -3336,11 +3486,15 @@ class SolidWorksBackend(CadBackend):
                             "configuration": referenced_configuration,
                         }
                     )
+                    mates_done += 1
                 # The next assembly selection may invalidate this entire borrowed
                 # tree. Pending assemblies and occurrence records contain paths
                 # and primitives only; release all native traversal handles now.
                 component = raw = root = active_config = part = children = holder = mass_property = None
+                root_children = mate_list = None
                 entity = reference = target = feature = specific = assembly = None
+            activity.emit("read_components", completed=components_done, total=components_total, force=True)
+            activity.emit("read_mates", completed=mates_done, total=mates_total, force=True)
             # Top-level mates can name descendants that are visited later.
             # Resolve the full scoped occurrence; leaf-name matching loses
             # identity when the same part is inserted more than once.
@@ -3396,6 +3550,7 @@ class SolidWorksBackend(CadBackend):
                         entity.get("mate_entity_reference"), scoped_name, scope, entity_frames
                     )
             datums = []
+            activity.emit("read_datums", current_object=_activity_object(main_path, source_root), force=True)
             doc = self._document_by_path(str(main_path))
             _select_configuration(doc, configuration, "assembly")
             for name in _coordinate_system_features(doc):
@@ -3407,6 +3562,7 @@ class SolidWorksBackend(CadBackend):
                     continue
                 if not entry["transform"]:
                     continue
+                activity.emit("read_datums", current_object=_activity_object(entry["name2"]))
                 document = self._document_by_path(source[0])
                 _select_configuration(document, entry["configuration"], entry["name2"])
                 for name in _coordinate_system_features(document):
@@ -3432,16 +3588,30 @@ class SolidWorksBackend(CadBackend):
                 source = by_component.get(entry["name2"])
                 if source is None or not source[1] or entry["suppressed"]:
                     continue
+                activity.emit("read_properties", current_object=_activity_object(entry["name2"]))
                 document = self._document_by_path(source[0])
                 _select_configuration(document, entry["configuration"], entry["name2"])
                 values = _custom_properties(document, entry["configuration"] or None)
                 if values:
                     property_buckets["components"][entry["name2"]] = values
             files = {}
-            for path in (main_path, *[Path(item[0]) for item in by_component.values()]):
+            file_paths = (main_path, *[Path(item[0]) for item in by_component.values()])
+            for index, path in enumerate(file_paths):
                 relative = _relative_document(path, source_root)
+                activity.emit(
+                    "hash_sources",
+                    current_object=_activity_object(path, source_root),
+                    completed=index,
+                    total=len(file_paths),
+                )
                 if relative and relative not in files:
                     files[relative] = _hash(str(Path(source_root) / relative))
+            activity.emit("hash_sources", completed=len(file_paths), total=len(file_paths), force=True)
+            activity.emit(
+                "build_record",
+                force=True,
+                params={"components": len(components), "mates": len(mates), "datums": len(datums)},
+            )
             return {
                 "schema_version": "solidworks-to-urdf.native-discovery/v1",
                 "contract": "native-discovery/v1",
