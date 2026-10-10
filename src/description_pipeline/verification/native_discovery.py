@@ -670,10 +670,41 @@ def _rows_for(mate: dict, frames) -> dict | None:
         rows = [_translation_row(axis, point) for axis in axes] + [_rotation_row(axis) for axis in axes]
         return {"rows": rows, "limits": limits, "axis": None, "point": point}
     if kind == "concentric":
-        if not _axis_entity(first) or not _axis_entity(second):
-            return None
+        # Generic point-on-axis form: one bare recorded point (no direction of its own)
+        # against one axis entity (cylindrical face or circular edge).  The point carries
+        # only its position, so a generic entity parameter is never promoted into a fake
+        # axis, and only the axis entity may define the line.  Solved-state consistency is
+        # required before the two point-on-line rows are emitted.
         left_point, left_axis = _geometry(first, frames)
         right_point, right_axis = _geometry(second, frames)
+        point_candidates = [
+            point
+            for entity, point, _axis in ((first, left_point, left_axis), (second, right_point, right_axis))
+            if _kind(entity) == "point" and point is not None
+        ]
+        axis_candidates = [
+            (point, axis)
+            for entity, point, axis in ((first, left_point, left_axis), (second, right_point, right_axis))
+            if _axis_entity(entity) and point is not None and axis is not None
+        ]
+        if len(point_candidates) == 1 and len(axis_candidates) == 1:
+            point_point = point_candidates[0]
+            axis_point, axis_direction = axis_candidates[0]
+            delta = [point_point[index] - axis_point[index] for index in range(3)]
+            along = _dot(delta, axis_direction)
+            radial = [delta[index] - along * axis_direction[index] for index in range(3)]
+            if math.sqrt(_dot(radial, radial)) > AXIS_OFFSET_TOL_M:
+                return None
+            plane = _plane_basis(axis_direction)
+            if len(plane) != 2:
+                return None
+            # Point-on-line rows live at the recorded point P: [n, P x n] for two
+            # independent directions n orthogonal to the axis.  The point evidences
+            # neither a shaft/joint identity nor a ground binding.
+            rows = [_translation_row(direction, point_point) for direction in plane]
+            return {"rows": rows, "limits": limits, "axis": None, "point": None}
+        if not _axis_entity(first) or not _axis_entity(second):
+            return None
         if (
             left_point is None
             or right_point is None
