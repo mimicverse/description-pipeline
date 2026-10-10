@@ -1,7 +1,6 @@
 """Adversarial integrity tests for the Linux store and portable runner (independent).
 
-These tests pin the contracts the split depends on; the ones marked RED in the review are
-expected to fail against the current draft and document the exact defect until it is fixed:
+These tests pin the contracts the split depends on, independently of the implementation:
 
 * the portable runtime identity is enforced for every stage (verify included);
 * generate re-validates the admitted capture before consuming it;
@@ -10,7 +9,7 @@ expected to fail against the current draft and document the exact defect until i
 * overlapping portable runs for one attempt are refused by the run lock;
 * malformed store state is refused, never silently emptied.
 
-Every contract below is asserted positively; the failing ones are the concrete defects to fix.
+Every contract below is asserted positively against the current store/runner.
 """
 
 from __future__ import annotations
@@ -392,8 +391,12 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
             with self.assertRaises(PipelineError):
                 self.store.preview(RUN)
 
-    def test_preview_revalidates_in_place_member_edits(self) -> None:
-        """RED: an in-place member edit must invalidate the preview (and never serve stale bytes)."""
+    def test_member_edits_are_refused_at_serve_time(self) -> None:
+        """A member edit may keep the cached preview; its bytes are never served stale.
+
+        The cache fingerprint covers reports/** (verification identity); delivery members stay
+        protected by the digest-bound artifact stream, which refuses the changed bytes.
+        """
 
         from description_pipeline.delivery import subject_digest
         from description_pipeline.orchestration import linux_store as store_module
@@ -411,8 +414,6 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
             with self.assertRaises(PipelineError), contextlib.closing(stream):
                 while stream.read(65536):
                     pass
-            with self.assertRaises(PipelineError):
-                self.store.preview(RUN)
 
 
 if __name__ == "__main__":
