@@ -31,6 +31,7 @@ const STAGE_TEXT = {
 // Starter vocabulary from the emit side; unknown codes fall back to a neutral stage phrase and
 // are never turned into invented specifics.
 const ACTION_TEXT = {
+  "discover.session_start": "正在启动 SolidWorks",
   "discover.scan_documents": "扫描工程文件",
   "discover.open_document": "打开文档",
   "discover.select_configuration": "切换配置",

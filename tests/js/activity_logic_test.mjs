@@ -154,6 +154,7 @@ assert.equal(activityPlacement(finalView, { stageId: "discover", stageRunning: f
 // The full emitted vocabulary maps to concrete labels (a slow open/rebuild call must not stay
 // at a blind 进行中); unknown codes keep the neutral fallback.
 const EMITTED_ACTIONS = [
+  ["discover.session_start", "正在启动 SolidWorks"],
   ["discover.scan_documents", "扫描工程文件"],
   ["discover.open_document", "打开文档"],
   ["discover.select_configuration", "切换配置"],
@@ -165,7 +166,7 @@ const EMITTED_ACTIONS = [
   ["discover.hash_sources", "计算文件摘要"],
   ["discover.build_record", "生成发现记录"],
 ];
-assert.equal(EMITTED_ACTIONS.length, 10);
+assert.equal(EMITTED_ACTIONS.length, 11);
 for (const [code, label] of EMITTED_ACTIONS) {
   assert.equal(actionText(code, "discover"), label, code);
 }

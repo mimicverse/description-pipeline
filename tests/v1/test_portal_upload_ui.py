@@ -494,6 +494,8 @@ class ActivityUiContractTests(unittest.TestCase):
             "打开文档",
             "重建模型",
             "discover.open_document",
+            "discover.session_start",
+            "正在启动 SolidWorks",
         ):
             self.assertIn(token, source)
         # No percentage figures in any rendered text (modulo arithmetic outside strings is
