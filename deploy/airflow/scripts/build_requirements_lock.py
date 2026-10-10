@@ -81,7 +81,8 @@ def resolve(
         command += ["-r", extra]
     for constraint in constraint_files:
         command += ["-c", str(constraint)]
-    command.append(wheel)
+    # Linux owns independent consumer verification; resolve its optional runtime too.
+    command.append(wheel + "[verify]")
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
         raise SystemExit(f"pip resolve failed:\n{result.stdout}\n{result.stderr}")

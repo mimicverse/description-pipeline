@@ -2,8 +2,8 @@
 # the socket DSN (psycopg2), and the async driver Airflow 3 uses alongside it (asyncpg).
 #
 # requirements.lock is the full Linux CPython 3.12 closure of these pins plus the built
-# mimicverse_description wheel, so the wheel's declared runtime dependencies (numpy, PyYAML,
-# jsonschema, packaging, mujoco) and mujoco's transitive closure (absl-py, etils, glfw, PyOpenGL,
+# mimicverse_description wheel with its verify extra, so the core runtime dependencies
+# and MuJoCo's transitive closure (absl-py, etils, glfw, PyOpenGL,
 # …) are pinned and hashed too. Resolution is constrained by the vendored Apache constraints
 # (constraints-3.12.txt) so already-tested Airflow-side versions win over newer transitive ranges.
 #
