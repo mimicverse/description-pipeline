@@ -22,7 +22,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import shutil
 import zipfile
 from collections.abc import Iterable, Mapping
 from contextlib import suppress
@@ -60,7 +59,6 @@ __all__ = [
     "RECORD_BUNDLE_SCHEMA",
     "RECORD_MEMBER",
     "RawRecordAdmission",
-    "admit_capture_request",
     "admit_raw_record_bundle",
     "derive_from_raw_bundle",
     "seal_capture_request",
@@ -713,55 +711,6 @@ def _admit_capture(
     )
     payload = {name: members[name] for name in files}
     return manifest, payload
-
-
-def admit_capture_request(
-    archive: Path,
-    staging: Path,
-    *,
-    expected_run_id: str,
-    expected_selection: dict,
-    expected_record: dict,
-    expected_native_tool: dict,
-    expected_prepared_sha256: str,
-    expected_archive_sha256: str | None = None,
-) -> dict:
-    """Validate the capture request and extract its generated members (Windows host).
-
-    Members are written exclusively into a freshly created staging directory and
-    the directory is removed again if any write fails.  ``expected_prepared_sha256``
-    is the caller-requested prepared identity from the authenticated Linux
-    request (recorded as a transport binding, not an independent qualification).
-    Returns the manifest.
-    """
-
-    staging = Path(staging)
-    manifest, payload = _admit_capture(
-        archive,
-        expected_run_id=expected_run_id,
-        expected_selection=expected_selection,
-        expected_record=expected_record,
-        expected_native_tool=expected_native_tool,
-        expected_prepared_sha256=expected_prepared_sha256,
-        expected_archive_sha256=expected_archive_sha256,
-    )
-    if staging.exists():
-        raise PipelineError(f"Capture request staging already exists: {staging}")
-    staging.mkdir(parents=True)
-    try:
-        for name, data in sorted(payload.items()):
-            target = confined(staging, name, exists=False)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with open(target, "xb") as handle:
-                handle.write(data)
-            _require(
-                hashlib.sha256(target.read_bytes()).hexdigest() == manifest["files"][name],
-                f"capture request member changed while staging: {name!r}",
-            )
-    except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
-    return manifest
 
 
 def _build_prepared(destination: Path, manifest: dict, expected_record: Mapping[str, Any]) -> PreparedPackage:

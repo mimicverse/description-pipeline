@@ -212,21 +212,6 @@ class DiscoveryTransferTests(unittest.TestCase):
             self.assertFalse(name.lower().endswith((".sldasm", ".sldprt", ".step", ".stp")))
             self.assertNotIn(name, self.selection["files"])
 
-        staging = self._path("staging")
-        admitted = transfer.admit_capture_request(
-            request_archive,
-            staging,
-            expected_run_id=RUN_ID,
-            expected_selection=self.selection,
-            expected_record=self.payload,
-            expected_native_tool=self.tool,
-            expected_prepared_sha256=prepared.prepared_sha256,
-            expected_archive_sha256=request["artifact"]["sha256"],
-        )
-        self.assertEqual(admitted, request["manifest"])
-        self.assertTrue((staging / "robot.yaml").is_file())
-        self.assertFalse((staging / transfer.MANIFEST_MEMBER).exists())
-
         destination = self._path("windows-prepared")
         for name in SOURCE_FILES:
             target = destination / name
@@ -474,7 +459,7 @@ class DiscoveryTransferTests(unittest.TestCase):
         }
         tampered = self._rewrite_zip(archive, replacements={"robot.yaml": b"changed: true\n"})
         with self.assertRaisesRegex(PipelineError, "differs from its digest"):
-            transfer.admit_capture_request(tampered, self._path("stage"), **good)
+            transfer.stage_capture_request(tampered, shutil.copytree(self.source, self._path("stage")), **good)
         with zipfile.ZipFile(archive) as source:
             items = {info.filename: source.read(info) for info in source.infolist()}
         polluted = {**items, "cad/robot.SLDASM": b"x"}
@@ -486,10 +471,12 @@ class DiscoveryTransferTests(unittest.TestCase):
         polluted_manifest["file_count"] = len(polluted_manifest["files"])
         polluted_manifest["total_bytes"] = sum(len(polluted[name]) for name in polluted_manifest["files"])
         with self.assertRaisesRegex(PipelineError, "unexpected generated member"):
-            transfer.admit_capture_request(self._build_zip(polluted, polluted_manifest), self._path("stage"), **good)
+            transfer.stage_capture_request(
+                self._build_zip(polluted, polluted_manifest), shutil.copytree(self.source, self._path("stage")), **good
+            )
         dropped = self._rewrite_zip(archive, drop=("robot.yaml",))
         with self.assertRaisesRegex(PipelineError, "member set differs from its manifest"):
-            transfer.admit_capture_request(dropped, self._path("stage"), **good)
+            transfer.stage_capture_request(dropped, shutil.copytree(self.source, self._path("stage")), **good)
         without = {name: data for name, data in items.items() if name != "robot.yaml"}
         manifest = dict(sealed["manifest"])
         manifest["files"] = {name: value for name, value in manifest["files"].items() if name != "robot.yaml"}
@@ -497,23 +484,31 @@ class DiscoveryTransferTests(unittest.TestCase):
         manifest["total_bytes"] = sum(len(without[name]) for name in manifest["files"])
         required_missing = self._build_zip(without, manifest)
         with self.assertRaisesRegex(PipelineError, "lacks required generated members"):
-            transfer.admit_capture_request(required_missing, self._path("stage"), **good)
+            transfer.stage_capture_request(required_missing, shutil.copytree(self.source, self._path("stage")), **good)
         other_prepared = self._rewrite_zip(
             archive,
             replacements={transfer.MANIFEST_MEMBER: canonical({**sealed["manifest"], "prepared_sha256": "00" * 32})},
         )
         with self.assertRaisesRegex(PipelineError, "prepared identity"):
-            transfer.admit_capture_request(other_prepared, self._path("stage"), **good)
+            transfer.stage_capture_request(other_prepared, shutil.copytree(self.source, self._path("stage")), **good)
         changed_record = json.loads(json.dumps(self.payload))
         changed_record["identity"]["change_summary"] = "changed"
         with self.assertRaisesRegex(PipelineError, "another raw record"):
-            transfer.admit_capture_request(archive, self._path("stage"), **{**good, "expected_record": changed_record})
+            transfer.stage_capture_request(
+                archive,
+                shutil.copytree(self.source, self._path("stage")),
+                **{**good, "expected_record": changed_record},
+            )
         with self.assertRaisesRegex(PipelineError, "other selection digests"):
-            transfer.admit_capture_request(
-                archive, self._path("stage"), **{**good, "expected_selection": self._selection("12" * 32)}
+            transfer.stage_capture_request(
+                archive,
+                shutil.copytree(self.source, self._path("stage")),
+                **{**good, "expected_selection": self._selection("12" * 32)},
             )
         with self.assertRaisesRegex(PipelineError, "transferred digest"):
-            transfer.admit_capture_request(archive, self._path("stage"), **good, expected_archive_sha256="00" * 32)
+            transfer.stage_capture_request(
+                archive, shutil.copytree(self.source, self._path("stage")), **good, expected_archive_sha256="00" * 32
+            )
 
     def test_capture_request_refuses_a_failed_derivation(self) -> None:
         prepared = self._prepared()
