@@ -1,7 +1,7 @@
 """One engineering-stage contract and its evidence-driven run view.
 
-Airflow transports one serialized native job. These six stages describe the
-engineering work inside that job; reading this view never executes that work.
+Airflow coordinates native acquisition and Linux verification. These six stages
+describe the engineering work; reading this view never executes that work.
 """
 
 from __future__ import annotations
@@ -228,7 +228,7 @@ def require_complete(view):
     if view.get("contract_sha256") != CONTRACT_SHA256 or [s["id"] for s in view.get("stages", [])] != list(STAGE_IDS):
         raise PipelineError("Stage result does not match the installed engineering contract")
     if view.get("execution_scope") != list(STAGE_IDS):
-        raise PipelineError("A complete native workflow requires all six engineering stages")
+        raise PipelineError("A complete workflow requires all six engineering stages")
     for stage, definition in zip(view["stages"], CONTRACT["stages"], strict=True):
         for boundary in ("input_qc", "output_qc"):
             rows = stage.get(boundary) or []

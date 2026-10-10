@@ -61,6 +61,7 @@ class PortalSplitTests(unittest.TestCase):
             json.dumps(
                 {
                     "state": "published",
+                    "passed": True,
                     "url": "https://github.com/owner/repo/pull/1",
                     "commit": "c" * 40,
                     "base": "main",

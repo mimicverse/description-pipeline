@@ -281,19 +281,26 @@ class LinuxStore:
         submission_state = (submission or {}).get("state")
         submission_bound = (
             submission_state in {"published", "updated", "noop"}
+            and (submission or {}).get("passed") is True
             and bool((submission or {}).get("url"))
             and (submission or {}).get("subject_sha256") == subject
         )
         result = {
-            "passed": bool(submission_bound and (quality or {}).get("passed")),
+            "pipeline_id": PIPELINE_ID,
+            "passed": bool(
+                submission_bound and (quality or {}).get("passed") is True
+                and (quality or {}).get("subject_sha256") == subject
+            ),
             "quality": quality or {},
             "subject_sha256": subject,
             "handoff_sha256": meta.get("handoff_sha256"),
         }
-        source = meta.get("source_run_id") or run_id
-        capture = self.capture_dir(str(source))
-        hardware = _capture_value(capture, "input/robot.yaml", "hardware_id")
-        revision = _capture_value(capture, "input/cad-revision.json", "revision")
+        try:
+            capture = self.checkpoint_dir(run_id, "capture")
+        except PipelineError:
+            capture = None
+        hardware = _capture_value(capture, "input/robot.yaml", "hardware_id") if capture else None
+        revision = _capture_value(capture, "input/cad-revision.json", "revision") if capture else None
         if submission is not None:
             result["submission"] = submission
         if (native_job or {}).get("status") == "failed":

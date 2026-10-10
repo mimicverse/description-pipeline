@@ -6,15 +6,16 @@ from unittest import TestCase, mock
 from description_pipeline.io import PipelineError
 from description_pipeline.orchestration import linux_runner
 
-from .test_linux_split import LinuxSplitTests, portable_record
+from . import test_linux_split as split_fixture
+from .test_linux_split import portable_record
 
 CHILD = "2ed90b89-de34-44a8-92e9-bc64e827aa37"
 GRANDCHILD = "4ca44547-8f76-4faa-bef4-63e8556f4a80"
 
 
 class LinuxLineageTests(TestCase):
-    setUp = LinuxSplitTests.setUp
-    admit = LinuxSplitTests.admit
+    setUp = split_fixture.LinuxSplitTests.setUp
+    admit = split_fixture.LinuxSplitTests.admit
 
     def set_parent_checkpoints(self):
         self.admit()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,9 @@ from unittest.mock import patch
 
 from tests.v1.test_airflow_dag import AIRFLOW_AVAILABLE
 from tests.v1.protocol_support import protocol_events
+from description_pipeline.io import write_json
+from description_pipeline.delivery import PIPELINE_ID
+from description_pipeline.orchestration.linux_store import LinuxStore
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -62,6 +66,50 @@ class SplitWorkflowTests(unittest.TestCase):
 
         with self.assertRaises(PipelineError):
             require_complete(stage_view(job))
+
+    def test_confirmation_consumes_bound_linux_results_for_every_publication_outcome(self):
+        module = self.module()
+        run_id = "7c9b44b3-0b9c-5ffe-9f4f-4bbdafb4a865"
+        subject = "a" * 64
+        request = {
+            "run_id": run_id, "package": "control", "handoff_sha256": "b" * 64,
+            "conn_id": "test", "linux_owned": True,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LinuxStore(Path(tmp))
+            store.update_meta(
+                run_id, state="published", subject_sha256=subject,
+                repository_slug="example/robot", repository_base="feature/robot",
+            )
+            capture = store.capture_dir(run_id)
+            write_json(capture / "input/robot.yaml", {"hardware_id": "robot"})
+            write_json(capture / "input/cad-revision.json", {"revision": "r1"})
+            output = store.output_dir(run_id)
+            (output / "input").mkdir(parents=True)
+            write_json(output / "reports/quality.json", {"passed": True, "subject_sha256": subject})
+            store.append_events(run_id, protocol_events(subject=subject))
+            confirm = module.dag.get_task("confirm_job").python_callable
+            with (
+                patch.object(module, "_linux_store", return_value=store),
+                patch.object(module, "_endpoint", side_effect=AssertionError("Linux confirmation must not open CAD")),
+            ):
+                for state in ("published", "updated", "noop"):
+                    with self.subTest(state=state):
+                        write_json(output / "reports/pr.json", {
+                            "state": state, "passed": True, "subject_sha256": subject,
+                            "url": "https://github.com/example/robot/pull/1", "commit": "c" * 40,
+                            "base": "feature/robot", "repository_slug": "example/robot",
+                            "branch": "work/solidworks/robot",
+                        })
+                        result = confirm({"request": request})
+                        self.assertEqual(result["pipeline_id"], PIPELINE_ID)
+                        self.assertEqual(result["submission"]["state"], state)
+                write_json(output / "reports/quality.json", {"passed": True, "subject_sha256": "d" * 64})
+                self.assertFalse(store.merged_job(run_id)["result"]["passed"])
+                from description_pipeline.orchestration.airflow_client import ResultNotPublishable
+
+                with self.assertRaises(ResultNotPublishable):
+                    confirm({"request": request})
 
 
 if __name__ == "__main__":
