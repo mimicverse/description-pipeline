@@ -634,7 +634,6 @@ class ClientTests(unittest.TestCase):
             "name": CAPTURE_ARCHIVE,
             "sha256": "a" * 64,
             "size": 1024,
-            "manifest_name": CAPTURE_MANIFEST,
             "manifest_sha256": "b" * 64,
         }
         job = {"status": "native_complete", "result": {"native_complete": True, "capture_archive": archive}}
@@ -648,7 +647,10 @@ class ClientTests(unittest.TestCase):
             },
             {
                 "status": "native_complete",
-                "result": {"native_complete": True, "capture_archive": {**archive, "manifest_name": "other.json"}},
+                "result": {
+                    "native_complete": True,
+                    "capture_archive": {**archive, "manifest_name": CAPTURE_MANIFEST},
+                },
             },
             {
                 "status": "native_complete",
@@ -716,14 +718,13 @@ class ClientTests(unittest.TestCase):
         import io as io_module
 
         from description_pipeline.orchestration.airflow_client import WindowsEndpoint
-        from description_pipeline.orchestration.stage_transfer import CAPTURE_ARCHIVE, CAPTURE_MANIFEST
+        from description_pipeline.orchestration.stage_transfer import CAPTURE_ARCHIVE
 
         payload = b"PK\x03\x04fixture-capture-archive"
         archive = {
             "name": CAPTURE_ARCHIVE,
             "sha256": hashlib.sha256(payload).hexdigest(),
             "size": len(payload),
-            "manifest_name": CAPTURE_MANIFEST,
             "manifest_sha256": "b" * 64,
         }
 
