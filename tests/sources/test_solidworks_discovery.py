@@ -570,6 +570,34 @@ class DiscoveryTests(unittest.TestCase):
         self.assertFalse(findings)
         self.assertTrue(rows["rows"])
 
+    def test_unmarked_empty_component_is_not_silently_the_assembly_frame(self):
+        mate = {
+            "name": "unmarked_empty",
+            "type": "coincident",
+            "suppressed": False,
+            "error_code": 0,
+            "scope": "",
+            "limits": None,
+            "entities": [
+                {
+                    "component": "base-1",
+                    "feature": "Plane1",
+                    "plane": {"point": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, -1.0]},
+                },
+                {
+                    "component": "",
+                    "feature": "Plane2",
+                    "plane": {"point": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0]},
+                },
+            ],
+        }
+        findings: list[dict] = []
+        frames = _component_frames(record(), findings)
+        rows = _mate_rows(mate, frames, findings, "mate:unmarked_empty")
+        self.assertIsNone(rows)
+        self.assertTrue(any(item["code"] == "discovery.component_transform_missing" for item in findings))
+        self.assertFalse(any(item["code"] == "discovery.mate_assembly_frame_unsupported" for item in findings))
+
     def test_container_datum_requires_solved_rigidity_and_excludes_container_material(self):
         for connected in (True, False):
 

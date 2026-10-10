@@ -297,7 +297,11 @@ class _ConfigurationManager:
     @property
     def ActiveConfiguration(self):
         name = self._doc.active_configuration
-        root = types.SimpleNamespace(GetChildren=lambda: list(self._doc.children_for(name)))
+        root = types.SimpleNamespace(
+            Name2=os.path.splitext(os.path.basename(self._doc._path))[0],
+            GetPathName=lambda: self._doc._path,
+            GetChildren=lambda: list(self._doc.children_for(name)),
+        )
         return types.SimpleNamespace(Name=name, GetRootComponent3=lambda _visible: root)
 
 
@@ -2738,6 +2742,52 @@ class AssemblyFrameMateTests(unittest.TestCase):
                 _read(root, _App({assembly: doc}))
             self.assertEqual(caught.exception.code, "cad_mate_scope_ambiguous")
             self.assertEqual(caught.exception.detail.get("component"), "orphan-1")
+
+    def test_same_document_with_a_different_name_is_not_the_root(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            assembly = _write(root, "robot.SLDASM")
+            imposter = _Component("robot (copy)", assembly)
+            mate = _mate(
+                "imposter_seat",
+                0,
+                [
+                    _MateEntity(component, "Face1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0))),
+                    _MateEntity(imposter, "Face2", _Plane((0.0, 0.0, -1.0), (0.0, 0.0, 0.0))),
+                ],
+            )
+            group = _Feature("MateGroup", "MateGroup", first_sub=mate)
+            doc = _Doc(assembly, first_feature=group, children=[component])
+
+            with self.assertRaises(CadError) as caught:
+                _read(root, _App({assembly: doc}))
+            self.assertEqual(caught.exception.code, "cad_mate_scope_ambiguous")
+            self.assertEqual(caught.exception.detail.get("component"), "robot (copy)")
+
+    def test_explicit_is_root_false_refutes_the_root_reading(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            assembly = _write(root, "robot.SLDASM")
+            not_root = _Component("robot", assembly)
+            not_root.IsRoot = False
+            mate = _mate(
+                "not_root_seat",
+                0,
+                [
+                    _MateEntity(component, "Face1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0))),
+                    _MateEntity(not_root, "Face2", _Plane((0.0, 0.0, -1.0), (0.0, 0.0, 0.0))),
+                ],
+            )
+            group = _Feature("MateGroup", "MateGroup", first_sub=mate)
+            doc = _Doc(assembly, first_feature=group, children=[component])
+
+            with self.assertRaises(CadError) as caught:
+                _read(root, _App({assembly: doc}))
+            self.assertEqual(caught.exception.code, "cad_mate_scope_ambiguous")
 
 
 if __name__ == "__main__":

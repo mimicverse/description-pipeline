@@ -396,7 +396,7 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
         return None
 
     def frame_of(entity: dict):
-        if str(entity.get("component") or "") == "":
+        if str(entity.get("component") or "") == "" and entity.get("assembly_frame") is True:
             # The owning assembly's own frame: a real constraint against the assembly
             # origin (the global frame for the frozen root), not a component identity.
             return _ASSEMBLY_FRAME
