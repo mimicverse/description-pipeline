@@ -42,6 +42,7 @@ from description_pipeline.orchestration.airflow_client import (
     validate_run_id,
     verified_result,
 )
+from description_pipeline.orchestration.stage_transfer import CAPTURE_ARCHIVE
 
 TOKEN = "test-token"
 RUN_ID = "b3f1c2d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
@@ -115,6 +116,7 @@ class MockEndpoint:
         preview_payload: dict | None = None,
         artifact_redirect_to: str | None = None,
         rerun_payload: dict | None = None,
+        native_complete: bool = False,
     ) -> None:
         self.token = token
         self.fail_job = fail_job
@@ -128,6 +130,7 @@ class MockEndpoint:
         self.preview_payload = preview_payload
         self.artifact_redirect_to = artifact_redirect_to
         self.rerun_payload = rerun_payload
+        self.native_complete = native_complete
         self.hits = 0
         self.jobs: dict[str, dict] = {}
         self.resolved_paths: list[str] = []
@@ -275,6 +278,20 @@ class MockEndpoint:
                             },
                         }
                         job["events"] = protocol_events(subject=SHA, failed_stage="publish")
+                    elif job["pokes"] >= 2 and outer.native_complete:
+                        # The split pipeline's native boundary: the capture is sealed and the
+                        # portable half continues on Linux.
+                        job["status"] = "native_complete"
+                        job["result"] = {
+                            "native_complete": True,
+                            "capture_archive": {
+                                "name": CAPTURE_ARCHIVE,
+                                "sha256": "a" * 64,
+                                "size": 1024,
+                                "manifest_sha256": "b" * 64,
+                            },
+                        }
+                        job["events"] = protocol_events(stages=("freeze", "discover", "capture"))
                     elif job["pokes"] >= 2:
                         job["status"] = "passed"
                         result = {
@@ -868,6 +885,18 @@ class ClientTests(unittest.TestCase):
                     expected_slug="example/m3.0",
                     expected_base="feature/m3.0",
                 )
+
+    def test_wait_returns_at_the_native_complete_boundary(self) -> None:
+        from description_pipeline.orchestration.airflow_client import capture_archive_metadata
+
+        with MockEndpoint(native_complete=True) as server:
+            endpoint = self.endpoint(server)
+            endpoint.start_job(run_id=RUN_ID, resolution=native_resolution())
+            job = endpoint.wait(RUN_ID, interval=0.05, timeout=5)
+            self.assertEqual(job["status"], "native_complete")
+            archive = capture_archive_metadata(job)
+            self.assertEqual(archive["name"], CAPTURE_ARCHIVE)
+            self.assertEqual(archive["size"], 1024)
 
     def test_publication_failure_never_hides_or_weakens_the_verified_model(self) -> None:
         # Real shape of a PR-service failure: the overall job and its publication failed while
