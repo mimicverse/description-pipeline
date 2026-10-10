@@ -567,7 +567,8 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
     if outside:
         raise BridgeError(
             "dependency_outside_allowed_roots",
-            "the assembly references files outside source.allowed_roots; widen the roots explicitly",
+            "the assembly references files outside the admitted CAD source roots; "
+            "collect the required references into the controlled assembly delivery",
             {"paths": outside[:20], "count": len(outside)},
             exit_code=3,
         )
