@@ -24,6 +24,10 @@ from .stage_transfer import CAPTURE_MANIFEST, admit_capture
 STORE_SCHEMA = "solidworks-to-urdf.linux-run/v1"
 PORTABLE_STAGES = ("generate", "verify", "publish")
 
+#: Artifact serving spools the verified bytes; memory stays bounded, disk holds the rest.
+_SPOOL_BYTES = 8 * 1024 * 1024
+_READ_CHUNK = 1024 * 1024
+
 
 class LinuxStore:
     """Attempt-scoped, immutable Linux store for the portable engineering stages."""
@@ -153,9 +157,7 @@ class LinuxStore:
             manifest_payload = meta.get("transfer")
             if not isinstance(manifest_payload, dict):
                 if not manifest_path.is_file():
-                    raise PipelineError(
-                        "The admitted capture has no transfer manifest; review this attempt manually"
-                    )
+                    raise PipelineError("The admitted capture has no transfer manifest; review this attempt manually")
                 manifest_payload = read_data(manifest_path)
                 if not isinstance(manifest_payload, dict):
                     raise PipelineError("The admitted capture transfer manifest is not an object")
@@ -332,10 +334,13 @@ class LinuxStore:
         return bound if bound is not None else self.preview(run_id)
 
     def open_artifact(self, run_id: str, name: str, *, sha256: str):
-        """Open one previewed artifact; the returned stream proves the previewed digest.
+        """Open one verified artifact whose exact bytes are proven before any response.
 
-        The caller-supplied digest is checked against the bound preview inventory, never
-        trusted, and the opened bytes are hashed on the same stream that is served.
+        The delivery's last verified preview stays the authority and the caller's digest is
+        checked against that bound inventory, never trusted.  The single opened handle is read
+        and hashed to EOF first and the verified bytes are served from a spool, so an artifact
+        that changed after verification fails before a response starts instead of after a
+        wrong body was already sent with a success status.
         """
         delivery = self.delivery_dir(run_id)
         if delivery is None:
@@ -345,9 +350,27 @@ class LinuxStore:
         if expected is None or expected != sha256:
             raise PipelineError("The requested artifact is not part of the verified preview")
         path = confined(delivery, name)
-        size = path.stat().st_size
-        handle = path.open("rb")
-        return _BoundArtifact(handle, name=name, expected=expected, size=size), size
+        spool = tempfile.SpooledTemporaryFile(  # noqa: SIM115 - the caller closes the returned stream
+            max_size=_SPOOL_BYTES, mode="w+b"
+        )
+        digest = hashlib.sha256()
+        total = 0
+        try:
+            with path.open("rb") as handle:
+                while True:
+                    chunk = handle.read(_READ_CHUNK)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    digest.update(chunk)
+                    spool.write(chunk)
+            if digest.hexdigest() != expected:
+                raise PipelineError("The artifact bytes changed after verification; refusing to serve")
+            spool.seek(0)
+            return spool, total
+        except BaseException:
+            spool.close()
+            raise
 
 
 class _BoundArtifact:

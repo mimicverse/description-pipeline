@@ -194,14 +194,11 @@ class LinuxSplitTests(unittest.TestCase):
                 self.store.open_artifact(self.run_id, "urdf/robot.urdf", sha256="c" * 64)
             # The preview is verified once for immutable checkpoint serving.
             self.assertEqual(calls["bundle"], 1)
-            # An in-place member edit keeps the verified reports untouched; the digest-bound
-            # stream still refuses the changed bytes at EOF.
+            # An in-place member edit keeps the verified reports untouched; opening the
+            # artifact must fail before any stream is returned.
             (verify / "urdf/robot.urdf").write_text("<roboX/>\n", encoding="utf-8")
-            tampered, _tampered_size = self.store.open_artifact(self.run_id, "urdf/robot.urdf", sha256=digest)
-            with tampered:
-                self.assertEqual(tampered.read(), b"<roboX/>\n")
-                with self.assertRaises(PipelineError):
-                    tampered.read()
+            with self.assertRaises(PipelineError):
+                self.store.open_artifact(self.run_id, "urdf/robot.urdf", sha256=digest)
         # A report member change forces re-verification of the checkpoint.
         (verify / "reports/quality.json").write_text('{"passed": true}\n', encoding="utf-8")
         with (
