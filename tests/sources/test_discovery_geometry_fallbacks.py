@@ -293,6 +293,23 @@ class GeometryFallbackTests(unittest.TestCase):
         self.assertEqual(findings, [])
         self.assertEqual(result["rank"], 1)
 
+    def test_stray_flat_line_key_is_never_evidence_beside_a_validated_reference(self) -> None:
+        # A top-level ``line`` key is outside the recorded face-evidence schema; the validated
+        # localized point stays the single reference (point-plane coincident = one row).
+        item = mate(
+            "重合22",
+            "coincident",
+            {
+                "component": "A",
+                "line": {"point": [0.0, 0.0, 0.0], "direction": [1.0, 0.0, 0.0]},
+                **localized("point", point=[0.0, 0.0, 0.0]),
+            },
+            {"component": "B", "plane": {"normal": [0.0, 1.0, 0.0], "point": [0.0, 0.0, 0.0]}},
+        )
+        result, findings, _ = self.rows(item, [component("A"), component("B")])
+        self.assertEqual(findings, [])
+        self.assertEqual(result["rank"], 1)
+
     def test_malformed_or_nonlocal_provenance_blocks_and_cylinders_are_never_fabricated(self) -> None:
         cases = {
             "not-component-local": localized("plane", frame="mate-assembly", normal=[0, 1, 0], point=[0, 0, 0]),

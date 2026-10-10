@@ -491,6 +491,10 @@ def _entity_geometry_view(entity: dict, findings: list[dict], obj: str) -> dict 
     """
 
     view = dict(entity)
+    # A top-level ``line`` key is not part of the recorded face-evidence schema (the reader
+    # never emits one and the independent oracle never treats it as evidence); dropping it
+    # keeps the validated reference single on both sides instead of letting a stray key win.
+    view.pop("line", None)
     flat: dict[str, dict] = {}
     malformed: list[str] = []
     for face_kind in _FLAT_FACE_KINDS:
