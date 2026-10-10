@@ -35,6 +35,7 @@ DAG_RUN_ID = "portal-20261010T000000-abcdef01"
 RUN = native_run_id(DAG_RUN_ID)
 FOREIGN = "9b2f4c55-0c3a-4f2b-9d1e-7a6b5c4d3e2f"
 FOREIGN_HANDOFF = "c" * 64
+LINKED_CHILD = "6d3e5f70-1a2b-4c3d-8e4f-5a6b7c8d9e0f"
 URDF = b'<robot name="probe"><link name="base_link"/></robot>\n'
 FAILING_CHECKS = [
     {
@@ -274,6 +275,48 @@ class DiagnosticPreviewTests(unittest.TestCase):
         with self.assertRaises(PipelineError) as caught:
             self.store.preview(FOREIGN)
         self.assertIn("another run or handoff", str(caught.exception))
+
+    # ------------------------------------------------------- linked attempts
+    def _linked_child(self) -> str:
+        """A linked attempt resuming verification: its transfer belongs to the parent."""
+
+        parent_failed = self._retained_failed_verify()
+        generate = self.store.stage_dir(RUN, "generate")
+        if not generate.is_dir():
+            shutil.copytree(self.store.capture_dir(RUN), generate)
+        child_failed = self.store.stage_dir(LINKED_CHILD, "verify").with_name("verify.failed")
+        shutil.copytree(parent_failed, child_failed)
+        # The immutable native transfer still records the capture owner (RUN); the
+        # embedded receipt and the store receipt must name the linked child.
+        self._restamp(child_failed, run_id=LINKED_CHILD, handoff=HANDOFF, manifest_run_id=RUN)
+        self._foreign_receipt(LINKED_CHILD, child_failed, handoff=HANDOFF)
+        self.store.update_meta(
+            LINKED_CHILD,
+            source_run_id=RUN,
+            resume_from="verify",
+            handoff_sha256=HANDOFF,
+        )
+        return LINKED_CHILD
+
+    def test_a_linked_child_serves_its_diagnostic_with_the_parent_transfer(self) -> None:
+        child = self._linked_child()
+        bundle = self.store.stage_dir(child, "verify").with_name("verify.failed")
+        preview = self.store.preview(child)
+        self.assertIs(preview["verified"], False)
+        self.assertEqual(preview["subject_sha256"], subject_digest(bundle))
+        stream, _size = self.store.open_artifact(child, "urdf/robot.urdf", sha256=preview["files"]["urdf/robot.urdf"])
+        with stream:
+            self.assertEqual(stream.read(), URDF)
+
+    def test_a_linked_child_refuses_foreign_transfer_provenance(self) -> None:
+        child = self._linked_child()
+        bundle = self.store.stage_dir(child, "verify").with_name("verify.failed")
+        # A manifest naming neither the child nor its capture owner breaks the lineage.
+        self._restamp(bundle, run_id=child, handoff=HANDOFF, manifest_run_id=FOREIGN)
+        self._foreign_receipt(child, bundle, handoff=HANDOFF)
+        with self.assertRaises(PipelineError) as caught:
+            self.store.preview(child)
+        self.assertIn("transfer provenance", str(caught.exception))
 
     # ------------------------------------------------------------- store payload
     def test_failed_verify_serves_an_explicitly_unverified_diagnostic(self) -> None:

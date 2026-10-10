@@ -402,11 +402,14 @@ class LinuxStore:
         to prove one identity from several directions before anything is served: the
         failed verify stage, an in-attempt path, a directory still matching its stamped
         inventory, the embedded receipt's run id, handoff and subject equal to this
-        attempt's recorded ones, the transfer provenance (when present) naming the same
-        run and handoff, and the archived input bytes equal to this attempt's admitted
-        capture.  Failure at any step is an integrity error, never a reason to serve
-        something else, so a foreign stamped bundle copied into another attempt cannot
-        be mislabeled as its diagnostic preview.
+        attempt's recorded ones, the transfer provenance (when present) naming the
+        native capture owner and the same handoff, and the archived input bytes equal
+        to that owner's admitted capture.  A linked attempt reuses the parent's
+        immutable transfer and checkpoints, so its own receipts must name the child
+        while the transfer may legitimately name the parent.  Failure at any step is
+        an integrity error, never a reason to serve something else, so a foreign
+        stamped bundle copied into another attempt cannot be mislabeled as its
+        diagnostic preview.
         """
         receipt_path = self.receipt_path(run_id, "verify")
         if not receipt_path.is_file():
@@ -443,20 +446,23 @@ class LinuxStore:
             or embedded.get("subject_sha256") != subject
         ):
             raise PipelineError("The retained diagnostic delivery belongs to another run or handoff")
+        try:
+            capture_owner = self.checkpoint_owner(run_id, "capture")
+            capture = self.capture_dir(capture_owner)
+        except PipelineError as error:
+            raise PipelineError("This attempt has no admitted capture to bind its diagnostic delivery") from error
         manifest_path = candidate / CAPTURE_MANIFEST
         if manifest_path.is_file():
             manifest = read_data(manifest_path)
             if (
                 not isinstance(manifest, dict)
                 or manifest.get("schema_version") != TRANSFER_SCHEMA
-                or manifest.get("run_id") != run_id
+                # A linked attempt inherits the parent's immutable native transfer,
+                # so the provenance names the capture checkpoint owner, not the child.
+                or manifest.get("run_id") != capture_owner
                 or manifest.get("handoff_sha256") != expected_handoff
             ):
                 raise PipelineError("The retained diagnostic transfer provenance belongs to another attempt")
-        try:
-            capture = self.capture_dir(self.checkpoint_owner(run_id, "capture"))
-        except PipelineError as error:
-            raise PipelineError("This attempt has no admitted capture to bind its diagnostic delivery") from error
         if inventory(candidate / "input") != inventory(capture / "input"):
             raise PipelineError("The retained diagnostic delivery does not carry this attempt's archived input")
         report = _read_optional_json(candidate / "reports/quality.json")
