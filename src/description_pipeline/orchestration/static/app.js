@@ -1162,7 +1162,7 @@ function buildActivityCard(view) {
   if (view.objectText) {
     const object = document.createElement("p");
     object.className = "activity-object muted small";
-    object.textContent = `当前对象：${view.objectText}`;
+    object.textContent = view.final ? `相关对象：${view.objectText}` : `当前对象：${view.objectText}`;
     card.append(object);
   }
   const metaParts = view.final

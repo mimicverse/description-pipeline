@@ -475,6 +475,7 @@ class ActivityUiContractTests(unittest.TestCase):
             "activityPlacement(",
             "startActivityTimer()",
             "stopActivityTimer()",
+            "相关对象：",
         ):
             self.assertIn(token, app)
 

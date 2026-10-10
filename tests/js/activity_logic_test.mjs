@@ -135,8 +135,8 @@ const finalView = activityView(
     stage: "capture",
     stage_started_at: null,
     updated_at: new Date(nowMs - 300000).toISOString(),
-    action: null,
-    object: null,
+    action: { code: "discover.read_mates" },
+    object: "headM3.0.SLDASM",
     counts: null,
     recent: [{ at: new Date(nowMs - 300000).toISOString(), code: "discover.read_mates", object: null }],
   },
@@ -145,6 +145,8 @@ const finalView = activityView(
 assert.equal(finalView.visible, true);
 assert.equal(finalView.final, true);
 assert.equal(finalView.stateText, "已结束");
+assert.equal(finalView.actionText, "读取配合关系");
+assert.equal(finalView.objectText, "headM3.0.SLDASM");
 assert.ok(finalView.freshnessText.startsWith("最后活动："), finalView.freshnessText);
 assert.equal(finalView.recent.length, 1);
 assert.equal(activityPlacement(finalView, { stageId: "capture", stageRunning: false, stageFailed: true }), "final");

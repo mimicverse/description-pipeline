@@ -167,7 +167,10 @@ export function activityView(activity, { runState = "", nowMs = Date.now() } = {
     // without any preserved record stay hidden.
     const recent = recentRows(record || {});
     const stamp = record && typeof record.updated_at === "string" ? absoluteStamp(record.updated_at) : "";
-    if (!recent.length && !stamp) {
+    const action = record && record.action && typeof record.action === "object" ? record.action : null;
+    const objectText = record && typeof record.object === "string" ? record.object : "";
+    const hasEvidence = recent.length > 0 || Boolean(stamp) || Boolean(action && action.code) || Boolean(objectText);
+    if (!hasEvidence) {
       return { ...empty, state: "finished", stateText: ACTIVITY_STATE_TEXT.finished };
     }
     return {
@@ -178,6 +181,8 @@ export function activityView(activity, { runState = "", nowMs = Date.now() } = {
       stateText: ACTIVITY_STATE_TEXT.finished,
       stage,
       stageText: stageText(stage),
+      actionText: action && action.code ? actionText(action.code, stage) : "",
+      objectText,
       freshnessText: stamp ? `最后活动：${stamp}` : "",
       recent,
     };
