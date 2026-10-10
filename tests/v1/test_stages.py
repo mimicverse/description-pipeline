@@ -12,12 +12,14 @@ from pathlib import Path
 from description_pipeline.io import PipelineError
 from description_pipeline.stages import (
     CONTRACT,
+    HOST_IDS,
     STAGE_IDS,
     checked,
     compact_view,
     contract_markdown,
     record_check,
     require_complete,
+    stage_host,
     stage_view,
 )
 from description_pipeline.verification.solidworks_urdf import evaluate_bundle, require_qualified_report
@@ -26,6 +28,26 @@ from description_pipeline.verification.solidworks_urdf import evaluate_bundle, r
 class StageTests(unittest.TestCase):
     def stage(self, view, name):
         return next(item for item in view["stages"] if item["id"] == name)
+
+    def test_stage_contract_declares_the_execution_host_per_stage(self):
+        expected = {
+            "freeze": "native",
+            "discover": "native",
+            "capture": "native",
+            "generate": "portable",
+            "verify": "portable",
+            "publish": "portable",
+        }
+        self.assertEqual(HOST_IDS, ("native", "portable"))
+        self.assertEqual({stage["id"]: stage["host"] for stage in CONTRACT["stages"]}, expected)
+        view = stage_view()
+        self.assertEqual({stage["id"]: stage["host"] for stage in view["stages"]}, expected)
+        self.assertEqual(
+            {stage["id"]: stage["host"] for stage in compact_view(view)["stages"]}, expected
+        )
+        self.assertEqual(stage_host("generate"), "portable")
+        with self.assertRaises(PipelineError):
+            stage_host("wait_for_job")
 
     def test_missing_results_and_green_events_cannot_pass_checks(self):
         for job in ({}, {"events": [{"stage": "capture", "state": "completed"}]}):
