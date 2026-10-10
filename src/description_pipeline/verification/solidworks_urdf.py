@@ -8,12 +8,15 @@ can repeat exactly the same verification.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import re
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
 import numpy as np
+import yaml
 
 from ..delivery import PIPELINE_ID, subject_digest
 from ..geometry import stl
@@ -219,9 +222,13 @@ def _input(root, diagnostics=None):
         revision = read_revision(root / "input", hardware_id=definition.get("hardware_id"))
         _require(saved.get("cad_revision") == revision, "Input report has another CAD revision")
     else:
+        from .native_discovery import DISCOVERY_FILE, publication_metadata_state
+
+        payload = read_data(confined(root / "input", DISCOVERY_FILE))
+        authored = publication_metadata_state(payload.get("raw") or {}, str(payload.get("namespace") or "dp"))
         _require(
-            not definition.get("hardware_id"),
-            "Missing generated cad-revision.json for a fully identified delivery",
+            authored["missing"],
+            "Missing generated cad-revision.json for complete authored publication metadata",
         )
         diagnostics.append(
             {
@@ -231,7 +238,7 @@ def _input(root, diagnostics=None):
                     "cad-revision.json is absent while authored publication metadata is incomplete; "
                     "engineering checks bind the archived native evidence instead"
                 ),
-                "detail": {"hardware_id": definition.get("hardware_id")},
+                "detail": {"hardware_id": definition.get("hardware_id"), "missing": list(authored["missing"])},
             }
         )
     files = package_inventory(root / "input")
@@ -326,26 +333,59 @@ def _dependencies(root, definition):
 
 
 def _handoff_native_hashes(input_root: Path) -> set[str]:
-    """Hashes of the frozen handoff bytes from archived native evidence.
+    """Hashes of the frozen handoff bytes, strictly from the proven native inventory.
 
-    The publication seal is optional while authored metadata is incomplete; every
-    captured dependency still has to match the archived native-file and raw-record
-    inventories. A supplied seal stays strictly validated and adds its own binding.
+    Every named native file must still match its recorded bytes in the archived input,
+    and the inventory digest and discovery-record digest must match robot.yaml
+    provenance. The raw record and a supplied publication seal may only confirm a
+    matching subset of that inventory; they never widen the allowed dependency sources.
     """
 
     from .native_discovery import DISCOVERY_FILE, REVISION_FILE
 
+    record_path = input_root / DISCOVERY_FILE
     payload = read_data(confined(input_root, DISCOVERY_FILE))
     native = payload.get("native_files") if isinstance(payload, dict) else None
     _require(isinstance(native, dict) and bool(native), "The archived native file inventory is missing")
-    hashes = {str(checksum) for checksum in native.values()}
+    frozen = {str(name): str(checksum) for name, checksum in native.items()}
+    for relative, checksum in sorted(frozen.items()):
+        path = confined(input_root, relative)
+        _require(path.is_file(), f"A frozen native file is missing from the archived input: {relative}")
+        _require(
+            file_digest(path) == checksum,
+            f"A frozen native file differs from its recorded bytes: {relative}",
+        )
+    robot = yaml.safe_load((input_root / "robot.yaml").read_text(encoding="utf-8"))
+    provenance = robot.get("provenance") if isinstance(robot, dict) else None
+    _require(isinstance(provenance, dict), "Archived robot.yaml carries no provenance")
+    canonical = hashlib.sha256(
+        (json.dumps(frozen, sort_keys=True, ensure_ascii=False, allow_nan=False, indent=2) + "\n").encode()
+    ).hexdigest()
+    _require(
+        canonical == provenance.get("native_inventory_sha256"),
+        "The native inventory digest does not match provenance",
+    )
+    _require(
+        hashlib.sha256(record_path.read_bytes()).hexdigest() == provenance.get("discovery_sha256"),
+        "The archived discovery record does not match provenance",
+    )
     raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
-    hashes.update(str(checksum) for checksum in (raw.get("files") or {}).values())
+    raw_files = {str(name): str(checksum) for name, checksum in (raw.get("files") or {}).items()}
+    _require(
+        raw_files.items() <= frozen.items(),
+        "Raw-recorded documents are not a matching subset of the frozen native inventory: "
+        f"{sorted(set(raw_files) - set(frozen))}",
+    )
     seal = input_root / REVISION_FILE
     _require(not seal.is_symlink(), "The revision manifest cannot be a symlink")
     if seal.is_file():
-        hashes.update(read_revision(input_root)["cad_files"].values())
-    return hashes
+        cad_files = {str(name): str(checksum) for name, checksum in read_revision(input_root)["cad_files"].items()}
+        _require(
+            cad_files.items() <= frozen.items(),
+            "The revision seal is not a matching subset of the frozen native inventory: "
+            f"{sorted(set(cad_files) - set(frozen))}",
+        )
+    return set(frozen.values())
 
 
 def _entities(source, raw, model):

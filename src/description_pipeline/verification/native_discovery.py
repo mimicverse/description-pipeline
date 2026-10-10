@@ -142,6 +142,12 @@ def _authored_identity(raw: dict, namespace: str) -> dict:
     return authored
 
 
+def publication_metadata_state(raw: dict, namespace: str) -> dict:
+    """Authored publication metadata exactly as the verifier reads it (single contract)."""
+
+    return _authored_identity(raw, namespace)
+
+
 def _digest_files(root: Path) -> dict[str, str]:
     files: dict[str, str] = {}
     for path in sorted(root.rglob("*")):
