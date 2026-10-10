@@ -4,16 +4,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
 from unittest import mock
 
+from packaging.utils import canonicalize_name
+
+from description_pipeline import __version__ as PIPELINE_VERSION
 from description_pipeline.build.archive import write_zip
 from description_pipeline.delivery import PIPELINE_ID
-from description_pipeline.io import PipelineError, canonical, file_digest, write_json
+from description_pipeline.io import PipelineError, canonical, digest, file_digest, write_json
 from description_pipeline.orchestration import stage_transfer as transfer
+from description_pipeline.runtime import RUNTIME_VERSIONS, required_packages
 from description_pipeline.sources.snapshot import write_manifest
 from description_pipeline.stages import CONTRACT, CONTRACT_FILE_SHA256, CONTRACT_SHA256, STAGE_IDS, VIEW_SCHEMA
 
@@ -24,9 +29,17 @@ MAIN_ASSEMBLY = "robot.SLDASM"
 
 def native_tool() -> dict:
     return {
-        "name": "solidworks-native-reader",
-        "version": "1.3.1",
-        "runtime": {"role": "native", "python": "3.12.10", "packages": {"numpy": "2.5.3"}},
+        "schema_version": "solidworks-to-urdf.tool/v1",
+        "pipeline_id": PIPELINE_ID,
+        "version": PIPELINE_VERSION,
+        "source_sha256": "f" * 64,
+        "runtime": {
+            "role": "native",
+            "system": "Windows",
+            "python": "3.12.10",
+            "machine": "AMD64",
+            "packages": {canonicalize_name(name): RUNTIME_VERSIONS[name] for name in required_packages("native")},
+        },
     }
 
 
@@ -86,11 +99,23 @@ def capture_root(base: Path, *, run_id: str = RUN_ID, handoff: str = HANDOFF, ma
     (evidence / "source").mkdir(parents=True)
     (evidence / "source/base.SLDPRT").write_bytes(b"PART-BYTES")
     write_json(evidence / "scene.json", {"components": [], "mates": []})
+    (evidence / "evidence").mkdir()
     write_json(
-        evidence / "collection.json",
+        evidence / "evidence/collection.json",
         {
-            "identity": {"provider": "solidworks", "assembly": main, "dependency_digest": "c" * 64},
-            "capture": {"originals_unchanged": True, "source_hashes": {main: {"sha256": "d" * 64}}},
+            "identity": {
+                "provider": "solidworks",
+                "assembly": str(root / "input" / main),
+                "dependency_digest": "c" * 64,
+            },
+            "capture": {
+                "originals_unchanged": {
+                    "files_checked": 2,
+                    "states_recorded": 2,
+                    "state_scope": "initial_source_observation",
+                },
+                "source_hashes": {main.lower(): {"sha256": "d" * 64}},
+            },
         },
     )
     write_manifest(
@@ -205,11 +230,14 @@ class StageTransferTests(unittest.TestCase):
         admitted = admit(self.archive, destination)
         self.assertEqual(admitted, manifest)
         installed = {path.relative_to(destination).as_posix() for path in destination.rglob("*") if path.is_file()}
-        self.assertEqual(installed, set(manifest["files"]))
+        self.assertEqual(installed, set(manifest["files"]) | {transfer.CAPTURE_MANIFEST})
         self.assertEqual(
             file_digest(destination / "reports/native-tool.json"),
             manifest["files"]["reports/native-tool.json"],
         )
+        with zipfile.ZipFile(self.archive) as archive:
+            sealed = archive.read(transfer.CAPTURE_MANIFEST)
+        self.assertEqual((destination / transfer.CAPTURE_MANIFEST).read_bytes(), sealed)
 
     def test_sealing_is_deterministic(self) -> None:
         first = self.base / "first.zip"
@@ -289,17 +317,17 @@ class StageTransferTests(unittest.TestCase):
     def test_self_consistent_evidence_tamper_is_refused(self) -> None:
         seal(self.root, self.archive)
         with zipfile.ZipFile(self.archive) as source:
-            collection = json.loads(source.read("evidence/collection.json"))
+            collection = json.loads(source.read("evidence/evidence/collection.json"))
         collection["capture"]["originals_unchanged"] = False
         payload = canonical(collection)
         with zipfile.ZipFile(self.archive) as source:
             evidence_manifest = json.loads(source.read("evidence/manifest.json"))
-        evidence_manifest["files"]["collection.json"] = hashlib.sha256(payload).hexdigest()
+        evidence_manifest["files"]["evidence/collection.json"] = hashlib.sha256(payload).hexdigest()
         broken = self.base / "evidence.zip"
         repack(
             self.archive,
             broken,
-            {"evidence/collection.json": payload, "evidence/manifest.json": canonical(evidence_manifest)},
+            {"evidence/evidence/collection.json": payload, "evidence/manifest.json": canonical(evidence_manifest)},
         )
         with self.assertRaisesRegex(PipelineError, "CAD bytes were unchanged"):
             admit(broken, self.base / "out-evidence")
@@ -374,7 +402,11 @@ class StageTransferTests(unittest.TestCase):
             ("run", {"expected_run_id": "other-run"}, "another run"),
             ("handoff", {"expected_handoff_sha256": "b" * 64}, "another handoff"),
             ("assembly", {"expected_main_assembly": "other.SLDASM"}, "another main assembly"),
-            ("tool", {"expected_native_tool": {**native_tool(), "version": "9.9.9"}}, "another native tool"),
+            (
+                "tool",
+                {"expected_native_tool": {**native_tool(), "source_sha256": "e" * 64}},
+                "another native tool",
+            ),
         )
         for label, overrides, expected in cases:
             with self.subTest(case=label), self.assertRaisesRegex(PipelineError, expected):
@@ -420,6 +452,223 @@ class StageTransferTests(unittest.TestCase):
     def test_admission_refuses_foreign_archive_layout(self) -> None:
         with self.assertRaisesRegex(PipelineError, "missing"):
             admit(self.base / "absent.zip", self.base / "out-absent")
+
+    def test_live_receipts_are_ignored_at_seal_and_never_transferred(self) -> None:
+        write_json(self.root / "reports/stages.json", stage_view())
+        write_json(self.root / "reports/run.json", {"run_id": RUN_ID})
+        manifest = seal(self.root, self.archive)
+        self.assertNotIn("reports/stages.json", manifest["files"])
+        self.assertNotIn("reports/run.json", manifest["files"])
+        self.assertIn("reports/native-stages.json", manifest["files"])
+
+        broken = self.base / "live.zip"
+        repack(self.archive, broken, {"reports/run.json": b"{}"})
+        with self.assertRaisesRegex(PipelineError, "outside the capture payload"):
+            admit(broken, self.base / "out-live")
+
+    def test_streaming_large_member_roundtrips(self) -> None:
+        payload = b"x" * (4 * 1024 * 1024)
+        (self.root / "input/big.bin").write_bytes(payload)
+        report = json.loads((self.root / "reports/input.json").read_text(encoding="utf-8"))
+        report["package_files"]["big.bin"] = hashlib.sha256(payload).hexdigest()
+        write_json(self.root / "reports/input.json", report)
+
+        manifest = seal(self.root, self.archive)
+        self.assertEqual(manifest["files"]["input/big.bin"], hashlib.sha256(payload).hexdigest())
+        destination = self.base / "out-big"
+        admit(self.archive, destination)
+        self.assertEqual(file_digest(destination / "input/big.bin"), hashlib.sha256(payload).hexdigest())
+
+    def test_stage_receipts_must_match_the_contract_checks_exactly(self) -> None:
+        seal(self.root, self.archive)
+        view = stage_view()
+        capture = next(stage for stage in view["stages"] if stage["id"] == "capture")
+        capture["input_qc"][0] = {"id": "input.arbitrary", "state": "passed", "details": {}}
+        broken = self.base / "wrong-checks.zip"
+        repack(self.archive, broken, {"reports/native-stages.json": canonical(view)})
+        with self.assertRaisesRegex(PipelineError, "differ from the release contract"):
+            admit(broken, self.base / "out-wrong-checks")
+
+    def test_native_tool_record_must_pin_its_release_and_runtime(self) -> None:
+        cases = (
+            ("schema", {"schema_version": "other/v1"}, "unknown schema"),
+            ("release", {"version": "9.9.9"}, "another release"),
+            ("system", {"runtime": {**native_tool()["runtime"], "system": "Linux"}}, "Windows host"),
+            ("python", {"runtime": {**native_tool()["runtime"], "python": "3.11.9"}}, "Python 3.12"),
+            (
+                "pin",
+                {"runtime": {**native_tool()["runtime"], "packages": {"numpy": "0.0.1"}}},
+                "pin numpy",
+            ),
+            (
+                "mujoco",
+                {
+                    "runtime": {
+                        **native_tool()["runtime"],
+                        "packages": {**native_tool()["runtime"]["packages"], "mujoco": "3.13.0"},
+                    }
+                },
+                "MuJoCo",
+            ),
+        )
+        for label, overrides, expected in cases:
+            with self.subTest(case=label):
+                root = capture_root(self.base / label)
+                tool = {**native_tool(), **overrides}
+                write_json(root / "reports/native-tool.json", tool)
+                with self.assertRaisesRegex(PipelineError, expected):
+                    seal(root, self.base / f"tool-{label}.zip", native_tool=tool)
+
+    def test_neutral_freeze_capture_roundtrip(self) -> None:
+        """The evidence identity is validated against a real freeze snapshot, not a hand shape."""
+
+        from tests.sources import support
+
+        from description_pipeline.sources.solidworks.freeze import freeze
+
+        work = self.base / "freeze"
+        try:
+            assembly = support.make_cad_tree(work / "cad")
+            backend = support.FixtureCadBackend(
+                assembly,
+                [
+                    {
+                        "name": "base-1",
+                        "transform": support.placement((0.0, 0.0, 0.0)),
+                        "mass": support.mass_payload(1.0, (0.0, 0.0, 0.0)),
+                    },
+                    {
+                        "name": "arm-1",
+                        "transform": support.placement((0.0, 0.0, 0.2)),
+                        "mass": support.mass_payload(0.5, (0.0, 0.0, 0.05)),
+                    },
+                ],
+                dependencies=[work / "cad/base.SLDPRT", work / "cad/arm.SLDPRT"],
+            )
+            config = {
+                "provider": "solidworks",
+                "assembly": str(assembly),
+                "configuration": "Default",
+                "allowed_roots": [str(work / "cad")],
+                "geometry": {"enabled": True, "format": "stl_binary"},
+                "coordinate_systems": ["base_datum", "arm_datum", "imu_datum"],
+                "bodies": [
+                    {
+                        "id": "base",
+                        "name": "base_link",
+                        "components": ["base-1"],
+                        "frame": {"coordinate_system": "base_datum"},
+                    },
+                    {
+                        "id": "arm",
+                        "name": "arm_link",
+                        "components": ["arm-1"],
+                        "frame": {"coordinate_system": "arm_datum"},
+                    },
+                ],
+                "joints": [
+                    {
+                        "id": "hinge",
+                        "name": "hinge_joint",
+                        "type": "revolute",
+                        "parent": "base_link",
+                        "child": "arm_link",
+                        "axis": [0.0, 0.0, 1.0],
+                        "limits": {"lower": -1.0, "upper": 1.0, "effort": 2.0, "velocity": 3.0},
+                    }
+                ],
+                "frames": [{"id": "imu", "parent": "base_link", "coordinate_system": "imu_datum"}],
+            }
+            snapshot = work / "snapshot"
+            freeze(config, snapshot, backend=backend, worker_version="test-worker")
+
+            capture = self.base / "real-capture"
+            (capture / "input").mkdir(parents=True)
+            write_json(capture / "input/robot.yaml", {"hardware_id": "robot"})
+            shutil.copyfile(assembly, capture / "input" / assembly.name)
+            shutil.copytree(snapshot, capture / "evidence")
+            package_files = {
+                "robot.yaml": file_digest(capture / "input/robot.yaml"),
+                assembly.name: file_digest(capture / "input" / assembly.name),
+            }
+            write_json(
+                capture / "reports/input.json",
+                {
+                    "passed": True,
+                    "input_receipt": {
+                        "inventory": [{"path": name, "sha256": sha} for name, sha in sorted(package_files.items())]
+                    },
+                    "cad_revision": {"revision": "r1"},
+                    "package_files": package_files,
+                },
+            )
+            write_json(capture / "reports/native-tool.json", native_tool())
+            write_json(capture / "reports/native-stages.json", stage_view())
+
+            archive = self.base / "real.zip"
+            manifest = seal(capture, archive, main_assembly=assembly.name)
+            self.assertIn("evidence/evidence/collection.json", manifest["files"])
+            destination = self.base / "real-admitted"
+            admit(archive, destination, expected_main_assembly=assembly.name)
+            self.assertTrue((destination / "evidence/manifest.json").is_file())
+            self.assertTrue((destination / transfer.CAPTURE_MANIFEST).is_file())
+        finally:
+            support.cleanup(work)
+
+    def test_publisher_copies_the_native_provenance_files(self) -> None:
+        from description_pipeline.repository.urdf_pr import _copy_governed
+
+        bundle = self.base / "publish-bundle"
+        for name in ("input", "evidence", "model", "urdf", "meshes"):
+            (bundle / name).mkdir(parents=True)
+        (bundle / "README.md").write_text("delivery\n", encoding="utf-8")
+        write_json(bundle / "reports/input.json", {"passed": True})
+        write_json(bundle / "reports/tool.json", {"role": "portable"})
+        write_json(bundle / "reports/quality.json", {"passed": True})
+        write_json(bundle / "reports/native-tool.json", native_tool())
+        write_json(bundle / "reports/native-stages.json", stage_view())
+        write_json(bundle / "transfer-manifest.json", {"schema_version": transfer.TRANSFER_SCHEMA})
+
+        worktree = self.base / "publish-worktree"
+        _copy_governed(bundle, worktree)
+        self.assertTrue((worktree / "reports/native-tool.json").is_file())
+        self.assertTrue((worktree / "reports/native-stages.json").is_file())
+        self.assertTrue((worktree / transfer.CAPTURE_MANIFEST).is_file())
+
+        neutral = self.base / "neutral-bundle"
+        for name in ("input", "evidence", "model", "urdf", "meshes"):
+            (neutral / name).mkdir(parents=True)
+        (neutral / "README.md").write_text("delivery\n", encoding="utf-8")
+        write_json(neutral / "reports/input.json", {"passed": True})
+        write_json(neutral / "reports/tool.json", {"role": "portable"})
+        neutral_worktree = self.base / "neutral-worktree"
+        _copy_governed(neutral, neutral_worktree)
+        self.assertFalse((neutral_worktree / "reports/native-tool.json").exists())
+        self.assertFalse((neutral_worktree / transfer.CAPTURE_MANIFEST).exists())
+
+    def test_subject_includes_transfer_provenance_only_as_a_complete_triplet(self) -> None:
+        from description_pipeline.delivery import subject_digest, subject_inventory
+
+        bundle = self.base / "subject-bundle"
+        for name in ("input", "evidence", "model", "urdf", "meshes"):
+            (bundle / name).mkdir(parents=True)
+        (bundle / "README.md").write_text("delivery\n", encoding="utf-8")
+        write_json(bundle / "reports/input.json", {"passed": True})
+        write_json(bundle / "reports/tool.json", {"role": "portable"})
+
+        neutral = subject_inventory(bundle)  # no transfer files: neutral fixtures stay valid
+        self.assertNotIn(transfer.CAPTURE_MANIFEST, neutral)
+
+        write_json(bundle / "reports/native-tool.json", native_tool())
+        with self.assertRaisesRegex(PipelineError, "provenance is incomplete"):
+            subject_inventory(bundle)
+
+        write_json(bundle / "reports/native-stages.json", stage_view())
+        write_json(bundle / transfer.CAPTURE_MANIFEST, {"schema_version": transfer.TRANSFER_SCHEMA})
+        complete = subject_inventory(bundle)
+        for name in ("reports/native-tool.json", "reports/native-stages.json", transfer.CAPTURE_MANIFEST):
+            self.assertIn(name, complete)
+        self.assertNotEqual(subject_digest(bundle), digest(neutral))
 
 
 if __name__ == "__main__":
