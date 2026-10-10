@@ -182,6 +182,42 @@ def native_record() -> dict:
     }
 
 
+def frame_ground_mates(component: str = "base-1") -> list[dict]:
+    """Three solved mates that rigidly ground ``component`` in the top assembly frame.
+
+    The aggregate is rank 6 (concentric 4 rows + coincident 3 + parallel 2 = 9 rows),
+    the same structure the M3 torso exhibits, expressed in the assembly frame that the
+    fixture's identity transforms already use.
+    """
+
+    def entity(component_name: str, feature: str, geometry: dict) -> dict:
+        item = {"component": component_name, "feature": feature}
+        if component_name == "":
+            item["assembly_frame"] = True
+        item.update(copy.deepcopy(geometry))
+        return item
+
+    def mate(name: str, kind: str, geometry: dict) -> dict:
+        return {
+            "name": name,
+            "type": kind,
+            "suppressed": False,
+            "error_code": 0,
+            "scope": "",
+            "limits": None,
+            "entities": [entity(component, "FaceA", geometry), entity("", "FaceB", geometry)],
+        }
+
+    cylinder = {"cylinder": {"point": [0.0, -0.088001, 0.0], "direction": [0.0, 1.0, 0.0], "radius": 0.006}}
+    plane = {"plane": {"point": [-0.027, 0.0, 0.03675756117070245], "normal": [0.0, 1.0, 0.0]}}
+    parallel = {"plane": {"point": [0.0, -0.034, -0.017], "normal": [0.0, 0.0, -1.0]}}
+    return [
+        mate("base_ground__coaxial", "concentric", cylinder),
+        mate("base_ground__locate", "coincident", plane),
+        mate("base_ground__align", "parallel", parallel),
+    ]
+
+
 class _ReplayBackend:
     def __init__(self, payload: dict) -> None:
         self.payload = payload
@@ -789,6 +825,175 @@ class OracleSemanticsTests(unittest.TestCase):
             ),
             errors,
         )
+
+    # ------------------------------------------------------- frame attachment
+
+    def test_full_rank_frame_attachment_is_verified_without_inventing_grounding(self) -> None:
+        """A rank-6 rigid attachment to the top frame is accepted; no joint or mass appears."""
+
+        def mutate(raw, payload):
+            raw["mates"].extend(frame_ground_mates())
+
+        package = self.baseline()
+        self._native(package, mutate)
+        passed, errors, checks = self.check(package)
+        self.assertTrue(passed, errors)
+        self.assertTrue(checks["discovery.frame_attachment"]["passed"], checks["discovery.frame_attachment"])
+        self.assertEqual(checks["discovery.frame_attachment"]["details"]["rank"], 6)
+        self.assertTrue(checks["discovery.bodies"]["passed"], checks["discovery.bodies"])
+        # The rigid attachment invents no world joint and no extra movement.
+        self.assertEqual(checks["discovery.joints"]["details"]["joints"], 1)
+        self.assertTrue(checks["discovery.masses"]["passed"], checks["discovery.masses"])
+
+    def test_top_owned_datum_binds_only_the_proven_frame_cluster(self) -> None:
+        """The ownerless top-assembly datum channel opens exactly for the proven attachment."""
+
+        def move_frame_to_assembly(raw, payload):
+            for datum in raw["datums"]:
+                if datum["name"] == "CS_base_link":
+                    datum["owner"] = ""
+
+        # Control: without a proven frame attachment the channel stays closed.
+        control = self.baseline()
+        self._native(control, move_frame_to_assembly)
+        passed, errors, _checks = self.check(control)
+        self.assertFalse(passed, errors)
+        self.assertTrue(
+            any(
+                error["code"] == "discovery.bodies" and "no datum owned uniquely by that body" in error["message"]
+                for error in errors
+            ),
+            errors,
+        )
+
+        def ground_and_move(raw, payload):
+            move_frame_to_assembly(raw, payload)
+            raw["mates"].extend(frame_ground_mates())
+
+        package = self.baseline()
+        self._native(package, ground_and_move)
+        passed, errors, checks = self.check(package)
+        self.assertTrue(passed, errors)
+        self.assertTrue(checks["discovery.frame_attachment"]["passed"], checks["discovery.frame_attachment"])
+        self.assertTrue(checks["discovery.bodies"]["passed"], checks["discovery.bodies"])
+
+    def test_incomplete_frame_attachment_blocks(self) -> None:
+        def mutate(raw, payload):
+            raw["mates"].append(frame_ground_mates()[0])
+
+        package = self.baseline()
+        self._native(package, mutate)
+        passed, errors, checks = self.check(package)
+        self.assertFalse(passed, errors)
+        self.assertFalse(checks["discovery.frame_attachment"]["passed"], checks["discovery.frame_attachment"])
+        self.assertTrue(
+            any(error["code"] == "discovery.frame_attachment" and "full rank" in error["message"] for error in errors),
+            errors,
+        )
+
+    def test_two_frame_attached_clusters_block(self) -> None:
+        def mutate(raw, payload):
+            raw["mates"].extend(frame_ground_mates("base-1"))
+            raw["mates"].extend(frame_ground_mates("arm-1"))
+
+        package = self.baseline()
+        self._native(package, mutate)
+        passed, errors, _checks = self.check(package)
+        self.assertFalse(passed, errors)
+        self.assertTrue(
+            any(
+                error["code"] == "discovery.frame_attachment" and "exactly one rigid cluster" in error["message"]
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_nested_frame_attachment_blocks(self) -> None:
+        def mutate(raw, payload):
+            raw["components"].append(self._container())
+            child = copy.deepcopy(raw["components"][1])
+            child.update({"name2": "sub-1/arm-2", "instance_id": "sub-1/arm-2"})
+            raw["components"].append(child)
+            raw["mates"].append(
+                {
+                    "name": "nested_ground__coaxial",
+                    "type": "concentric",
+                    "suppressed": False,
+                    "error_code": 0,
+                    "scope": "sub-1",
+                    "limits": None,
+                    "entities": [
+                        {
+                            "component": "sub-1/arm-2",
+                            "feature": "Cyl1",
+                            "cylinder": {
+                                "point": [0.0, 0.0, 0.1],
+                                "direction": [0.0, 0.0, 1.0],
+                                "radius": 0.006,
+                            },
+                        },
+                        {
+                            "component": "sub-1",
+                            "assembly_frame": True,
+                            "feature": "Cyl2",
+                            "cylinder": {
+                                "point": [0.0, 0.0, 0.1],
+                                "direction": [0.0, 0.0, 1.0],
+                                "radius": 0.006,
+                            },
+                        },
+                    ],
+                }
+            )
+
+        package = self.baseline()
+        self._native(package, mutate)
+        passed, errors, _checks = self.check(package)
+        self.assertFalse(passed, errors)
+        self.assertTrue(
+            any(
+                error["code"] == "discovery.frame_attachment"
+                and "outside the frozen top assembly" in error["message"]
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_assembly_frame_identity_requires_the_explicit_marker(self) -> None:
+        from description_pipeline.verification.native_discovery import _frame_attachment, _frames, _rows_for
+
+        raw = native_record()
+        frames = _frames(raw)
+        cylinder = {"point": [0.0, 0.0, 0.1], "direction": [0.0, 0.0, 1.0], "radius": 0.006}
+        base = {"component": "base-1", "feature": "Cyl1", "cylinder": copy.deepcopy(cylinder)}
+        marked = {"component": "", "assembly_frame": True, "feature": "Cyl2", "cylinder": copy.deepcopy(cylinder)}
+        unmarked = {"component": "", "feature": "Cyl2", "cylinder": copy.deepcopy(cylinder)}
+        mate = {
+            "name": "probe__coaxial",
+            "type": "concentric",
+            "suppressed": False,
+            "error_code": 0,
+            "scope": "",
+            "limits": None,
+            "entities": [copy.deepcopy(base), marked],
+        }
+
+        self.assertIsNotNone(_rows_for(mate, frames))
+        summary = _frame_attachment({**raw, "mates": [mate]})
+        self.assertEqual(summary["mates"], 1)
+        self.assertEqual(summary["rank"], 4)
+        self.assertTrue(any("full rank" in item["message"] for item in summary["problems"]))
+
+        unmarked_mate = {**mate, "entities": [copy.deepcopy(base), unmarked]}
+        self.assertIsNone(_rows_for(unmarked_mate, frames))
+        self.assertEqual(_frame_attachment({**raw, "mates": [unmarked_mate]})["mates"], 0)
+
+    def test_datum_owner_allowance_is_bound_to_the_proven_cluster(self) -> None:
+        from description_pipeline.verification.native_discovery import _datum_owners
+
+        self.assertEqual(_datum_owners(frozenset({"base-1"}), frozenset({"base-1"})), {"base-1", ""})
+        self.assertEqual(_datum_owners(frozenset({"arm-1"}), frozenset({"base-1"})), {"arm-1"})
+        self.assertEqual(_datum_owners(frozenset(), frozenset()), set())
 
 
 if __name__ == "__main__":
