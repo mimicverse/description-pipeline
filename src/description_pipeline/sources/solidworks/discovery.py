@@ -103,8 +103,8 @@ JCS_PREFIX = "JCS_"
 _TOL = 1e-6
 
 #: Mate types whose constraint rows this module can reconstruct from recorded
-#: entity geometry.  Everything else blocks with an object finding; a mate type
-#: this table does not support is never turned into a rigid connection.
+#: entity geometry. Unknown types never establish rigid membership; declaration
+#: mode retains their rejection as a diagnostic without vetoing the declared tree.
 SUPPORTED_MATES = (
     "coincident",
     "concentric",
@@ -678,9 +678,8 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
 
     Entity geometry is recorded in its component frame and transformed here
     with that component's occurrence transform, so translation and rotation
-    are coupled through the real entity points.  ``None`` means the mate is
-    outside the supported scope and is blocked, never guessed: an unknown mate
-    must not become a rigid connection.
+    are coupled through the real entity points. ``None`` means the mate supplies
+    no usable rows: an unknown mate must not become a rigid connection.
     """
 
     kind = str(mate.get("type") or "").strip().lower()
@@ -2090,8 +2089,10 @@ def _exporter_memberships(record: dict, declaration: dict, findings: list[dict])
                     _finding(
                         "discovery.exporter_rigidity_conflict",
                         "assembly",
-                        "proven native rigidity connects separately declared moving links",
+                        "saved-pose native rigidity connects several declared links; their declared memberships "
+                        "remain separate and this group cannot assign unselected occurrences",
                         {"links": sorted(owners), "components": sorted(members)},
+                        blocking=False,
                     )
                 )
             continue
@@ -2252,7 +2253,11 @@ def _body_datum(record: dict, body: dict) -> dict | None:
 
 
 def _exporter_native_pairs(record: dict, findings: list[dict]) -> dict[tuple[str, str], dict]:
-    """Native constraints audit declarations; they do not have to discover them."""
+    """Retain usable saved-pose constraints without vetoing the declared tree.
+
+    Incomplete mate evidence is diagnostic in declaration mode. It contributes
+    no constraint rows and leaves its pair unresolved for membership completion.
+    """
 
     frames = _component_frames(record, findings)
     pairs: dict[tuple[str, str], dict] = {}
@@ -2262,28 +2267,36 @@ def _exporter_native_pairs(record: dict, findings: list[dict]) -> dict[tuple[str
         name = str(mate.get("name") or index)
         obj = f"mate:{name}"
         entities = _mate_entities(mate)
+        endpoints = tuple(sorted(str(entity.get("component")) for entity in entities))
+        detail = {
+            "mate": name,
+            "scope": mate.get("scope"),
+            "mate_type": mate.get("type"),
+            "components": list(endpoints),
+        }
         if len(entities) != 2 or len(mate.get("entities") or []) != 2:
             findings.append(
                 _finding(
                     "discovery.mate_entities_unsupported",
                     obj,
                     "native constraint cannot be checked because it does not have exactly two raw endpoints",
+                    detail,
                     blocking=False,
                 )
             )
             continue
-        endpoints = tuple(sorted(str(entity.get("component")) for entity in entities))
         if any(endpoint not in frames and endpoint != "" for endpoint in endpoints):
             findings.append(
                 _finding(
                     "discovery.mate_component_missing",
                     obj,
                     "native constraint refers to an unknown occurrence",
-                    {"components": endpoints},
+                    detail,
+                    blocking=False,
                 )
             )
             continue
-        group = pairs.setdefault(endpoints, {"rows": [], "mates": [], "unresolved": False, "limits": []})
+        group = pairs.setdefault(endpoints, {"rows": [], "mates": [], "unresolved": False, "constraints": []})
         group["mates"].append(name)
         if type(mate.get("error_code")) is not int or mate["error_code"] != 0:
             findings.append(
@@ -2291,23 +2304,35 @@ def _exporter_native_pairs(record: dict, findings: list[dict]) -> dict[tuple[str
                     "discovery.mate_error_state",
                     obj,
                     "saved mate reports an error or unreadable solve state",
-                    {"error_code": mate.get("error_code")},
+                    {**detail, "error_code": mate.get("error_code")},
+                    blocking=False,
                 )
             )
             group["unresolved"] = True
             continue
         diagnostics: list[dict] = []
-        view = _mate_rows(mate, frames, diagnostics, obj)
+        kind = str(mate.get("type") or "").strip().lower()
+        if kind in SUPPORTED_MATES and kind not in {"lock", "limitangle"}:
+            geometry = [_entity_geometry_view(entity, diagnostics, obj) for entity in entities]
+            if all(entity is not None for entity in geometry) and any(
+                not any(entity.get(shape) is not None for shape in ("point", "plane", "cylinder", "circle", "line"))
+                for entity in geometry
+            ):
+                diagnostics.append(
+                    _finding(
+                        "discovery.mate_entities_unsupported",
+                        obj,
+                        "native constraint lacks recorded geometry for both endpoints",
+                    )
+                )
+        view = None if diagnostics else _mate_rows(mate, frames, diagnostics, obj)
         for finding in diagnostics:
-            if finding["code"] in {"discovery.mate_unsupported", "discovery.mate_entities_unsupported"}:
-                finding = {**finding, "blocking": False}
-            findings.append(finding)
-        if view is None:
+            findings.append({**finding, "detail": {**detail, **(finding.get("detail") or {})}, "blocking": False})
+        if view is None or any(finding["blocking"] for finding in diagnostics):
             group["unresolved"] = True
         else:
             group["rows"].extend(view["rows"])
-            if isinstance(view.get("limits"), dict):
-                group["limits"].append(view["limits"])
+            group["constraints"].append({**detail, "rows": view["rows"], "limits": view.get("limits")})
     for group in pairs.values():
         group["rank"] = _rank(group["rows"])
     return pairs
@@ -2321,8 +2346,6 @@ def _exporter_constraint_checks(
         if link["parent"] is not None:
             descendants[link["parent"]].update(descendants[link["name"]])
     for (left, right), group in clusters.pairs.items():
-        if group["unresolved"]:
-            continue
         owners = [declaration["root"] if component == "" else clusters.of.get(component) for component in (left, right)]
         if None in owners or owners[0] == owners[1]:
             continue
@@ -2339,17 +2362,44 @@ def _exporter_constraint_checks(
             twist = (
                 [*direction, 0.0, 0.0, 0.0] if joint["type"] == "prismatic" else [*_cross(point, direction), *direction]
             )
-            residual = max((abs(_dot(row, twist)) / max(math.hypot(*row), 1e-12) for row in group["rows"]), default=0.0)
-            if residual > 1e-6:
-                findings.append(
-                    _finding(
-                        "discovery.exporter_mate_conflict",
-                        f"joint:{joint['name']}",
-                        "active supported native constraints oppose the declared joint motion",
-                        {"mates": group["mates"], "components": [left, right], "residual": residual},
+            for constraint in group["constraints"]:
+                raw_residuals = [_dot(row, twist) for row in constraint["rows"]]
+                normalized_residuals = [
+                    abs(value) / max(math.hypot(*row), 1e-12)
+                    for value, row in zip(raw_residuals, constraint["rows"], strict=True)
+                ]
+                residual = max(normalized_residuals, default=0.0)
+                detail = {
+                    "joint": joint["name"],
+                    "mate": constraint["mate"],
+                    "scope": constraint["scope"],
+                    "mate_type": constraint["mate_type"],
+                    "components": [left, right],
+                    "links": owners,
+                }
+                if residual > 1e-6:
+                    findings.append(
+                        _finding(
+                            "discovery.exporter_saved_pose_restriction",
+                            f"joint:{joint['name']}",
+                            "native mate restricts the declared joint motion at the saved CAD pose; "
+                            "the saved declaration remains the kinematic authority",
+                            {
+                                **detail,
+                                "rows": constraint["rows"],
+                                "declared_twist": twist,
+                                "raw_residuals": raw_residuals,
+                                "max_abs_residual": max((abs(value) for value in raw_residuals), default=0.0),
+                                "normalized_residuals": normalized_residuals,
+                                "max_normalized_residual": residual,
+                                "threshold": 1e-6,
+                            },
+                            blocking=False,
+                        )
                     )
-                )
-            for limits in group["limits"]:
+                limits = constraint["limits"]
+                if not isinstance(limits, dict):
+                    continue
                 expected = "m" if joint["type"] == "prismatic" else "rad"
                 declared = joint.get("limits") or {}
                 if limits.get("unit") != expected or any(
@@ -2357,10 +2407,11 @@ def _exporter_constraint_checks(
                 ):
                     findings.append(
                         _finding(
-                            "discovery.joint_limits_conflict",
+                            "discovery.exporter_native_limits_difference",
                             f"joint:{joint['name']}",
-                            "native mate position limits disagree with the saved declaration",
-                            {"native": limits, "declared": declared},
+                            "native mate position limits differ from the saved joint declaration",
+                            {**detail, "native": limits, "declared": declared},
+                            blocking=False,
                         )
                     )
 

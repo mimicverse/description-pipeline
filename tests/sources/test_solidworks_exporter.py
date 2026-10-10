@@ -17,6 +17,7 @@ from description_pipeline.sources.solidworks.discovery import (
     _exporter_declaration,
     _exporter_joint_facts,
     _exporter_memberships,
+    _exporter_native_pairs,
     _robot_document,
     prepare_native_package,
 )
@@ -419,21 +420,206 @@ class ExporterDiscoveryTests(unittest.TestCase):
         raw["datums"].append({**raw["datums"][1], "owner": "arm-1"})
         self.assertIn("discovery.exporter_frame_ambiguous", {item["code"] for item in self.derive(raw)[2]})
 
-    def test_rigidity_cannot_merge_separately_declared_moving_links(self):
+    def test_saved_pose_rigidity_cannot_merge_or_veto_separately_declared_links(self):
         raw = raw_record()
         raw["mates"] = [
             {
-                "name": "bad_lock",
+                "name": "saved_pose_lock",
                 "type": "lock",
                 "error_code": 0,
                 "entities": [{"component": "base-1"}, {"component": "arm-1"}],
             }
         ]
         bodies, _, findings = self.derive(raw)
-        self.assertEqual(len(bodies), 2)
+        self.assertEqual([body["components"] for body in bodies], [["base-1"], ["arm-1"]])
         codes = {item["code"] for item in findings}
         self.assertIn("discovery.exporter_rigidity_conflict", codes)
-        self.assertIn("discovery.exporter_mate_conflict", codes)
+        self.assertIn("discovery.exporter_saved_pose_restriction", codes)
+        self.assertFalse(any(item["blocking"] for item in findings))
+
+    def test_parallel_saved_pose_restrictions_keep_per_mate_evidence(self):
+        raw = raw_record()
+        raw["mates"] = [
+            {
+                "name": name,
+                "scope": "",
+                "type": "parallel",
+                "error_code": 0,
+                "entities": [
+                    {"component": component, "plane": {"point": [0, 0, 0], "normal": normal}}
+                    for component in ("base-1", "arm-1")
+                ],
+            }
+            for name, normal in (("pose_hold_one", [1, 0, 0]), ("pose_hold_two", [0, 1, 0]), ("shaft", [0, 0, 1]))
+        ]
+        bodies, joints, findings = self.derive(raw)
+        self.assertFalse(any(item["blocking"] for item in findings))
+        self.assertEqual([body["components"] for body in bodies], [["base-1"], ["arm-1"]])
+        self.assertEqual(joints[0]["axis"]["direction"], [0, 0, 1])
+        observations = [item for item in findings if item["code"] == "discovery.exporter_saved_pose_restriction"]
+        self.assertEqual([item["detail"]["mate"] for item in observations], ["pose_hold_one", "pose_hold_two"])
+        for item in observations:
+            detail = item["detail"]
+            self.assertFalse(item["blocking"])
+            self.assertEqual(detail["joint"], "hinge")
+            self.assertEqual(detail["scope"], "")
+            self.assertEqual(detail["mate_type"], "parallel")
+            self.assertEqual(detail["components"], ["arm-1", "base-1"])
+            self.assertEqual(detail["links"], ["arm", "base_link"])
+            self.assertEqual(detail["declared_twist"], [0, 0, 0, 0, 0, 1])
+            self.assertEqual(detail["raw_residuals"], [row[5] for row in detail["rows"]])
+            self.assertEqual(detail["max_abs_residual"], 1.0)
+            self.assertEqual(detail["max_normalized_residual"], 1.0)
+            self.assertEqual(detail["threshold"], 1e-6)
+
+    def test_saved_pose_observation_keeps_existing_scaled_tolerance(self):
+        for deviation, expected_count in ((5e-7, 0), (2e-6, 1)):
+            with self.subTest(deviation=deviation):
+                raw = raw_record()
+                raw["mates"] = [
+                    {
+                        "name": "nearly_axial",
+                        "type": "parallel",
+                        "error_code": 0,
+                        "entities": [
+                            {"component": component, "plane": {"point": [0, 0, 0], "normal": [deviation, 0, 1]}}
+                            for component in ("base-1", "arm-1")
+                        ],
+                    }
+                ]
+                findings = self.derive(raw)[2]
+                observations = [
+                    item for item in findings if item["code"] == "discovery.exporter_saved_pose_restriction"
+                ]
+                self.assertEqual(len(observations), expected_count)
+                if observations:
+                    self.assertAlmostEqual(observations[0]["detail"]["max_normalized_residual"], deviation, places=12)
+                    self.assertFalse(observations[0]["blocking"])
+
+    def test_incomplete_mates_are_diagnostic_and_cannot_complete_rank_six_membership(self):
+        for kind, error, normals, expected in (
+            ("parallel", 0, ([1, 0, 0], [0, 1, 0]), "discovery.mate_geometry_mismatch"),
+            ("parallel", 0, (None, None), "discovery.mate_entities_unsupported"),
+            ("lock", 1, (None, None), "discovery.mate_error_state"),
+            ("gear", 0, (None, None), "discovery.mate_unsupported"),
+        ):
+            with self.subTest(expected=expected):
+                raw = raw_record()
+                raw["components"].append({**raw["components"][0], "name2": "cover-1"})
+                raw["mates"] = [
+                    {
+                        "name": "recorded_lock",
+                        "type": "lock",
+                        "error_code": 0,
+                        "entities": [{"component": "base-1"}, {"component": "cover-1"}],
+                    },
+                    {
+                        "name": "incomplete_constraint",
+                        "type": kind,
+                        "error_code": error,
+                        "entities": [
+                            {
+                                "component": component,
+                                **({"plane": {"point": [0, 0, 0], "normal": normal}} if normal else {}),
+                            }
+                            for component, normal in zip(("base-1", "cover-1"), normals, strict=True)
+                        ],
+                    },
+                ]
+                pair = _exporter_native_pairs(raw, [])["base-1", "cover-1"]
+                self.assertEqual(pair["rank"], 6)
+                self.assertTrue(pair["unresolved"])
+                self.assertEqual([item["mate"] for item in pair["constraints"]], ["recorded_lock"])
+                bodies, _, findings = self.derive(raw)
+                self.assertEqual(bodies[0]["components"], ["base-1"])
+                self.assertFalse(any(item["blocking"] for item in findings))
+                diagnostic = next(item for item in findings if item["code"] == expected)
+                self.assertEqual(diagnostic["detail"]["mate"], "incomplete_constraint")
+                self.assertIn("discovery.exporter_membership_uncovered", {item["code"] for item in findings})
+
+    def test_rejected_mate_does_not_hide_other_valid_saved_pose_restrictions(self):
+        raw = raw_record()
+        raw["mates"] = [
+            {
+                "name": "valid_pose_hold",
+                "scope": "",
+                "type": "parallel",
+                "error_code": 0,
+                "entities": [
+                    {"component": component, "plane": {"point": [0, 0, 0], "normal": [1, 0, 0]}}
+                    for component in ("base-1", "arm-1")
+                ],
+            },
+            {
+                "name": "unread_pose_hold",
+                "type": "lock",
+                "error_code": 1,
+                "entities": [{"component": "base-1"}, {"component": "arm-1"}],
+            },
+        ]
+        findings = self.derive(raw)[2]
+        observations = [item for item in findings if item["code"] == "discovery.exporter_saved_pose_restriction"]
+        self.assertEqual([item["detail"]["mate"] for item in observations], ["valid_pose_hold"])
+        self.assertFalse(any(item["blocking"] for item in findings))
+
+    def test_one_sided_parallel_geometry_cannot_contribute_rigidity_or_pose_rows(self):
+        raw = raw_record()
+        raw["mates"] = [
+            {
+                "name": "one_sided_parallel",
+                "type": "parallel",
+                "error_code": 0,
+                "entities": [
+                    {"component": "base-1", "cylinder": {"point": [0, 0, 0], "direction": [1, 0, 0], "radius": 1}},
+                    {"component": "arm-1"},
+                ],
+            }
+        ]
+        findings = []
+        pair = _exporter_native_pairs(raw, findings)["arm-1", "base-1"]
+        self.assertEqual(pair["rows"], [])
+        self.assertEqual(pair["constraints"], [])
+        self.assertEqual(pair["rank"], 0)
+        self.assertTrue(pair["unresolved"])
+        self.assertEqual([item["code"] for item in findings], ["discovery.mate_entities_unsupported"])
+        self.assertFalse(findings[0]["blocking"])
+
+    def test_native_limit_difference_does_not_replace_the_declared_range(self):
+        raw = raw_record()
+        limits = {"unit": "rad", "lower": -2, "upper": 2}
+        raw["mates"] = [
+            {
+                "name": "cad_limit",
+                "scope": "",
+                "type": "limitangle",
+                "error_code": 0,
+                "entities": [{"component": "base-1"}, {"component": "arm-1"}],
+                "limits": limits,
+            }
+        ]
+        _, joints, findings = self.derive(raw)
+        observed = next(item for item in findings if item["code"] == "discovery.exporter_native_limits_difference")
+        self.assertEqual(observed["detail"]["mate"], "cad_limit")
+        self.assertEqual(observed["detail"]["native"], limits)
+        self.assertEqual(observed["detail"]["declared"], joints[0]["limits"])
+        self.assertEqual(joints[0]["limits"]["lower"], 0)
+        self.assertEqual(joints[0]["limits"]["upper"], 0)
+        self.assertFalse(any(item["blocking"] for item in findings))
+
+    def test_structural_declaration_errors_remain_blocking(self):
+        for mutate, code in (
+            (lambda raw: raw["exporter"]["pid_bindings"].pop(), "discovery.exporter_pid_unresolved"),
+            (
+                lambda raw: raw["exporter"]["pid_bindings"][1].update(name2="base-1", document="base.SLDPRT"),
+                "discovery.exporter_membership_overlap",
+            ),
+            (lambda raw: raw["datums"].pop(), "discovery.exporter_frame_missing"),
+            (lambda raw: raw["reference_axes"].clear(), "discovery.exporter_axis_missing"),
+        ):
+            with self.subTest(code=code):
+                raw = raw_record()
+                mutate(raw)
+                self.assertIn(code, {item["code"] for item in self.derive(raw)[2] if item["blocking"]})
 
     def test_signed_axis_is_independent_of_native_undirected_axis_orientation(self):
         raw = raw_record()
