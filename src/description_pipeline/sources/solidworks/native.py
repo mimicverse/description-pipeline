@@ -424,14 +424,19 @@ def document_paths_match(active, requested):
     return bool(a and b and (a == b or ("\\" not in b and a.rsplit("\\", 1)[-1] == b)))
 
 
-def _matches_assembly_root(reference, root, reference_full, reference_name) -> bool:
+def _matches_assembly_root(reference, root, reference_full, reference_name, assembly_full) -> bool:
     """True when a mate entity references the owning assembly's own root component.
 
-    The root object read from ``GetRootComponent3`` under the assembly's current
-    configuration is the authority: its document must be the assembly and its
-    ``Name2`` must equal the entity's reference name.  When the API exposes an
-    ``IsRoot`` reading it must not say False.  A matching document alone (or a
-    name alone) is never accepted.
+    Identity is strict: the walked assembly document, the root object read from
+    ``GetRootComponent3`` under the assembly's current configuration, and the
+    entity's reference must all carry the same normalized full document path,
+    and the reference ``Name2`` must equal the root ``Name2``.  A bare name or
+    basename match is never accepted.  ``IsRoot`` must read as exactly the
+    boolean True: a readable False, a non-boolean value and an unreadable
+    reading all fail closed — the read-only root-signature probe on the frozen
+    production assembly (2026-10-10) showed the authoritative reading is
+    available as a native boolean on this API version, so no fallback is
+    justified.
     """
 
     if root is None:
@@ -441,17 +446,18 @@ def _matches_assembly_root(reference, root, reference_full, reference_name) -> b
         root_name = str(_member(root, "Name2") or "")
     except Exception:  # noqa: BLE001 - an unreadable root object cannot prove identity
         return False
-    if not root_name or not document_paths_match(root_full, reference_full):
+    reference_key = normalize_document_path(reference_full)
+    root_key = normalize_document_path(root_full)
+    assembly_key = normalize_document_path(str(assembly_full))
+    if not reference_key or reference_key != root_key or reference_key != assembly_key:
         return False
-    if reference_name != root_name:
+    if not root_name or reference_name != root_name:
         return False
     try:
         flag = _member(reference, "IsRoot")
-    except Exception:  # noqa: BLE001 - the published API may not expose IsRoot
-        return True
-    if type(flag) is bool:
-        return flag
-    return True
+    except Exception:  # noqa: BLE001 - an unreadable IsRoot is no proof
+        return False
+    return type(flag) is bool and flag is True
 
 
 def _inertia_from_raw(values, component):
@@ -2606,8 +2612,16 @@ class SolidWorksBackend(CadBackend):
         They bind to the assembly frame, never to a component occurrence name.
         The entity is identified as the assembly root against the object read
         from ``GetRootComponent3`` under the assembly's current configuration
-        (document and root ``Name2`` must agree; an available ``IsRoot`` reading
-        must not say False) — never from the reference name alone.
+        — exact normalized full document path equality across the walked
+        assembly, the root object and the reference, equal reference/root
+        ``Name2``, and ``IsRoot`` reading as exactly the boolean True (a
+        readable False, a non-boolean value and an unreadable reading all fail
+        closed; the native root signature was verified by a read-only probe on
+        the frozen production assembly) — never from the reference name alone.
+        An unproven same-document reference keeps failing closed with
+        ``cad_mate_scope_ambiguous``; containment chains that repeat a document
+        and occurrences holding the owning assembly's own document raise
+        ``cad_reference_cycle`` instead of being traversed or bound.
         """
 
         source_root = Path(frozen_source).resolve()
@@ -2745,10 +2759,11 @@ class SolidWorksBackend(CadBackend):
                     "",
                     configuration,
                     [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
+                    (normalize_document_path(str(main_path)),),
                 )
             ]
             while stack:
-                assembly_path, prefix, referenced_configuration, parent_matrix = stack.pop()
+                assembly_path, prefix, referenced_configuration, parent_matrix, ancestor_paths = stack.pop()
                 assembly = self._document_by_path(assembly_path)
                 _select_configuration(assembly, referenced_configuration, prefix or "assembly")
                 _manager, active_config = _active_configuration_view(assembly)
@@ -2844,6 +2859,17 @@ class SolidWorksBackend(CadBackend):
                         part = _method(component, "GetModelDoc2")
                         if part is not None:
                             referenced = str(_member(component, "ReferencedConfiguration") or "")
+                            # A containment chain that repeats a document (an assembly
+                            # holding itself, directly or through its ancestors) is a
+                            # reference cycle: recursing would never converge and the
+                            # occurrence has no resolvable identity.
+                            document_key = normalize_document_path(str(document_path))
+                            if document_key and document_key in ancestor_paths:
+                                raise CadError(
+                                    "cad_reference_cycle",
+                                    "an assembly occurrence repeats a document in its own ancestor chain",
+                                    {"component": path_name, "document": entry["document"]},
+                                )
                             stack.append(
                                 (
                                     str(document_path),
@@ -2855,6 +2881,7 @@ class SolidWorksBackend(CadBackend):
                                         transform[8:12],
                                         transform[12:16],
                                     ],
+                                    (*ancestor_paths, document_key),
                                 )
                             )
                 for feature, specific, entity_count in _mate_features(assembly):
@@ -2880,8 +2907,11 @@ class SolidWorksBackend(CadBackend):
                             # geometry (assembly planes/axes): it has no component
                             # occurrence identity and belongs to that assembly's frame.
                             # The root object from this assembly's current configuration
-                            # is the authority; a document match alone is not proof.
-                            assembly_frame = _matches_assembly_root(reference, root, reference_full, reference_name)
+                            # is the authority; a document match alone is not proof, and
+                            # the identity must be exact (full path, Name2, IsRoot true).
+                            assembly_frame = _matches_assembly_root(
+                                reference, root, reference_full, reference_name, assembly_path
+                            )
                             # EXEMPT (untyped multi-type return): IMateEntity2.Reference
                             # is a VT_DISPATCH spanning multiple native geometry kinds
                             # with no single declared view, so the generic dispatch
@@ -3005,6 +3035,14 @@ class SolidWorksBackend(CadBackend):
                         raise CadError(
                             "cad_mate_scope_ambiguous",
                             "a mate entity does not resolve to its exact scoped occurrence",
+                            {"mate": mate["name"], "component": reference_name, "scope": scope},
+                        )
+                    owner_entry = by_component.get(scope) if scope else None
+                    owner_document = owner_entry[0] if owner_entry is not None else str(main_path)
+                    if normalize_document_path(by_component[scoped_name][0]) == normalize_document_path(owner_document):
+                        raise CadError(
+                            "cad_reference_cycle",
+                            "a mate entity resolves to an occurrence holding the owning assembly's own document",
                             {"mate": mate["name"], "component": reference_name, "scope": scope},
                         )
                     entity["component"] = scoped_name
