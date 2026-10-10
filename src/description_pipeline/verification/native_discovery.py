@@ -212,14 +212,15 @@ def _frame_for(entity: dict, frames):
     """The entity's frame; a proven assembly-frame entity binds the identity frame.
 
     Only an entity that carries ``assembly_frame: true`` together with the frozen
-    top-scope identity ``""`` reads the assembly frame.  An unmarked empty
-    component stays unknown and fails closed.
+    top-scope identity ``""`` reads the assembly frame.  The identity must be exactly
+    the empty string: a marked entity with a missing, null or numeric component stays
+    unknown and fails closed.
     """
 
-    name = str(entity.get("component") or "")
-    if entity.get("assembly_frame") is True and name == "":
-        return _ASSEMBLY_FRAME
-    return frames.get(name)
+    component = entity.get("component")
+    if entity.get("assembly_frame") is True:
+        return _ASSEMBLY_FRAME if component == "" else None
+    return frames.get(component) if isinstance(component, str) else None
 
 
 def _frames(record: dict) -> dict[str, list[list[float]] | None]:
@@ -641,11 +642,14 @@ def _frame_attachment(record: dict) -> dict:
             )
             continue
         others = [entity for entity in entities if entity.get("assembly_frame") is not True]
-        if not others:
-            problem("a frame-attached mate has no occurrence endpoint", {"mate": name})
+        if len(entities) != 2 or len(flagged) != 1 or len(others) != 1:
+            problem(
+                "a frame-attached mate must carry exactly one frame entity and one occurrence entity",
+                {"mate": name, "entities": len(entities)},
+            )
             continue
         for entity in flagged:
-            if str(entity.get("component") or "") != "":
+            if entity.get("component") != "":
                 problem(
                     "a frame entity must carry the frozen top-scope identity",
                     {"mate": name, "component": entity.get("component")},
@@ -659,12 +663,16 @@ def _frame_attachment(record: dict) -> dict:
             continue
         rows_all.extend(rows["rows"])
         for entity in others:
-            attached.append(str(entity.get("component") or ""))
+            component = entity.get("component")
+            if not isinstance(component, str) or not component:
+                problem("a frame-attached mate names an unknown occurrence", {"mate": name, "component": component})
+                continue
+            attached.append(component)
     if problems:
         return {"mates": seen, "components": sorted(set(attached)), "members": None, "rank": None, "problems": problems}
     if not seen:
         return {"mates": 0, "components": [], "members": None, "rank": None, "problems": []}
-    unknown = sorted(name for name in set(attached) if not name or name not in known)
+    unknown = sorted(name for name in set(attached) if name not in known)
     if unknown:
         problem("a frame-attached mate names an unknown occurrence", {"components": unknown})
     members, _pairs = _independent_clusters(record)
@@ -686,12 +694,20 @@ def _frame_attachment(record: dict) -> dict:
 
 
 def _frame_attached_members(record: dict) -> frozenset[str]:
-    """Members of the proven top frame cluster; empty when the attachment is not proven."""
+    """Members of the proven top frame cluster; empty when the attachment is not proven.
+
+    Proven means a well-formed top-scope attachment (rank 6, one rigid cluster) whose
+    cluster itself binds ``CS_base_link``.  A rank-6 attachment on a moving cluster is
+    not the base, so it earns no datum-channel allowance.
+    """
 
     result = _frame_attachment(record)
     if result["problems"] or result["members"] is None:
         return frozenset()
-    return frozenset(result["members"])
+    members = frozenset(result["members"])
+    if _owned_datum(record, "CS_base_link", _datum_owners(members, members)) is None:
+        return frozenset()
+    return members
 
 
 def _datum_owners(full, attached: frozenset[str]) -> set[str]:
@@ -1068,9 +1084,9 @@ def verify_discovery(package: Path) -> dict:
                     "an assembly-frame flag must be exactly true when present",
                     {"mate": mate.get("name"), "assembly_frame": frame_flag},
                 )
-                component = str(entity.get("component") or "")
+                component = entity.get("component")
                 _require(
-                    component in names or (frame_flag is True and component == ""),
+                    (isinstance(component, str) and component in names) or (frame_flag is True and component == ""),
                     "discovery.graph",
                     "a mate entity names an unknown component",
                     {"component": entity.get("component")},
@@ -1805,6 +1821,22 @@ def verify_discovery(package: Path) -> dict:
             cluster_of_body[name] = full
             for component in full:
                 component_body[component] = name
+        # A proven frame-attached cluster is rigidly the assembly frame, so the frozen
+        # top assembly's ownerless datum channel maps to exactly that body: recognised
+        # top-owned interfaces (TCP_/SCS_) resolve there or stay unowned and block.
+        if attached:
+            material = next((group for group, full in by_material.items() if set(full) == set(attached)), None)
+            if material is not None:
+                base = next(
+                    (
+                        str(item.get("name"))
+                        for item in bodies
+                        if {str(value) for value in (item.get("components") or [])} == set(material)
+                    ),
+                    None,
+                )
+                if base is not None:
+                    component_body[""] = base
         for body in bodies:
             frame_name = str((body.get("frame") or {}).get("coordinate_system") or "")
             frame_datum = _owned_datum(
