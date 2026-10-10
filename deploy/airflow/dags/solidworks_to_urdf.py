@@ -341,7 +341,6 @@ def _provide_definition(endpoint: WindowsEndpoint, request: dict) -> None:
     selected = manifest.get("files")
     if not isinstance(selected, dict) or not selected:
         raise AirflowFailException("The sealed selection lists no files to derive")
-    settings = _definition_settings(endpoint.config, main_assembly)
     store = _linux_store(request["conn_id"])
     work = store.run_dir(run_id) / "definition"
     bundle = work / "raw-record.zip"
@@ -349,10 +348,9 @@ def _provide_definition(endpoint: WindowsEndpoint, request: dict) -> None:
     capture_request = work / "capture-request.zip"
     work.mkdir(parents=True, exist_ok=True)
     endpoint.stream_native_record(run_id, snapshot, bundle)
-    if derived.exists():
-        shutil.rmtree(derived)
-    capture_request.unlink(missing_ok=True)
+    prepared = None
     try:
+        settings = _definition_settings(endpoint.config, main_assembly)
         frozen = _materialize_selection(Path(intake), selected, work / "selected")
         admission = admit_raw_record_bundle(
             bundle,
@@ -363,6 +361,9 @@ def _provide_definition(endpoint: WindowsEndpoint, request: dict) -> None:
         )
         if admission.manifest != snapshot.record_manifest:
             raise AirflowFailException("The admitted raw record differs from the endpoint declaration")
+        if derived.exists():
+            shutil.rmtree(derived)
+        capture_request.unlink(missing_ok=True)
         prepared = derive_from_raw_bundle(
             bundle,
             frozen,
@@ -373,6 +374,8 @@ def _provide_definition(endpoint: WindowsEndpoint, request: dict) -> None:
             expected_archive_sha256=snapshot.record_sha256,
             settings=settings,
         )
+        if prepared.passed is not True:
+            raise PipelineError("the derivation did not pass; its findings must be resolved before capture")
         seal_capture_request(
             prepared,
             capture_request,
@@ -386,6 +389,12 @@ def _provide_definition(endpoint: WindowsEndpoint, request: dict) -> None:
         diagnostic = getattr(error, "diagnostic_path", None)
         if diagnostic:
             detail.setdefault("diagnostic_path", str(diagnostic))
+        if prepared is not None:
+            detail.setdefault("findings", [dict(item) for item in prepared.findings])
+            detail.setdefault("hardware_id", prepared.hardware_id)
+            detail.setdefault("revision", prepared.revision)
+            detail.setdefault("discovery_sha256", prepared.discovery_sha256)
+            detail.setdefault("prepared_passed", prepared.passed)
         detail.setdefault("work_dir", str(work))
         try:
             endpoint.abort_job(
