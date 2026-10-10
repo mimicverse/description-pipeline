@@ -3535,6 +3535,11 @@ class SolidWorksBackend(CadBackend):
             configuration = str(_member(active, "Name") or "")
             if not configuration:
                 raise CadError("cad_configuration_missing", "the saved main assembly configuration is unreadable")
+            # Capture native persistent identities in the initial saved root
+            # context. Reading shared import documents later can make
+            # GetImportedPath expose the stored source path instead of the
+            # path SolidWorks resolved when this exact root was opened.
+            exporter_block = _urdf_exporter_attribute(self._app_obj(), doc, source_root, configuration)
             activity.emit("read_properties", current_object=_activity_object(main_path, source_root), force=True)
             identity_properties = _custom_properties(doc, configuration)
             entries = None
@@ -3908,7 +3913,6 @@ class SolidWorksBackend(CadBackend):
                         ),
                     }
                 )
-            exporter_block = _urdf_exporter_attribute(self._app_obj(), doc, source_root, configuration)
             reference_axes = []
             for feature in _features_of_type(doc, {"RefAxis"}):
                 suppressed = _method(feature, "IsSuppressed")

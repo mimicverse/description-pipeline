@@ -208,6 +208,38 @@ class ReferenceAxisReadTests(unittest.TestCase):
 
 
 class ImportedSourceBindingTests(unittest.TestCase):
+    def test_pid_source_is_captured_before_shared_native_document_reads_change_import_metadata(self):
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as native_tmp:
+            root = Path(tmp)
+            assembly = _write(root, "robot.SLDASM")
+            imported = _write(root, "battery.step")
+            generated = _write(Path(native_tmp), "battery.step.SLDPRT")
+            component = _Component("battery-1", generated)
+            component.imported_path = str(imported)
+            component.GetImportedPath = lambda: component.imported_path
+            component.IsVirtual = False
+            original_get_model = component.GetModelDoc2
+
+            def shared_document():
+                component.imported_path = "/old-authoring-folder/battery.step"
+                return original_get_model()
+
+            component.GetModelDoc2 = shared_document
+            xml = "<Root><SWComponentPIDs><base64Binary>AAE=</base64Binary></SWComponentPIDs></Root>"
+            attribute_feature = _exporter_doc(xml).FirstFeature()
+            doc = _Doc(assembly, first_feature=attribute_feature, children=[component])
+            doc.Extension.GetObjectByPersistReference3 = lambda _pid, _code: component
+            app = _App({assembly: doc})
+            backend = N.SolidWorksBackend(session_factory=lambda: _Session(app))
+            with _variants():
+                record = backend.discover_native(root, {"main_assembly": "robot.SLDASM"})
+            self.assertEqual(record["exporter"]["state"], "extracted")
+            row = record["exporter"]["pid_bindings"][0]
+            self.assertEqual(row["document"], "battery.step")
+            self.assertEqual(row["source_provenance"]["imported_path"], str(imported))
+            self.assertNotIn("resolution_error", row)
+            self.assertEqual(record["components"][0]["document"], "battery.step")
+
     def test_discovery_records_staleness_without_rebuilding_the_saved_model(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
