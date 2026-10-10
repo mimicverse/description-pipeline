@@ -8,12 +8,22 @@ import sys
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from description_pipeline.sources.solidworks import native as N
 from description_pipeline.sources.solidworks.errors import CadError
-from tests.sources.test_solidworks_native_reader import _Feature, _com_stubs, _raiser
+from tests.sources.test_solidworks_native_reader import (
+    _App,
+    _Component,
+    _Doc,
+    _Feature,
+    _Session,
+    _com_stubs,
+    _raiser,
+    _write,
+)
 
 
 @contextmanager
@@ -101,7 +111,7 @@ class ExporterReadTests(unittest.TestCase):
             errors.value = 0
             return component
 
-        with _variants():
+        with _variants(), patch.object(N, "_relative_document", return_value="part.SLDPRT"):
             rows = N._urdf_exporter_pid_bindings(
                 xml, SimpleNamespace(GetObjectByPersistReference3=resolve), Path("/locked")
             )
@@ -113,6 +123,7 @@ class ExporterReadTests(unittest.TestCase):
         self.assertEqual(rows[0]["name2"], "arm-2/part-1")
         self.assertEqual(rows[0]["configuration"], "SavedConfig")
         self.assertEqual(rows[0]["error_code"], 0)
+        self.assertNotIn("resolution_error", rows[0])
 
     def test_failed_native_pid_binding_is_preserved_with_error(self):
         xml = "<Root><SWComponentPIDs><base64Binary>AAE=</base64Binary></SWComponentPIDs></Root>"
@@ -194,6 +205,58 @@ class ReferenceAxisReadTests(unittest.TestCase):
         ):
             with self.subTest(reference=reference), self.assertRaises(CadError):
                 backend.capture_axis_reference(reference)
+
+
+class ImportedSourceBindingTests(unittest.TestCase):
+    def test_discovery_binds_and_hashes_the_import_source_not_the_generated_temp_file(self):
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as native_tmp:
+            root = Path(tmp)
+            assembly = _write(root, "robot.SLDASM")
+            imported = _write(root, "battery.step")
+            generated = _write(Path(native_tmp), "battery.step.SLDPRT")
+            component = _Component("battery-1", generated)
+            component.GetImportedPath = lambda: str(imported)
+            component.IsVirtual = False
+            app = _App({assembly: _Doc(assembly, children=[component])})
+            backend = N.SolidWorksBackend(session_factory=lambda: _Session(app))
+            with _com_stubs():
+                record = backend.discover_native(root, {"main_assembly": "robot.SLDASM"})
+            self.assertEqual(record["components"][0]["document"], "battery.step")
+            self.assertEqual(record["components"][0]["source_provenance"]["native_document_path"], str(generated))
+            self.assertEqual(record["files"]["battery.step"], hashlib.sha256(imported.read_bytes()).hexdigest())
+            self.assertNotIn(str(generated), record["files"])
+
+    def test_current_import_api_binds_temporary_native_part_to_delivered_bytes(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "battery.step"
+            source.write_bytes(b"locked imported source")
+            component = SimpleNamespace(
+                GetPathName=lambda: "/temporary/current-session/battery.step.SLDPRT",
+                GetImportedPath=lambda: str(source),
+                IsVirtual=False,
+            )
+            result = N._component_source_document(component, root)
+        self.assertEqual(result["document"], "battery.step")
+        provenance = result["source_provenance"]
+        self.assertEqual(provenance["state"], "resolved")
+        self.assertEqual(provenance["sha256"], hashlib.sha256(b"locked imported source").hexdigest())
+        self.assertEqual(provenance["native_document_path"], "/temporary/current-session/battery.step.SLDPRT")
+        self.assertIs(provenance["is_virtual"], False)
+
+    def test_matching_basename_never_substitutes_for_an_external_import(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "battery.step").write_bytes(b"unrelated same name")
+            component = SimpleNamespace(
+                GetPathName=lambda: "/temporary/current-session/battery.step.SLDPRT",
+                GetImportedPath=lambda: "/outside/battery.step",
+                IsVirtual=False,
+            )
+            result = N._component_source_document(component, root)
+        self.assertIsNone(result["document"])
+        self.assertEqual(result["source_provenance"]["state"], "unread")
+        self.assertIn("inside the delivered folder", result["source_provenance"]["error"])
 
 
 if __name__ == "__main__":

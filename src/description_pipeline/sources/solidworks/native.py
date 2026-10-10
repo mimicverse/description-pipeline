@@ -1354,7 +1354,7 @@ def _urdf_exporter_pid_bindings(xml_text, extension, source_root):
                     raise ValueError("GetObjectByPersistReference3 returned no object")
                 component = _component(_dynamic(resolved))
                 row["name2"] = str(_member(component, "Name2") or "") or None
-                row["document"] = _relative_document(str(_method(component, "GetPathName") or ""), source_root)
+                row.update(_component_source_document(component, source_root))
                 row["configuration"] = str(_member(component, "ReferencedConfiguration") or "") or None
                 if (
                     type(row["error_code"]) is not int
@@ -1456,6 +1456,48 @@ def _relative_document(path_value, source_root):
         return relative.as_posix()
     except (OSError, ValueError):
         return None
+
+
+def _component_source_document(component, source_root):
+    """Bind an occurrence to a delivered file, including native linked imports.
+
+    SolidWorks materializes 3D Interconnect parts in an owned temporary path.
+    Only GetImportedPath can bind that current native occurrence to a source
+    inside the delivered folder; temporary names and basenames are not proof.
+    """
+
+    native_path = str(_method(component, "GetPathName") or "")
+    relative = _relative_document(native_path, source_root)
+    if relative:
+        return {"document": relative}
+    provenance = {
+        "state": "unread",
+        "native_document_path": native_path,
+        "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
+    }
+    result = {"document": None, "source_provenance": provenance}
+    try:
+        imported_path = _method(component, "GetImportedPath")
+        provenance["imported_path"] = imported_path if isinstance(imported_path, str) else None
+        imported = _relative_document(imported_path, source_root) if _is_text_name(imported_path) else None
+        if not imported:
+            raise ValueError("native imported source does not resolve to a file inside the delivered folder")
+        virtual = _member(component, "IsVirtual")
+        if type(virtual) is not bool:
+            raise ValueError("native virtual-component state is unreadable")
+        result["document"] = imported
+        provenance.update(
+            {
+                "state": "resolved",
+                "kind": "native_imported_document",
+                "document": imported,
+                "sha256": _hash(str(Path(source_root) / imported)),
+                "is_virtual": virtual,
+            }
+        )
+    except Exception as error:  # noqa: BLE001 - a temp or foreign path is never an implicit source
+        provenance["error"] = f"{type(error).__name__}: {error}"[:300]
+    return result
 
 
 def _solver_observation(component, defining_document, source_root, *, configuration, scope):
@@ -3525,7 +3567,7 @@ class SolidWorksBackend(CadBackend):
                         total=components_total,
                     )
                     document_path = _method(component, "GetPathName")
-                    relative = _relative_document(document_path, source_root) if _is_text_name(document_path) else None
+                    source_document = _component_source_document(component, source_root)
                     local_transform = []
                     # Mechanical placement is the fixed False form only; the True
                     # form includes the presentation transform and must never
@@ -3556,7 +3598,7 @@ class SolidWorksBackend(CadBackend):
                     entry = {
                         "name2": path_name,
                         "instance_id": path_name,
-                        "document": relative
+                        "document": source_document["document"]
                         or (normalize_document_path(str(document_path)) if _is_text_name(document_path) else ""),
                         "configuration": str(_member(component, "ReferencedConfiguration") or ""),
                         "fixed": bool(_member(component, "IsFixed")),
@@ -3564,6 +3606,8 @@ class SolidWorksBackend(CadBackend):
                         "lightweight": None,
                         "transform": transform,
                     }
+                    if "source_provenance" in source_document:
+                        entry["source_provenance"] = source_document["source_provenance"]
                     entry["solver_observation"] = _solver_observation(
                         component,
                         assembly_path,
@@ -3902,6 +3946,12 @@ class SolidWorksBackend(CadBackend):
                 if relative and relative not in planned:
                     planned.add(relative)
                     hash_plan.append((path, relative))
+            for entry in components:
+                provenance = entry.get("source_provenance", {})
+                relative = provenance.get("document") if provenance.get("state") == "resolved" else None
+                if relative and relative not in planned:
+                    planned.add(relative)
+                    hash_plan.append((source_root / relative, relative))
             for index, (path, relative) in enumerate(hash_plan):
                 activity.emit(
                     "hash_sources",
