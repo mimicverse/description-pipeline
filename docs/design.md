@@ -45,8 +45,9 @@ Generated-input inspection is the input check of `capture`.
 
 Each boundary records its actual check result before the next step consumes its
 output. Missing checks remain `not_run`; a failure blocks downstream work.
-Each receipt declares its `execution_scope`: a complete endpoint job covers all
-six stages, while maintenance commands cover only the stages they execute
+Each receipt declares its `execution_scope`: Windows covers freeze, discover and
+capture; Linux covers generate, verify and publish. The complete Airflow run
+combines both receipts, while maintenance commands cover only the stages they execute
 ([operations](operations.md#6-independent-review-and-recovery)); unexecuted
 native stages are reported as out of scope, never as qualified.
 [Quality](quality.md) defines the independent gates and tolerances.
@@ -80,14 +81,20 @@ The pipeline ID is `solidworks-to-urdf`; every run has a UUID. Source revisions,
 controlled records, tool code, dependencies, environment and file hashes bind the
 execution. Transport retries reconnect to the same UUID and frozen inputs. A
 terminal native failure or source correction requires a new run. Frozen evidence
-can be rebuilt on Linux or Windows without reopening CAD.
+can be rebuilt on Linux without reopening CAD.
 
-Airflow's four transport tasks resolve the folder, submit the job, poll it and
-confirm its result. They do not execute separate CAD steps. The DAG documentation
-shows the six-step contract; task logs show live states and terminal QC details;
-`engineering_stages` XCom retains the terminal summary, including failures. The
-operator page shows each step's inputs, input QC, outputs, output QC and evidence.
-`reports/stages.json` retains the detailed run receipt.
+Airflow sends freeze, discovery and capture to the serialized Windows worker,
+then runs generation, independent verification and publication on Linux.
+Windows returns a sealed capture bundle; Linux checks its complete inventory,
+file hashes, selected assembly, run identity and native tool identity before use.
+Native completion is an intermediate state, not a verified model.
+
+Both hosts use the same tool source release and record their own runtime
+requirements. Windows checks SolidWorks and COM readiness. Linux checks MuJoCo
+and loads the actual generated URDF in isolation. Git credentials and model
+checkouts stay on Linux. Each stage's results, checks and execution host appear
+in the operator view; the final receipt binds both hosts' evidence. The Linux
+store supplies model previews, downloads and publication results.
 
 When a folder contains more than one saved `.SLDASM`, the page always lists their
 relative paths and requires the operator to choose the main assembly before the run
@@ -138,7 +145,7 @@ receipts; the renderer does not execute engineering work.
 
 One Linux server hosts Airflow, its database and the operator page. One licensed
 Windows endpoint serializes native jobs in owned processes, separate from an
-engineer's CAD session. Runtime readiness precedes CAD access. Native acquisitions
+engineer's CAD session. Native runtime readiness precedes CAD access; consumer readiness is checked on Linux. Native acquisitions
 bind their documented interfaces; each rebuild refreshes and verifies the owned
 document once before continuation. Lost bindings or unavailable capabilities
 stop execution, retain diagnostics and release owned resources.

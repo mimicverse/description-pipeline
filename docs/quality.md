@@ -29,10 +29,23 @@ creates a candidate PR and cannot set an engineering-approved release state.
 Passed automatic checks do not require manual repetition. Failed checks require
 correction, not human override. Applicable approvals of unchanged engineering
 facts can be reused; changed facts and their effects need review.
-Each receipt declares its `execution_scope`: a complete endpoint job covers all
-six stages, while maintenance generation/verification runs cover only the stages
-they execute ([operations](operations.md#6-independent-review-and-recovery));
+Each receipt declares its `execution_scope`: Windows covers the first three
+stages and Linux covers generation, verification and publication. A complete
+Airflow run binds both; maintenance runs cover only the stages they execute ([operations](operations.md#6-independent-review-and-recovery));
 unexecuted native stages are shown as out of scope rather than qualified.
+
+## Capture transfer
+
+The Windows worker seals archived inputs, native evidence, the input report,
+native tool identity and native stage receipt. Linux admits this bundle only
+when its closed inventory, every file hash, run ID, handoff digest and selected
+assembly agree with the request. Both hosts must use the same tool source release;
+their dependency records identify their different execution roles.
+
+`reports/native-stages.json` preserves the native receipt. The final
+`reports/stages.json` records the full run. Native completion does not grant
+model qualification. Linux still independently reconstructs engineering facts,
+checks the delivered bytes and loads the URDF with MuJoCo before publication.
 
 ## Verification gates
 

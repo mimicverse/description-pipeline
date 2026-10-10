@@ -34,7 +34,9 @@ python -B -m unittest discover -s tests -t .
 python -m ruff check src tests tools deploy
 ```
 
-On Windows, use `.venv\Scripts\python.exe` in place of `python` for both commands.
+Windows uses the native capture dependency lock; its runtime does not include
+MuJoCo. Run native adapter regressions there with `.venv\Scripts\python.exe`.
+Run the full suite and consumer checks in the Linux verification environment.
 For changes to Airflow deployment, also follow its
 [deployment checks](docs/deployment.md#maintenance).
 

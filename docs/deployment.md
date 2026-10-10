@@ -1,8 +1,9 @@
 # Deployment
 
-One Linux server hosts the HTTPS operator page, Airflow and PostgreSQL. One
-logged-in Windows computer with licensed SolidWorks executes native jobs
-serially. Operators use **Feishu login → engineering folder → Start → checks,
+One Linux server hosts the HTTPS operator page, Airflow and PostgreSQL, and
+executes generation, independent MuJoCo verification and PR publication. One
+logged-in Windows computer with licensed SolidWorks serializes native input
+freezing, discovery and capture. Operators use **Feishu login → engineering folder → Start → checks,
 URDF preview and review PR**.
 
 Use the same source-bound tool release on both hosts. This guide owns installation
@@ -12,9 +13,9 @@ and maintenance; [operations](operations.md) owns the engineering workflow.
 
 | Host or service | Required preparation |
 |---|---|
-| Linux | Ubuntu 22.04 x86_64, user-level systemd, network access to the Windows worker, GitHub and Feishu |
-| Windows | SolidWorks 2026 (native major 34; other versions require platform acceptance first), Python 3.12 x86_64, Git, GitHub CLI and OpenSSH Server; an interactive desktop session |
-| Model repository | Private repository, an existing `feature/<hardware>` base and a dedicated clean Windows clone |
+| Linux | Ubuntu 22.04 x86_64, user-level systemd, Git, GitHub CLI, network access to the Windows worker, GitHub and Feishu |
+| Windows | SolidWorks 2026 (native major 34; other versions require platform acceptance first), Python 3.12 x86_64 and OpenSSH Server; an interactive desktop session |
+| Model repository | Private repository, an existing `feature/<hardware>` base and a dedicated clean Linux clone |
 | Feishu | Enterprise app, approved tenant keys, registered OAuth callback and access to basic user identity/profile |
 | Storage | Dedicated CAD intake directories; separate frozen inputs, outputs, state, secrets and model clones |
 
@@ -37,11 +38,13 @@ configuration takes effect after publication. A creator-only release is
 sufficient for commissioning that user's sign-in.
 
 SolidWorks is required for fresh native discovery and capture. Verification and
-rebuild of a complete frozen delivery run on Linux or Windows without opening
-CAD. Both hosts require Python 3.12 x86_64 and the pinned runtime wheels.
+rebuild of a complete frozen delivery run on Linux without opening CAD. Both hosts require Python 3.12 x86_64 and the pinned runtime wheels.
 Consumer checks load models without rendering; they require no display, GPU or
-graphics-driver setup. `description doctor` exercises the actual consumer loader
-in an isolated process, and native jobs check readiness before opening CAD.
+graphics-driver setup. `description doctor` checks the host role: SolidWorks registration and COM
+prerequisites on Windows, pinned dependencies and an isolated consumer load on
+Linux. Windows capture requires neither MuJoCo nor GitHub access. A native
+readiness pass is a prerequisite; the capture session still checks actual CAD
+access and document readiness.
 Windows jobs must run as the logged-in execution user, outside Session 0.
 
 ## 1. Install the Windows worker
@@ -53,15 +56,6 @@ release manifest. Extract it, then run from the extracted directory:
 py -3.12 -m venv C:\description-runtime
 C:\description-runtime\Scripts\python.exe -m pip install --no-index --require-hashes --find-links wheels -r requirements.lock
 C:\description-runtime\Scripts\description.exe doctor
-```
-
-Configure Git identity and GitHub authentication for that execution user. Create
-a dedicated clone of the private model repository:
-
-```powershell
-gh auth login
-gh auth setup-git
-git clone https://github.com/<owner>/<model-repository> C:\description-models\arm
 ```
 
 Create the directories below. `C:\cad-handoffs` contains engineering sources;
@@ -94,7 +88,7 @@ Save `C:\description-state\endpoint.json`:
   },
   "targets": {
     "arm": {
-      "repository": "C:/description-models/arm",
+      "repository_slug": "<owner>/<model-repository>",
       "base": "feature/arm"
     }
   }
@@ -126,6 +120,17 @@ interactive Scheduled Task may start this same command at login under the same
 user. Do not create a second worker or run concurrent native CAD jobs.
 
 ## 2. Configure Linux and Feishu
+
+
+Configure Git identity and GitHub authentication for the Linux service user.
+Create a dedicated clean model checkout; the publication stage verifies that its
+origin matches the Windows hardware routing's repository slug:
+
+```sh
+gh auth login
+gh auth setup-git
+git clone https://github.com/<owner>/<model-repository> /srv/description/models/arm
+```
 
 Extract the deployment archive matching the worker release. Keep deployment
 configuration and secrets outside the checkout. Copy
