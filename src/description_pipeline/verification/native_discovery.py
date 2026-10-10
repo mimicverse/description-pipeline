@@ -107,22 +107,33 @@ def _names(mate: dict) -> list[str]:
     return out
 
 
-def _nested_self_frame_entity(entities: list[dict], scope) -> dict | None:
-    """The scope's own frame entity inside a nested self-frame relation, if present.
+def _nested_self_frame_entity(mate: dict) -> dict | None:
+    """The scope's own frame entity inside a well-formed nested self-frame relation.
 
-    A mate whose scope is ``S`` may carry exactly one assembly-frame entity with
-    ``component == S``: that entity is S's own reference geometry, expressed in S's own
-    space.  In the parent record the occurrence ``S`` supplies the transform into parent
-    coordinates, so the relation is an ordinary in-scope pair -- it never takes part in
-    the frozen top attachment and never grounds anything.
+    A mate whose scope is ``S`` may carry exactly two raw recorded entities: one
+    assembly-frame entity with ``component == S`` (S's own reference geometry, expressed
+    in S's own space) and one ordinary endpoint whose occurrence lives inside S's subtree
+    (``S/...``).  In the parent record the occurrence ``S`` supplies the transform into
+    parent coordinates, so the relation is an ordinary in-scope pair -- it never takes
+    part in the frozen top attachment and never grounds anything.  A malformed raw list
+    (non-dict entries or a wrong length) or an endpoint outside the scope subtree is not
+    this relation and stays unsupported.
     """
 
+    raw = mate.get("entities")
+    if not isinstance(raw, list) or len(raw) != 2 or not all(isinstance(item, dict) for item in raw):
+        return None
+    scope = mate.get("scope")
     if not isinstance(scope, str) or scope == "":
         return None
-    flagged = [entity for entity in entities if entity.get("assembly_frame") is True]
-    if len(flagged) == 1 and flagged[0].get("component") == scope:
-        return flagged[0]
-    return None
+    flagged = [entity for entity in raw if entity.get("assembly_frame") is True]
+    if len(flagged) != 1 or flagged[0].get("component") != scope:
+        return None
+    endpoint = next(entity for entity in raw if entity is not flagged[0])
+    component = endpoint.get("component")
+    if not isinstance(component, str) or not component.startswith(scope + "/"):
+        return None
+    return flagged[0]
 
 
 def _number(value) -> float | None:
@@ -669,7 +680,7 @@ def _rows_for(mate: dict, frames) -> dict | None:
     if kind not in SUPPORTED_MATES:
         return None
     entities = _entities(mate)
-    nested = _nested_self_frame_entity(entities, mate.get("scope"))
+    nested = _nested_self_frame_entity(mate)
     if nested is not None:
         # The scope's own frame entity resolves through the scope occurrence transform,
         # exactly like the same relation written as an ordinary in-scope pair.
@@ -1103,17 +1114,11 @@ def _frame_attachment(record: dict) -> dict:
             continue
         name = str(mate.get("name") or index)
         scope = mate.get("scope")
-        nested = _nested_self_frame_entity(entities, scope)
+        nested = _nested_self_frame_entity(mate)
         if nested is not None:
             others = [entity for entity in entities if entity is not nested]
             endpoint = others[0].get("component") if len(others) == 1 else None
-            if (
-                len(entities) != 2
-                or len(others) != 1
-                or scope not in known
-                or not isinstance(endpoint, str)
-                or endpoint not in known
-            ):
+            if scope not in known or not isinstance(endpoint, str) or endpoint not in known:
                 problem(
                     scope_problems,
                     "a frame-attached mate outside the frozen top assembly is not supported",

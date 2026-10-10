@@ -161,7 +161,7 @@ class NestedSelfFrameTests(unittest.TestCase):
         parent_normal=None,
         neck_normal=None,
         extra_flagged=False,
-        endpoint="neck-1",
+        endpoint="head-1/neck-1",
     ):
         normal = unit(parent_normal or self.PARENT_NORMAL)
         endpoint_normal = unit(neck_normal or parent_normal or self.PARENT_NORMAL)
@@ -208,7 +208,9 @@ class NestedSelfFrameTests(unittest.TestCase):
             self.component("head-1", self.head_rotation, self.head_translation, "head.sldasm"),
         ]
         if endpoint_component:
-            components.append(self.component("neck-1", self.neck_rotation, self.neck_translation, "neck.sldprt"))
+            components.append(
+                self.component("head-1/neck-1", self.neck_rotation, self.neck_translation, "neck.sldprt")
+            )
         if other_component:
             components.append(self.component("other-1", self.neck_rotation, self.neck_translation, "other.sldprt"))
         mates = self.top_mates()
@@ -263,9 +265,9 @@ class NestedSelfFrameTests(unittest.TestCase):
         frames = V._frames(self.record(nested=nested))
         self.assertIsNone(V._rows_for(nested, frames))
         members, pairs = V._independent_clusters(self.record(nested=nested))
-        self.assertTrue(pairs[("head-1", "neck-1")]["unresolved"])
+        self.assertTrue(pairs[("head-1", "head-1/neck-1")]["unresolved"])
         self.assertEqual(members["head-1"], ["head-1"])
-        self.assertEqual(members["neck-1"], ["neck-1"])
+        self.assertEqual(members["head-1/neck-1"], ["head-1/neck-1"])
         # The top aggregate is computed on the same record and is unaffected.
         attachment = V._frame_attachment(self.record(nested=nested))
         self.assertEqual(attachment["members"], frozenset({"torso-1"}))
@@ -278,6 +280,7 @@ class NestedSelfFrameTests(unittest.TestCase):
             "two-flagged-entities": self.nested_mate(extra_flagged=True),
             "unknown-scope": self.nested_mate(flagged_component="ghost-1"),
             "unknown-endpoint": self.nested_mate(endpoint="void-1"),
+            "foreign-recorded-endpoint": self.nested_mate(endpoint="other-1"),
         }
         for label, nested in cases.items():
             with self.subTest(label=label):
@@ -295,7 +298,7 @@ class NestedSelfFrameTests(unittest.TestCase):
         with_nested = self.record(nested=nested)
         for record in (without, with_nested):
             members, _pairs = V._independent_clusters(record)
-            self.assertEqual(members["neck-1"], ["neck-1"])
+            self.assertEqual(members["head-1/neck-1"], ["head-1/neck-1"])
         # Reaching rank six through in-scope rows unions the pair exactly like the same
         # relation written as an ordinary pair (no solver-flag inference anywhere).
         shaft = {
@@ -315,7 +318,7 @@ class NestedSelfFrameTests(unittest.TestCase):
                     },
                 },
                 {
-                    "component": "neck-1",
+                    "component": "head-1/neck-1",
                     "cylinder": {
                         "point": inverse_point(self.neck_rotation, self.neck_translation, [0.0, 0.0, 0.03]),
                         "direction": inverse_vector(self.neck_rotation, [0.0, 0.0, 1.0]),
@@ -342,7 +345,7 @@ class NestedSelfFrameTests(unittest.TestCase):
                     },
                 },
                 {
-                    "component": "neck-1",
+                    "component": "head-1/neck-1",
                     "plane": {
                         "point": inverse_point(self.neck_rotation, self.neck_translation, [0.0, 0.0, 0.0]),
                         "normal": inverse_vector(self.neck_rotation, [0.0, 0.0, -1.0]),
@@ -366,7 +369,37 @@ class NestedSelfFrameTests(unittest.TestCase):
         members_a, _ = V._independent_clusters(unioned)
         members_b, _ = V._independent_clusters(ordinary_equivalent)
         self.assertEqual(members_a, members_b)
-        self.assertEqual(sorted(members_a["head-1"]), ["head-1", "neck-1"])
+        self.assertEqual(sorted(members_a["head-1"]), ["head-1", "head-1/neck-1"])
+
+    def test_malformed_raw_entity_lists_fail_closed(self):
+        base = V._frame_attachment(self.record())
+        good = self.nested_mate()
+        malformed_variants = {
+            "non-dict-entry": [good["entities"][0], good["entities"][1], "bad"],
+            "non-dict-entry-swapped": [good["entities"][1], good["entities"][0], "bad"],
+            "three-dicts": [good["entities"][0], good["entities"][1], dict(good["entities"][1])],
+            "single-entity": [good["entities"][0]],
+        }
+        for label, raw in malformed_variants.items():
+            with self.subTest(label=label):
+                nested = {**good, "entities": raw}
+                frames = V._frames(self.record(nested=nested))
+                self.assertIsNone(V._rows_for(nested, frames), label)
+                attachment = V._frame_attachment(self.record(nested=nested))
+                self.assertEqual(attachment["members"], base["members"], label)
+                self.assertEqual(attachment["rank"], base["rank"], label)
+                self.assertEqual(attachment["top_problems"], [], label)
+                self.assertTrue(attachment["scope_problems"], label)
+
+    def test_foreign_recorded_endpoint_is_refused(self):
+        nested = self.nested_mate(endpoint="other-1")
+        frames = V._frames(self.record(nested=nested, other_component=True))
+        self.assertIsNone(V._rows_for(nested, frames))
+        attachment = V._frame_attachment(self.record(nested=nested, other_component=True))
+        self.assertEqual(attachment["members"], frozenset({"torso-1"}))
+        self.assertEqual(attachment["rank"], 6)
+        self.assertEqual(attachment["top_problems"], [])
+        self.assertTrue(attachment["scope_problems"])
 
 
 if __name__ == "__main__":
