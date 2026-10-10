@@ -823,6 +823,10 @@ def _feature_name(target):
 #: Geometric classes of a mate entity reference read from the native
 #: ``ReferenceType`` member for the documented point/line/plane/cylinder/cone
 #: kinds; every other value is recorded raw so no class is ever guessed.
+#: ``IMateEntity2::ReferenceType`` is documented as obsolete (superseded by
+#: ``IMate2Entity::Reference2``), and the published ``IMateEntity2::EntityParams``
+#: layout table documents no Circle row — circle-class values therefore stay raw
+#: until a controlled probe pins the interface/enum/layout triple.
 MATE_ENTITY_REFERENCE_TYPES = {
     0: "Point",
     1: "Line",
