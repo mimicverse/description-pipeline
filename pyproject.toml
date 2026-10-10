@@ -27,7 +27,6 @@ dependencies = [
     "PyYAML==6.0.3",
     "jsonschema==4.26.0",
     "packaging==26.3",
-    "mujoco==3.13.0",
     "python-multipart==0.0.32",
 ]
 
@@ -39,6 +38,7 @@ Documentation = "https://github.com/mimicverse/description-pipeline/tree/main/do
 
 [project.optional-dependencies]
 windows = ["pywin32==311; sys_platform == 'win32'"]
+verify = ["mujoco==3.13.0"]
 dev = ["ruff==0.16.8", "build==1.6.1"]
 
 [project.scripts]
