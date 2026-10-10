@@ -454,9 +454,7 @@ def _rows_for(mate: dict, frames) -> dict | None:
             # A circular edge coincident with a plane: the circle's plane is the
             # plane (two tilts locked) and its centre lies in it (one translation
             # locked); sliding and spinning in the plane stay free.
-            circle_entity, plane_entity = (
-                (first, second) if isinstance(first.get("circle"), dict) else (second, first)
-            )
+            circle_entity, plane_entity = (first, second) if isinstance(first.get("circle"), dict) else (second, first)
             circle_point, circle_axis = _geometry(circle_entity, frames)
             plane_point, plane_axis = _geometry(plane_entity, frames)
             if (
@@ -1291,7 +1289,8 @@ def verify_discovery(package: Path) -> dict:
         source_bodies = (state["robot"].get("source") or {}).get("bodies") or []
         body = next(
             (
-                item for item in source_bodies
+                item
+                for item in source_bodies
                 if {str(value) for value in (item.get("components") or [])} == set(material)
             ),
             None,
@@ -1369,9 +1368,7 @@ def verify_discovery(package: Path) -> dict:
                 _owned_datum(
                     raw,
                     frame["coordinate_system"],
-                    _datum_owners(
-                        full_by_material.get(frozenset(body.get("components") or []), frozenset()), attached
-                    ),
+                    _datum_owners(full_by_material.get(frozenset(body.get("components") or []), frozenset()), attached),
                 )
                 is not None,
                 "discovery.bodies",
@@ -1455,7 +1452,8 @@ def verify_discovery(package: Path) -> dict:
             datum_name = str((body.get("frame") or {}).get("coordinate_system"))
             owners = _datum_owners(full, attached)
             owned = [
-                item for item in datums
+                item
+                for item in datums
                 if str(item.get("owner") or "") in owners and str(item.get("name")) == datum_name
             ]
             _require(

@@ -978,8 +978,7 @@ class OracleSemanticsTests(unittest.TestCase):
         self.assertFalse(passed, errors)
         self.assertTrue(
             any(
-                error["code"] == "discovery.frame_attachment"
-                and "outside the frozen top assembly" in error["message"]
+                error["code"] == "discovery.frame_attachment" and "outside the frozen top assembly" in error["message"]
                 for error in errors
             ),
             errors,
@@ -1129,8 +1128,7 @@ class OracleSemanticsTests(unittest.TestCase):
                 self.assertTrue(
                     any(
                         error["code"] == "discovery.graph"
-                        and "datum owner must be a known occurrence name or the frozen top assembly"
-                        in error["message"]
+                        and "datum owner must be a known occurrence name or the frozen top assembly" in error["message"]
                         for error in errors
                     ),
                     errors,
@@ -1141,9 +1139,7 @@ class OracleSemanticsTests(unittest.TestCase):
             robot_path = package / "robot.yaml"
             robot = yaml.safe_load(robot_path.read_text(encoding="utf-8"))
             robot["source"].setdefault("frames", [])
-            robot["source"]["frames"].append(
-                {"name": "tool", "parent": parent, "coordinate_system": "TCP_tool"}
-            )
+            robot["source"]["frames"].append({"name": "tool", "parent": parent, "coordinate_system": "TCP_tool"})
             robot_path.write_text(yaml.safe_dump(robot, sort_keys=False), encoding="utf-8")
 
         def add_tool_datum(raw, payload):
@@ -1174,8 +1170,7 @@ class OracleSemanticsTests(unittest.TestCase):
         self.assertFalse(passed, errors)
         self.assertTrue(
             any(
-                error["code"] == "discovery.frames" and "not owned by any body" in error["message"]
-                for error in errors
+                error["code"] == "discovery.frames" and "not owned by any body" in error["message"] for error in errors
             ),
             errors,
         )
@@ -1196,8 +1191,7 @@ class OracleSemanticsTests(unittest.TestCase):
         )
         self.assertTrue(
             any(
-                error["code"] == "discovery.frames" and "not owned by any body" in error["message"]
-                for error in errors
+                error["code"] == "discovery.frames" and "not owned by any body" in error["message"] for error in errors
             ),
             errors,
         )
@@ -1305,10 +1299,22 @@ class OracleSemanticsTests(unittest.TestCase):
         # b's circle is authored in a frame rotated +90° about X and translated z+0.05:
         # local normal (0,1,0) becomes the assembly axis (0,0,1); the centre maps to (0,0,0.05).
         rotated = [
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 0.0, -1.0, 0.0,
-            0.0, 1.0, 0.0, 0.05,
-            0.0, 0.0, 0.0, 1.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            -1.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.05,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
         ]
         frames = {"a-1": _matrix4(IDENTITY), "b-1": _matrix4(rotated)}
 
@@ -1402,17 +1408,26 @@ class OracleSemanticsTests(unittest.TestCase):
                 "entities": [first_entity, second_entity],
             }
 
-        circle = {"component": "a-1", "feature": "Edge1",
-                  "circle": {"center": [0.0, 0.0, 0.02], "normal": [0.0, 0.0, 1.0], "radius": 0.003}}
+        circle = {
+            "component": "a-1",
+            "feature": "Edge1",
+            "circle": {"center": [0.0, 0.0, 0.02], "normal": [0.0, 0.0, 1.0], "radius": 0.003},
+        }
         # A plane is not an axis-bearing entity, even with usable geometry.
-        plane = {"component": "b-1", "feature": "Plane1",
-                 "plane": {"point": [0.0, 0.0, 0.05], "normal": [0.0, 0.0, 1.0]}}
+        plane = {
+            "component": "b-1",
+            "feature": "Plane1",
+            "plane": {"point": [0.0, 0.0, 0.05], "normal": [0.0, 0.0, 1.0]},
+        }
         self.assertIsNone(_rows_for(mate(copy.deepcopy(circle), plane), frames))
 
         zero_normal = copy.deepcopy(circle)
         zero_normal["circle"]["normal"] = [0.0, 0.0, 0.0]
-        cylinder = {"component": "b-1", "feature": "Cyl1",
-                    "cylinder": {"point": [0.0, 0.0, 0.05], "direction": [0.0, 0.0, 1.0], "radius": 0.004}}
+        cylinder = {
+            "component": "b-1",
+            "feature": "Cyl1",
+            "cylinder": {"point": [0.0, 0.0, 0.05], "direction": [0.0, 0.0, 1.0], "radius": 0.004},
+        }
         self.assertIsNone(_rows_for(mate(zero_normal, cylinder), frames))
 
         infinite_centre = copy.deepcopy(circle)
