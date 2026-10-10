@@ -2712,6 +2712,21 @@ def _write_yaml(path: Path, document: dict) -> None:
     path.write_text(text, encoding="utf-8", newline="\n")
 
 
+def _guarded_sink(on_activity):
+    """The observer guard: activity callbacks can never alter or fail the capture."""
+
+    if on_activity is None:
+        return None
+
+    def guarded(record):
+        try:
+            on_activity(record)
+        except Exception:  # noqa: BLE001 - an observer can never fail the capture
+            return
+
+    return guarded
+
+
 def prepare_native_package(
     frozen_source: Path,
     output: Path,
@@ -2722,8 +2737,14 @@ def prepare_native_package(
     configuration: str | None = None,
     assembly: str | None = None,
     on_event=None,
+    on_activity=None,
 ) -> PreparedPackage:
-    """Derive a prepared package from one immutable native engineering directory."""
+    """Derive a prepared package from one immutable native engineering directory.
+
+    ``on_activity`` is the optional live-activity sink described by the activity
+    contract: it observes what the native read is doing right now and can never
+    change the derived record, the returned package or any failure path.
+    """
 
     settings = settings or DiscoverySettings()
     frozen_source = Path(frozen_source)
@@ -2748,7 +2769,7 @@ def prepare_native_package(
     native_settings = {"namespace": NAMESPACE, "contract": CONTRACT}
     if settings.main_assembly:
         native_settings["main_assembly"] = settings.main_assembly
-    record = backend.discover_native(frozen_source, native_settings)
+    record = backend.discover_native(frozen_source, native_settings, on_activity=_guarded_sink(on_activity))
     if not isinstance(record, dict) or record.get("schema_version") != DISCOVERY_SCHEMA:
         raise PipelineError("native discovery backend returned an unexpected record schema")
     _validate_native_record(record)

@@ -261,7 +261,7 @@ class FakeBackend:
     def __init__(self, payload: dict):
         self.payload = payload
 
-    def discover_native(self, frozen_source: Path, settings: dict) -> dict:
+    def discover_native(self, frozen_source: Path, settings: dict, *, on_activity=None) -> dict:
         return copy.deepcopy(self.payload)
 
 
@@ -311,6 +311,45 @@ class DiscoveryTests(unittest.TestCase):
     def _codes(self, result) -> list[str]:
         self.assertFalse(result.passed)
         return [finding["code"] for finding in result.findings]
+
+    def test_native_preparation_forwards_the_guarded_activity_sink(self):
+        class ActivityBackend:
+            def __init__(self):
+                self.sink = None
+
+            def discover_native(self, frozen_source, settings, *, on_activity=None):
+                self.sink = on_activity
+                if on_activity is not None:
+                    on_activity({"phase": "discover", "action": "read_components", "completed": 1, "total": 2})
+                return copy.deepcopy(record())
+
+        source, records = self._native()
+        received = []
+
+        def observer(item):
+            received.append(item)
+            raise RuntimeError("observer failures must never propagate")
+
+        backend = ActivityBackend()
+        prepare_native_package(
+            source,
+            self.tmp / "prepared-activity",
+            run_id="run-1",
+            backend=backend,
+            settings=DiscoverySettings(record_roots=(records,)),
+            on_activity=observer,
+        )
+        self.assertEqual(received[0]["action"], "read_components")
+
+        plain = ActivityBackend()
+        prepare_native_package(
+            source,
+            self.tmp / "prepared-no-activity",
+            run_id="run-1",
+            backend=plain,
+            settings=DiscoverySettings(record_roots=(records,)),
+        )
+        self.assertIsNone(plain.sink)
 
     # ----------------------------------------------------------------- positive
 

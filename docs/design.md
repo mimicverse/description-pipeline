@@ -47,6 +47,10 @@ Generated-input inspection is the input check of `capture`.
 
 Each boundary records its actual check result before the next step consumes its
 output. Missing checks remain `not_run`; a failure blocks downstream work.
+Live activity is separate from these checks: the worker records its current
+operation, object and known item counts with timestamps and a bounded history.
+The operator page displays these observations without inferring progress from
+polling, inventing a completion percentage or changing qualification results.
 Each receipt declares its `execution_scope`: Windows covers freeze, discover and
 capture; Linux covers generate, verify and publish. The complete Airflow run
 combines both receipts, while maintenance commands cover only the stages they execute

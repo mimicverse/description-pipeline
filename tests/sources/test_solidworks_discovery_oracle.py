@@ -235,7 +235,7 @@ class _ReplayBackend:
     def __init__(self, payload: dict) -> None:
         self.payload = payload
 
-    def discover_native(self, frozen_source: Path, settings: dict) -> dict:
+    def discover_native(self, frozen_source: Path, settings: dict, *, on_activity=None) -> dict:
         return copy.deepcopy(self.payload)
 
 

@@ -457,5 +457,103 @@ class RunHistoryJsLogicTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
 
 
+class ActivityUiContractTests(unittest.TestCase):
+    """Live-activity card: mounts, wording, and the no-fabrication hard rules."""
+
+    def activity(self) -> str:
+        return (STATIC / "activity.js").read_text(encoding="utf-8")
+
+    def test_page_mounts_the_card_in_overview_and_running_stage(self) -> None:
+        html = (STATIC / "index.html").read_text(encoding="utf-8")
+        self.assertIn('id="activity-overview"', html)
+        self.assertIn('id="activity-stage"', html)
+        app = (STATIC / "app.js").read_text(encoding="utf-8")
+        for token in (
+            'from "/static/activity.js"',
+            "renderActivity(run);",
+            "activityView(run.activity",
+            "activityPlacement(",
+            "startActivityTimer()",
+            "stopActivityTimer()",
+            "相关对象：",
+        ):
+            self.assertIn(token, app)
+
+    def test_wording_states_and_hard_rules_are_pinned(self) -> None:
+        source = self.activity()
+        for token in (
+            "暂无详细进度",
+            "暂无新更新",
+            "刚刚更新",
+            "已处理",
+            "updated_at",
+            "queued",
+            "waiting",
+            "busy",
+            "finished",
+            "最后活动",
+            "打开文档",
+            "重建模型",
+            "discover.open_document",
+            "discover.session_start",
+            "正在启动 SolidWorks",
+        ):
+            self.assertIn(token, source)
+        # No percentage figures in any rendered text (modulo arithmetic outside strings is
+        # fine), no forecasts, no HTML injection surface.
+        self.assertIsNone(re.search(r'"[^"\n]*%[^"\n]*"', source), "percent in double-quoted text")
+        self.assertIsNone(re.search(r"`[^`\n]*%[^`\n]*`", source), "percent in template text")
+        self.assertNotIn("预计", source)
+        self.assertNotIn("剩余", source)
+        self.assertNotIn("innerHTML", source)
+        app = (STATIC / "app.js").read_text(encoding="utf-8")
+        self.assertIn("buildActivityCard", app)
+        self.assertNotIn("innerHTML", app)
+
+
+class ActivityJsLogicTests(unittest.TestCase):
+    """Focused Node regression for the pure live-activity view helpers."""
+
+    @unittest.skipUnless(shutil.which("node"), "node is required to run the JS logic regression")
+    def test_activity_logic_regression(self) -> None:
+        script = ROOT / "tests" / "js" / "activity_logic_test.mjs"
+        result = subprocess.run(
+            [shutil.which("node"), str(script)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
+
+
+class FailureDisplayUiContractTests(unittest.TestCase):
+    """Terminal-failure summary: reported-finding counts, bounded collapsible evidence."""
+
+    def test_failure_summary_counts_are_findings_not_defects(self) -> None:
+        app = (STATIC / "app.js").read_text(encoding="utf-8")
+        for token in (
+            "不代表 CAD 缺陷",
+            "discovery.link_name_missing",
+            "并不代表 CAD 中不存在坐标系",
+            "不需要为每个供应商内部叶件单独添加坐标系",
+            "示例对象：",
+            "未读取到机器人名称",
+            "缺少机器人名称",
+        ):
+            self.assertIn(token, app)
+
+    def test_large_finding_groups_are_lazy_and_bounded(self) -> None:
+        app = (STATIC / "app.js").read_text(encoding="utf-8")
+        for token in (
+            "items.length <= 12",
+            "populated",
+            'section.addEventListener("toggle"',
+            "if (!knownRun) void refreshRuns();",
+        ):
+            self.assertIn(token, app)
+        # The eager pre-open that expanded hundreds of rows must stay gone.
+        self.assertNotIn("if (index === 0) section.open = true;", app)
+
+
 if __name__ == "__main__":
     unittest.main()

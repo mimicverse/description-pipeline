@@ -2,6 +2,7 @@
 // module only talks to the portal's own JSON API and the digest-verified artifact routes.
 import { buildJointControls, createViewer, disposeRobot, loadRobot } from "/static/viewer.js";
 import { menuAction, overlayRun, resolveDeleted, resolveTitle } from "/static/run_history.js";
+import { activityPlacement, activityView } from "/static/activity.js";
 
 const state = {
   csrf: null,
@@ -21,6 +22,7 @@ const state = {
   viewer: null,
   controls: null,
   timer: null,
+  activityTimer: null,
   retryingRunId: null,
   tabsInitializedFor: null,
   rerunningRunId: null,
@@ -383,6 +385,7 @@ function clearSession() {
   $("stage-rerun").hidden = true;
   if (state.timer) window.clearInterval(state.timer);
   state.timer = null;
+  stopActivityTimer();
   $("workspace").hidden = true;
   $("account").hidden = true;
   $("login-card").hidden = false;
@@ -930,6 +933,31 @@ function buildFailureCard(failure) {
       (failure.finding_total ? `（共 ${failure.finding_total} 项，逐项见下方问题清单，可展开查看）` : "");
     card.append(groups);
   }
+  if (Array.isArray(failure.finding_counts) && failure.finding_counts.length) {
+    const note = document.createElement("p");
+    note.className = "muted small";
+    note.textContent = "以上计数为平台报告发现与受影响实例，不代表 CAD 缺陷；逐项证据见下方问题清单（默认折叠）。";
+    card.append(note);
+    if (failure.finding_counts.some((group) => group && group.code === "discovery.link_name_missing")) {
+      const hint = document.createElement("p");
+      hint.className = "muted small";
+      hint.textContent =
+        "未识别刚体坐标系（discovery.link_name_missing）：记录表示刚体归属与命名尚未证明，并不代表 CAD 中不存在坐标系；" +
+        "处置方向为补齐交付定义与坐标系归属（由结构交付侧在原生工程中完成），" +
+        "不需要为每个供应商内部叶件单独添加坐标系。";
+      card.append(hint);
+      const samples = failure.finding_samples && Array.isArray(failure.finding_samples["discovery.link_name_missing"])
+        ? failure.finding_samples["discovery.link_name_missing"]
+        : [];
+      const objects = samples.map((row) => row && row.object).filter(Boolean).slice(0, 2);
+      if (objects.length) {
+        const sample = document.createElement("p");
+        sample.className = "muted small";
+        sample.textContent = `示例对象：${objects.join("、")}（完整清单见下方问题清单）`;
+        card.append(sample);
+      }
+    }
+  }
   if (failure.stage_name_zh) {
     const stage = document.createElement("p");
     stage.className = "muted small";
@@ -1085,6 +1113,117 @@ function updatePreviewLayout() {
   const has = Boolean(state.previewSubject);
   workspace.classList.toggle("has-preview", has);
   workspace.classList.toggle("no-preview", !has);
+}
+
+function stopActivityTimer() {
+  if (state.activityTimer) window.clearInterval(state.activityTimer);
+  state.activityTimer = null;
+}
+
+// Local 1 s ticker: only re-renders elapsed/freshness text; the network poll stays at 3 s and
+// a successful poll is never treated as liveness.
+function startActivityTimer() {
+  if (state.activityTimer) return;
+  state.activityTimer = window.setInterval(() => {
+    const run = state.lastRun;
+    if (!run || run.dag_run_id !== state.dagRunId) return;
+    if (run.state === "success" || run.state === "failed") return;
+    renderActivity(run);
+  }, 1000);
+}
+
+function buildActivityCard(view) {
+  const card = document.createElement("section");
+  card.className = `activity-card state-${view.state}`;
+  card.setAttribute("aria-label", "实时活动");
+  const head = document.createElement("div");
+  head.className = "activity-head";
+  const dot = document.createElement("span");
+  dot.className = `dot ${view.state === "busy" || view.state === "queued" ? "run" : "idle"}`;
+  const title = document.createElement("strong");
+  title.textContent = view.final ? "最后活动" : "实时活动";
+  const chip = document.createElement("span");
+  chip.className = `chip ${view.state === "busy" ? "running" : view.state === "queued" ? "queued" : "blocked"}`;
+  chip.textContent = view.stateText;
+  head.append(dot, title, chip);
+  if (view.stageText) {
+    const stage = document.createElement("span");
+    stage.className = "muted small";
+    stage.textContent = `阶段：${view.stageText}`;
+    head.append(stage);
+  }
+  card.append(head);
+  if (view.actionText) {
+    const action = document.createElement("p");
+    action.className = "activity-action";
+    action.textContent = view.actionText;
+    card.append(action);
+  }
+  if (view.objectText) {
+    const object = document.createElement("p");
+    object.className = "activity-object muted small";
+    object.textContent = view.final ? `相关对象：${view.objectText}` : `当前对象：${view.objectText}`;
+    card.append(object);
+  }
+  const metaParts = view.final
+    ? [view.freshnessText].filter(Boolean)
+    : [view.elapsedText, view.countsText, view.freshnessText].filter(Boolean);
+  if (metaParts.length) {
+    const meta = document.createElement("p");
+    meta.className = view.stale ? "activity-meta muted small stale" : "activity-meta muted small";
+    meta.textContent = metaParts.join("　•　");
+    card.append(meta);
+  }
+  if (view.note) {
+    const note = document.createElement("p");
+    note.className = "activity-note muted small";
+    note.textContent = view.note;
+    card.append(note);
+  }
+  if (view.recent.length) {
+    const list = document.createElement("ul");
+    list.className = "activity-recent";
+    for (const row of view.recent) {
+      const item = document.createElement("li");
+      const time = document.createElement("time");
+      time.textContent = row.timeText || "—";
+      const text = document.createElement("span");
+      text.textContent = row.object ? `${row.text} · ${row.object}` : row.text;
+      item.append(time, text);
+      list.append(item);
+    }
+    card.append(list);
+  }
+  return card;
+}
+
+function renderActivity(run) {
+  const overview = $("activity-overview");
+  const stageHost = $("activity-stage");
+  if (!overview || !stageHost) return;
+  overview.textContent = "";
+  stageHost.textContent = "";
+  if (!run || run.dag_run_id !== state.dagRunId) return;
+  const view = activityView(run.activity, { runState: run.state, nowMs: Date.now() });
+  if (view.visible) overview.append(buildActivityCard(view));
+  const selected = Array.isArray(state.stages) && Number.isInteger(state.selectedStage)
+    ? state.stages[state.selectedStage] || null
+    : null;
+  const mode = activityPlacement(view, {
+    stageId: selected ? selected.id : "",
+    stageRunning: Boolean(selected && selected.state === "running"),
+    stageFailed: Boolean(selected && selected.state === "failed"),
+  });
+  if (mode === "live" || mode === "final") {
+    stageHost.append(buildActivityCard(view));
+  } else if (mode === "note") {
+    const note = document.createElement("p");
+    note.className = "activity-note muted small";
+    note.textContent = view.state === "busy" && view.stageText && selected && view.stage !== selected.id
+      ? `当前活动阶段为「${view.stageText}」，此阶段暂无详细进度。`
+      : "此阶段暂无详细进度可用。";
+    stageHost.append(note);
+  }
 }
 
 function renderStepper() {
@@ -1429,6 +1568,7 @@ function renderRun(run) {
   state.selectedStage = chooseStageIndex(state.stages, runId);
   renderStepper();
   renderStageDetail();
+  renderActivity(run);
 
   const automatic = $("automatic");
   automatic.textContent = "";
@@ -1539,11 +1679,21 @@ function renderRun(run) {
   const codeLabels = new Map(
     ((failure && failure.finding_counts) || []).map((group) => [group.code, group.label_zh || group.code]),
   );
+  const findingNameValue = (finding) => {
+    const evidence = finding && finding.evidence && typeof finding.evidence === "object" ? finding.evidence : {};
+    const detail = evidence.detail && typeof evidence.detail === "object" ? evidence.detail : {};
+    const value = typeof detail.name === "string" ? detail.name.trim() : "";
+    return value || null;
+  };
   const renderFinding = (finding) => {
     const item = document.createElement("li");
     if (finding.severity && finding.severity !== "error") item.className = "warn";
     const message = document.createElement("div");
-    message.textContent = finding.message || "未提供说明";
+    // A missing robot name is not a malformed name; keep the two cases distinct.
+    message.textContent =
+      finding.id === "discovery.robot_name_invalid" && findingNameValue(finding) === null
+        ? "未读取到机器人名称（detail.name 为空）。"
+        : finding.message || "未提供说明";
     const context = document.createElement("div");
     context.className = "object";
     context.textContent = [finding.id, finding.stage, finding.object].filter(Boolean).join(" · ") || "—";
@@ -1580,12 +1730,29 @@ function renderRun(run) {
   orderedGroups.forEach(([code, items], index) => {
     const outer = document.createElement("li");
     const section = document.createElement("details");
-    if (index === 0) section.open = true;
     const header = document.createElement("summary");
-    header.textContent = `${codeLabels.get(code) || code}（${items.length} 项）`;
+    let groupLabel = codeLabels.get(code) || code;
+    if (code === "discovery.robot_name_invalid") {
+      const missing = items.filter((finding) => findingNameValue(finding) === null).length;
+      if (missing === items.length) groupLabel = "缺少机器人名称";
+    }
+    header.textContent = `${groupLabel}（${items.length} 项）`;
     const nested = document.createElement("ul");
     nested.className = "finding-group";
-    for (const finding of items) nested.append(renderFinding(finding));
+    // Bounded first paint: a large group renders its rows only when the operator opens it.
+    let populated = false;
+    const populate = () => {
+      if (populated) return;
+      populated = true;
+      for (const finding of items) nested.append(renderFinding(finding));
+    };
+    section.addEventListener("toggle", () => {
+      if (section.open) populate();
+    });
+    if (index === 0 && items.length <= 12) {
+      section.open = true;
+      populate();
+    }
     section.append(header, nested);
     outer.append(section);
     findings.append(outer);
@@ -1694,6 +1861,7 @@ async function poll() {
     if ((run.state === "success" || run.state === "failed") && jobDone && (!verified || state.previewSubject)) {
       if (state.timer) window.clearInterval(state.timer);
       state.timer = null;
+      stopActivityTimer();
     }
     const terminalNow = run.state === "success" || run.state === "failed";
     if (terminalNow && !(previous && (previous.state === "success" || previous.state === "failed"))) {
@@ -1714,6 +1882,7 @@ async function poll() {
       state.tabsInitializedFor = null;
       if (state.timer) window.clearInterval(state.timer);
       state.timer = null;
+      stopActivityTimer();
       $("retry-panel").hidden = true;
       showUploadView();
       await refreshRuns();
@@ -1727,6 +1896,7 @@ async function poll() {
 async function selectRun(dagRunId) {
   if (state.timer) window.clearInterval(state.timer);
   state.timer = null;
+  stopActivityTimer();
   clearPreview();
   state.dagRunId = dagRunId;
   state.lastRun = null;
@@ -1739,10 +1909,15 @@ async function selectRun(dagRunId) {
   setError($("retry-error"), "");
   showRunView();
   renderRunsList();
+  // A run opened from a stale list (deep link, another tab, freshly queued) still lands in the
+  // sidebar: refresh once when the selected id is not part of the cached page.
+  const knownRun = (state.runsList || []).some((item) => item && item.dag_run_id === dagRunId);
+  if (!knownRun) void refreshRuns();
   if (state.dagRunId !== dagRunId) return;
   state.timer = window.setInterval(() => {
     void poll();
   }, 3000);
+  startActivityTimer();
   await poll();
 }
 
@@ -1761,6 +1936,7 @@ async function retryRun() {
     await api(`/api/runs/${encodeURIComponent(dagRunId)}/retry`, { method: "POST", body: {} });
     if (state.dagRunId !== dagRunId) return;
     if (!state.timer) state.timer = window.setInterval(() => { void poll(); }, 3000);
+    startActivityTimer();
     await poll();
     await refreshRuns();
   } catch (error) {

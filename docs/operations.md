@@ -131,6 +131,18 @@ evidence are available in collapsed details. Without a verified URDF, the report
 uses the available workspace instead of reserving an empty preview pane.
 Generation-input inspection belongs to capture; it is not another operator step.
 
+During native work, the activity card shows the operation reported by the worker,
+the current CAD object, available item counts and the last progress update. Recent
+activity explains the work between boundary checks. A check count such as **1/3**
+means one of three checks passed; it is not a completion percentage. Item counts
+cover only the named operation and do not predict the remaining run time.
+
+Queued work, reported activity and a finished run have distinct states. If no new
+activity arrives, the page shows how old the last update is; successful polling
+does not prove that CAD is advancing, and silence does not prove it has stalled.
+Runs without recorded activity explicitly report that detailed progress is
+unavailable. A failed run retains its last activity and check diagnostics.
+
 A completed step requires its boundary checks to pass. Failed checks retain their
 diagnostics, and later steps show blocked. Checks whose prerequisites failed show
 not run. Each run records which steps actually ran; steps outside the run are
@@ -152,10 +164,15 @@ effects in the matching PR or controlled record.
 Use the affected CAD object, mate, configuration, property or specification
 reference shown in the result to locate the problem.
 
+Finding counts describe recorded observations, not a count of defective parts.
+One unresolved connection or ownership rule can affect many instances. Review
+the evidence before deciding whether the correction belongs in CAD or the reader;
+an unsupported native pattern is not proof of a mechanical design error.
+
 | Finding | Correction |
 |---|---|
 | Dependency, configuration or saved-state error | Repair and save the native engineering package |
-| Ambiguous body, joint, name or frame | Correct native connections, approved names and reference geometry |
+| Ambiguous body, joint, name or frame | Check native evidence coverage, then correct the reader or the unresolved engineering definition |
 | Zero, direction, limit or drive disagreement | Correct its mechanical definition or controlled specification |
 | Material, mass or inertia disagreement | Correct material assignments, scope or the documented physical source |
 | Independent verification disagreement | Trace the native evidence and generation rule; preserve the failed diagnostics |

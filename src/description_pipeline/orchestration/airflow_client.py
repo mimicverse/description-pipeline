@@ -61,6 +61,45 @@ _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 
+def _validate_activity_block(activity, label: str) -> None:
+    if activity is None:
+        return
+    if not isinstance(activity, dict):
+        raise EndpointProtocolError(f"job {label} must be an object when present")
+    if activity.get("phase") not in STAGE_IDS or not isinstance(activity.get("action"), str):
+        raise EndpointProtocolError(f"job {label} must carry a stage phase and an action")
+    for field in ("at", "started_at", "updated_at"):
+        if not isinstance(activity.get(field), str):
+            raise EndpointProtocolError(f"job {label} must carry {field}")
+    completed, total = activity.get("completed"), activity.get("total")
+    if (completed is not None or total is not None) and (
+        type(completed) is not int or type(total) is not int or completed < 0 or total < completed
+    ):
+        raise EndpointProtocolError(f"job {label} counts must be a non-negative completed/total pair")
+
+
+def _validate_activity(job: dict) -> None:
+    """The optional live-activity blocks must be shape-correct when present.
+
+    Activity is observation, so the blocks are optional; when an endpoint sends
+    them, the portal must be able to trust their shape before rendering.
+    """
+
+    _validate_activity_block(job.get("activity"), "activity")
+    _validate_activity_block(job.get("activity_final"), "activity_final")
+    history = job.get("activity_history")
+    if history is not None and not isinstance(history, list):
+        raise EndpointProtocolError("job activity_history must be a list when present")
+    if isinstance(history, list):
+        for entry in history:
+            if (
+                not isinstance(entry, dict)
+                or not isinstance(entry.get("at"), str)
+                or not isinstance(entry.get("code"), str)
+            ):
+                raise EndpointProtocolError("activity history entries must carry at and code")
+
+
 class EndpointError(RuntimeError):
     """Transport or protocol failure while talking to the execution endpoint."""
 
@@ -553,6 +592,7 @@ class WindowsEndpoint:
         for event in job["events"]:
             if not isinstance(event, dict) or any(key not in event for key in EVENT_KEYS):
                 raise EndpointProtocolError("Events must carry stage, state and timestamp")
+        _validate_activity(job)
         return job
 
     def get_preview(self, run_id: str) -> dict:
