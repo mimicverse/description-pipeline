@@ -277,6 +277,7 @@ class Jobs:
                     self._clear_activity(job)
                     self._save(job)
                 elif job["status"] == "queued":
+                    self.selection_locks[identifier] = threading.RLock()
                     self.queue.put(identifier)
             self.thread = threading.Thread(target=self._work, name="description-cad-queue", daemon=True)
             self.thread.start()
@@ -649,7 +650,7 @@ class Jobs:
                 if hashlib.file_digest(stream, "sha256").hexdigest() != expected:
                     raise RequestError("Transfer artifact differs from its bound digest", 409)
                 stream.seek(0)
-                return stream, path.stat().st_size
+                return stream, os.fstat(stream.fileno()).st_size
             except BaseException:
                 stream.close()
                 raise
@@ -1118,6 +1119,11 @@ class Jobs:
                 from ..steps import freeze_inputs
 
                 package = self._source_dir(job)
+                _require(
+                    job.get("main_assembly") == job["request"]["main_assembly"]
+                    and job["selection"]["manifest"]["main_assembly"] == job["request"]["main_assembly"],
+                    "The queued run's effective main assembly differs from its sealed selection",
+                )
                 verify_selection(
                     job["selection"]["manifest"],
                     job["request"]["upload_files"],

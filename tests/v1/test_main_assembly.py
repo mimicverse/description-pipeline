@@ -206,7 +206,7 @@ class MainAssemblyResumeTests(EndpointFixture, unittest.TestCase):
                     stored["selection"]["manifest"]["main_assembly"] = "cad/other.SLDASM"
                 ledger.write_text(json.dumps(stored, ensure_ascii=False), encoding="utf-8")
                 jobs = self.jobs(
-                    lambda *args, **kwargs: calls.append(args),
+                    lambda *args, calls=calls, **kwargs: calls.append(args),
                     native_reader=lambda *args, **kwargs: self.fail("discovery must not rerun"),
                 )
                 try:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import threading
 import unittest
+from unittest.mock import patch
 import uuid
 from pathlib import Path
 
@@ -191,6 +192,34 @@ class ResumeEndpointTests(EndpointFixture, unittest.TestCase):
         finished = self.await_terminal(resumed, request["run_id"])
         self.assertEqual(finished["status"], "failed")
         self.assertIn("重新开始", finished["error"])
+
+    def test_queued_freeze_restart_can_complete_its_definition_exchange(self) -> None:
+        jobs, parent = self.native_parent()
+        request = self.linked_request(parent, "freeze")
+        with patch.object(jobs.queue, "put"):
+            jobs.create(request)
+        jobs.close()
+        resumed = self.jobs()
+        waiting = self.wait_state_any_status(resumed, request["run_id"], {"awaiting_definition"})
+        self.assertEqual(waiting["status"], "awaiting_definition", waiting.get("error"))
+        self.complete_definition(resumed, request["run_id"])
+        finished = self.await_terminal(resumed, request["run_id"])
+        self.assertEqual(finished["status"], "native_complete", finished.get("error"))
+
+    def test_restarted_queue_revalidates_its_effective_selection(self) -> None:
+        jobs, parent = self.native_parent()
+        request = self.linked_request(parent, "capture")
+        with patch.object(jobs.queue, "put"):
+            jobs.create(request)
+        jobs.close()
+        ledger = self.config["state_root"] / "jobs" / (request["run_id"] + ".json")
+        stored = json.loads(ledger.read_text(encoding="utf-8"))
+        stored["main_assembly"] = None
+        write_json(ledger, stored)
+        resumed = self.jobs(lambda *args, **kwargs: self.fail("Mismatched queued selection must not capture"))
+        finished = self.await_terminal(resumed, request["run_id"])
+        self.assertEqual(finished["status"], "failed")
+        self.assertIn("effective main assembly", finished["error"])
 
 
 if __name__ == "__main__":
