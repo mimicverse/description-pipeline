@@ -625,6 +625,18 @@ def _entity_geometry_view(entity: dict, findings: list[dict], obj: str) -> dict 
                 )
                 return None
             return view
+        if usable_flat:
+            # A localized point cannot coexist with recorded face evidence of another kind:
+            # the shapes contradict each other, and merging them would invent a reference.
+            findings.append(
+                _finding(
+                    "discovery.mate_entities_unsupported",
+                    obj,
+                    "localized mate entity geometry contradicts recorded face evidence",
+                    {"kind": kind},
+                )
+            )
+            return None
         # A recorded point is a bare 3-vector, matching ``point_of`` and the existing API.
         view["point"] = values["point"]
         return view

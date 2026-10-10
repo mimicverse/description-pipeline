@@ -266,6 +266,33 @@ class GeometryFallbackTests(unittest.TestCase):
         self.assertEqual(findings, [])
         self.assertEqual(result["rank"], 1)
 
+    def test_localized_point_never_merges_with_recorded_face_evidence(self) -> None:
+        # A valid localized point beside a valid recorded plane is a contradictory shape and
+        # must block; only a recorded bare point of the same kind stays cross-checkable.
+        mixed = mate(
+            "重合20",
+            "coincident",
+            {
+                "component": "A",
+                "plane": {"normal": [0.0, 1.0, 0.0], "point": [0.0, 0.0, 0.0]},
+                **localized("point", point=[0.0, 0.0, 0.0]),
+            },
+            {"component": "B", "plane": {"normal": [0.0, 1.0, 0.0], "point": [0.0, 0.0, 0.0]}},
+        )
+        result, findings, _ = self.rows(mixed, [component("A"), component("B")])
+        self.assertIsNone(result)
+        self.assertIn("contradicts recorded face evidence", findings[0]["message"])
+
+        same_kind = mate(
+            "重合21",
+            "coincident",
+            {"component": "A", "point": [0.0, 0.0, 0.0], **localized("point", point=[0.0, 0.0, 0.0])},
+            {"component": "B", "plane": {"normal": [0.0, 1.0, 0.0], "point": [0.0, 0.0, 0.0]}},
+        )
+        result, findings, _ = self.rows(same_kind, [component("A"), component("B")])
+        self.assertEqual(findings, [])
+        self.assertEqual(result["rank"], 1)
+
     def test_malformed_or_nonlocal_provenance_blocks_and_cylinders_are_never_fabricated(self) -> None:
         cases = {
             "not-component-local": localized("plane", frame="mate-assembly", normal=[0, 1, 0], point=[0, 0, 0]),
