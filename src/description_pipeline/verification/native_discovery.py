@@ -47,7 +47,6 @@ TOL = 1e-6
 #: Conflict tolerances of the delivery contract: 0.05 mm and 0.05 degrees.
 _CONFLICT_POS_TOL_M = 5e-5
 _CONFLICT_ANGLE_EPS = 1.0 - math.cos(math.radians(0.05))
-_CONFLICT_PERP_EPS = math.sin(math.radians(0.05))
 #: Kinds a localized fallback may surface; a cylinder must exist as recorded face evidence.
 _LOCALIZED_KINDS = ("point", "line", "plane")
 
@@ -326,14 +325,34 @@ def _axis_entity(entity: dict) -> bool:
     return isinstance(entity.get("cylinder"), dict) or isinstance(entity.get("circle"), dict)
 
 
+def _malformed_recorded(entity: dict) -> bool:
+    """A present recorded primary that is unusable refuses the entity outright.
+
+    Recorded primaries are the flat faces (``plane``/``cylinder``/``circle``) and the
+    bare-list ``point``; ``None`` means absent.  A present value of any other shape is
+    malformed evidence: it must fail closed and never be silently substituted by
+    localized provenance.  Line references have no flat record by design.
+    """
+
+    for name in ("plane", "cylinder", "circle"):
+        value = entity.get(name)
+        if value is not None and not isinstance(value, dict):
+            return True
+    point = entity.get("point")
+    return point is not None and (not isinstance(point, (list, tuple)) or _finite_triple(point) is None)
+
+
 def _kind(entity: dict) -> str | None:
     """The entity's effective kind: recorded face first, then a licensed localization.
 
     Mirrors :func:`_geometry`'s resolution order so branch selection and geometry always
-    agree; a failed localization (``mate_entity_reference.error``) never supplies a kind.
+    agree; a failed localization (``mate_entity_reference.error``) never supplies a kind,
+    and a present-but-unusable recorded primary refuses the entity.
     """
 
-    for known in ("cylinder", "circle", "plane", "line"):
+    if _malformed_recorded(entity):
+        return None
+    for known in ("cylinder", "circle", "plane"):
         if isinstance(entity.get(known), dict):
             return known
     if isinstance(entity.get("point"), (list, tuple)):
@@ -341,10 +360,19 @@ def _kind(entity: dict) -> str | None:
     reference = entity.get("mate_entity_reference")
     if isinstance(reference, dict) and reference.get("error") is None:
         geometry = reference.get("geometry")
-        if isinstance(geometry, dict) and geometry.get("frame") == "component-local":
-            kind = str(geometry.get("kind") or "")
-            if kind in _LOCALIZED_KINDS or kind == "cylinder":
-                return kind
+        if isinstance(geometry, dict):
+            if geometry.get("frame") == "component-local":
+                kind = str(geometry.get("kind") or "")
+                if kind in _LOCALIZED_KINDS or kind == "cylinder":
+                    return kind
+            return None
+        if isinstance(entity.get("line"), dict):
+            # No localized geometry to validate: a stray flat line key remains
+            # last-resort evidence, exactly as the source's view consumes it.
+            return "line"
+        return None
+    if reference is None and isinstance(entity.get("line"), dict):
+        return "line"
     return None
 
 
@@ -352,8 +380,8 @@ def _recorded_geometry(entity: dict, frame):
     """Recorded face evidence in the assembly frame as ``(kind, point, direction)``.
 
     ``(None, None, None)`` means no recorded kind exists.  ``("invalid", None, None)``
-    means a recorded kind exists but is unusable: the caller must fail closed rather
-    than silently falling back to localized provenance.
+    means recorded evidence exists but is unusable: the caller must fail closed rather
+    than silently falling back to localized provenance.  Lines are never recorded flat.
     """
 
     def finish(kind: str, source, direction):
@@ -362,6 +390,8 @@ def _recorded_geometry(entity: dict, frame):
             return "invalid", None, None
         return kind, point, direction
 
+    if _malformed_recorded(entity):
+        return "invalid", None, None
     if isinstance(entity.get("cylinder"), dict):
         source = _finite_triple(entity["cylinder"].get("point"))
         return finish(
@@ -382,13 +412,6 @@ def _recorded_geometry(entity: dict, frame):
             "plane",
             source,
             _unit_vector(_apply_vector(entity["plane"].get("normal") or (), frame)),
-        )
-    if isinstance(entity.get("line"), dict):
-        source = _finite_triple(entity["line"].get("point"))
-        return finish(
-            "line",
-            source,
-            _unit_vector(_apply_vector(entity["line"].get("direction") or (), frame)),
         )
     if isinstance(entity.get("point"), (list, tuple)):
         source = _finite_triple(entity["point"])
@@ -532,19 +555,33 @@ def _geometry(entity: dict, frames):
     recorded_kind, point, direction = _recorded_geometry(entity, frame)
     if recorded_kind == "invalid":
         return None, None
+
+    def raw_line():
+        # A flat line key is not recorded evidence (records carry line references only
+        # through localization), so it can never override validated provenance; it is
+        # consumed as-is only when no localized geometry exists to validate.
+        value = entity.get("line")
+        if not isinstance(value, dict):
+            return None, None
+        source = _finite_triple(value.get("point"))
+        surface = _apply_point(source, frame) if source is not None else None
+        heading = _unit_vector(_apply_vector(value.get("direction") or (), frame))
+        if surface is None or heading is None or not all(math.isfinite(value) for value in surface):
+            return None, None
+        return surface, heading
+
     reference = entity.get("mate_entity_reference")
     if reference is None:
-        return (point, direction) if recorded_kind is not None else (None, None)
-    if not isinstance(reference, dict):
-        # Malformed provenance never blocks recorded face evidence.
-        return (point, direction) if recorded_kind is not None else (None, None)
-    if reference.get("error") is not None:
-        # A failed localization is never trusted; valid recorded face evidence stays primary.
+        return (point, direction) if recorded_kind is not None else raw_line()
+    if not isinstance(reference, dict) or reference.get("error") is not None:
+        # Malformed or failed provenance never blocks recorded face evidence; without
+        # recorded evidence the entity fails closed.
         return (point, direction) if recorded_kind is not None else (None, None)
     geometry = reference.get("geometry")
-    if geometry is None:
-        # No localized provenance: recorded face evidence stays the only source.
-        return (point, direction) if recorded_kind is not None else (None, None)
+    if not isinstance(geometry, dict):
+        # No localized geometry to validate: recorded evidence stays the source, and a
+        # stray flat line key remains last-resort evidence.
+        return (point, direction) if recorded_kind is not None else raw_line()
     values = _localized_values(geometry)
     if values is None:
         # Missing or malformed provenance never blocks recorded face evidence.
@@ -580,8 +617,31 @@ def _geometry(entity: dict, frames):
         if surface_direction is None or not all(math.isfinite(value) for value in surface_point):
             return None, None
         return surface_point, surface_direction
-    # A recorded face of another kind stays primary; the localized key is not consulted.
-    return point, direction
+    # A comparable localized reference that contradicts the recorded primary is refused.
+    return None, None
+
+
+def _rejected_entity(entity: dict, frames) -> bool:
+    """The source refuses an entity whose evidence cannot be validated; mirror that gate.
+
+    A present-but-unusable recorded primary, a comparable contradiction, or a required
+    localization that cannot be validated blocks the whole mate before branch selection,
+    so branches that never read geometry (lock, limitangle) cannot accept the mate.
+    """
+
+    if _malformed_recorded(entity):
+        return True
+    point, direction = _geometry(entity, frames)
+    if point is not None or direction is not None:
+        return False
+    reference = entity.get("mate_entity_reference")
+    if reference is None:
+        return False
+    if isinstance(reference, dict) and reference.get("error") is None:
+        geometry = reference.get("geometry")
+        if not isinstance(geometry, dict):
+            return False
+    return True
 
 
 def _rows_for(mate: dict, frames) -> dict | None:
@@ -594,6 +654,9 @@ def _rows_for(mate: dict, frames) -> dict | None:
     if len(entities) < 2:
         return None
     first, second = entities[0], entities[1]
+    for entity in (first, second):
+        if _rejected_entity(entity, frames):
+            return None
     limits = mate.get("limits") if isinstance(mate.get("limits"), dict) else None
     axes = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
     if kind == "lock":
@@ -784,13 +847,15 @@ def _rows_for(mate: dict, frames) -> dict | None:
         kinds = [_kind(first), _kind(second)]
         if "line" in kinds and "plane" in kinds:
             # A line parallel to a plane is one rotational freedom: the solved state must
-            # already show the line direction perpendicular to the plane normal.
+            # already show the line direction perpendicular to the plane normal within
+            # the module's solved-state tolerance (the 0.05-degree bound belongs to the
+            # face-evidence crosscheck only).
             line_entity, plane_entity = (first, second) if kinds[0] == "line" else (second, first)
             _line_point, line_direction = _geometry(line_entity, frames)
             _plane_point, plane_normal = _geometry(plane_entity, frames)
             if line_direction is None or plane_normal is None:
                 return None
-            if abs(_dot(line_direction, plane_normal)) > _CONFLICT_PERP_EPS:
+            if abs(_dot(line_direction, plane_normal)) > TOL:
                 return None
             pivot = _unit_vector(_cross(line_direction, plane_normal))
             if pivot is None:
