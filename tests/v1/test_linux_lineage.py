@@ -76,7 +76,9 @@ class LinuxLineageTests(TestCase):
         self.assertEqual(self.store.checkpoint_owner(GRANDCHILD, "capture"), self.run_id)
         self.assertEqual(self.store.checkpoint_owner(GRANDCHILD, "generate"), self.run_id)
         self.assertEqual(self.store.checkpoint_owner(GRANDCHILD, "verify"), GRANDCHILD)
-        self.assertEqual(self.store.checkpoint_receipt(CHILD, "generate"), self.store.receipt_path(self.run_id, "generate"))
+        self.assertEqual(
+            self.store.checkpoint_receipt(CHILD, "generate"), self.store.receipt_path(self.run_id, "generate")
+        )
         self.assertFalse(self.store.capture_dir(CHILD).exists())
 
     def test_missing_regenerated_output_never_falls_back_to_old_parent(self):
