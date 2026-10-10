@@ -644,7 +644,14 @@ def _frame_attachment(record: dict) -> dict:
             )
             continue
         others = [entity for entity in entities if entity.get("assembly_frame") is not True]
-        if len(entities) != 2 or len(flagged) != 1 or len(others) != 1:
+        raw_entities = mate.get("entities")
+        if (
+            not isinstance(raw_entities, list)
+            or len(raw_entities) != 2
+            or len(entities) != 2
+            or len(flagged) != 1
+            or len(others) != 1
+        ):
             problem(
                 "a frame-attached mate must carry exactly one frame entity and one occurrence entity",
                 {"mate": name, "entities": len(entities)},
@@ -1213,7 +1220,10 @@ def verify_discovery(package: Path) -> dict:
         )
         source_bodies = (state["robot"].get("source") or {}).get("bodies") or []
         body = next(
-            (item for item in source_bodies if {str(value) for value in (item.get("components") or [])} == set(material)),
+            (
+                item for item in source_bodies
+                if {str(value) for value in (item.get("components") or [])} == set(material)
+            ),
             None,
         )
         _require(
@@ -1375,7 +1385,8 @@ def verify_discovery(package: Path) -> dict:
             datum_name = str((body.get("frame") or {}).get("coordinate_system"))
             owners = _datum_owners(full, attached)
             owned = [
-                item for item in datums if str(item.get("owner") or "") in owners and str(item.get("name")) == datum_name
+                item for item in datums
+                if str(item.get("owner") or "") in owners and str(item.get("name")) == datum_name
             ]
             _require(
                 owned,

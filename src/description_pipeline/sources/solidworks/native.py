@@ -433,10 +433,7 @@ def _matches_assembly_root(reference, root, reference_full, reference_name, asse
     and the reference ``Name2`` must equal the root ``Name2``.  A bare name or
     basename match is never accepted.  ``IsRoot`` must read as exactly the
     boolean True: a readable False, a non-boolean value and an unreadable
-    reading all fail closed — the read-only root-signature probe on the frozen
-    production assembly (2026-10-10) showed the authoritative reading is
-    available as a native boolean on this API version, so no fallback is
-    justified.
+    reading all fail closed.
     """
 
     if root is None:
@@ -2616,8 +2613,7 @@ class SolidWorksBackend(CadBackend):
         assembly, the root object and the reference, equal reference/root
         ``Name2``, and ``IsRoot`` reading as exactly the boolean True (a
         readable False, a non-boolean value and an unreadable reading all fail
-        closed; the native root signature was verified by a read-only probe on
-        the frozen production assembly) — never from the reference name alone.
+        closed) — never from the reference name alone.
         An unproven same-document reference keeps failing closed with
         ``cad_mate_scope_ambiguous``; containment chains that repeat a document
         and occurrences holding the owning assembly's own document raise

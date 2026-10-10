@@ -1033,7 +1033,16 @@ class OracleSemanticsTests(unittest.TestCase):
             mate["entities"][0].update({"component": "", "assembly_frame": True})
             raw["mates"].append(mate)
 
-        for label, mutate in (("three_entities", three_entities), ("two_frame_entities", two_frame_entities)):
+        def malformed_extra_entity(raw, payload):
+            mate = frame_ground_mates()[0]
+            mate["entities"].append(None)
+            raw["mates"].append(mate)
+
+        for label, mutate in (
+            ("three_entities", three_entities),
+            ("two_frame_entities", two_frame_entities),
+            ("malformed_extra_entity", malformed_extra_entity),
+        ):
             with self.subTest(case=label):
                 package = self.baseline()
                 self._native(package, mutate)
