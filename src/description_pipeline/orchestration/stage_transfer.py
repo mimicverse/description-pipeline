@@ -16,6 +16,7 @@ import shutil
 import stat
 import tempfile
 import zipfile
+from contextlib import suppress
 from pathlib import Path
 
 from ..build.archive import write_zip
@@ -43,6 +44,12 @@ _READ_CHUNK = 1024 * 1024
 def _require(condition, message: str) -> None:
     if not condition:
         raise PipelineError(message)
+
+
+def _allowed_payload(name: str) -> bool:
+    """Only the archived input, the evidence snapshot and the three reports are payload."""
+
+    return name.startswith(("input/", "evidence/")) or name in _REQUIRED_REPORTS
 
 
 def _is_sha256(value) -> bool:
@@ -187,10 +194,17 @@ def seal_capture(
     _require(not archive.exists(), f"Transfer archive already exists: {archive}")
 
     files = inventory(root)
+    # The archive itself and the optional sidecar manifest are sealing outputs, never payload.
+    ignored = {CAPTURE_MANIFEST}
+    with suppress(ValueError):
+        ignored.add(archive.resolve().relative_to(root.resolve()).as_posix())
+    files = {name: checksum for name, checksum in files.items() if name not in ignored}
     _require(files, "Capture root contains no files to seal")
     _require(len(files) <= MAX_TRANSFER_FILES, "Capture exceeds the transfer file limit")
     total_bytes = sum(confined(root, name).stat().st_size for name in files)
     _require(total_bytes <= MAX_TRANSFER_BYTES, "Capture exceeds the transfer size limit")
+    stray = sorted(name for name in files if not _allowed_payload(name))
+    _require(not stray, f"Capture contains files outside the transfer payload: {stray[:5]}")
     for name in _REQUIRED_REPORTS:
         _require(name in files, f"Capture lacks required report: {name}")
     _require(any(name == "input" or name.startswith("input/") for name in files), "Capture lacks the archived input")
@@ -279,6 +293,8 @@ def _extract(archive: Path, staging: Path) -> dict:
                 not missing and not extra,
                 f"Transfer archive inventory differs from its manifest: missing={missing[:5]}, extra={extra[:5]}",
             )
+            stray = sorted(name for name in members if not _allowed_payload(name))
+            _require(not stray, f"Transfer contains members outside the capture payload: {stray[:5]}")
             _require(
                 manifest.get("file_count") == len(files),
                 "Transfer manifest file count differs from its inventory",
