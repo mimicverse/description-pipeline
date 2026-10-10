@@ -550,8 +550,9 @@ def _com_stubs():
 
 def _read(root: Path, app: _App, settings=None) -> dict:
     backend = SolidWorksBackend(session_factory=lambda: _Session(app))
+    resolved = {"main_assembly": "robot.SLDASM"} if settings is None else settings
     with _com_stubs():
-        return backend.discover_native(root, settings if settings is not None else {})
+        return backend.discover_native(root, resolved)
 
 
 def _mate(name, mate_type, entities, *, lower=0.0, upper=0.0, count=None, suppressed=False, error_code=0):
@@ -2145,13 +2146,11 @@ class PropertyContractTests(unittest.TestCase):
         # exact six-argument vendor signature with ResolvedFlag False.
         self.assertEqual(record["identity"]["hardware_id"], "m3.0")
         self.assertEqual(record["identity"]["revision"], "r1")
-        # Root selection probes the candidate marker once; the record then reads
-        # the identity again from the same six-argument by-ref contract.
+        # The record reads the identity once from the same six-argument by-ref
+        # contract; selection never probes document properties.
         self.assertEqual(
             manager.get6_calls,
             [
-                ("dp.hardware_id", False),
-                ("dp.revision", False),
                 ("dp.hardware_id", False),
                 ("dp.revision", False),
             ],
@@ -2272,9 +2271,9 @@ class PropertyContractTests(unittest.TestCase):
 
 
 class MainAssemblySelectionTests(unittest.TestCase):
-    """Root selection: declared identity first, otherwise a unique graph root."""
+    """Explicit selection or a sole frozen assembly; ambiguity never opens CAD."""
 
-    def _delivery_scene(self, root: Path, name: str, *, marker: bool):
+    def _delivery_scene(self, root: Path, name: str):
         stem = name.split(".", 1)[0]
         base = _write(root, f"{stem}-base.SLDPRT")
         component = _Component("base-1", base)
@@ -2285,51 +2284,48 @@ class MainAssemblySelectionTests(unittest.TestCase):
         )
         group = _Feature("MateGroup", "MateGroup", first_sub=seat)
         assembly = _write(root, name)
-        properties = {"dp.hardware_id": "m3.0", "dp.delivery_configuration": "Default"} if marker else {}
+        properties = {"dp.hardware_id": "m3.0", "dp.delivery_configuration": "Default"}
         doc = _Doc(assembly, first_feature=group, children=[component], properties=properties)
         return assembly, doc
 
-    def test_declared_marker_wins_over_broken_unreferenced_assembly(self) -> None:
+    @staticmethod
+    def _unreachable_session_backend() -> SolidWorksBackend:
+        def _raise():  # pragma: no cover - the session must never be requested
+            raise AssertionError("a CAD session must not be started")
+
+        return SolidWorksBackend(session_factory=_raise)
+
+    def test_sole_assembly_is_accepted_without_a_selection(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            assembly, doc = self._delivery_scene(root, "robot.SLDASM", marker=True)
-            spare = _write(root, "spare.SLDASM")
-            app = _App(
-                {assembly: doc, spare: _Doc(spare, doc_type=2)},
-                open_errors={spare: 2},
-                not_preopened={spare},
-            )
+            assembly, doc = self._delivery_scene(root, "robot.SLDASM")
 
-            record = _read(root, app)
+            record = _read(root, _App({assembly: doc}), {})
 
             self.assertEqual(record["identity"]["main_assembly"], "robot.SLDASM")
             self.assertEqual(record["identity"]["hardware_id"], "m3.0")
-            self.assertEqual(record["identity"]["delivery_configuration"], "Default")
+            self.assertEqual({"mode": "sole_candidate", "main_assembly": "robot.SLDASM"}, record["selection"])
 
-    def test_unmarked_multiple_roots_fail_with_actionable_ambiguity(self) -> None:
+    def test_several_assemblies_require_a_selection_before_any_session(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            first = _write(root, "aaa.SLDASM")
-            second = _write(root, "zzz.SLDASM")
-            app = _App({first: _Doc(first, doc_type=2), second: _Doc(second, doc_type=2)})
+            _write(root, "aaa.SLDASM")
+            _write(root, "zzz.SLDASM")
 
             with self.assertRaises(CadError) as caught:
-                _read(root, app)
+                self._unreachable_session_backend().discover_native(root, {})
 
             error = caught.exception
             self.assertEqual(error.code, "native_discovery_main_assembly_ambiguous")
-            self.assertEqual(
-                sorted(os.path.basename(entry) for entry in error.detail["unreferenced"]),
-                ["aaa.SLDASM", "zzz.SLDASM"],
-            )
-            self.assertIn("dp.hardware_id", error.message)
+            self.assertEqual(error.detail["candidates"], ["aaa.SLDASM", "zzz.SLDASM"])
+            self.assertIn("select the delivered main assembly", error.message)
 
-    def test_two_marked_assemblies_fail_as_ambiguous(self) -> None:
+    def test_declared_markers_do_not_select_a_main_assembly(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
+            marker = {"dp.hardware_id": "m3.0", "dp.delivery_configuration": "Default"}
             first = _write(root, "first.SLDASM")
             second = _write(root, "second.SLDASM")
-            marker = {"dp.hardware_id": "m3.0", "dp.delivery_configuration": "Default"}
             app = _App(
                 {
                     first: _Doc(first, doc_type=2, properties=dict(marker)),
@@ -2338,14 +2334,21 @@ class MainAssemblySelectionTests(unittest.TestCase):
             )
 
             with self.assertRaises(CadError) as caught:
-                _read(root, app)
+                _read(root, app, {})
 
             error = caught.exception
             self.assertEqual(error.code, "native_discovery_main_assembly_ambiguous")
-            self.assertEqual(
-                sorted(os.path.basename(entry) for entry in error.detail["marked"]),
-                ["first.SLDASM", "second.SLDASM"],
-            )
+            self.assertEqual(error.detail["candidates"], ["first.SLDASM", "second.SLDASM"])
+
+    def test_no_assembly_fails_before_any_session(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write(root, "base.SLDPRT")
+
+            with self.assertRaises(CadError) as caught:
+                self._unreachable_session_backend().discover_native(root, {})
+
+            self.assertEqual(caught.exception.code, "native_discovery_assembly_missing")
 
     def test_marked_main_must_pass_the_strict_open_with_diagnostics(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -2420,15 +2423,6 @@ class MainAssemblySelectionTests(unittest.TestCase):
             self.assertEqual(caught.exception.detail["errors"], 2)
             self.assertNotIn("unresolved_references", caught.exception.detail)
 
-    def test_single_unmarked_assembly_is_still_selected(self) -> None:
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            assembly, doc = self._delivery_scene(root, "robot.SLDASM", marker=False)
-
-            record = _read(root, _App({assembly: doc}))
-
-            self.assertEqual(record["identity"]["main_assembly"], "robot.SLDASM")
-
     def test_unreadable_open_status_blocks_the_selected_root(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2467,50 +2461,6 @@ class MainAssemblySelectionTests(unittest.TestCase):
             error = caught.exception
             self.assertEqual(error.code, "cad_document_open_failed")
             self.assertEqual(error.detail["errors"], 2)
-
-    def test_partial_candidate_graph_blocks_unique_root_selection(self) -> None:
-        class _UnreadableGraph(_Doc):
-            def GetComponents(self, _ignored):
-                raise RuntimeError("graph unreadable")
-
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            first = _write(root, "aaa.SLDASM")
-            second = _write(root, "zzz.SLDASM")
-            app = _App({first: _Doc(first, doc_type=2), second: _UnreadableGraph(second, doc_type=2)})
-
-            with self.assertRaises(CadError) as caught:
-                _read(root, app)
-
-            error = caught.exception
-            self.assertEqual(error.code, "native_discovery_main_assembly_ambiguous")
-            self.assertEqual(
-                [os.path.basename(entry) for entry in error.detail["incomplete_graph"]],
-                ["zzz.SLDASM"],
-            )
-
-    def test_unreadable_identity_blocks_a_declared_main_selection(self) -> None:
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            assembly, doc = self._delivery_scene(root, "robot.SLDASM", marker=True)
-            extra = _write(root, "extra.SLDASM")
-            extra_doc = _Doc(
-                extra,
-                doc_type=2,
-                scope_managers={"": _PropertyManager({}, get_names_error=RuntimeError("no scope"))},
-            )
-            app = _App({assembly: doc, extra: extra_doc})
-
-            with self.assertRaises(CadError) as caught:
-                _read(root, app)
-
-            error = caught.exception
-            self.assertEqual(error.code, "native_discovery_main_assembly_ambiguous")
-            self.assertEqual(
-                [os.path.basename(entry) for entry in error.detail["unreadable_identity"]],
-                ["extra.SLDASM"],
-            )
-
 
 class EntityGeometryTests(unittest.TestCase):
     """The reader decodes real surface/curve/vertex primitives, never heuristics."""
@@ -2802,8 +2752,9 @@ class ExplicitSelectionTests(unittest.TestCase):
             root = Path(tmp)
             app, _assembly, _decoy = self._scene(root)
             with self.assertRaises(CadError) as caught:
-                _read(root, app)
+                _read(root, app, {})
             self.assertEqual("native_discovery_main_assembly_ambiguous", caught.exception.code)
+            self.assertEqual(caught.exception.detail["candidates"], ["decoy.SLDASM", "robot.SLDASM"])
 
     def test_invalid_and_missing_selections_fail_before_any_session(self) -> None:
         with TemporaryDirectory() as tmp:

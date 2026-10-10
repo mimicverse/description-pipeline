@@ -41,7 +41,7 @@ def _scene(root: Path, count: int = 1):
 def _discover(root: Path, app, callback=None):
     backend = SolidWorksBackend(session_factory=lambda: _Session(app))
     with _com_stubs():
-        return backend.discover_native(root, {}, on_activity=callback)
+        return backend.discover_native(root, {"main_assembly": "robot.SLDASM"}, on_activity=callback)
 
 
 class ActivityObjectTests(unittest.TestCase):
@@ -100,7 +100,6 @@ class ActivityEmissionTests(unittest.TestCase):
 
             for expected in (
                 "session_start",
-                "scan_documents",
                 "read_document_state",
                 "read_components",
                 "read_mates",

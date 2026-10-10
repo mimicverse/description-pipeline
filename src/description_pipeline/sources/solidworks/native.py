@@ -1901,8 +1901,8 @@ class SolidWorksBackend(CadBackend):
         """Open a document read-only in the owned application.
 
         Returns ``(doc, errors, warnings)`` and leaves CAD-reported open errors
-        to the caller: :meth:`open_document` applies the strict gate, while
-        root selection records them per candidate.
+        to the caller: :meth:`open_document` applies the strict gate, while the
+        main-assembly open records them for the selected document.
         """
 
         import pythoncom
@@ -3196,7 +3196,7 @@ class SolidWorksBackend(CadBackend):
         }
 
     def _probe_document(self, path):
-        """Collect one candidate for root selection without strict gating.
+        """Open the selected assembly without strict gating.
 
         Documents already open in the owned session are reused.  Otherwise the
         read-only open is attempted and its CAD-reported errors are recorded
@@ -3215,7 +3215,7 @@ class SolidWorksBackend(CadBackend):
             return {"doc": doc, "errors": 0, "warnings": 0, "open_exception": None, "already_open": True}
         try:
             doc, errors, warnings = self._open_document_raw(path)
-        except Exception as exc:  # noqa: BLE001 - per-candidate failure is recorded, not fatal
+        except Exception as exc:  # noqa: BLE001 - a per-open failure is recorded, not fatal
             return {
                 "doc": None,
                 "errors": None,
@@ -3237,114 +3237,12 @@ class SolidWorksBackend(CadBackend):
             "already_open": False,
         }
 
-    def _identity_marker(self, doc):
-        """Declared-main marker from the candidate's active configuration.
-
-        ``dp.hardware_id`` plus ``dp.delivery_configuration`` identify the
-        delivered assembly; both must be recorded, merged across the document
-        and active-configuration scopes exactly as the main record reads them.
-        Returns ``(marker, unreadable)``: an open document whose properties
-        cannot be read is not the same as an unmarked document, and selection
-        must never silently default between the two.
-        """
-
-        if doc is None:
-            return None, False
-        try:
-            _manager, active = _active_configuration_view(doc)
-            configuration = str(_member(active, "Name") or "")
-        except Exception:  # noqa: BLE001 - an unreadable identity is reported, not defaulted
-            return None, True
-        try:
-            values = _custom_properties(doc, configuration or None)
-        except Exception:  # noqa: BLE001 - an unreadable identity is reported, not defaulted
-            return None, True
-        hardware = values.get("dp.hardware_id")
-        delivery = values.get("dp.delivery_configuration")
-        if _is_text_name(hardware) and _is_text_name(delivery):
-            return {"hardware_id": str(hardware).strip(), "delivery_configuration": str(delivery).strip()}, False
-        return None, False
-
-    def _candidate_entry(self, path):
-        """One candidate entry: opened document plus its declared-identity reading."""
+    def _main_entry(self, path):
+        """The selected assembly opened read-only; per-open failures are recorded."""
 
         entry = self._probe_document(str(path))
         entry["path"] = path
-        entry["marker"], entry["identity_unreadable"] = self._identity_marker(entry.get("doc"))
         return entry
-
-    @staticmethod
-    def _select_main_assembly(entries, referenced):
-        """Choose the delivered assembly: declared marker first, else unique root.
-
-        A single candidate carrying the ``dp.hardware_id`` and
-        ``dp.delivery_configuration`` marker is the declared delivery and
-        cannot be displaced by broken or unreferenced extra documents.  Only a
-        demonstrable selection is accepted: an open document whose identity or
-        graph cannot be read is never silently treated as absent, and without a
-        marker the graph must be complete and show exactly one unreferenced
-        candidate.  Anything else is an actionable ambiguity, never a name,
-        size or order heuristic.
-        """
-
-        marked = [entry for entry in entries if entry.get("marker")]
-        if len(marked) > 1:
-            raise CadError(
-                "native_discovery_main_assembly_ambiguous",
-                "several assemblies declare a delivery identity; keep one marked top-level assembly",
-                {
-                    "candidates": [str(entry["path"]) for entry in entries],
-                    "marked": [str(entry["path"]) for entry in marked],
-                },
-            )
-        unreadable = [entry for entry in entries if entry.get("identity_unreadable")]
-        if len(marked) == 1:
-            if unreadable:
-                raise CadError(
-                    "native_discovery_main_assembly_ambiguous",
-                    "the declared delivery identity cannot be verified; some candidate properties could not be read",
-                    {
-                        "candidates": [str(entry["path"]) for entry in entries],
-                        "unreadable_identity": [str(entry["path"]) for entry in unreadable],
-                    },
-                )
-            marked[0]["selection_mode"] = "marker"
-            return marked[0]
-        if len(entries) == 1:
-            entries[0]["selection_mode"] = "sole_candidate"
-            return entries[0]
-        if unreadable:
-            raise CadError(
-                "native_discovery_main_assembly_ambiguous",
-                "no delivery identity could be read; some candidate properties could not be read",
-                {
-                    "candidates": [str(entry["path"]) for entry in entries],
-                    "unreadable_identity": [str(entry["path"]) for entry in unreadable],
-                },
-            )
-        incomplete = [entry for entry in entries if not entry.get("graph_readable")]
-        if incomplete:
-            raise CadError(
-                "native_discovery_main_assembly_ambiguous",
-                "the assembly graph is incomplete; an unreadable candidate could hide the delivered assembly",
-                {
-                    "candidates": [str(entry["path"]) for entry in entries],
-                    "incomplete_graph": [str(entry["path"]) for entry in incomplete],
-                },
-            )
-        roots = [entry for entry in entries if normalize_document_path(str(entry["path"])) not in referenced]
-        if len(roots) == 1:
-            roots[0]["selection_mode"] = "unique_root"
-            return roots[0]
-        raise CadError(
-            "native_discovery_main_assembly_ambiguous",
-            "no unique delivered assembly; mark the top with dp.hardware_id and "
-            "dp.delivery_configuration or keep one top-level assembly",
-            {
-                "candidates": [str(entry["path"]) for entry in entries],
-                "unreferenced": [str(entry["path"]) for entry in roots],
-            },
-        )
 
     def discover_native(self, frozen_source: Path, settings: dict, *, on_activity=None) -> dict:
         """Read the raw native record for CAD-only discovery (owned session).
@@ -3355,13 +3253,11 @@ class SolidWorksBackend(CadBackend):
         mate features with component-frame entity geometry, coordinate systems
         (assembly and component scope), materials/masses and per-document
         hashes.  Every read fails closed; nothing is defaulted.  The delivered
-        assembly is selected by a declared ``dp`` identity marker first and
-        otherwise by a unique unreferenced graph root; per-candidate open
-        errors are collected per document, and only the selected assembly
-        gates the run.  An explicit ``main_assembly`` in ``settings`` is
-        authoritative: exactly that frozen entry is opened (without scanning
-        unrelated candidates) and the default marker/unique-root selection is
-        skipped.
+        assembly is named by ``settings["main_assembly"]``; without one, a
+        frozen directory holding exactly one ``.SLDASM`` is accepted as the
+        sole candidate, while zero or several assemblies fail with an
+        actionable selection error before any CAD session starts.  Exactly the
+        selected frozen entry is opened read-only and only it gates the run.
 
         Mate entities that lie on the owning assembly's own reference geometry
         (assembly planes/axes) are recorded with ``component`` equal to that
@@ -3415,6 +3311,7 @@ class SolidWorksBackend(CadBackend):
                 {"main_assembly": repr(selection)},
             )
         selected_path = None
+        selection_mode = None
         if selection is not None:
             from ...io import artifact_path_parts, confined
 
@@ -3452,58 +3349,39 @@ class SolidWorksBackend(CadBackend):
                     "the selected main assembly is not present in the frozen engineering directory",
                     {"main_assembly": selection},
                 )
+            selection_mode = "explicit"
+        else:
+            candidates = sorted(
+                path
+                for path in source_root.rglob("*")
+                if path.suffix.lower() == ".sldasm" and not path.name.startswith("~$") and path.is_file()
+            )
+            if not candidates:
+                raise CadError(
+                    "native_discovery_assembly_missing", "no SolidWorks assembly in the engineering directory"
+                )
+            if len(candidates) > 1:
+                raise CadError(
+                    "native_discovery_main_assembly_ambiguous",
+                    "several assemblies are present; select the delivered main assembly before the CAD session",
+                    {"candidates": [path.relative_to(source_root).as_posix() for path in candidates]},
+                )
+            selected_path = candidates[0]
+            selection_mode = "sole_candidate"
         activity.emit("session_start", force=True)
         with self.session():
-            if selected_path is not None:
-                # The operator named the delivered assembly: open exactly that frozen
-                # entry (no unrelated candidate scan); every engineering check below
-                # is unchanged.
-                activity.emit("open_document", current_object=_activity_object(selected_path, source_root), force=True)
-                main_entry = self._candidate_entry(selected_path)
-                main_entry["selection_mode"] = "explicit"
-            else:
-                candidates = sorted(
-                    path
-                    for path in source_root.rglob("*")
-                    if path.suffix.lower() == ".sldasm" and not path.name.startswith("~$") and path.is_file()
-                )
-                if not candidates:
-                    raise CadError(
-                        "native_discovery_assembly_missing", "no SolidWorks assembly in the engineering directory"
-                    )
-                entries = []
-                for index, candidate in enumerate(candidates):
-                    activity.emit(
-                        "scan_documents",
-                        current_object=_activity_object(candidate, source_root),
-                        completed=index,
-                        total=len(candidates),
-                        force=True,
-                    )
-                    entries.append(self._candidate_entry(candidate))
-                activity.emit("scan_documents", completed=len(candidates), total=len(candidates), force=True)
-                referenced = set()
-                for entry in entries:
-                    doc = entry.get("doc")
-                    entry["graph_readable"] = doc is not None
-                    if doc is None:
-                        continue
-                    try:
-                        for component in _assembly_components(doc):
-                            path = _method(_component(component), "GetPathName")
-                            if _is_text_name(path):
-                                referenced.add(normalize_document_path(str(path)))
-                    except Exception:  # noqa: BLE001 - a partial candidate graph is tracked, not defaulted
-                        entry["graph_readable"] = False
-                        continue
-                main_entry = self._select_main_assembly(entries, referenced)
+            # Exactly the selected frozen entry is opened; zero or several
+            # assemblies already failed before this session started.
+            activity.emit("open_document", current_object=_activity_object(selected_path, source_root), force=True)
+            main_entry = self._main_entry(selected_path)
+            main_entry["selection_mode"] = selection_mode
             main_path = main_entry["path"]
             errors = main_entry.get("errors")
             warnings = main_entry.get("warnings")
             if main_entry.get("already_open"):
                 # A document already open in the owned session may have been
-                # loaded as a transitive dependency of another candidate; only
-                # a fresh exact-root open reports this document's own status.
+                # loaded as a transitive dependency of another document; only a
+                # fresh exact-root open reports this document's own status.
                 try:
                     doc, raw_errors, raw_warnings = self._open_document_raw(str(main_path))
                 except Exception as exc:  # noqa: BLE001 - reported as the strict open failure
@@ -3542,7 +3420,6 @@ class SolidWorksBackend(CadBackend):
             exporter_block = _urdf_exporter_attribute(self._app_obj(), doc, source_root, configuration)
             activity.emit("read_properties", current_object=_activity_object(main_path, source_root), force=True)
             identity_properties = _custom_properties(doc, configuration)
-            entries = None
             doc = active = None
             components = []
             by_component = {}
