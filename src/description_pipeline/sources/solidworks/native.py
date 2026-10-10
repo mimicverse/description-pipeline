@@ -1207,6 +1207,59 @@ def _relative_document(path_value, source_root):
         return None
 
 
+def _solver_observation(component, defining_document, source_root, *, configuration, scope):
+    """Context-bound solver readings for one occurrence (diagnostics only).
+
+    The documented ``IComponent2.Solving`` property and
+    ``IComponent2.GetConstrainedStatus()`` method are recorded with their enum
+    families and the context the occurrence was read in: the *defining*
+    document, its configuration and the occurrence scope.  That context is kept
+    distinct from the occurrence's referenced child configuration and from
+    ``IsFixed``.  An unavailable or non-integer reading is preserved explicitly
+    as ``value: None`` plus an error string — never coerced to ``False`` or
+    ``0``, never defaulted, and never a capture failure.
+    """
+
+    def relative_document(value) -> str:
+        found = _relative_document(value, source_root)
+        if found is not None:
+            return found
+        return normalize_document_path(str(value)) if _is_text_name(value) else ""
+
+    def reading(method: str, family: str, read) -> dict:
+        try:
+            value = read()
+        except Exception as error:  # noqa: BLE001 - a diagnostic read must not fail the capture
+            return {
+                "method": method,
+                "family": family,
+                "value": None,
+                "error": f"{type(error).__name__}: {error}"[:200],
+            }
+        if type(value) is int:
+            return {"method": method, "family": family, "value": value, "error": None}
+        return {
+            "method": method,
+            "family": family,
+            "value": None,
+            "error": f"non-integer reading: {type(value).__name__}: {value!r}"[:200],
+        }
+
+    return {
+        "context": {
+            "document": relative_document(defining_document),
+            "configuration": str(configuration or ""),
+            "scope": str(scope or ""),
+        },
+        "solving": reading("IComponent2.Solving", "swComponentSolvingOption_e", lambda: _member(component, "Solving")),
+        "constrained_status": reading(
+            "IComponent2.GetConstrainedStatus",
+            "swConstrainedStatus_e",
+            lambda: _method(component, "GetConstrainedStatus"),
+        ),
+    }
+
+
 class SolidWorksBackend(CadBackend):
     name = "solidworks"
 
@@ -2892,6 +2945,17 @@ class SolidWorksBackend(CadBackend):
         The block is additive evidence: the existing plane/cylinder/circle/point
         keys and every derivation consumer are unchanged by it, so recorded
         geometry gaps are not resolved until a consumer update is reviewed.
+        Every component occurrence additionally carries ``solver_observation``:
+        the configuration-bound ``IComponent2.Solving`` (family
+        ``swComponentSolvingOption_e``) and ``IComponent2.GetConstrainedStatus``
+        (family ``swConstrainedStatus_e``) readings, each with its method
+        provenance, plus the defining document, its configuration and the
+        occurrence scope the reading was taken in — distinct from the
+        occurrence's referenced child configuration and from ``IsFixed``.
+        These readings are diagnostics for unproven bodies: they change no
+        grouping, mass, axis, limit or gate derivation, and an unavailable or
+        unreadable reading is preserved explicitly (``value: None`` plus
+        ``error``) without failing the capture.
         """
 
         source_root = Path(frozen_source).resolve()
@@ -3090,6 +3154,13 @@ class SolidWorksBackend(CadBackend):
                         "lightweight": None,
                         "transform": transform,
                     }
+                    entry["solver_observation"] = _solver_observation(
+                        component,
+                        assembly_path,
+                        source_root,
+                        configuration=referenced_configuration,
+                        scope=prefix,
+                    )
                     notes.append(f"lightweight:{path_name}:unsupported_declared")
                     components.append(entry)
                     # Keep primitives beyond this traversal scope. Later

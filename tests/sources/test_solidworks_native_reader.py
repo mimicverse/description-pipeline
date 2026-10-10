@@ -30,6 +30,7 @@ from unittest.mock import Mock
 from description_pipeline.geometry.stl import read as read_stl
 from description_pipeline.sources.solidworks.errors import CadError
 from description_pipeline.sources.solidworks.isolation import CadSession
+from description_pipeline.sources.solidworks.jsonio import read_json, write_json
 from description_pipeline.sources.solidworks.native import (
     SolidWorksBackend,
     normalize_document_path,
@@ -1018,6 +1019,147 @@ class ProducerContextTests(unittest.TestCase):
                 {"sub-a": "sub-a/arm-1", "sub-b": "sub-b/arm-1"},
                 msg="a shared leaf name must resolve through its occurrence path, never by leaf name alone",
             )
+
+
+class SolverObservationTests(unittest.TestCase):
+    """Context-bound solver readings: provenance, context binding, explicit unknowns."""
+
+    def test_solver_observation_binds_defining_context_and_keeps_reference_distinct(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            arm_path = _write(root, "arm.SLDPRT")
+            sub_path = _write(root, "sub.SLDASM")
+            assembly = _write(root, "robot.SLDASM")
+            arm_doc = _Doc(arm_path)
+            arm_component = _Component("arm-1", arm_path, doc=arm_doc)
+            arm_component.Solving = 1
+            arm_component.GetConstrainedStatus = lambda: 2
+            sub_doc = _Doc(
+                sub_path,
+                children=[arm_component],
+                configuration="Sub",
+                configuration_children={"Sub": [arm_component]},
+            )
+            sub_component = _Component("sub-1", sub_path, children=[arm_component], doc=sub_doc, configuration="Sub")
+            sub_component.Solving = 0
+            sub_component.GetConstrainedStatus = lambda: 3
+            main_doc = _Doc(assembly, children=[sub_component], configuration="Parent")
+
+            record = _read(root, _App({assembly: main_doc, sub_path: sub_doc, arm_path: arm_doc}))
+            entries = {item["name2"]: item for item in record["components"]}
+
+            top = entries["sub-1"]
+            # The referenced child configuration stays untouched and separate.
+            self.assertEqual(top["configuration"], "Sub")
+            self.assertIs(top["fixed"], False)
+            self.assertEqual(
+                top["solver_observation"]["context"],
+                {"document": "robot.SLDASM", "configuration": "Parent", "scope": ""},
+            )
+            self.assertEqual(
+                top["solver_observation"]["solving"],
+                {"method": "IComponent2.Solving", "family": "swComponentSolvingOption_e", "value": 0, "error": None},
+            )
+            self.assertEqual(
+                top["solver_observation"]["constrained_status"],
+                {
+                    "method": "IComponent2.GetConstrainedStatus",
+                    "family": "swConstrainedStatus_e",
+                    "value": 3,
+                    "error": None,
+                },
+            )
+
+            nested = entries["sub-1/arm-1"]
+            self.assertEqual(
+                nested["solver_observation"]["context"],
+                {"document": "sub.SLDASM", "configuration": "Sub", "scope": "sub-1"},
+            )
+            self.assertEqual(nested["solver_observation"]["solving"]["value"], 1)
+            self.assertEqual(nested["solver_observation"]["constrained_status"]["value"], 2)
+
+    def test_solver_observation_keeps_status_three_and_fixed_distinct(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            wrench = _write(root, "wrench.SLDPRT")
+            grounded = _Component("base-1", base)
+            grounded.IsFixed = True
+            grounded.Solving = 0
+            grounded.GetConstrainedStatus = lambda: 3
+            free = _Component("wrench-1", wrench)
+            free.IsFixed = False
+            free.Solving = 0
+            free.GetConstrainedStatus = lambda: 3
+            assembly = _write(root, "robot.SLDASM")
+            doc = _Doc(assembly, children=[grounded, free])
+
+            record = _read(root, _App({assembly: doc}))
+            entries = {item["name2"]: item for item in record["components"]}
+
+            self.assertIs(entries["base-1"]["fixed"], True)
+            self.assertIs(entries["wrench-1"]["fixed"], False)
+            # Equal solver status does not collapse the fixed distinction and the
+            # observation never overwrites the recorded IsFixed value.
+            self.assertEqual(entries["base-1"]["solver_observation"]["constrained_status"]["value"], 3)
+            self.assertEqual(entries["wrench-1"]["solver_observation"]["constrained_status"]["value"], 3)
+
+    def test_solver_observation_preserves_unreadable_readings_without_failing(self) -> None:
+        class _RaisingSolving(_Component):
+            @property
+            def Solving(self):
+                raise RuntimeError("native property unavailable")
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            part = _write(root, "part.SLDPRT")
+            raising = _RaisingSolving("raising-1", part)
+            raising.GetConstrainedStatus = _raiser(RuntimeError("status read failed"))
+            junk = _Component("junk-1", part)
+            junk.Solving = "not-an-int"
+            junk.GetConstrainedStatus = lambda: None
+            missing = _Component("missing-1", part)
+            assembly = _write(root, "robot.SLDASM")
+            doc = _Doc(assembly, children=[raising, junk, missing])
+
+            record = _read(root, _App({assembly: doc}))
+            entries = {item["name2"]: item for item in record["components"]}
+
+            raised = entries["raising-1"]["solver_observation"]
+            self.assertIsNone(raised["solving"]["value"])
+            self.assertIn("native property unavailable", raised["solving"]["error"])
+            self.assertIsNone(raised["constrained_status"]["value"])
+            self.assertIn("status read failed", raised["constrained_status"]["error"])
+
+            junk_top = entries["junk-1"]["solver_observation"]
+            self.assertIsNone(junk_top["solving"]["value"])
+            self.assertIn("non-integer reading", junk_top["solving"]["error"])
+            self.assertIsNone(junk_top["constrained_status"]["value"])
+            self.assertIn("non-integer reading", junk_top["constrained_status"]["error"])
+
+            missing_top = entries["missing-1"]["solver_observation"]
+            self.assertIsNone(missing_top["solving"]["value"])
+            self.assertTrue(missing_top["solving"]["error"])
+            self.assertIsNone(missing_top["constrained_status"]["value"])
+            self.assertTrue(missing_top["constrained_status"]["error"])
+
+    def test_record_normalization_preserves_solver_observation(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            component.Solving = 0
+            component.GetConstrainedStatus = lambda: 3
+            assembly = _write(root, "robot.SLDASM")
+            doc = _Doc(assembly, children=[component])
+
+            record = _read(root, _App({assembly: doc}))
+            target = root / "native-discovery.json"
+            write_json(target, record)
+            normalized = read_json(target)
+
+            self.assertEqual(normalized, record)
+            self.assertEqual(normalized["components"][0]["solver_observation"]["constrained_status"]["value"], 3)
 
 
 class CaptureSceneTests(unittest.TestCase):
