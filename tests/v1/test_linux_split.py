@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import tempfile
 import unittest
@@ -168,19 +169,42 @@ class LinuxSplitTests(unittest.TestCase):
         (verify / "urdf/robot.urdf").write_text("<robot/>\n", encoding="utf-8")
         subject = subject_digest(verify)
         report = {"passed": True, "subject_sha256": subject}
+        calls = {"bundle": 0}
+
+        def counting_check(bundle):
+            calls["bundle"] += 1
+            return report
+
         with (
-            mock.patch.object(store_module, "check_bundle", return_value=report),
+            mock.patch.object(store_module, "check_bundle", side_effect=counting_check),
             mock.patch.object(store_module, "require_qualified_report", return_value=report),
         ):
             preview = self.store.preview(self.run_id)
             self.assertEqual(preview["subject_sha256"], subject)
+            self.assertIs(self.store.preview(self.run_id), preview)
             digest = preview["files"]["urdf/robot.urdf"]
             stream, size = self.store.open_artifact(self.run_id, "urdf/robot.urdf", sha256=digest)
             with stream:
                 self.assertEqual(stream.read(), b"<robot/>\n")
+                self.assertEqual(stream.read(), b"")
             self.assertEqual(size, len(b"<robot/>\n"))
+            second, _second_size = self.store.open_artifact(self.run_id, "urdf/robot.urdf", sha256=digest)
+            with second:
+                self.assertEqual(second.read(), b"<robot/>\n")
             with self.assertRaises(PipelineError):
                 self.store.open_artifact(self.run_id, "urdf/robot.urdf", sha256="c" * 64)
+            # The preview is verified once for immutable checkpoint serving.
+            self.assertEqual(calls["bundle"], 1)
+            # Bytes changed after verification (same length, checkpoint identity held)
+            # must be refused on the served stream itself.
+            before = verify.stat()
+            (verify / "urdf/robot.urdf").write_text("<roboX/>\n", encoding="utf-8")
+            os.utime(verify, ns=(before.st_atime_ns, before.st_mtime_ns))
+            tampered, _tampered_size = self.store.open_artifact(self.run_id, "urdf/robot.urdf", sha256=digest)
+            with tampered:
+                self.assertEqual(tampered.read(), b"<roboX/>\n")
+                with self.assertRaises(PipelineError):
+                    tampered.read()
         with (
             mock.patch.object(store_module, "check_bundle", side_effect=PipelineError("report bytes changed")),
             self.assertRaises(PipelineError),
