@@ -1297,11 +1297,20 @@ def _clusters(record: dict, findings: list[dict]) -> _Clusters:
                 # geometry is mapped back exactly by the recorded occurrence transform.
                 # It is therefore reconstructed by the ordinary pair machinery below:
                 # it can never ground anything and never vetoes the frozen top aggregate.
+                # The non-frame endpoint must be a recorded occurrence under the mate's
+                # scope: the reader records every in-scope component as ``scope/...``,
+                # so any other name is an unjustified scope cross-link and is rejected
+                # rather than guessed at.
                 others = [entity for entity in entities if entity.get("assembly_frame") is not True]
                 endpoints = [str(entity.get("component") or "") for entity in others]
+                raw_entities = mate.get("entities")
                 if (
-                    len(endpoints) != 1
+                    not isinstance(raw_entities, list)
+                    or len(raw_entities) != 2
+                    or any(not isinstance(item, dict) for item in raw_entities)
+                    or len(endpoints) != 1
                     or not endpoints[0]
+                    or not endpoints[0].startswith(scope + "/")
                     or endpoints[0] not in components
                     or scope not in components
                 ):

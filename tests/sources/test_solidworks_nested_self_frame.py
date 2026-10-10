@@ -206,6 +206,45 @@ class NestedSelfFrameTests(unittest.TestCase):
                 self.assertIsNotNone(clusters.frame)  # the top aggregate is never vetoed
                 self.assertEqual(clusters.frame.members, frozenset({"A"}))
 
+    def test_nested_self_frame_requires_exactly_two_raw_entities(self):
+        components = self._base()
+        three_with_junk = mate(
+            "Bad5",
+            "parallel",
+            "S",
+            plane_on("S/part-1", [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]),
+            self_frame("S", plane=([0.0, 1.0, 0.0], [0.0, 0.2, 0.0])),
+        )
+        three_with_junk["entities"].append("junk")
+        three_dicts = mate(
+            "Bad6",
+            "parallel",
+            "S",
+            plane_on("S/part-1", [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]),
+            self_frame("S", plane=([0.0, 1.0, 0.0], [0.0, 0.2, 0.0])),
+        )
+        three_dicts["entities"].append(plane_on("S/part-1", [0.0, 1.0, 0.0], [0.0, 0.1, 0.0]))
+        for label, bad in {"third-non-dict": three_with_junk, "three-dicts": three_dicts}.items():
+            with self.subTest(case=label):
+                clusters, findings = cluster_state(components, [top_lock("A"), bad])
+                self.assertTrue(any(f["code"] == "discovery.frame_attachment" for f in findings), findings)
+                self.assertIsNotNone(clusters.frame)
+                self.assertEqual(clusters.frame.members, frozenset({"A"}))
+
+    def test_nested_self_frame_endpoint_outside_the_scope_is_rejected(self):
+        components = [*self._base(), {**component("T", "T.SLDASM"), "transform": flat(IDENTITY)}]
+        bad = mate(
+            "Bad7",
+            "parallel",
+            "S",
+            plane_on("T", [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]),
+            self_frame("S", plane=([0.0, 1.0, 0.0], [0.0, 0.2, 0.0])),
+        )
+        clusters, findings = cluster_state(components, [top_lock("A"), bad])
+        self.assertTrue(any(f["code"] == "discovery.frame_attachment" for f in findings), findings)
+        self.assertIsNotNone(clusters.frame)
+        self.assertEqual(clusters.frame.members, frozenset({"A"}))
+
     def test_nested_self_frame_rank_and_membership_invariants(self):
         components = self._base()
         parallel = mate(
