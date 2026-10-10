@@ -3836,13 +3836,20 @@ def derive_native_package(
             "Native discovery did not open the selected main assembly "
             f"({recorded_main!r} != {settings.main_assembly!r})"
         )
-    recorded_configuration = _identity_value(record, NAMESPACE, "delivery_configuration") or record.get(
-        "saved_configuration"
-    )
-    if configuration is not None and _text(recorded_configuration) and str(configuration) != str(
-        recorded_configuration
+    declared_configuration = _identity_value(record, NAMESPACE, "delivery_configuration")
+    saved_configuration = record.get("saved_configuration")
+    if (
+        _text(declared_configuration)
+        and _text(saved_configuration)
+        and str(declared_configuration) != str(saved_configuration)
     ):
-        raise PipelineError("the requested configuration does not match the recorded delivery configuration")
+        raise PipelineError("the recorded delivery configuration disagrees with the saved assembly configuration")
+    recorded_configuration = saved_configuration if _text(saved_configuration) else declared_configuration
+    if configuration is not None:
+        if not _text(recorded_configuration):
+            raise PipelineError("an explicit configuration cannot be bound: the record carries no usable configuration")
+        if str(configuration) != str(recorded_configuration):
+            raise PipelineError("the requested configuration does not match the recorded delivery configuration")
     findings: list[dict] = []
     known_occurrences = {
         str(item.get("name2"))

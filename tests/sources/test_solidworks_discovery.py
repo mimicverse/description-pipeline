@@ -2193,6 +2193,35 @@ class DerivationSplitTests(unittest.TestCase):
         )
         self.assertTrue(matching.passed, matching.findings)
 
+    def test_derivation_refuses_an_explicit_configuration_without_a_recorded_one(self) -> None:
+        source, records = self._scene()
+        payload = record()
+        payload["identity"]["delivery_configuration"] = None
+        payload.pop("saved_configuration", None)
+        with self.assertRaisesRegex(PipelineError, "carries no usable configuration"):
+            derive_native_package(
+                source,
+                self.tmp / "derived-unbound-config",
+                "run-1",
+                payload,
+                settings=DiscoverySettings(record_roots=(records,)),
+                configuration="Default",
+            )
+
+    def test_derivation_refuses_a_declared_configuration_that_contradicts_the_saved_one(self) -> None:
+        source, records = self._scene()
+        payload = record()
+        payload["identity"]["delivery_configuration"] = "Other"
+        payload["saved_configuration"] = "Default"
+        with self.assertRaisesRegex(PipelineError, "disagrees with the saved assembly configuration"):
+            derive_native_package(
+                source,
+                self.tmp / "derived-conflicting-config",
+                "run-1",
+                payload,
+                settings=DiscoverySettings(record_roots=(records,)),
+            )
+
     def test_preparation_refuses_authored_files_before_any_native_read(self) -> None:
         source, records = self._scene()
         (source / "robot.yaml").write_text("schema_version: x\n", encoding="utf-8")
