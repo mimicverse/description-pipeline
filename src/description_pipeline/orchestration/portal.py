@@ -372,7 +372,7 @@ _CONFIG_KEYS = {
     "airflow": {"url"},
     "endpoint": {"url", "token_file"},
     "portal": {"host", "port", "upload_root", "upload_concurrency"},
-    "pipeline": {"store_root", "repositories"},
+    "pipeline": {"store_root", "repositories", "discovery"},
 }
 
 

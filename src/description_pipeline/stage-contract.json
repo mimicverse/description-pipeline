@@ -40,7 +40,7 @@
     },
     {
       "id": "discover",
-      "host": "native",
+      "host": "native+portable",
       "name": "Discover structure",
       "name_zh": "解析结构",
       "inputs": [

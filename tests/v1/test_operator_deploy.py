@@ -62,6 +62,27 @@ def write_stub(path: Path, body: str) -> None:
 
 
 class RenderTests(unittest.TestCase):
+    def test_linux_discovery_settings_are_rendered_and_changes_are_drift(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            settings = root / "discovery.json"
+            expected = {"record_roots": [str(root / "records")], "frozen_names_file": str(root / "names.json")}
+            settings.write_text(json.dumps(expected))
+            settings.chmod(0o600)
+            rendered = render(state, DISCOVERY_SETTINGS_FILE=str(settings))
+            self.assertEqual(rendered.returncode, 0, rendered.stderr)
+            config = json.loads((state / "portal.json").read_text())
+            self.assertEqual(config["pipeline"]["discovery"], expected)
+            before = (state / "portal.json").read_bytes()
+            settings.write_text(json.dumps({"record_roots": [str(root / "new-records")]}))
+            drift = run([sys.executable, str(RENDER), "--env-file", str(root / "operator.env"), "--dry-run"], {})
+            self.assertNotEqual(drift.returncode, 0)
+            self.assertIn("portal.json", drift.stdout + drift.stderr)
+            self.assertEqual((state / "portal.json").read_bytes(), before)
+            settings.write_text(json.dumps({"record_roots": ["relative"]}))
+            self.assertNotEqual(render(state, DISCOVERY_SETTINGS_FILE=str(settings)).returncode, 0)
+
     def test_linux_routes_are_rendered_and_mapping_changes_are_drift(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -229,7 +250,9 @@ class RenderTests(unittest.TestCase):
 
             parsed = json.loads(portal)
             self.assertEqual(sorted(parsed), ["airflow", "endpoint", "pipeline", "portal"])
-            self.assertEqual(parsed["pipeline"], {"store_root": str(state / "runs"), "repositories": {}})
+            self.assertEqual(
+                parsed["pipeline"], {"store_root": str(state / "runs"), "repositories": {}, "discovery": {}}
+            )
             self.assertEqual(sorted(parsed["airflow"]), ["url"])
             self.assertEqual(sorted(parsed["endpoint"]), ["token_file", "url"])
             self.assertEqual(sorted(parsed["portal"]), ["host", "port", "upload_root"])

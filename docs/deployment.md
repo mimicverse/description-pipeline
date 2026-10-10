@@ -149,6 +149,7 @@ Complete these configuration groups once:
 | `SOLIDWORKS_HANDOFF_ROOT` | Dedicated Linux intake, such as `/srv/description/cad-handoffs`, outside runtime and state |
 | `PIPELINE_STORE_ROOT` | Linux stage checkpoints, model deliveries and diagnostics; defaults to `OPERATOR_STATE/runs` |
 | `MODEL_REPOSITORIES_FILE` | Mode-`0600` JSON mapping repository slugs to dedicated Linux model checkouts |
+| `DISCOVERY_SETTINGS_FILE` | Optional mode-`0600` JSON with Linux `record_roots` and `frozen_names_file` |
 | `FEISHU_APP_SECRET_FILE`, `FEISHU_TENANT_KEYS` | App credentials and mandatory tenant allowlist |
 | `FEISHU_ADMIN_OPEN_IDS` | Explicit administrator identities; optional, no automatic administrator |
 
@@ -165,6 +166,11 @@ Installation renders the same store and routing into the portal and Airflow
 Connection. Health refuses an empty mapping. Reinstall after changing routing.
 Back up the run store with platform state; it owns portable checkpoints and
 published model receipts.
+
+Set `DISCOVERY_SETTINGS_FILE` to the absolute path of a private JSON file, for example
+`{"record_roots":["/srv/description/cad-records"],"frozen_names_file":"/srv/description/interface-names.json"}`.
+Omit unused keys. Installation carries this object through `pipeline.discovery`
+to the Airflow connection's `discovery` settings; reinstall after changing it.
 
 Controlled-record roots and the optional approved-interface-name file are Linux
 derivation settings set by the platform maintainer with the platform's Linux

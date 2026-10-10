@@ -706,6 +706,11 @@ class Jobs:
                     "A linked attempt must retain its parent's exact upload and selected assembly",
                 )
                 _require((parent.get("selection") or {}).get("state") == "sealed", "Parent selection is incomplete")
+                _require(
+                    parent.get("main_assembly") == request["main_assembly"]
+                    and parent["selection"]["manifest"]["main_assembly"] == request["main_assembly"],
+                    "The parent's effective main assembly differs from its sealed selection",
+                )
                 job.update(self._inherited_metadata(parent, spec["from_stage"]))
                 job.update(
                     source_run_id=parent.get("source_run_id") or parent["run_id"],
