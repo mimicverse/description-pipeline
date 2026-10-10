@@ -29,10 +29,23 @@ creates a candidate PR and cannot set an engineering-approved release state.
 Passed automatic checks do not require manual repetition. Failed checks require
 correction, not human override. Applicable approvals of unchanged engineering
 facts can be reused; changed facts and their effects need review.
-Each receipt declares its `execution_scope`: a complete endpoint job covers all
-six stages, while maintenance generation/verification runs cover only the stages
-they execute ([operations](operations.md#6-independent-review-and-recovery));
+Each receipt declares its `execution_scope`: Windows covers the first three
+stages and Linux covers generation, verification and publication. A complete
+Airflow run binds both; maintenance runs cover only the stages they execute ([operations](operations.md#6-independent-review-and-recovery));
 unexecuted native stages are shown as out of scope rather than qualified.
+
+## Capture transfer
+
+The Windows worker seals archived inputs, native evidence, the input report,
+native tool identity and native stage receipt. Linux admits this bundle only
+when its closed inventory, every file hash, run ID, handoff digest and selected
+assembly agree with the request. Both hosts must use the same tool source release;
+their dependency records identify their different execution roles.
+
+`reports/native-stages.json` preserves the native receipt. The final
+`reports/stages.json` records the full run. Native completion does not grant
+model qualification. Linux still independently reconstructs engineering facts,
+checks the delivered bytes and loads the URDF with MuJoCo before publication.
 
 ## Verification gates
 
@@ -122,12 +135,22 @@ SolidWorks' vendor MathTransform layout at the COM boundary. Verification reads
 the captured protocol directly and derives zero-pose FK from the native root
 datum, independently of model provenance.
 
+Assembly reference geometry is recorded as a frame, never a physical part.
+Top-assembly datums may belong to the base body only when all assembly-frame
+mates resolve to one rigid cluster, their combined constraints have rank six,
+and that cluster owns `CS_base_link`. The generator and verifier derive this
+attachment separately from the raw observations. Partial, ambiguous and nested
+assembly-frame attachments block derivation with the affected mate and scope;
+no world joint, mass or rigid membership is inferred from an `IsFixed` flag.
+
 ## Report identity
 
 The subject digest binds every file under `input/`, `evidence/`, `model/`,
 `urdf/`, `meshes/`, plus `README.md`, `reports/input.json` and
-`reports/tool.json`. The quality report refers to that subject and cannot hash
-itself. Local run/PR receipts are also outside the subject and are not published
+`reports/tool.json`. Transferred captures also bind `reports/native-tool.json`,
+`reports/native-stages.json` and `transfer-manifest.json`; a partial set fails.
+Independent verification rechecks the manifest and native provenance from the
+delivered files. The quality report refers to that subject and cannot hash itself. Local run/PR receipts are also outside the subject and are not published
 as model evidence. `reports/stages.json` is also a run receipt: it records
 the subject and contract hashes, and its own file hash is retained in
 `reports/run.json`. It stays outside the subject to avoid circular hashes and
@@ -174,6 +197,13 @@ Their combined six-dimensional constraint space must establish rigid membership
 or one supported relative motion. Temporary fixed flags and mate names cannot
 establish motion. Unresolved entities, unsupported constraints, ambiguous motion
 and non-tree topology block derivation.
+
+Constraint reconstruction accepts concentric circular edges and cylindrical
+faces when their recorded axes are coaxial in the assembly frame. A circular
+edge coincident with a plane must lie in that plane, with aligned normals.
+Both entities require usable geometry; a missing entity cannot supply a
+constraint. Supporting an edge for mate reconstruction does not qualify it as
+the independently reread cylindrical interface required for a joint axis.
 
 Capture requires a rereadable cylindrical interface for each motion axis.
 Named axes alone do not qualify this capture path. Owned `CS_<link>` datums

@@ -30,8 +30,9 @@ import tempfile
 import time
 import unicodedata
 import uuid
-from dataclasses import dataclass
 from collections.abc import Callable
+from contextlib import suppress
+from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib import error as urlerror
@@ -42,11 +43,14 @@ from ..delivery import PIPELINE_ID
 from ..io import PipelineError, artifact_path_parts
 from ..sources.solidworks.handoff import HANDOFF_SCHEMA
 from ..stages import STAGE_IDS
+from .stage_transfer import CAPTURE_ARCHIVE, MAX_TRANSFER_BYTES
 
 JOB_SCHEMA = "solidworks-to-urdf.job/v1"
 NATIVE_RUN_NAMESPACE = "solidworks_to_urdf"
 EVENT_KEYS = ("stage", "state", "at")
-RUN_STATES = {"queued", "running", "passed", "failed"}
+#: ``native_complete`` means the Windows half finished and the sealed capture archive
+#: is ready for the Linux generate/verify/publish half; it is never final success.
+RUN_STATES = {"queued", "running", "native_complete", "passed", "failed"}
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _PULL_URL = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/pull/[1-9]\d*\Z")
@@ -118,6 +122,32 @@ def validate_resume(value: object, *, run_id: str | None = None) -> dict:
     if run_id is not None and parent == run_id:
         raise EndpointProtocolError("a linked run cannot reuse itself")
     return {"parent_run": parent, "from_stage": stage}
+
+
+def _validate_capture_archive(archive) -> dict:
+    """The exact native capture-archive receipt the sealing contract produces."""
+    expected = {"name", "sha256", "size", "manifest_sha256"}
+    if not isinstance(archive, dict) or set(archive) != expected:
+        raise EndpointProtocolError("capture_archive must carry exactly name, sha256, size and manifest_sha256")
+    if archive.get("name") != CAPTURE_ARCHIVE:
+        raise EndpointProtocolError("capture_archive name differs from the transfer contract")
+    for key in ("sha256", "manifest_sha256"):
+        if not isinstance(archive.get(key), str) or _SHA256.fullmatch(archive[key]) is None:
+            raise EndpointProtocolError(f"capture_archive {key} must be lowercase SHA-256")
+    size = archive.get("size")
+    if type(size) is not int or size <= 0 or size > MAX_TRANSFER_BYTES:
+        raise EndpointProtocolError("capture_archive size must be a positive integer within the transfer bound")
+    return dict(archive)
+
+
+def capture_archive_metadata(job: dict) -> dict:
+    """The validated capture-archive receipt of one ``native_complete`` job."""
+    if not isinstance(job, dict) or job.get("status") != "native_complete":
+        raise EndpointProtocolError("the job is not native_complete")
+    result = job.get("result")
+    if not isinstance(result, dict) or result.get("native_complete") is not True:
+        raise EndpointProtocolError("native_complete result must declare native_complete = true")
+    return _validate_capture_archive(result.get("capture_archive"))
 
 
 def _validate_relative_path(value: str, field: str) -> str:
@@ -213,6 +243,9 @@ class EndpointConfig:
     token: str
     timeout: float = 30.0
     handoff_roots: tuple[Path, ...] = ()
+    #: Linux-side routing: model-repository slug to local checkout, and the attempt store.
+    repositories: dict[str, Path] = dataclass_field(default_factory=dict)
+    store_root: Path | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "base_url", _validate_base_url(self.base_url))
@@ -221,6 +254,8 @@ class EndpointConfig:
         if not math.isfinite(self.timeout) or self.timeout <= 0:
             raise EndpointProtocolError("Endpoint timeout must be finite and positive")
         object.__setattr__(self, "handoff_roots", _handoff_roots(self.handoff_roots))
+        object.__setattr__(self, "repositories", _linux_repositories(self.repositories))
+        object.__setattr__(self, "store_root", _linux_store_root(self.store_root))
 
 
 def _handoff_roots(values) -> tuple[Path, ...]:
@@ -233,6 +268,36 @@ def _handoff_roots(values) -> tuple[Path, ...]:
         return validate_handoff_roots(values)
     except (ImportError, PipelineError, TypeError, ValueError, OSError) as error:
         raise EndpointProtocolError(str(error)) from error
+
+
+_REPOSITORY_SLUG = re.compile(r"[^/\s]+/[^/\s]+\Z")
+
+
+def _linux_repositories(values) -> dict[str, Path]:
+    """Validate the Linux slug-to-checkout map used to publish without Windows."""
+    if values in (None, "", {}):
+        return {}
+    if not isinstance(values, dict):
+        raise EndpointProtocolError("repositories must be a slug-to-absolute-path mapping")
+    resolved: dict[str, Path] = {}
+    for slug, path in values.items():
+        if not isinstance(slug, str) or _REPOSITORY_SLUG.fullmatch(slug) is None:
+            raise EndpointProtocolError(f"repository slug must be owner/name: {slug!r}")
+        candidate = Path(str(path))
+        if not candidate.is_absolute():
+            raise EndpointProtocolError(f"repository path for {slug!r} must be absolute")
+        resolved[slug] = candidate
+    return resolved
+
+
+def _linux_store_root(value) -> Path | None:
+    """Validate the absolute Linux attempt-store root; absent disables the portable half."""
+    if value in (None, ""):
+        return None
+    candidate = Path(str(value))
+    if not candidate.is_absolute():
+        raise EndpointProtocolError("store_root must be an absolute Linux path")
+    return candidate
 
 
 def config_from_airflow_connection(conn_id: str, *, timeout: float = 30.0) -> EndpointConfig:
@@ -252,6 +317,8 @@ def config_from_airflow_connection(conn_id: str, *, timeout: float = 30.0) -> En
         token=connection.password or "",
         timeout=float(extra.get("timeout", timeout)),
         handoff_roots=extra.get("handoff_roots") or (),
+        repositories=extra.get("repositories") or {},
+        store_root=extra.get("store_root"),
     )
 
 
@@ -532,6 +599,45 @@ class WindowsEndpoint:
         except urlerror.URLError as error:
             raise EndpointError(f"endpoint unreachable: {error.reason}") from error
 
+    def stream_capture_archive(
+        self, run_id: str, archive: dict, destination: Path, *, limit: int = MAX_TRANSFER_BYTES
+    ) -> Path:
+        """Stream the native capture archive to disk, requiring its exact size and digest."""
+        metadata = _validate_capture_archive(archive)
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+            raise EndpointProtocolError("archive size limit must be a positive integer")
+        if metadata["size"] > limit:
+            raise EndpointProtocolError("capture archive exceeds the configured size limit")
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256()
+        total = 0
+        with (
+            self.open_artifact(run_id, metadata["name"]) as response,
+            tempfile.NamedTemporaryFile(prefix=".capture-archive-", dir=destination.parent, delete=False) as handle,
+        ):
+            temporary = Path(handle.name)
+            try:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > limit:
+                        raise EndpointProtocolError("capture archive exceeds the configured size limit")
+                    digest.update(chunk)
+                    handle.write(chunk)
+            except BaseException:
+                with suppress(OSError):
+                    temporary.unlink()
+                raise
+        if total != metadata["size"] or digest.hexdigest() != metadata["sha256"]:
+            with suppress(OSError):
+                temporary.unlink()
+            raise EndpointProtocolError("capture archive does not match its recorded size or digest")
+        os.replace(temporary, destination)
+        return destination
+
     def read_artifact(self, run_id: str, name: str, *, sha256: str, limit: int = 64 * 1024 * 1024) -> bytes:
         """Read one artifact into memory and require its exact digest before returning it."""
         expected = validate_sha256(sha256)
@@ -560,12 +666,16 @@ class WindowsEndpoint:
         return bytes(data)
 
     def wait(self, run_id: str, *, interval: float = 2.0, timeout: float = 600.0) -> dict:
-        """Bounded polling; returns the job dict only for the terminal passed state."""
+        """Bounded polling; returns the job dict at the native terminal boundary.
+
+        Sealed native evidence transfers to Linux at ``native_complete``.
+        Qualification stays with the independent result gates.
+        """
         deadline = self._clock() + timeout
         while True:
             job = self.get_job(run_id)
             status = job["status"]
-            if status == "passed":
+            if status in {"passed", "native_complete"}:
                 return job
             if status == "failed":
                 raise JobFailed(run_id, job)

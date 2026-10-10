@@ -12,6 +12,11 @@ BUNDLE_SCHEMA = "solidworks-to-urdf.bundle/v1"
 SUBJECT_DIRECTORIES = ("input", "evidence", "model", "urdf", "meshes")
 SUBJECT_FILES = ("README.md", "reports/input.json", "reports/tool.json")
 
+#: Transferred native capture provenance.  A production capture that was sealed on Windows and
+#: admitted on Linux carries all three; neutral local-backend fixtures may carry none.  A partial
+#: set is an error: provenance must never be published without its bindings.
+TRANSFER_FILES = ("reports/native-tool.json", "reports/native-stages.json", "transfer-manifest.json")
+
 
 def subject_inventory(root: Path) -> dict[str, str]:
     """Bind the delivered inputs, captured evidence and actual model bytes.
@@ -19,7 +24,9 @@ def subject_inventory(root: Path) -> dict[str, str]:
     Quality and PR receipts refer to this subject and cannot be part of their
     own digest. Git metadata and unrelated repository files are not model
     inputs. Every file inside a subject directory is bound, including unused
-    assets; nothing inside these directories can be silently ignored.
+    assets; nothing inside these directories can be silently ignored.  When a
+    transfer provenance file is present, the complete triplet must be present
+    and is bound too, so a published delivery can never omit its provenance.
     """
 
     root = Path(root)
@@ -37,6 +44,12 @@ def subject_inventory(root: Path) -> dict[str, str]:
     for name in SUBJECT_FILES:
         path = confined(root, name)
         files[name] = file_digest(path)
+    present = [name for name in TRANSFER_FILES if (root / name).is_file()]
+    if present and len(present) != len(TRANSFER_FILES):
+        missing = sorted(set(TRANSFER_FILES) - set(present))
+        raise PipelineError(f"Transferred capture provenance is incomplete; missing: {missing}")
+    for name in present:
+        files[name] = file_digest(confined(root, name))
     return dict(sorted(files.items()))
 
 

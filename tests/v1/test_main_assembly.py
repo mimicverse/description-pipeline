@@ -6,6 +6,7 @@ they do not qualify native CAD behavior.
 
 from __future__ import annotations
 
+import json
 import time
 import unittest
 import uuid
@@ -89,7 +90,7 @@ class MainAssemblyEndpointTests(EndpointFixture, unittest.TestCase):
         self.assertTrue(created)
         jobs.queue.join()
         job = jobs.snapshot(request["run_id"])
-        self.assertEqual("passed", job["status"], job.get("error"))
+        self.assertEqual("native_complete", job["status"], job.get("error"))
         self.assertEqual(selection, job["main_assembly"])
         integrity = next(
             event["check"] for event in job["events"] if (event.get("check") or {}).get("id") == "handoff.integrity"
@@ -138,7 +139,7 @@ class MainAssemblyResumeTests(EndpointFixture, unittest.TestCase):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             job = jobs.snapshot(run_id)
-            if job["status"] in {"passed", "failed"}:
+            if job["status"] in {"passed", "failed", "native_complete"}:
                 return job
             time.sleep(0.01)
         raise AssertionError(f"{run_id} did not finish")
@@ -150,7 +151,7 @@ class MainAssemblyResumeTests(EndpointFixture, unittest.TestCase):
             request["main_assembly"] = selection
         jobs.create(request)
         parent = self.await_terminal(jobs, request["run_id"])
-        self.assertEqual("passed", parent["status"], parent.get("error"))
+        self.assertEqual("native_complete", parent["status"], parent.get("error"))
         return jobs, parent
 
     @staticmethod
@@ -176,7 +177,7 @@ class MainAssemblyResumeTests(EndpointFixture, unittest.TestCase):
                 self.assertTrue(created)
                 self.assertEqual("总装.SLDASM", child["main_assembly"])
                 finished = self.await_terminal(child_jobs, request["run_id"])
-                self.assertEqual("passed", finished["status"], finished.get("error"))
+                self.assertEqual("native_complete", finished["status"], finished.get("error"))
                 child_jobs.close()
 
     def test_changed_selection_cannot_reuse_checkpoints(self):
@@ -191,6 +192,13 @@ class MainAssemblyResumeTests(EndpointFixture, unittest.TestCase):
     def test_legacy_parent_cannot_gain_a_selection_on_resume(self):
         parent_jobs, parent = self.finished_parent(None)
         parent_jobs.close()
+        # A run stored before effective selections were recorded carries none; it cannot
+        # acquire one retroactively on resume.
+        ledger = self.config["state_root"] / "jobs" / (parent["run_id"] + ".json")
+        stored = json.loads(ledger.read_text(encoding="utf-8"))
+        stored["main_assembly"] = None
+        ledger.write_text(json.dumps(stored, ensure_ascii=False), encoding="utf-8")
+        parent["main_assembly"] = None
         jobs = self.jobs()
         with self.assertRaises(RequestError) as error:
             jobs.create(self.linked_request(parent, "总装.SLDASM"))

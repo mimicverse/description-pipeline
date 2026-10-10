@@ -7,9 +7,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from description_pipeline.delivery import subject_inventory
-from description_pipeline.io import digest, write_json
+from description_pipeline.io import digest, file_digest, write_json
 from description_pipeline.orchestration.windows import Jobs, RequestError
+from description_pipeline.sources.solidworks.revision import package_inventory
 from .endpoint_support import EndpointFixture
 
 
@@ -37,9 +37,9 @@ class NativeEndpointTests(EndpointFixture, unittest.TestCase):
 
         def runner(package, output, **kwargs):
             calls.append(package)
-            self.assertEqual("feature/arm", kwargs["base"])
+            self.assertEqual("capture", kwargs["stop_after"])
             self.assertTrue((package / "robot.yaml").is_file())
-            return self.passing_result(on_event=kwargs["on_event"])
+            return self.capture_transfer_result(output, run_id=kwargs["run_id"], on_event=kwargs["on_event"])
 
         jobs = self.jobs(runner=runner)
         request = self.request(jobs)
@@ -47,9 +47,10 @@ class NativeEndpointTests(EndpointFixture, unittest.TestCase):
         jobs.queue.join()
         job, created = jobs.create(request)
         self.assertFalse(created)
-        self.assertEqual("passed", job["status"])
+        self.assertEqual("native_complete", job["status"])
         self.assertEqual("arm", job["hardware_id"])
         self.assertEqual("a/b", job["repository_slug"])
+        self.assertEqual(set(job["capture_archive"]), {"name", "sha256", "size", "manifest_sha256"})
         self.assertEqual(1, len(calls))
         self.assertFalse((self.source / "robot.yaml").exists())
         with self.assertRaises(RequestError) as error:
@@ -109,49 +110,127 @@ class NativeEndpointTests(EndpointFixture, unittest.TestCase):
                 # Restore the synthetic frozen store for the next independent case.
                 shutil.rmtree(self.packages / "imports")
 
-    def test_native_job_requires_independent_discovery_gate(self):
-        result = self.passing_result()
-        result["quality"]["checks"] = []
-        jobs = self.jobs(runner=lambda *args, **kwargs: result)
+    def test_native_job_without_a_sealed_transfer_is_never_qualified(self):
+        jobs = self.jobs(runner=lambda *args, **kwargs: {"passed": True, "subject_sha256": "a" * 64})
         request = self.request(jobs)
         jobs.create(request)
         jobs.queue.join()
-        self.assertEqual("failed", jobs.snapshot(request["run_id"])["status"])
+        job = jobs.snapshot(request["run_id"])
+        self.assertEqual("failed", job["status"])
+        self.assertIn("sealed capture transfer", job["error"])
 
-    def test_preview_survives_pr_failure_but_rejects_mutation_and_nonviewer_files(self):
+    def test_request_without_selection_seals_with_the_discovered_assembly(self):
+        seen = []
+
         def runner(package, output, **kwargs):
-            for directory in ("input", "evidence", "model", "urdf", "meshes"):
-                (output / directory).mkdir(parents=True, exist_ok=True)
-            (output / "urdf/robot.urdf").write_text('<robot name="control"/>')
-            (output / "input/hidden.txt").write_text("Never a viewer asset")
-            (output / "README.md").write_text("Synthetic viewer boundary test")
-            write_json(output / "reports/input.json", {})
-            write_json(output / "reports/tool.json", {})
-            subject = digest(subject_inventory(output))
-            return {
-                "passed": False,
-                "error": "PR service unavailable",
-                "subject_sha256": subject,
-                "quality": {
-                    "passed": True,
-                    "subject_sha256": subject,
-                    "checks": [{"id": "source.native_discovery", "passed": True}],
-                },
-                "submission": {},
-            }
+            seen.append(kwargs["main_assembly"])
+            return self.capture_transfer_result(output, run_id=kwargs["run_id"], on_event=kwargs["on_event"])
 
         jobs = self.jobs(runner=runner)
         request = self.request(jobs)
+        self.assertNotIn("main_assembly", request)
         jobs.create(request)
         jobs.queue.join()
-        self.assertEqual("failed", jobs.snapshot(request["run_id"])["status"])
-        preview = jobs.preview(request["run_id"])
-        self.assertEqual(["urdf/robot.urdf"], list(preview["files"]))
-        with self.assertRaises(RequestError):
-            jobs.artifact(request["run_id"], "input/hidden.txt")
-        stream, size = jobs.artifact(request["run_id"], "urdf/robot.urdf")
+        job = jobs.snapshot(request["run_id"])
+        self.assertEqual("native_complete", job["status"])
+        self.assertEqual("总装.SLDASM", job["main_assembly"])
+        self.assertEqual(["总装.SLDASM"], seen)
+        # The operator request binding stays exactly as submitted.
+        self.assertEqual(request, job["request"])
+
+    def test_explicit_selection_is_unchanged_by_discovery(self):
+        seen = []
+
+        def prepare(source, output, run_id, **kwargs):
+            result = self.prepare(source, output, run_id, **kwargs)
+            write_json(
+                result.discovery_path,
+                {"synthetic_control": True, "identity": {"main_assembly": "OTHER.SLDASM"}},
+            )
+            result.discovery_sha256 = file_digest(result.discovery_path)
+            result.prepared_sha256 = digest(package_inventory(result.package))
+            return result
+
+        def runner(package, output, **kwargs):
+            seen.append(kwargs["main_assembly"])
+            return self.capture_transfer_result(output, run_id=kwargs["run_id"], on_event=kwargs["on_event"])
+
+        jobs = self.jobs(runner=runner, preparer=prepare)
+        request = {**self.request(jobs), "main_assembly": "总装.SLDASM"}
+        jobs.create(request)
+        jobs.queue.join()
+        job = jobs.snapshot(request["run_id"])
+        self.assertEqual("native_complete", job["status"])
+        self.assertEqual("总装.SLDASM", job["main_assembly"])
+        self.assertEqual("总装.SLDASM", job["request"]["main_assembly"])
+        self.assertEqual(["总装.SLDASM"], seen)
+
+    def test_linked_rerun_uses_the_effective_parent_selection(self):
+        seen = []
+
+        def runner(package, output, **kwargs):
+            seen.append(kwargs.get("main_assembly"))
+            return self.capture_transfer_result(output, run_id=kwargs["run_id"], on_event=kwargs["on_event"])
+
+        jobs = self.jobs(runner=runner)
+        parent = self.request(jobs)
+        jobs.create(parent)
+        jobs.queue.join()
+        parent_job = jobs.snapshot(parent["run_id"])
+        self.assertEqual("native_complete", parent_job["status"])
+        self.assertEqual("总装.SLDASM", parent_job["main_assembly"])
+        self.assertNotIn("main_assembly", parent_job["request"])
+
+        def linked(**extra):
+            base = self.request(jobs)
+            return {
+                **base,
+                **extra,
+                "resume": {"parent_run": parent["run_id"], "from_stage": "capture"},
+            }
+
+        accepted = {"accepted": True}
+        with patch("description_pipeline.orchestration.windows.start_plan", return_value=accepted):
+            with self.assertRaises(RequestError) as refused:
+                jobs.create(linked(main_assembly="OTHER.SLDASM"))
+            self.assertEqual(409, refused.exception.status)
+            inherited = linked()
+            jobs.create(inherited)
+            jobs.queue.join()
+            explicit = linked(main_assembly="总装.SLDASM")
+            jobs.create(explicit)
+            jobs.queue.join()
+
+        inherited_job = jobs.snapshot(inherited["run_id"])
+        self.assertEqual("native_complete", inherited_job["status"])
+        self.assertEqual("总装.SLDASM", inherited_job["main_assembly"])
+        self.assertNotIn("main_assembly", inherited_job["request"])
+        explicit_job = jobs.snapshot(explicit["run_id"])
+        self.assertEqual("native_complete", explicit_job["status"])
+        self.assertEqual("总装.SLDASM", explicit_job["main_assembly"])
+        self.assertEqual("总装.SLDASM", explicit_job["request"]["main_assembly"])
+        self.assertEqual(["总装.SLDASM", "总装.SLDASM", "总装.SLDASM"], seen)
+
+    def test_sealed_transfer_artifacts_are_hash_bound_and_state_gated(self):
+        jobs = self.jobs()
+        request = self.request(jobs)
+        jobs.create(request)
+        jobs.queue.join()
+        job = jobs.snapshot(request["run_id"])
+        self.assertEqual("native_complete", job["status"])
+        output = self.config["output_root"] / request["run_id"]
+        archive = job["capture_archive"]
+        stream, size = jobs.artifact(request["run_id"], "native-evidence.zip")
         with stream:
             self.assertEqual(size, len(stream.read()))
-        (self.config["output_root"] / request["run_id"] / "urdf/robot.urdf").write_text("Changed")
-        with self.assertRaises(RequestError):
-            jobs.preview(request["run_id"])
+        stream, size = jobs.artifact(request["run_id"], "transfer-manifest.json")
+        with stream:
+            self.assertEqual(size, len(stream.read()))
+        with self.assertRaises(RequestError) as unknown:
+            jobs.artifact(request["run_id"], "urdf/robot.urdf")
+        self.assertEqual(404, unknown.exception.status)
+        (output / "native-evidence.zip").write_bytes(b"tampered")
+        with self.assertRaises(RequestError) as tampered:
+            jobs.artifact(request["run_id"], "native-evidence.zip")
+        self.assertEqual(409, tampered.exception.status)
+        self.assertEqual(archive["sha256"], job["capture_archive"]["sha256"])

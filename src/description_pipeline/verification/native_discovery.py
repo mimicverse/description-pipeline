@@ -199,6 +199,30 @@ def _span(rows) -> list[list[float]]:
     return basis
 
 
+#: The frozen top assembly's own frame: identity at the assembly origin.
+_ASSEMBLY_FRAME = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+]
+
+
+def _frame_for(entity: dict, frames):
+    """The entity's frame; a proven assembly-frame entity binds the identity frame.
+
+    Only an entity that carries ``assembly_frame: true`` together with the frozen
+    top-scope identity ``""`` reads the assembly frame.  The identity must be exactly
+    the empty string: a marked entity with a missing, null or numeric component stays
+    unknown and fails closed.
+    """
+
+    component = entity.get("component")
+    if entity.get("assembly_frame") is True:
+        return _ASSEMBLY_FRAME if component == "" else None
+    return frames.get(component) if isinstance(component, str) else None
+
+
 def _frames(record: dict) -> dict[str, list[list[float]] | None]:
     frames: dict[str, list[list[float]] | None] = {}
     for item in record.get("components") or []:
@@ -290,8 +314,14 @@ def _null_space(rows, dim: int = 6) -> list[list[float]]:
     return basis
 
 
+def _axis_entity(entity: dict) -> bool:
+    """An entity that defines an axis: a cylindrical face or a circular edge."""
+
+    return isinstance(entity.get("cylinder"), dict) or isinstance(entity.get("circle"), dict)
+
+
 def _geometry(entity: dict, frames):
-    frame = frames.get(str(entity.get("component")))
+    frame = _frame_for(entity, frames)
     if frame is None:
         return None, None
     if isinstance(entity.get("cylinder"), dict):
@@ -345,8 +375,8 @@ def _rows_for(mate: dict, frames) -> dict | None:
     limits = mate.get("limits") if isinstance(mate.get("limits"), dict) else None
     axes = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
     if kind == "lock":
-        first_frame = frames.get(str(first.get("component")))
-        second_frame = frames.get(str(second.get("component")))
+        first_frame = _frame_for(first, frames)
+        second_frame = _frame_for(second, frames)
         if first_frame is None or second_frame is None:
             return None
         # A solved lock removes all six relative freedoms; the constraint basis can be stated at
@@ -355,11 +385,24 @@ def _rows_for(mate: dict, frames) -> dict | None:
         rows = [_translation_row(axis, point) for axis in axes] + [_rotation_row(axis) for axis in axes]
         return {"rows": rows, "limits": limits, "axis": None, "point": point}
     if kind == "concentric":
-        if not isinstance(first.get("cylinder"), dict) or not isinstance(second.get("cylinder"), dict):
+        if not _axis_entity(first) or not _axis_entity(second):
             return None
         left_point, left_axis = _geometry(first, frames)
         right_point, right_axis = _geometry(second, frames)
-        if left_axis is None or right_axis is None or abs(abs(_dot(left_axis, right_axis)) - 1.0) > TOL:
+        if (
+            left_point is None
+            or right_point is None
+            or left_axis is None
+            or right_axis is None
+            or abs(abs(_dot(left_axis, right_axis)) - 1.0) > TOL
+        ):
+            return None
+        # Solved-state consistency: the recorded axes must be coaxial, not merely
+        # parallel, exactly as the constraint requires of the solved assembly.
+        delta = [right_point[index] - left_point[index] for index in range(3)]
+        along = _dot(delta, left_axis)
+        radial = [delta[index] - along * left_axis[index] for index in range(3)]
+        if math.sqrt(_dot(radial, radial)) > AXIS_OFFSET_TOL_M:
             return None
         plane = _plane_basis(left_axis)
         if len(plane) != 2:
@@ -367,7 +410,15 @@ def _rows_for(mate: dict, frames) -> dict | None:
         rows = [_translation_row(direction, left_point) for direction in plane] + [
             _rotation_row(direction) for direction in plane
         ]
-        return {"rows": rows, "limits": limits, "axis": left_axis, "point": left_point}
+        # Circle axes reconstruct the constraint but never evidence the shaft: the
+        # independent interface gate must keep requiring a real cylindrical entity.
+        shaft = None
+        shaft_point = None
+        for entity, point, axis in ((first, left_point, left_axis), (second, right_point, right_axis)):
+            if isinstance(entity.get("cylinder"), dict):
+                shaft, shaft_point = axis, point
+                break
+        return {"rows": rows, "limits": limits, "axis": shaft, "point": shaft_point}
     if kind == "coincident":
         left_point, left_axis = _geometry(first, frames)
         right_point, right_axis = _geometry(second, frames)
@@ -397,12 +448,53 @@ def _rows_for(mate: dict, frames) -> dict | None:
                 "axis": None,
                 "point": left_point,
             }
+        if (isinstance(first.get("circle"), dict) and isinstance(second.get("plane"), dict)) or (
+            isinstance(second.get("circle"), dict) and isinstance(first.get("plane"), dict)
+        ):
+            # A circular edge coincident with a plane: the circle's plane is the
+            # plane (two tilts locked) and its centre lies in it (one translation
+            # locked); sliding and spinning in the plane stay free.
+            circle_entity, plane_entity = (first, second) if isinstance(first.get("circle"), dict) else (second, first)
+            circle_point, circle_axis = _geometry(circle_entity, frames)
+            plane_point, plane_axis = _geometry(plane_entity, frames)
+            if (
+                circle_point is None
+                or plane_point is None
+                or circle_axis is None
+                or plane_axis is None
+                or abs(abs(_dot(circle_axis, plane_axis)) - 1.0) > TOL
+            ):
+                return None
+            normal = plane_axis if _dot(circle_axis, plane_axis) >= 0 else [-value for value in plane_axis]
+            offset = abs(sum((circle_point[index] - plane_point[index]) * normal[index] for index in range(3)))
+            if offset > AXIS_OFFSET_TOL_M:
+                return None
+            plane = _plane_basis(normal)
+            if len(plane) != 2:
+                return None
+            rows = [_translation_row(normal, circle_point)] + [_rotation_row(direction) for direction in plane]
+            return {"rows": rows, "limits": limits, "axis": None, "point": circle_point}
         if isinstance(first.get("point"), (list, tuple)) and isinstance(second.get("point"), (list, tuple)):
             rows = [_translation_row(axis, left_point) for axis in axes]
             return {"rows": rows, "limits": limits, "axis": None, "point": left_point}
-        normal = left_axis or right_axis
-        point = left_point if left_axis is not None else right_point
-        if normal is None or point is None:
+        # Only the explicit plane-plus-vertex form remains: the face side must be a
+        # recorded plane and the other side an explicit point.  A missing entity, a
+        # cylinder, a circle, or any unrelated geometry is never treated as a vertex.
+        if (
+            isinstance(first.get("plane"), dict)
+            and left_axis is not None
+            and isinstance(second.get("point"), (list, tuple))
+            and right_point is not None
+        ):
+            normal, point = left_axis, right_point
+        elif (
+            isinstance(second.get("plane"), dict)
+            and right_axis is not None
+            and isinstance(first.get("point"), (list, tuple))
+            and left_point is not None
+        ):
+            normal, point = right_axis, left_point
+        else:
             return None
         # A vertex on a face removes one translation only.
         return {"rows": [_translation_row(normal, point)], "limits": limits, "axis": None, "point": point}
@@ -577,6 +669,136 @@ def _cluster_bindings(
         for name in full:
             by_component[name] = full
     return by_material, by_component
+
+
+def _frame_attachment(record: dict) -> dict:
+    """Re-derive the frozen top assembly's frame attachment from the record alone.
+
+    An assembly-frame entity is ``{component: "", assembly_frame: true}``: geometry of
+    the assembly's own reference geometry, recorded in the top assembly frame.  It may
+    only appear in an unsuppressed top-scope mate together with at least one occurrence
+    endpoint.  The aggregate of every such mate's reconstructed rows must reach rank 6
+    and every occurrence endpoint must belong to exactly one rigid cluster; that
+    cluster is the only claim the frame attachment can carry.  Nested, incomplete or
+    ambiguous attachments are recorded as problems, never guessed.
+    """
+
+    problems: list[dict] = []
+    seen = 0
+    attached: list[str] = []
+    rows_all: list[list[float]] = []
+    known = _components_by_name(record)
+    frames = _frames(record)
+
+    def problem(message: str, detail: dict | None = None) -> None:
+        problems.append({"code": "discovery.frame_attachment", "message": message, "detail": detail or {}})
+
+    for index, mate in enumerate(record.get("mates") or []):
+        if not isinstance(mate, dict) or mate.get("suppressed"):
+            continue
+        entities = _entities(mate)
+        flagged = [entity for entity in entities if entity.get("assembly_frame") is True]
+        if not flagged:
+            continue
+        seen += 1
+        name = str(mate.get("name") or index)
+        scope = mate.get("scope")
+        if scope != "":
+            # Missing, null or numeric scopes are as unsupported as a nested one: the
+            # frozen top scope must be exactly the empty string.
+            problem(
+                "a frame-attached mate outside the frozen top assembly is not supported",
+                {"mate": name, "scope": scope},
+            )
+            continue
+        others = [entity for entity in entities if entity.get("assembly_frame") is not True]
+        raw_entities = mate.get("entities")
+        if (
+            not isinstance(raw_entities, list)
+            or len(raw_entities) != 2
+            or len(entities) != 2
+            or len(flagged) != 1
+            or len(others) != 1
+        ):
+            problem(
+                "a frame-attached mate must carry exactly one frame entity and one occurrence entity",
+                {"mate": name, "entities": len(entities)},
+            )
+            continue
+        for entity in flagged:
+            if entity.get("component") != "":
+                problem(
+                    "a frame entity must carry the frozen top-scope identity",
+                    {"mate": name, "component": entity.get("component")},
+                )
+        rows = _rows_for(mate, frames)
+        if rows is None:
+            problem(
+                "a frame-attached mate cannot be reconstructed from its recorded entities",
+                {"mate": name, "type": mate.get("type")},
+            )
+            continue
+        rows_all.extend(rows["rows"])
+        for entity in others:
+            component = entity.get("component")
+            if not isinstance(component, str) or not component:
+                problem("a frame-attached mate names an unknown occurrence", {"mate": name, "component": component})
+                continue
+            attached.append(component)
+    if problems:
+        return {"mates": seen, "components": sorted(set(attached)), "members": None, "rank": None, "problems": problems}
+    if not seen:
+        return {"mates": 0, "components": [], "members": None, "rank": None, "problems": []}
+    unknown = sorted(name for name in set(attached) if name not in known)
+    if unknown:
+        problem("a frame-attached mate names an unknown occurrence", {"components": unknown})
+    members, _pairs = _independent_clusters(record)
+    cluster_of = {name: key for key, group in members.items() for name in group}
+    keys = sorted({cluster_of[name] for name in set(attached) if name in cluster_of})
+    if len(keys) != 1:
+        problem(
+            "frame-attached components must belong to exactly one rigid cluster",
+            {"components": sorted(set(attached)), "clusters": [sorted(members[key]) for key in keys]},
+        )
+    rank = len(_span(rows_all))
+    if rank != 6:
+        problem(
+            "the aggregate frame attachment does not reach full rank; the attachment is incomplete",
+            {"rank": rank},
+        )
+    full = frozenset(members[keys[0]]) if len(keys) == 1 else None
+    return {"mates": seen, "components": sorted(set(attached)), "members": full, "rank": rank, "problems": problems}
+
+
+def _frame_attached_members(record: dict) -> frozenset[str]:
+    """Members of the proven top frame cluster; empty when the attachment is not proven.
+
+    Proven means a well-formed top-scope attachment (rank 6, one rigid cluster) whose
+    cluster itself binds ``CS_base_link``.  A rank-6 attachment on a moving cluster is
+    not the base, so it earns no datum-channel allowance.
+    """
+
+    result = _frame_attachment(record)
+    if result["problems"] or result["members"] is None:
+        return frozenset()
+    members = frozenset(result["members"])
+    if _owned_datum(record, "CS_base_link", _datum_owners(members, members)) is None:
+        return frozenset()
+    return members
+
+
+def _datum_owners(full, attached: frozenset[str]) -> set[str]:
+    """Owners that may bind a cluster's frame datum.
+
+    A cluster's own members always qualify.  The frozen top assembly's datum channel
+    (owner ``""``) qualifies only for the proven frame-attached cluster: that cluster is
+    rigidly the assembly frame, so its own datums are equivalent to top-owned ones.
+    """
+
+    owners = {str(value) for value in full}
+    if attached and owners == set(attached):
+        owners.add("")
+    return owners
 
 
 def _frame(values) -> list[list[float]] | None:
@@ -932,8 +1154,16 @@ def verify_discovery(package: Path) -> dict:
                     {"mate": mate.get("name"), "limits": limits},
                 )
             for entity in _entities(mate):
+                frame_flag = entity.get("assembly_frame")
                 _require(
-                    str(entity.get("component")) in names,
+                    frame_flag is None or frame_flag is True,
+                    "discovery.graph",
+                    "an assembly-frame flag must be exactly true when present",
+                    {"mate": mate.get("name"), "assembly_frame": frame_flag},
+                )
+                component = entity.get("component")
+                _require(
+                    (isinstance(component, str) and component in names) or (frame_flag is True and component == ""),
                     "discovery.graph",
                     "a mate entity names an unknown component",
                     {"component": entity.get("component")},
@@ -1022,6 +1252,13 @@ def verify_discovery(package: Path) -> dict:
                 "discovery.graph",
                 "a datum transform is not a 4x4 frame",
             )
+            owner = datum.get("owner")
+            _require(
+                isinstance(owner, str) and (owner == "" or owner in names),
+                "discovery.graph",
+                "a datum owner must be a known occurrence name or the frozen top assembly",
+                {"datum": datum.get("name"), "owner": owner},
+            )
         component_properties = (raw.get("properties") or {}).get("components") or {}
         for name, values in component_properties.items():
             marker = values.get("dp.body_marker") if isinstance(values, dict) else None
@@ -1033,9 +1270,55 @@ def verify_discovery(package: Path) -> dict:
             )
         return {"components": len(names), "mates": len(raw.get("mates") or []), "datums": len(raw.get("datums") or [])}
 
+    def frame_attachment():
+        raw = state["payload"]["raw"]
+        result = _frame_attachment(raw)
+        for item in result["problems"]:
+            _require(False, item["code"], item["message"], item["detail"])
+        members = result["members"]
+        if members is None:
+            return {"mates": result["mates"]}
+        by_material, _by_component = _cluster_bindings(raw)
+        material = next((group for group, full in by_material.items() if set(full) == set(members)), None)
+        _require(
+            material is not None,
+            "discovery.frame_attachment",
+            "the frame-attached cluster has no material body",
+            {"components": sorted(members)},
+        )
+        source_bodies = (state["robot"].get("source") or {}).get("bodies") or []
+        body = next(
+            (
+                item
+                for item in source_bodies
+                if {str(value) for value in (item.get("components") or [])} == set(material)
+            ),
+            None,
+        )
+        _require(
+            body is not None,
+            "discovery.frame_attachment",
+            "the frame-attached cluster has no published body",
+            {"components": sorted(material)},
+        )
+        datum = str((body.get("frame") or {}).get("coordinate_system") or "")
+        _require(
+            datum == "CS_base_link",
+            "discovery.frame_attachment",
+            "the frame-attached cluster must become the CS_base_link body",
+            {"body": body.get("name"), "datum": datum},
+        )
+        return {
+            "mates": result["mates"],
+            "components": result["components"],
+            "rank": result["rank"],
+            "body": body.get("name"),
+        }
+
     def bodies():
         robot = state["robot"]
         raw = state["payload"]["raw"]
+        attached = _frame_attached_members(raw)
         by_name = _components_by_name(raw)
         source_bodies = (robot.get("source") or {}).get("bodies")
         _require(isinstance(source_bodies, list) and source_bodies, "discovery.bodies", "robot.yaml declares no bodies")
@@ -1085,7 +1368,7 @@ def verify_discovery(package: Path) -> dict:
                 _owned_datum(
                     raw,
                     frame["coordinate_system"],
-                    full_by_material.get(frozenset(body.get("components") or []), frozenset()),
+                    _datum_owners(full_by_material.get(frozenset(body.get("components") or []), frozenset()), attached),
                 )
                 is not None,
                 "discovery.bodies",
@@ -1143,6 +1426,7 @@ def verify_discovery(package: Path) -> dict:
         robot = state["robot"]
         payload = state["payload"]
         raw = payload["raw"]
+        attached = _frame_attached_members(raw)
         frozen = payload.get("frozen_names") or {}
         _require(isinstance(frozen, dict), "discovery.names", "frozen_names must be an object")
         source = robot.get("source") or {}
@@ -1166,8 +1450,11 @@ def verify_discovery(package: Path) -> dict:
             )
             name = str(body.get("name"))
             datum_name = str((body.get("frame") or {}).get("coordinate_system"))
+            owners = _datum_owners(full, attached)
             owned = [
-                item for item in datums if str(item.get("owner") or "") in full and str(item.get("name")) == datum_name
+                item
+                for item in datums
+                if str(item.get("owner") or "") in owners and str(item.get("name")) == datum_name
             ]
             _require(
                 owned,
@@ -1203,7 +1490,7 @@ def verify_discovery(package: Path) -> dict:
                 explicit = {(components_properties.get(component) or {}).get("dp.body_datum") for component in full}
                 if datum_name in explicit:
                     _require(
-                        _owned_datum(raw, datum_name, full) is not None,
+                        _owned_datum(raw, datum_name, _datum_owners(full, attached)) is not None,
                         "discovery.names",
                         "body_datum names a datum no component of this body owns uniquely",
                         {"body": name, "datum": datum_name},
@@ -1268,6 +1555,7 @@ def verify_discovery(package: Path) -> dict:
         robot = state["robot"]
         payload = state["payload"]
         raw = payload["raw"]
+        attached = _frame_attached_members(raw)
         source = robot.get("source") or {}
         source_joints = source.get("joints") or []
         bodies = {
@@ -1401,7 +1689,7 @@ def verify_discovery(package: Path) -> dict:
             child_datum = _owned_datum(
                 raw,
                 child["frame"]["coordinate_system"],
-                cluster_of_body.get(str(child.get("name")), frozenset()),
+                _datum_owners(cluster_of_body.get(str(child.get("name")), frozenset()), attached),
             )
             _require(
                 child_datum is not None,
@@ -1605,6 +1893,7 @@ def verify_discovery(package: Path) -> dict:
         robot = state["robot"]
         payload = state["payload"]
         raw = payload["raw"]
+        attached = _frame_attached_members(raw)
         source = robot.get("source") or {}
         bodies = source.get("bodies") or []
         by_material, _by_component = _cluster_bindings(raw)
@@ -1620,9 +1909,29 @@ def verify_discovery(package: Path) -> dict:
             cluster_of_body[name] = full
             for component in full:
                 component_body[component] = name
+        # A proven frame-attached cluster is rigidly the assembly frame, so the frozen
+        # top assembly's ownerless datum channel maps to exactly that body: recognised
+        # top-owned interfaces (TCP_/SCS_) resolve there or stay unowned and block.
+        if attached:
+            material = next((group for group, full in by_material.items() if set(full) == set(attached)), None)
+            if material is not None:
+                base = next(
+                    (
+                        str(item.get("name"))
+                        for item in bodies
+                        if {str(value) for value in (item.get("components") or [])} == set(material)
+                    ),
+                    None,
+                )
+                if base is not None:
+                    component_body[""] = base
         for body in bodies:
             frame_name = str((body.get("frame") or {}).get("coordinate_system") or "")
-            frame_datum = _owned_datum(raw, frame_name, cluster_of_body.get(str(body.get("name")), frozenset()))
+            frame_datum = _owned_datum(
+                raw,
+                frame_name,
+                _datum_owners(cluster_of_body.get(str(body.get("name")), frozenset()), attached),
+            )
             if frame_datum is not None:
                 link_datums.add((str(frame_datum.get("owner") or ""), str(frame_datum.get("name") or "")))
         expected: dict[str, tuple[str, str]] = {}
@@ -1703,7 +2012,7 @@ def verify_discovery(package: Path) -> dict:
             reference = _owned_datum(
                 raw,
                 (child.get("frame") or {}).get("coordinate_system"),
-                cluster_of_body.get(str(child.get("name")), frozenset()),
+                _datum_owners(cluster_of_body.get(str(child.get("name")), frozenset()), attached),
             )
             _require(
                 reference is not None,
@@ -1729,6 +2038,7 @@ def verify_discovery(package: Path) -> dict:
         ("discovery.revision", revision),
         ("discovery.budgets", budgets),
         ("discovery.graph", graph),
+        ("discovery.frame_attachment", frame_attachment),
         ("discovery.bodies", bodies),
         ("discovery.masses", masses),
         ("discovery.names", names),

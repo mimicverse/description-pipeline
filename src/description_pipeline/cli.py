@@ -36,14 +36,14 @@ def parser() -> argparse.ArgumentParser:
     rebuild.add_argument("--repository", type=Path)
     rebuild.add_argument("--base")
     rebuild.add_argument("--message")
-    submit = operations.add_parser("submit", help="recheck and submit a frozen delivery from Windows or Linux")
+    submit = operations.add_parser("submit", help="recheck and submit a frozen delivery on Linux")
     submit.add_argument("bundle", type=Path)
     submit.add_argument("--repository", type=Path, required=True)
     submit.add_argument("--base")
     submit.add_argument("--message")
     serve = operations.add_parser("serve", help="run the authenticated Windows endpoint used by Apache Airflow")
     serve.add_argument("--config", type=Path, required=True)
-    operations.add_parser("doctor", help="check runtime and native capture availability")
+    operations.add_parser("doctor", help="check this host's native or portable runtime")
     return commands
 
 

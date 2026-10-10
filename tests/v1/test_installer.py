@@ -218,6 +218,9 @@ class InstallGuardsTest(unittest.TestCase):
             python = bindir / "python"
             python.write_text('#!/bin/bash\n[ "${1:-}" != "-c" ] || echo 3.12\nexit 0\n')
             python.chmod(0o755)
+            doctor = bindir / "description"
+            doctor.write_text('#!/bin/bash\necho "doctor" >> "$CALLS"\nexit "${DOCTOR_EXIT:-0}"\n')
+            doctor.chmod(0o755)
             airflow = bindir / "airflow"
             airflow.write_text(
                 '#!/bin/bash\necho "$*" >> "$CALLS"\n'
@@ -242,7 +245,14 @@ class InstallGuardsTest(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertEqual(admission.read_text(), initial)
-            self.assertEqual(calls.read_text().splitlines(), ["db migrate", "version"] * 2)
+            self.assertEqual(calls.read_text().splitlines(), ["doctor", "db migrate", "version"] * 2)
+            calls.write_text("")
+            rejected = self._install(
+                tmp, AIRFLOW_PYTHON=str(python), PIPELINE_WHEEL=str(wheel),
+                ADMISSION=str(admission), CALLS=str(calls), DOCTOR_EXIT="1",
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertEqual(calls.read_text().splitlines(), ["doctor"])
 
     def test_rejects_relative_forbidden_and_missing_wheel(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

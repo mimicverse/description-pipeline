@@ -98,7 +98,7 @@ def start_plan(job: dict, requested: str, *, probe: dict[str, str], tool: str) -
             "start_stage": None,
             "stage_name_zh": None,
         }
-    if job.get("status") not in {"failed", "passed"}:
+    if job.get("status") not in {"failed", "passed", "native_complete"}:
         return {
             "accepted": False,
             "reason": "not_ready",

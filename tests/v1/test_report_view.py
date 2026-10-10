@@ -63,7 +63,11 @@ def passed_job() -> dict:
             "files": {"handoff/a.SLDPRT": "a" * 64, "handoff/b.SLDPRT": "b" * 64, "handoff/c.SLDPRT": "c" * 64}
         },
         "discovery.definition": {"passed": True, "findings": [], "hardware_id": "nd_cfg_gap", "revision": "r1"},
-        "runtime.ready": {"reader": "mujoco", "bodies": 4, "joints": 2},
+        "runtime.ready": {
+            "role": "native",
+            "scope": "Native prerequisites; the capture session checks CAD access and document readiness",
+            "solidworks_executable": "D:\\DOWNLO~1\\SOLIDWORKS\\SLDWORKS.exe",
+        },
         "publication.inputs": {
             "repository_slug": "example/repo",
             "base": "feature/nd_cfg_gap",
@@ -163,7 +167,17 @@ class ReportViewTests(unittest.TestCase):
         self.assertIn("型号 nd_cfg_gap", definition["summary"]["actual"])
         self.assertIn("阻塞发现 0 项", definition["summary"]["actual"])
         runtime = next(row for row in stages["capture"]["boundary"] if row["id"] == "runtime.ready")
-        self.assertIn("mujoco 环境自检模型：4 个刚体、2 个关节", runtime["summary"]["actual"])
+        # Native readiness reports prerequisites; the CAD session itself is not claimed here, and
+        # the raw host executable path never reaches the operator summary.
+        self.assertEqual(runtime["summary"]["expected"], "原生平台与 SolidWorks 就绪")
+        self.assertIn("Windows、COM 与 SolidWorks 前置条件", runtime["summary"]["actual"])
+        self.assertIn("采集会话", runtime["summary"]["actual"])
+        self.assertNotIn("未记录", runtime["summary"]["actual"])
+        self.assertNotIn("SLDWORKS.exe", runtime["summary"]["actual"])
+        consumer = independent["consumer.urdf"]
+        self.assertEqual(consumer["label_zh"], "消费端 URDF 可加载性")
+        self.assertIn("4 个消费端刚体", consumer["summary"]["actual"])
+        self.assertIn("3.13.0", consumer["summary"]["actual"])
         publish_rows = {row["id"]: row for row in stages["publish"]["boundary"]}
         self.assertEqual(publish_rows["publication.git"]["label_zh"], "发布提交字节一致性（复制/暂存/提交）")
         self.assertIn("字节一致性", publish_rows["publication.git"]["summary"]["scope_zh"])

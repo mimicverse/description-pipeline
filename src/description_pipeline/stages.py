@@ -1,7 +1,7 @@
 """One engineering-stage contract and its evidence-driven run view.
 
-Airflow transports one serialized native job. These six stages describe the
-engineering work inside that job; reading this view never executes that work.
+Airflow coordinates native acquisition and Linux verification. These six stages
+describe the engineering work; reading this view never executes that work.
 """
 
 from __future__ import annotations
@@ -17,7 +17,22 @@ CONTRACT = json.loads(Path(__file__).with_name("stage-contract.json").read_text(
 CONTRACT_SHA256 = digest(CONTRACT)
 CONTRACT_FILE_SHA256 = file_digest(Path(__file__).with_name("stage-contract.json"))
 STAGE_IDS = tuple(stage["id"] for stage in CONTRACT["stages"])
+#: One execution host per stage: Windows native CAD evidence versus the portable
+#: Linux generation, verification and publication half.
+HOST_IDS = ("native", "portable")
+HOST_BY_STAGE = {stage["id"]: stage.get("host") for stage in CONTRACT["stages"]}
+if set(HOST_BY_STAGE.values()) - set(HOST_IDS) or any(host is None for host in HOST_BY_STAGE.values()):
+    raise PipelineError("Every engineering stage must declare exactly one execution host")
 VIEW_SCHEMA = "solidworks-to-urdf.stages/v1"
+
+
+def stage_host(stage_id: str) -> str:
+    """The declared execution host of one engineering stage."""
+
+    try:
+        return HOST_BY_STAGE[stage_id]
+    except KeyError as error:
+        raise PipelineError(f"Unknown engineering stage: {stage_id!r}") from error
 
 
 def _boundary(stage, boundary, identifier):
@@ -213,7 +228,7 @@ def require_complete(view):
     if view.get("contract_sha256") != CONTRACT_SHA256 or [s["id"] for s in view.get("stages", [])] != list(STAGE_IDS):
         raise PipelineError("Stage result does not match the installed engineering contract")
     if view.get("execution_scope") != list(STAGE_IDS):
-        raise PipelineError("A complete native workflow requires all six engineering stages")
+        raise PipelineError("A complete workflow requires all six engineering stages")
     for stage, definition in zip(view["stages"], CONTRACT["stages"], strict=True):
         for boundary in ("input_qc", "output_qc"):
             rows = stage.get(boundary) or []
@@ -265,6 +280,7 @@ def compact_view(view):
         "stages": [
             {
                 "id": stage["id"],
+                "host": stage["host"],
                 "state": stage["state"],
                 "checks_passed": stage["checks_passed"],
                 "checks_total": stage["checks_total"],

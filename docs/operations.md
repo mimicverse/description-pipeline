@@ -139,8 +139,8 @@ After verification, the engineering view lists only facts outside automatic
 coverage; it does not claim that external approvals are pending or complete.
 Unsupported items never become implicit passes.
 The detailed delivery receipt is `reports/stages.json`. Maintainers can also
-inspect terminal results in Airflow's `wait_for_job` task logs, including when
-`confirm_job` is blocked; see [deployment maintenance](deployment.md#maintenance).
+inspect native results in Airflow's `wait_for_job` task logs and portable results in
+the generation, verification and publication task logs; see [deployment maintenance](deployment.md#maintenance).
 
 An engineer cannot override a failed automatic check by signing a review.
 Existing approvals may be reused only while the relevant structure,
@@ -186,7 +186,7 @@ with the approved model.
 ## 6. Independent review and recovery
 
 Platform maintainers use the recorded tool environment to verify or rebuild a
-complete frozen delivery on Linux or Windows without opening SolidWorks:
+complete frozen delivery on Linux without opening SolidWorks:
 
 ```sh
 description check /path/to/delivery
@@ -202,7 +202,7 @@ executes generation and verification (plus publication when a repository is
 given) against the frozen evidence, and `description submit` executes publication
 only. They do not reopen or re-qualify the native stages freeze, discover or
 capture; their `reports/stages.json` marks those stages as out of scope. The
-detailed six-stage completeness belongs to a complete endpoint job.
+detailed six-stage completeness belongs to a complete Airflow run.
 
 For publication recovery, use the retained verified delivery and a dedicated
 clean model clone with GitHub access. Work on a copy of the delivery so the

@@ -45,11 +45,15 @@ from .airflow_client import (
     EndpointProtocolError,
     ResultNotPublishable,
     WindowsEndpoint,
+    _linux_repositories,
+    _linux_store_root,
     check_result,
     native_run_id,
     validate_artifact_name,
     verified_result,
 )
+from ..io import PipelineError
+from .linux_store import LinuxStore
 from .feishu_oauth import (
     TRIGGERING_USER_NAME_DELIMITER,
     TRIGGERING_USER_NAME_LIMIT,
@@ -359,12 +363,16 @@ class PortalConfig:
     max_body_bytes: int = 64 * 1024
     upload_root: Path | None = None
     upload_concurrency: int = 2
+    #: Split-pipeline routing: the Linux attempt store and model-repository checkouts.
+    pipeline_store_root: Path | None = None
+    pipeline_repositories: dict[str, Path] | None = None
 
 
 _CONFIG_KEYS = {
     "airflow": {"url"},
     "endpoint": {"url", "token_file"},
     "portal": {"host", "port", "upload_root", "upload_concurrency"},
+    "pipeline": {"store_root", "repositories"},
 }
 
 
@@ -418,9 +426,15 @@ def load_portal_config(path: Path) -> PortalConfig:
     airflow_section = _section(data, "airflow")
     portal_section = _section(data, "portal")
     endpoint_section = _section(data, "endpoint")
+    pipeline_section = _section(data, "pipeline")
     url = airflow_section.get("url")
     if not isinstance(url, str) or not url.strip():
         raise AirflowApiError("portal config needs airflow.url")
+    try:
+        pipeline_store_root = _linux_store_root(pipeline_section.get("store_root"))
+        pipeline_repositories = _linux_repositories(pipeline_section.get("repositories") or {})
+    except EndpointProtocolError as error:
+        raise AirflowApiError(f"portal config [pipeline]: {error}") from error
     return PortalConfig(
         airflow=AirflowApi(url.strip()),
         endpoint=_endpoint_from_config(endpoint_section),
@@ -428,6 +442,8 @@ def load_portal_config(path: Path) -> PortalConfig:
         port=int(portal_section.get("port", 8780)),
         upload_root=_upload_root(portal_section),
         upload_concurrency=_upload_concurrency(portal_section),
+        pipeline_store_root=pipeline_store_root,
+        pipeline_repositories=pipeline_repositories,
     )
 
 
@@ -632,8 +648,15 @@ def _automatic_summary(job: dict | None) -> dict:
         }
     if status == "failed":
         return {"state": "failed", "job_state": status, "checks": checks, "message": message}
-    if status in {"queued", "running"}:
-        return {"state": status, "job_state": status, "checks": checks}
+    if status in {"queued", "running", "native_complete"}:
+        # native_complete ends the native half only: the portable half is still the
+        # pipeline's remaining work, so the automatic view stays in progress instead of
+        # surfacing a terminal verdict or a raw protocol message.
+        return {
+            "state": "running" if status == "native_complete" else status,
+            "job_state": status,
+            "checks": checks,
+        }
     return {"state": "unverified", "job_state": status, "checks": checks, "message": message}
 
 
@@ -658,7 +681,9 @@ def _retry_assessment(run: dict, tasks: list[dict], job: dict | None, endpoint_e
         )
     if job.get("status") == "failed":
         return RetryAssessment(False, "native_terminal_failure", ())
-    if job.get("status") not in {"queued", "running", "passed"}:
+    # native_complete is the split pipeline's native boundary: the immutable evidence exists
+    # and recovery revalidates it, so it must not read as evidence-unavailable.
+    if job.get("status") not in {"queued", "running", "passed", "native_complete"}:
         return RetryAssessment(False, "endpoint_evidence_unavailable", ())
     return assessment
 
@@ -711,6 +736,7 @@ class PortalApp:
         self._lock = threading.Lock()
         self._runs: dict[str, PortalRun] = {}
         self._previews: dict[str, tuple[float, dict]] = {}
+        self._store_cache: LinuxStore | None = None
         self._upload_gate = UploadGate(config.upload_concurrency)
         self._rerun_lock = threading.Lock()
         self.run_metadata = RunMetadataStore(
@@ -1228,7 +1254,9 @@ class PortalApp:
             job_state = str(job.get("status") or "")
             if job_state in {"queued", "running"}:
                 return "run_active", "原生作业仍在执行，结束后才能删除"
-            if job_state not in {"passed", "failed"}:
+            # native_complete is a definitive native state: the Windows half is done and only
+            # the Linux portable half may still be running (checked above).
+            if job_state not in {"passed", "failed", "native_complete"}:
                 return "unconfirmed", "无法确认原生作业状态，请稍后重试"
         return None
 
@@ -1265,9 +1293,7 @@ class PortalApp:
         job: dict | None = None
         endpoint_error: str | None = None
         try:
-            job = endpoint.get_job(run_id)
-        except EndpointNotFound:
-            job = None
+            job = self._job_snapshot(run_id, endpoint)
         except EndpointError as error:
             endpoint_error = str(error)
         conf = airflow_run.get("conf") if isinstance(airflow_run.get("conf"), dict) else {}
@@ -1433,14 +1459,59 @@ class PortalApp:
     def _rerun_rows(self, native_id: str) -> list[dict] | None:
         """Finished stage-rerun availability rows; unavailable data is omitted, never faked."""
         plan = getattr(self._endpoint(), "rerun_plan", None)
-        if plan is None:
-            return None
-        try:
-            payload = plan(native_id)
-        except (EndpointNotFound, EndpointError):
-            return None
-        rows = payload.get("stage_reruns") if isinstance(payload, dict) else None
-        return rows if isinstance(rows, list) and rows else None
+        rows = None
+        if plan is not None:
+            try:
+                payload = plan(native_id)
+                rows = payload.get("stage_reruns") if isinstance(payload, dict) else None
+            except (EndpointNotFound, EndpointError):
+                rows = None
+        if not isinstance(rows, list) or not rows:
+            rows = None
+        store = self._store()
+        if store is None or not isinstance(store.meta(native_id), dict):
+            return rows
+
+        def checkpoint(stage: str) -> Path | None:
+            try:
+                return store.checkpoint_dir(native_id, stage)
+            except PipelineError:
+                return None
+
+        if rows is None:
+            # A linked Linux attempt has no Windows plan of its own: the rows describe the
+            # portable restart surface while the native stages remain reused evidence.
+            rows = [
+                {
+                    "stage": stage["id"],
+                    "name_zh": stage["name_zh"],
+                    "eligible": False,
+                    "reason": "linux_owned",
+                    "reason_zh": "该阶段由 Windows 原生端提供或已复用",
+                    "recomputes": [stage["id"]],
+                    "retains": [],
+                    "prerequisites": [],
+                    "target_changed": False,
+                }
+                for stage in CONTRACT["stages"]
+            ]
+        seeds = {"generate": checkpoint("capture"), "verify": checkpoint("generate"), "publish": checkpoint("verify")}
+        for row in rows:
+            stage = row.get("stage")
+            if stage not in seeds:
+                continue
+            ready = seeds[stage] is not None
+            row.update(
+                eligible=bool(ready),
+                reason="linux_ready" if ready else "linux_checkpoint_missing",
+                reason_zh="可在 Linux 便携端重跑" if ready else "缺少可在 Linux 重跑的检查点",
+                # The native plan's prerequisite summary describes the Windows half only
+                # (its receipt accounting cannot see post-capture evidence); for the
+                # portable surface the verdict above is proven by the local checkpoints.
+                # Clear it instead of inventing Linux receipt evidence.
+                prerequisites=[],
+            )
+        return rows
 
     def _scan_active_attempt(
         self, session: PortalSession, parent_dag_run_id: str
@@ -1772,6 +1843,17 @@ class PortalApp:
             cached = self._previews.get(run_id)
         if cached is not None and now - cached[0] <= self.config.preview_ttl:
             return cached[1]
+        store = self._store()
+        if store is not None and isinstance(store.meta(run_id), dict):
+            try:
+                preview = store.preview(run_id)
+            except PipelineError as error:
+                if store.delivery_dir(run_id) is None:
+                    raise PortalError(HTTPStatus.NOT_FOUND, "该运行还没有可展示的已验证交付") from error
+                raise PortalError(HTTPStatus.CONFLICT, f"模型尚未通过独立校验：{error}") from error
+            with self._lock:
+                self._previews[run_id] = (now, preview)
+            return preview
         endpoint = self._endpoint()
         try:
             job = endpoint.get_job(run_id)
@@ -1803,6 +1885,32 @@ class PortalApp:
         digest = preview["files"].get(artifact)
         if not isinstance(digest, str):
             raise PortalError(HTTPStatus.NOT_FOUND, "该文件不在已验证交付清单中")
+        store = self._store()
+        store_run_id = native_run_id(dag_run_id)
+        if store is not None and isinstance(store.meta(store_run_id), dict):
+            try:
+                stream, _size = store.open_artifact(store_run_id, artifact, sha256=digest)
+            except PipelineError as error:
+                raise PortalError(HTTPStatus.NOT_FOUND, str(error)) from error
+            data = bytearray()
+            try:
+                with stream:
+                    while True:
+                        chunk = stream.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        data.extend(chunk)
+            except PipelineError as error:
+                # The stream verifies the digest at EOF; nothing may reach the browser first.
+                raise PortalError(HTTPStatus.BAD_GATEWAY, "交付文件摘要校验失败，已拒绝提供") from error
+            content_type = _ARTIFACT_TYPES.get(Path(artifact).suffix.lower(), "application/octet-stream")
+            headers = [
+                ("Content-Type", content_type),
+                ("Content-Length", str(len(data))),
+                ("Cache-Control", "private, max-age=300"),
+            ]
+            start_response("200 OK", _common_headers(headers, self.config))
+            return [bytes(data)]
         endpoint = self._endpoint()
         try:
             data = endpoint.read_artifact(
@@ -1852,6 +1960,28 @@ class PortalApp:
     def _endpoint(self) -> WindowsEndpoint:
         endpoint = self.config.endpoint
         return endpoint() if callable(endpoint) else endpoint
+
+    def _store(self) -> LinuxStore | None:
+        root = self.config.pipeline_store_root
+        if root is None:
+            return None
+        with self._lock:
+            if self._store_cache is None:
+                self._store_cache = LinuxStore(root)
+            return self._store_cache
+
+    def _job_snapshot(self, run_id: str, endpoint: WindowsEndpoint) -> dict | None:
+        """The authoritative run snapshot: the Linux store when the attempt entered it."""
+        native = None
+        try:
+            native = endpoint.get_job(run_id)
+        except (EndpointNotFound, EndpointError):
+            # An admitted Linux attempt stays readable even when Windows is unreachable.
+            native = None
+        store = self._store()
+        if store is not None and isinstance(store.meta(run_id), dict):
+            return store.merged_job(run_id, native)
+        return native
 
     def _body(self, environ: dict) -> dict:
         try:

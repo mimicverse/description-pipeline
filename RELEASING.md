@@ -15,7 +15,10 @@ model repository. Retain local acceptance evidence; GitHub CI is not required.
    and independent verification report. Include repeated part occurrences with
    distinct saved configurations and a nested rigid assembly to verify context,
    geometry and mass coverage.
-3. Build twice from one clean committed checkout. Compare distribution hashes
+3. Verify capture transfer rejects missing, extra, changed and foreign-run files.
+   Confirm native capture works without MuJoCo installed, and Linux refuses
+   publication when consumer verification fails.
+   Build twice from one clean committed checkout. Compare distribution hashes
    and verify installation outside that checkout on Linux and Windows.
 4. Accept the deployed workflow: HTTPS login → native folder → Airflow run →
    detailed checks → actual verified URDF and joint limits → review PR.

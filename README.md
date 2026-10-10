@@ -4,8 +4,9 @@ One engineering folder, one operator page, one verified model PR.
 
 `solidworks-to-urdf` freezes native SolidWorks engineering, derives the robot
 model, generates URDF and meshes, independently verifies the delivery, and
-creates or updates its review PR. Airflow coordinates execution on a licensed
-Windows SolidWorks worker.
+creates or updates its review PR. Airflow coordinates native CAD capture on Windows and generation, independent
+MuJoCo verification and PR publication on Linux. Windows requires licensed
+SolidWorks; it does not require MuJoCo or GitHub credentials.
 
 ## Use
 
@@ -61,7 +62,7 @@ The self-contained delivery contains `urdf/robot.urdf`, `meshes/`, frozen
 engineering, raw evidence, the canonical model and bound quality reports.
 `reports/stages.json` records each step's inputs, checks, outputs and evidence,
 and which steps actually ran.
-With the recorded tool environment installed, recheck it on Linux or Windows:
+With the recorded Linux verification environment installed, recheck it:
 
 ```sh
 description check /path/to/delivery

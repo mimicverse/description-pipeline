@@ -60,7 +60,27 @@ class DagTests(unittest.TestCase):
         self.assertEqual(bag.import_errors, {})
         dag = bag.dags["solidworks_to_urdf"]
         self.assertIsNone(dag.schedule)
-        self.assertEqual(set(dag.task_ids), {"resolve_handoff", "start_job", "wait_for_job", "confirm_job"})
+        self.assertEqual(
+            set(dag.task_ids),
+            {
+                "resolve_handoff",
+                "start_job",
+                "wait_for_job",
+                "fetch_capture",
+                "run_generate",
+                "run_verify",
+                "run_publish",
+                "confirm_job",
+            },
+        )
+        edges = {task_id: set(task.upstream_task_ids) for task_id, task in dag.task_dict.items()}
+        self.assertEqual(edges["start_job"], {"resolve_handoff"})
+        self.assertEqual(edges["wait_for_job"], {"start_job"})
+        self.assertEqual(edges["fetch_capture"], {"start_job", "wait_for_job"})
+        self.assertEqual(edges["run_generate"], {"fetch_capture"})
+        self.assertEqual(edges["run_verify"], {"run_generate"})
+        self.assertEqual(edges["run_publish"], {"run_verify"})
+        self.assertEqual(edges["confirm_job"], {"run_publish"})
         self.assertEqual(set(dag.params), {"handoff_path", "main_assembly"})
         handoff_param = dict(dag.params.items())["handoff_path"]
         self.assertEqual(handoff_param.schema["title"], "Engineering folder path")
@@ -142,10 +162,10 @@ class DagTests(unittest.TestCase):
 
     def test_dag_run_against_mock_endpoint(self) -> None:
         from tests.v1.test_airflow_client import MockEndpoint
+        from airflow.sdk.exceptions import AirflowFailException
 
-        venv = Path(os.environ.get("AIRFLOW_VENV", sys.prefix))
-        airflow = venv / "bin" / "airflow"
-        self.assertTrue(airflow.is_file(), airflow)
+        module = self._module()
+        dag = module.dag
         with MockEndpoint() as server:
             connection = json.dumps(
                 {
@@ -155,41 +175,34 @@ class DagTests(unittest.TestCase):
                     "password": "test-token",
                 }
             )
-            env = dict(
-                os.environ,
-                AIRFLOW_HOME=str(migrated_airflow_home(venv)),
-                AIRFLOW__CORE__DAGS_FOLDER=str(DAG_DIR),
-                PYTHONPATH=str(ROOT / "src"),
-                AIRFLOW_CONN_SOLIDWORKS_WINDOWS=connection,
-                SOLIDWORKS_SENSOR_MODE="poke",
-                SOLIDWORKS_POLL_INTERVAL="0.2",
-                SOLIDWORKS_TIMEOUT="60",
-            )
-            conf = json.dumps(
-                {
-                    "handoff_path": "handoff/m3.0",
-                }
-            )
-            result = subprocess.run(
-                [str(airflow), "dags", "test", "solidworks_to_urdf", "2026-01-01", "--conf", conf],
-                cwd=ROOT,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=300,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+            request = {
+                "run_id": module.native_run_id("dag-run-native-half"),
+                "package": "handoff/m3.0",
+                "handoff_sha256": "b" * 64,
+                "conn_id": "solidworks_windows",
+            }
+            with patch.dict(os.environ, {"AIRFLOW_CONN_SOLIDWORKS_WINDOWS": connection}):
+                started = dag.task_dict["start_job"].python_callable(request)
+                self.assertIn(started["status"], {"queued", "running"})
+                polled = False
+                for _ in range(8):
+                    if module._poke(started):
+                        polled = True
+                        break
+                self.assertTrue(polled)
+                with self.assertRaises(AirflowFailException):
+                    # The portable half only starts from the native_complete boundary;
+                    # the full split is covered by test_split_workflow/test_linux_split.
+                    dag.task_dict["fetch_capture"].python_callable(started)
             self.assertEqual(len(server.jobs), 1)
             job = next(iter(server.jobs.values()))
-            self.assertEqual(job["status"], "passed")
             self.assertEqual(
                 job["request"],
-                {"run_id": job["run_id"], "package": "handoff/m3.0", "handoff_sha256": "b" * 64},
+                {"run_id": request["run_id"], "package": "handoff/m3.0", "handoff_sha256": "b" * 64},
             )
             self.assertEqual(job["hardware_id"], "m3.0")
             self.assertEqual(job["repository_slug"], "example/m3.0")
             self.assertEqual(job["repository_base"], "feature/m3.0")
-            self.assertEqual(server.resolved_paths, ["handoff/m3.0"])
 
     def test_linked_conf_binding_is_validated(self) -> None:
         from types import SimpleNamespace
@@ -232,9 +245,8 @@ class DagTests(unittest.TestCase):
     def test_dag_run_with_explicit_main_assembly(self) -> None:
         from tests.v1.test_airflow_client import MockEndpoint
 
-        venv = Path(os.environ.get("AIRFLOW_VENV", sys.prefix))
-        airflow = venv / "bin" / "airflow"
-        self.assertTrue(airflow.is_file(), airflow)
+        module = self._module()
+        dag = module.dag
         with MockEndpoint() as server:
             connection = json.dumps(
                 {
@@ -244,38 +256,22 @@ class DagTests(unittest.TestCase):
                     "password": "test-token",
                 }
             )
-            env = dict(
-                os.environ,
-                AIRFLOW_HOME=str(migrated_airflow_home(venv)),
-                AIRFLOW__CORE__DAGS_FOLDER=str(DAG_DIR),
-                PYTHONPATH=str(ROOT / "src"),
-                AIRFLOW_CONN_SOLIDWORKS_WINDOWS=connection,
-                SOLIDWORKS_SENSOR_MODE="poke",
-                SOLIDWORKS_POLL_INTERVAL="0.2",
-                SOLIDWORKS_TIMEOUT="60",
-            )
-            conf = json.dumps(
-                {
-                    "handoff_path": "handoff/m3.0",
-                    "main_assembly": "3.0 总装1008.SLDASM",
-                }
-            )
-            result = subprocess.run(
-                [str(airflow), "dags", "test", "solidworks_to_urdf", "2026-01-01", "--conf", conf],
-                cwd=ROOT,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=300,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+            request = {
+                "run_id": module.native_run_id("dag-run-selection"),
+                "package": "handoff/m3.0",
+                "handoff_sha256": "b" * 64,
+                "conn_id": "solidworks_windows",
+                "main_assembly": "3.0 总装1008.SLDASM",
+            }
+            with patch.dict(os.environ, {"AIRFLOW_CONN_SOLIDWORKS_WINDOWS": connection}):
+                started = dag.task_dict["start_job"].python_callable(request)
+                self.assertIn(started["status"], {"queued", "running"})
             self.assertEqual(len(server.jobs), 1)
             job = next(iter(server.jobs.values()))
-            self.assertEqual(job["status"], "passed")
             self.assertEqual(
                 job["request"],
                 {
-                    "run_id": job["run_id"],
+                    "run_id": request["run_id"],
                     "package": "handoff/m3.0",
                     "handoff_sha256": "b" * 64,
                     "main_assembly": "3.0 总装1008.SLDASM",
@@ -286,9 +282,10 @@ class DagTests(unittest.TestCase):
         from tests.v1.test_airflow_client import JOB_SCHEMA, MockEndpoint, PIPELINE_ID
         from description_pipeline.orchestration.airflow_client import native_run_id
 
-        venv = Path(os.environ.get("AIRFLOW_VENV", sys.prefix))
-        airflow = venv / "bin" / "airflow"
-        self.assertTrue(airflow.is_file(), airflow)
+        from types import SimpleNamespace
+
+        module = self._module()
+        dag = module.dag
         parent_dag_run_id = "portal-parent-20261009"
         parent_run_id = native_run_id(parent_dag_run_id)
         with MockEndpoint() as server:
@@ -316,41 +313,34 @@ class DagTests(unittest.TestCase):
                     "password": "test-token",
                 }
             )
-            env = dict(
-                os.environ,
-                AIRFLOW_HOME=str(migrated_airflow_home(venv)),
-                AIRFLOW__CORE__DAGS_FOLDER=str(DAG_DIR),
-                PYTHONPATH=str(ROOT / "src"),
-                AIRFLOW_CONN_SOLIDWORKS_WINDOWS=connection,
-                SOLIDWORKS_SENSOR_MODE="poke",
-                SOLIDWORKS_POLL_INTERVAL="0.2",
-                SOLIDWORKS_TIMEOUT="60",
-            )
-            conf = json.dumps(
-                {
-                    "handoff_path": "handoff/m3.0",
-                    "parent_dag_run_id": parent_dag_run_id,
-                    "resume_from": "verify",
-                }
-            )
-            result = subprocess.run(
-                [str(airflow), "dags", "test", "solidworks_to_urdf", "2026-01-01", "--conf", conf],
-                cwd=ROOT,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=300,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+            context = {
+                "dag_run": SimpleNamespace(
+                    conf={"parent_dag_run_id": parent_dag_run_id, "resume_from": "capture"},
+                    run_id="portal-child-1",
+                ),
+                "params": {"handoff_path": "", "main_assembly": ""},
+            }
+            with patch.dict(os.environ, {"AIRFLOW_CONN_SOLIDWORKS_WINDOWS": connection}):
+                request = dag.task_dict["resolve_handoff"].python_callable(**context)
+                self.assertEqual(request["package"], "handoff/m3.0")
+                self.assertEqual(request["handoff_sha256"], "b" * 64)
+                self.assertEqual(request["main_assembly"], "3.0 总装1008.SLDASM")
+                self.assertEqual(request["resume"], {"parent_run": parent_run_id, "from_stage": "capture"})
+                started = dag.task_dict["start_job"].python_callable(request)
+                polled = False
+                for _ in range(8):
+                    if module._poke(started):
+                        polled = True
+                        break
+                self.assertTrue(polled)
             self.assertEqual(server.resolved_paths, [])
             children = [job for job in server.jobs.values() if job["run_id"] != parent_run_id]
             self.assertEqual(len(children), 1)
             child = children[0]
-            self.assertEqual(child["status"], "passed")
             self.assertEqual(child["request"]["package"], "handoff/m3.0")
             self.assertEqual(child["request"]["handoff_sha256"], "b" * 64)
             self.assertEqual(child["request"]["main_assembly"], "3.0 总装1008.SLDASM")
-            self.assertEqual(child["request"]["resume"], {"parent_run": parent_run_id, "from_stage": "verify"})
+            self.assertEqual(child["request"]["resume"], {"parent_run": parent_run_id, "from_stage": "capture"})
 
 
 if __name__ == "__main__":

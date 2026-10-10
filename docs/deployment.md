@@ -1,8 +1,9 @@
 # Deployment
 
-One Linux server hosts the HTTPS operator page, Airflow and PostgreSQL. One
-logged-in Windows computer with licensed SolidWorks executes native jobs
-serially. Operators use **Feishu login → engineering folder → Start → checks,
+One Linux server hosts the HTTPS operator page, Airflow and PostgreSQL, and
+executes generation, independent MuJoCo verification and PR publication. One
+logged-in Windows computer with licensed SolidWorks serializes native input
+freezing, discovery and capture. Operators use **Feishu login → engineering folder → Start → checks,
 URDF preview and review PR**.
 
 Use the same source-bound tool release on both hosts. This guide owns installation
@@ -12,9 +13,9 @@ and maintenance; [operations](operations.md) owns the engineering workflow.
 
 | Host or service | Required preparation |
 |---|---|
-| Linux | Ubuntu 22.04 x86_64, user-level systemd, network access to the Windows worker, GitHub and Feishu |
-| Windows | SolidWorks 2026 (native major 34; other versions require platform acceptance first), Python 3.12 x86_64, Git, GitHub CLI and OpenSSH Server; an interactive desktop session |
-| Model repository | Private repository, an existing `feature/<hardware>` base and a dedicated clean Windows clone |
+| Linux | Ubuntu 22.04 x86_64, user-level systemd, Git, GitHub CLI, network access to the Windows worker, GitHub and Feishu |
+| Windows | SolidWorks 2026 (native major 34; other versions require platform acceptance first), Python 3.12 x86_64 and OpenSSH Server; an interactive desktop session |
+| Model repository | Private repository, an existing `feature/<hardware>` base and a dedicated clean Linux clone |
 | Feishu | Enterprise app, approved tenant keys, registered OAuth callback and access to basic user identity/profile |
 | Storage | Dedicated CAD intake directories; separate frozen inputs, outputs, state, secrets and model clones |
 
@@ -37,11 +38,13 @@ configuration takes effect after publication. A creator-only release is
 sufficient for commissioning that user's sign-in.
 
 SolidWorks is required for fresh native discovery and capture. Verification and
-rebuild of a complete frozen delivery run on Linux or Windows without opening
-CAD. Both hosts require Python 3.12 x86_64 and the pinned runtime wheels.
+rebuild of a complete frozen delivery run on Linux without opening CAD. Both hosts require Python 3.12 x86_64 and the pinned runtime wheels.
 Consumer checks load models without rendering; they require no display, GPU or
-graphics-driver setup. `description doctor` exercises the actual consumer loader
-in an isolated process, and native jobs check readiness before opening CAD.
+graphics-driver setup. `description doctor` checks the host role: SolidWorks registration and COM
+prerequisites on Windows, pinned dependencies and an isolated consumer load on
+Linux. Windows capture requires neither MuJoCo nor GitHub access. A native
+readiness pass is a prerequisite; the capture session still checks actual CAD
+access and document readiness.
 Windows jobs must run as the logged-in execution user, outside Session 0.
 
 ## 1. Install the Windows worker
@@ -53,15 +56,6 @@ release manifest. Extract it, then run from the extracted directory:
 py -3.12 -m venv C:\description-runtime
 C:\description-runtime\Scripts\python.exe -m pip install --no-index --require-hashes --find-links wheels -r requirements.lock
 C:\description-runtime\Scripts\description.exe doctor
-```
-
-Configure Git identity and GitHub authentication for that execution user. Create
-a dedicated clone of the private model repository:
-
-```powershell
-gh auth login
-gh auth setup-git
-git clone https://github.com/<owner>/<model-repository> C:\description-models\arm
 ```
 
 Create the directories below. `C:\cad-handoffs` contains engineering sources;
@@ -85,7 +79,7 @@ Save `C:\description-state\endpoint.json`:
   "handoff_roots": ["C:/cad-handoffs"],
   "package_root": "C:/description-packages",
   "output_root": "C:/description-deliveries",
-  "state_root": "C:/description-state/jobs",
+  "state_root": "C:/description-state",
   "token_file": "C:/description-secrets/endpoint.token",
   "host": "127.0.0.1",
   "port": 8765,
@@ -94,7 +88,7 @@ Save `C:\description-state\endpoint.json`:
   },
   "targets": {
     "arm": {
-      "repository": "C:/description-models/arm",
+      "repository_slug": "<owner>/<model-repository>",
       "base": "feature/arm"
     }
   }
@@ -127,6 +121,17 @@ user. Do not create a second worker or run concurrent native CAD jobs.
 
 ## 2. Configure Linux and Feishu
 
+
+Configure Git identity and GitHub authentication for the Linux service user.
+Create a dedicated clean model checkout; the publication stage verifies that its
+origin matches the Windows hardware routing's repository slug:
+
+```sh
+gh auth login
+gh auth setup-git
+git clone https://github.com/<owner>/<model-repository> /srv/description/models/arm
+```
+
 Extract the deployment archive matching the worker release. Keep deployment
 configuration and secrets outside the checkout. Copy
 [`operator.env.example`](../deploy/operator/operator.env.example) to a private
@@ -152,8 +157,24 @@ Complete these configuration groups once:
 | `SOLIDWORKS_SSH_HOST`, `SOLIDWORKS_ENDPOINT_PORT` | Key-authenticated SSH alias to Windows and its loopback endpoint |
 | `ENDPOINT_TOKEN_FILE` | Private copy of the Windows endpoint token, mode `0600` |
 | `SOLIDWORKS_HANDOFF_ROOT` | Dedicated Linux intake, such as `/srv/description/cad-handoffs`, outside runtime and state |
+| `PIPELINE_STORE_ROOT` | Linux stage checkpoints, model deliveries and diagnostics; defaults to `OPERATOR_STATE/runs` |
+| `MODEL_REPOSITORIES_FILE` | Mode-`0600` JSON mapping repository slugs to dedicated Linux model checkouts |
 | `FEISHU_APP_SECRET_FILE`, `FEISHU_TENANT_KEYS` | App credentials and mandatory tenant allowlist |
 | `FEISHU_ADMIN_OPEN_IDS` | Explicit administrator identities; optional, no automatic administrator |
+
+Create the repository mapping before accepting runs, for example:
+
+```json
+{"<owner>/<model-repository>": "/srv/description/models/arm"}
+```
+
+Set `MODEL_REPOSITORIES_FILE` to its absolute path and restrict it to mode `0600`.
+The slug must match the Windows target's `repository_slug`; its Git origin must
+match that slug. Keep checkouts separate from CAD intake, runtime and run storage.
+Installation renders the same store and routing into the portal and Airflow
+Connection. Health refuses an empty mapping. Reinstall after changing routing.
+Back up the run store with platform state; it owns portable checkpoints and
+published model receipts.
 
 Use comma-separated tenant and administrator lists without spaces.
 The configuration example defines the remaining service and transport defaults.
@@ -196,14 +217,14 @@ Keep the list empty until an administrator is explicitly selected. User IDs
 from another app cannot be reused. Apply configuration through the supported
 installation and restart steps below.
 
-Membership in an approved tenant grants workflow operator access; administrators
-must also appear in the explicit admin list. Operator access covers starting new
-runs and viewing shared results; the run's initiator (stable authenticated
-identity) and platform administrators can retry that run through the single
-contextual Retry action for positively classified transport recovery, which
-continues the same DAG run and native job without recapturing or editing frozen
-inputs or artifacts. Native terminal failures require a new run after correcting
-inputs or configuration. The owner check ships with the platform package; no
+Membership in an approved tenant grants access to start runs and view shared
+results; administrators must also appear in the explicit admin list. Only the
+initiator and platform administrators may change a run. **从此步骤重新运行** creates
+a linked attempt from an eligible retained checkpoint and executes that step and
+its successors. Generation, verification and publication reruns stay on Linux;
+they do not reopen CAD. Changed source files require a new upload.
+**继续原作业** recovers an interrupted transport connection within the same run;
+it does not repeat engineering work. The owner check ships with the platform package; no
 separate credential or install-time flag is required, and operator run changes
 are refused when that guard is absent. Each run's history and details show the
 original submitter's Feishu username from the authenticated API response.
@@ -232,10 +253,12 @@ bash deploy/operator/operatorctl.sh health --env-file "$description_env"
 ```
 
 Installation provisions the pinned Python toolchain, PostgreSQL 14, Airflow
-3.3.2, the matching tool wheel, proxy and service configuration. It starts the
+3.3.2, the matching tool wheel with its verification runtime, proxy and service
+configuration. The Linux runtime check must pass before database migration. It starts the
 managed database before migration; `start` launches the remaining services.
 Installation creates the sole `solidworks_windows` Connection with the endpoint
-token and Linux source allowlist. Operators need no Connection or DAG setup.
+token, Linux source allowlist, run store and model routing. Operators need no
+Connection or DAG setup.
 
 `install` writes configuration, secrets and service units while preserving the
 DAG's admission state. `start` opens and verifies DAG admission before starting
@@ -268,16 +291,13 @@ Commission the complete workflow with actual native CAD and live Feishu:
    explicit admin assignment and denied unauthorized users. Confirm an approved
    operator can start new pipeline runs and view shared results from other
    operators.
-3. As the run's initiator, confirm the Retry action appears only for a
-   positively classified transport failure and continues the same DAG run and
-   native job without recapturing or editing frozen inputs or artifacts, and is
-   absent for native terminal failures. Confirm a platform administrator can
-   also retry that run, that another approved user can view the run but cannot
-   retry it, and that the Retry request
-   (`POST /api/v2/dags/{dag_id}/dagRuns/{dag_run_id}/clear` with
-   `dry_run`, `only_failed: true`, `only_new: false`,
-   `run_on_latest_version: false`) is accepted for the initiator and refused
-   for another approved user.
+3. Verify that the initiator and administrators can start a linked attempt from
+   every eligible engineering step, including a completed step. Earlier work is
+   reused only after its checkpoint checks pass. A verification rerun must not
+   reopen CAD or regenerate the model; a publication rerun must independently
+   recheck the retained delivery before submitting. Other operators may view
+   results but cannot initiate these changes. Separately exercise **继续原作业**
+   for a recoverable transport failure and confirm it retains the same run.
 4. In the operator page, choose the complete engineering folder once (Chrome or
    Edge); the browser uploads its files to the platform's Linux intake and
    `Start` creates the run. No server path, YAML, branch, hardware or
@@ -299,8 +319,8 @@ Commission the complete workflow with actual native CAD and live Feishu:
    diagnostics; a PR-service failure preserves verified preview.
 9. After the complete service restart described below, select a completed run
    and choose **从此步骤重新运行** from verification or publication. Require a
-   new linked run with the selected starting step recorded in the endpoint
-   request. Upstream results must show **复用已验证结果**, retain their original
+   new linked run with the selected starting step recorded in its request.
+   These Linux stages must not submit a new Windows job. Upstream results must show **复用已验证结果**, retain their original
    timestamps and producing-run identity, and trigger no new CAD capture.
    Confirm that only the selected step and its downstream steps execute again,
    and that the original run and evidence remain unchanged. Verify access for

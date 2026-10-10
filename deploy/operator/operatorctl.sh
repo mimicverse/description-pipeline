@@ -183,10 +183,12 @@ case "$ACTION" in
     fi
     mkdir -p "$SOLIDWORKS_HANDOFF_ROOT"
     chmod 700 "$SOLIDWORKS_HANDOFF_ROOT"
+    mkdir -p "$PIPELINE_STORE_ROOT"
+    chmod 700 "$PIPELINE_STORE_ROOT"
     [ -f "$ENDPOINT_TOKEN_FILE" ] || die "endpoint token file missing: $ENDPOINT_TOKEN_FILE"
     AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$AIRFLOW_HERE/scripts/add_connection.py" \
       --token-file "$ENDPOINT_TOKEN_FILE" --host 127.0.0.1 --port 18765 \
-      --handoff-root "$SOLIDWORKS_HANDOFF_ROOT"
+      --handoff-root "$SOLIDWORKS_HANDOFF_ROOT" --pipeline-config "$PORTAL_CONFIG"
     if [ ! -x "${NGINX_BIN:-/usr/sbin/nginx}" ]; then
       OPERATOR_STATE="$OPERATOR_STATE" bash "$HERE/scripts/install_proxy.sh" >/dev/null
     fi

@@ -37,7 +37,7 @@ Generated-input inspection is the input check of `capture`.
 |---|---|---|---|---|---|
 | 1 | `freeze` — Freeze inputs | Saved SolidWorks folder | Admitted path, regular files and native package | Frozen handoff, file inventory and digest | Exact file inventory and handoff digest |
 | 2 | `discover` — Discover structure | Frozen handoff and versioned component records | Unchanged handoff and controlled discovery settings | Native observations and findings; Derived definition and structural revision | Unambiguous identity, bodies, motion, names and references; Native evidence, original files, revision and routing agree |
-| 3 | `capture` — Capture evidence | Prepared definition, saved CAD and native runtime | Derived definition, structural revision and archive integrity; Native platform and isolated URDF consumer readiness | Collected CAD, raw measurements, native meshes and manifest | Complete snapshot with capture and saved-state guards; Original handoff unchanged after capture |
+| 3 | `capture` — Capture evidence | Prepared definition, saved CAD and native runtime | Derived definition, structural revision and archive integrity; Native Windows, COM and SolidWorks prerequisites | Collected CAD, raw measurements, native meshes and manifest | Complete snapshot with capture and saved-state guards; Original handoff unchanged after capture |
 | 4 | `generate` — Generate URDF | Frozen native evidence | Snapshot integrity before consumption | Canonical model; URDF and local meshes; Tool identity and file subject | Valid canonical schema and complete hashed delivery |
 | 5 | `verify` — Independent verification | Original evidence and actual generated files | Generated file subject unchanged | Deterministic per-object quality report | All required native, physical, frame, geometry and consumer checks; Saved report equals independent recomputation |
 | 6 | `publish` — Publish review PR | Verified delivery and configured model repository | Reverified delivery, clean repository and deterministic review branch | Candidate commit and PR receipt | Copied, staged and committed bytes match the verified subject; Remote commit, PR head/base and subject agree |
@@ -45,8 +45,9 @@ Generated-input inspection is the input check of `capture`.
 
 Each boundary records its actual check result before the next step consumes its
 output. Missing checks remain `not_run`; a failure blocks downstream work.
-Each receipt declares its `execution_scope`: a complete endpoint job covers all
-six stages, while maintenance commands cover only the stages they execute
+Each receipt declares its `execution_scope`: Windows covers freeze, discover and
+capture; Linux covers generate, verify and publish. The complete Airflow run
+combines both receipts, while maintenance commands cover only the stages they execute
 ([operations](operations.md#6-independent-review-and-recovery)); unexecuted
 native stages are reported as out of scope, never as qualified.
 [Quality](quality.md) defines the independent gates and tolerances.
@@ -80,14 +81,20 @@ The pipeline ID is `solidworks-to-urdf`; every run has a UUID. Source revisions,
 controlled records, tool code, dependencies, environment and file hashes bind the
 execution. Transport retries reconnect to the same UUID and frozen inputs. A
 terminal native failure or source correction requires a new run. Frozen evidence
-can be rebuilt on Linux or Windows without reopening CAD.
+can be rebuilt on Linux without reopening CAD.
 
-Airflow's four transport tasks resolve the folder, submit the job, poll it and
-confirm its result. They do not execute separate CAD steps. The DAG documentation
-shows the six-step contract; task logs show live states and terminal QC details;
-`engineering_stages` XCom retains the terminal summary, including failures. The
-operator page shows each step's inputs, input QC, outputs, output QC and evidence.
-`reports/stages.json` retains the detailed run receipt.
+Airflow sends freeze, discovery and capture to the serialized Windows worker,
+then runs generation, independent verification and publication on Linux.
+Windows returns a sealed capture bundle; Linux checks its complete inventory,
+file hashes, selected assembly, run identity and native tool identity before use.
+Native completion is an intermediate state, not a verified model.
+
+Both hosts use the same tool source release and record their own runtime
+requirements. Windows checks SolidWorks and COM readiness. Linux checks MuJoCo
+and loads the actual generated URDF in isolation. Git credentials and model
+checkouts stay on Linux. Each stage's results, checks and execution host appear
+in the operator view; the final receipt binds both hosts' evidence. The Linux
+store supplies model previews, downloads and publication results.
 
 When a folder contains more than one saved `.SLDASM`, the page always lists their
 relative paths and requires the operator to choose the main assembly before the run
@@ -138,7 +145,8 @@ receipts; the renderer does not execute engineering work.
 
 One Linux server hosts Airflow, its database and the operator page. One licensed
 Windows endpoint serializes native jobs in owned processes, separate from an
-engineer's CAD session. Runtime readiness precedes CAD access. Native acquisitions
+engineer's CAD session. Native runtime readiness precedes CAD access; consumer
+readiness is checked on Linux. Native acquisitions
 bind their documented interfaces; each rebuild refreshes and verifies the owned
 document once before continuation. Lost bindings or unavailable capabilities
 stop execution, retain diagnostics and release owned resources.
@@ -151,12 +159,12 @@ restricts tenant and workflow permissions and keeps credentials server-side.
 Approved Feishu users may start new pipeline runs and view shared results. Each
 run records its initiator's stable authenticated identity and displays that
 operator's original Feishu username. The run's initiator and platform
-administrators can retry that run through one contextual Retry action for
-positively classified transport recovery; retrying continues the same DAG run
-and native job with the frozen inputs, and captured evidence and delivered
-artifacts are never edited. Every terminal native failure requires a new run
-after correcting the inputs or configuration. Administrators retain broader
-platform administration beyond this action.
+administrators may start a linked attempt from any step whose retained inputs
+pass validation. Earlier results are reused with their original evidence;
+the selected step and its successors execute again. The original run remains
+unchanged. Recoverable transport interruption has a separate continuation action
+within the same run. Changed CAD requires a new upload. Administrators retain
+broader platform administration.
 
 Maintainers configure storage roots and hardware routing once; operators choose
 one complete engineering folder on their own computer in the page, and the

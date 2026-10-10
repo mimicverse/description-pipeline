@@ -102,9 +102,25 @@ class _Target:
 
 
 class _MateEntity:
-    def __init__(self, component, feature_name, geometry=None, *, curve=None, point=None):
+    def __init__(
+        self,
+        component,
+        feature_name,
+        geometry=None,
+        *,
+        curve=None,
+        point=None,
+        reference_type=0,
+        reference_type2=0,
+        entity_params=(0.0, 0.0, 0.0),
+    ):
         self.ReferenceComponent = component
         self.Reference = _Target(feature_name, geometry, curve=curve, point=point)
+        # Documented IMateEntity2 readings; values may also be callables whose
+        # invocation raises, modelling unreadable native members.
+        self.ReferenceType = reference_type
+        self.ReferenceType2 = reference_type2
+        self.EntityParams = entity_params
 
 
 class _MateSpecific:
@@ -198,6 +214,7 @@ class _Component:
         suppressed=False,
         transform=SW_IDENTITY,
         configuration="Default",
+        is_root=False,
     ):
         self.Name2 = name
         self._path = str(path)
@@ -208,6 +225,10 @@ class _Component:
         self._transform = tuple(transform)
         self.IsSuppressed = suppressed
         self.IsFixed = False
+        # The read-only root-signature probe on the frozen production assembly
+        # (2026-10-10) shows IsRoot as a native boolean: True on the root
+        # reference, False on part references.  Mocks default to the part case.
+        self.IsRoot = is_root
         self.ReferencedConfiguration = configuration
 
     def GetPathName(self):
@@ -297,7 +318,11 @@ class _ConfigurationManager:
     @property
     def ActiveConfiguration(self):
         name = self._doc.active_configuration
-        root = types.SimpleNamespace(GetChildren=lambda: list(self._doc.children_for(name)))
+        root = types.SimpleNamespace(
+            Name2=os.path.splitext(os.path.basename(self._doc._path))[0],
+            GetPathName=lambda: self._doc._path,
+            GetChildren=lambda: list(self._doc.children_for(name)),
+        )
         return types.SimpleNamespace(Name=name, GetRootComponent3=lambda _visible: root)
 
 
@@ -2365,7 +2390,7 @@ class EntityGeometryTests(unittest.TestCase):
             record = self._record(tmp, [("seat", entity)])
 
             geometry = record["mates"][0]["entities"][0]
-            self.assertEqual(set(geometry), {"component", "feature", "face_index", "cylinder"})
+            self.assertEqual(set(geometry), {"component", "feature", "face_index", "cylinder", "mate_entity_reference"})
             self.assertEqual(
                 geometry["cylinder"],
                 {"point": [0.1, 0.2, 0.3], "direction": [0.0, 1.0, 0.0], "radius": 0.05},
@@ -2383,7 +2408,7 @@ class EntityGeometryTests(unittest.TestCase):
             record = self._record(tmp, [("seat", entity)])
 
             geometry = record["mates"][0]["entities"][0]
-            self.assertEqual(set(geometry), {"component", "feature", "face_index", "circle"})
+            self.assertEqual(set(geometry), {"component", "feature", "face_index", "circle", "mate_entity_reference"})
             self.assertEqual(
                 geometry["circle"],
                 {"center": [1.0, 2.0, 3.0], "normal": [0.0, 0.0, -1.0], "radius": 0.25},
@@ -2413,7 +2438,7 @@ class EntityGeometryTests(unittest.TestCase):
             record = self._record(tmp, [("seat", entity)])
 
             geometry = record["mates"][0]["entities"][0]
-            self.assertEqual(set(geometry), {"component", "feature", "face_index", "point"})
+            self.assertEqual(set(geometry), {"component", "feature", "face_index", "point", "mate_entity_reference"})
             self.assertEqual(geometry["point"], [1.0, 2.0, 3.0])
 
     def test_nonfinite_entity_geometry_blocks(self) -> None:
@@ -2647,6 +2672,558 @@ class ExplicitSelectionTests(unittest.TestCase):
             with self.assertRaises(CadError) as missing:
                 backend.discover_native(root, {"main_assembly": "missing.SLDASM"})
             self.assertEqual("native_discovery_selection_missing", missing.exception.code)
+
+
+class AssemblyFrameMateTests(unittest.TestCase):
+    """Mate entities on the assembly's own geometry bind to that assembly's frame."""
+
+    def test_top_level_mate_to_the_assembly_frame_binds_to_the_root(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            assembly = _write(root, "robot.SLDASM")
+            root_reference = _Component("robot", assembly, is_root=True)
+            mate = _mate(
+                "ground_pin",
+                0,
+                [
+                    _MateEntity(component, "Face1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0))),
+                    _MateEntity(root_reference, "Face2", _Plane((0.0, 0.0, -1.0), (0.0, 0.0, 0.0))),
+                ],
+            )
+            group = _Feature("MateGroup", "MateGroup", first_sub=mate)
+            doc = _Doc(assembly, first_feature=group, children=[component])
+
+            record = _read(root, _App({assembly: doc}))
+
+            entities = record["mates"][0]["entities"]
+            self.assertEqual(entities[0]["component"], "base-1")
+            self.assertEqual(entities[1]["component"], "")
+            self.assertIs(entities[1]["assembly_frame"], True)
+            self.assertNotIn("reference_name", entities[1])
+
+    def test_nested_mate_to_the_sub_assembly_frame_binds_to_its_occurrence(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            arm_path = _write(root, "arm.SLDPRT")
+            sub_path = _write(root, "sub.SLDASM")
+            arm_doc = _Doc(arm_path)
+            arm_component = _Component("arm-1", arm_path, doc=arm_doc)
+            sub_reference = _Component("sub", sub_path, is_root=True)
+            nested = _mate(
+                "nested_ground_pin",
+                0,
+                [
+                    _MateEntity(arm_component, "Face1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0))),
+                    _MateEntity(sub_reference, "Face2", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0))),
+                ],
+            )
+            sub_group = _Feature("MateGroup", "MateGroup", first_sub=nested)
+            sub_doc = _Doc(
+                sub_path,
+                first_feature=sub_group,
+                children=[arm_component],
+                configuration="Sub",
+                configuration_children={"Sub": [arm_component]},
+            )
+            sub_component = _Component("sub-1", sub_path, children=[arm_component], doc=sub_doc, configuration="Sub")
+            assembly = _write(root, "robot.SLDASM")
+            main_doc = _Doc(assembly, children=[sub_component])
+
+            record = _read(root, _App({assembly: main_doc, sub_path: sub_doc}))
+
+            nested_mate = record["mates"][0]
+            self.assertEqual(nested_mate["scope"], "sub-1")
+            entities = nested_mate["entities"]
+            self.assertEqual(entities[0]["component"], "sub-1/arm-1")
+            self.assertEqual(entities[1]["component"], "sub-1")
+            self.assertIs(entities[1]["assembly_frame"], True)
+
+    def test_unrecorded_reference_still_fails_closed(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            orphan_path = _write(root, "orphan.SLDPRT")
+            component = _Component("base-1", base)
+            orphan = _Component("orphan-1", orphan_path)
+            mate = _mate(
+                "dangling_seat",
+                0,
+                [
+                    _MateEntity(component, "Face1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0))),
+                    _MateEntity(orphan, "Face2", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0))),
+                ],
+            )
+            group = _Feature("MateGroup", "MateGroup", first_sub=mate)
+            assembly = _write(root, "robot.SLDASM")
+            doc = _Doc(assembly, first_feature=group, children=[component])
+
+            with self.assertRaises(CadError) as caught:
+                _read(root, _App({assembly: doc}))
+            self.assertEqual(caught.exception.code, "cad_mate_scope_ambiguous")
+            self.assertEqual(caught.exception.detail.get("component"), "orphan-1")
+
+    def test_same_document_with_a_different_name_is_not_the_root(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            assembly = _write(root, "robot.SLDASM")
+            imposter = _Component("robot (copy)", assembly)
+            mate = _mate(
+                "imposter_seat",
+                0,
+                [
+                    _MateEntity(component, "Face1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0))),
+                    _MateEntity(imposter, "Face2", _Plane((0.0, 0.0, -1.0), (0.0, 0.0, 0.0))),
+                ],
+            )
+            group = _Feature("MateGroup", "MateGroup", first_sub=mate)
+            doc = _Doc(assembly, first_feature=group, children=[component])
+
+            with self.assertRaises(CadError) as caught:
+                _read(root, _App({assembly: doc}))
+            self.assertEqual(caught.exception.code, "cad_mate_scope_ambiguous")
+            self.assertEqual(caught.exception.detail.get("component"), "robot (copy)")
+
+    def test_explicit_is_root_false_refutes_the_root_reading(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            assembly = _write(root, "robot.SLDASM")
+            not_root = _Component("robot", assembly)
+            not_root.IsRoot = False
+            mate = _mate(
+                "not_root_seat",
+                0,
+                [
+                    _MateEntity(component, "Face1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0))),
+                    _MateEntity(not_root, "Face2", _Plane((0.0, 0.0, -1.0), (0.0, 0.0, 0.0))),
+                ],
+            )
+            group = _Feature("MateGroup", "MateGroup", first_sub=mate)
+            doc = _Doc(assembly, first_feature=group, children=[component])
+
+            with self.assertRaises(CadError) as caught:
+                _read(root, _App({assembly: doc}))
+            self.assertEqual(caught.exception.code, "cad_mate_scope_ambiguous")
+
+    def test_unreadable_is_root_is_not_the_root(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            assembly = _write(root, "robot.SLDASM")
+            unreadable = _Component("robot", assembly, is_root=True)
+            del unreadable.IsRoot
+            mate = _mate(
+                "unreadable_seat",
+                0,
+                [
+                    _MateEntity(component, "Face1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0))),
+                    _MateEntity(unreadable, "Face2", _Plane((0.0, 0.0, -1.0), (0.0, 0.0, 0.0))),
+                ],
+            )
+            group = _Feature("MateGroup", "MateGroup", first_sub=mate)
+            doc = _Doc(assembly, first_feature=group, children=[component])
+
+            with self.assertRaises(CadError) as caught:
+                _read(root, _App({assembly: doc}))
+            self.assertEqual(caught.exception.code, "cad_mate_scope_ambiguous")
+            self.assertEqual(caught.exception.detail.get("component"), "robot")
+
+    def test_non_boolean_is_root_is_not_the_root(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            assembly = _write(root, "robot.SLDASM")
+            not_bool = _Component("robot", assembly, is_root=True)
+            not_bool.IsRoot = 1
+            mate = _mate(
+                "non_boolean_seat",
+                0,
+                [
+                    _MateEntity(component, "Face1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0))),
+                    _MateEntity(not_bool, "Face2", _Plane((0.0, 0.0, -1.0), (0.0, 0.0, 0.0))),
+                ],
+            )
+            group = _Feature("MateGroup", "MateGroup", first_sub=mate)
+            doc = _Doc(assembly, first_feature=group, children=[component])
+
+            with self.assertRaises(CadError) as caught:
+                _read(root, _App({assembly: doc}))
+            self.assertEqual(caught.exception.code, "cad_mate_scope_ambiguous")
+            self.assertEqual(caught.exception.detail.get("component"), "robot")
+
+    def test_bare_name_document_match_is_not_the_root(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            assembly = _write(root, "robot.SLDASM")
+            bare = _Component("robot", "robot.SLDASM", is_root=True)
+            mate = _mate(
+                "bare_name_seat",
+                0,
+                [
+                    _MateEntity(component, "Face1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0))),
+                    _MateEntity(bare, "Face2", _Plane((0.0, 0.0, -1.0), (0.0, 0.0, 0.0))),
+                ],
+            )
+            group = _Feature("MateGroup", "MateGroup", first_sub=mate)
+            doc = _Doc(assembly, first_feature=group, children=[component])
+
+            with self.assertRaises(CadError) as caught:
+                _read(root, _App({assembly: doc}))
+            self.assertEqual(caught.exception.code, "cad_mate_scope_ambiguous")
+            self.assertEqual(caught.exception.detail.get("component"), "robot")
+
+
+class ReferenceCycleTests(unittest.TestCase):
+    """A containment chain or mate that repeats a document is a reference cycle."""
+
+    def test_self_contained_occurrence_is_a_reference_cycle(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            assembly = _write(root, "robot.SLDASM")
+            inner = _Component("inner-1", base)
+            self_occurrence = _Component("robot-2", assembly, children=[inner])
+            doc = _Doc(assembly, children=[self_occurrence])
+
+            with self.assertRaises(CadError) as caught:
+                _read(root, _App({assembly: doc}))
+            self.assertEqual(caught.exception.code, "cad_reference_cycle")
+            self.assertEqual(caught.exception.detail.get("component"), "robot-2")
+
+    def test_ancestor_document_repeat_is_a_reference_cycle(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            assembly = _write(root, "robot.SLDASM")
+            sub_path = _write(root, "sub.SLDASM")
+            inner = _Component("inner-1", base)
+            ancestor_copy = _Component("robot-2", assembly, children=[inner])
+            sub_doc = _Doc(sub_path, children=[ancestor_copy])
+            sub_component = _Component("b-1", sub_path, children=[ancestor_copy], doc=sub_doc)
+            main_doc = _Doc(assembly, children=[sub_component])
+
+            with self.assertRaises(CadError) as caught:
+                _read(
+                    root,
+                    _App({assembly: main_doc, sub_path: sub_doc}),
+                    settings={"main_assembly": "robot.SLDASM"},
+                )
+            self.assertEqual(caught.exception.code, "cad_reference_cycle")
+            self.assertEqual(caught.exception.detail.get("component"), "b-1/robot-2")
+
+    def test_mate_to_a_self_instance_occurrence_is_a_reference_cycle(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            assembly = _write(root, "robot.SLDASM")
+            leaf_self = _Component("robot-2", assembly)
+            mate = _mate(
+                "self_seat",
+                0,
+                [
+                    _MateEntity(component, "Face1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0))),
+                    _MateEntity(leaf_self, "Face2", _Plane((0.0, 0.0, -1.0), (0.0, 0.0, 0.0))),
+                ],
+            )
+            group = _Feature("MateGroup", "MateGroup", first_sub=mate)
+            doc = _Doc(assembly, first_feature=group, children=[component, leaf_self])
+
+            with self.assertRaises(CadError) as caught:
+                _read(root, _App({assembly: doc}))
+            self.assertEqual(caught.exception.code, "cad_reference_cycle")
+            self.assertEqual(caught.exception.detail.get("component"), "robot-2")
+
+
+class MateEntityReferenceTests(unittest.TestCase):
+    """Documented IMateEntity2 EntityParams provenance and geometry."""
+
+    def _read_single_entity(self, tmp: Path, component: _Component, entity: _MateEntity) -> dict:
+        assembly = _write(tmp, "robot.SLDASM")
+        mate = _mate("seat", 0, [entity])
+        group = _Feature("MateGroup", "MateGroup", first_sub=mate)
+        doc = _Doc(assembly, first_feature=group, children=[component])
+        return _read(tmp, _App({assembly: doc}))["mates"][0]["entities"][0]
+
+    def test_line_reference_keeps_native_shape_and_params(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            entity = _MateEntity(
+                component,
+                "Edge1",
+                reference_type=1,
+                reference_type2=1,
+                entity_params=[0.1, 0.2, 0.3, 0.0, 2.0, 0.0, 0.0, 0.0],
+            )
+            record = self._read_single_entity(root, component, entity)
+            reference = record["mate_entity_reference"]
+            self.assertEqual(reference["source"], "mate-entity-params")
+            self.assertEqual(reference["reference_type"], 1)
+            self.assertEqual(reference["reference_type_name"], "Line")
+            self.assertEqual(reference["reference_type2"], 1)
+            self.assertEqual(reference["space"], "mate-assembly")
+            self.assertEqual(reference["params"], [0.1, 0.2, 0.3, 0.0, 2.0, 0.0, 0.0, 0.0])
+            self.assertEqual(
+                reference["geometry"],
+                {"kind": "line", "point": [0.1, 0.2, 0.3], "direction": [0.0, 1.0, 0.0], "frame": "component-local"},
+            )
+            self.assertIsNone(reference["error"])
+
+    def test_frame_reference_keeps_assembly_parameters_and_shape(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            assembly = _write(root, "robot.SLDASM")
+            frame = _Component("robot", assembly, is_root=True)
+            frame_entity = _MateEntity(
+                frame,
+                "Face2",
+                reference_type=3,
+                reference_type2=4,
+                entity_params=[0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            )
+            mate = _mate(
+                "frame_seat",
+                0,
+                [_MateEntity(component, "Face1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0))), frame_entity],
+            )
+            group = _Feature("MateGroup", "MateGroup", first_sub=mate)
+            doc = _Doc(assembly, first_feature=group, children=[component])
+            record = _read(root, _App({assembly: doc}))["mates"][0]["entities"][1]
+            self.assertEqual(record["component"], "")
+            self.assertIs(record["assembly_frame"], True)
+            reference = record["mate_entity_reference"]
+            self.assertEqual(reference["reference_type_name"], "Plane")
+            self.assertEqual(
+                reference["geometry"],
+                {"kind": "plane", "point": [0.0, 0.0, 0.0], "normal": [0.0, 0.0, 1.0], "frame": "component-local"},
+            )
+            self.assertIsNone(reference["error"])
+
+    def test_entity_params_are_transformed_into_component_local_frame(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base, transform=_sw_translation(1.0, 2.0, 3.0))
+            entity = _MateEntity(
+                component,
+                "Vertex1",
+                reference_type=0,
+                reference_type2=3,
+                entity_params=[1.5, 2.5, 3.0],
+            )
+            record = self._read_single_entity(root, component, entity)
+            reference = record["mate_entity_reference"]
+            self.assertEqual(reference["params"], [1.5, 2.5, 3.0])
+            self.assertEqual(reference["geometry"]["kind"], "point")
+            for actual, expected in zip(reference["geometry"]["point"], [0.5, 0.5, 0.0], strict=True):
+                self.assertAlmostEqual(actual, expected, places=9)
+            self.assertEqual(reference["geometry"]["frame"], "component-local")
+            self.assertIsNone(reference["error"])
+
+    def test_entity_params_direction_rotates_into_component_local_frame(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            # SolidWorks ArrayData for a +90 degree rotation about Z (local X -> assembly Y).
+            rotation = (0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
+            component = _Component("base-1", base, transform=rotation)
+            entity = _MateEntity(
+                component,
+                "Edge1",
+                reference_type=1,
+                reference_type2=1,
+                entity_params=[1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            )
+            record = self._read_single_entity(root, component, entity)
+            geometry = record["mate_entity_reference"]["geometry"]
+            self.assertEqual(geometry["kind"], "line")
+            for actual, expected in zip(geometry["direction"], [0.0, -1.0, 0.0], strict=True):
+                self.assertAlmostEqual(actual, expected, places=9)
+            self.assertIsNone(record["mate_entity_reference"]["error"])
+
+    def test_unreadable_entity_params_are_recorded_not_dropped(self) -> None:
+        def raiser():
+            raise RuntimeError("boom")
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            entity = _MateEntity(component, "Face1", reference_type=1, reference_type2=1, entity_params=raiser)
+            record = self._read_single_entity(root, component, entity)
+            reference = record["mate_entity_reference"]
+            self.assertIn("RuntimeError: boom", reference["error"])
+            self.assertIsNone(reference["params"])
+            self.assertIsNone(reference["geometry"])
+            self.assertEqual(record["component"], "base-1")
+
+    def test_unreadable_reference_type2_is_provenance_only(self) -> None:
+        def raiser():
+            raise RuntimeError("no type2")
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            entity = _MateEntity(
+                component,
+                "Edge1",
+                reference_type=1,
+                reference_type2=raiser,
+                entity_params=[0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            )
+            record = self._read_single_entity(root, component, entity)
+            reference = record["mate_entity_reference"]
+            self.assertIn("RuntimeError: no type2", reference["reference_type2_error"])
+            self.assertIsNone(reference["reference_type2"])
+            self.assertIsNone(reference["error"])
+            self.assertEqual(reference["geometry"]["kind"], "line")
+
+    def test_frame_matrix_requires_proper_rigid_rotation(self) -> None:
+        from description_pipeline.sources.solidworks import native as native_module
+
+        identity = (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+        scaled = (2.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+        reflected = (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+        skewed_tail = (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 2.0)
+        self.assertIsNotNone(native_module._frame_matrix(identity))
+        self.assertIsNone(native_module._frame_matrix(scaled))
+        self.assertIsNone(native_module._frame_matrix(reflected))
+        self.assertIsNone(native_module._frame_matrix(skewed_tail))
+        self.assertIsNone(native_module._frame_matrix(identity[:12]))
+
+    def test_malformed_entity_params_fail_closed(self) -> None:
+        cases = (
+            ("non-finite", {"reference_type": 1, "entity_params": [0.0, float("nan"), 0.0]}, "non-finite", None),
+            ("non-numeric", {"reference_type": 1, "entity_params": [0.0, "x", 0.0]}, "non-numeric", None),
+            (
+                "short-plane",
+                {"reference_type": 3, "entity_params": [0.0, 0.0, 0.0]},
+                "documented layout",
+                [0.0, 0.0, 0.0],
+            ),
+            (
+                "zero-vector",
+                {"reference_type": 1, "entity_params": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]},
+                "zero-length",
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                "bad-type",
+                {"reference_type": "Plane", "entity_params": [0.0, 0.0, 0.0]},
+                "ReferenceType",
+                [0.0, 0.0, 0.0],
+            ),
+        )
+        for name, kwargs, expected_error, expected_params in cases:
+            with self.subTest(case=name), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                base = _write(root, "base.SLDPRT")
+                component = _Component("base-1", base)
+                entity = _MateEntity(component, "Face1", **kwargs)
+                record = self._read_single_entity(root, component, entity)
+                reference = record["mate_entity_reference"]
+                self.assertIn(expected_error, reference["error"])
+                self.assertEqual(reference["params"], expected_params)
+                self.assertIsNone(reference["geometry"])
+
+    def test_missing_occurrence_frame_rejects_geometry(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base, transform=())
+            entity = _MateEntity(component, "Face1", reference_type=0, entity_params=[1.0, 2.0, 3.0])
+            record = self._read_single_entity(root, component, entity)
+            reference = record["mate_entity_reference"]
+            self.assertIn("frame for this reference is unavailable", reference["error"])
+            self.assertIsNone(reference["geometry"])
+            self.assertEqual(reference["params"], [1.0, 2.0, 3.0])
+
+    def test_nested_scope_params_localize_through_owner_and_child(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            arm_path = _write(root, "arm.SLDPRT")
+            sub_path = _write(root, "sub.SLDASM")
+            arm_doc = _Doc(arm_path)
+            # Child: +90 degree Z rotation plus translation (1, 2, 3) inside the sub-assembly.
+            arm_transform = (0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 3.0, 1.0, 0.0, 0.0, 0.0)
+            arm_component = _Component("arm-1", arm_path, doc=arm_doc, transform=arm_transform)
+            sub_reference = _Component("sub", sub_path, is_root=True)
+            nested = _mate(
+                "nested_seat",
+                0,
+                [
+                    _MateEntity(
+                        arm_component,
+                        "Face1",
+                        _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0)),
+                        reference_type=0,
+                        reference_type2=3,
+                        entity_params=[2.0, 0.0, 4.0],
+                    ),
+                    _MateEntity(
+                        sub_reference,
+                        "Face2",
+                        _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0)),
+                        reference_type=3,
+                        reference_type2=4,
+                        entity_params=[0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                    ),
+                ],
+            )
+            sub_group = _Feature("MateGroup", "MateGroup", first_sub=nested)
+            sub_doc = _Doc(
+                sub_path,
+                first_feature=sub_group,
+                children=[arm_component],
+                configuration="Sub",
+                configuration_children={"Sub": [arm_component]},
+            )
+            # Owner: pure translation (10, 0, 0) in the top assembly.
+            sub_component = _Component(
+                "sub-1",
+                sub_path,
+                children=[arm_component],
+                doc=sub_doc,
+                configuration="Sub",
+                transform=_sw_translation(10.0, 0.0, 0.0),
+            )
+            assembly = _write(root, "robot.SLDASM")
+            main_doc = _Doc(assembly, children=[sub_component])
+
+            record = _read(root, _App({assembly: main_doc, sub_path: sub_doc}))
+
+            nested_mate = record["mates"][0]
+            self.assertEqual(nested_mate["scope"], "sub-1")
+            entities = nested_mate["entities"]
+            self.assertEqual(entities[0]["component"], "sub-1/arm-1")
+            arm_reference = entities[0]["mate_entity_reference"]
+            self.assertIsNone(arm_reference["error"])
+            self.assertEqual(arm_reference["params"], [2.0, 0.0, 4.0])
+            for actual, expected in zip(arm_reference["geometry"]["point"], [-2.0, -1.0, 1.0], strict=True):
+                self.assertAlmostEqual(actual, expected, places=9)
+            self.assertEqual(arm_reference["geometry"]["frame"], "component-local")
+            self.assertEqual(entities[1]["component"], "sub-1")
+            self.assertIs(entities[1]["assembly_frame"], True)
+            frame_reference = entities[1]["mate_entity_reference"]
+            self.assertIsNone(frame_reference["error"])
+            self.assertEqual(
+                frame_reference["geometry"],
+                {"kind": "plane", "point": [0.0, 0.0, 0.0], "normal": [0.0, 0.0, 1.0], "frame": "component-local"},
+            )
 
 
 if __name__ == "__main__":

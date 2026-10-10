@@ -53,6 +53,9 @@ fi
 "$AIRFLOW_VENV/bin/python" -m pip install --no-deps --force-reinstall "$PIPELINE_WHEEL"
 # Fail closed if the lock does not cover the wheel's declared runtime dependencies.
 "$AIRFLOW_VENV/bin/python" -m pip check
+# pip check excludes optional dependencies. Exercise the Linux verifier before
+# installing configuration or migrating the service database.
+"$AIRFLOW_VENV/bin/description" doctor
 
 # Atomic 0600 config; preserves previously generated Fernet/JWT secrets on rerun.
 AIRFLOW_DB_URL="$AIRFLOW_DB_URL" "$AIRFLOW_VENV/bin/python" "$HERE/render_config.py" \

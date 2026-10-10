@@ -29,17 +29,21 @@ from ..io import PipelineError, acquire_process_lock, confined, file_digest, rea
 from ..sources.solidworks import revision as cad_revision
 from ..stages import record_check
 
-DELIVERY_PATHS = ("README.md", "input", "evidence", "model", "urdf", "meshes", "reports")
+#: ``transfer-manifest.json`` is the sealed native provenance sidecar; it is copied whenever the
+#: bundle carries it (neutral local fixtures may not).
+DELIVERY_PATHS = ("README.md", "transfer-manifest.json", "input", "evidence", "model", "urdf", "meshes", "reports")
 GOVERNED_PATHS = (*DELIVERY_PATHS, ".gitattributes")
 BYTE_ATTRIBUTES = ("text", "filter", "working-tree-encoding")
 GIT_ATTRIBUTES = (
     "# Preserve verified delivery bytes in Git and on checkout.\n"
     + "".join(
-        f"/{name}{'/**' if name not in {'README.md', '.gitattributes'} else ''} -text -filter -working-tree-encoding\n"
+        f"/{name}{'/**' if name not in {'README.md', '.gitattributes', 'transfer-manifest.json'} else ''} "
+        "-text -filter -working-tree-encoding\n"
         for name in GOVERNED_PATHS
     )
 ).encode("ascii")
-REPORTS_FILES = ("input.json", "tool.json", "quality.json")
+#: Immutable native provenance reports travel with the delivery whenever present.
+REPORTS_FILES = ("input.json", "tool.json", "quality.json", "native-tool.json", "native-stages.json")
 REQUIRED_FILES = (
     "README.md",
     "input/robot.yaml",
