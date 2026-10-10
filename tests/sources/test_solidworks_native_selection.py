@@ -79,9 +79,7 @@ class NativeSelectionObservationTests(unittest.TestCase):
         digests = write_stage(self.tmp, {"assembly.SLDASM": b"main-bytes"})
         application = FakeApplication({self.path("assembly.SLDASM"): []})
         observations = observe(application, self.tmp, digests, digests)
-        self.assertEqual(
-            observations, {"assembly.SLDASM": {"sha256": digests["assembly.SLDASM"], "references": []}}
-        )
+        self.assertEqual(observations, {"assembly.SLDASM": {"sha256": digests["assembly.SLDASM"], "references": []}})
         self.assertEqual(application.calls, [self.path("assembly.SLDASM")])
 
     def test_nested_references_are_canonical_and_only_pending_documents_are_queried(self) -> None:
@@ -105,9 +103,7 @@ class NativeSelectionObservationTests(unittest.TestCase):
         self.assertEqual(application.calls[-1], self.path("parts/frame.SLDASM"))
 
         third = observe(application, self.tmp, {"parts/link.SLDPRT": digests["parts/link.SLDPRT"]}, digests)
-        self.assertEqual(
-            third, {"parts/link.SLDPRT": {"sha256": digests["parts/link.SLDPRT"], "references": []}}
-        )
+        self.assertEqual(third, {"parts/link.SLDPRT": {"sha256": digests["parts/link.SLDPRT"], "references": []}})
 
     def test_unrequested_staged_documents_are_never_queried(self) -> None:
         digests = write_stage(

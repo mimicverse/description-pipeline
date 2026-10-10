@@ -222,5 +222,6 @@ class MainAssemblyResumeTests(EndpointFixture, unittest.TestCase):
                 self.assertEqual([], calls)
                 jobs.close()
 
+
 if __name__ == "__main__":
     unittest.main()

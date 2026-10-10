@@ -178,16 +178,12 @@ class DefinitionEndpointTests(EndpointFixture, unittest.TestCase):
         self.assertTrue(self.frozen_names)
         self.assertNotEqual(digest(self.frozen_names), digest({}))
         check = next(
-            event["check"]
-            for event in finished["events"]
-            if (event.get("check") or {}).get("id") == "discovery.inputs"
+            event["check"] for event in finished["events"] if (event.get("check") or {}).get("id") == "discovery.inputs"
         )
         self.assertEqual(digest(self.frozen_names), check["details"]["frozen_names_sha256"])
         self.assertEqual([str(self.records_dir())], check["details"]["record_roots"])
         payload = json.loads(
-            (self.config["state_root"] / "prepared" / request["run_id"] / DISCOVERY_FILE).read_text(
-                encoding="utf-8"
-            )
+            (self.config["state_root"] / "prepared" / request["run_id"] / DISCOVERY_FILE).read_text(encoding="utf-8")
         )
         self.assertEqual(self.frozen_names, payload["derivation"]["frozen_names"])
         self.assertEqual(MAIN, payload["derivation"]["main_assembly"])
@@ -233,9 +229,7 @@ class DefinitionEndpointTests(EndpointFixture, unittest.TestCase):
         self.assertEqual("native_complete", finished["status"], finished.get("error"))
 
 
-@unittest.skipUnless(
-    hasattr(WindowsEndpoint, "start_selection_job"), "A's selection client is not integrated yet"
-)
+@unittest.skipUnless(hasattr(WindowsEndpoint, "start_selection_job"), "A's selection client is not integrated yet")
 class DefinitionClientLoopbackTests(EndpointFixture, unittest.TestCase):
     def test_client_drives_the_whole_native_boundary_over_loopback(self) -> None:
         jobs = self.jobs()

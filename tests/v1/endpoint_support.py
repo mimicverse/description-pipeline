@@ -67,8 +67,7 @@ class RefusingSelectionReader:
         if self.refusal is not None:
             raise self.refusal
         return {
-            name: {"sha256": upload_files[name], "references": sorted(self.documents.get(name, []))}
-            for name in pending
+            name: {"sha256": upload_files[name], "references": sorted(self.documents.get(name, []))} for name in pending
         }
 
 
@@ -105,9 +104,7 @@ class EndpointFixture:
         self.write_config()
         self.config = read_config(self.path)
         self.record = native_record()
-        self.upload_files = {
-            name: hashlib.sha256(payload).hexdigest() for name, payload in source_bytes().items()
-        }
+        self.upload_files = {name: hashlib.sha256(payload).hexdigest() for name, payload in source_bytes().items()}
         self.upload_sha = digest(self.upload_files)
         self.documents = {MAIN: [PART, ARM], PART: [], ARM: []}
         self.reader_log: list = []
@@ -150,9 +147,7 @@ class EndpointFixture:
         backend_factory=None,
     ) -> Jobs:
         def default_reader():
-            return RefusingSelectionReader(
-                self.documents, self.reader_log, refusal=self.selection_refusal
-            )
+            return RefusingSelectionReader(self.documents, self.reader_log, refusal=self.selection_refusal)
 
         record = self.record
         jobs = Jobs(
@@ -164,8 +159,7 @@ class EndpointFixture:
                 )
             ),
             selection_reader_factory=selection_reader or default_reader,
-            native_reader=native_reader
-            or (lambda frozen, settings, on_activity=None: copy.deepcopy(record)),
+            native_reader=native_reader or (lambda frozen, settings, on_activity=None: copy.deepcopy(record)),
             backend_factory=backend_factory or (lambda package, files: CaptureBackend()),
         )
         self.addCleanup(jobs.close)
@@ -307,9 +301,7 @@ class EndpointFixture:
             if snapshot["status"] in statuses or snapshot["status"] in {"failed", "native_complete", "passed"}:
                 return snapshot
             if time.monotonic() >= deadline:
-                raise AssertionError(
-                    f"timed out waiting for {sorted(statuses)}; last status {snapshot['status']!r}"
-                )
+                raise AssertionError(f"timed out waiting for {sorted(statuses)}; last status {snapshot['status']!r}")
             time.sleep(0.01)
 
     def await_terminal(self, jobs: Jobs, run_id: str, *, timeout: float = 15.0) -> dict:

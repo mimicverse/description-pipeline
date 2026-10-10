@@ -92,9 +92,7 @@ def _staged_sha256(path: Path, name: str) -> str:
             for block in iter(lambda: stream.read(_READ_CHUNK), b""):
                 read += len(block)
                 if read > size:
-                    raise SelectionError(
-                        "selection_source_changed", "Staged document changed while hashing", path=name
-                    )
+                    raise SelectionError("selection_source_changed", "Staged document changed while hashing", path=name)
                 hasher.update(block)
     except OSError as error:
         raise SelectionError(
@@ -271,13 +269,9 @@ class NativeSelectionReader:
 
     def _check_open(self) -> None:
         if self._closed or self._thread is None:
-            raise SelectionError(
-                "selection_reader_closed", "Observe calls must run inside the reader context"
-            )
+            raise SelectionError("selection_reader_closed", "Observe calls must run inside the reader context")
         if threading.get_ident() != self._thread:
-            raise SelectionError(
-                "selection_reader_thread", "Observe calls must stay on the reader's owning thread"
-            )
+            raise SelectionError("selection_reader_thread", "Observe calls must stay on the reader's owning thread")
 
     def _application(self):
         if self._injected is not None:

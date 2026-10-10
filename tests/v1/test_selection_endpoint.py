@@ -90,8 +90,7 @@ class FakeSelectionReader:
                 count=1,
             )
         return {
-            name: {"sha256": upload_files[name], "references": sorted(self.documents.get(name, []))}
-            for name in pending
+            name: {"sha256": upload_files[name], "references": sorted(self.documents.get(name, []))} for name in pending
         }
 
 
@@ -158,9 +157,7 @@ class SelectionEndpointTests(unittest.TestCase):
         jobs = Jobs(
             self.config,
             runner=runner,
-            selection_reader_factory=lambda: FakeSelectionReader(
-                self.documents, self.reader_log, refuse=self.refusing
-            ),
+            selection_reader_factory=lambda: FakeSelectionReader(self.documents, self.reader_log, refuse=self.refusing),
             native_reader=self.sentinel,
         )
         self.addCleanup(jobs.close)
@@ -406,9 +403,7 @@ class SelectionEndpointTests(unittest.TestCase):
         self.assertEqual(set(observed), {first})
         jobs.seal_selection(first, {"selection": self.manifest(jobs, first)})
         self.wait_state(jobs, second, {"awaiting_files", "ready"}, round_id=second_round)
-        self.assertTrue(
-            any(entry[2] == second for entry in self.observe_events()), "the second job was never observed"
-        )
+        self.assertTrue(any(entry[2] == second for entry in self.observe_events()), "the second job was never observed")
         depth = 0
         for entry in self.reader_log:
             if entry[0] == "enter":
