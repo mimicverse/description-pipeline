@@ -43,7 +43,7 @@ from ..delivery import PIPELINE_ID
 from ..io import PipelineError, artifact_path_parts
 from ..sources.solidworks.handoff import HANDOFF_SCHEMA
 from ..stages import STAGE_IDS
-from .stage_transfer import CAPTURE_ARCHIVE, CAPTURE_MANIFEST, MAX_TRANSFER_BYTES
+from .stage_transfer import CAPTURE_ARCHIVE, MAX_TRANSFER_BYTES
 
 JOB_SCHEMA = "solidworks-to-urdf.job/v1"
 NATIVE_RUN_NAMESPACE = "solidworks_to_urdf"
@@ -126,13 +126,11 @@ def validate_resume(value: object, *, run_id: str | None = None) -> dict:
 
 def _validate_capture_archive(archive) -> dict:
     """The exact native capture-archive receipt the sealing contract produces."""
-    expected = {"name", "sha256", "size", "manifest_name", "manifest_sha256"}
+    expected = {"name", "sha256", "size", "manifest_sha256"}
     if not isinstance(archive, dict) or set(archive) != expected:
-        raise EndpointProtocolError(
-            "capture_archive must carry exactly name, sha256, size, manifest_name and manifest_sha256"
-        )
-    if archive.get("name") != CAPTURE_ARCHIVE or archive.get("manifest_name") != CAPTURE_MANIFEST:
-        raise EndpointProtocolError("capture_archive names differ from the transfer contract")
+        raise EndpointProtocolError("capture_archive must carry exactly name, sha256, size and manifest_sha256")
+    if archive.get("name") != CAPTURE_ARCHIVE:
+        raise EndpointProtocolError("capture_archive name differs from the transfer contract")
     for key in ("sha256", "manifest_sha256"):
         if not isinstance(archive.get(key), str) or _SHA256.fullmatch(archive[key]) is None:
             raise EndpointProtocolError(f"capture_archive {key} must be lowercase SHA-256")
