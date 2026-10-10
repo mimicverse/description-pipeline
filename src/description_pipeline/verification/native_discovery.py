@@ -2478,6 +2478,23 @@ def verify_discovery(package: Path) -> dict:
             )
         return {"frames": len(expected), "jcs_aliases": jcs_seen}
 
+    def declarations():
+        from .native_declarations import verify_declarations
+
+        report = verify_declarations(state["payload"]["raw"], state["robot"].get("source"))
+        _require(
+            report["passed"],
+            "discovery.declarations",
+            "independent native declaration verification failed",
+            {"failures": report["errors"], "checks": report["checks"]},
+        )
+        return {
+            "bodies": len(report["members"]),
+            "joints": len((state["robot"].get("source") or {}).get("joints") or []),
+            "checks": report["checks"],
+            "rigid_completion": report["completion"],
+        }
+
     bound = check("discovery.binding", binding)
     dependent = (
         ("discovery.files", files),
@@ -2492,6 +2509,17 @@ def verify_discovery(package: Path) -> dict:
         ("discovery.tree", tree),
         ("discovery.frames", frames),
     )
+    if bound["passed"] and "exporter" in state["payload"].get("raw", {}):
+        # Explicit native declarations do not require incomplete mate inference to
+        # rediscover memberships or impose unrelated CS_/dp.* naming conventions.
+        # Capture/file/mass binding remains mandatory. A declaration carries no
+        # external design budget; never invent nominal mass or extent ranges.
+        dependent = (
+            ("discovery.files", files),
+            ("discovery.revision", revision),
+            ("discovery.masses", masses),
+            ("discovery.declarations", declarations),
+        )
     if bound["passed"]:
         for identifier, callback in dependent:
             check(identifier, callback)
@@ -2514,10 +2542,12 @@ def verify_discovery(package: Path) -> dict:
     if checks and checks[0]["passed"]:
         report["discovery_sha256"] = checks[0]["details"].get("discovery_sha256")
         report["bodies"] = next(
-            (item["details"].get("bodies") for item in checks if item["id"] == "discovery.bodies"), None
+            (item["details"].get("bodies") for item in checks
+             if item["id"] in {"discovery.bodies", "discovery.declarations"}), None
         )
         report["joints"] = next(
-            (item["details"].get("joints") for item in checks if item["id"] == "discovery.joints"), None
+            (item["details"].get("joints") for item in checks
+             if item["id"] in {"discovery.joints", "discovery.declarations"}), None
         )
     return report
 

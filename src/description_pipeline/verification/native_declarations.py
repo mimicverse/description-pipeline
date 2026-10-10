@@ -1,0 +1,584 @@
+"""Re-derive native exporter claims without importing the producer's decoder.
+
+Explicit saved memberships are authoritative. Incomplete mate inference cannot
+refute them. An unselected leaf is completed only through fully reconstructed
+rigidity to exactly one selected link. Native endpoints/datums supply geometry;
+saved zero operating parameters remain zero, and serialized physics is ignored.
+"""
+
+from __future__ import annotations
+
+import math
+import re
+
+import numpy as np
+
+from .solidworks_urdf import _axis, _cad_pose, _pose, _same_pose
+from .v14_declarations import DeclarationError, pid_hex, validate_boundary
+
+SCHEMA = "solidworks-to-urdf.native-declarations-verification/v1"
+_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
+
+
+def _require(condition, code, message, **detail):
+    if not condition:
+        raise DeclarationError(code, message, detail)
+
+
+def _selector(value):
+    _require(isinstance(value, str) and bool(value.strip()), "v14.datum_missing", "no named native feature was saved")
+    match = re.fullmatch(r"(.+?)\s*<([^<>]+)>", value.strip())
+    return (match[1].strip(), match[2]) if match else (value.strip(), "")
+
+
+def _number(value):
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def _leaves(components):
+    active = {name for name, item in components.items() if item["suppressed"] is False}
+    return {
+        name
+        for name in active
+        if not str(components[name].get("document") or "").lower().endswith(".sldasm")
+        and not any(other.startswith(name + "/") for other in active)
+    }
+
+
+def _expanded(name, leaves):
+    return {leaf for leaf in leaves if leaf == name or leaf.startswith(name + "/")}
+
+
+def _valid_mate(mate, components):
+    """Only measured, solved, two-occurrence evidence may prove completion/conflict."""
+    entities = mate.get("entities")
+    if (
+        mate.get("suppressed") is not False
+        or type(mate.get("error_code")) is not int
+        or mate["error_code"] != 0
+        or not isinstance(entities, list)
+        or len(entities) != 2
+        or not all(isinstance(item, dict) and item.get("component") in components for item in entities)
+    ):
+        return False
+    try:
+        for entity in entities:
+            component = components[entity["component"]]
+            if component["suppressed"] is not False:
+                return False
+            _cad_pose(component["transform"])
+    except Exception:  # noqa: BLE001
+        # Native pose verification raises PipelineError. No malformed reading proves a mate.
+        return False
+    return True
+
+
+def _complete_membership(raw, components, members, leaves):
+    from .native_discovery import _frames, _rows_for, _span
+
+    grouped = {}
+    frames = _frames(raw)
+    for index, mate in enumerate(raw.get("mates") or []):
+        if not isinstance(mate, dict) or mate.get("suppressed") is True:
+            continue
+        entities = mate.get("entities")
+        if not isinstance(entities, list) or len(entities) != 2 or not all(isinstance(item, dict) for item in entities):
+            continue
+        names = [item.get("component") for item in entities]
+        if not all(isinstance(name, str) and name in components for name in names) or names[0] == names[1]:
+            continue
+        pair = tuple(sorted(names))
+        group = grouped.setdefault(pair, {"rows": [], "invalid": False, "mates": []})
+        rows = _rows_for(mate, frames) if _valid_mate(mate, components) else None
+        group["mates"].append(index)
+        if rows is None:
+            group["invalid"] = True
+        else:
+            group["rows"].extend(rows["rows"])
+    graph = {}
+    proofs = []
+    for pair, group in grouped.items():
+        if group["invalid"] or len(_span(group["rows"])) != 6:
+            continue
+        left, right = pair
+        graph.setdefault(left, set()).add(right)
+        graph.setdefault(right, set()).add(left)
+        proofs.append({"pair": list(pair), "mates": group["mates"]})
+    selected_owner = {leaf: owner for owner, names in members.items() for leaf in names}
+    # A container with leaves owned by two links cannot be assigned one owner.
+    initial = {}
+    for name in components:
+        covered = _expanded(name, leaves)
+        owners = {selected_owner[leaf] for leaf in covered if leaf in selected_owner}
+        if covered and covered <= selected_owner.keys() and len(owners) == 1:
+            initial[name] = next(iter(owners))
+    added = {}
+    visited = set()
+    conflicts = []
+    for start in sorted(graph):
+        if start in visited:
+            continue
+        connected, frontier = set(), [start]
+        while frontier:
+            node = frontier.pop()
+            if node in connected:
+                continue
+            connected.add(node)
+            frontier.extend(graph.get(node, set()) - connected)
+        visited.update(connected)
+        owners = {initial[node] for node in connected if node in initial}
+        if len(owners) > 1:
+            conflicts.append({"components": sorted(connected), "links": sorted(owners)})
+        elif len(owners) == 1:
+            owner = next(iter(owners))
+            for leaf in sorted(connected & leaves - selected_owner.keys()):
+                members[owner].add(leaf)
+                added[leaf] = owner
+    return added, proofs, conflicts
+
+
+def verify_declarations(raw: dict, source: dict | None = None) -> dict:
+    """Audit raw native declaration evidence and, optionally, generated source claims."""
+    checks, errors, state = [], [], {}
+
+    def check(identifier, callback):
+        try:
+            details = callback() or {}
+            checks.append({"id": identifier, "passed": True, "details": details})
+            return True
+        except DeclarationError as error:
+            failure = {"code": error.code, "message": str(error), "detail": error.detail}
+        except Exception as error:  # noqa: BLE001 - malformed evidence must produce a failed gate
+            failure = {"code": "v14.evidence_invalid", "message": f"{type(error).__name__}: {error}", "detail": {}}
+        errors.append(failure)
+        checks.append({"id": identifier, "passed": False, "details": failure})
+        return False
+
+    def boundary():
+        block = raw.get("exporter")
+        _require(isinstance(block, dict), "v14.unread", "native exporter evidence has not been read")
+        _require(block.get("state") != "absent", "v14.absent", "no v1.4 exporter declaration was found")
+        _require(
+            block.get("state") == "extracted",
+            "v14.unread",
+            "exporter extraction is incomplete",
+            native_error=block.get("error"),
+        )
+        declaration = validate_boundary(block)
+        main = (raw.get("selection") or {}).get("main_assembly") or (raw.get("identity") or {}).get("main_assembly")
+        _require(declaration["document"] == main, "v14.capture_binding", "the declaration came from another document")
+        _require(
+            declaration["configuration"] == raw.get("saved_configuration"),
+            "v14.capture_binding",
+            "the declaration was not read in the observed saved configuration",
+        )
+        state["declaration"] = declaration
+        return {
+            "raw_xml_sha256": declaration["raw_xml_sha256"],
+            "document": main,
+            "configuration": declaration["configuration"],
+        }
+
+    def topology():
+        links, parents, joints = {}, {}, {}
+        stack = [(state["declaration"]["root"], None)]
+        while stack:
+            link, parent = stack.pop()
+            _require(isinstance(link, dict), "v14.topology", "a link tree contains a null link")
+            name = link.get("name")
+            _require(
+                isinstance(name, str) and _NAME.fullmatch(name) and name not in links,
+                "v14.topology",
+                "link names must be unique snake_case names",
+                name=name,
+            )
+            links[name] = link
+            parents[name] = parent
+            _require(link.get("is_incomplete") is not True, "v14.incomplete", "the saved link is incomplete", link=name)
+            joint = link.get("joint")
+            if parent is None:
+                _require(
+                    joint is None
+                    or all(joint.get(key) in (None, "") for key in ("name", "type", "parent_link", "child_link")),
+                    "v14.topology",
+                    "the root metadata holder declares a tree edge",
+                )
+            else:
+                _require(
+                    isinstance(joint, dict) and joint.get("parent_link") == parent and joint.get("child_link") == name,
+                    "v14.topology",
+                    "joint endpoints disagree with the saved link tree",
+                    link=name,
+                )
+                jname = joint.get("name")
+                _require(
+                    isinstance(jname, str) and _NAME.fullmatch(jname) and jname not in joints,
+                    "v14.topology",
+                    "joint names must be unique snake_case names",
+                    joint=jname,
+                )
+                _require(
+                    joint.get("type") in {"fixed", "revolute", "continuous", "prismatic"},
+                    "v14.joint_type",
+                    "unsupported saved joint type",
+                    joint=jname,
+                    type=joint.get("type"),
+                )
+                joints[jname] = joint
+            stack.extend((child, name) for child in reversed(link.get("children") or []))
+        state.update(links=links, parents=parents, joints=joints)
+        return {"links": len(links), "joints": len(joints), "root": state["declaration"]["root"]["name"]}
+
+    def membership():
+        components = {}
+        for item in raw.get("components") or []:
+            _require(
+                isinstance(item, dict)
+                and isinstance(item.get("name2"), str)
+                and item["name2"]
+                and item["name2"] not in components
+                and type(item.get("suppressed")) is bool,
+                "v14.components",
+                "the native occurrence inventory is malformed",
+            )
+            components[item["name2"]] = item
+        _require(bool(components), "v14.components", "native occurrence inventory is empty")
+        leaves = _leaves(components)
+        state.update(components=components, leaves=leaves)
+        bindings = {row["pid_hex"]: row for row in state["declaration"]["pid_bindings"]}
+        members = {name: set() for name in state["links"]}
+        selected, pids, suppressed = {}, {}, []
+        main_pids = {}
+        for name, link in state["links"].items():
+            selected[name] = set()
+            slots = link.get("component_pids")
+            _require(
+                isinstance(slots, list), "v14.membership_unread", "a component selection array is absent", link=name
+            )
+            if link.get("main_component_pid") is not None:
+                main_pids[name] = pid_hex(link["main_component_pid"])
+            for value in slots:
+                key = pid_hex(value)
+                _require(
+                    key not in pids or pids[key] == name,
+                    "v14.membership_overlap",
+                    "the same persistent reference belongs to two links",
+                    links=[pids.get(key), name],
+                )
+                pids[key] = name
+                row = bindings.get(key)
+                _require(
+                    row is not None and row["error_code"] == 0 and row["name2"] in components,
+                    "v14.pid_unread",
+                    "a saved component PID did not resolve in this capture",
+                    link=name,
+                    pid_hex=key,
+                )
+                component = components[row["name2"]]
+                _require(
+                    row["configuration"] == component.get("configuration"),
+                    "v14.pid_binding",
+                    "the PID resolved another occurrence configuration",
+                    component=row["name2"],
+                )
+                if row["document"] is not None:
+                    _require(
+                        row["document"] == component.get("document"),
+                        "v14.pid_binding",
+                        "the PID resolved another occurrence document",
+                        component=row["name2"],
+                    )
+                else:
+                    _require(
+                        component.get("virtual") is True or component.get("document") is None,
+                        "v14.pid_document_unread",
+                        "the PID document identity needs native virtual-component proof",
+                        component=row["name2"],
+                    )
+                if component["suppressed"]:
+                    suppressed.append(row["name2"])
+                    continue
+                selected[name].add(row["name2"])
+                members[name].update(_expanded(row["name2"], leaves))
+        _require(
+            set(bindings) == set(pids) | set(main_pids.values()),
+            "v14.pid_binding",
+            "the PID binding inventory differs from the declaration",
+        )
+        claimed = {}
+        for name, names in members.items():
+            for leaf in names:
+                _require(
+                    leaf not in claimed,
+                    "v14.membership_overlap",
+                    "two expanded selections claim one leaf",
+                    component=leaf,
+                    links=[claimed.get(leaf), name],
+                )
+                claimed[leaf] = name
+        for name, key in main_pids.items():
+            row = bindings[key]
+            _require(
+                row["error_code"] == 0 and row["name2"] in components, "v14.pid_unread", "main PID did not resolve"
+            )
+            material = _expanded(row["name2"], leaves)
+            _require(
+                bool(material) and material <= members[name],
+                "v14.main_component",
+                "the main component is outside its declared link",
+                link=name,
+            )
+        added, proofs, conflicts = _complete_membership(raw, components, members, leaves)
+        uncovered = sorted(leaves - set().union(*members.values()))
+        state.update(
+            components=components,
+            members=members,
+            leaves=leaves,
+            selected=selected,
+            completion=added,
+            rigid_conflicts=conflicts,
+        )
+        details = {
+            "leaves": len(leaves),
+            "covered": len(leaves) - len(uncovered),
+            "uncovered": uncovered,
+            "suppressed": sorted(set(suppressed)),
+            "rigid_completion": added,
+            "rigid_proofs": proofs,
+        }
+        _require(not uncovered, "v14.coverage", "native material leaves remain unassigned", **details)
+        return details
+
+    def frame(name):
+        link = state["links"][name]
+        joint = link.get("joint") or {}
+        feature, owner = _selector(joint.get("coordinate_system_name"))
+        candidates = [
+            datum for datum in raw.get("datums") or [] if datum.get("name") == feature and datum.get("owner") == owner
+        ]
+        _require(
+            len(candidates) == 1,
+            "v14.datum_unread",
+            "the named coordinate system was not read uniquely",
+            feature=feature,
+            owner=owner,
+        )
+        _require(
+            sum(datum.get("name") == feature for datum in raw.get("datums") or []) == 1,
+            "v14.datum_ambiguous",
+            "the delivery frame name is ambiguous across occurrences",
+            feature=feature,
+        )
+        if owner:
+            _require(owner in state.get("components", {}), "v14.datum_owner", "unknown coordinate-system occurrence")
+            owned = _expanded(owner, state["leaves"])
+            _require(owned <= state["members"][name], "v14.datum_owner", "coordinate system belongs to another link")
+        else:
+            _require(
+                candidates[0].get("configuration") == raw.get("saved_configuration"),
+                "v14.capture_binding",
+                "the datum was read in another configuration",
+            )
+        matrix = _cad_pose(candidates[0]["array"])
+        state.setdefault("frames", {})[name] = matrix
+        state.setdefault("frame_names", {})[name] = feature
+        return {"coordinate_system": feature, "owner": owner}
+
+    def optional(name, joint):
+        populated = {
+            kind: values
+            for kind, values in joint.get("optional", {}).items()
+            if values is not None and any(value is not None for value in values.values())
+        }
+        _require(
+            not populated,
+            "v14.unsupported_semantics",
+            "authored optional joint semantics cannot be discarded",
+            joint=name,
+            values=populated,
+        )
+        return {}
+
+    def joint_limits(name, joint):
+        if joint["type"] == "fixed":
+            return {"type": "fixed"}
+        limits = joint.get("limit")
+        _require(isinstance(limits, dict), "v14.limits", "moving joint has no authored limit record", joint=name)
+        invalid = [key for key in ("effort", "velocity") if not (_number(limits.get(key)) and limits[key] > 0)]
+        if joint["type"] in {"revolute", "prismatic"} and not (
+            _number(limits.get("lower")) and _number(limits.get("upper")) and limits["lower"] < limits["upper"]
+        ):
+            invalid.append("ordered_bounds")
+        _require(
+            not invalid,
+            "v14.operating_parameters",
+            "authored bounds must be ordered and effort/velocity positive",
+            joint=name,
+            limits=limits,
+            invalid=invalid,
+        )
+        return {"limits": limits}
+
+    def joint_geometry(name, joint):
+        parent, child = joint["parent_link"], joint["child_link"]
+        _require(
+            parent in state.get("frames", {}) and child in state.get("frames", {}),
+            "v14.datum_unread",
+            "joint datums are incomplete",
+            joint=name,
+        )
+        origin = joint.get("origin") or {}
+        _require(type(origin.get("customized")) is bool, "v14.origin_unread", "origin customization state is unread")
+        if origin["customized"]:
+            observed = np.linalg.inv(state["frames"][parent]) @ state["frames"][child]
+            _same_pose(_pose(origin.get("xyz"), origin.get("rpy")), observed)
+        if joint["type"] == "fixed":
+            return {"origin_customized": origin["customized"]}
+        feature, owner = _selector(joint.get("axis_name"))
+        reference = {"kind": "reference_axis", "component": owner, "feature_name": feature}
+        candidates = [item for item in raw.get("reference_axes") or [] if item.get("selector") == reference]
+        _require(len(candidates) == 1, "v14.axis_unread", "the declared native axis was not read uniquely", joint=name)
+        if owner:
+            material = _expanded(owner, state["leaves"])
+            _require(
+                material and material <= (state["members"][parent] | state["members"][child]),
+                "v14.axis_owner",
+                "axis occurrence belongs to a foreign declared link",
+                joint=name,
+            )
+        components = {
+            key: _cad_pose(value["transform"])
+            for key, value in state["components"].items()
+            if value["suppressed"] is False
+        }
+        details = _axis(
+            {"axis_reference": reference, "axis": joint.get("axis")}, candidates[0], components, state["frames"][child]
+        )
+        state.setdefault("axes", {})[name] = reference
+        return {**details, "origin_customized": origin["customized"]}
+
+    def contradictions():
+        from .native_discovery import _frames, _rows_for
+
+        _require("members" in state, "v14.membership_unread", "motion comparison awaits complete PID membership reads")
+        components, leaves, members = state["components"], state["leaves"], state["members"]
+        owners = {}
+        for component in components:
+            material = _expanded(component, leaves)
+            matching = [name for name, group in members.items() if material and material <= group]
+            if len(matching) == 1:
+                owners[component] = matching[0]
+        conflicts = []
+        frames = _frames(raw)
+        for name, joint in state["joints"].items():
+            if joint["type"] == "fixed" or joint["child_link"] not in state.get("frames", {}):
+                continue
+            direction = np.asarray(joint.get("axis"), dtype=float)
+            if direction.shape != (3,) or not np.isfinite(direction).all() or abs(np.linalg.norm(direction) - 1) > 1e-8:
+                continue
+            frame = state["frames"][joint["child_link"]]
+            direction = frame[:3, :3] @ direction
+            twist = (
+                np.r_[direction, [0, 0, 0]]
+                if joint["type"] == "prismatic"
+                else np.r_[-np.cross(direction, frame[:3, 3]), direction]
+            )
+            descendants = {joint["child_link"]}
+            while True:
+                expanded = descendants | {child for child, parent in state["parents"].items() if parent in descendants}
+                if expanded == descendants:
+                    break
+                descendants = expanded
+            for mate in raw.get("mates") or []:
+                if not isinstance(mate, dict) or not _valid_mate(mate, components):
+                    continue
+                left, right = [owners.get(entity["component"]) for entity in mate["entities"]]
+                if left is None or right is None or (left in descendants) == (right in descendants):
+                    continue
+                rows = _rows_for(mate, frames)
+                if rows is None:
+                    continue
+                if any(
+                    abs(float(np.dot(row, twist))) > 1e-6 * max(1, float(np.linalg.norm(row))) for row in rows["rows"]
+                ):
+                    conflicts.append({"joint": name, "mate": mate.get("name"), "links": [left, right]})
+        _require(
+            not conflicts,
+            "v14.motion_conflict",
+            "complete active native constraints contradict declared motion",
+            conflicts=conflicts,
+        )
+        return {"conflicts": [], "unresolved_mates": "not evidence of a declaration defect"}
+
+    def claims():
+        _require("members" in state, "v14.membership_unread", "claim comparison awaits complete PID membership reads")
+        _require(isinstance(source, dict), "v14.claims", "generated source claims are absent")
+        bodies, joints = source.get("bodies"), source.get("joints")
+        _require(isinstance(bodies, list) and len(bodies) == len(state["links"]), "v14.claims", "body count differs")
+        by_name = {body.get("name"): body for body in bodies}
+        _require(len(by_name) == len(bodies) and set(by_name) == set(state["links"]), "v14.claims", "body names differ")
+        for name, body in by_name.items():
+            _require(
+                isinstance(body.get("components"), list)
+                and len(set(body["components"])) == len(body["components"])
+                and set(body["components"]) == state["members"][name],
+                "v14.claims",
+                "generated membership differs from native evidence",
+                link=name,
+            )
+            _require(
+                body.get("frame") == {"coordinate_system": state["frame_names"][name]},
+                "v14.claims",
+                "generated body datum differs from the saved native selection",
+                link=name,
+            )
+        _require(isinstance(joints, list) and len(joints) == len(state["joints"]), "v14.claims", "joint count differs")
+        by_joint = {joint.get("name"): joint for joint in joints}
+        _require(
+            len(by_joint) == len(joints) and set(by_joint) == set(state["joints"]), "v14.claims", "joint names differ"
+        )
+        for name, saved in state["joints"].items():
+            observed = by_joint[name]
+            expected = {"type": saved["type"], "parent": saved["parent_link"], "child": saved["child_link"]}
+            _require(
+                all(observed.get(key) == value for key, value in expected.items()),
+                "v14.claims",
+                "generated joint topology differs",
+                joint=name,
+            )
+            if saved["type"] != "fixed":
+                limits = saved["limit"]
+                if saved["type"] == "continuous":
+                    limits = {key: limits[key] for key in ("effort", "velocity")}
+                _require(
+                    observed.get("limits") == limits
+                    and observed.get("axis") == saved["axis"]
+                    and observed.get("axis_reference") == state["axes"].get(name),
+                    "v14.claims",
+                    "generated joint axis or operating values differ",
+                    joint=name,
+                )
+        _require(source.get("frames") == [], "v14.claims", "generated interface frames have no saved declaration")
+        return {"bodies": len(bodies), "joints": len(joints)}
+
+    if check("declarations.binding", boundary) and check("declarations.topology", topology):
+        check("declarations.membership", membership)
+        for name in state["links"]:
+            check("declarations.frame." + name, lambda n=name: frame(n))
+            metadata = state["links"][name].get("joint")
+            if metadata is not None:
+                check("declarations.optional." + name, lambda n=name, j=metadata: optional(n, j))
+        for name, joint in state["joints"].items():
+            check("declarations.limits." + name, lambda n=name, j=joint: joint_limits(n, j))
+            check("declarations.axis." + name, lambda n=name, j=joint: joint_geometry(n, j))
+        check("declarations.motion", contradictions)
+        if source is not None:
+            check("declarations.claims", claims)
+    return {
+        "schema_version": SCHEMA,
+        "passed": not errors and bool(checks),
+        "checks": checks,
+        "errors": errors,
+        "members": {name: sorted(values) for name, values in state.get("members", {}).items()},
+        "completion": state.get("completion", {}),
+    }
