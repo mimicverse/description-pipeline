@@ -53,7 +53,7 @@ def joint_xml(*, nil_velocity=True, root=False):
                 "Origin",
                 prefix + "_origin",
                 [("XYZAttribute", "xyz", [0, 0, 0.2]), ("RPYAttribute", "rpy", [0, 0, 1.5707963267948966])],
-                '<isCustomized>false</isCustomized>',
+                "<isCustomized>false</isCustomized>",
             ),
             element("ParentLink", prefix + "_parent", [("NameAttribute", "link", "" if root else "base")]),
             element("ChildLink", prefix + "_child", [("NameAttribute", "link", "" if root else "tool")]),
@@ -139,6 +139,7 @@ class V14DeclarationDecoderTests(unittest.TestCase):
                 "limit": {"lower": -1.5, "upper": 1.5, "effort": 0, "velocity": None},
                 "coordinate_system_name": "frame",
                 "axis_name": "shaft",
+                "optional": {"calibration": None, "dynamics": None, "safety": None, "mimic": None},
             },
         )
 
@@ -221,6 +222,19 @@ class V14DeclarationDecoderTests(unittest.TestCase):
         extra = "<Inertial><Mass>nonsense</Mass></Inertial><Visual><Mesh>missing.stl</Mesh></Visual>"
         self.assertEqual(v14.parse_v14_xml(document_xml()), v14.parse_v14_xml(document_xml(extra_elements=extra)))
 
+    def test_optional_authored_semantics_are_preserved(self):
+        dynamics = element("Dynamics", "dynamics", [("DampingAttribute", "damping", 0.5)])
+        mimic = element(
+            "Mimic", "mimic", [("JointNameAttribute", "joint", "driver"), ("MultiplierAttribute", "multiplier", 0)]
+        )
+        payload = document_xml().replace('<Joint z:Ref="joint"/>', '<Joint z:Ref="joint"/>' + dynamics + mimic)
+        payload = payload.replace(
+            "<AxisName>shaft</AxisName>", '<AxisName>shaft</AxisName><Dynamics z:Ref="dynamics"/><Mimic z:Ref="mimic"/>'
+        )
+        optional = v14.parse_v14_xml(payload)["children"][0]["joint"]["optional"]
+        self.assertEqual(optional["dynamics"], {"Damping": 0.5, "Friction": None})
+        self.assertEqual(optional["mimic"], {"JointName": "driver", "Multiplier": 0, "Offset": None})
+
     def test_xml_safety_guards(self):
         for xml, code in [
             ('<?xml version="1.0"?><!DOCTYPE Link><Link/>', "v14.unsafe_xml"),
@@ -240,7 +254,15 @@ class V14DeclarationDecoderTests(unittest.TestCase):
     def test_boundary_validation_and_hash(self):
         raw = document_xml()
         digest = hashlib.sha256(raw.encode()).hexdigest()
-        bindings = [{"pid_hex": "414243", "name2": "part-1", "error_code": 0}]
+        bindings = [
+            {
+                "pid_hex": "414243",
+                "name2": "part-1",
+                "error_code": 0,
+                "document": "part.SLDPRT",
+                "configuration": "Default",
+            }
+        ]
         base = {
             "attribute_name": v14.ATTRIBUTE_NAME,
             "exporter_version": 1.4,
@@ -248,6 +270,7 @@ class V14DeclarationDecoderTests(unittest.TestCase):
             "raw_xml_sha256": digest.upper(),
             "pid_bindings": bindings,
             "document": "robot.SLDASM",
+            "configuration": "Default",
         }
         decoded = v14.validate_boundary(base)
         self.assertEqual(decoded["root"]["name"], "base")
@@ -259,6 +282,10 @@ class V14DeclarationDecoderTests(unittest.TestCase):
             ({"attribute_name": "other"}, "v14.attribute_name"),
             ({"exporter_version": 1.3}, "v14.exporter_version"),
             ({"raw_xml_sha256": "0" * 64}, "v14.raw_hash_mismatch"),
+            ({"raw_xml_sha256": None}, "v14.raw_hash_mismatch"),
+            ({"configuration": None}, "v14.boundary_identity"),
+            ({"pid_bindings": {}}, "v14.pid_bindings"),
+            ({"pid_bindings": bindings * 2}, "v14.pid_bindings"),
             ({"raw_xml": ""}, "v14.empty_payload"),
         ]:
             with self.assertRaises(v14.DeclarationError) as caught:

@@ -13,6 +13,7 @@ import base64
 import binascii
 import hashlib
 import math
+import re
 import xml.etree.ElementTree as ET
 
 ATTRIBUTE_NAME = "URDF Export Configuration (v1.4)"
@@ -141,7 +142,14 @@ def _attribute_value(owner: ET.Element, field: str, resolver: _Resolver) -> ET.E
     value = _first(holder, "Value", resolver)
     if attribute_type is None or value is None:
         _refuse("v14.attribute_shape", "an Attribute lacks AttributeType or Value", {"field": field})
-    expected = {"name", "link"} if field == "NameAttribute" else {field.removesuffix("Attribute").lower()}
+    wire = {
+        "JointNameAttribute": "joint",
+        "SoftLowerAttribute": "soft_lower",
+        "SoftUpperAttribute": "soft_upper",
+        "KPositionAttribute": "k_position",
+        "KVelocityAttribute": "k_velocity",
+    }.get(field, field.removesuffix("Attribute").lower())
+    expected = {"name", "link"} if field == "NameAttribute" else {wire}
     if _string_value(attribute_type) not in expected:
         _refuse("v14.attribute_shape", "an Attribute carries another field's value", {"field": field})
     return value
@@ -252,6 +260,24 @@ def _joint_record(element: ET.Element | None, resolver: _Resolver) -> dict | Non
         "limit": _limit_record(_first(element, "Limit", resolver), resolver),
         "coordinate_system_name": _direct_string(element, "CoordinateSystemName", resolver),
         "axis_name": _direct_string(element, "AxisName", resolver),
+        "optional": {
+            "calibration": _optional_record(element, "Calibration", ("Rising", "Falling"), resolver),
+            "dynamics": _optional_record(element, "Dynamics", ("Damping", "Friction"), resolver),
+            "safety": _optional_record(
+                element, "Safety", ("SoftLower", "SoftUpper", "KPosition", "KVelocity"), resolver
+            ),
+            "mimic": _optional_record(element, "Mimic", ("JointName", "Multiplier", "Offset"), resolver),
+        },
+    }
+
+
+def _optional_record(owner: ET.Element, field: str, names: tuple[str, ...], resolver: _Resolver) -> dict | None:
+    element = _typed(_first(owner, field, resolver), "SafetyController" if field == "Safety" else field, field)
+    if element is None:
+        return None
+    return {
+        name: (_attribute_string if name == "JointName" else _attribute_numbers)(element, name + "Attribute", resolver)
+        for name in names
     }
 
 
@@ -339,8 +365,31 @@ def validate_boundary(block: dict) -> dict:
     raw = block.get("raw_xml")
     digest = hashlib.sha256(_guard_payload(raw)).hexdigest()
     stated = block.get("raw_xml_sha256")
-    if stated is not None and (not isinstance(stated, str) or stated.lower() != digest):
+    if not isinstance(stated, str) or stated.lower() != digest:
         _refuse("v14.raw_hash_mismatch", "the raw payload hash differs from the boundary hash")
+    for key in ("document", "configuration"):
+        if not isinstance(block.get(key), str) or not block[key].strip():
+            _refuse("v14.boundary_identity", f"the observed {key} is missing")
+    bindings = block.get("pid_bindings")
+    if not isinstance(bindings, list):
+        _refuse("v14.pid_bindings", "the native PID bindings are not an array")
+    seen = set()
+    for row in bindings:
+        if (
+            not isinstance(row, dict)
+            or not {"pid_hex", "name2", "document", "configuration", "error_code"} <= row.keys()
+            or not isinstance(row.get("pid_hex"), str)
+            or re.fullmatch(r"(?:[0-9a-f]{2})+", row["pid_hex"]) is None
+            or type(row.get("error_code")) is not int
+            or any(
+                row.get(key) is not None and not isinstance(row[key], str)
+                for key in ("name2", "document", "configuration")
+            )
+        ):
+            _refuse("v14.pid_bindings", "a native PID binding is malformed")
+        if row["pid_hex"] in seen:
+            _refuse("v14.pid_bindings", "a native PID was resolved more than once")
+        seen.add(row["pid_hex"])
     return {
         "attribute_name": name,
         "exporter_version": version,

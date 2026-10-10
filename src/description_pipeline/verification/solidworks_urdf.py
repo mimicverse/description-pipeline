@@ -408,6 +408,59 @@ def _axis(authored, record, components, child_datum):
     reference = authored["axis_reference"]
     _require(isinstance(reference, dict), "Moving joints require a structured native shaft reference")
     _require(record["component"] == reference["component"], "Shaft evidence names another occurrence")
+    if reference.get("kind") == "reference_axis":
+        point, direction = _reference_axis_line(reference, record, components)
+    else:
+        point, direction = _cylinder_axis_line(reference, record, components)
+    authored_axis = _vector(authored["axis"])
+    _require(abs(float(np.linalg.norm(authored_axis)) - 1) < 1e-8, "Authored joint axis is not a unit vector")
+    axis = child_datum[:3, :3] @ authored_axis
+    angle = math.acos(float(np.clip(abs(direction @ axis), -1, 1)))
+    delta = point - child_datum[:3, 3]
+    offset = float(np.linalg.norm(delta - float(delta @ axis) * axis))
+    _require(
+        offset <= POSITION_TOL_M and angle <= ROTATION_TOL_RAD,
+        f"Joint origin/axis misses the native shaft by {offset:.9g} m / {math.degrees(angle):.9g} deg",
+    )
+    return {"offset_m": offset, "angle_deg": math.degrees(angle), "positive_direction": "author_axis_in_child_datum"}
+
+
+def _reference_axis_line(reference, record, components):
+    """Re-derive the native undirected RefAxis from its two measured endpoints."""
+    _require(
+        record.get("kind") == "reference_axis"
+        and record.get("selector") == reference
+        and record.get("direction_semantics") == "undirected_axis_line"
+        and record.get("used_api") == "IFeature.GetSpecificFeature2/IRefAxis.GetRefAxisParams",
+        "No matching native reference-axis reading",
+    )
+    component = reference.get("component")
+    _require(isinstance(component, str) and (component == "" or component in components), "Unknown axis occurrence")
+    _require(
+        isinstance(reference.get("feature_name"), str) and bool(reference["feature_name"]), "Unnamed reference axis"
+    )
+    endpoints = _vector(record["raw_endpoints_m"], 6)
+    point, endpoint = endpoints[:3], endpoints[3:]
+    delta = endpoint - point
+    length = float(np.linalg.norm(delta))
+    _require(math.isfinite(length) and length > 0, "Native reference-axis endpoints coincide")
+    direction = delta / length
+    _require(
+        np.allclose(_vector(record["axis_point_m"]), point, atol=1e-12, rtol=0)
+        and np.allclose(_vector(record["axis_direction"]), direction, atol=1e-12, rtol=0),
+        "Reference-axis summary differs from native endpoints",
+    )
+    if record.get("coordinate_frame") == "component_local":
+        _require(component != "", "A top-assembly axis cannot claim a component-local frame")
+        transform = components[component]
+        point = transform[:3, :3] @ point + transform[:3, 3]
+        direction = transform[:3, :3] @ direction
+    else:
+        _require(record.get("coordinate_frame") == "assembly", "Unknown reference-axis coordinate frame")
+    return point, direction
+
+
+def _cylinder_axis_line(reference, record, components):
     if reference.get("feature_name"):
         _require(
             record["selector"]["feature_name"] == reference["feature_name"], "Shaft evidence names another CAD feature"
@@ -427,15 +480,7 @@ def _axis(authored, record, components, child_datum):
         direction = transform[:3, :3] @ direction
     else:
         _require(record["coordinate_frame"] == "assembly", "Unknown shaft coordinate frame")
-    axis = child_datum[:3, :3] @ _vector(authored["axis"])
-    angle = math.acos(float(np.clip(abs(direction @ axis), -1, 1)))
-    delta = point - child_datum[:3, 3]
-    offset = float(np.linalg.norm(delta - float(delta @ axis) * axis))
-    _require(
-        offset <= POSITION_TOL_M and angle <= ROTATION_TOL_RAD,
-        f"Joint origin/axis misses the native shaft by {offset:.9g} m / {math.degrees(angle):.9g} deg",
-    )
-    return {"offset_m": offset, "angle_deg": math.degrees(angle), "positive_direction": "author_axis_in_child_datum"}
+    return point, direction
 
 
 def _tree(document, base_pose):
