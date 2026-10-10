@@ -28,7 +28,7 @@ from unittest import mock
 from packaging.utils import canonicalize_name
 
 from description_pipeline import solidworks
-from description_pipeline.io import PipelineError, canonical, write_json
+from description_pipeline.io import PipelineError, canonical, file_digest, write_json
 from description_pipeline.orchestration import linux_runner
 from description_pipeline.orchestration.linux_store import STORE_SCHEMA, LinuxStore
 from description_pipeline.orchestration.stage_transfer import CAPTURE_ARCHIVE, CAPTURE_MANIFEST, seal_capture
@@ -225,6 +225,16 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         result = linux_runner.fetch_capture(self.store, endpoint, FRESH, job)
         self.assertEqual(result["state"], "capture_admitted")
         self.assertEqual((self.store.meta(FRESH) or {}).get("handoff_sha256"), HANDOFF)
+
+    def test_manifest_receipt_mismatch_is_refused_before_import_and_on_retry(self) -> None:
+        endpoint = FakeEndpoint(self.archive.read_bytes())
+        job = self._job(RUN, self.archive, declared_sha256=file_digest(self.archive))
+        job["result"]["capture_archive"]["manifest_sha256"] = "e" * 64
+        fresh = LinuxStore(self.tmp / "manifest-mismatch")
+        for store in (fresh, self.store):
+            with self.subTest(admitted=store is self.store), self.assertRaisesRegex(PipelineError, "manifest"):
+                linux_runner.fetch_capture(store, endpoint, RUN, job)
+        self.assertFalse(fresh.capture_dir(RUN).exists())
 
     # ------------------------------------------------------------ run lock
 

@@ -11,7 +11,7 @@ from unittest import mock
 
 from packaging.utils import canonicalize_name
 
-from description_pipeline.io import PipelineError
+from description_pipeline.io import PipelineError, file_digest
 from description_pipeline.orchestration import linux_runner
 from description_pipeline.orchestration.linux_store import LinuxStore
 from description_pipeline.orchestration.stage_transfer import seal_capture
@@ -286,7 +286,14 @@ class LinuxSplitTests(unittest.TestCase):
         job = {
             "status": "native_complete",
             "request": {"handoff_sha256": HANDOFF, "main_assembly": MAIN_ASSEMBLY},
-            "result": {"native_complete": True, "native_tool": self.tool},
+            "result": {
+                "native_complete": True, "native_tool": self.tool,
+                "capture_archive": {
+                    "name": "native-evidence.zip", "sha256": file_digest(self.archive),
+                    "size": self.archive.stat().st_size,
+                    "manifest_sha256": file_digest(self.store.capture_dir(self.run_id) / "transfer-manifest.json"),
+                },
+            },
         }
         binding = linux_runner.fetch_capture(self.store, endpoint, self.run_id, job)
         self.assertEqual(binding["state"], "capture_admitted")

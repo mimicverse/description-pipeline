@@ -10,6 +10,8 @@ tool record and carry the pinned MuJoCo before generation and before publication
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
+import zipfile
 
 from packaging.utils import canonicalize_name
 
@@ -19,7 +21,7 @@ from ..runtime import RUNTIME_VERSIONS, required_packages, tool_record
 from ..stages import STAGE_IDS
 from .airflow_client import capture_archive_metadata, validate_run_id
 from .linux_store import PORTABLE_STAGES, LinuxStore
-from .stage_transfer import CAPTURE_ARCHIVE, CAPTURE_MANIFEST, verify_transfer
+from .stage_transfer import CAPTURE_ARCHIVE, CAPTURE_MANIFEST, MAX_MANIFEST_BYTES, verify_transfer
 
 
 def _portable_identity_gate(store: LinuxStore, run_id: str) -> dict:
@@ -201,6 +203,7 @@ def fetch_capture(store: LinuxStore, endpoint, run_id: str, job: dict) -> dict:
     if not isinstance(handoff, str) or not handoff:
         raise PipelineError("The native job carries no frozen handoff digest")
     main_assembly = job.get("main_assembly") or request.get("main_assembly")
+    archive = capture_archive_metadata(job)
     meta = store.meta(run_id)
     if (
         isinstance(meta, dict)
@@ -211,6 +214,9 @@ def fetch_capture(store: LinuxStore, endpoint, run_id: str, job: dict) -> dict:
         and store.capture_dir(run_id).is_dir()
     ):
         # A committed identical admission is returned without re-downloading the archive.
+        if file_digest(store.capture_dir(run_id) / CAPTURE_MANIFEST) != archive["manifest_sha256"]:
+            raise PipelineError("The admitted capture differs from the native manifest receipt")
+        _revalidate_capture(store, run_id)
         return {
             "run_id": run_id,
             "store_root": str(store.root),
@@ -219,12 +225,23 @@ def fetch_capture(store: LinuxStore, endpoint, run_id: str, job: dict) -> dict:
             "main_assembly": main_assembly,
             "state": meta.get("state"),
         }
-    archive = capture_archive_metadata(job)
     store.run_dir(run_id).mkdir(parents=True, exist_ok=True)
     archive_path = store.run_dir(run_id) / CAPTURE_ARCHIVE
     endpoint.stream_capture_archive(run_id, archive, archive_path)
     if file_digest(archive_path) != archive["sha256"] or archive_path.stat().st_size != archive["size"]:
         raise PipelineError("The downloaded capture archive does not match its declared receipt")
+    try:
+        with zipfile.ZipFile(archive_path) as packed, packed.open(CAPTURE_MANIFEST) as manifest:
+            total, checksum = 0, hashlib.sha256()
+            while chunk := manifest.read(1024 * 1024):
+                total += len(chunk)
+                if total > MAX_MANIFEST_BYTES:
+                    raise PipelineError("The native manifest exceeds the transfer size limit")
+                checksum.update(chunk)
+            if checksum.hexdigest() != archive["manifest_sha256"]:
+                raise PipelineError("The capture manifest does not match its native receipt")
+    except (zipfile.BadZipFile, KeyError) as error:
+        raise PipelineError("The capture archive contains no readable manifest") from error
     meta = store.import_capture(
         run_id,
         archive_path,
