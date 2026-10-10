@@ -112,6 +112,9 @@ class EndpointFixture:
         self.documents = {MAIN: [PART, ARM], PART: [], ARM: []}
         self.reader_log: list = []
         self.selection_refusal = None
+        #: A nonempty approved-name registry: the discovery contract must record
+        #: its digest instead of digest({}).
+        self.frozen_names = {"arm": "arm_link"}
 
     def write_config(self, **changes) -> None:
         write_json(self.path, {**self.config_data, **changes})
@@ -196,11 +199,12 @@ class EndpointFixture:
         from description_pipeline.sources.solidworks.selection import seal_selection
 
         observations = jobs.snapshot(run_id)["selection"]["observations"]
+        selected = {name: self.upload_files[name] for name in self.documents}
         return seal_selection(
             self.upload_files,
             MAIN,
             observations,
-            selected_files=dict(self.upload_files),
+            selected_files=selected,
             reader_sha256=TOOL["source_sha256"],
         )
 
@@ -253,18 +257,20 @@ class EndpointFixture:
             expected_run_id=run_id,
             expected_selection=selection,
             expected_native_tool=TOOL,
-            settings=DiscoverySettings(record_roots=[self.records_dir()]),
+            settings=DiscoverySettings(record_roots=[self.records_dir()], frozen_names=dict(self.frozen_names)),
         )
+        archive = self.root / f"capture-request-{run_id}.zip"
         seal_capture_request(
             prepared,
-            self.root / f"capture-request-{run_id}.zip",
+            archive,
             record=self.record,
             selection=selection,
             native_tool=TOOL,
         )
+        self.last_definition = {"archive": archive, "prepared_sha256": prepared.prepared_sha256}
         if submit:
-            jobs.submit_definition(run_id, self.root / f"capture-request-{run_id}.zip", prepared.prepared_sha256)
-        return self.root / f"capture-request-{run_id}.zip"
+            jobs.submit_definition(run_id, archive, prepared.prepared_sha256)
+        return archive
 
     def records_dir(self) -> Path:
         """The derivation record roots the raw record's properties point at."""
