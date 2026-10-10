@@ -96,7 +96,8 @@ Save `C:\description-state\endpoint.json`:
 ```
 
 Replace `arm` with the CAD's `dp.hardware_id` and configure its model base.
-The endpoint rejects unconfigured hardware. Configure `discovery.record_roots`
+Publication requires a configured hardware target; extraction and inspection
+can proceed while routing is absent. Configure `discovery.record_roots`
 for the controlled specification library, for example `["C:/cad-records"]`.
 Populate the library with approved records before admitting jobs.
 CAD references include the approved record version, such as

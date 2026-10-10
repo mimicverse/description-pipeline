@@ -635,6 +635,10 @@ _WARNING_DETAIL_KEYS = (
     "scope",
     "mate_type",
     "qualification_blocker",
+    "publication_blocker",
+    "missing",
+    "technical_label",
+    "label_source",
     "mass_kg",
     "masses",
 )
@@ -686,6 +690,11 @@ def _recorded_warnings(stage: dict, findings: list, rows: list[dict]) -> list[di
         )
     for row in rows:
         details = row.get("raw_details")
+        recorded = details.get("warnings") if isinstance(details, dict) else None
+        if isinstance(recorded, list):
+            warnings.extend(
+                _warning_row(stage, item) for item in recorded if isinstance(item, dict) and item.get("code")
+            )
         diagnostics = details.get("diagnostics") if isinstance(details, dict) else None
         if isinstance(diagnostics, list):
             warnings.extend(

@@ -3592,7 +3592,9 @@ def _identity(
         robot_name = str(authored_name).strip()
         if _SNAKE.fullmatch(robot_name) is None:
             findings.append(
-                _finding("discovery.robot_name_invalid", "assembly", "robot name is not snake_case", {"name": robot_name})
+                _finding(
+                    "discovery.robot_name_invalid", "assembly", "robot name is not snake_case", {"name": robot_name}
+                )
             )
         technical_name = None
     else:
