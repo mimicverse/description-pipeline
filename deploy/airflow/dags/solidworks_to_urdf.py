@@ -10,6 +10,7 @@ confirmed here before publication.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from datetime import datetime, timedelta
@@ -21,12 +22,16 @@ from airflow.sdk.exceptions import AirflowFailException
 from description_pipeline.orchestration.airflow_client import (
     HandoffResolution,
     WindowsEndpoint,
+    capture_archive_metadata,
     check_result,
     config_from_airflow_connection,
     native_run_id,
     resolved_routing,
     validate_main_assembly,
 )
+from description_pipeline.orchestration.linux_runner import fetch_capture as fetch_native_capture
+from description_pipeline.orchestration.linux_runner import run_portable_stage
+from description_pipeline.orchestration.linux_store import LinuxStore
 from description_pipeline.stages import (
     STAGE_IDS,
     compact_view,
@@ -39,6 +44,8 @@ from description_pipeline.io import digest
 
 DAG_ID = "solidworks_to_urdf"
 CONN_ID = os.environ.get("SOLIDWORKS_ENDPOINT_CONN_ID", "solidworks_windows")
+#: Stages the Linux portable host owns; a linked attempt from one of these skips Windows.
+PORTABLE_STAGES = ("generate", "verify", "publish")
 SENSOR_MODE = os.environ.get("SOLIDWORKS_SENSOR_MODE", "reschedule")
 POLL_INTERVAL = float(os.environ.get("SOLIDWORKS_POLL_INTERVAL", "10"))
 POLL_TIMEOUT = float(os.environ.get("SOLIDWORKS_TIMEOUT", "3600"))
@@ -47,6 +54,37 @@ log = logging.getLogger(__name__)
 
 def _endpoint(conn_id: str) -> WindowsEndpoint:
     return WindowsEndpoint(config_from_airflow_connection(conn_id))
+
+
+def _linux_store(conn_id: str) -> LinuxStore:
+    config = config_from_airflow_connection(conn_id)
+    if config.store_root is None:
+        raise AirflowFailException(
+            "pipeline.store_root / PIPELINE_STORE_ROOT is not configured; the Linux portable half cannot run"
+        )
+    return LinuxStore(config.store_root)
+
+
+def _portable_summary(receipt: dict) -> dict:
+    return {
+        "state": receipt.get("state"),
+        "passed": receipt.get("passed"),
+        "subject_sha256": receipt.get("subject_sha256"),
+        "error": receipt.get("error"),
+        "submission": receipt.get("submission"),
+    }
+
+
+def _parent_subject(store: LinuxStore, parent_run: str, stage: str) -> str:
+    """The recorded subject of a parent portable checkpoint a linked rerun reuses."""
+    path = store.receipt_path(parent_run, stage)
+    if not path.is_file():
+        raise AirflowFailException(f"parent attempt {parent_run} has no {stage} checkpoint to reuse")
+    receipt = json.loads(path.read_text(encoding="utf-8"))
+    subject = receipt.get("subject_sha256")
+    if not isinstance(subject, str) or not subject:
+        raise AirflowFailException(f"parent attempt {parent_run} {stage} checkpoint carries no subject")
+    return subject
 
 
 def _run_uuid(context) -> str:
@@ -103,6 +141,9 @@ def _resolution(request: dict) -> HandoffResolution:
 
 
 def _poke(request: dict, **context) -> bool:
+    if request.get("linux_owned"):
+        # A linked portable attempt has no Windows job to poll.
+        return True
     job = _endpoint(request["conn_id"]).get_job(request["run_id"])
     _same_request(job, request)
     latest = job["events"][-1] if job["events"] else {}
@@ -127,7 +168,7 @@ def _poke(request: dict, **context) -> bool:
             )
         if ti is not None:
             ti.xcom_push(key="engineering_progress", value=progress)
-    if job["status"] in {"passed", "failed"}:
+    if job["status"] in {"passed", "failed", "native_complete"}:
         for row in stage_log(stages):
             log.info("engineering result=%s", row)
         if ti is not None:
@@ -138,7 +179,7 @@ def _poke(request: dict, **context) -> bool:
         result = job.get("result") or {}
         log.error("native diagnostics=%s events=%s", result.get("diagnostic_path"), job["events"])
         raise AirflowFailException(f"SolidWorks job {request['run_id']} failed: {job.get('error')}")
-    return job["status"] == "passed"
+    return job["status"] in {"passed", "native_complete"}
 
 
 def _same_request(job: dict, request: dict) -> None:
@@ -194,6 +235,33 @@ def solidworks_to_urdf():
     def resolve_handoff(**context) -> dict:
         linked = _linked_conf(context)
         if linked is not None:
+            if linked["from_stage"] in PORTABLE_STAGES:
+                # A portable-linked rerun resumes from the parent's Linux attempt and never
+                # contacts Windows: the parent store already holds the admitted capture.
+                store = _linux_store(CONN_ID)
+                parent_meta = store.meta(linked["parent_run"])
+                if (
+                    not isinstance(parent_meta, dict)
+                    or not parent_meta.get("handoff_sha256")
+                    or not store.capture_dir(linked["parent_run"]).is_dir()
+                ):
+                    raise AirflowFailException(
+                        f"Linked parent {linked['parent_run']} has no admitted Linux capture to resume"
+                    )
+                request = {
+                    "run_id": _run_uuid(context),
+                    "package": str(store.capture_dir(linked["parent_run"])),
+                    "handoff_sha256": str(parent_meta["handoff_sha256"]),
+                    "conn_id": CONN_ID,
+                    "resume": linked,
+                    "linux_owned": True,
+                }
+                selection = _linked_selection(
+                    parent_meta.get("main_assembly"), context["params"].get("main_assembly")
+                )
+                if selection is not None:
+                    request["main_assembly"] = selection
+                return request
             # The parent native job is the only authority for the retained upload;
             # client-supplied package or digest values are never trusted.
             parent = _endpoint(CONN_ID).get_job(linked["parent_run"])
@@ -246,6 +314,13 @@ def solidworks_to_urdf():
 
     @task(doc_md="Submit the same UUID and frozen handoff to the serial Windows queue; retries never replay CAD.")
     def start_job(request: dict) -> dict:
+        if request.get("linux_owned"):
+            log.info(
+                "linked attempt run_id=%s from_stage=%s is linux-owned; no Windows job",
+                request["run_id"],
+                (request.get("resume") or {}).get("from_stage"),
+            )
+            return {**request, "status": "linux_owned"}
         job = _endpoint(request["conn_id"]).start_job(
             run_id=request["run_id"],
             resolution=_resolution(request),
@@ -255,13 +330,112 @@ def solidworks_to_urdf():
         log.info("started run_id=%s status=%s", job["run_id"], job["status"])
         return {**request, "status": job["status"]}
 
-    @task(doc_md="Confirm all six engineering stages and the verified candidate PR; return the bound stage summary.")
-    def confirm_job(request: dict) -> dict:
-        job = _endpoint(request["conn_id"]).get_job(request["run_id"])
-        _same_request(job, request)
-        if job["status"] != "passed":
-            raise AirflowFailException(f"job {request['run_id']} is {job['status']}, not passed")
-        routing = resolved_routing(job)
+    @task(doc_md="Import the sealed native capture into the Linux attempt store and bind routing.")
+    def fetch_capture(request: dict) -> dict:
+        store = _linux_store(request["conn_id"])
+        run_id = request["run_id"]
+        resume = request.get("resume") or {}
+        if request.get("linux_owned"):
+            parent_run = resume["parent_run"]
+            parent_meta = store.meta(parent_run) or {}
+            binding = {
+                "run_id": run_id,
+                "source_run_id": parent_run,
+                "from_stage": resume.get("from_stage"),
+                "handoff_sha256": parent_meta.get("handoff_sha256"),
+                "main_assembly": parent_meta.get("main_assembly"),
+                "repository_slug": parent_meta.get("repository_slug"),
+                "repository_base": parent_meta.get("repository_base"),
+                "state": "linked",
+            }
+        else:
+            job = _endpoint(request["conn_id"]).get_job(run_id)
+            _same_request(job, request)
+            if job.get("status") != "native_complete":
+                raise AirflowFailException(f"native job {run_id} is {job.get('status')}, not native_complete")
+            capture_archive_metadata(job)
+            binding = fetch_native_capture(store, _endpoint(request["conn_id"]), run_id, job)
+            binding["repository_slug"] = job.get("repository_slug")
+            binding["repository_base"] = job.get("repository_base")
+            binding["source_run_id"] = None
+            binding["from_stage"] = None
+        log.info(
+            "linux capture ready run_id=%s source=%s state=%s",
+            run_id,
+            binding.get("source_run_id"),
+            binding.get("state"),
+        )
+        return {"request": request, **binding}
+
+    @task(doc_md="Generate the model on Linux; this checkpoint is intentionally unverified.")
+    def run_generate(binding: dict) -> dict:
+        if binding.get("from_stage") in {"verify", "publish"}:
+            # The linked attempt resumes past generation: reuse the parent checkpoint.
+            store = _linux_store(binding["request"]["conn_id"])
+            subject = _parent_subject(store, binding["source_run_id"], "generate")
+            return {**binding, "generate": {"state": "reused", "passed": True, "subject_sha256": subject}}
+        store = _linux_store(binding["request"]["conn_id"])
+        receipt = run_portable_stage(
+            store, binding["run_id"], "generate", source_run_id=binding.get("source_run_id")
+        )
+        return {**binding, "generate": _portable_summary(receipt)}
+
+    @task(doc_md="Independent verification on Linux, including the MuJoCo consumer.")
+    def run_verify(generated: dict) -> dict:
+        if generated.get("from_stage") == "publish":
+            # The linked attempt resumes past verification: reuse the parent checkpoint.
+            store = _linux_store(generated["request"]["conn_id"])
+            subject = _parent_subject(store, generated["source_run_id"], "verify")
+            return {**generated, "verify": {"state": "reused", "passed": True, "subject_sha256": subject}}
+        subject = (generated.get("generate") or {}).get("subject_sha256")
+        if not subject:
+            raise AirflowFailException("generate produced no subject to verify")
+        store = _linux_store(generated["request"]["conn_id"])
+        receipt = run_portable_stage(
+            store,
+            generated["run_id"],
+            "verify",
+            expected_subject=subject,
+            source_run_id=generated.get("source_run_id"),
+        )
+        return {**generated, "verify": _portable_summary(receipt)}
+
+    @task(doc_md="Publish the verified delivery from Linux; no repository work happens on Windows.")
+    def run_publish(verified: dict) -> dict:
+        subject = (verified.get("verify") or {}).get("subject_sha256")
+        if not subject:
+            raise AirflowFailException("verify produced no subject to publish")
+        slug, base = verified.get("repository_slug"), verified.get("repository_base")
+        repository = config_from_airflow_connection(CONN_ID).repositories.get(str(slug or ""))
+        if repository is None:
+            raise AirflowFailException(f"no configured Linux checkout for model repository {slug!r}")
+        store = _linux_store(verified["request"]["conn_id"])
+        receipt = run_portable_stage(
+            store,
+            verified["run_id"],
+            "publish",
+            expected_subject=subject,
+            repository=repository,
+            base=base,
+            source_run_id=verified.get("source_run_id"),
+        )
+        return {**verified, "publish": _portable_summary(receipt)}
+
+    @task(doc_md="Confirm the six-stage receipt and the verified candidate PR from the Linux store.")
+    def confirm_job(published: dict) -> dict:
+        request = published["request"]
+        run_id = request["run_id"]
+        native = None
+        if not request.get("linux_owned"):
+            native = _endpoint(request["conn_id"]).get_job(run_id)
+            _same_request(native, request)
+            if native["status"] == "failed":
+                raise AirflowFailException(f"native job {run_id} failed: {native.get('error')}")
+        store = _linux_store(request["conn_id"])
+        snapshot = store.merged_job(run_id, native)
+        view = stage_view(snapshot)
+        require_complete(view)
+        routing = resolved_routing(snapshot)
         handoff = {
             "package": request["package"],
             "handoff_sha256": request["handoff_sha256"],
@@ -271,23 +445,21 @@ def solidworks_to_urdf():
             "base": routing["repository_base"],
         }
         result = check_result(
-            job.get("result"),
+            snapshot.get("result"),
             expected_slug=routing["repository_slug"],
             expected_base=routing["repository_base"],
         )
-        stages = stage_view(job)
-        require_complete(stages)
         log.info(
             "published run_id=%s quality=%s submission=%s",
-            request["run_id"],
+            run_id,
             result.get("quality"),
             result.get("submission"),
         )
         return {
-            "run_id": request["run_id"],
+            "run_id": run_id,
             "pipeline_id": result["pipeline_id"],
             "handoff": handoff,
-            "stages": compact_view(stages),
+            "stages": compact_view(view),
             "quality": {key: result["quality"].get(key) for key in ("passed", "subject_sha256")},
             "submission": result["submission"],
         }
@@ -305,8 +477,13 @@ def solidworks_to_urdf():
             "Transport polling only. Engineering stage/QC results are in these logs and the engineering_stages XCom."
         ),
     )
-    confirm = confirm_job(started)
-    wait_for_job >> confirm
+    fetched = fetch_capture(started)
+    generated = run_generate(fetched)
+    verified = run_verify(generated)
+    published = run_publish(verified)
+    confirm = confirm_job(published)
+    wait_for_job >> fetched
+    fetched >> generated >> verified >> published >> confirm
 
 
 dag = solidworks_to_urdf()

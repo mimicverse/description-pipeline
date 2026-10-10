@@ -14,11 +14,12 @@ from pathlib import Path
 from packaging.utils import canonicalize_name
 
 from .. import solidworks
-from ..io import PipelineError, read_data
+from ..io import PipelineError, file_digest, read_data
 from ..runtime import RUNTIME_VERSIONS, required_packages, tool_record
+from ..stages import STAGE_IDS
 from .airflow_client import capture_archive_metadata, validate_run_id
 from .linux_store import PORTABLE_STAGES, LinuxStore
-from .stage_transfer import CAPTURE_ARCHIVE, verify_transfer
+from .stage_transfer import CAPTURE_ARCHIVE, CAPTURE_MANIFEST, verify_transfer
 
 
 def _portable_identity_gate(store: LinuxStore, run_id: str) -> dict:
@@ -58,9 +59,14 @@ def _revalidate_capture(store: LinuxStore, run_id: str) -> None:
     for key in ("run_id", "handoff_sha256", "main_assembly"):
         if summary.get(key) != recorded.get(key):
             raise PipelineError(f"Admitted capture provenance differs from the recorded admission: {key}")
-    files = recorded.get("files")
-    if not isinstance(files, dict) or summary.get("files") != len(files):
-        raise PipelineError("Admitted capture inventory differs from the recorded admission")
+    manifest = read_data(capture / CAPTURE_MANIFEST)
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("files") != recorded.get("files")
+        or manifest.get("file_count") != recorded.get("file_count")
+        or manifest.get("total_bytes") != recorded.get("total_bytes")
+    ):
+        raise PipelineError("Admitted capture manifest differs from the recorded admission")
     if read_data(capture / "reports/native-tool.json") != recorded.get("native_tool"):
         raise PipelineError("Admitted capture native tool record differs from the recorded admission")
 
@@ -87,19 +93,21 @@ def run_portable_stage(
     base: str | None = None,
     expected_subject: str | None = None,
     parent_run: str | None = None,
+    source_run_id: str | None = None,
     on_event=None,
 ) -> dict:
     """Run one portable stage to its boundary and record the receipt in the store."""
     run_id = validate_run_id(run_id)
     if stage not in PORTABLE_STAGES:
         raise PipelineError(f"stage must be one of {PORTABLE_STAGES}: {stage!r}")
-    meta = store.meta(run_id)
-    if not isinstance(meta, dict) or not store.capture_dir(run_id).is_dir():
+    owner = validate_run_id(source_run_id) if source_run_id else run_id
+    meta = store.meta(owner)
+    if not isinstance(meta, dict) or not store.capture_dir(owner).is_dir():
         raise PipelineError("This run has no admitted native capture; fetch the transfer first")
     seeds = {
-        "generate": store.capture_dir(run_id),
-        "verify": store.stage_dir(run_id, "generate"),
-        "publish": store.stage_dir(run_id, "verify"),
+        "generate": store.capture_dir(owner),
+        "verify": store.stage_dir(owner, "generate"),
+        "publish": store.stage_dir(owner, "verify"),
     }
     outputs = {
         "generate": store.stage_dir(run_id, "generate"),
@@ -116,6 +124,17 @@ def run_portable_stage(
 
     with solidworks.output_lock(store.run_dir(run_id)):
         try:
+            store.update_meta(
+                run_id,
+                source_run_id=owner,
+                handoff_sha256=meta.get("handoff_sha256"),
+                main_assembly=meta.get("main_assembly"),
+                native_tool=meta.get("native_tool"),
+                repository_slug=meta.get("repository_slug"),
+                repository_base=meta.get("repository_base"),
+            )
+            if owner != run_id:
+                _seed_reuse(store, run_id, owner, stage)
             if stage == "generate" and expected_subject is not None:
                 raise PipelineError("generate does not take an expected subject")
             if stage in {"verify", "publish"} and not expected_subject:
@@ -123,10 +142,10 @@ def run_portable_stage(
             if stage == "publish" and repository is None:
                 raise PipelineError("publish requires the configured model repository checkout")
             if stage == "generate":
-                _revalidate_capture(store, run_id)
-            _portable_identity_gate(store, run_id)
+                _revalidate_capture(store, owner)
+            _portable_identity_gate(store, owner)
             receipt = solidworks.run(
-                store.capture_dir(run_id),
+                store.capture_dir(owner),
                 outputs[stage],
                 repository=Path(repository) if stage == "publish" else None,
                 base=base,
@@ -145,6 +164,22 @@ def run_portable_stage(
             raise
         store.record_stage(run_id, stage, receipt)
     return receipt
+
+
+def _seed_reuse(store: LinuxStore, run_id: str, owner: str, stage: str) -> None:
+    """Copy the parent's raw events for the stages this attempt resumes past, marked reused.
+
+    Timestamps and check records are preserved verbatim: a linked attempt renders the
+    parent's evidence as reused instead of fabricating new passes.
+    """
+    prefix = set(STAGE_IDS[: STAGE_IDS.index(stage)])
+    reuse = {"parent_run": owner, "reused": True}
+    seeded = [
+        {**event, "reuse": reuse}
+        for event in store.events(owner)
+        if isinstance(event, dict) and event.get("stage") in prefix
+    ]
+    store.append_events(run_id, seeded)
 
 
 def fetch_capture(store: LinuxStore, endpoint, run_id: str, job: dict) -> dict:
@@ -181,6 +216,8 @@ def fetch_capture(store: LinuxStore, endpoint, run_id: str, job: dict) -> dict:
     store.run_dir(run_id).mkdir(parents=True, exist_ok=True)
     archive_path = store.run_dir(run_id) / CAPTURE_ARCHIVE
     endpoint.stream_capture_archive(run_id, archive, archive_path)
+    if file_digest(archive_path) != archive["sha256"] or archive_path.stat().st_size != archive["size"]:
+        raise PipelineError("The downloaded capture archive does not match its declared receipt")
     meta = store.import_capture(
         run_id,
         archive_path,
@@ -188,6 +225,9 @@ def fetch_capture(store: LinuxStore, endpoint, run_id: str, job: dict) -> dict:
         expected_main_assembly=main_assembly,
         expected_native_tool=native_tool,
     )
+    slug = job.get("repository_slug")
+    base = job.get("repository_base")
+    store.update_meta(run_id, repository_slug=slug, repository_base=base)
     return {
         "run_id": run_id,
         "store_root": str(store.root),
@@ -195,4 +235,6 @@ def fetch_capture(store: LinuxStore, endpoint, run_id: str, job: dict) -> dict:
         "handoff_sha256": handoff,
         "main_assembly": main_assembly,
         "state": meta.get("state"),
+        "repository_slug": slug,
+        "repository_base": base,
     }
