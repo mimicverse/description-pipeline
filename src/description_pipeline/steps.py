@@ -96,7 +96,6 @@ def discover_structure(
     on_event=None,
 ):
     """Derive mechanical semantics and bind their native observations to the handoff."""
-    from .repository.urdf_pr import _origin_slug
     from .sources.solidworks.discovery import DiscoverySettings, prepare_native_package
 
     _state(on_event, "discover", "running")
@@ -177,7 +176,7 @@ def discover_structure(
             "discovery_sha256": prepared.discovery_sha256,
             "hardware_id": prepared.hardware_id,
             "revision": prepared.revision,
-            "repository_slug": _origin_slug(value[1]["repository"]),
+            "repository_slug": value[1]["repository_slug"],
             "base": value[1]["base"],
             "prepared_sha256": digest(value[2]),
             "files": {"input/" + name: checksum for name, checksum in value[2].items()},
