@@ -56,6 +56,27 @@ _BOUNDARY_LABELS_ZH = {
     "publication.receipt": "评审分支回执确认",
 }
 
+#: Readable names for the native discovery finding codes (fallback: the raw code).
+_DISCOVERY_CODE_LABELS_ZH = {
+    "discovery.identity_missing": "缺少硬件身份定义",
+    "discovery.revision_missing": "缺少结构修订记录",
+    "discovery.owner_missing": "缺少修订责任人",
+    "discovery.summary_missing": "缺少变更说明",
+    "discovery.control_missing": "缺少控制参考系定义",
+    "discovery.configuration_missing": "缺少交付配置声明",
+    "discovery.robot_name_invalid": "机器人名称不是 snake_case",
+    "discovery.design_budget_missing": "缺少设计预算记录",
+    "discovery.link_name_missing": "刚体缺少 CS_<link> 坐标系",
+    "discovery.joint_unsupported_pattern": "装配约束未形成单一关节运动",
+    "discovery.joint_axis_sign_missing": "缺少 dp.joint.axis_sign（±1）",
+    "discovery.joint_axis_selector_missing": "缺少可读取的关节轴选择器",
+    "discovery.mate_entities_unsupported": "配合实体缺少可重建方向",
+    "discovery.frame_attachment": "坐标系挂接配合无法重建",
+    "discovery.root_missing": "缺少 owning CS_base_link 的根刚体",
+    "discovery.inputs": "解析输入（原生文件夹可用）",
+    "discovery.main_assembly_ambiguous": "无法唯一确定主装配",
+}
+
 #: Chinese descriptions for the contract's declared input/output records (by path string).
 _FILE_PATH_LABELS_ZH = {
     "handoff/": "已保存的 SolidWorks 工程文件夹",
@@ -436,13 +457,47 @@ def _failure(job: dict, stage: dict) -> dict:
     diagnostic = stage.get("diagnostic")
     raw_detail = diagnostic if isinstance(diagnostic, dict) and diagnostic else None
     codes = None
+    kind = "unknown"
+    structured_groups = None
+    structured_samples = None
+    discovery = job.get("discovery") if isinstance(job.get("discovery"), dict) else {}
+    blocking_findings = [
+        item
+        for item in discovery.get("findings") or []
+        if isinstance(item, dict) and item.get("blocking", True) and item.get("code")
+    ]
     if stage.get("error_code") == "native_discovery_main_assembly_ambiguous":
         title = "无法唯一确定主装配"
         meaning = (
             "请在交付主装配中保存 dp.hardware_id 和 dp.delivery_configuration；"
             "多个装配声明交付身份时须明确唯一入口，流水线不会按文件名或大小猜测。"
         )
+        kind = "definition"
+    elif blocking_findings:
+        counts: dict[str, int] = {}
+        samples: dict[str, list[dict]] = {}
+        for item in blocking_findings:
+            code = str(item.get("code"))
+            counts[code] = counts.get(code, 0) + 1
+            rows = samples.setdefault(code, [])
+            if len(rows) < 3:
+                rows.append({"object": str(item.get("object") or ""), "message": str(item.get("message") or "")})
+        structured_groups = [
+            {"code": code, "label_zh": _DISCOVERY_CODE_LABELS_ZH.get(code, code), "count": count}
+            for code, count in sorted(counts.items(), key=lambda entry: (-entry[1], entry[0]))
+        ]
+        structured_samples = samples
+        top = "、".join(f"{group['label_zh']}×{group['count']}" for group in structured_groups[:6])
+        remainder = "…" if len(structured_groups) > 6 else ""
+        title = "结构解析检查未通过"
+        meaning = (
+            f"原生结构解析未通过工程定义检查：共 {len(blocking_findings)} 项，"
+            "可能缺少必需定义，或装配约束当前不受支持。"
+            f"分类：{top}{remainder}。逐项对象与说明见问题清单（全部保留）。"
+        )
+        kind = "definition"
     elif raw_type == "CadError" and raw_detail and {"errors", "warnings"} <= set(raw_detail):
+        kind = "runtime"
         codes = {"errors": raw_detail.get("errors"), "warnings": raw_detail.get("warnings")}
         if raw_detail.get("errors") == 2:
             title = "原生 CAD 打开失败"
@@ -457,12 +512,15 @@ def _failure(job: dict, stage: dict) -> dict:
                 "无法据此判定文件缺失，请由平台维护人员核实后处理。"
             )
     elif raw_type == "CadError":
+        kind = "runtime"
         title = "原生 CAD 阶段失败"
         meaning = "当前文档或其依赖无法被读取，阶段未完成；请按诊断信息核查后重试。"
     elif raw_type in {"EnvironmentError_", "EnvironmentError"}:
+        kind = "runtime"
         title = "原生运行环境不可用"
         meaning = "Windows 原生环境未就绪（服务或许可等），阶段未完成；请联系平台维护人员。"
     elif raw_type == "TimeoutError" or "modal" in message.lower():
+        kind = "runtime"
         title = "原生会话被阻塞"
         meaning = "原生会话被对话框或超时阻塞，阶段未完成；请在 Windows 会话上处理后重试。"
     else:
@@ -477,7 +535,13 @@ def _failure(job: dict, stage: dict) -> dict:
         "error_code": stage.get("error_code"),
         "raw_error": raw_error or None,
         "raw_detail": raw_detail,
+        "kind": kind,
     }
+    if structured_groups is not None:
+        failure["discovery_sha256"] = discovery.get("discovery_sha256")
+        failure["finding_total"] = len(blocking_findings)
+        failure["finding_counts"] = structured_groups
+        failure["finding_samples"] = structured_samples
     failed_object = _failure_object(raw_type, message, raw_detail)
     if failed_object:
         failure["object"] = failed_object
@@ -538,7 +602,12 @@ def _failed_summary(label: str, summary: dict | None, details: dict) -> dict:
             reason = first.get("message") or first.get("code")
     row = dict(summary) if summary else {"scope_zh": f"{label}未通过"}
     row.setdefault("expected", "检查通过")
-    row["actual"] = f"未通过：{str(reason)[:160]}" if reason else "未通过（未提供原因）"
+    if isinstance(reason, str) and reason.strip():
+        text = reason.strip()
+        pointer = "…（完整诊断见问题清单与原始证据）" if len(text) > 160 else ""
+        row["actual"] = f"未通过：{text[:160]}{pointer}"
+    else:
+        row["actual"] = "未通过（原因未记录，详见问题清单与原始证据）"
     return row
 
 

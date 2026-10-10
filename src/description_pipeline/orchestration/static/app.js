@@ -913,6 +913,23 @@ function buildFailureCard(failure) {
     meaning.textContent = failure.meaning_zh;
     card.append(meaning);
   }
+  if (failure.kind === "definition" || failure.kind === "runtime") {
+    const kind = document.createElement("p");
+    kind.className = "muted small";
+    kind.textContent = failure.kind === "definition" ? "分类：工程定义检查" : "分类：运行时问题";
+    card.append(kind);
+  }
+  if (Array.isArray(failure.finding_counts) && failure.finding_counts.length) {
+    const groups = document.createElement("p");
+    groups.className = "muted small";
+    const shown = failure.finding_counts.slice(0, 8);
+    groups.textContent =
+      "分类汇总：" +
+      shown.map((group) => `${group.label_zh || group.code}×${group.count}`).join("、") +
+      (failure.finding_counts.length > shown.length ? "…" : "") +
+      (failure.finding_total ? `（共 ${failure.finding_total} 项，逐项见下方问题清单，可展开查看）` : "");
+    card.append(groups);
+  }
   if (failure.stage_name_zh) {
     const stage = document.createElement("p");
     stage.className = "muted small";
@@ -1519,13 +1536,10 @@ function renderRun(run) {
   const visibleFindings = (run.findings || []).filter(
     (finding) => !(failure && !finding.id && finding.message === failure.raw_error),
   );
-  if (!visibleFindings.length) {
-    const item = document.createElement("li");
-    item.className = "muted";
-    item.textContent = "暂无问题";
-    findings.append(item);
-  }
-  for (const finding of visibleFindings) {
+  const codeLabels = new Map(
+    ((failure && failure.finding_counts) || []).map((group) => [group.code, group.label_zh || group.code]),
+  );
+  const renderFinding = (finding) => {
     const item = document.createElement("li");
     if (finding.severity && finding.severity !== "error") item.className = "warn";
     const message = document.createElement("div");
@@ -1540,8 +1554,38 @@ function renderRun(run) {
       evidence.textContent = JSON.stringify(finding.evidence, null, 2);
       expandable(item, "查看证据").append(evidence);
     }
+    return item;
+  };
+  if (!visibleFindings.length) {
+    const item = document.createElement("li");
+    item.className = "muted";
+    item.textContent = "暂无问题";
     findings.append(item);
   }
+  // Coded findings are grouped by their check code so a large discovery set stays a
+  // compact hierarchy with every finding retained and expandable inside its group.
+  const findingGroups = new Map();
+  for (const finding of visibleFindings) {
+    const code = finding.id || "";
+    if (!code) {
+      findings.append(renderFinding(finding));
+      continue;
+    }
+    if (!findingGroups.has(code)) findingGroups.set(code, []);
+    findingGroups.get(code).push(finding);
+  }
+  const orderedGroups = [...findingGroups.entries()].sort(
+    (a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]),
+  );
+  orderedGroups.forEach(([code, items], index) => {
+    const section = document.createElement("details");
+    if (index === 0) section.open = true;
+    const header = document.createElement("summary");
+    header.textContent = `${codeLabels.get(code) || code}（${items.length} 项）`;
+    section.append(header);
+    for (const finding of items) section.append(renderFinding(finding));
+    findings.append(section);
+  });
 
   const pr = $("pr");
   pr.textContent = "";
