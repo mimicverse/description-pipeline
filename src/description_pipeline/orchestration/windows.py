@@ -21,6 +21,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import sys
 import threading
 import time
@@ -49,8 +50,10 @@ from ..sources.solidworks.revision import package_inventory
 from ..runtime import tool_record
 from ..stages import ACTIVITY_HISTORY_LIMIT, STAGE_IDS, merge_activity, normalize_activity, stage_view
 from .stage_transfer import CAPTURE_MANIFEST as CAPTURE_MANIFEST_NAME
+from .selection_transport import StagedSelection
+from ..sources.solidworks.selection import selection_plan, validate_file_index, verify_selection
 from .recovery import stage_reruns, start_plan
-from ..sources.solidworks.handoff import HANDOFF_SCHEMA, MAX_HANDOFF_BYTES, freeze_handoff, import_archive
+from ..sources.solidworks.handoff import MAX_HANDOFF_BYTES
 
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _HARDWARE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
@@ -159,36 +162,18 @@ def read_config(path):
         <= {
             "schema_version",
             "package_root",
-            "handoff_roots",
             "output_root",
             "state_root",
             "targets",
             "token_file",
             "host",
             "port",
-            "discovery",
         },
         "Unknown endpoint configuration key",
     )
     for key in ("package_root", "output_root", "state_root"):
         config[key] = _root(config[key])
     _require(config["package_root"].is_dir(), "Package root does not exist")
-    from ..sources.solidworks.handoff import validate_handoff_roots
-
-    config["handoff_roots"] = validate_handoff_roots(config.get("handoff_roots"))
-    settings = config.get("discovery", {})
-    _require(
-        isinstance(settings, dict) and set(settings) <= {"record_roots", "frozen_names_file"},
-        "Unknown native discovery setting",
-    )
-    records = settings.get("record_roots", [])
-    _require(isinstance(records, list), "Native record_roots must be a list")
-    settings["record_roots"] = [_root(value) for value in records]
-    _require(all(path.is_dir() for path in settings["record_roots"]), "Native record root does not exist")
-    if "frozen_names_file" in settings:
-        settings["frozen_names_file"] = _root(settings["frozen_names_file"])
-        _require(settings["frozen_names_file"].is_file(), "Missing frozen-name registry")
-    config["discovery"] = settings
     targets = config["targets"]
     _require(isinstance(targets, dict) and bool(targets), "Configure at least one model repository target")
     roots = [config[key] for key in ("package_root", "output_root", "state_root")]
@@ -215,12 +200,6 @@ def read_config(path):
             _require(
                 not first.is_relative_to(second) and not second.is_relative_to(first),
                 "Endpoint package, output, state and repository roots must be separate",
-            )
-    for source in config["handoff_roots"]:
-        for managed in roots:
-            _require(
-                not source.is_relative_to(managed) and not managed.is_relative_to(source),
-                "Engineering source roots must be separate from managed inputs, state, outputs and repositories",
             )
     token_file = _root(config["token_file"])
     _require(token_file.is_file(), "Missing endpoint token file")
@@ -259,12 +238,14 @@ class Jobs:
     #: finished plans are memoized briefly. ``create`` always probes afresh.
     PLAN_TTL = 30.0
 
-    def __init__(self, config, *, runner=None, native_preparer=None):
+    def __init__(self, config, *, runner=None, selection_reader_factory=None, native_reader=None, backend_factory=None):
         from ..solidworks import run
 
         self.config = config
         self.runner = runner or run
-        self.native_preparer = native_preparer
+        self.selection_reader_factory = selection_reader_factory
+        self.native_reader = native_reader
+        self.backend_factory = backend_factory or self._sealed_backend
         self._plans = {}
         self.directory = config["state_root"] / "jobs"
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -273,6 +254,11 @@ class Jobs:
         self.handle = _owner_lock(self.lock_path)
         self._closed = False
         self.mutex = threading.RLock()
+        self.condition = threading.Condition(self.mutex)
+        self._stopping = False
+        self.selections = {}
+        self.selection_locks = {}
+        self.prepared_packages = {}
         self.queue = queue.Queue()
         self.jobs = {}
         try:
@@ -283,7 +269,7 @@ class Jobs:
                     job.get("schema_version") == JOB_SCHEMA and job.get("run_id") == identifier, "Invalid persisted job"
                 )
                 self.jobs[identifier] = job
-                if job["status"] == "running":
+                if job["status"] in {"running", "selecting", "awaiting_definition"}:
                     job.update(
                         status="failed",
                         error="Endpoint restarted during native execution; inspect diagnostics and use a new run_id",
@@ -301,72 +287,25 @@ class Jobs:
     def _save(self, job):
         write_json(self.directory / (job["run_id"] + ".json"), job)
 
-    def _handoff(self, package, identity):
-        return {
-            "schema_version": HANDOFF_SCHEMA,
-            "pipeline_id": PIPELINE_ID,
-            "package": package.relative_to(self.config["package_root"]).as_posix(),
-            "handoff_sha256": identity["handoff_sha256"],
-        }
-
-    def resolve_handoff(self, request):
-        _require(isinstance(request, dict) and set(request) == {"handoff_path"}, "Expected a mechanical handoff folder")
-        path = request["handoff_path"]
-        _require(
-            isinstance(path, str) and bool(path.strip()) and not any(ord(c) < 32 for c in path),
-            "Mechanical handoff folder is required",
-        )
-        source = Path(path)
-        if not source.is_absolute():
-            _require(
-                len(self.config["handoff_roots"]) == 1, "Use an absolute engineering path with multiple source roots"
-            )
-            source = confined(
-                self.config["handoff_roots"][0], path.rstrip("/") + "/.handoff-folder", exists=False
-            ).parent
-        from ..sources.solidworks.handoff import authorize_handoff
-
-        source = authorize_handoff(source, self.config["handoff_roots"])
-        package, identity = freeze_handoff(source, self.config["package_root"] / "imports")
-        return self._handoff(package, identity)
-
-    def import_handoff(self, archive):
-        package, identity = import_archive(archive, self.config["package_root"] / "imports")
-        return self._handoff(package, identity)
-
     def validate(self, request):
+        expected = {"run_id", "upload_files", "upload_sha256", "main_assembly"}
         _require(
-            isinstance(request, dict)
-            and set(request)
-            in (
-                {"run_id", "package", "handoff_sha256"},
-                {"run_id", "package", "handoff_sha256", "resume"},
-                {"run_id", "package", "handoff_sha256", "main_assembly"},
-                {"run_id", "package", "handoff_sha256", "resume", "main_assembly"},
-            ),
-            "Expected run_id, package, handoff_sha256, an optional resume and an optional "
-            "main_assembly",
+            isinstance(request, dict) and set(request) in (expected, expected | {"resume"}),
+            "Expected run_id, upload_files, upload_sha256, main_assembly and optional resume",
         )
         _job_id(request["run_id"])
         _resume_spec(request)
-        _main_assembly_spec(request.get("main_assembly"))
         _require(
-            isinstance(request["package"], str) and bool(artifact_path_parts(request["package"])),
-            "Invalid native package path",
+            _main_assembly_spec(request["main_assembly"]) is not None, "Select the main assembly before native work"
         )
-        _require(
-            isinstance(request["handoff_sha256"], str) and _SHA.fullmatch(request["handoff_sha256"]) is not None,
-            "Invalid native handoff digest",
-        )
-        package = confined(self.config["package_root"], request["package"] + "/.handoff-folder", exists=False).parent
-        from ..sources.solidworks.handoff import describe_handoff
+        files = validate_file_index(request["upload_files"])
+        _require(digest(files) == request["upload_sha256"], "Upload metadata differs from its bound identity")
+        selection_plan(files, request["main_assembly"], {})
+        return files
 
-        identity = describe_handoff(package)
-        _require(
-            identity["handoff_sha256"] == request["handoff_sha256"],
-            "Native engineering files changed after selection; start a new run",
-        )
-        return package
+    def _source_dir(self, job):
+        owner = _job_id(job.get("source_run_id") or job["run_id"])
+        return confined(self.config["package_root"], "selected/" + owner + "/.source", exists=False).parent
 
     def _delivery_dir(self, job):
         """Retained delivery or diagnostic directory of one finished native job."""
@@ -425,18 +364,6 @@ class Jobs:
         return None
 
     @staticmethod
-    def _recorded_frozen_names(job):
-        for event in job.get("events") or []:
-            check = event.get("check") if isinstance(event, dict) else None
-            if not isinstance(check, dict) or check.get("id") != "discovery.inputs":
-                continue
-            details = check.get("details") or {}
-            value = details.get("frozen_names_sha256")
-            if isinstance(value, str) and _SHA.fullmatch(value):
-                return value
-        return None
-
-    @staticmethod
     def _check_details(job, check_id):
         for event in reversed(job.get("events") or []):
             check = event.get("check") if isinstance(event, dict) else None
@@ -444,24 +371,6 @@ class Jobs:
                 details = check.get("details")
                 return details if isinstance(details, dict) else None
         return None
-
-    def _dependency_identity(self):
-        """The dependency inputs a discovery run binds: registry snapshot and record roots."""
-        settings = self.config.get("discovery", {})
-        names = None
-        try:
-            names = read_data(settings["frozen_names_file"]) if settings.get("frozen_names_file") else {}
-        except (PipelineError, OSError, ValueError):
-            names = None
-        roots = None
-        try:
-            roots = sorted(str(Path(value).resolve()) for value in settings.get("record_roots", []))
-        except (TypeError, ValueError, OSError):
-            roots = None
-        return {
-            "frozen_names_sha256": digest(names) if names is not None else None,
-            "record_roots": roots,
-        }
 
     @staticmethod
     def _native_stage_rows(rows):
@@ -557,21 +466,22 @@ class Jobs:
         }
         request = job.get("request") if isinstance(job.get("request"), dict) else {}
         try:
-            package = confined(
-                self.config["package_root"], str(request.get("package", "")) + "/.handoff-folder", exists=False
-            ).parent
+            package = self._source_dir(job)
             if package.is_dir():
-                from ..sources.solidworks.handoff import describe_handoff
-
-                identity = describe_handoff(package)
                 files = package_inventory(package)
+                manifest = (job.get("selection") or {}).get("manifest")
+                verify_selection(
+                    manifest,
+                    request["upload_files"],
+                    files,
+                    reader_sha256=job["native_tool"]["source_sha256"],
+                )
                 probe["source"] = (
                     "ok"
-                    if identity.get("handoff_sha256") == request.get("handoff_sha256")
-                    and files == job.get("package_files")
+                    if digest(files) == job.get("handoff_sha256") and files == job.get("package_files")
                     else "changed"
                 )
-        except (PipelineError, OSError, ValueError, TypeError):
+        except (PipelineError, OSError, ValueError, TypeError, KeyError):
             probe["source"] = "changed"
         prepared = self._prepared_dir(job)
         if prepared is not None and isinstance(job.get("prepared_files"), dict):
@@ -601,22 +511,9 @@ class Jobs:
                 except (PipelineError, OSError, ValueError):
                     probe["generate"] = "changed"
             probe["receipt"] = self._receipt_checkpoint(seed, job)
-        recorded = job.get("dependency") if isinstance(job.get("dependency"), dict) else None
-        current = self._dependency_identity()
-        if recorded is None:
-            # Legacy jobs predate the recorded identity: only the registry snapshot can be
-            # compared; the records their discovery embedded stay pinned by the prepared package.
-            recorded = {"frozen_names_sha256": self._recorded_frozen_names(job), "record_roots": None}
-        if recorded.get("frozen_names_sha256") is None or current.get("frozen_names_sha256") is None:
-            probe["dependency"] = "unverifiable"
-        elif recorded["frozen_names_sha256"] != current["frozen_names_sha256"] or (
-            recorded.get("record_roots") is not None and recorded["record_roots"] != current.get("record_roots")
-        ):
-            probe["dependency"] = "changed"
-        elif recorded.get("record_roots") is None and current.get("record_roots"):
-            probe["dependency"] = "unverifiable"
-        else:
-            probe["dependency"] = "ok"
+        # Linux owns derivation dependencies. Native reuse depends on the sealed
+        # source graph, installed reader, and exact prepared checkpoint bytes.
+        probe["dependency"] = "ok" if probe["source"] == "ok" and self._tool_state(job) == "ok" else "changed"
         target = self.config["targets"].get(job.get("hardware_id"))
         if (
             isinstance(target, dict)
@@ -625,8 +522,7 @@ class Jobs:
         ):
             probe["target"] = (
                 "ok"
-                if target.get("repository_slug") == job["repository_slug"]
-                and target["base"] == job["repository_base"]
+                if target.get("repository_slug") == job["repository_slug"] and target["base"] == job["repository_base"]
                 else "changed"
             )
         return probe
@@ -692,7 +588,7 @@ class Jobs:
             if (
                 isinstance(resume, dict)
                 and resume.get("parent_run") == parent_run
-                and other.get("status") in {"queued", "running"}
+                and other.get("status") in {"queued", "running", "selecting", "awaiting_definition"}
             ):
                 return other["run_id"]
         return None
@@ -751,6 +647,18 @@ class Jobs:
 
     def artifact(self, identifier, name):
         job = self.snapshot(identifier)
+        record = job.get("native_record")
+        if isinstance(record, dict) and name == record.get("name"):
+            path = confined(self.config["state_root"] / "native_records" / identifier, name)
+            stream = path.open("rb")
+            try:
+                if hashlib.file_digest(stream, "sha256").hexdigest() != record.get("sha256"):
+                    raise RequestError("Raw record artifact differs from its bound digest", 409)
+                stream.seek(0)
+                return stream, os.fstat(stream.fileno()).st_size
+            except BaseException:
+                stream.close()
+                raise
         archive = job.get("capture_archive") if isinstance(job.get("capture_archive"), dict) else None
         if job.get("status") == "native_complete" and archive:
             if name == archive.get("name"):
@@ -789,83 +697,284 @@ class Jobs:
         identifier = _job_id(request.get("run_id"))
         with self.mutex:
             if identifier in self.jobs:
-                job = self.jobs[identifier]
-                if job["request"] != request:
+                if self.jobs[identifier]["request"] != request:
                     raise RequestError("run_id is already bound to a different request", 409)
                 return self.snapshot(identifier), False
-            package = self.validate(request)
+            files = self.validate(request)
             spec = _resume_spec(request)
-            if spec is not None and spec["from_stage"] not in NATIVE_STAGES:
-                raise _refusal(
-                    "linux_owned",
-                    "该阶段已移至 Linux 执行；请通过交付流程重新运行",
-                    from_stage=spec["from_stage"],
-                )
-            events = []
-            inherited = {}
-            if spec is not None:
-                _require(spec["parent_run"] != identifier, "A linked run cannot reuse itself")
-                parent = self.jobs.get(spec["parent_run"])
-                if parent is None:
-                    raise RequestError("The selected run is unknown to this endpoint", 409)
-                plan = start_plan(parent, spec["from_stage"], probe=self._probe(parent), tool=self._tool_state(parent))
-                if not plan["accepted"]:
-                    raise _refusal(plan["reason"], plan["reason_zh"], earliest=plan["earliest_required"])
-                active = self._active_attempt(spec["parent_run"])
-                if active is not None:
-                    raise _refusal(
-                        "already_active",
-                        "此运行已有正在执行的重新运行，请等待完成后再试",
-                        active_run_id=active,
-                    )
-                parent_request = parent.get("request") if isinstance(parent.get("request"), dict) else {}
-                if (
-                    parent_request.get("package") != request["package"]
-                    or parent_request.get("handoff_sha256") != request["handoff_sha256"]
-                ):
-                    raise _refusal(
-                        "source_changed",
-                        "原始上传不可复用，请重新上传后开始新运行",
-                        earliest=None,
-                    )
-                if request.get("main_assembly") is not None and request["main_assembly"] != parent.get("main_assembly"):
-                    raise _refusal(
-                        "selection_changed",
-                        "所选主装配与原运行不一致，无法复用其检查点；请保持同一主装配或重新开始新运行",
-                        earliest=None,
-                    )
-                if spec["from_stage"] in {"verify", "publish"} and self._recorded_subject(parent) is None:
-                    raise _refusal(
-                        "prerequisite_invalid",
-                        "原运行未记录可验证的模型主体，最早可从“生成 URDF”重新开始",
-                        earliest="generate",
-                    )
-                events = self._reuse_events(parent, spec["from_stage"])
-                inherited = self._inherited_metadata(parent, spec["from_stage"])
-            selection = request.get("main_assembly")
-            if selection is None and spec is not None:
-                parent_job = self.jobs.get(spec["parent_run"])
-                selection = parent_job.get("main_assembly") if isinstance(parent_job, dict) else None
+            tool = self._tool_identity()
+            _require(
+                isinstance(tool, dict) and _SHA.fullmatch(str(tool.get("source_sha256", ""))),
+                "Native selection requires a pinned source identity",
+            )
             job = {
                 "schema_version": JOB_SCHEMA,
                 "pipeline_id": PIPELINE_ID,
                 "run_id": identifier,
-                "request": dict(request),
-                "main_assembly": selection,
-                "status": "queued",
-                "events": events,
+                "request": copy.deepcopy(request),
+                "main_assembly": request["main_assembly"],
+                "status": "selecting",
+                "events": [],
                 "result": None,
                 "error": None,
+                "native_tool": tool,
+                "tool": tool,
                 "created_at": datetime.now(UTC).isoformat(),
             }
-            job.update(inherited)
-            job["package_files"] = package_inventory(package)
-            job["tool"] = self._tool_identity()
-            job["dependency"] = self._dependency_identity()
+            if spec is not None:
+                _require(spec["from_stage"] in NATIVE_STAGES, "Portable reruns belong to the Linux host")
+                parent = self.jobs.get(spec["parent_run"])
+                _require(parent is not None and parent["run_id"] != identifier, "The parent native run is unknown")
+                _require(parent.get("native_tool") == tool, "Native reader changed; start a fresh source selection")
+                if self._active_attempt(spec["parent_run"]) is not None:
+                    raise _refusal("already_active", "The selected run already has an active linked attempt")
+                plan = start_plan(parent, spec["from_stage"], probe=self._probe(parent), tool=self._tool_state(parent))
+                if not plan["accepted"]:
+                    raise _refusal(plan["reason"], plan["reason_zh"], earliest=plan["earliest_required"])
+                _require(
+                    all(
+                        parent["request"].get(key) == request[key]
+                        for key in ("upload_files", "upload_sha256", "main_assembly")
+                    ),
+                    "A linked attempt must retain its parent's exact upload and selected assembly",
+                )
+                _require((parent.get("selection") or {}).get("state") == "sealed", "Parent selection is incomplete")
+                job.update(self._inherited_metadata(parent, spec["from_stage"]))
+                job.update(
+                    source_run_id=parent.get("source_run_id") or parent["run_id"],
+                    selection=copy.deepcopy(parent["selection"]),
+                    handoff_sha256=parent["handoff_sha256"],
+                    package_files=copy.deepcopy(parent["package_files"]),
+                    events=self._reuse_events(parent, spec["from_stage"]),
+                    status="queued",
+                )
+            else:
+                session = StagedSelection(
+                    self._source_dir(job), files, job["main_assembly"], reader_sha256=tool["source_sha256"]
+                )
+                self.selections[identifier] = session
+                job["selection"] = session.snapshot()
+            self.selection_locks[identifier] = threading.RLock()
             self._save(job)
             self.jobs[identifier] = job
-            self.queue.put(identifier)
+            if spec is not None:
+                self.queue.put(identifier)
             return self.snapshot(identifier), True
+
+    def _selection(self, identifier):
+        identifier = _job_id(identifier)
+        self.snapshot(identifier)
+        session = self.selections.get(identifier)
+        if session is None:
+            raise RequestError("This run has no active source selection", 409)
+        return session
+
+    def submit_files(self, identifier, archive, round_id):
+        session = self._selection(identifier)
+        with self.selection_locks[identifier]:
+            with self.mutex:
+                _require(
+                    self.jobs[identifier]["status"] not in {"failed", "native_complete", "passed"},
+                    "The native run is already terminal",
+                )
+            accepted = session.accept_batch(archive, round_id)
+            with self.condition:
+                job = self.jobs[identifier]
+                job["selection"] = session.snapshot()
+                if accepted and not job.get("selection_worker_started"):
+                    job["selection_worker_started"] = True
+                    self.queue.put(identifier)
+                self._save(job)
+                self.condition.notify_all()
+        return self.snapshot(identifier)
+
+    def seal_selection(self, identifier, request):
+        _require(isinstance(request, dict) and set(request) == {"selection"}, "Expected the selection manifest")
+        session = self._selection(identifier)
+        with self.selection_locks[identifier]:
+            prior_state = session.state
+            manifest = session.seal(request["selection"])
+            with self.condition:
+                job = self.jobs[identifier]
+                _require(job["status"] not in {"failed", "native_complete", "passed"}, "The native run is terminal")
+                job.update(
+                    selection=session.snapshot(),
+                    handoff_sha256=manifest["handoff_sha256"],
+                    package_files=manifest["files"],
+                )
+                if prior_state != "sealed":
+                    job["status"] = "running"
+                self._save(job)
+                self.condition.notify_all()
+        return self.snapshot(identifier)
+
+    def _await_client(self, identifier, predicate, *, timeout=600):
+        deadline = time.monotonic() + timeout
+        with self.condition:
+            while True:
+                if self._stopping:
+                    raise PipelineError("Endpoint closed while waiting for the Linux continuation")
+                if self.jobs[identifier]["status"] == "failed":
+                    raise PipelineError(self.jobs[identifier]["error"])
+                if predicate(self.jobs[identifier]):
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise PipelineError("Timed out waiting for the bound Linux continuation")
+                self.condition.wait(timeout=min(remaining, 10))
+
+    def _select_native(self, identifier):
+        session = self.selections[identifier]
+        factory = self.selection_reader_factory
+        if factory is None:
+            from ..sources.solidworks.native_selection import NativeSelectionReader
+
+            factory = NativeSelectionReader
+        with factory() as reader:
+            while True:
+                self._await_client(identifier, lambda job: job["selection"]["state"] in {"reading", "sealed"})
+                if session.state == "sealed":
+                    return session.stage
+                _require(
+                    self._tool_identity() == self.jobs[identifier]["native_tool"],
+                    "Native reader identity changed during selection",
+                )
+                observations = reader.observe(session.stage, dict(session.pending), session.upload_files)
+                with self.selection_locks[identifier]:
+                    session.record_observations(observations)
+                    with self.condition:
+                        self.jobs[identifier]["selection"] = session.snapshot()
+                        self._save(self.jobs[identifier])
+                        self.condition.notify_all()
+
+    def _record_and_await_definition(self, identifier, record):
+        """Seal native observations, then wait for Linux's derived capture inputs."""
+        from .discovery_transfer import RAW_RECORD_ARCHIVE, seal_raw_record_bundle
+
+        job = self.jobs[identifier]
+        _require(
+            package_inventory(self._source_dir(job)) == job["package_files"], "Native reading changed selected CAD"
+        )
+        _require(self._tool_identity() == job["native_tool"], "Native tool identity changed during discovery")
+        directory = self.config["state_root"] / "native_records" / identifier
+        directory.mkdir(parents=True, exist_ok=False)
+        sealed = seal_raw_record_bundle(
+            record,
+            directory / RAW_RECORD_ARCHIVE,
+            run_id=identifier,
+            selection=job["selection"]["manifest"],
+            native_tool=job["native_tool"],
+        )
+        artifact = sealed["artifact"]
+        with self.condition:
+            _require(not self._stopping, "Endpoint is closing")
+            job.update(
+                status="awaiting_definition",
+                native_record={
+                    "name": artifact["name"],
+                    "sha256": artifact["sha256"],
+                    "size": artifact["bytes"],
+                    "manifest_sha256": digest(sealed["manifest"]),
+                    "manifest": sealed["manifest"],
+                },
+            )
+            self._clear_activity(job)
+            self._save(job)
+            self.condition.notify_all()
+        self._await_client(identifier, lambda current: identifier in self.prepared_packages)
+        with self.mutex:
+            return self.prepared_packages.pop(identifier)
+
+    def submit_definition(self, identifier, archive, prepared_sha256):
+        """Admit generated text beside the selected CAD without deriving on Windows."""
+        from .discovery_transfer import admit_raw_record_bundle, stage_capture_request
+
+        self.snapshot(identifier)
+        _require(
+            isinstance(prepared_sha256, str) and _SHA.fullmatch(prepared_sha256),
+            "X-Prepared-SHA256 must bind the Linux prepared inventory",
+        )
+        archive_sha256 = file_digest(archive)
+        requested = {"sha256": archive_sha256, "prepared_sha256": prepared_sha256}
+        lock = self.selection_locks.get(identifier)
+        _require(lock is not None, "This run has no active definition exchange")
+        with lock:
+            job = self.snapshot(identifier)
+            previous = job.get("capture_request")
+            if previous is not None:
+                if previous != requested:
+                    raise RequestError("This run already accepted a different capture definition", 409)
+                return job
+            if job["status"] != "awaiting_definition":
+                raise RequestError("The native run is not awaiting a Linux definition", 409)
+            source = self._source_dir(job)
+            files = package_inventory(source)
+            selection = job["selection"]["manifest"]
+            verify_selection(
+                selection, job["request"]["upload_files"], files, reader_sha256=job["native_tool"]["source_sha256"]
+            )
+            _require(files == job["package_files"], "Selected CAD changed before definition admission")
+            metadata = job["native_record"]
+            admission = admit_raw_record_bundle(
+                confined(self.config["state_root"] / "native_records" / identifier, metadata["name"]),
+                expected_run_id=identifier,
+                expected_selection=selection,
+                expected_native_tool=job["native_tool"],
+                expected_archive_sha256=metadata["sha256"],
+            )
+            destination = self.config["state_root"] / "prepared" / identifier
+            destination.mkdir(parents=True, exist_ok=False)
+            try:
+                for name in files:
+                    target = confined(destination, name, exists=False)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(confined(source, name), target)
+                _require(package_inventory(destination) == files, "Selected CAD changed while preparing capture")
+                prepared = stage_capture_request(
+                    archive,
+                    destination,
+                    expected_run_id=identifier,
+                    expected_selection=selection,
+                    expected_record=admission.record,
+                    expected_native_tool=job["native_tool"],
+                    expected_prepared_sha256=prepared_sha256,
+                    expected_archive_sha256=archive_sha256,
+                )
+                with self.condition:
+                    current = self.jobs[identifier]
+                    _require(
+                        not self._stopping and current["status"] == "awaiting_definition",
+                        "The definition exchange is no longer active",
+                    )
+                    current.update(capture_request=requested, status="running")
+                    self._save(current)
+                    self.prepared_packages[identifier] = prepared
+                    self.condition.notify_all()
+            except BaseException:
+                shutil.rmtree(destination)
+                raise
+        return self.snapshot(identifier)
+
+    def abort(self, identifier, request):
+        _require(
+            isinstance(request, dict) and set(request) == {"error", "error_code", "detail"},
+            "Expected the Linux derivation error, error_code and detail",
+        )
+        _require(isinstance(request["error"], str) and 0 < len(request["error"]) <= 4096, "Invalid derivation error")
+        _require(isinstance(request["error_code"], str) and 0 < len(request["error_code"]) <= 128, "Invalid error_code")
+        _require(isinstance(request["detail"], dict), "Derivation detail must be an object")
+        self.snapshot(identifier)
+        with self.condition:
+            job = self.jobs[identifier]
+            if job.get("client_failure") == request:
+                return self.snapshot(identifier)
+            if job["status"] != "awaiting_definition":
+                raise RequestError("Only a pending Linux derivation can be aborted", 409)
+            job.update(copy.deepcopy(request), status="failed", client_failure=copy.deepcopy(request))
+            self._clear_activity(job)
+            self._save(job)
+            self.condition.notify_all()
+        return self.snapshot(identifier)
 
     def snapshot(self, identifier):
         identifier = _job_id(identifier)
@@ -949,18 +1058,31 @@ class Jobs:
 
     def _prepare_native(self, identifier, frozen, selection=None):
         from ..steps import discover_structure
+        from ..sources.solidworks.discovery import DiscoverySettings, read_native_record
 
         job = self.jobs[identifier]
+        self._event(identifier, {"stage": "discover", "state": "running"})
+        settings = DiscoverySettings(main_assembly=selection)
+
+        def activity(item):
+            self._activity(identifier, item)
+
+        if self.native_reader is None:
+            backend = self.backend_factory(frozen, job["package_files"])
+            record = read_native_record(frozen, settings, backend=backend, on_activity=activity)
+        else:
+            record = self.native_reader(frozen, settings, on_activity=activity)
+        prepared = self._record_and_await_definition(identifier, record)
         package, target, prepared, files = discover_structure(
             frozen,
             self.config["state_root"] / "prepared" / identifier,
             identifier,
-            expected_digest=job["request"]["handoff_sha256"],
+            expected_digest=job["handoff_sha256"],
             expected_files=job["package_files"],
             main_assembly=selection,
-            configuration=self.config.get("discovery", {}),
+            configuration={},
             targets=self.config["targets"],
-            preparer=self.native_preparer,
+            preparer=lambda *args, **kwargs: prepared,
             on_event=lambda item: self._event(identifier, item),
             on_activity=lambda item: self._activity(identifier, item),
         )
@@ -973,18 +1095,18 @@ class Jobs:
                 prepared_files=files,
                 prepared_dir=str(package),
             )
-            if job.get("main_assembly") is None:
-                # A request may omit the selection; native discovery resolves the delivered
-                # assembly into its bound identity record.  Persist that resolved value
-                # (the operator's request payload stays untouched) so the runner and the
-                # capture seal bind the same assembly.
-                loaded = read_data(prepared.discovery_path)
-                identity = loaded.get("identity") if isinstance(loaded, dict) else None
-                assembly = identity.get("main_assembly") if isinstance(identity, dict) else None
-                if isinstance(assembly, str) and assembly.strip():
-                    job["main_assembly"] = assembly
             self._save(job)
         return package, target
+
+    @staticmethod
+    def _sealed_backend(package, files):
+        from ..runtime import native_readiness
+        from ..sources.solidworks.native import SolidWorksBackend
+
+        native_readiness()
+        backend = SolidWorksBackend()
+        backend.seal_documents([confined(package, name) for name in files])
+        return backend
 
     def _work(self):
         while True:
@@ -1006,13 +1128,24 @@ class Jobs:
                         },
                     )
                 with self.mutex:
-                    job.update(status="running", started_at=datetime.now(UTC).isoformat())
+                    _require(not self._stopping, "Endpoint is closing")
+                    job["started_at"] = datetime.now(UTC).isoformat()
+                    self._save(job)
+                if spec is None:
+                    self._select_native(identifier)
+                with self.mutex:
+                    job["status"] = "running"
                     self._save(job)
                 from ..steps import freeze_inputs
 
-                package = confined(
-                    self.config["package_root"], job["request"]["package"] + "/.handoff-folder", exists=False
-                ).parent
+                package = self._source_dir(job)
+                verify_selection(
+                    job["selection"]["manifest"],
+                    job["request"]["upload_files"],
+                    package_inventory(package),
+                    reader_sha256=job["native_tool"]["source_sha256"],
+                )
+                _require(self._tool_identity() == job["native_tool"], "Native tool changed after source selection")
                 from_stage = spec["from_stage"] if spec is not None else None
                 selection = job.get("main_assembly")
                 if selection is None and spec is not None:
@@ -1040,7 +1173,7 @@ class Jobs:
                     # A fresh job or a freeze restart re-admits the retained upload.
                     freeze_inputs(
                         package,
-                        job["request"]["handoff_sha256"],
+                        job["handoff_sha256"],
                         job["package_files"],
                         main_assembly=selection,
                         on_event=lambda item, identifier=identifier: self._event(identifier, item),
@@ -1064,9 +1197,6 @@ class Jobs:
                         seed_dir=seed,
                         expected_subject=self._recorded_subject(parent),
                     )
-                # Re-read after preparation: a request without an explicit selection now
-                # carries the discovery-resolved assembly, and linked native reruns
-                # inherit the parent's effective selection.
                 selection = job.get("main_assembly")
                 _require(
                     job.get("repository_slug") == (target or {}).get("repository_slug")
@@ -1076,13 +1206,14 @@ class Jobs:
                 result = self.runner(
                     package,
                     self.config["output_root"] / identifier,
+                    backend=self.backend_factory(package, job["package_files"]),
                     run_id=identifier,
                     stop_after="capture",
                     main_assembly=selection,
                     on_event=lambda event, identifier=identifier: self._event(identifier, event),
                     prior_events=list(job["events"]),
                     expected_inputs=job["prepared_files"],
-                    handoff_sha256=job["request"]["handoff_sha256"],
+                    handoff_sha256=job["handoff_sha256"],
                     **resume_kwargs,
                 )
                 with self.mutex:
@@ -1095,8 +1226,7 @@ class Jobs:
                     elif result.get("native_complete") is True or result.get("passed") is True:
                         job.update(
                             status="failed",
-                            error="Native result shape is not a sealed capture transfer; "
-                            "the run cannot be qualified",
+                            error="Native result shape is not a sealed capture transfer; the run cannot be qualified",
                         )
                         self._clear_activity(job)
                         if result.get("error_code"):
@@ -1112,15 +1242,16 @@ class Jobs:
                                 job[key] = result[key]
             except Exception as error:
                 with self.mutex:
-                    job.update(status="failed", error=f"{type(error).__name__}: {error}")
-                    self._clear_activity(job)
-                    code = getattr(error, "code", None)
-                    if code:
-                        job["error_code"] = str(code)
-                    if getattr(error, "detail", None) is not None:
-                        job["detail"] = error.detail
-                    elif isinstance(getattr(error, "details", None), dict):
-                        job["detail"] = error.details
+                    if job["status"] != "failed":
+                        job.update(status="failed", error=f"{type(error).__name__}: {error}")
+                        self._clear_activity(job)
+                        code = getattr(error, "code", None)
+                        if code:
+                            job["error_code"] = str(code)
+                        if getattr(error, "detail", None) is not None:
+                            job["detail"] = error.detail
+                        elif isinstance(getattr(error, "details", None), dict):
+                            job["detail"] = error.details
             finally:
                 with self.mutex:
                     if job["status"] == "failed" and (not job["events"] or job["events"][-1]["state"] != "failed"):
@@ -1133,6 +1264,9 @@ class Jobs:
     def close(self):
         if self._closed:
             return
+        with self.condition:
+            self._stopping = True
+            self.condition.notify_all()
         self.queue.put(None)
         self.thread.join(timeout=30)
         if self.thread.is_alive():
@@ -1222,42 +1356,52 @@ def handler(jobs, token):
         def do_POST(self):
             if not self._authorized():
                 return
-            if self.path not in {"/v1/jobs", "/v1/handoffs/resolve", "/v1/handoffs/import"}:
+            match = re.fullmatch(r"/v1/jobs/([0-9a-f-]+)/(files|seal|definition|abort)", self.path)
+            if self.path != "/v1/jobs" and match is None:
                 self._reply(404, {"error": "Unknown API route"})
                 return
             try:
-                if self.path == "/v1/handoffs/import":
+                identifier, operation = match.groups() if match else (None, None)
+                if identifier is not None:
+                    _job_id(identifier)
+                if operation in {"files", "definition"}:
+                    from .discovery_transfer import MAX_REQUEST_BYTES
+
                     _require(
                         self.headers.get("Content-Type", "").split(";")[0] == "application/zip",
                         "Content-Type must be application/zip",
                     )
                     size = int(self.headers.get("Content-Length", "0"))
-                    _require(
-                        0 < size <= MAX_HANDOFF_BYTES and not self.headers.get("Transfer-Encoding"),
-                        "Invalid handoff size",
-                    )
+                    limit = MAX_HANDOFF_BYTES if operation == "files" else MAX_REQUEST_BYTES
+                    _require(0 < size <= limit and not self.headers.get("Transfer-Encoding"), "Invalid archive size")
                     self.connection.settimeout(60)
                     with tempfile.TemporaryDirectory(prefix=".transport-", dir=jobs.config["state_root"]) as temporary:
-                        archive = Path(temporary) / "handoff.zip"
+                        archive = Path(temporary) / "request.zip"
                         with archive.open("xb") as output:
                             remaining = size
                             while remaining:
                                 chunk = self.rfile.read(min(remaining, 1024 * 1024))
-                                _require(bool(chunk), "Incomplete handoff transport; no job was started")
+                                _require(bool(chunk), "Incomplete archive transport")
                                 output.write(chunk)
                                 remaining -= len(chunk)
-                        self._reply(200, jobs.import_handoff(archive))
+                        if operation == "files":
+                            result = jobs.submit_files(identifier, archive, self.headers.get("X-Selection-Round"))
+                        else:
+                            result = jobs.submit_definition(identifier, archive, self.headers.get("X-Prepared-SHA256"))
+                        self._reply(202, result)
                     return
                 _require(
                     self.headers.get("Content-Type", "").split(";")[0] == "application/json",
                     "Content-Type must be application/json",
                 )
                 size = int(self.headers.get("Content-Length", "0"))
-                _require(0 < size <= 16384 and not self.headers.get("Transfer-Encoding"), "Invalid request size")
+                _require(0 < size <= 8 * 1024**2 and not self.headers.get("Transfer-Encoding"), "Invalid request size")
                 self.connection.settimeout(10)
                 request = json.loads(self.rfile.read(size))
-                if self.path == "/v1/handoffs/resolve":
-                    self._reply(200, jobs.resolve_handoff(request))
+                if operation == "seal":
+                    self._reply(202, jobs.seal_selection(identifier, request))
+                elif operation == "abort":
+                    self._reply(200, jobs.abort(identifier, request))
                 else:
                     result, created = jobs.create(request)
                     self._reply(202 if created else 200, result)

@@ -112,7 +112,6 @@ class SelectionEndpointTests(unittest.TestCase):
             {
                 "schema_version": "solidworks-to-urdf.endpoint/v1",
                 "package_root": str(self.packages),
-                "handoff_roots": [str(self.engineering)],
                 "output_root": str(self.root / "outputs"),
                 "state_root": str(self.root / "state"),
                 "token_file": str(token),
