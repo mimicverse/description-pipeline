@@ -374,16 +374,30 @@ class MockEndpoint:
                 }
                 if "upload_files" in payload:
                     job["native_tool"] = {"source_sha256": READER_SHA256, "role": "native"}
-                    job["selection"] = {
-                        "state": "awaiting_files",
-                        "round_id": "f" * 64,
-                        "reader_sha256": READER_SHA256,
-                        "observations": {},
-                        "staged_files": {},
-                        "requested_files": {
-                            payload["main_assembly"]: payload["upload_files"][payload["main_assembly"]]
-                        },
-                    }
+                    if "resume" in payload:
+                        sealed = dict(payload["upload_files"])
+                        job["selection"] = {
+                            "state": "sealed",
+                            "round_id": "f" * 64,
+                            "reader_sha256": READER_SHA256,
+                            "observations": {
+                                name: {"sha256": checksum, "references": []} for name, checksum in sealed.items()
+                            },
+                            "staged_files": sealed,
+                            "requested_files": {},
+                            "manifest": {"main_assembly": payload["main_assembly"], "files": sealed},
+                        }
+                    else:
+                        job["selection"] = {
+                            "state": "awaiting_files",
+                            "round_id": "f" * 64,
+                            "reader_sha256": READER_SHA256,
+                            "observations": {},
+                            "staged_files": {},
+                            "requested_files": {
+                                payload["main_assembly"]: payload["upload_files"][payload["main_assembly"]]
+                            },
+                        }
                 outer.jobs[run_id] = job
                 self._send(202, {k: v for k, v in job.items() if k != "pokes"})
 
@@ -895,6 +909,42 @@ class ClientTests(unittest.TestCase):
             with self.assertRaises(EndpointError):
                 endpoint.health()
             self.assertEqual(target.hits, 0)
+
+    def test_refusal_bodies_reach_callers(self) -> None:
+        body = {
+            "error": "selection is bound to another run",
+            "error_code": "already_active",
+            "active_run_id": RUN_ID,
+            "earliest_required": "2026-10-11T00:00:00Z",
+            "detail": {"stage": "capture"},
+        }
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args) -> None:
+                return
+
+            def do_POST(self) -> None:
+                encoded = json.dumps(body).encode()
+                self.send_response(409)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        endpoint = WindowsEndpoint(EndpointConfig(base_url=f"http://127.0.0.1:{server.server_port}", token=TOKEN))
+        with self.assertRaises(EndpointConflict) as caught:
+            start_selection(endpoint)
+        failure = caught.exception
+        self.assertEqual(failure.status, 409)
+        self.assertEqual(failure.error_code, "already_active")
+        self.assertEqual(failure.active_run_id, RUN_ID)
+        self.assertEqual(failure.earliest_required, "2026-10-11T00:00:00Z")
+        self.assertEqual(failure.detail, {"stage": "capture"})
+        self.assertIn("selection is bound to another run", str(failure))
 
     def test_start_rejects_a_different_echoed_request(self) -> None:
         response = {

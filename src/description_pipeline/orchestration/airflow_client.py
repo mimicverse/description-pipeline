@@ -2,18 +2,17 @@
 
 The endpoint contract is fixed and carries no shell or local paths:
 
-* ``POST /v1/handoffs/resolve`` with ``{handoff_path}`` resolves one operator-supplied folder to
-  the managed package and its complete-package digest; an absolute POSIX path is archived locally
-  and sent to ``POST /v1/handoffs/import`` (``application/zip``) only when it is link-free and
-  inside the platform ``handoff_roots`` allowlist from the Airflow connection;
-* ``POST /v1/jobs`` with ``{run_id, package, handoff_sha256}`` starts one run (idempotent per
-  run_id; a different payload for the same run_id is HTTP 409); an optional ``main_assembly``
-  names the delivered assembly explicitly. Hardware, revision and repository routing resolve
-  inside the serialized Windows job after CAD discovery;
-* ``GET /v1/jobs/<uuid>`` returns status/events/result/error and, for native runs, the routing the
-  job resolved after discovery;
-* ``GET /v1/jobs/<uuid>/preview`` and ``GET /v1/jobs/<uuid>/artifacts/<name>`` expose the verified
-  delivery for the operator portal;
+* ``POST /v1/jobs`` with ``{run_id, upload_files, upload_sha256, main_assembly}`` starts one
+  selection job (idempotent per run_id; a different payload for the same run_id is HTTP 409);
+  an optional ``resume={parent_run, from_stage}`` inherits a parent's sealed selection for a
+  linked native rerun;
+* ``POST /v1/jobs/<uuid>/files`` admits exactly one requested source batch (``application/zip``
+  with ``X-Selection-Round``) and ``POST /v1/jobs/<uuid>/seal`` seals the dependent closure;
+* ``GET /v1/jobs/<uuid>`` returns status/events/result/error plus the selection block and, once
+  sealed, the manifest; ``awaiting_definition`` exposes the raw-record artifact, and
+  ``POST /v1/jobs/<uuid>/definition`` submits the sealed capture request carrying
+  ``X-Prepared-SHA256``; ``POST /v1/jobs/<uuid>/abort`` reports one local derivation failure;
+* ``GET /v1/jobs/<uuid>/artifacts/<name>`` streams one verified delivery artifact;
 * ``GET /health`` exposes only ``pipeline_id`` and readiness.
 
 Plaintext HTTP is allowed only for loopback hosts; anything remote requires TLS.
@@ -138,6 +137,40 @@ class JobFailed(EndpointError):
 
 class ResultNotPublishable(EndpointError):
     """A passed job whose result is missing quality or PR evidence."""
+
+
+def _error_payload(error: urlerror.HTTPError) -> dict:
+    """The server's structured refusal body, when the endpoint provides one."""
+    try:
+        raw = error.read(64 * 1024)
+    except OSError:
+        return {}
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _http_refusal(error: urlerror.HTTPError) -> EndpointError:
+    """One request refusal that keeps the server's structured body for callers."""
+    payload = _error_payload(error)
+    if error.code in {401, 403}:
+        failure: EndpointError = EndpointAuthError(f"endpoint rejected the bearer token ({error.code})")
+    elif error.code == 404:
+        failure = EndpointNotFound("endpoint has no record of the requested resource")
+    elif error.code == 409:
+        failure = EndpointConflict(f"run_id already bound to a different request ({error.code})")
+    else:
+        failure = EndpointError(f"endpoint returned HTTP {error.code}")
+    message = payload.get("error")
+    if isinstance(message, str) and message:
+        failure.args = (f"{failure.args[0]}: {message}",)
+    failure.status = error.code
+    failure.payload = payload
+    for field in ("error_code", "reason", "reason_zh", "earliest_required", "active_run_id", "detail"):
+        setattr(failure, field, payload.get(field))
+    return failure
 
 
 def validate_run_id(value: str) -> str:
@@ -595,13 +628,7 @@ class WindowsEndpoint:
             with self._opener(request, timeout=self.config.timeout) as response:
                 data = json.loads(response.read().decode("utf-8") or "{}")
         except urlerror.HTTPError as error:
-            if error.code in {401, 403}:
-                raise EndpointAuthError(f"endpoint rejected the bearer token ({error.code})") from error
-            if error.code == 404:
-                raise EndpointNotFound("endpoint has no record of the requested resource") from error
-            if error.code == 409:
-                raise EndpointConflict(f"run_id already bound to a different request ({error.code})") from error
-            raise EndpointError(f"endpoint returned HTTP {error.code}") from error
+            raise _http_refusal(error) from error
         except urlerror.URLError as error:
             raise EndpointError(f"endpoint unreachable: {error.reason}") from error
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -678,7 +705,7 @@ class WindowsEndpoint:
         main_assembly: str,
         resume: dict | None = None,
     ) -> dict:
-        """Start one selection job with the frozen request: index, digest and main assembly."""
+        """Start one selection job: a fresh round loop, or a linked rerun inheriting a sealed parent."""
 
         validated = validate_file_index(upload_files)
         main = validate_main_assembly(main_assembly)
@@ -697,9 +724,18 @@ class WindowsEndpoint:
             raise EndpointProtocolError("endpoint accepted a different selection request")
         if response.get("status") not in RUN_STATES:
             raise EndpointProtocolError(f"unexpected job status: {response.get('status')!r}")
-        snapshot = _selection_block(response, upload_files=validated, initial=True)
-        if snapshot.requested_files != {main: validated[main]}:
-            raise EndpointProtocolError("selection must start with the main assembly only")
+        snapshot = _selection_block(response, upload_files=validated, initial=resume is None)
+        if resume is None:
+            if snapshot.requested_files != {main: validated[main]}:
+                raise EndpointProtocolError("selection must start with the main assembly only")
+            return response
+        if snapshot.state != "sealed" or snapshot.manifest is None or snapshot.requested_files:
+            raise EndpointProtocolError("a linked rerun must inherit the parent's sealed selection")
+        if snapshot.manifest.get("main_assembly") != main:
+            raise EndpointProtocolError("the inherited selection is bound to a different main assembly")
+        sealed_files = snapshot.manifest.get("files")
+        if not isinstance(sealed_files, dict) or not sealed_files or snapshot.staged_files != sealed_files:
+            raise EndpointProtocolError("the inherited selection stage differs from its sealed manifest")
         return response
 
     def selection_snapshot(self, run_id: str, *, upload_files: dict[str, str] | None = None) -> SelectionSnapshot:

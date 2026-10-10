@@ -20,11 +20,13 @@ import unittest
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 from description_pipeline.io import PipelineError, digest
 from description_pipeline.orchestration.airflow_client import (
     EndpointConfig,
     EndpointConflict,
+    EndpointError,
     EndpointProtocolError,
     WindowsEndpoint,
     drive_selection_round,
@@ -51,6 +53,7 @@ class _FakeSelection:
         self.switch_reader_after_pushes: int | None = None
         self.extra_staged_at_ready: dict[str, str] = {}
         self.missing_staged_at_ready: bool = False
+        self.linked_manifest_main: str | None = None
 
     def create(self, payload: dict) -> dict:
         upload = payload["upload_files"]
@@ -62,6 +65,31 @@ class _FakeSelection:
             "零件.SLDPRT": ["deps/子零件.SLDPRT"],
             "deps/子零件.SLDPRT": [],
         }
+        resume = payload.get("resume")
+        if resume is not None:
+            parent = self.jobs[resume["parent_run"]]
+            if parent["state"] != "sealed":
+                raise ValueError("linked parent selection is not sealed")
+            manifest = dict(parent["manifest"])
+            if self.linked_manifest_main is not None:
+                manifest["main_assembly"] = self.linked_manifest_main
+            job = {
+                "request": dict(payload),
+                "upload": dict(parent["upload"]),
+                "refs": refs,
+                "reader": parent["reader"],
+                "staged": dict(parent["staged"]),
+                "observations": dict(parent["observations"]),
+                "requested": {},
+                "state": "sealed",
+                "settle": None,
+                "status": "queued",
+                "pushes": 0,
+                "reading_gets": 0,
+                "manifest": manifest,
+            }
+            self.jobs[payload["run_id"]] = job
+            return self.snapshot(job)
         requested = {name: upload[name] for name in upload} if self.initial_all else {main: upload[main]}
         job = {
             "request": dict(payload),
@@ -461,6 +489,41 @@ class SelectionTransportTests(unittest.TestCase):
                 return outcome["manifest"]
         self.fail("selection did not reach a sealed manifest")
 
+    def test_linked_rerun_inherits_the_sealed_parent_selection(self) -> None:
+        manifest = self._sealed_manifest()
+        child = "2b3faa2a-0000-4000-8000-000000000002"
+        resume = {"parent_run": self.run_id, "from_stage": "capture"}
+        response = self.endpoint.start_selection_job(
+            run_id=child, upload_files=self.upload, main_assembly="总装.SLDASM", resume=resume
+        )
+        self.assertEqual(response["status"], "queued")
+        self.assertEqual(response["selection"]["state"], "sealed")
+        self.assertEqual(response["selection"]["manifest"], manifest)
+        retry = self.endpoint.start_selection_job(
+            run_id=child, upload_files=self.upload, main_assembly="总装.SLDASM", resume=resume
+        )
+        self.assertEqual(retry["selection"]["manifest"], manifest)
+
+    def test_linked_rerun_refuses_a_foreign_or_unsealed_parent(self) -> None:
+        self._sealed_manifest()
+        self.state.linked_manifest_main = "零件.SLDPRT"
+        with self.assertRaises(EndpointProtocolError) as caught:
+            self.endpoint.start_selection_job(
+                run_id="2b3faa2a-0000-4000-8000-000000000003",
+                upload_files=self.upload,
+                main_assembly="总装.SLDASM",
+                resume={"parent_run": self.run_id, "from_stage": "capture"},
+            )
+        self.assertIn("different main assembly", str(caught.exception))
+        self.state.linked_manifest_main = None
+        with self.assertRaises(EndpointError):
+            self.endpoint.start_selection_job(
+                run_id="2b3faa2a-0000-4000-8000-000000000004",
+                upload_files=self.upload,
+                main_assembly="总装.SLDASM",
+                resume={"parent_run": "9e9e9e9e-0000-4000-8000-000000000005", "from_stage": "capture"},
+            )
+
     def test_definition_snapshot_and_record_transport(self) -> None:
         manifest = self._sealed_manifest()
         snapshot = self.endpoint.definition_snapshot(self.run_id, upload_files=self.upload)
@@ -616,6 +679,118 @@ class SelectionDagTests(unittest.TestCase):
                 self.assertRaises(self.dag.AirflowFailException),
             ):
                 self.dag._definition_settings(SimpleNamespace(discovery=discovery), "总装.SLDASM")
+
+    def test_linked_native_reruns_keep_the_sealed_intake(self) -> None:
+        from types import SimpleNamespace
+
+        from airflow.sdk.exceptions import AirflowFailException
+        from description_pipeline.orchestration.airflow_client import native_run_id
+
+        module = self.dag
+        dag = module.dag
+        root = Path(tempfile.mkdtemp(prefix="linked-intake-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        intake = _intake(root)
+        upload = _upload_files(intake)
+        parent_job = {
+            "request": {
+                "run_id": native_run_id("portal-parent"),
+                "upload_files": upload,
+                "upload_sha256": digest(upload),
+                "main_assembly": "总装.SLDASM",
+            }
+        }
+
+        class Stub:
+            def get_job(self, run_id):
+                return parent_job
+
+            def authorized_intake_dir(self, path):
+                return intake
+
+        def context(stage, path):
+            return {
+                "dag_run": SimpleNamespace(
+                    conf={"parent_dag_run_id": "portal-parent", "resume_from": stage},
+                    run_id=f"portal-child-{stage}",
+                ),
+                "params": {"handoff_path": path, "main_assembly": ""},
+            }
+
+        with patch.object(module, "_endpoint", return_value=Stub()):
+            request = dag.task_dict["resolve_handoff"].python_callable(**context("discover", str(intake)))
+            capture = dag.task_dict["resolve_handoff"].python_callable(**context("capture", ""))
+        self.assertEqual(request["intake_dir"], str(intake))
+        self.assertEqual(request["resume"]["from_stage"], "discover")
+        self.assertNotIn("intake_dir", capture)
+        with patch.object(module, "_endpoint", return_value=Stub()), self.assertRaises(AirflowFailException):
+            dag.task_dict["resolve_handoff"].python_callable(**context("discover", ""))
+        drifted = root / "drifted"
+        drifted.mkdir()
+        (drifted / "总装.SLDASM").write_bytes(b"drifted assembly bytes")
+        (drifted / "零件.SLDPRT").write_bytes((intake / "零件.SLDPRT").read_bytes())
+
+        class DriftStub(Stub):
+            def authorized_intake_dir(self, path):
+                return drifted
+
+        with patch.object(module, "_endpoint", return_value=DriftStub()), self.assertRaises(AirflowFailException):
+            dag.task_dict["resolve_handoff"].python_callable(**context("discover", str(intake)))
+
+    def test_missing_intake_aborts_before_the_endpoint_waits(self) -> None:
+        from types import SimpleNamespace
+
+        from airflow.sdk.exceptions import AirflowFailException
+        from description_pipeline.orchestration.airflow_client import AwaitingDefinition, SelectionSnapshot
+        from description_pipeline.orchestration.linux_store import LinuxStore
+
+        module = self.dag
+        aborted = {}
+
+        class Stub:
+            config = SimpleNamespace(discovery={})
+
+            def definition_snapshot(self, run_id, upload_files=None):
+                return AwaitingDefinition(
+                    record_name="raw-record.zip",
+                    record_sha256="a" * 64,
+                    record_size=8,
+                    record_manifest={"schema_version": "fixture"},
+                    native_tool={"source_sha256": "b" * 64},
+                    selection=SelectionSnapshot(
+                        state="sealed",
+                        round_id="c" * 64,
+                        reader_sha256="b" * 64,
+                        observations={},
+                        staged_files={"a.SLDASM": "d" * 64},
+                        requested_files={},
+                        manifest={"main_assembly": "a.SLDASM", "files": {"a.SLDASM": "d" * 64}},
+                    ),
+                )
+
+            def stream_native_record(self, run_id, snapshot, destination, *, limit=None):
+                Path(destination).write_bytes(b"bundle")
+                return Path(destination)
+
+            def abort_job(self, run_id, **fields):
+                aborted.update(fields)
+                return {}
+
+        root = Path(tempfile.mkdtemp(prefix="definition-abort-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        request = {
+            "run_id": "11111111-2222-4333-8444-555555555555",
+            "upload_files": {"a.SLDASM": "d" * 64},
+            "conn_id": "test",
+        }
+        with (
+            patch.object(module, "_linux_store", return_value=LinuxStore(root)),
+            self.assertRaises(AirflowFailException),
+        ):
+            module._provide_definition(Stub(), request)
+        self.assertEqual(aborted["error_code"], "definition_derivation_failed")
+        self.assertIn("intake", aborted["error"])
+        self.assertIn("work_dir", aborted["detail"])
 
 
 if __name__ == "__main__":

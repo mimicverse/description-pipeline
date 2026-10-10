@@ -1,14 +1,14 @@
 """Submit one engineering folder to the Windows SolidWorks execution endpoint.
 
 The DAG carries ``handoff_path`` and an optional ``main_assembly`` (the explicit delivered
-assembly). A linked attempt (``parent_dag_run_id`` and ``resume_from``) reuses the retained
-source selection - files, index digest and main assembly - of the parent native job itself;
-a supplied selection that differs from the parent's is refused instead of silently discarded.
-The waiting loop also serves the definition hand-off: the transferred raw record is derived
-on Linux over the sealed selection alone and the generated capture request is submitted, or
-the endpoint is aborted with a structured failure. Hardware, revision and repository routing
-resolve inside the serialized Windows job after CAD discovery and are confirmed here before
-publication.
+assembly). A fresh run admits the sealed local intake, stages only the assembly-derived
+dependency closure to the endpoint and lets the native host read the raw discovery record;
+the prepared package is derived here on Linux over the sealed selection alone and returned as
+the capture request, and a local derivation refusal aborts the waiting endpoint with a
+structured failure. A linked attempt (``parent_dag_run_id`` and ``resume_from``) reuses the
+parent native job's retained source selection - files, index digest and main assembly - and
+refuses a supplied selection that differs. Hardware, revision and repository routing are
+confirmed here before publication.
 """
 
 from __future__ import annotations
@@ -322,17 +322,7 @@ def _provide_definition(endpoint: WindowsEndpoint, request: dict) -> None:
     )
 
     run_id = request["run_id"]
-    intake = request.get("intake_dir")
-    if not isinstance(intake, str) or not intake:
-        raise AirflowFailException("Definition derivation requires the sealed intake folder of a fresh source")
     snapshot = endpoint.definition_snapshot(run_id, upload_files=request["upload_files"])
-    manifest = snapshot.selection.manifest
-    main_assembly = manifest.get("main_assembly")
-    if not isinstance(main_assembly, str) or not main_assembly:
-        raise AirflowFailException("The sealed selection names no main assembly to derive")
-    selected = manifest.get("files")
-    if not isinstance(selected, dict) or not selected:
-        raise AirflowFailException("The sealed selection lists no files to derive")
     store = _linux_store(request["conn_id"])
     work = store.run_dir(run_id) / "definition"
     bundle = work / "raw-record.zip"
@@ -342,6 +332,18 @@ def _provide_definition(endpoint: WindowsEndpoint, request: dict) -> None:
     endpoint.stream_native_record(run_id, snapshot, bundle)
     prepared = None
     try:
+        intake = request.get("intake_dir")
+        if not isinstance(intake, str) or not intake:
+            raise AirflowFailException(
+                "Definition derivation requires the sealed intake folder of the fresh or linked source"
+            )
+        manifest = snapshot.selection.manifest
+        main_assembly = manifest.get("main_assembly")
+        if not isinstance(main_assembly, str) or not main_assembly:
+            raise AirflowFailException("The sealed selection names no main assembly to derive")
+        selected = manifest.get("files")
+        if not isinstance(selected, dict) or not selected:
+            raise AirflowFailException("The sealed selection lists no files to derive")
         settings = _definition_settings(endpoint.config, main_assembly)
         frozen = _materialize_selection(Path(intake), selected, work / "selected")
         admission = admit_raw_record_bundle(
@@ -499,9 +501,11 @@ def _same_request(job: dict, request: dict) -> None:
     tags=["solidworks", "urdf", "windows"],
     default_args={"retries": 2, "retry_delay": timedelta(seconds=15)},
     doc_md=(
-        "# SolidWorks to URDF\n\nWindows freezes inputs, discovers the assembly and captures native evidence. "
-        "Linux receives the sealed capture, generates the URDF, independently verifies it and publishes the PR. "
-        "The graph coordinates these six engineering stages; transport and polling are orchestration tasks.\n\n"
+        "# SolidWorks to URDF\n\nLinux admits the sealed engineering folder and stages the assembly-derived "
+        "dependency closure to the Windows endpoint; the native host reads the raw discovery record and, "
+        "after Linux derives the prepared package from the sealed selection, captures the native evidence. "
+        "Linux then generates the URDF, independently verifies it and publishes the PR. The graph "
+        "coordinates these six engineering stages; transport and polling are orchestration tasks.\n\n"
         + contract_markdown()
         + "\n\nRun results: `wait_for_job` logs native stage checks; `run_generate`, `run_verify` and "
         "`run_publish` log Linux stage results. Their `engineering_stages` XComs retain stage summaries, "
@@ -516,8 +520,8 @@ def _same_request(job: dict, request: dict) -> None:
             type="string",
             title="Engineering folder path",
             description=(
-                "Folder the Windows endpoint inspects (an absolute Linux folder is archived and "
-                "imported before the run starts)"
+                "Sealed engineering folder on this Linux host whose dependency closure is staged to "
+                "the Windows endpoint (an absolute folder inside the configured handoff roots)"
             ),
         ),
         "main_assembly": Param(
@@ -573,7 +577,7 @@ def solidworks_to_urdf():
                 main,
                 CONN_ID,
             )
-            return {
+            request = {
                 "run_id": _run_uuid(context),
                 "upload_files": upload_files,
                 "upload_sha256": upload_sha256,
@@ -581,6 +585,19 @@ def solidworks_to_urdf():
                 "resume": linked,
                 "conn_id": CONN_ID,
             }
+            if linked["from_stage"] != "capture":
+                # A freeze or discover rerun still serves the definition leg from the
+                # original sealed intake; the local folder must match it exactly.
+                handoff_path = str(context["params"].get("handoff_path") or "").strip()
+                if not handoff_path:
+                    raise AirflowFailException(
+                        "A linked freeze or discover rerun needs handoff_path with the original sealed intake"
+                    )
+                intake = _endpoint(CONN_ID).authorized_intake_dir(handoff_path)
+                if validate_file_index(package_inventory(intake)) != upload_files:
+                    raise AirflowFailException("The linked intake no longer matches the parent's retained selection")
+                request["intake_dir"] = str(intake)
+            return request
         handoff_path = str(context["params"]["handoff_path"]).strip()
         if not handoff_path:
             raise AirflowFailException("handoff_path is required")
