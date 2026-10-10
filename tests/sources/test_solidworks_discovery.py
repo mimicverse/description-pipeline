@@ -1417,6 +1417,263 @@ class DiscoveryTests(unittest.TestCase):
         result, _source, _output = self._prepare(mutate=mutate)
         self.assertIn("discovery.mate_geometry_mismatch", self._codes(result))
 
+    def test_concentric_accepts_circular_edges_as_the_axis(self):
+        findings: list[dict] = []
+        frames = _component_frames(record(), findings)
+        self.assertFalse(findings)
+
+        def mate(entities) -> dict:
+            return {
+                "name": "shaft",
+                "type": "concentric",
+                "suppressed": False,
+                "error_code": 0,
+                "scope": "",
+                "limits": None,
+                "entities": entities,
+            }
+
+        cylinder = {
+            "component": "base-1",
+            "feature": "Cyl1",
+            "cylinder": {"point": [0.0, 0.0, 0.1], "direction": [0.0, 0.0, 1.0], "radius": 0.006},
+        }
+        circle = {
+            "component": "arm-1",
+            "feature": "Edge1",
+            "circle": {"center": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0], "radius": 0.006},
+        }
+        flipped = {
+            "component": "arm-1",
+            "feature": "Edge1",
+            "circle": {"center": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, -1.0], "radius": 0.006},
+        }
+        far_cylinder = {
+            "component": "arm-1",
+            "feature": "Cyl2",
+            "cylinder": {"point": [0.0, 0.0, 0.2], "direction": [0.0, 0.0, 1.0], "radius": 0.006},
+        }
+
+        baseline = _mate_rows(mate([cylinder, cylinder]), frames, [], "mate:shaft")
+        self.assertIsNotNone(baseline)
+        circle_second = _mate_rows(mate([cylinder, circle]), frames, [], "mate:shaft")
+        circle_first = _mate_rows(mate([circle, far_cylinder]), frames, [], "mate:shaft")
+        circle_only = _mate_rows(mate([circle, circle]), frames, [], "mate:shaft")
+        flipped_second = _mate_rows(mate([cylinder, flipped]), frames, [], "mate:shaft")
+        for rows in (circle_second, circle_first, circle_only, flipped_second):
+            self.assertIsNotNone(rows)
+            self.assertEqual(rows["rows"], baseline["rows"])
+
+        # Shaft evidence is the actual cylinder, never a circle normal: a flipped
+        # circle-first normal must not change the returned axis or its point.
+        self.assertEqual(circle_second["axis"], baseline["axis"])
+        self.assertEqual(circle_second["point"], baseline["point"])
+        self.assertEqual(circle_second["entity"]["component"], "base-1")
+        self.assertEqual(circle_first["axis"], [0.0, 0.0, 1.0])
+        self.assertEqual(circle_first["point"], [0.0, 0.0, 0.2])
+        self.assertEqual(circle_first["entity"]["component"], "arm-1")
+        self.assertEqual(flipped_second["axis"], baseline["axis"])
+
+        # Circle-only reconstruction carries rows but no cylinder evidence at all.
+        self.assertIsNone(circle_only["axis"])
+        self.assertIsNone(circle_only["point"])
+        self.assertIsNone(circle_only["entity"])
+
+    def test_concentric_circle_geometry_gates_stay_fail_closed(self):
+        frames = _component_frames(record(), [])
+        base = {
+            "component": "base-1",
+            "feature": "Cyl1",
+            "cylinder": {"point": [0.0, 0.0, 0.1], "direction": [0.0, 0.0, 1.0], "radius": 0.006},
+        }
+
+        def run(circle: dict):
+            findings: list[dict] = []
+            rows = _mate_rows(
+                {
+                    "name": "shaft",
+                    "type": "concentric",
+                    "suppressed": False,
+                    "error_code": 0,
+                    "scope": "",
+                    "limits": None,
+                    "entities": [base, {"component": "arm-1", "feature": "Edge1", "circle": circle}],
+                },
+                frames,
+                findings,
+                "mate:shaft",
+            )
+            return rows, findings
+
+        rows, findings = run({"center": [0.0, 0.0, 0.1], "normal": [0.0, 1.0, 0.0], "radius": 0.006})
+        self.assertIsNone(rows)
+        self.assertTrue(any(item["code"] == "discovery.mate_geometry_mismatch" for item in findings))
+
+        rows, findings = run({"center": [0.001, 0.0, 0.1], "normal": [0.0, 0.0, 1.0], "radius": 0.006})
+        self.assertIsNone(rows)
+        misaligned = next(item for item in findings if item["code"] == "discovery.joint_axis_misaligned")
+        self.assertAlmostEqual(misaligned["detail"]["radial_gap_m"], 0.001)
+
+        for broken in (
+            {"center": [0.0, 0.0, 0.1], "radius": 0.006},
+            {"center": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 0.0], "radius": 0.006},
+            {"normal": [0.0, 0.0, 1.0], "radius": 0.006},
+        ):
+            rows, findings = run(broken)
+            self.assertIsNone(rows)
+            self.assertTrue(
+                any(item["code"] == "discovery.mate_entities_unsupported" for item in findings), findings
+            )
+
+    def test_coincident_circle_with_plane_locks_alignment_and_position(self):
+        frames = _component_frames(record(), [])
+        plane = {
+            "component": "base-1",
+            "feature": "Plane1",
+            "plane": {"point": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0]},
+        }
+        other_plane = {
+            "component": "arm-1",
+            "feature": "Plane2",
+            "plane": {"point": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0]},
+        }
+        circle = {
+            "component": "arm-1",
+            "feature": "Edge1",
+            "circle": {"center": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0], "radius": 0.006},
+        }
+
+        def coincident(entities) -> dict:
+            return {
+                "name": "seat",
+                "type": "coincident",
+                "suppressed": False,
+                "error_code": 0,
+                "scope": "",
+                "limits": None,
+                "entities": entities,
+            }
+
+        plane_plane = _mate_rows(coincident([plane, other_plane]), frames, [], "mate:seat")
+        circle_plane = _mate_rows(coincident([plane, circle]), frames, [], "mate:seat")
+        mirrored = _mate_rows(
+            coincident(
+                [
+                    {"component": "base-1", "feature": "Edge1", "circle": circle["circle"]},
+                    {"component": "arm-1", "feature": "Plane2", "plane": other_plane["plane"]},
+                ]
+            ),
+            frames,
+            [],
+            "mate:seat",
+        )
+        self.assertEqual(len(circle_plane["rows"]), 3)
+        self.assertEqual(circle_plane["rows"], plane_plane["rows"])
+        self.assertEqual(mirrored["rows"], plane_plane["rows"])
+        self.assertEqual(circle_plane["point"], [0.0, 0.0, 0.1])
+
+        anti_parallel = {**circle, "circle": {"center": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, -1.0], "radius": 0.006}}
+        flipped = _mate_rows(coincident([plane, anti_parallel]), frames, [], "mate:seat")
+        self.assertEqual(len(flipped["rows"]), 3)
+        self.assertAlmostEqual(abs(flipped["rows"][0][2]), 1.0)
+
+    def test_coincident_circle_plane_geometry_gates_stay_fail_closed(self):
+        frames = _component_frames(record(), [])
+        plane = {
+            "component": "base-1",
+            "feature": "Plane1",
+            "plane": {"point": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0]},
+        }
+
+        def run(circle: dict):
+            findings: list[dict] = []
+            rows = _mate_rows(
+                {
+                    "name": "seat",
+                    "type": "coincident",
+                    "suppressed": False,
+                    "error_code": 0,
+                    "scope": "",
+                    "limits": None,
+                    "entities": [plane, {"component": "arm-1", "feature": "Edge1", "circle": circle}],
+                },
+                frames,
+                findings,
+                "mate:seat",
+            )
+            return rows, findings
+
+        rows, findings = run({"center": [0.0, 0.0, 0.1], "normal": [0.0, 1.0, 0.0], "radius": 0.006})
+        self.assertIsNone(rows)
+        self.assertTrue(any(item["code"] == "discovery.mate_geometry_mismatch" for item in findings))
+
+        rows, findings = run({"center": [0.0, 0.0, 0.1005], "normal": [0.0, 0.0, 1.0], "radius": 0.006})
+        self.assertIsNone(rows)
+        mismatch = next(item for item in findings if item["code"] == "discovery.mate_geometry_mismatch")
+        self.assertAlmostEqual(mismatch["detail"]["separation_m"], 0.0005)
+
+        rows, findings = run({"center": [0.0, 0.0, 0.1], "radius": 0.006})
+        self.assertIsNone(rows)
+        self.assertTrue(any(item["code"] == "discovery.mate_entities_unsupported" for item in findings))
+
+    def test_hinge_recorded_with_circular_edges_generates_the_same_joint(self):
+        def mutate(payload):
+            payload["mates"][0]["entities"][0] = {
+                "component": "base-1",
+                "feature": "Edge1",
+                "circle": {"center": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0], "radius": 0.006},
+            }
+            payload["mates"][1]["entities"][0] = {
+                "component": "base-1",
+                "feature": "Edge2",
+                "circle": {"center": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0], "radius": 0.006},
+            }
+
+        result, _source, output = self._prepare(mutate=mutate)
+        self.assertTrue(result.passed, result.findings)
+        document = yaml.safe_load((output / "robot.yaml").read_text(encoding="utf-8"))
+        joint = document["source"]["joints"][0]
+        self.assertEqual(joint["type"], "revolute")
+        self.assertEqual(joint["axis"], [0.0, 0.0, 1.0])
+        self.assertEqual((joint["parent"], joint["child"]), ("base_link", "arm_link"))
+        # Cylinder evidence is required for the published axis reference; the circle
+        # supplies rows, never the interface record.
+        self.assertEqual(joint["axis_reference"]["component"], "arm-1")
+        # The independent verifier's row model pins circle support to C's parity
+        # patch, so verification is asserted in the combined tree, not here.
+
+    def test_circle_only_joint_still_fails_the_cylinder_shaft_gate(self):
+        def mutate(payload):
+            payload["mates"][0]["entities"] = [
+                {
+                    "component": "base-1",
+                    "feature": "Edge1",
+                    "circle": {"center": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0], "radius": 0.006},
+                },
+                {
+                    "component": "arm-1",
+                    "feature": "Edge2",
+                    "circle": {"center": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0], "radius": 0.006},
+                },
+            ]
+            payload["mates"][1]["entities"] = [
+                {
+                    "component": "base-1",
+                    "feature": "Edge3",
+                    "circle": {"center": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0], "radius": 0.006},
+                },
+                {
+                    "component": "arm-1",
+                    "feature": "Edge4",
+                    "circle": {"center": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0], "radius": 0.006},
+                },
+            ]
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        self.assertIn("discovery.joint_axis_selector_missing", self._codes(result))
+        finding = next(item for item in result.findings if item["code"] == "discovery.joint_axis_selector_missing")
+        self.assertIn("no cylindrical mate entity carries the joint shaft", finding["message"])
+
     def test_missing_or_nonzero_native_error_state_blocks(self):
         for payload_mutate in (
             lambda payload: payload["mates"][0].pop("error_code"),

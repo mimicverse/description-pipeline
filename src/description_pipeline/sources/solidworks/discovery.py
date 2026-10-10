@@ -29,6 +29,8 @@ the backend and re-read by the independent verifier:
     ``{name, type, entities: [{component, feature, face_index, cylinder}],
     alignment, limits: {lower, upper, unit}, suppressed}`` with each cylinder
     given in its component frame (``point``/``direction``/``radius``).
+    A circular edge (``circle``: centre/normal/radius) carries the same axis or
+    plane data as a cylinder/plane where a mate's semantics allow it.
     A mate entity may instead be the frozen top assembly's own frame:
     ``{component: "", assembly_frame: true, ...}`` with geometry recorded in the
     assembly frame.  Such mates only ground exactly one rigid cluster when they
@@ -452,6 +454,37 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
             return None
         return point, direction
 
+    def circle_of(entity: dict):
+        """A recorded circular edge as (centre, unit normal) in the assembly frame."""
+
+        frame = frame_of(entity)
+        circle = entity.get("circle")
+        if frame is None or not isinstance(circle, dict):
+            return None
+        try:
+            normal = _unit(_vector(circle.get("normal") or (), frame))
+        except (TypeError, ValueError):
+            normal = None
+        try:
+            centre = _point([float(value) for value in circle.get("center") or ()], frame)
+        except (TypeError, ValueError):
+            centre = None
+        if normal is None or centre is None or len(centre) != 3:
+            fail(
+                "discovery.mate_entities_unsupported",
+                "recorded circular edge is not usable",
+                {"feature": entity.get("feature")},
+            )
+            return None
+        return centre, normal
+
+    def axial_geometry_of(entity: dict):
+        """A cylinder face or circular edge as (point, unit direction)."""
+
+        if isinstance(entity.get("cylinder"), dict):
+            return cylinder_of(entity)
+        return circle_of(entity)
+
     def point_of(entity: dict):
         frame = frame_of(entity)
         if frame is None:
@@ -481,13 +514,16 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
         rows += [_rotation_row(axis) for axis in (basis_x, basis_y, basis_z)]
         return {"rows": rows, "limits": limits, "axis": None, "point": point, "entity": None}
     if kind == "concentric":
-        left = cylinder_of(first)
-        right = cylinder_of(second)
+        left = axial_geometry_of(first)
+        right = axial_geometry_of(second)
         if left is None or right is None:
-            return fail("discovery.mate_entities_unsupported", "concentric mate needs two recorded cylindrical faces")
+            return fail(
+                "discovery.mate_entities_unsupported",
+                "concentric mate needs two recorded cylinders or circular edges",
+            )
         if abs(abs(_dot(left[1], right[1])) - 1.0) > _TOL:
             return fail(
-                "discovery.mate_geometry_mismatch", "recorded cylinder axes are not parallel in the solved state"
+                "discovery.mate_geometry_mismatch", "concentric mate axes are not parallel in the solved state"
             )
         delta = [right[0][index] - left[0][index] for index in range(3)]
         along = _dot(delta, left[1])
@@ -496,14 +532,34 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
         if radial_gap > AXIS_OFFSET_TOL_M:
             return fail(
                 "discovery.joint_axis_misaligned",
-                "concentric mate cylinders are parallel but radially displaced",
+                "concentric mate references are parallel but radially displaced",
                 {"radial_gap_m": radial_gap, "tolerance_m": AXIS_OFFSET_TOL_M},
             )
         axis = left[1]
         basis = _orthogonal_basis(axis)
         rows = [_translation_row(direction, left[0]) for direction in basis]
         rows += [_rotation_row(direction) for direction in basis]
-        return {"rows": rows, "limits": limits, "axis": axis, "point": left[0], "entity": first}
+        # Rows may be reconstructed from a circular edge, but shaft evidence is
+        # only ever an actual cylindrical face: a circle normal can be flipped
+        # against the vendor axis, and a circle carries no cylinder contract.
+        shaft = next(
+            (
+                (entity, geometry)
+                for entity, geometry in ((first, left), (second, right))
+                if isinstance(entity.get("cylinder"), dict)
+            ),
+            None,
+        )
+        if shaft is None:
+            return {"rows": rows, "limits": limits, "axis": None, "point": None, "entity": None}
+        shaft_entity, shaft_geometry = shaft
+        return {
+            "rows": rows,
+            "limits": limits,
+            "axis": shaft_geometry[1],
+            "point": shaft_geometry[0],
+            "entity": shaft_entity,
+        }
     if kind == "coincident":
         left_plane = plane_of(first)
         right_plane = plane_of(second)
@@ -545,6 +601,34 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
                 "point": center,
                 "entity": None,
             }
+        def circle_plane_rows(circle_entity: dict, plane_entity: dict):
+            # A circular edge coincident with a plane lies in that plane: the
+            # row model locks the same alignment and position as plane-plane.
+            geometry = circle_of(circle_entity)
+            plane = plane_of(plane_entity)
+            if geometry is None or plane is None:
+                return None
+            centre, normal = geometry
+            if abs(abs(_dot(normal, plane[1])) - 1.0) > _TOL:
+                return fail(
+                    "discovery.mate_geometry_mismatch", "solved coincident circle and plane are not parallel"
+                )
+            direction = normal if _dot(normal, plane[1]) >= 0 else [-value for value in normal]
+            separation = abs(_dot([centre[index] - plane[0][index] for index in range(3)], plane[1]))
+            if separation > AXIS_OFFSET_TOL_M:
+                return fail(
+                    "discovery.mate_geometry_mismatch",
+                    "solved coincident circle and plane are not co-located",
+                    {"separation_m": separation},
+                )
+            rows = [_translation_row(direction, centre)]
+            rows += [_rotation_row(item) for item in _orthogonal_basis(direction)]
+            return {"rows": rows, "limits": limits, "axis": None, "point": centre, "entity": None}
+
+        if isinstance(first.get("circle"), dict) and isinstance(second.get("plane"), dict):
+            return circle_plane_rows(first, second)
+        if isinstance(first.get("plane"), dict) and isinstance(second.get("circle"), dict):
+            return circle_plane_rows(second, first)
         if left_point is not None and right_point is not None:
             rows = [_translation_row(axis, left_point) for axis in (basis_x, basis_y, basis_z)]
             return {"rows": rows, "limits": limits, "axis": None, "point": left_point, "entity": None}
