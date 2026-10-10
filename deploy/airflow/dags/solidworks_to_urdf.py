@@ -15,7 +15,6 @@ import logging
 import os
 from datetime import datetime, timedelta
 
-from airflow.providers.standard.sensors.python import PythonSensor
 from airflow.sdk import Param, dag, task
 from airflow.sdk.exceptions import AirflowFailException
 
@@ -466,10 +465,7 @@ def solidworks_to_urdf():
 
     request = resolve_handoff()
     started = start_job(request)
-    wait_for_job = PythonSensor(
-        task_id="wait_for_job",
-        python_callable=_poke,
-        op_kwargs={"request": started},
+    @task.sensor(
         mode=SENSOR_MODE,
         poke_interval=POLL_INTERVAL,
         timeout=POLL_TIMEOUT,
@@ -477,12 +473,18 @@ def solidworks_to_urdf():
             "Transport polling only. Engineering stage/QC results are in these logs and the engineering_stages XCom."
         ),
     )
+    def wait_for_job(request: dict, **context) -> bool:
+        return _poke(request, **context)
+
+    waited = wait_for_job(started)
+    # The poll follows the submission even where op_kwargs XCom resolution is not
+    # inferred as a dependency edge.
     fetched = fetch_capture(started)
     generated = run_generate(fetched)
     verified = run_verify(generated)
     published = run_publish(verified)
     confirm = confirm_job(published)
-    wait_for_job >> fetched
+    waited >> fetched
     fetched >> generated >> verified >> published >> confirm
 
 
