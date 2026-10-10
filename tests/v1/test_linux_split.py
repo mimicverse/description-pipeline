@@ -3,24 +3,76 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import shutil
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
 from packaging.utils import canonicalize_name
 
-from description_pipeline.io import PipelineError, file_digest
+from description_pipeline.io import PipelineError, digest, file_digest
 from description_pipeline.orchestration import linux_runner
 from description_pipeline.orchestration.linux_store import LinuxStore
 from description_pipeline.orchestration.stage_transfer import seal_capture
 from description_pipeline.runtime import RUNTIME_VERSIONS, required_packages
+from description_pipeline.sources.solidworks.selection import seal_selection
 from description_pipeline.stages import STAGE_IDS
 
-from .test_stage_transfer import HANDOFF, MAIN_ASSEMBLY, capture_root, native_tool
+from .test_stage_transfer import MAIN_ASSEMBLY, capture_root, native_tool
 
 RUN = "7c9b44b3-0b9c-5ffe-9f4f-4bbdafb4a865"
+SELECTED = {MAIN_ASSEMBLY: hashlib.sha256(b"CAD-BYTES").hexdigest()}
+UPLOAD = {**SELECTED, "unrelated.txt": hashlib.sha256(b"not selected").hexdigest()}
+HANDOFF = digest(SELECTED)
+
+
+def capture_job(run_id: str, archive: Path, tool: dict) -> dict:
+    """A current server receipt whose upload differs from its selected closure."""
+    selection = seal_selection(
+        UPLOAD,
+        MAIN_ASSEMBLY,
+        {MAIN_ASSEMBLY: {"sha256": SELECTED[MAIN_ASSEMBLY], "references": []}},
+        selected_files=SELECTED,
+        reader_sha256=tool["source_sha256"],
+    )
+    with zipfile.ZipFile(archive) as packed:
+        manifest_sha256 = hashlib.sha256(packed.read("transfer-manifest.json")).hexdigest()
+    return {
+        "status": "native_complete",
+        "run_id": run_id,
+        "main_assembly": MAIN_ASSEMBLY,
+        "native_tool": tool,
+        "handoff_sha256": HANDOFF,
+        "package_files": dict(SELECTED),
+        "request": {
+            "run_id": run_id,
+            "upload_files": dict(UPLOAD),
+            "upload_sha256": digest(UPLOAD),
+            "main_assembly": MAIN_ASSEMBLY,
+        },
+        "selection": {
+            "state": "sealed",
+            "round_id": selection["selection_sha256"],
+            "reader_sha256": tool["source_sha256"],
+            "staged_files": dict(SELECTED),
+            "requested_files": {},
+            "observations": selection["observations"],
+            "manifest": selection,
+        },
+        "result": {
+            "native_complete": True,
+            "native_tool": tool,
+            "capture_archive": {
+                "name": "native-evidence.zip",
+                "sha256": file_digest(archive),
+                "size": archive.stat().st_size,
+                "manifest_sha256": manifest_sha256,
+            },
+        },
+    }
 
 
 def portable_record(native: dict, *, source_sha256: str | None = None, mujoco: str = "3.13.0") -> dict:
@@ -46,7 +98,7 @@ class LinuxSplitTests(unittest.TestCase):
         self.store = LinuxStore(self.tmp / "store")
         self.tool = native_tool()
         self.run_id = RUN
-        source = capture_root(self.tmp, run_id=self.run_id)
+        source = capture_root(self.tmp, run_id=self.run_id, handoff=HANDOFF)
         self.archive = self.tmp / "native-evidence.zip"
         seal_capture(
             source,
@@ -231,9 +283,7 @@ class LinuxSplitTests(unittest.TestCase):
                 mock.patch.object(linux_runner.solidworks, "run", side_effect=AssertionError("must not run")),
                 self.assertRaises(PipelineError),
             ):
-                linux_runner.run_portable_stage(
-                    self.store, self.run_id, "verify", expected_subject="a" * 64
-                )
+                linux_runner.run_portable_stage(self.store, self.run_id, "verify", expected_subject="a" * 64)
         with (
             mock.patch.object(linux_runner.solidworks, "run", side_effect=AssertionError("must not run")),
             self.assertRaises(PipelineError),
@@ -283,21 +333,11 @@ class LinuxSplitTests(unittest.TestCase):
         self.admit()
         endpoint = mock.Mock()
         endpoint.stream_capture_archive.side_effect = AssertionError("must not re-download")
-        job = {
-            "status": "native_complete",
-            "request": {"handoff_sha256": HANDOFF, "main_assembly": MAIN_ASSEMBLY},
-            "result": {
-                "native_complete": True, "native_tool": self.tool,
-                "capture_archive": {
-                    "name": "native-evidence.zip", "sha256": file_digest(self.archive),
-                    "size": self.archive.stat().st_size,
-                    "manifest_sha256": file_digest(self.store.capture_dir(self.run_id) / "transfer-manifest.json"),
-                },
-            },
-        }
+        job = capture_job(self.run_id, self.archive, self.tool)
         binding = linux_runner.fetch_capture(self.store, endpoint, self.run_id, job)
         self.assertEqual(binding["state"], "capture_admitted")
         self.assertEqual(binding["capture_dir"], str(self.store.capture_dir(self.run_id)))
+        self.assertEqual(self.store.meta(self.run_id)["selection"], job["selection"]["manifest"])
         endpoint.stream_capture_archive.assert_not_called()
 
     def test_verify_and_publish_seed_from_the_previous_checkpoints(self) -> None:
