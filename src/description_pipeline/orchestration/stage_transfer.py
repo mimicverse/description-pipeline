@@ -29,7 +29,7 @@ from ..io import PipelineError, artifact_path_parts, canonical, confined, digest
 from ..runtime import RUNTIME_VERSIONS, required_packages
 from ..sources.snapshot import verify_snapshot
 from ..sources.solidworks.revision import package_inventory
-from ..stages import CONTRACT, CONTRACT_FILE_SHA256, CONTRACT_SHA256, STAGE_IDS, VIEW_SCHEMA
+from ..stages import CONTRACT, CONTRACT_FILE_SHA256, CONTRACT_SHA256, STAGE_IDS, VIEW_SCHEMA, stage_view
 
 CAPTURE_ARCHIVE = "native-evidence.zip"
 CAPTURE_MANIFEST = "transfer-manifest.json"
@@ -167,6 +167,66 @@ def _validate_stage_receipts(view, *, run_id: str, handoff_sha256: str) -> None:
             stage.get("state") != "completed",
             f"Non-native stage {stage_id} is claimed complete in the native transfer",
         )
+    events = view.get("events")
+    _require(
+        isinstance(events, list) and events,
+        "Native stage receipts must carry the raw protocol events",
+    )
+    for event in events:
+        _require(isinstance(event, dict), "A native protocol event must be an object")
+        _require(
+            event.get("stage") in NATIVE_STAGE_SCOPE,
+            "Native stage receipts must contain only the first three stages' events",
+        )
+        _require(isinstance(event.get("at"), str) and event["at"], "A native protocol event lacks its timestamp")
+        _require(
+            event.get("state") in {"running", "completed", "failed"},
+            "A native protocol event has an unknown state",
+        )
+        check = event.get("check")
+        if check is not None:
+            _require(
+                isinstance(check, dict) and check.get("state") in {"passed", "failed"},
+                "A native protocol check event is malformed",
+            )
+    try:
+        recomputed = stage_view(
+            {
+                "run_id": run_id,
+                "request": {"handoff_sha256": handoff_sha256},
+                "result": {"execution_scope": list(NATIVE_STAGE_SCOPE)},
+                "events": events,
+            }
+        )
+    except Exception as error:  # noqa: BLE001 - a receipt that cannot be rebuilt is not evidence
+        raise PipelineError(f"Native stage receipts cannot be rebuilt from their events: {error}") from error
+    _require(
+        _receipt_projection(recomputed) == _receipt_projection(view),
+        "Native stage receipts differ from the stage view rebuilt from their own events",
+    )
+
+
+def _receipt_projection(view) -> dict:
+    """The native rows and boundary-check states a receipt must actually prove."""
+
+    stages = view.get("stages")
+    by_id = {stage.get("id"): stage for stage in stages or [] if isinstance(stage, dict)}
+    projection = {}
+    for stage_id in NATIVE_STAGE_SCOPE:
+        stage = by_id.get(stage_id) or {}
+        checks = {}
+        for boundary in ("input", "output"):
+            for item in stage.get(f"{boundary}_qc") or []:
+                if isinstance(item, dict):
+                    checks[(boundary, item.get("id"))] = item.get("state")
+        projection[stage_id] = {
+            "state": stage.get("state"),
+            "in_scope": stage.get("in_scope"),
+            "checks_passed": stage.get("checks_passed"),
+            "checks_total": stage.get("checks_total"),
+            "checks": checks,
+        }
+    return projection
 
 
 def _validate_input(root: Path, report, main_assembly: str) -> str:

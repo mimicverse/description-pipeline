@@ -21,7 +21,9 @@ from description_pipeline.io import PipelineError, canonical, digest, file_diges
 from description_pipeline.orchestration import stage_transfer as transfer
 from description_pipeline.runtime import RUNTIME_VERSIONS, required_packages
 from description_pipeline.sources.snapshot import write_manifest
-from description_pipeline.stages import CONTRACT, CONTRACT_FILE_SHA256, CONTRACT_SHA256, STAGE_IDS, VIEW_SCHEMA
+from description_pipeline.stages import stage_view as rendered_stage_view
+
+from . import protocol_support
 
 RUN_ID = "20261010T000000-transfer"
 HANDOFF = "a" * 64
@@ -44,36 +46,23 @@ def native_tool() -> dict:
     }
 
 
-def stage_view(*, run_id: str = RUN_ID, handoff: str = HANDOFF, scope=("freeze", "discover", "capture")) -> dict:
-    definitions = {stage["id"]: stage for stage in CONTRACT["stages"]}
-    stages = []
-    for stage_id in STAGE_IDS:
-        definition = definitions[stage_id]
-        in_scope = stage_id in scope
-        state = "passed" if in_scope else "not_run"
-        input_qc = [{"id": item["id"], "state": state, "details": {}} for item in definition["input_qc"]]
-        output_qc = [{"id": item["id"], "state": state, "details": {}} for item in definition["output_qc"]]
-        stages.append(
-            {
-                "id": stage_id,
-                "state": "completed" if in_scope else "not_run",
-                "in_scope": in_scope,
-                "checks_passed": len(input_qc) + len(output_qc) if in_scope else 0,
-                "checks_total": len(input_qc) + len(output_qc),
-                "input_qc": input_qc,
-                "output_qc": output_qc,
-            }
-        )
-    return {
-        "schema_version": VIEW_SCHEMA,
-        "pipeline_id": PIPELINE_ID,
-        "contract_sha256": CONTRACT_SHA256,
-        "contract_file_sha256": CONTRACT_FILE_SHA256,
-        "run_id": run_id,
-        "handoff_sha256": handoff,
-        "execution_scope": list(scope),
-        "stages": stages,
-    }
+def stage_view(
+    *, run_id: str = RUN_ID, handoff: str = HANDOFF, scope=("freeze", "discover", "capture"), events=None
+) -> dict:
+    """The real rendered receipt (from synthetic protocol events) carrying its raw events list."""
+
+    if events is None:
+        events = protocol_support.protocol_events(stages=tuple(scope))
+    view = rendered_stage_view(
+        {
+            "run_id": run_id,
+            "request": {"handoff_sha256": handoff},
+            "result": {"execution_scope": list(scope)},
+            "events": events,
+        }
+    )
+    view["events"] = events
+    return view
 
 
 def capture_root(base: Path, *, run_id: str = RUN_ID, handoff: str = HANDOFF, main: str = MAIN_ASSEMBLY) -> Path:
@@ -797,6 +786,52 @@ class StageTransferTests(unittest.TestCase):
         (removed / "reports/native-stages.json").unlink()
         with self.assertRaises(PipelineError):
             transfer.verify_transfer(removed)
+
+    def test_native_receipts_must_carry_events_that_rebuild_their_rows(self) -> None:
+        cases = {}
+
+        without_events = stage_view()
+        without_events.pop("events")
+        cases["no-events"] = (without_events, "carry the raw protocol events")
+
+        foreign = stage_view()
+        foreign["events"] = [
+            *foreign["events"],
+            {"at": "2026-10-10T00:00:00+00:00", "stage": "generate", "state": "completed"},
+        ]
+        cases["foreign-stage"] = (foreign, "first three stages")
+
+        missing_stage = stage_view()
+        missing_stage["events"] = [event for event in missing_stage["events"] if event.get("stage") != "capture"]
+        cases["incomplete-events"] = (missing_stage, "rebuilt from their own events")
+
+        malformed = stage_view()
+        malformed["events"] = [
+            *malformed["events"],
+            {
+                "at": "2026-10-10T00:00:00+00:00",
+                "stage": "capture",
+                "state": "running",
+                "check": {"state": "maybe"},
+            },
+        ]
+        cases["malformed-check"] = (malformed, "malformed")
+
+        for label, (receipt, expected) in cases.items():
+            with self.subTest(case=label):
+                root = capture_root(self.base / label)
+                write_json(root / "reports/native-stages.json", receipt)
+                with self.assertRaisesRegex(PipelineError, expected):
+                    seal(root, self.base / f"{label}.zip")
+
+    def test_receipts_rebuilt_from_fabricated_rows_are_refused(self) -> None:
+        # Stored rows claim success while the bound events never reported the checks.
+        receipt = stage_view()
+        receipt["events"] = [event for event in receipt["events"] if isinstance(event.get("check"), dict)][:1]
+        root = capture_root(self.base / "fabricated")
+        write_json(root / "reports/native-stages.json", receipt)
+        with self.assertRaisesRegex(PipelineError, "rebuilt from their own events"):
+            seal(root, self.base / "fabricated.zip")
 
     def test_windows_evidence_paths_transport_onto_linux(self) -> None:
         """The real identity.assembly is a Windows absolute path; binding must not parse it."""
