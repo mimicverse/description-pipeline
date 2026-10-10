@@ -1148,119 +1148,224 @@ def _coordinate_system_feature(doc, name):
     return None
 
 
-def _entity_reference_observation(entity, source_root):
-    """Raw facts about one referenced entity; unreadable fields stay explicit."""
-
-    observation: dict = {}
-    try:
-        component = _method(entity, "GetComponent")
-    except Exception as error:  # noqa: BLE001 - additive diagnostics must not fail the capture
-        observation["unreadable"] = True
-        observation["owner_error"] = f"{type(error).__name__}: {error}"[:200]
-        return observation
-    if component is None:
-        observation["owner_component"] = None
-        observation["owner_document"] = None
-        return observation
-    try:
-        observation["owner_component"] = str(_member(component, "Name2") or "") or None
-    except Exception as error:  # noqa: BLE001
-        observation["unreadable"] = True
-        observation["owner_component_error"] = f"{type(error).__name__}: {error}"[:200]
-    try:
-        raw = str(_method(component, "GetPathName") or "")
-        observation["owner_document"] = _relative_document(raw, source_root) or normalize_document_path(raw)
-    except Exception as error:  # noqa: BLE001
-        observation["unreadable"] = True
-        observation["owner_document_error"] = f"{type(error).__name__}: {error}"[:200]
-    return observation
-
-
 def _coordinate_system_references(doc, name, *, source_root, document, configuration, scope):
-    """Raw definition-reference observations for one coordinate-system feature.
+    """Mark definition ownership unread without changing the native saved state.
 
-    Reads ``IFeature.GetDefinition`` → ``ICoordinateSystemFeatureData`` and
-    records the origin entity, the three axis entity sets, the documented
-    native type values (``GetOriginEntityType`` / ``Get*AxisEntitiesTypes``),
-    the flip flags and each entity's owning component via the documented
-    ``IEntity.GetComponent``.  Facts are kept per entity and per axis — a
-    cross-component origin/axis set is recorded as such, never collapsed to a
-    single owner and never turned into a datum-owner or link inference.  This
-    is an additive diagnostic block: every unreadable member or entity is
-    explicit, and no failure here changes the datum record or any check.
+    ICoordinateSystemFeatureData entities require AccessSelections. On the
+    installed SolidWorks API that call sets GetSaveFlag even after balanced
+    ReleaseSelectionAccess. Production reads the coordinate transform only;
+    empty entity arrays without access must never imply absent references.
     """
 
-    block: dict = {
+    return {
+        "state": "unread",
         "source": "IFeature.GetDefinition / ICoordinateSystemFeatureData",
         "context": {
             "document": str(document or ""),
             "configuration": str(configuration or ""),
             "scope": str(scope or ""),
         },
+        "reason": "AccessSelections changes the document saved state",
+        "required_api": "ICoordinateSystemFeatureData.AccessSelections/ReleaseSelectionAccess",
     }
 
-    def read(label, reader):
-        try:
-            return reader()
-        except Exception as error:  # noqa: BLE001 - additive diagnostics stay explicit
-            block[label + "_error"] = f"{type(error).__name__}: {error}"[:200]
-            return None
 
+def _features_of_type(doc, type_names):
+    """Read matching top-level features without changing selection or rollback."""
+
+    feature = _dynamic(_method(doc, "FirstFeature"))
+    while feature is not None:
+        if str(_method(feature, "GetTypeName2") or "") in type_names:
+            yield feature
+        feature = _dynamic(_method(feature, "GetNextFeature"))
+
+
+def _specific_feature_object(feature):
+    """Read the polymorphic return without forcing it through the mate IID.
+
+    GetSpecificFeature2 can return IAttribute or IRefAxis as well as IMate2.
+    VT_UNKNOWN preserves the native return, which pywin32 then wraps as the
+    object's own IDispatch. No interface name is guessed from a failed query.
+    """
+
+    ole = getattr(feature, "_oleobj_", None)
+    if ole is None:
+        return _method(feature, "GetSpecificFeature2")
+    import pythoncom
+
+    raw = ole.InvokeTypes(
+        ole.GetIDsOfNames("GetSpecificFeature2"), 0, pythoncom.DISPATCH_METHOD, (pythoncom.VT_UNKNOWN, 0), ()
+    )
+    return _dynamic(_win32().Dispatch(raw)) if raw is not None else None
+
+
+def _reference_axis_record(doc, name, component="", selector=None):
+    """Exact native RefAxis endpoints and the line rederived from those endpoints."""
+
+    detail = {"component": component, "feature_name": name}
     try:
-        feature = _coordinate_system_feature(doc, name)
-    except Exception as error:  # noqa: BLE001
-        block["definition_error"] = f"{type(error).__name__}: {error}"[:200]
-        return block
-    if feature is None:
-        block["definition_error"] = "coordinate system feature not found in the active tree"
-        return block
-    definition = read("definition", lambda: _method(feature, "GetDefinition"))
-    if definition is None:
-        if "definition_error" not in block:
-            block["definition_error"] = "GetDefinition returned no feature data object"
-        return block
-
-    origin = read("origin", lambda: _member(definition, "OriginEntity"))
-    origin_type = read("origin_type", lambda: _method(definition, "GetOriginEntityType"))
-    block["origin"] = {
-        "entity": _entity_reference_observation(_dynamic(origin), source_root) if origin is not None else None,
-        "type_value": origin_type if type(origin_type) is int else None,
+        matching = [f for f in _features_of_type(doc, {"RefAxis"}) if str(_member(f, "Name") or "") == name]
+        if len(matching) != 1:
+            raise ValueError(f"expected one exact RefAxis feature, found {len(matching)}")
+        feature = matching[0]
+        suppressed = _method(feature, "IsSuppressed")
+        if type(suppressed) is not bool or suppressed:
+            raise ValueError("reference axis is suppressed or its state is unreadable")
+        error_code = _method(feature, "GetErrorCode")
+        if type(error_code) is not int or error_code != 0:
+            raise ValueError(f"reference axis has an unreadable or nonzero feature error: {error_code!r}")
+        axis = _specific_feature_object(feature)
+        endpoints = [float(value) for value in _as_list(_method(axis, "GetRefAxisParams"))]
+        if len(endpoints) != 6 or not all(math.isfinite(value) for value in endpoints):
+            raise ValueError("GetRefAxisParams must return six finite endpoint coordinates")
+        vector = [endpoints[index + 3] - endpoints[index] for index in range(3)]
+        norm = math.hypot(*vector)
+        if norm <= 0 or not math.isfinite(norm):
+            raise ValueError("reference-axis endpoints do not define a finite nonzero line")
+    except Exception as error:
+        raise CadError("cad_axis_reference_unreadable", str(error), detail) from error
+    return {
+        "kind": "reference_axis",
+        "component": component,
+        "selector": dict(selector or {"kind": "reference_axis", **detail}),
+        "coordinate_frame": "component_local" if component else "assembly",
+        "direction_semantics": "undirected_axis_line",
+        "raw_endpoints_m": endpoints,
+        "axis_point_m": endpoints[:3],
+        "axis_direction": [value / norm for value in vector],
+        "used_api": "IFeature.GetSpecificFeature2/IRefAxis.GetRefAxisParams",
     }
-    if origin_type is not None and type(origin_type) is not int:
-        block["origin"]["type_error"] = f"non-integer type value: {origin_type!r}"[:200]
 
-    for member, flipped_member, label in (
-        ("XAxisEntities", "XFlipped", "x_axis"),
-        ("YAxisEntities", "YFlipped", "y_axis"),
-        ("ZAxisEntities", "ZFlipped", "z_axis"),
-    ):
-        raw_entities = read(label, lambda m=member: _member(definition, m))
-        entities = []
-        if raw_entities is not None:
-            try:
-                for item in _as_list(raw_entities):
-                    entities.append(_entity_reference_observation(_dynamic(item), source_root))
-            except Exception as error:  # noqa: BLE001
-                block[label + "_list_error"] = f"{type(error).__name__}: {error}"[:200]
-        type_values = read(
-            label + "_types",
-            lambda m=member: _method(definition, "Get" + m.replace("Entities", "EntitiesTypes")),
+
+URDF_EXPORTER_ATTRIBUTE_NAME = "URDF Export Configuration (v1.4)"
+_URDF_EXPORTER_PARAMETERS = (
+    ("data", 1, 0),
+    ("name", 1, 0),
+    ("date", 1, 0),
+    ("exporterVersion", 0, 1.0),
+)
+
+
+def _urdf_exporter_attribute(app, doc, source_root, configuration):
+    """Read the stored exporter XML and bind its exact persistent-reference bytes.
+
+    Schema registration is session-local (no CreateInstance, SetParameter or
+    save). This layer records native facts only; the model decoder owns the
+    interpretation of links, joints and engineering semantics.
+    """
+
+    result = {
+        "state": "unread",
+        "attribute_name": URDF_EXPORTER_ATTRIBUTE_NAME,
+        "document": _relative_document(str(_method(doc, "GetPathName") or ""), source_root),
+        "configuration": configuration,
+        "registration": {},
+        "pid_bindings": [],
+    }
+    try:
+        features = [
+            feature
+            for feature in _features_of_type(doc, {"Attribute"})
+            if str(_member(feature, "Name") or "").startswith(URDF_EXPORTER_ATTRIBUTE_NAME)
+        ]
+    except Exception as error:  # noqa: BLE001 - unread must never become absent
+        result["error"] = f"attribute feature traversal failed: {type(error).__name__}: {error}"[:300]
+        return result
+    if not features:
+        result["state"] = "absent"
+        return result
+    if len(features) != 1:
+        result["error"] = "multiple exporter attributes matched the stored schema name"
+        return result
+    try:
+        definition = _method(app, "DefineAttribute", URDF_EXPORTER_ATTRIBUTE_NAME)
+        result["registration"]["defined"] = definition is not None
+        for name, kind, default in _URDF_EXPORTER_PARAMETERS:
+            result["registration"][name] = bool(_method(definition, "AddParameter", name, kind, default, 0))
+        result["registration"]["register"] = bool(_method(definition, "Register"))
+    except Exception as error:  # noqa: BLE001 - a registered schema may already exist
+        result["registration"]["error"] = f"{type(error).__name__}: {error}"[:300]
+    try:
+        attribute = _specific_feature_object(features[0])
+        actual_name = str(_method(attribute, "GetName") or "")
+        if actual_name != URDF_EXPORTER_ATTRIBUTE_NAME:
+            raise ValueError(f"stored attribute schema name mismatch: {actual_name!r}")
+        data = _dynamic(_method(attribute, "GetParameter", "data"))
+        xml = _method(data, "GetStringValue")
+        if not isinstance(xml, str) or not xml.strip():
+            raise ValueError("stored exporter XML is empty or not a string")
+        result["raw_xml"] = xml
+        result["raw_xml_sha256"] = hashlib.sha256(xml.encode("utf-8")).hexdigest()
+        version_parameter = _dynamic(_method(attribute, "GetParameter", "exporterVersion"))
+        version = float(_method(version_parameter, "GetDoubleValue"))
+        if not math.isfinite(version):
+            raise ValueError("stored exporter version is not finite")
+        result.update(
+            {
+                "exporter_version": version,
+                "pid_bindings": _urdf_exporter_pid_bindings(xml, _member(doc, "Extension"), source_root),
+                "state": "extracted",
+            }
         )
-        types = None
-        if type_values is not None:
-            types = []
-            for value in _as_list(type_values):
-                types.append(value if type(value) is int else {"error": f"non-integer type value: {value!r}"[:200]})
-        flipped = read(label + "_flipped", lambda m=flipped_member: _member(definition, m))
-        entry: dict = {
-            "entities": entities,
-            "types": types,
-            "flipped": flipped if type(flipped) is bool else None,
-        }
-        if flipped is not None and type(flipped) is not bool:
-            entry["flipped_error"] = f"non-boolean flip state: {flipped!r}"[:200]
-        block[label] = entry
-    return block
+    except Exception as error:  # noqa: BLE001 - preserve the unread attribute explicitly
+        result["error"] = f"{type(error).__name__}: {error}"[:300]
+    return result
+
+
+def _urdf_exporter_pid_bindings(xml_text, extension, source_root):
+    """Resolve each unique declared PID as exact bytes, preserving XML separately."""
+
+    import base64
+    import xml.etree.ElementTree as ElementTree
+
+    import pythoncom
+
+    root = ElementTree.fromstring(xml_text)
+    bindings = []
+    seen = set()
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1] not in {"SWComponentPIDs", "SWMainComponentPID", "SWComponentPID"}:
+            continue
+        for node in element.iter():
+            if node.tag.rsplit("}", 1)[-1] != "base64Binary":
+                continue
+            encoded = "".join((node.text or "").split())
+            data = base64.b64decode(encoded, validate=True)
+            if not data:
+                raise ValueError("stored component PID is empty")
+            if data in seen:
+                continue
+            seen.add(data)
+            row = {
+                "pid_hex": data.hex(),
+                "pid_base64": encoded,
+                "pid_sha256": hashlib.sha256(data).hexdigest(),
+                "name2": None,
+                "document": None,
+                "configuration": None,
+                "error_code": None,
+            }
+            try:
+                errors = _win32().VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+                variant = _win32().VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_UI1, data)
+                resolved = _method(extension, "GetObjectByPersistReference3", variant, errors)
+                row["error_code"] = errors.value
+                if resolved is None:
+                    raise ValueError("GetObjectByPersistReference3 returned no object")
+                component = _component(_dynamic(resolved))
+                row["name2"] = str(_member(component, "Name2") or "") or None
+                row["document"] = _relative_document(str(_method(component, "GetPathName") or ""), source_root)
+                row["configuration"] = str(_member(component, "ReferencedConfiguration") or "") or None
+                if (
+                    type(row["error_code"]) is not int
+                    or row["error_code"] != 0
+                    or not all(row[key] for key in ("name2", "document", "configuration"))
+                ):
+                    raise ValueError("persistent reference did not resolve to a complete current component identity")
+            except Exception as error:  # noqa: BLE001 - every failed binding stays explicit
+                row["resolution_error"] = f"{type(error).__name__}: {error}"[:300]
+            bindings.append(row)
+    return bindings
 
 
 def _mate_specific(feature, strict=False):
@@ -2036,7 +2141,7 @@ class SolidWorksBackend(CadBackend):
         }
 
     def capture_axis_reference(self, reference):
-        """Resolve a structured native face reference to its cylindrical axis.
+        """Resolve a named reference axis or a native cylindrical face.
 
         ``reference`` is the authored joint ``axis_reference``
         (``{component, face_index, body_type}``).  The returned record carries
@@ -2050,6 +2155,19 @@ class SolidWorksBackend(CadBackend):
         """
 
         component = str(reference.get("component") or "")
+        if reference.get("kind") == "reference_axis":
+            name = reference.get("feature_name")
+            if not _is_text_name(name) or "face_index" in reference:
+                raise CadError("cad_axis_reference_invalid", "a reference axis needs an exact feature_name", reference)
+            if not component:
+                doc = self._captured_document(self._scene_document_key, phase="axis_reference")
+                return _reference_axis_record(doc, name, component, reference)
+            if component not in self._components:
+                raise CadError("cad_missing_component", component, {"axis_reference": reference})
+            with self._current_components("axis_reference"):
+                key, _configuration_name = self._source_components[component]
+                doc = self._captured_document(key, component, "axis_reference")
+                return _reference_axis_record(doc, name, component, reference)
         if component not in self._components:
             raise CadError("cad_missing_component", component, {"axis_reference": reference})
         feature_name = reference.get("feature_name")
@@ -3349,6 +3467,8 @@ class SolidWorksBackend(CadBackend):
                 raise CadError("cad_rebuild_failed", "ForceRebuild3 reported failure; the saved state is stale")
             _manager, active = _active_configuration_view(doc)
             configuration = str(_member(active, "Name") or "")
+            if not configuration:
+                raise CadError("cad_configuration_missing", "the saved main assembly configuration is unreadable")
             activity.emit("read_properties", current_object=_activity_object(main_path, source_root), force=True)
             identity_properties = _custom_properties(doc, configuration)
             entries = None
@@ -3720,6 +3840,14 @@ class SolidWorksBackend(CadBackend):
                         ),
                     }
                 )
+            exporter_block = _urdf_exporter_attribute(self._app_obj(), doc, source_root, configuration)
+            reference_axes = []
+            for feature in _features_of_type(doc, {"RefAxis"}):
+                suppressed = _method(feature, "IsSuppressed")
+                if type(suppressed) is not bool:
+                    raise CadError("cad_axis_reference_unreadable", "reference axis suppression state is unreadable")
+                if not suppressed:
+                    reference_axes.append(_reference_axis_record(doc, str(_member(feature, "Name"))))
             for entry in components:
                 source = by_component.get(entry["name2"])
                 if source is None or not source[1] or entry["suppressed"]:
@@ -3794,6 +3922,7 @@ class SolidWorksBackend(CadBackend):
                 "namespace": "dp",
                 "generator": "solidworks-native-reader",
                 "solidworks": dict(self.environment()),
+                "saved_configuration": configuration,
                 "identity": {
                     "hardware_id": identity_properties.get("dp.hardware_id"),
                     "revision": identity_properties.get("dp.revision"),
@@ -3811,6 +3940,8 @@ class SolidWorksBackend(CadBackend):
                 "components": components,
                 "mates": mates,
                 "datums": datums,
+                "reference_axes": reference_axes,
+                "exporter": exporter_block,
                 "masses": masses,
                 "properties": property_buckets,
                 "files": files,
