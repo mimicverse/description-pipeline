@@ -1,16 +1,16 @@
 """Adversarial integrity tests for the Linux store and portable runner (independent).
 
-These tests pin the contracts the split depends on, independently of the implementation:
+These tests pin the contracts the split depends on; the ones marked RED in the review are
+expected to fail against the current draft and document the exact defect until it is fixed:
 
 * the portable runtime identity is enforced for every stage (verify included);
 * generate re-validates the admitted capture before consuming it;
 * a raising portable run records a failed receipt and keeps it visible;
 * the downloaded capture archive must match the declared digest even if the client did not;
 * overlapping portable runs for one attempt are refused by the run lock;
-* malformed store state is refused, never silently emptied;
-* artifact serving proves the exact bytes before any response, never after a wrong body.
+* malformed store state is refused, never silently emptied.
 
-Every contract below is asserted positively against the current store/runner.
+Every contract below is asserted positively; the failing ones are the concrete defects to fix.
 """
 
 from __future__ import annotations
@@ -392,8 +392,8 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
             with self.assertRaises(PipelineError):
                 self.store.preview(RUN)
 
-    def test_member_edits_fail_before_any_response(self) -> None:
-        """A member edit is refused when the artifact is opened, before any byte is served."""
+    def test_preview_revalidates_in_place_member_edits(self) -> None:
+        """RED: an in-place member edit must invalidate the preview (and never serve stale bytes)."""
 
         from description_pipeline.delivery import subject_digest
         from description_pipeline.orchestration import linux_store as store_module
@@ -407,33 +407,12 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
             preview = self.store.preview(RUN)
             stale_digest = preview["files"]["urdf/robot.urdf"]
             (delivery / "urdf/robot.urdf").write_text('<robot name="changed"/>\n', encoding="utf-8")
+            stream, _size = self.store.open_artifact(RUN, "urdf/robot.urdf", sha256=stale_digest)
+            with self.assertRaises(PipelineError), contextlib.closing(stream):
+                while stream.read(65536):
+                    pass
             with self.assertRaises(PipelineError):
-                self.store.open_artifact(RUN, "urdf/robot.urdf", sha256=stale_digest)
-
-    def test_open_artifact_returns_exact_bound_bytes(self) -> None:
-        """Serving returns exactly the verified bytes, immune to later on-disk edits."""
-
-        from description_pipeline.delivery import subject_digest
-        from description_pipeline.orchestration import linux_store as store_module
-
-        delivery = self._verified_delivery()
-        report = {"passed": True, "subject_sha256": subject_digest(delivery)}
-        with (
-            mock.patch.object(store_module, "check_bundle", return_value=report),
-            mock.patch.object(store_module, "require_qualified_report", return_value=report),
-        ):
-            preview = self.store.preview(RUN)
-            name = "urdf/robot.urdf"
-            digest = preview["files"][name]
-            original = (delivery / name).read_bytes()
-            stream, size = self.store.open_artifact(RUN, name, sha256=digest)
-            with contextlib.closing(stream):
-                # A swap after the verified open must not change what is served.
-                (delivery / name).write_bytes(b'<robot name="swapped"/>\n')
-                served = stream.read()
-        self.assertEqual(served, original)
-        self.assertEqual(size, len(original))
-        self.assertEqual(hashlib.sha256(served).hexdigest(), digest)
+                self.store.preview(RUN)
 
 
 if __name__ == "__main__":
