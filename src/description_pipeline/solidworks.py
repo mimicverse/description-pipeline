@@ -177,8 +177,11 @@ def _finish_native_capture(staging, output, receipt, *, run_id, handoff_sha256, 
     write_json(staging / "reports/native-tool.json", tool)
     receipt.update(state="native_complete", passed=False, native_complete=True, native_tool=tool, stage="capture")
     _stamp(staging, receipt)
-    # The native receipt must stay stable even when Linux rewrites reports/stages.json.
-    shutil.copy2(staging / "reports/stages.json", staging / "reports/native-stages.json")
+    # The native receipt must stay stable even when Linux rewrites reports/stages.json, and
+    # it keeps the raw events (with timestamps) so the portable side can seed prior_events.
+    native_stages = read_data(staging / "reports/stages.json")
+    native_stages["events"] = list(receipt["events"])
+    write_json(staging / "reports/native-stages.json", native_stages)
     from .orchestration.stage_transfer import CAPTURE_ARCHIVE, CAPTURE_MANIFEST, seal_capture
 
     archive = staging / CAPTURE_ARCHIVE
