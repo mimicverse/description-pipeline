@@ -424,6 +424,36 @@ def document_paths_match(active, requested):
     return bool(a and b and (a == b or ("\\" not in b and a.rsplit("\\", 1)[-1] == b)))
 
 
+def _matches_assembly_root(reference, root, reference_full, reference_name) -> bool:
+    """True when a mate entity references the owning assembly's own root component.
+
+    The root object read from ``GetRootComponent3`` under the assembly's current
+    configuration is the authority: its document must be the assembly and its
+    ``Name2`` must equal the entity's reference name.  When the API exposes an
+    ``IsRoot`` reading it must not say False.  A matching document alone (or a
+    name alone) is never accepted.
+    """
+
+    if root is None:
+        return False
+    try:
+        root_full = str(_method(root, "GetPathName") or "")
+        root_name = str(_member(root, "Name2") or "")
+    except Exception:  # noqa: BLE001 - an unreadable root object cannot prove identity
+        return False
+    if not root_name or not document_paths_match(root_full, reference_full):
+        return False
+    if reference_name != root_name:
+        return False
+    try:
+        flag = _member(reference, "IsRoot")
+    except Exception:  # noqa: BLE001 - the published API may not expose IsRoot
+        return True
+    if type(flag) is bool:
+        return flag
+    return True
+
+
 def _inertia_from_raw(values, component):
     """Parse the documented nine-value ``GetMomentOfInertia(0)`` full tensor.
 
@@ -2574,6 +2604,10 @@ class SolidWorksBackend(CadBackend):
         assembly's scope — ``""`` for the frozen root, or the sub-assembly
         occurrence path for a nested frame — and ``assembly_frame: true``.
         They bind to the assembly frame, never to a component occurrence name.
+        The entity is identified as the assembly root against the object read
+        from ``GetRootComponent3`` under the assembly's current configuration
+        (document and root ``Name2`` must agree; an available ``IsRoot`` reading
+        must not say False) — never from the reference name alone.
         """
 
         source_root = Path(frozen_source).resolve()
@@ -2845,7 +2879,9 @@ class SolidWorksBackend(CadBackend):
                             # An entity may lie on the owning assembly's own reference
                             # geometry (assembly planes/axes): it has no component
                             # occurrence identity and belongs to that assembly's frame.
-                            assembly_frame = document_paths_match(str(assembly_path), reference_full)
+                            # The root object from this assembly's current configuration
+                            # is the authority; a document match alone is not proof.
+                            assembly_frame = _matches_assembly_root(reference, root, reference_full, reference_name)
                             # EXEMPT (untyped multi-type return): IMateEntity2.Reference
                             # is a VT_DISPATCH spanning multiple native geometry kinds
                             # with no single declared view, so the generic dispatch
