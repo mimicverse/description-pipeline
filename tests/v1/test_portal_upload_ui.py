@@ -262,6 +262,21 @@ class ReportUiContractTests(unittest.TestCase):
         self.assertNotIn('sum("warnings")', app)
         self.assertNotIn("checkbox", app)
 
+    def test_failure_card_lists_failed_checks_and_keeps_warnings_separate(self) -> None:
+        """A failed stage names its exact failed checks instead of "原因未判定"."""
+
+        app = self.app()
+        for token in (
+            "buildFailureCard(report.failure, report)",
+            "未通过的自动检查（",
+            "failedChecks.slice(0, 5)",
+            "源完整性未通过说明",
+            "该阶段另有",
+            "警告不计为通过",
+        ):
+            self.assertIn(token, app)
+        self.assertNotIn("buildFailureCard(report.failure);", app)
+
     def test_no_legacy_stage_view_rendering_survives(self) -> None:
         app = self.app()
         for legacy in (

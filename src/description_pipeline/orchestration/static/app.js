@@ -1021,16 +1021,59 @@ function renderStageWarnings(root, stage, note) {
   root.append(group);
 }
 
-function buildFailureCard(failure) {
+function buildFailureCard(failure, report) {
   const card = document.createElement("div");
   card.className = "fail-card";
   const title = document.createElement("strong");
   title.textContent = failure.title_zh || "运行失败";
   card.append(title);
-  if (failure.meaning_zh) {
+  const stage =
+    report && Array.isArray(report.stages) ? report.stages.find((entry) => entry && entry.id === failure.stage) : null;
+  const failedChecks = stage
+    ? [...(Array.isArray(stage.boundary) ? stage.boundary : []), ...(Array.isArray(stage.independent) ? stage.independent : [])]
+        .filter((row) => row && row.state === "failed")
+    : [];
+  const warningCount = stage && Number.isFinite(stage.counts && stage.counts.warnings) ? stage.counts.warnings : 0;
+  if (failure.meaning_zh && !(failure.kind === "unknown" && failedChecks.length)) {
     const meaning = document.createElement("p");
     meaning.textContent = failure.meaning_zh;
     card.append(meaning);
+  }
+  if (failedChecks.length) {
+    const heading = document.createElement("p");
+    heading.textContent = `未通过的自动检查（${failedChecks.length} 项）：`;
+    card.append(heading);
+    for (const row of failedChecks.slice(0, 5)) {
+      const line = document.createElement("p");
+      line.className = "muted small";
+      const message = row.summary && row.summary.actual ? row.summary.actual : "未通过";
+      line.textContent = `${row.label_zh || row.id || "检查"}：${message}`;
+      card.append(line);
+    }
+    if (failedChecks.length > 5) {
+      const more = document.createElement("p");
+      more.className = "muted small";
+      more.textContent = `另有 ${failedChecks.length - 5} 项未通过检查，逐项证据见下方阶段检查。`;
+      card.append(more);
+    }
+    if (failedChecks.some((row) => String(row.id || "").startsWith("source."))) {
+      const hint = document.createElement("p");
+      hint.className = "muted small";
+      hint.textContent =
+        "源完整性未通过说明冻结的源文件与清单或采集记录不一致；逐项差异见该检查的原始证据，不代表 CAD 缺陷。";
+      card.append(hint);
+    } else {
+      const detail = document.createElement("p");
+      detail.className = "muted small";
+      detail.textContent = "逐项证据见下方阶段检查的“原始证据”。";
+      card.append(detail);
+    }
+  }
+  if (warningCount > 0) {
+    const warnings = document.createElement("p");
+    warnings.className = "muted small";
+    warnings.textContent = `该阶段另有 ${warningCount} 项记录警告：警告不计为通过，也不作为验收或发布依据。`;
+    card.append(warnings);
   }
   if (failure.kind === "definition" || failure.kind === "runtime") {
     const kind = document.createElement("p");
@@ -1659,7 +1702,7 @@ function renderRun(run) {
   const failureCard = $("failure-card");
   failureCard.textContent = "";
   if (report && report.failure) {
-    failureCard.append(buildFailureCard(report.failure));
+    failureCard.append(buildFailureCard(report.failure, report));
     failureCard.hidden = false;
   } else {
     failureCard.hidden = true;
