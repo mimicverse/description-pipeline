@@ -621,12 +621,20 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
     # exact author path may still be listed by the engine, but after the
     # coverage proof below it is excluded from the required graph and copied
     # graph as recorded evidence -- never a broad STEP or name rule.
-    author_metadata_paths = {
+    # Only genuinely external author links are excluded: an author path that is
+    # itself inside the admitted roots is an ordinary delivered dependency and
+    # is never dropped (e.g. NP-F550.step resolving inside the flat package).
+    def _author_link_is_external(value) -> bool:
+        roots = cfg.get("allowed_roots") or []
+        return bool(roots) and not _under(str(value), roots)
+
+    author_metadata_external = {
         os.path.normcase(os.path.abspath(str(entry.get("author_imported_path"))))
         for entry in closure.get("imports") or []
         if isinstance(entry, dict)
         and entry.get("state") == "cached_materialization"
         and entry.get("author_imported_path")
+        and _author_link_is_external(entry.get("author_imported_path"))
     }
     inspector = getattr(backend, "inspect_copy", None)
     if not callable(inspector):
@@ -706,7 +714,7 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
             suppressed_skipped.append(path)
             continue
         normalized = os.path.normcase(os.path.abspath(path)) if path else ""
-        if path and materializations_verified and normalized in author_metadata_paths:
+        if path and materializations_verified and normalized in author_metadata_external:
             stale_source_links.append(path)
             continue
         if path and materializations_verified and session_materialization_path(path):
@@ -747,7 +755,7 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
             continue
         if materializations_verified and session_materialization_path(path):
             continue
-        if materializations_verified and os.path.normcase(os.path.abspath(path)) in author_metadata_paths:
+        if materializations_verified and os.path.normcase(os.path.abspath(path)) in author_metadata_external:
             continue
         original_documents.append(path)
     original_states: dict[str, dict[str, Any]] = {}
@@ -797,7 +805,7 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
             str(source_dir),
             skip_missing=sorted(suppressed_paths),
             skip_session_temp=materializations_verified,
-            excluded_paths=sorted(author_metadata_paths) if materializations_verified else (),
+            excluded_paths=sorted(author_metadata_external) if materializations_verified else (),
         )
         or {}
     )
@@ -849,7 +857,7 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         if path and os.path.normcase(os.path.abspath(path)) in suppressed_paths:
             suppressed_skipped.append(path)
             continue
-        if path and materializations_verified and os.path.normcase(os.path.abspath(path)) in author_metadata_paths:
+        if path and materializations_verified and os.path.normcase(os.path.abspath(path)) in author_metadata_external:
             stale_source_links.append(path)
             continue
         if path and materializations_verified and session_materialization_path(path):

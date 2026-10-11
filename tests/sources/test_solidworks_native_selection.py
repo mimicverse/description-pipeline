@@ -52,6 +52,7 @@ def occurrence(
     virtual=None,
     imported=None,
     name=None,
+    native_owner=None,
     configuration: str = "默认",
 ) -> dict:
     record = {
@@ -67,6 +68,8 @@ def occurrence(
         record["is_virtual"] = virtual
     if imported is not None:
         record["imported_path"] = imported
+    if native_owner is not None:
+        record["native_owner"] = native_owner
     return record
 
 
@@ -257,17 +260,28 @@ class ClosureAdmissionTests(unittest.TestCase):
         child = session_temp("swx25524", "IC~~", "HL-3608_ASM_52_ASM.stp.SLDASM")
         payload = self.observe(
             [
-                occurrence("HD-1910-C001-20260902.stp-2", parent, imported=r"D:\M2.2\change11\HD.stp"),
+                occurrence(
+                    "HD-1910-C001-20260902.stp-2",
+                    parent,
+                    imported=r"D:\M2.2\change11\HD.stp",
+                    native_owner="robot.SLDASM",
+                ),
                 occurrence(
                     "HD-1910-C001-20260902.stp-2/HL-3608_ASM_52_ASM.stp-1",
                     child,
                     defining=parent,
                     imported=r"D:\M2.2\change11\HD.stp",
+                    native_owner="robot.SLDASM",
                 ),
             ]
         )
         self.assertEqual(len(payload["imports"]), 2)
         self.assertEqual(sorted(payload["graph"]), ["robot.SLDASM"])
+        # The ultimate native owner propagates through nested materialization
+        # descendants (never a temp parent, never None) with its owner hash.
+        for entry in payload["imports"]:
+            self.assertEqual(entry["owner"], "robot.SLDASM")
+            self.assertEqual(entry["owner_sha256"], self.files["robot.SLDASM"])
 
     def test_import_without_materialization_refused(self) -> None:
         with self.assertRaises(SelectionError) as caught:

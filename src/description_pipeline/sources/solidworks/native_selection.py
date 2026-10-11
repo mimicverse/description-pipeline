@@ -13,7 +13,8 @@ bytes in the backend's owned session:
   false-Searchflag query reports the in-session resolution, not the saved
   author references) and are evidence only, never admission,
 * the sealed staged main is opened read-only and every occurrence's actual
-  resolved document (and ``GetImportedPath`` binding for imports) is recorded,
+  resolved document (and, for imports, the materialization/author-metadata
+  readings) is recorded,
 * admission is the native closure: every resolved document must lie under the
   staged root and be a staged upload-index file with matching sha256; any
   out-of-stage, unresolved or unbound-import edge refuses the run with the
@@ -344,11 +345,13 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                 # (no graph edge); the absence test decides cache provenance.
                 cached_materializations.add(cached_key(resolved))
                 author_in_stage = _indexed(stage_root, imported, files) is not None if imported else None
-                owner_sha256 = files.get(defining_name) if defining_name else None
+                owner = record.get("native_owner")
+                owner = owner if isinstance(owner, str) and owner in files else (defining_name or raw_defining)
+                owner_sha256 = files.get(owner) if isinstance(owner, str) and owner in files else None
                 imports.append(
                     {
                         "document": label,
-                        "owner": defining_name,
+                        "owner": owner,
                         "owner_anchor": raw_anchor,
                         "owner_sha256": owner_sha256,
                         "defining_materialization": raw_defining if cached_defining else None,
@@ -372,7 +375,7 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                             "the author import path is metadata, not a proven in-package binding"
                         ),
                         "document": label,
-                        "owner": defining_name,
+                        "owner": owner,
                         "owner_anchor": raw_anchor,
                         "owner_sha256": owner_sha256,
                         "instance": instance,

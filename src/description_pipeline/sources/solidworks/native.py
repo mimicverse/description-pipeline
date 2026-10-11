@@ -669,6 +669,16 @@ def _stage_relative(root, value) -> str | None:
     return relative.as_posix()
 
 
+def _index_spelling(index, relative) -> str | None:
+    """The upload-index spelling of a staged-relative path (case-tolerant)."""
+
+    if relative in index:
+        return relative
+    folded = relative.casefold()
+    matches = [name for name in index if name.casefold() == folded]
+    return matches[0] if len(matches) == 1 else None
+
+
 def import_materialization_path(value) -> bool:
     """True for a session 3D-Interconnect materialization path (``...\\IC~~\\...``).
 
@@ -3613,11 +3623,11 @@ class SolidWorksBackend(CadBackend):
                 root = _component(_member(configuration, "GetRootComponent3", True))
                 occurrences = []
                 stack = [
-                    (child, "", 0, str(main_assembly), None)
+                    (child, "", 0, str(main_assembly), None, str(main_assembly))
                     for child in reversed(_as_list(_method(root, "GetChildren")))
                 ]
                 while stack:
-                    item, context, depth, defining, anchor = stack.pop()
+                    item, context, depth, defining, anchor, native_owner = stack.pop()
                     if depth > 40:
                         raise CadError("cad_assembly_too_deep", str(stage / main_assembly), {"depth": depth})
                     component = _component(item)
@@ -3629,6 +3639,7 @@ class SolidWorksBackend(CadBackend):
                         "depth": depth,
                         "defining": defining,
                         "defining_anchor": anchor,
+                        "native_owner": native_owner,
                     }
                     referenced = _member(component, "ReferencedConfiguration")
                     record["configuration"] = str(referenced) if referenced is not None else None
@@ -3655,8 +3666,11 @@ class SolidWorksBackend(CadBackend):
                     resolved = record["resolved_path"]
                     relative = _stage_relative(stage, resolved) if resolved else None
                     record["resolved_relative"] = relative
-                    materialized = session_materialization_path(resolved) or virtual is True
+                    materialized = session_materialization_path(resolved)
                     anchor_for_children = instance if materialized else anchor
+                    child_owner = native_owner
+                    if not materialized and relative:
+                        child_owner = _index_spelling(index, relative) or native_owner
                     if (not resolved) or relative is None or virtual is True or "IC~~" in resolved:
                         try:
                             imported = _method(component, "GetImportedPath")
@@ -3671,7 +3685,9 @@ class SolidWorksBackend(CadBackend):
                         continue
                     child_defining = relative or resolved or defining
                     for child in reversed(_as_list(_method(component, "GetChildren"))):
-                        stack.append((child, instance, depth + 1, child_defining, anchor_for_children))
+                        stack.append(
+                            (child, instance, depth + 1, child_defining, anchor_for_children, child_owner)
+                        )
                 readings["occurrences"] = occurrences
                 readings["documents_after"] = int(_member(app, "GetDocumentCount"))
             finally:
@@ -3766,7 +3782,7 @@ class SolidWorksBackend(CadBackend):
                     imported_path = reading if isinstance(reading, str) and reading.strip() else None
                 except Exception:  # noqa: BLE001 - a non-imported component has no binding
                     imported_path = None
-            materialized = session_materialization_path(str(document)) or virtual is True
+            materialized = session_materialization_path(str(document))
             anchor_for_children = instance if materialized else anchor
             instances.append(
                 {
@@ -4054,10 +4070,19 @@ class SolidWorksBackend(CadBackend):
                     [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
                     (normalize_document_path(str(main_path)),),
                     None,
+                    str(main_path),
                 )
             ]
             while stack:
-                assembly_path, prefix, referenced_configuration, parent_matrix, ancestor_paths, anchor = stack.pop()
+                (
+                    assembly_path,
+                    prefix,
+                    referenced_configuration,
+                    parent_matrix,
+                    ancestor_paths,
+                    anchor,
+                    owner_path,
+                ) = stack.pop()
                 activity.emit("open_document", current_object=_activity_object(assembly_path, source_root))
                 assembly = self._document_by_path(assembly_path)
                 activity.emit(
@@ -4076,7 +4101,10 @@ class SolidWorksBackend(CadBackend):
                     if not name:
                         components_done += 1
                         continue
-                    path_name = f"{prefix}/{name}" if prefix else name
+                    # The scoped instance identity must be byte-identical to the
+                    # selection walk's (and inspect_copy's) stitching rule so the
+                    # closure carrier's occurrence strings compare exactly.
+                    path_name = name if not prefix or name.startswith(prefix + "/") else f"{prefix}/{name}"
                     if path_name in by_component:
                         raise CadError(
                             "cad_component_identity_ambiguous",
@@ -4099,15 +4127,23 @@ class SolidWorksBackend(CadBackend):
                         source_document["materialization_path"]
                     )
                     anchor_for_children = path_name if materialized else anchor
+                    # Ultimate native owner: the nearest ancestor delivered
+                    # document that owns this occurrence's subtree; nested
+                    # materialization descendants inherit it unchanged.
+                    child_owner_path = owner_path
+                    if not materialized:
+                        child_relative = _relative_document(document_path, source_root)
+                        if child_relative:
+                            child_owner_path = str(Path(source_root) / child_relative)
                     provenance = source_document.get("source_provenance")
                     if provenance is not None:
-                        owner_relative = _relative_document(assembly_path, source_root)
+                        owner_relative = _relative_document(owner_path, source_root)
                         if not owner_relative:
-                            owner_relative = normalize_document_path(str(assembly_path))
+                            owner_relative = normalize_document_path(str(owner_path))
                         try:
-                            if assembly_path not in owner_hashes:
-                                owner_hashes[assembly_path] = _hash(str(assembly_path))
-                            provenance["owner_sha256"] = owner_hashes[assembly_path]
+                            if owner_path not in owner_hashes:
+                                owner_hashes[owner_path] = _hash(str(owner_path))
+                            provenance["owner_sha256"] = owner_hashes[owner_path]
                         except Exception as error:  # noqa: BLE001 - an unreadable owner hash stays explicit
                             provenance["owner_sha256"] = None
                             provenance["owner_sha256_error"] = f"{type(error).__name__}: {error}"[:200]
@@ -4233,6 +4269,7 @@ class SolidWorksBackend(CadBackend):
                                     ],
                                     (*ancestor_paths, document_key),
                                     anchor_for_children,
+                                    child_owner_path,
                                 )
                             )
                     components_done += 1
