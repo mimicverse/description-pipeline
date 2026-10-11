@@ -1683,10 +1683,27 @@ def _urdf_exporter_pid_bindings(xml_text, extension, source_root):
                 row["name2"] = str(_member(component, "Name2") or "") or None
                 row.update(_component_source_document(component, source_root))
                 row["configuration"] = str(_member(component, "ReferencedConfiguration") or "") or None
+                provenance = row.get("source_provenance")
+                cached = (
+                    isinstance(provenance, dict)
+                    and provenance.get("state") == "cached_materialization"
+                    and bool(provenance.get("materialization_path"))
+                )
+                if cached and not row["document"]:
+                    # The exact active occurrence identity for a cached import is
+                    # the engine-resolved session materialization; record it in
+                    # the *same* normalized spelling the component walk uses so
+                    # the PID binding and the active node compare equal.  This
+                    # is the occurrence's own resolved document in the same
+                    # session -- never the author path and never a substitution.
+                    row["document"] = normalize_document_path(str(provenance["materialization_path"]))
+                bound = bool(row["document"])
                 if (
                     type(row["error_code"]) is not int
                     or row["error_code"] != 0
-                    or not all(row[key] for key in ("name2", "document", "configuration"))
+                    or not row["name2"]
+                    or not row["configuration"]
+                    or not bound
                 ):
                     raise ValueError("persistent reference did not resolve to a complete current component identity")
             except Exception as error:  # noqa: BLE001 - every failed binding stays explicit

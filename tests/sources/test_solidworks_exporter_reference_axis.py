@@ -207,13 +207,22 @@ class ReferenceAxisReadTests(unittest.TestCase):
                 backend.capture_axis_reference(reference)
 
 
+def session_materialization(directory: Path, name: str) -> Path:
+    """A structural session materialization: IC~~ under the system temp area."""
+
+    path = directory / "swx4242" / "IC~~" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"generated native part")
+    return path
+
+
 class ImportedSourceBindingTests(unittest.TestCase):
     def test_pid_source_is_captured_before_shared_native_document_reads_change_import_metadata(self):
         with TemporaryDirectory() as tmp, TemporaryDirectory() as native_tmp:
             root = Path(tmp)
             assembly = _write(root, "robot.SLDASM")
             imported = _write(root, "battery.step")
-            generated = _write(Path(native_tmp), "battery.step.SLDPRT")
+            generated = session_materialization(Path(native_tmp), "battery.step.SLDPRT")
             component = _Component("battery-1", generated)
             component.imported_path = str(imported)
             component.GetImportedPath = lambda: component.imported_path
@@ -235,10 +244,19 @@ class ImportedSourceBindingTests(unittest.TestCase):
                 record = backend.discover_native(root, {"main_assembly": "robot.SLDASM"})
             self.assertEqual(record["exporter"]["state"], "extracted")
             row = record["exporter"]["pid_bindings"][0]
-            self.assertEqual(row["document"], "battery.step")
-            self.assertEqual(row["source_provenance"]["imported_path"], str(imported))
+            # The cached class is a complete identity: the row's document is the
+            # occurrence's own session materialization (same normalized spelling
+            # as the active walk), and the author path is author metadata,
+            # captured before the shared-document read could change it.
+            self.assertEqual(row["document"], N.normalize_document_path(str(generated)))
+            self.assertEqual(row["source_provenance"]["state"], "cached_materialization")
+            self.assertEqual(row["source_provenance"]["author_imported_path"], str(imported))
+            self.assertTrue(row["source_provenance"]["author_imported_in_source_root"])
+            self.assertEqual(row["source_provenance"]["author_imported_relative"], "battery.step")
             self.assertNotIn("resolution_error", row)
-            self.assertEqual(record["components"][0]["document"], "battery.step")
+            component_row = record["components"][0]
+            self.assertEqual(row["document"], component_row["document"])
+            self.assertEqual(component_row["source_provenance"]["state"], "cached_materialization")
 
     def test_discovery_records_staleness_without_rebuilding_the_saved_model(self):
         with TemporaryDirectory() as tmp:
@@ -256,12 +274,12 @@ class ImportedSourceBindingTests(unittest.TestCase):
         self.assertEqual(record["document_state"]["before"]["needs_rebuild2_value"], 1)
         self.assertIs(record["document_state"]["after"]["save_flag"], False)
 
-    def test_discovery_binds_and_hashes_the_import_source_not_the_generated_temp_file(self):
+    def test_discovery_records_cached_materialization_without_hashing_the_generated_temp_file(self):
         with TemporaryDirectory() as tmp, TemporaryDirectory() as native_tmp:
             root = Path(tmp)
             assembly = _write(root, "robot.SLDASM")
             imported = _write(root, "battery.step")
-            generated = _write(Path(native_tmp), "battery.step.SLDPRT")
+            generated = session_materialization(Path(native_tmp), "battery.step.SLDPRT")
             component = _Component("battery-1", generated)
             component.GetImportedPath = lambda: str(imported)
             component.IsVirtual = False
@@ -269,29 +287,41 @@ class ImportedSourceBindingTests(unittest.TestCase):
             backend = N.SolidWorksBackend(session_factory=lambda: _Session(app))
             with _com_stubs():
                 record = backend.discover_native(root, {"main_assembly": "robot.SLDASM"})
-            self.assertEqual(record["components"][0]["document"], "battery.step")
-            self.assertEqual(record["components"][0]["source_provenance"]["native_document_path"], str(generated))
-            self.assertEqual(record["files"]["battery.step"], hashlib.sha256(imported.read_bytes()).hexdigest())
+            entry = record["components"][0]
+            provenance = entry["source_provenance"]
+            self.assertEqual(provenance["state"], "cached_materialization")
+            self.assertEqual(provenance["native_document_path"], str(generated))
+            self.assertEqual(provenance["materialization_path"], str(generated))
+            self.assertEqual(provenance["author_imported_path"], str(imported))
+            self.assertTrue(provenance["author_imported_in_source_root"])
+            self.assertEqual(provenance["author_imported_relative"], "battery.step")
+            # The generated temp file is never hashed into the delivered file
+            # map; the delivered bytes binding lives in the selection carrier
+            # (bound_source), not in a discovery-level document claim.
             self.assertNotIn(str(generated), record["files"])
+            self.assertNotIn("battery.step", record["files"])
 
-    def test_current_import_api_binds_temporary_native_part_to_delivered_bytes(self):
-        with TemporaryDirectory() as tmp:
+    def test_current_import_api_records_cached_materialization_with_in_stage_source(self):
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as native_tmp:
             root = Path(tmp)
             source = root / "battery.step"
             source.write_bytes(b"locked imported source")
+            generated = session_materialization(Path(native_tmp), "battery.step.SLDPRT")
             component = SimpleNamespace(
-                GetPathName=lambda: "/temporary/current-session/battery.step.SLDPRT",
+                GetPathName=lambda: str(generated),
                 GetImportedPath=lambda: str(source),
                 IsVirtual=False,
             )
             result = N._component_source_document(component, root)
             self.assertEqual(result["source_provenance"]["source_root"], str(root.resolve()))
-        self.assertEqual(result["document"], "battery.step")
-        provenance = result["source_provenance"]
-        self.assertEqual(provenance["state"], "resolved")
-        self.assertEqual(provenance["sha256"], hashlib.sha256(b"locked imported source").hexdigest())
-        self.assertEqual(provenance["native_document_path"], "/temporary/current-session/battery.step.SLDPRT")
-        self.assertIs(provenance["is_virtual"], False)
+            self.assertIsNone(result["document"])
+            provenance = result["source_provenance"]
+            self.assertEqual(provenance["state"], "cached_materialization")
+            self.assertEqual(provenance["materialization_path"], str(generated))
+            self.assertEqual(provenance["session_temp_root"], str(Path(native_tmp) / "swx4242"))
+            self.assertTrue(provenance["author_imported_in_source_root"])
+            self.assertEqual(provenance["author_imported_relative"], "battery.step")
+            self.assertIs(provenance["is_virtual"], False)
 
     def test_matching_basename_never_substitutes_for_an_external_import(self):
         with TemporaryDirectory() as tmp:
@@ -305,7 +335,9 @@ class ImportedSourceBindingTests(unittest.TestCase):
             result = N._component_source_document(component, root)
         self.assertIsNone(result["document"])
         self.assertEqual(result["source_provenance"]["state"], "unread")
-        self.assertIn("inside the delivered folder", result["source_provenance"]["error"])
+        error = result["source_provenance"]["error"]
+        self.assertIn("not a structural session materialization", error)
+        self.assertIn("IC~~", error)
 
 
 if __name__ == "__main__":
