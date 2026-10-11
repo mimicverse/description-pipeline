@@ -14,10 +14,7 @@ import unittest
 
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
-from description_pipeline.sources.solidworks.freeze import (  # noqa: E402
-    _component_context_record,
-    _effective_instance_record,
-)
+from description_pipeline.sources.solidworks.freeze import _effective_instance_record  # noqa: E402
 from description_pipeline.sources.solidworks.scene import (  # noqa: E402
     _PartReading,
     build_scene,
@@ -187,46 +184,6 @@ class EffectiveInstanceRecordTests(unittest.TestCase):
 
     def _leaf_effective(self):
         return _effective_reading(0.026, (0.002, 0.0, 0.0), role="leaf", document_type="part", name=EASYEDA)
-
-    def test_effective_total_substitutes_the_shallowest_overridden_ancestor(self):
-        instances = [
-            self._instance(
-                "board-1", depth=0, parent=None, document_type="assembly", mass=0.0632,
-                overrides=_flags(OverrideMass=True), effective=self._parent(),
-            ),
-            self._instance(DEV, depth=1, parent="board-1", document_type="part", mass=0.035, overrides=_flags()),
-            self._instance(
-                EASYEDA, depth=1, parent="board-1", document_type="part", mass=0.026,
-                overrides=_flags(OverrideMass=True), effective=self._leaf_effective(),
-            ),
-        ]
-        bodies = [{"name": "base_link", "components": [DEV, EASYEDA]}]
-        record = _component_context_record(self._reading(instances), self._scene(), 0.0632, bodies)
-        self.assertEqual(record["effective_total"]["substituted"], ["board-1"])
-        self.assertAlmostEqual(record["effective_total"]["mass"], 0.0632, places=12)
-        self.assertEqual(record["blockers"], [])
-        self.assertEqual(record["instances"][0]["effective"]["mass"], 0.0632)
-
-    def test_effective_total_records_an_explicit_blocker_when_the_subtree_spans_bodies(self):
-        instances = [
-            self._instance(
-                "board-1", depth=0, parent=None, document_type="assembly", mass=0.0632,
-                overrides=_flags(OverrideMass=True), effective=self._parent(),
-            ),
-            self._instance(DEV, depth=1, parent="board-1", document_type="part", mass=0.035, overrides=_flags()),
-            self._instance(
-                EASYEDA, depth=1, parent="board-1", document_type="part", mass=0.026,
-                overrides=_flags(OverrideMass=True), effective=self._leaf_effective(),
-            ),
-        ]
-        bodies = [
-            {"name": "base_link", "components": [DEV]},
-            {"name": "arm_link", "components": [EASYEDA]},
-        ]
-        record = _component_context_record(self._reading(instances), self._scene(), 0.0632, bodies)
-        self.assertEqual([item["code"] for item in record["blockers"]], ["effective_instance_spans_bodies"])
-        self.assertEqual(record["effective_total"]["substituted"], [])
-        self.assertAlmostEqual(record["effective_total"]["mass"], 0.061, places=12)
 
     def test_effective_instance_record_carries_identity_and_the_override_warning(self):
         scene = self._scene()

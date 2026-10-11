@@ -24,16 +24,7 @@ from .errors import BridgeError, ConfigError
 from .native import session_materialization_path
 from .evidence import build_evidence, capture_environment
 from .jsonio import digest_json, sha256_file, write_json
-from .scene import (
-    _PartReading,
-    assembly_leaf_total,
-    closure_delta,
-    combine_mass_properties,
-    identity_matrix,
-)
-
-# The pipeline-wide STL reader owns the acceptance standard for meshes; the
-# adapter only writes geometry and then asks that reader what it produced.
+# The native adapter binds exported bytes; full mesh analysis runs on Linux.
 from ...io import inventory
 
 FREEZE_SCHEMA = "description-pipeline.solidworks-freeze/v1"
@@ -1267,29 +1258,15 @@ def _exception_trace(error: BaseException) -> list[dict[str, Any]]:
     return chain
 
 
-def _component_context_record(
-    reading: dict[str, Any],
-    scene: Any,
-    assembly_mass: float | None,
-    bodies: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """Align the assembly context's per-instance readings with the leaf/document basis.
+def _component_context_record(reading: dict[str, Any], assembly_mass: float | None) -> dict[str, Any]:
+    """Native component-context observations, verbatim; no derived math.
 
-    ``document_basis_mass_kg`` is the sum of the existing leaf/document readings under that
-    instance (itself, for a leaf).  Totals use only the disjoint depth-0 rows; nested rows are kept
-    to detect overrides a clean parent would otherwise hide.  ``leaf_documents_covered`` counts
-    exact part-row matches, not ancestors.  Everything here is recorded for comparison only: no
-    total is forced to agree and nothing is distributed into any declared mass.
+    Windows records only what CAD answered: per-instance identity, context
+    mass/volume, override flags, effective readings and their failures.
+    Document basis, deltas, totals, coverage and the effective recombination
+    are rebuilt on Linux (``closure.derive_mass_closure``); there is no
+    compatibility format and no computed field survives here.
     """
-
-    leaves = [
-        (str(component.name), float((scene.mass_properties.get(str(component.name)) or {}).get("mass") or 0.0))
-        for component in scene.components
-    ]
-
-    def document_basis(name: str) -> float:
-        prefix = name + "/"
-        return sum(mass for leaf, mass in leaves if leaf == name or leaf.startswith(prefix))
 
     instances = []
     errors = list(reading.get("errors") or [])
@@ -1328,7 +1305,6 @@ def _component_context_record(
         except (KeyError, TypeError, ValueError) as exc:
             errors.append({"name": name, "error": "cad_component_context_invalid", "message": str(exc)[:200]})
             continue
-        basis = document_basis(name)
         instances.append(
             {
                 "name": name,
@@ -1339,128 +1315,16 @@ def _component_context_record(
                 "context_mass_kg": mass,
                 "context_volume_m3": volume,
                 "overrides": overrides,
-                "document_basis_mass_kg": basis,
-                "delta_kg": mass - basis,
                 "effective": entry.get("effective"),
                 "effective_error": entry.get("effective_error"),
             }
         )
-    leaf_names = {leaf for leaf, _ in leaves}
-    part_rows = {entry["name"] for entry in instances if entry["document_type"] == "part"}
-    covered = {leaf for leaf in leaf_names if leaf in part_rows}
-    top_level = [entry for entry in instances if entry["depth"] == 0]
-    context_total = sum(entry["context_mass_kg"] for entry in top_level)
-    document_total = sum(entry["document_basis_mass_kg"] or 0.0 for entry in top_level)
-    assembly_kg = None if assembly_mass is None else float(assembly_mass)
-    # Effective recombination: the shallowest overridden ancestor substitutes
-    # its whole subtree per rigid body, and only when its entire descendant
-    # leaf set lies in exactly one body.  leaf_total stays diagnostic; nothing
-    # is distributed and no delta is coerced.
-    effective_readings = {
-        str(entry["name"]): entry.get("effective")
-        for entry in instances
-        if isinstance(entry.get("effective"), dict)
-    }
-    body_members: dict[str, str] = {}
-    for body in bodies or []:
-        if not isinstance(body, dict):
-            continue
-        body_name = str(body.get("name") or body.get("id") or "")
-        for member in body.get("components") or []:
-            body_members[str(member)] = body_name
-    transforms = {
-        str(getattr(component, "name", "") or ""): getattr(component, "transform", None)
-        for component in (scene.components or [])
-    }
-    parent_readings = {
-        name: value
-        for name, value in effective_readings.items()
-        if str(value.get("document_type") or value.get("role") or "") == "assembly"
-    }
-    blockers: list[dict[str, Any]] = []
-    substitutable: list[tuple[str, set[str], dict[str, Any]]] = []
-    for name, value in sorted(parent_readings.items()):
-        descendants = {leaf for leaf, _mass in leaves if leaf == name or leaf.startswith(name + "/")}
-        if not descendants:
-            continue
-        owners = {body_members.get(leaf, "") for leaf in descendants}
-        if len(owners) == 1 and next(iter(owners)):
-            substitutable.append((name, descendants, value))
-        else:
-            blockers.append(
-                {
-                    "code": "effective_instance_spans_bodies",
-                    "component": name,
-                    "bodies": sorted(owner for owner in owners if owner),
-                    "descendants": sorted(descendants)[:50],
-                }
-            )
-    top_most = [
-        (name, descendants, value)
-        for name, descendants, value in substitutable
-        if not any(
-            other != name and (name == other or name.startswith(other + "/"))
-            for other, _descendants, _value in substitutable
-        )
-    ]
-    effective_entries: list[dict[str, Any]] = []
-    covered_effective: set[str] = set()
-    for name, descendants, value in top_most:
-        covered_effective |= descendants
-        effective_entries.append(
-            {
-                "mass": float(value["mass"]),
-                "com": [float(item) for item in value["com"]],
-                "inertia": [[float(item) for item in row] for row in value["inertia"]],
-            }
-        )
-    for leaf, _mass in leaves:
-        if leaf in covered_effective:
-            continue
-        payload = (scene.mass_properties or {}).get(leaf)
-        if not isinstance(payload, dict) or "mass" not in payload:
-            continue
-        transform = transforms.get(leaf)
-        if transform is None:
-            continue
-        part = _PartReading(leaf, transform, payload, identity_matrix(), (0.0, 0.0, 0.0))
-        effective_entries.append(part.mass_entry())
-    effective_total: dict[str, Any] | None = None
-    if effective_entries:
-        combined = combine_mass_properties(effective_entries)
-        effective_total = {
-            "mass": float(combined["mass"]),
-            "com": [float(item) for item in combined["com"]],
-            "inertia": [[float(item) for item in row] for row in combined["inertia"]],
-            "substituted": sorted(name for name, _descendants, _value in top_most),
-        }
     return {
         "schema_version": "description-pipeline.solidworks-component-mass-context/v1",
         "status": "recorded" if not errors else "partial",
-        "assembly_mass_kg": assembly_kg,
+        "assembly_mass_kg": None if assembly_mass is None else float(assembly_mass),
         "instances": instances,
-        "totals": {
-            "context_kg": context_total,
-            "document_kg": document_total,
-            "assembly_kg": assembly_kg,
-            "context_minus_document_kg": context_total - document_total,
-            "context_minus_assembly_kg": None if assembly_kg is None else context_total - assembly_kg,
-        },
-        "overridden": {
-            "top_level_instances": len(top_level),
-            "mass": sum(1 for entry in instances if entry["overrides"].get("OverrideMass")),
-            "com": sum(1 for entry in instances if entry["overrides"].get("OverrideCenterOfMass")),
-            "inertia": sum(1 for entry in instances if entry["overrides"].get("OverrideMomentsOfInertia")),
-            "any": sum(1 for entry in instances if any(entry["overrides"].values())),
-            "top_level_overridden": sum(1 for entry in top_level if any(entry["overrides"].values())),
-            "examples": [entry["name"] for entry in instances if entry["overrides"].get("OverrideMass")][:50],
-        },
-        "leaf_documents": len(leaf_names),
-        "leaf_documents_covered": len(covered),
-        "leaf_documents_uncovered": sorted(leaf_names - covered)[:50],
         "errors": errors,
-        "effective_total": effective_total,
-        "blockers": blockers,
         "reference": dict(reading.get("reference") or {}),
     }
 
@@ -1468,7 +1332,6 @@ def _component_context_record(
 def _component_mass_context(
     backend: Any,
     cfg: dict[str, Any],
-    scene: Any,
     assembly_mass: float | None,
     document: str | None = None,
 ) -> dict[str, Any] | None:
@@ -1496,7 +1359,7 @@ def _component_mass_context(
             "message": "the backend returned no component mass context object",
         }
     try:
-        return _component_context_record(reading, scene, assembly_mass, cfg.get("bodies"))
+        return _component_context_record(reading, assembly_mass)
     except Exception as error:  # noqa: BLE001 - an optional probe must never abort a capture
         return {
             "schema_version": "description-pipeline.solidworks-component-mass-context/v1",
@@ -1506,14 +1369,14 @@ def _component_mass_context(
         }
 
 
-def _mass_closure(backend: Any, cfg: dict[str, Any], scene: Any, document: str | None = None) -> dict[str, Any] | None:
-    """The assembly's own reading next to the recombined leaf readings, as capture evidence.
+def _mass_closure(backend: Any, cfg: dict[str, Any], document: str | None = None) -> dict[str, Any] | None:
+    """Native closure observations only: the assembly reading and instance context.
 
-    Capture retains full readings, closure deltas and explicit unavailable/error
-    receipts for diagnosis. The v1 delivery verifier requires full whole-assembly
-    closure and complete component-context evidence; a missing or inconsistent
-    receipt blocks publication. Keeping a failed probe in the snapshot does not
-    qualify the delivery.
+    The Windows boundary records what CAD answered (whole-assembly reading,
+    per-instance context with overrides and effective readings) plus explicit
+    unavailable/error receipts.  All comparison math - leaf totals, deltas,
+    totals, coverage and the effective recombination - lives on Linux
+    (``closure.derive_mass_closure``); no computed field survives here.
     """
 
     closure_reader = getattr(backend, "assembly_mass_properties", None)
@@ -1549,21 +1412,11 @@ def _mass_closure(backend: Any, cfg: dict[str, Any], scene: Any, document: str |
         }
     # The override evidence is required for a pure-CAD claim, so it is collected even when the
     # optional assembly reading failed (or the record would earn cad equivalence by omission).
-    component_context = _component_mass_context(backend, cfg, scene, top_mass, measured)
-    # The effective recombination and its blockers belong to the mass-closure
-    # ROOT (approved schema); they are popped from the component context so no
-    # duplicate alias survives.
-    effective_total: dict[str, Any] | None = None
-    blockers: list[dict[str, Any]] = []
-    if isinstance(component_context, dict):
-        effective_total = component_context.pop("effective_total", None)
-        blockers = list(component_context.pop("blockers", []) or [])
+    component_context = _component_mass_context(backend, cfg, top_mass, measured)
     if top_level is None or top_mass is None:
         unavailable_record: dict[str, Any] = {
             "schema_version": "description-pipeline.solidworks-mass-closure/v1",
             "status": "unavailable",
-            "effective_total": effective_total,
-            "blockers": blockers,
             **(
                 failure
                 or {"reason": "cad_mass_property_unavailable", "message": "no assembly mass reading was recorded"}
@@ -1572,7 +1425,6 @@ def _mass_closure(backend: Any, cfg: dict[str, Any], scene: Any, document: str |
         if component_context is not None:
             unavailable_record["component_context"] = component_context
         return unavailable_record
-    leaf_total = assembly_leaf_total(scene.components, scene.mass_properties)
     record = {
         "schema_version": "description-pipeline.solidworks-mass-closure/v1",
         "status": "recorded",
@@ -1583,11 +1435,6 @@ def _mass_closure(backend: Any, cfg: dict[str, Any], scene: Any, document: str |
             "inertia": [[float(value) for value in row] for row in top_level["inertia"]],
             "reference": dict(top_level.get("reference") or {}),
         },
-        "leaf_total": leaf_total,
-        "leaf_components": len(list(scene.components)),
-        "delta": closure_delta(top_level, leaf_total),
-        "effective_total": effective_total,
-        "blockers": blockers,
     }
     if component_context is not None:
         record["component_context"] = component_context
@@ -2014,7 +1861,7 @@ def _freeze_local(
         axis_references = _capture_axis_references(backend, cfg)
         if axis_references:
             write_json(staging / "raw" / "axis_references.json", axis_references)
-        mass_closure = _mass_closure(backend, cfg, scene, getattr(scene, "document", None))
+        mass_closure = _mass_closure(backend, cfg, getattr(scene, "document", None))
         if mass_closure is not None:
             write_json(staging / "raw" / "mass_closure.json", mass_closure)
         # Effective instance readings (overridden instances, sheet-only
