@@ -183,14 +183,25 @@ class _PartReading:
         self.mass = float(mass["mass"])
         self.cad_mass_kg = float(mass.get("cad_mass_kg", mass["mass"]))
         self.mass_scale = float(mass.get("scale", 1.0))
-        part_com = tuple(float(value) for value in mass["com"])
         reference = mass.get("reference") or {}
-        part_inertia = tensor_from_raw(mass["inertia"], reference, where=f"component {name}")
+        raw_inertia = tensor_from_raw(mass["inertia"], reference, where=f"component {name}")
         self.product_convention = "solidworks_standard"
-        # part frame -> assembly frame
-        assembly_com = _matvec(self.rotation, part_com)  # type: ignore[arg-type]
-        self.assembly_com = tuple(assembly_com[i] + self.translation[i] for i in range(3))
-        self.assembly_inertia = _rotate_inertia(self.rotation, part_inertia)
+        if str(reference.get("scope") or "part_document") == "assembly_component_group":
+            # Effective CAD-authored instance measurement (sheet-only fallback
+            # or overridden instance): the CoM and tensor are recorded about
+            # the CoM in assembly document coordinates and are used verbatim
+            # in the assembly frame.  No part coordinates are invented and
+            # nothing is rescaled; the independent verifier derives the same
+            # assembly-frame values from the raw row and the recorded
+            # placement.
+            self.assembly_com = tuple(float(value) for value in mass["com"])
+            self.assembly_inertia = raw_inertia
+        else:
+            part_com = tuple(float(value) for value in mass["com"])
+            # part frame -> assembly frame
+            assembly_com = _matvec(self.rotation, part_com)  # type: ignore[arg-type]
+            self.assembly_com = tuple(assembly_com[i] + self.translation[i] for i in range(3))
+            self.assembly_inertia = _rotate_inertia(self.rotation, raw_inertia)
         # assembly frame -> link frame
         link_rotation_t = _transpose(link)
         relative = tuple(self.assembly_com[i] - self.link_translation[i] for i in range(3))
@@ -432,7 +443,48 @@ def build_scene(
             # by load_scene, and only there do they become "used" values.
             payload = dict(payload, mass_source="cad")
             readings.append(_PartReading(component, placements[component], payload, link_rotation, link_translation))
-        combined = combine_mass_properties([reading.mass_entry() for reading in readings])
+        effective_instances = {
+            str(instance): dict(reading)
+            for instance, reading in ((getattr(raw_scene, "notes", None) or {}).get("effective_instances") or {}).items()
+            if isinstance(reading, dict)
+        }
+        all_leaves = {str(component.name) for component in (raw_scene.components or [])}
+        member_set = set(components)
+        candidates = []
+        for instance, reading in sorted(effective_instances.items()):
+            if str(reading.get("document_type") or "") != "assembly":
+                continue
+            full_descendants = {
+                leaf for leaf in all_leaves if leaf == instance or leaf.startswith(instance + "/")
+            }
+            local = full_descendants & member_set
+            if not local or full_descendants != local:
+                # A parent substitutes only when its ENTIRE descendant leaf
+                # set lies in this rigid body; otherwise the leaf readings
+                # stay and the closure records the explicit blocker.
+                continue
+            candidates.append((instance, local, reading))
+        top_most = [
+            (instance, local, reading)
+            for instance, local, reading in candidates
+            if not any(
+                other != instance and (instance == other or instance.startswith(other + "/"))
+                for other, _local, _reading in candidates
+            )
+        ]
+        covered: set[str] = set()
+        entries = []
+        for instance, local, reading in top_most:
+            covered |= local
+            entries.append(
+                {
+                    "mass": float(reading["mass"]),
+                    "com": [float(value) for value in reading["com"]],
+                    "inertia": [[float(value) for value in row] for row in reading["inertia"]],
+                }
+            )
+        entries.extend(reading.mass_entry() for reading in readings if reading.name not in covered)
+        combined = combine_mass_properties(entries)
         visuals = []
         for reading in readings:
             entry = geometry_by_component.get(reading.name)
@@ -478,6 +530,10 @@ def build_scene(
                 },
             }
         )
+        if top_most:
+            links[-1]["provenance"]["effective_instances"] = sorted(
+                instance for instance, _local, _reading in top_most
+            )
 
     joint_entries = _build_joints(cfg, {link["name"] for link in links}, link_frames)
     frames = _build_frames(cfg, {link["name"] for link in links}, raw_scene, link_frames)

@@ -24,7 +24,13 @@ from .errors import BridgeError, ConfigError
 from .native import session_materialization_path
 from .evidence import build_evidence, capture_environment
 from .jsonio import digest_json, sha256_file, write_json
-from .scene import assembly_leaf_total, closure_delta
+from .scene import (
+    _PartReading,
+    assembly_leaf_total,
+    closure_delta,
+    combine_mass_properties,
+    identity_matrix,
+)
 
 # The pipeline-wide STL reader owns the acceptance standard for meshes; the
 # adapter only writes geometry and then asks that reader what it produced.
@@ -1262,7 +1268,12 @@ def _exception_trace(error: BaseException) -> list[dict[str, Any]]:
     return chain
 
 
-def _component_context_record(reading: dict[str, Any], scene: Any, assembly_mass: float | None) -> dict[str, Any]:
+def _component_context_record(
+    reading: dict[str, Any],
+    scene: Any,
+    assembly_mass: float | None,
+    bodies: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Align the assembly context's per-instance readings with the leaf/document basis.
 
     ``document_basis_mass_kg`` is the sum of the existing leaf/document readings under that
@@ -1331,6 +1342,8 @@ def _component_context_record(reading: dict[str, Any], scene: Any, assembly_mass
                 "overrides": overrides,
                 "document_basis_mass_kg": basis,
                 "delta_kg": mass - basis,
+                "effective": entry.get("effective"),
+                "effective_error": entry.get("effective_error"),
             }
         )
     leaf_names = {leaf for leaf, _ in leaves}
@@ -1340,6 +1353,88 @@ def _component_context_record(reading: dict[str, Any], scene: Any, assembly_mass
     context_total = sum(entry["context_mass_kg"] for entry in top_level)
     document_total = sum(entry["document_basis_mass_kg"] or 0.0 for entry in top_level)
     assembly_kg = None if assembly_mass is None else float(assembly_mass)
+    # Effective recombination: the shallowest overridden ancestor substitutes
+    # its whole subtree per rigid body, and only when its entire descendant
+    # leaf set lies in exactly one body.  leaf_total stays diagnostic; nothing
+    # is distributed and no delta is coerced.
+    effective_readings = {
+        str(entry["name"]): entry.get("effective")
+        for entry in instances
+        if isinstance(entry.get("effective"), dict)
+    }
+    body_members: dict[str, str] = {}
+    for body in bodies or []:
+        if not isinstance(body, dict):
+            continue
+        body_name = str(body.get("name") or body.get("id") or "")
+        for member in body.get("components") or []:
+            body_members[str(member)] = body_name
+    transforms = {
+        str(getattr(component, "name", "") or ""): getattr(component, "transform", None)
+        for component in (scene.components or [])
+    }
+    parent_readings = {
+        name: value
+        for name, value in effective_readings.items()
+        if str(value.get("document_type") or value.get("role") or "") == "assembly"
+    }
+    blockers: list[dict[str, Any]] = []
+    substitutable: list[tuple[str, set[str], dict[str, Any]]] = []
+    for name, value in sorted(parent_readings.items()):
+        descendants = {leaf for leaf, _mass in leaves if leaf == name or leaf.startswith(name + "/")}
+        if not descendants:
+            continue
+        owners = {body_members.get(leaf, "") for leaf in descendants}
+        if len(owners) == 1 and next(iter(owners)):
+            substitutable.append((name, descendants, value))
+        else:
+            blockers.append(
+                {
+                    "code": "effective_instance_spans_bodies",
+                    "component": name,
+                    "bodies": sorted(owner for owner in owners if owner),
+                    "descendants": sorted(descendants)[:50],
+                }
+            )
+    top_most = [
+        (name, descendants, value)
+        for name, descendants, value in substitutable
+        if not any(
+            other != name and (name == other or name.startswith(other + "/"))
+            for other, _descendants, _value in substitutable
+        )
+    ]
+    effective_entries: list[dict[str, Any]] = []
+    covered_effective: set[str] = set()
+    for name, descendants, value in top_most:
+        covered_effective |= descendants
+        effective_entries.append(
+            {
+                "mass": float(value["mass"]),
+                "com": [float(item) for item in value["com"]],
+                "inertia": [[float(item) for item in row] for row in value["inertia"]],
+            }
+        )
+    for leaf, _mass in leaves:
+        if leaf in covered_effective:
+            continue
+        payload = (scene.mass_properties or {}).get(leaf)
+        if not isinstance(payload, dict) or "mass" not in payload:
+            continue
+        transform = transforms.get(leaf)
+        if transform is None:
+            continue
+        part = _PartReading(leaf, transform, payload, identity_matrix(), (0.0, 0.0, 0.0))
+        effective_entries.append(part.mass_entry())
+    effective_total: dict[str, Any] | None = None
+    if effective_entries:
+        combined = combine_mass_properties(effective_entries)
+        effective_total = {
+            "mass": float(combined["mass"]),
+            "com": [float(item) for item in combined["com"]],
+            "inertia": [[float(item) for item in row] for row in combined["inertia"]],
+            "substituted": sorted(name for name, _descendants, _value in top_most),
+        }
     return {
         "schema_version": "description-pipeline.solidworks-component-mass-context/v1",
         "status": "recorded" if not errors else "partial",
@@ -1365,6 +1460,8 @@ def _component_context_record(reading: dict[str, Any], scene: Any, assembly_mass
         "leaf_documents_covered": len(covered),
         "leaf_documents_uncovered": sorted(leaf_names - covered)[:50],
         "errors": errors,
+        "effective_total": effective_total,
+        "blockers": blockers,
         "reference": dict(reading.get("reference") or {}),
     }
 
@@ -1400,7 +1497,7 @@ def _component_mass_context(
             "message": "the backend returned no component mass context object",
         }
     try:
-        return _component_context_record(reading, scene, assembly_mass)
+        return _component_context_record(reading, scene, assembly_mass, cfg.get("bodies"))
     except Exception as error:  # noqa: BLE001 - an optional probe must never abort a capture
         return {
             "schema_version": "description-pipeline.solidworks-component-mass-context/v1",
@@ -1454,10 +1551,20 @@ def _mass_closure(backend: Any, cfg: dict[str, Any], scene: Any, document: str |
     # The override evidence is required for a pure-CAD claim, so it is collected even when the
     # optional assembly reading failed (or the record would earn cad equivalence by omission).
     component_context = _component_mass_context(backend, cfg, scene, top_mass, measured)
+    # The effective recombination and its blockers belong to the mass-closure
+    # ROOT (approved schema); they are popped from the component context so no
+    # duplicate alias survives.
+    effective_total: dict[str, Any] | None = None
+    blockers: list[dict[str, Any]] = []
+    if isinstance(component_context, dict):
+        effective_total = component_context.pop("effective_total", None)
+        blockers = list(component_context.pop("blockers", []) or [])
     if top_level is None or top_mass is None:
         unavailable_record: dict[str, Any] = {
             "schema_version": "description-pipeline.solidworks-mass-closure/v1",
             "status": "unavailable",
+            "effective_total": effective_total,
+            "blockers": blockers,
             **(
                 failure
                 or {"reason": "cad_mass_property_unavailable", "message": "no assembly mass reading was recorded"}
@@ -1480,6 +1587,8 @@ def _mass_closure(backend: Any, cfg: dict[str, Any], scene: Any, document: str |
         "leaf_total": leaf_total,
         "leaf_components": len(list(scene.components)),
         "delta": closure_delta(top_level, leaf_total),
+        "effective_total": effective_total,
+        "blockers": blockers,
     }
     if component_context is not None:
         record["component_context"] = component_context
@@ -1519,7 +1628,18 @@ def _capture_readings(
             {"requested": document, "reported": reported, "assembly": cfg["assembly"]},
             exit_code=3,
         )
-    raw = {
+    return scene, _raw_scene_payload(scene, cfg, source_root)
+
+
+def _raw_scene_payload(scene: Any, cfg: dict[str, Any], source_root: Path) -> dict[str, Any]:
+    """The raw/scene_raw.json projection of the captured scene.
+
+    Rebuilt after the component mass context runs, because the effective
+    instance readings are injected into ``scene.notes`` there and the earlier
+    file write cannot see them.
+    """
+
+    return {
         "document": scene.document,
         "source_document": cfg["assembly"],
         "source_root": str(source_root),
@@ -1537,7 +1657,6 @@ def _capture_readings(
         "mass_properties": scene.mass_properties,
         "notes": scene.notes,
     }
-    return scene, raw
 
 
 def _material_provenance_record(scene: Any, cfg: dict[str, Any]) -> dict[str, Any]:
@@ -1585,6 +1704,118 @@ def _material_provenance_record(scene: Any, cfg: dict[str, Any]) -> dict[str, An
         "configuration": str(cfg.get("configuration") or ""),
         "material_source": str(cfg.get("material_source") or "cad"),
         "measured_source": "cad_api",
+        "warnings": warnings,
+    }
+
+
+def _effective_instance_record(
+    scene: Any, cfg: dict[str, Any], readings: dict[str, Any], cache_error: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """The stable record for CAD-authored effective instance measurements.
+
+    A surface-only occurrence whose part document cannot answer mass questions,
+    and any overridden instance, are read through the assembly instance under
+    the ``assembly_component_group`` scope (including CAD-authored overrides).
+    The record is written for EVERY capture - with empty readings/warnings when
+    none was needed - and states plainly that these values are CAD-authored
+    effective data: not geometry-derived and not independently physically
+    qualified.  Nothing is rescaled, substituted or distributed here.
+    """
+
+    readings_payload = {
+        str(name): dict(reading)
+        for name, reading in sorted((readings or {}).items())
+        if isinstance(reading, dict)
+    }
+    warnings: list[dict[str, Any]] = []
+    for name, reading in sorted(readings_payload.items()):
+        reference = dict(reading.get("reference") or {})
+        flags = dict(reference.get("overrides") or {})
+        if not any(bool(value) for value in flags.values()):
+            continue
+        warnings.append(
+            {
+                "code": "cad_instance_override_effective",
+                "blocking": False,
+                "message": (
+                    "the instance carries CAD-authored mass-property overrides; these are effective CAD values, "
+                    "not geometry qualification"
+                ),
+                "component": name,
+                "role": reading.get("role"),
+                "document_type": reading.get("document_type"),
+                "configuration": reference.get("configuration"),
+                "part_document": reference.get("part_document"),
+                "assembly_document": reference.get("assembly_document"),
+                "assembly_configuration": reference.get("assembly_configuration"),
+                "selected_components": reference.get("selected_components"),
+                "overrides": flags,
+                "qualification": (
+                    "cad_authored_effective_instance; not geometry-derived, not independently physically qualified"
+                ),
+                "measurement": {
+                    "scope": reference.get("scope"),
+                    "axes": reference.get("axes"),
+                    "used_api": reference.get("used_api"),
+                    "selection_api": reference.get("selection_api"),
+                    "override_api": reference.get("override_api"),
+                    "mass_kg": reading.get("mass"),
+                    "center_of_mass_m": reading.get("com"),
+                    "inertia_kg_m2": reading.get("inertia"),
+                    "volume_m3": reference.get("volume_m3"),
+                    "density_kg_m3": reference.get("density_kg_m3"),
+                },
+            }
+        )
+    for name, payload in sorted((getattr(scene, "mass_properties", None) or {}).items()):
+        if not isinstance(payload, dict) or payload.get("mode") != "effective_instance":
+            continue
+        reference = dict(payload.get("reference") or {})
+        warnings.append(
+            {
+                "code": "cad_surface_only_effective_instance",
+                "blocking": False,
+                "message": (
+                    "the part is surface-only (no solid bodies); its mass properties come from the assembly "
+                    "instance measurement, not from geometric qualification"
+                ),
+                "component": str(name),
+                "document": reference.get("part_document"),
+                "configuration": reference.get("configuration"),
+                "assembly_document": reference.get("assembly_document"),
+                "assembly_configuration": reference.get("assembly_configuration"),
+                "selected_components": reference.get("selected_components"),
+                "part_document_read": "unavailable",
+                "fallback_reason": reference.get("fallback_reason"),
+                "fallback_error_code": reference.get("fallback_error_code"),
+                "solid_bodies": reference.get("solid_bodies"),
+                "sheet_bodies": reference.get("sheet_bodies"),
+                "overrides": dict(reference.get("overrides") or {}),
+                "qualification": (
+                    "cad_authored_effective_instance; not geometry-derived, not independently physically qualified"
+                ),
+                "measurement": {
+                    "state": payload.get("state"),
+                    "measurement_basis": payload.get("measurement_basis"),
+                    "scope": reference.get("scope"),
+                    "axes": reference.get("axes"),
+                    "used_api": reference.get("used_api"),
+                    "selection_api": reference.get("selection_api"),
+                    "override_api": reference.get("override_api"),
+                    "mass_kg": payload.get("mass"),
+                    "center_of_mass_m": payload.get("com"),
+                    "inertia_kg_m2": payload.get("inertia"),
+                    "volume_m3": reference.get("volume_m3"),
+                    "density_kg_m3": reference.get("density_kg_m3"),
+                },
+            }
+        )
+    return {
+        "schema_version": "solidworks-to-urdf.effective-instances/v1",
+        "assembly": str(cfg.get("assembly") or ""),
+        "configuration": str(cfg.get("configuration") or ""),
+        "cache_error": cache_error,
+        "readings": readings_payload,
         "warnings": warnings,
     }
 
@@ -1773,6 +2004,30 @@ def _freeze_local(
         mass_closure = _mass_closure(backend, cfg, scene, getattr(scene, "document", None))
         if mass_closure is not None:
             write_json(staging / "raw" / "mass_closure.json", mass_closure)
+        # Effective instance readings (overridden instances, sheet-only
+        # fallback) come from the SAME component-context traversal; they are
+        # injected into the scene notes and the raw scene file is rewritten so
+        # notes, canonical record and closure rows carry exactly the same
+        # reading.  The canonical record is written for every capture.
+        backend_readings: dict[str, Any] = {}
+        cache_error: dict[str, Any] | None = None
+        collector = getattr(backend, "effective_instance_readings", None)
+        if callable(collector):
+            try:
+                backend_readings = collector()
+            except Exception as error:  # noqa: BLE001 - preserved as evidence, never fatal
+                cache_error = {
+                    "reason": str(getattr(error, "code", "") or type(error).__name__),
+                    "message": " ".join(str(error).split())[:200],
+                }
+        if cache_error is not None:
+            scene.notes["effective_instances_error"] = cache_error
+        scene.notes["effective_instances"] = backend_readings
+        write_json(staging / "raw" / "scene_raw.json", _raw_scene_payload(scene, cfg, staging / "source"))
+        write_json(
+            staging / "raw" / "effective_instances.json",
+            _effective_instance_record(scene, cfg, backend_readings, cache_error),
+        )
         # Declared author decisions are recorded as declared input, never as CAD
         # readings: freeze keeps the snapshot raw and load_scene applies them.
         write_json(

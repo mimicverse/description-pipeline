@@ -2636,6 +2636,10 @@ class SolidWorksBackend(CadBackend):
                     continue
                 children = list(_method(component, "GetChildren") or ())
                 component_path = str(_method(component, "GetPathName"))
+                try:
+                    referenced_configuration = str(_member(component, "ReferencedConfiguration") or "")
+                except Exception:  # noqa: BLE001 - optional context, never fatal
+                    referenced_configuration = ""
             except Exception as error:  # noqa: BLE001 - one unreadable instance must not stop the walk
                 errors.append(_instance_error(name, parent, depth, "hierarchy", error))
                 continue
@@ -2658,21 +2662,49 @@ class SolidWorksBackend(CadBackend):
                         "cad_mass_property_invalid", "component mass is not finite and positive", {"name": name}
                     )
                 volume = float(_member(mp, "Volume"))
-                entries.append(
-                    {
-                        "name": name,
-                        "parent": parent,
-                        "depth": depth,
-                        "document": component_path,
-                        "document_type": "assembly" if children else "part",
-                        "context_mass_kg": mass,
-                        "context_volume_m3": volume if math.isfinite(volume) else None,
-                        "overrides": {
-                            key: bool(_member(override, key))
-                            for key in ("OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia")
-                        },
-                    }
-                )
+                flags = {
+                    key: bool(_member(override, key))
+                    for key in ("OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia")
+                }
+                document_type = "assembly" if children else "part"
+                entry = {
+                    "name": name,
+                    "parent": parent,
+                    "depth": depth,
+                    "document": component_path,
+                    "document_type": document_type,
+                    "context_mass_kg": mass,
+                    "context_volume_m3": volume if math.isfinite(volume) else None,
+                    "overrides": flags,
+                }
+                if any(flags.values()):
+                    # Approved override support: one positively identified
+                    # instance, full singleton tensor read from the SAME
+                    # selection (no second traversal), cached for the
+                    # canonical effective-instances record and the scene
+                    # mirror.  A failed tensor read is recorded, never
+                    # substituted.
+                    effective = self._singleton_effective_reading(
+                        mp,
+                        name,
+                        mass,
+                        component_path,
+                        document_path,
+                        configuration_name,
+                        referenced_configuration,
+                        flags,
+                        document_type,
+                    )
+                    entry["effective"] = effective
+                    if effective is None:
+                        entry["effective_error"] = "cad_effective_instance_unreadable"
+                    else:
+                        cache = getattr(self, "_effective_instance_readings", None)
+                        if cache is None:
+                            cache = {}
+                            self._effective_instance_readings = cache
+                        cache[name] = effective
+                entries.append(entry)
             except Exception as error:  # noqa: BLE001 - one unreadable instance is reported, not fatal
                 errors.append(_instance_error(name, parent, depth, "mass_property", error))
         return {
@@ -2849,7 +2881,7 @@ class SolidWorksBackend(CadBackend):
             for key in ("OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia")
         }
 
-    def assembly_group_mass_properties(self, path, names):
+    def assembly_group_mass_properties(self, path, names, *, allow_overrides=False):
         """Mass properties for a selected group of component instances.
 
         Measured on the analytic fixture (2026-10-06, SolidWorks 34.0.0): a
@@ -2889,7 +2921,7 @@ class SolidWorksBackend(CadBackend):
             if name not in wanted:
                 continue
             flags = self._component_override_flags(doc, component)
-            if any(flags.values()):
+            if any(flags.values()) and not allow_overrides:
                 raise CadError(
                     "cad_mass_override",
                     "pure-CAD export refuses component instance overrides",
@@ -2903,6 +2935,12 @@ class SolidWorksBackend(CadBackend):
                 "cad_missing_component",
                 "group members are not component instances of this assembly",
                 {"missing": missing, "group": sorted(wanted)},
+            )
+        if allow_overrides and len(selection) != 1:
+            raise CadError(
+                "cad_group_selection_not_singleton",
+                "allow_overrides reads exactly one selected occurrence",
+                {"selected": sorted(overrides), "requested": sorted(wanted)},
             )
         import pythoncom
 
@@ -2922,7 +2960,7 @@ class SolidWorksBackend(CadBackend):
         inertia, _ = _inertia_from_raw(values, document_title)
         if mass <= 0 or not math.isfinite(mass) or len(com) != 3 or not all(map(math.isfinite, com)):
             raise CadError("cad_mass_property_invalid", "mass/COM are not finite and positive")
-        return {
+        result = {
             "assembly": document_path,
             "configuration": configuration_name,
             "group": sorted(wanted),
@@ -2942,6 +2980,175 @@ class SolidWorksBackend(CadBackend):
                 "document": document_path,
                 "configuration": configuration_name,
             },
+        }
+        if allow_overrides:
+            singleton = overrides[sorted(overrides)[0]]
+            effective = bool(any(singleton.values()))
+            result["reference"].update(
+                {
+                    "selection_api": "IMassProperty2 (SelectedItems = component instance)",
+                    "override_api": "IMassProperty2.GetOverrideOptions (same selection)",
+                    "effective_instance": effective,
+                    "measurement_basis": (
+                        "cad_authored_effective_instance" if effective else "cad_measured"
+                    ),
+                }
+            )
+            # Optional native scalars are preserved verbatim when readable and
+            # omitted otherwise; nothing is inferred from them.
+            for key, member in (("volume_m3", "Volume"), ("density_kg_m3", "Density")):
+                try:
+                    value = float(_member(mp, member))
+                except Exception:  # noqa: BLE001 - an unreadable optional scalar is omitted, never inferred
+                    continue
+                if math.isfinite(value):
+                    result["reference"][key] = value
+        return result
+
+    def _singleton_effective_reading(
+        self,
+        mp,
+        name,
+        mass,
+        component_path,
+        assembly_path,
+        assembly_configuration,
+        referenced,
+        flags,
+        document_type,
+    ):
+        """Full singleton tensor for one already-selected overridden instance.
+
+        Reads COM/tensor/optional scalars from the mass-property object the
+        caller created with exactly this instance selected: no second
+        traversal, no second selection, no scaling and no substitution.  A
+        failed tensor read returns ``None`` so the caller records the failure
+        instead of inventing a value.
+        """
+
+        try:
+            com = tuple(map(float, _member(mp, "CenterOfMass")))
+            values = tuple(map(float, _member(mp, "GetMomentOfInertia", 0)))
+            if len(values) != 9 or len(com) != 3 or not all(map(math.isfinite, com)):
+                return None
+            inertia, _ = _inertia_from_raw(values, name)
+        except Exception:  # noqa: BLE001 - evidence-driven: the failure is recorded by the caller
+            return None
+        reference = {
+            "used_api": "IMassProperty2.GetMomentOfInertia(0)",
+            "selection_api": "IMassProperty2 (SelectedItems = component instance)",
+            "override_api": "IMassProperty2.GetOverrideOptions (same selection)",
+            "scope": "assembly_component_group",
+            "convention_basis": "analytic_fixture_v2_20261006",
+            "product_convention": "solidworks_standard",
+            "reference_point": "center_of_mass",
+            "axes": "assembly_document_axes",
+            "use_system_units": True,
+            "configuration": referenced,
+            "part_document": component_path,
+            "assembly_document": assembly_path,
+            "assembly_configuration": assembly_configuration,
+            "selected_components": [name],
+            "effective_instance": True,
+            "measurement_basis": "cad_authored_effective_instance",
+            "overrides": dict(flags),
+        }
+        for key, member in (("volume_m3", "Volume"), ("density_kg_m3", "Density")):
+            try:
+                value = float(_member(mp, member))
+            except Exception:  # noqa: BLE001
+                continue
+            if math.isfinite(value):
+                reference[key] = value
+        return {
+            "role": "parent" if document_type == "assembly" else "leaf",
+            "document_type": document_type,
+            "mass": float(mass),
+            "com": [float(value) for value in com],
+            "inertia": [list(map(float, row)) for row in inertia],
+            "reference": reference,
+        }
+
+    def effective_instance_readings(self):
+        """Cached singleton readings for overridden instances (assembly context)."""
+
+        cache = getattr(self, "_effective_instance_readings", None) or {}
+        return {name: dict(value) for name, value in cache.items()}
+
+    def _sheet_only_instance_fallback(self, occurrence, assembly_path, name, referenced, error, counts):
+        """Effective CAD-authored instance measurement for a proven sheet-only occurrence.
+
+        The part document of a surface-only occurrence cannot answer mass
+        questions (``CreateMassProperty2`` returns no object), while the
+        assembly instance carries the CAD-authored effective measurement,
+        including any instance overrides.  The fallback is deliberately
+        narrow: exactly one selected occurrence, exact boolean override flags
+        with at least one true, and the reading keeps its own scope and
+        measurement basis.  Nothing is rescaled, substituted or converted
+        into part coordinates here; consumers convert from the raw assembly
+        coordinates using the recorded placement.
+        """
+
+        reading = self.assembly_group_mass_properties(str(assembly_path), [name], allow_overrides=True)
+        members = reading.get("members")
+        flags = members.get(name) if isinstance(members, dict) else None
+        expected_flags = ("OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia")
+        if (
+            not isinstance(flags, dict)
+            or set(flags) != set(expected_flags)
+            or any(type(flags[key]) is not bool for key in expected_flags)
+        ):
+            raise CadError(
+                "cad_effective_instance_flags_invalid",
+                "effective instance measurement needs exact boolean override flags",
+                {"component": name, "flags": flags},
+            )
+        if not any(flags.values()):
+            raise CadError(
+                "cad_effective_instance_flags_invalid",
+                "effective instance measurement needs at least one active override",
+                {"component": name, "flags": flags},
+            )
+        reference = dict(reading.get("reference") or {})
+        if str(reference.get("used_api")) != "IMassProperty2.GetMomentOfInertia(0)":
+            raise CadError(
+                "cad_effective_instance_api_mismatch",
+                "effective instance measurement must use the qualified tensor API",
+                {"used_api": reference.get("used_api")},
+            )
+        row_reference = {
+            "used_api": "IMassProperty2.GetMomentOfInertia(0)",
+            "selection_api": str(reference.get("selection_api") or ""),
+            "override_api": str(reference.get("override_api") or ""),
+            "scope": "assembly_component_group",
+            "convention_basis": str(reference.get("convention_basis") or "analytic_fixture_v2_20261006"),
+            "product_convention": "solidworks_standard",
+            "reference_point": "center_of_mass",
+            "axes": "assembly_document_axes",
+            "use_system_units": True,
+            "configuration": str(referenced),
+            "part_document": str(occurrence.path),
+            "assembly_document": str(reading.get("assembly") or ""),
+            "assembly_configuration": str(reading.get("configuration") or ""),
+            "selected_components": [name],
+            "fallback_reason": "cad_part_document_mass_unavailable",
+            "fallback_error_code": str(error.code),
+            "solid_bodies": int(counts.get("solid") or 0),
+            "sheet_bodies": int(counts.get("sheet") or 0),
+            "effective_instance": True,
+            "overrides": {key: bool(flags[key]) for key in expected_flags},
+        }
+        for key in ("volume_m3", "density_kg_m3"):
+            if key in reference:
+                row_reference[key] = reference[key]
+        return {
+            "mass": float(reading["mass"]),
+            "com": [float(value) for value in reading["com"]],
+            "inertia": [[float(value) for value in row_values] for row_values in reading["inertia"]],
+            "mode": "effective_instance",
+            "state": "sheet_only",
+            "measurement_basis": "cad_authored_effective_instance",
+            "reference": row_reference,
         }
 
     def _rebuild_capture_copy(self, doc, path):
@@ -2979,7 +3186,7 @@ class SolidWorksBackend(CadBackend):
             "save_flag_after": bool(_member(doc, "GetSaveFlag")),
         }
 
-    def _leaf_mass_failure(self, name, occurrence, referenced, error):
+    def _leaf_mass_failure(self, name, occurrence, referenced, error, extra=None):
         """Name the occurrence behind a leaf mass-read failure.
 
         A failed leaf mass read must never be anonymous: the phase-one
@@ -3003,6 +3210,8 @@ class SolidWorksBackend(CadBackend):
                 "phase": "leaf_mass_read",
             }
         )
+        if extra:
+            detail.update(extra)
         return CadError(error.code, error.message, detail)
 
     def collect_scene(self, doc_path, coordinate_systems, progress=None, require_material=True):
@@ -3113,7 +3322,34 @@ class SolidWorksBackend(CadBackend):
                 try:
                     properties[name] = self._mass_properties_document(part, require_material)
                 except CadError as error:
-                    raise self._leaf_mass_failure(name, occurrence, referenced, error) from error
+                    counts = dict(self.notes.get("bodies:" + name) or {})
+                    fallback_row = None
+                    if (
+                        error.code == "cad_empty_model"
+                        and int(counts.get("solid") or 0) == 0
+                        and int(counts.get("sheet") or 0) > 0
+                    ):
+                        try:
+                            fallback_row = self._sheet_only_instance_fallback(
+                                occurrence, doc_path, name, referenced, error, counts
+                            )
+                        except Exception as fallback_error:  # noqa: BLE001
+                            raise self._leaf_mass_failure(
+                                name,
+                                occurrence,
+                                referenced,
+                                error,
+                                extra={
+                                    "fallback_error": str(
+                                        getattr(fallback_error, "code", "") or type(fallback_error).__name__
+                                    ),
+                                    "fallback_message": " ".join(str(fallback_error).split())[:200],
+                                },
+                            ) from fallback_error
+                    if fallback_row is None:
+                        raise self._leaf_mass_failure(name, occurrence, referenced, error) from error
+                    properties[name] = fallback_row
+                    self.notes["effective_instance:" + name] = "cad_authored_effective_instance"
                 properties[name]["reference"]["configuration"] = referenced
                 self.notes["mass_property:" + name] = properties[name]["reference"]["used_api"]
         if not components:

@@ -1459,6 +1459,9 @@ class CaptureSceneTests(unittest.TestCase):
             def _mass_properties_document(self, doc, require_material=True):
                 raise CadError("cad_empty_model", "part has no solid bodies", {"marker": "kept"})
 
+            def assembly_group_mass_properties(self, path, names, *, allow_overrides=False):
+                raise CadError("cad_group_unavailable", "no assembly context here")
+
         class SheetOnlyComponent(_Component):
             def GetBodies2(self, body_type):
                 return [] if body_type == 0 else [object()]
@@ -1482,6 +1485,131 @@ class CaptureSceneTests(unittest.TestCase):
         self.assertEqual(error.detail["referenced_configuration"], "Default")
         self.assertEqual(error.detail["bodies"], {"solid": 0, "sheet": 1})
         self.assertEqual(error.detail["phase"], "leaf_mass_read")
+        self.assertEqual(error.detail["fallback_error"], "cad_group_unavailable")
+
+    def test_sheet_only_fallback_records_the_effective_instance_row(self):
+        class FallbackBackend(_CaptureBackend):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.group_calls = []
+
+            def _body_count(self, holder, body_type, component):
+                return len(holder.GetBodies2(body_type))
+
+            def _mass_properties_document(self, doc, require_material=True):
+                raise CadError("cad_empty_model", "part has no solid bodies")
+
+            def assembly_group_mass_properties(self, path, names, *, allow_overrides=False):
+                self.group_calls.append((str(path), tuple(names), allow_overrides))
+                flags = {
+                    "OverrideMass": True,
+                    "OverrideCenterOfMass": True,
+                    "OverrideMomentsOfInertia": True,
+                }
+                return {
+                    "assembly": str(path),
+                    "configuration": "Default",
+                    "group": list(names),
+                    "members": {names[0]: flags},
+                    "mass": 0.026,
+                    "com": [0.0, 0.0, 0.05],
+                    "inertia": [[1e-6, 1e-8, 0.0], [1e-8, 1.2e-6, 0.0], [0.0, 0.0, 2e-6]],
+                    "reference": {
+                        "used_api": "IMassProperty2.GetMomentOfInertia(0)",
+                        "selection_api": "IMassProperty2 (SelectedItems = component instance)",
+                        "override_api": "IMassProperty2.GetOverrideOptions (same selection)",
+                        "scope": "assembly_component_group",
+                        "convention_basis": "analytic_fixture_v2_20261006",
+                        "product_convention": "solidworks_standard",
+                        "reference_point": "center_of_mass",
+                        "axes": "assembly_document_axes",
+                        "use_system_units": True,
+                        "effective_instance": True,
+                        "measurement_basis": "cad_authored_effective_instance",
+                        "volume_m3": 3.3e-6,
+                        "density_kg_m3": 7878.0,
+                    },
+                }
+
+        class SheetOnlyComponent(_Component):
+            def GetBodies2(self, body_type):
+                return [] if body_type == 0 else [object()] * 2350
+
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            part = _write(root, "EasyEDA PCB Model~Nz70.SLDPRT")
+            shared = _Doc(part, configuration="Default", configuration_children={"Default": []})
+            component = SheetOnlyComponent("part-sheet", part, doc=shared, configuration="Default")
+            assembly = _write(root, "robot.SLDASM")
+            main = _Doc(assembly, doc_type=2, children=[component])
+            backend = FallbackBackend(session_factory=lambda: _Session(_App({assembly: main, part: shared})))
+            scene = backend.collect_scene(str(assembly), [])
+        row = scene.mass_properties["part-sheet"]
+        self.assertEqual(row["mode"], "effective_instance")
+        self.assertEqual(row["state"], "sheet_only")
+        self.assertEqual(row["measurement_basis"], "cad_authored_effective_instance")
+        self.assertEqual(row["mass"], 0.026)
+        self.assertEqual(row["com"], [0.0, 0.0, 0.05])
+        reference = row["reference"]
+        self.assertEqual(reference["used_api"], "IMassProperty2.GetMomentOfInertia(0)")
+        self.assertEqual(reference["selection_api"], "IMassProperty2 (SelectedItems = component instance)")
+        self.assertEqual(reference["override_api"], "IMassProperty2.GetOverrideOptions (same selection)")
+        self.assertEqual(reference["scope"], "assembly_component_group")
+        self.assertEqual(reference["axes"], "assembly_document_axes")
+        self.assertEqual(reference["selected_components"], ["part-sheet"])
+        self.assertEqual(reference["part_document"], str(part))
+        self.assertEqual(reference["assembly_document"], str(assembly))
+        self.assertEqual(reference["assembly_configuration"], "Default")
+        self.assertEqual(reference["configuration"], "Default")
+        self.assertEqual(reference["fallback_error_code"], "cad_empty_model")
+        self.assertEqual(reference["fallback_reason"], "cad_part_document_mass_unavailable")
+        self.assertEqual(reference["solid_bodies"], 0)
+        self.assertEqual(reference["sheet_bodies"], 2350)
+        self.assertEqual(
+            reference["overrides"],
+            {"OverrideMass": True, "OverrideCenterOfMass": True, "OverrideMomentsOfInertia": True},
+        )
+        self.assertEqual(reference["volume_m3"], 3.3e-6)
+        self.assertEqual(reference["density_kg_m3"], 7878.0)
+        self.assertEqual(scene.notes["effective_instance:part-sheet"], "cad_authored_effective_instance")
+        self.assertEqual(backend.group_calls, [(str(assembly), ("part-sheet",), True)])
+
+    def test_no_bodies_at_all_still_fails_without_a_fallback(self):
+        class NoBodyBackend(_CaptureBackend):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.group_calls = 0
+
+            def _body_count(self, holder, body_type, component):
+                return len(holder.GetBodies2(body_type))
+
+            def _mass_properties_document(self, doc, require_material=True):
+                raise CadError("cad_empty_model", "part has no solid bodies")
+
+            def assembly_group_mass_properties(self, path, names, *, allow_overrides=False):
+                self.group_calls += 1
+                raise AssertionError("no fallback may be attempted without sheet bodies")
+
+        class EmptyComponent(_Component):
+            def GetBodies2(self, body_type):
+                return []
+
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            part = _write(root, "empty.SLDPRT")
+            shared = _Doc(part, configuration="Default", configuration_children={"Default": []})
+            component = EmptyComponent("part-empty", part, doc=shared, configuration="Default")
+            assembly = _write(root, "robot.SLDASM")
+            main = _Doc(assembly, doc_type=2, children=[component])
+            backend = NoBodyBackend(session_factory=lambda: _Session(_App({assembly: main, part: shared})))
+            with self.assertRaises(CadError) as caught:
+                backend.collect_scene(str(assembly), [])
+        error = caught.exception
+        self.assertEqual(error.code, "cad_empty_model")
+        self.assertEqual(error.detail["component"], "part-empty")
+        self.assertEqual(error.detail["bodies"], {"solid": 0, "sheet": 0})
+        self.assertNotIn("fallback_error", error.detail)
+        self.assertEqual(backend.group_calls, 0)
 
     def test_geometry_phase_does_not_release_and_reacquire_parents_between_occurrences(self):
         from contextlib import contextmanager
