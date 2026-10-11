@@ -328,7 +328,7 @@ class DagTests(unittest.TestCase):
             def get_job(self, run_id):
                 return parent_job
 
-            def start_selection_job(self, **kwargs):
+            def start_staging_job(self, **kwargs):
                 submitted.update(kwargs)
                 return {"run_id": kwargs["run_id"], "status": "queued"}
 

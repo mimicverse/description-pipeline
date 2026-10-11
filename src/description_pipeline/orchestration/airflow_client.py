@@ -3,11 +3,12 @@
 The endpoint contract is fixed and carries no shell or local paths:
 
 * ``POST /v1/jobs`` with ``{run_id, upload_files, upload_sha256, main_assembly}`` starts one
-  selection job (idempotent per run_id; a different payload for the same run_id is HTTP 409);
-  an optional ``resume={parent_run, from_stage}`` inherits a parent's sealed selection for a
-  linked native rerun;
-* ``POST /v1/jobs/<uuid>/files`` admits exactly one requested source batch (``application/zip``
-  with ``X-Selection-Round``) and ``POST /v1/jobs/<uuid>/seal`` seals the dependent closure;
+  staging job (idempotent per run_id; a different payload for the same run_id is HTTP 409);
+  an optional ``resume={parent_run, from_stage}`` inherits a parent's sealed dependency closure
+  for a linked native rerun;
+* ``POST /v1/jobs/<uuid>/files`` admits the one full indexed-folder archive (``application/zip``);
+  the endpoint stages it provisionally, then resolves, verifies and seals the native dependency
+  closure server-side;
 * ``GET /v1/jobs/<uuid>`` returns status/events/result/error plus the selection block and, once
   sealed, the manifest; ``awaiting_definition`` exposes the raw-record artifact, and
   ``POST /v1/jobs/<uuid>/definition`` submits the sealed capture request carrying
@@ -40,9 +41,9 @@ from urllib import request as urlrequest
 
 from ..delivery import PIPELINE_ID
 from ..io import PipelineError, artifact_path_parts, digest
-from ..sources.solidworks.selection import seal_selection, selection_plan, validate_file_index, verify_selection
+from ..sources.solidworks.selection import validate_file_index
 from ..stages import STAGE_IDS
-from .selection_client import prepare_selection_batch
+from .selection_client import prepare_staging_archive
 from .stage_transfer import CAPTURE_ARCHIVE, MAX_TRANSFER_BYTES
 
 JOB_SCHEMA = "solidworks-to-urdf.job/v1"
@@ -53,8 +54,8 @@ EVENT_KEYS = ("stage", "state", "at")
 #: ``awaiting_definition`` is the nonterminal hand-off where the native raw record
 #: is available and the generated definition ZIP is still to be submitted.
 RUN_STATES = {"queued", "selecting", "running", "awaiting_definition", "native_complete", "passed", "failed"}
-#: Selection transport states of a ``selecting`` job (frozen contract).
-SELECTION_STATES = ("awaiting_files", "reading", "ready", "sealed")
+#: Staging transport states of a ``selecting`` job (frozen contract).
+SELECTION_STATES = ("awaiting_files", "reading", "sealed")
 #: The fixed artifact name of the native raw-record bundle (mirrors discovery_transfer).
 NATIVE_RECORD_ARCHIVE = "raw-record.zip"
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -439,11 +440,9 @@ class SelectionSnapshot:
     """Validated selection block of one endpoint job snapshot."""
 
     state: str
-    round_id: str
     reader_sha256: str
-    observations: dict[str, dict]
+    upload_sha256: str
     staged_files: dict[str, str]
-    requested_files: dict[str, str]
     manifest: dict | None = None
 
 
@@ -464,35 +463,10 @@ def _selection_files(value: object, label: str) -> dict[str, str]:
     return files
 
 
-def _selection_observations(value: object, staged: dict[str, str]) -> dict[str, dict]:
-    if not isinstance(value, dict) or any(not isinstance(name, str) for name in value):
-        raise EndpointProtocolError("selection observations must be a document->record object")
-    observations: dict[str, dict] = {}
-    for name, record in value.items():
-        if name not in staged:
-            raise EndpointProtocolError(f"selection observed a document that is not staged: {name!r}")
-        if not isinstance(record, dict) or set(record) != {"sha256", "references"}:
-            raise EndpointProtocolError(f"invalid dependency observation: {name!r}")
-        if record["sha256"] != staged[name]:
-            raise EndpointProtocolError(f"observation source differs from the staged bytes: {name!r}")
-        references = record["references"]
-        if not isinstance(references, list) or any(not isinstance(item, str) for item in references):
-            raise EndpointProtocolError(f"invalid dependency list: {name!r}")
-        for reference in references:
-            try:
-                parts = artifact_path_parts(reference)
-            except PipelineError as error:
-                raise EndpointProtocolError(f"invalid dependency path: {reference!r}") from error
-            if "/".join(parts) != reference:
-                raise EndpointProtocolError(f"noncanonical dependency path: {reference!r}")
-        observations[name] = {"sha256": staged[name], "references": list(references)}
-    return observations
-
-
 def _selection_block(
     job: dict, *, upload_files: dict[str, str] | None = None, initial: bool = False
 ) -> SelectionSnapshot:
-    """Parse and validate one job's selection block against the frozen contract."""
+    """Parse and validate one job's staging block against the frozen contract."""
 
     tool = job.get("native_tool")
     if not isinstance(tool, dict):
@@ -500,34 +474,41 @@ def _selection_block(
     reader = validate_sha256(tool.get("source_sha256"))
     block = job.get("selection")
     if not isinstance(block, dict):
-        raise EndpointProtocolError("selection job carries no selection block")
+        raise EndpointProtocolError("staging job carries no selection block")
     state = block.get("state")
     if state not in SELECTION_STATES:
-        raise EndpointProtocolError(f"unexpected selection state: {state!r}")
-    round_id = validate_sha256(block.get("round_id"))
+        raise EndpointProtocolError(f"unexpected staging state: {state!r}")
+    expected_keys = {"state", "reader_sha256", "upload_sha256", "staged_files"}
+    if "manifest" in block:
+        expected_keys.add("manifest")
+    if set(block) != expected_keys:
+        raise EndpointProtocolError("the staging block carries unexpected fields")
     if validate_sha256(block.get("reader_sha256")) != reader:
-        raise EndpointProtocolError("selection reader identity differs from the native tool record")
+        raise EndpointProtocolError("staging reader identity differs from the native tool record")
+    upload_sha256 = validate_sha256(block.get("upload_sha256"))
     staged = _selection_files(block.get("staged_files"), "staged_files")
-    requested = _selection_files(block.get("requested_files"), "requested_files")
-    observations = _selection_observations(block.get("observations"), staged)
     manifest = block.get("manifest")
     if manifest is not None and (not isinstance(manifest, dict) or not manifest):
         raise EndpointProtocolError("selection manifest must be a non-empty object")
     if state == "sealed" and manifest is None:
         raise EndpointProtocolError("a sealed selection must carry its manifest")
     if upload_files is not None:
-        for name, checksum in (*staged.items(), *requested.items()):
+        if upload_sha256 != digest(upload_files):
+            raise EndpointProtocolError("staging upload digest differs from the upload index")
+        for name, checksum in staged.items():
             if upload_files.get(name) != checksum:
-                raise EndpointProtocolError(f"selection names a file outside the upload index: {name!r}")
-    if initial and (state != "awaiting_files" or staged or observations or len(requested) != 1):
-        raise EndpointProtocolError("selection must start from the main-assembly-only request")
+                raise EndpointProtocolError(f"staging names a file outside the upload index: {name!r}")
+        if state == "sealed" and staged != dict(upload_files):
+            raise EndpointProtocolError("a sealed staging must hold the full upload index")
+    if state == "awaiting_files" and (staged or manifest is not None):
+        raise EndpointProtocolError("an awaiting staging carries no staged bytes")
+    if initial and (state != "awaiting_files" or staged or manifest is not None):
+        raise EndpointProtocolError("staging must start from an empty awaiting stage")
     return SelectionSnapshot(
         state=state,
-        round_id=round_id,
         reader_sha256=reader,
-        observations=observations,
+        upload_sha256=upload_sha256,
         staged_files=staged,
-        requested_files=requested,
         manifest=manifest,
     )
 
@@ -698,7 +679,7 @@ class WindowsEndpoint:
 
         return self._authorized_handoff_dir(validate_handoff_path(handoff_path))
 
-    def start_selection_job(
+    def start_staging_job(
         self,
         *,
         run_id: str,
@@ -706,7 +687,7 @@ class WindowsEndpoint:
         main_assembly: str,
         resume: dict | None = None,
     ) -> dict:
-        """Start one selection job: a fresh round loop, or a linked rerun inheriting a sealed parent."""
+        """Start one staging job: a fresh full-folder stage, or a linked rerun inheriting a sealed parent."""
 
         validated = validate_file_index(upload_files)
         main = validate_main_assembly(main_assembly)
@@ -722,74 +703,49 @@ class WindowsEndpoint:
             payload["resume"] = validate_resume(resume, run_id=payload["run_id"])
         response = self._request("POST", "/v1/jobs", payload)
         if response.get("run_id") != payload["run_id"] or response.get("request") != payload:
-            raise EndpointProtocolError("endpoint accepted a different selection request")
+            raise EndpointProtocolError("endpoint accepted a different staging request")
         if response.get("status") not in RUN_STATES:
             raise EndpointProtocolError(f"unexpected job status: {response.get('status')!r}")
         snapshot = _selection_block(response, upload_files=validated, initial=resume is None)
         if resume is None:
-            if snapshot.requested_files != {main: validated[main]}:
-                raise EndpointProtocolError("selection must start with the main assembly only")
             return response
-        if snapshot.state != "sealed" or snapshot.manifest is None or snapshot.requested_files:
-            raise EndpointProtocolError("a linked rerun must inherit the parent's sealed selection")
+        if snapshot.state != "sealed" or snapshot.manifest is None:
+            raise EndpointProtocolError("a linked rerun must inherit the parent's sealed closure")
         if snapshot.manifest.get("main_assembly") != main:
-            raise EndpointProtocolError("the inherited selection is bound to a different main assembly")
+            raise EndpointProtocolError("the inherited closure is bound to a different main assembly")
         sealed_files = snapshot.manifest.get("files")
-        if not isinstance(sealed_files, dict) or not sealed_files or snapshot.staged_files != sealed_files:
-            raise EndpointProtocolError("the inherited selection stage differs from its sealed manifest")
+        if not isinstance(sealed_files, dict) or not sealed_files:
+            raise EndpointProtocolError("the inherited closure carries no resolved files")
+        for name, checksum in sealed_files.items():
+            if validated.get(name) != checksum:
+                raise EndpointProtocolError(f"the inherited closure names a file outside the upload index: {name!r}")
         return response
 
-    def selection_snapshot(self, run_id: str, *, upload_files: dict[str, str] | None = None) -> SelectionSnapshot:
-        """Fetch and validate the selection block; never trusts a partial contract."""
+    def staging_snapshot(self, run_id: str, *, upload_files: dict[str, str] | None = None) -> SelectionSnapshot:
+        """Fetch and validate the staging block; never trusts a partial contract."""
 
         job = self.get_job(run_id)
         validated = None if upload_files is None else validate_file_index(upload_files)
         return _selection_block(job, upload_files=validated)
 
-    def push_selection_batch(
-        self,
-        *,
-        run_id: str,
-        round_id: str,
-        archive: Path,
-        batch: dict[str, str],
-        upload_files: dict[str, str],
-    ) -> dict:
-        """Push exactly one requested batch with its round binding; acknowledge staged bytes."""
+    def stage_folder_archive(self, run_id: str, archive: Path, *, upload_files: dict[str, str]) -> dict:
+        """Push the one exact full-index folder archive; the endpoint stages it before resolving."""
 
         validated = validate_file_index(upload_files)
-        for name, checksum in batch.items():
-            if validated.get(name) != checksum:
-                raise EndpointProtocolError(f"batch file is not authorized by the upload index: {name!r}")
         archive = Path(archive)
         size = archive.stat().st_size
         if not 0 < size <= MAX_TRANSFER_BYTES:
-            raise EndpointProtocolError("selection batch archive has an invalid size")
+            raise EndpointProtocolError("staging archive has an invalid size")
         with archive.open("rb") as handle:
             response = self._request_stream(
                 "POST",
                 f"/v1/jobs/{validate_run_id(run_id)}/files",
                 handle,
                 size=size,
-                headers={"X-Selection-Round": validate_sha256(round_id)},
             )
         snapshot = _selection_block(response, upload_files=validated)
-        for name, checksum in batch.items():
-            if snapshot.staged_files.get(name) != checksum:
-                raise EndpointProtocolError(f"endpoint did not stage the requested bytes: {name!r}")
-        return response
-
-    def post_selection_seal(self, *, run_id: str, manifest: dict) -> dict:
-        """Submit the sealed manifest; the endpoint re-hashes its own stage before accepting."""
-
-        response = self._request(
-            "POST",
-            f"/v1/jobs/{validate_run_id(run_id)}/seal",
-            {"selection": dict(manifest)},
-        )
-        snapshot = _selection_block(response)
-        if snapshot.state != "sealed" or snapshot.requested_files:
-            raise EndpointProtocolError("endpoint did not seal the validated selection")
+        if snapshot.staged_files != validated:
+            raise EndpointProtocolError("endpoint did not stage the full indexed folder")
         return response
 
     def definition_snapshot(self, run_id: str, *, upload_files: dict[str, str] | None = None) -> AwaitingDefinition:
@@ -1016,33 +972,28 @@ class WindowsEndpoint:
             self._sleep(interval)
 
 
-def _selection_progress(snapshot: SelectionSnapshot) -> dict:
-    """The cross-poke invariant bundle kept in the task XCom."""
+def _require_closure(upload_files: dict[str, str], main_assembly: str, snapshot: SelectionSnapshot) -> dict:
+    """The sealed closure manifest must bind to the local intake it was staged from."""
 
-    return {
-        "reader_sha256": snapshot.reader_sha256,
-        "round_id": snapshot.round_id,
-        "staged_files": snapshot.staged_files,
-        "observations": snapshot.observations,
-    }
-
-
-def _require_monotonic(previous: object, snapshot: SelectionSnapshot) -> None:
-    """Staged and observed identities may only grow, never change."""
-
-    if not isinstance(previous, dict):
-        return
-    if previous.get("reader_sha256") not in (None, snapshot.reader_sha256):
-        raise EndpointProtocolError("selection reader identity changed between rounds")
-    for name, checksum in (previous.get("staged_files") or {}).items():
-        if snapshot.staged_files.get(name) != checksum:
-            raise EndpointProtocolError(f"staged file identity changed between rounds: {name!r}")
-    for name, record in (previous.get("observations") or {}).items():
-        if snapshot.observations.get(name) != record:
-            raise EndpointProtocolError(f"recorded observation changed between rounds: {name!r}")
+    manifest = snapshot.manifest
+    if not isinstance(manifest, dict):
+        raise EndpointProtocolError("a sealed staging carries no closure manifest")
+    if manifest.get("upload_sha256") != digest(upload_files):
+        raise EndpointProtocolError("the closure manifest does not bind the upload index digest")
+    if manifest.get("main_assembly") != main_assembly:
+        raise EndpointProtocolError("the closure manifest is bound to a different main assembly")
+    files = manifest.get("files")
+    if not isinstance(files, dict) or not files:
+        raise EndpointProtocolError("the closure manifest carries no resolved files")
+    for name, checksum in files.items():
+        if upload_files.get(name) != checksum:
+            raise EndpointProtocolError(f"the closure manifest names a file outside the upload index: {name!r}")
+    if manifest.get("handoff_sha256") != digest(files):
+        raise EndpointProtocolError("the closure manifest does not bind its resolved closure digest")
+    return manifest
 
 
-def drive_selection_round(
+def drive_staging(
     endpoint: WindowsEndpoint,
     *,
     run_id: str,
@@ -1050,76 +1001,36 @@ def drive_selection_round(
     main_assembly: str,
     intake_dir: Path,
     batch_dir: Path,
-    previous: object = None,
 ) -> dict:
-    """One bounded selection step: wait, push the exact next request, or seal.
+    """One bounded staging step: push the exact indexed folder once, wait, or verify the closure.
 
-    The recorded dependency graph (``selection_plan``) is recomputed from the
-    endpoint-observed documents on every call; the next push must equal its
-    request exactly, staged bytes must equal the selected graph before sealing,
-    and the manifest is sealed from the endpoint-attested stage inventory - never
-    from plan metadata - with the reader identity pinned by the native tool.
+    The archive carries every indexed name with the exact recorded bytes; a lost
+    acknowledgement is retried logically with the same member set and hashes, and
+    the endpoint seals the native closure itself - the client never plans rounds,
+    seals or transfers anything beyond the one full indexed folder.
     """
 
     validated = validate_file_index(upload_files)
-    snapshot = endpoint.selection_snapshot(run_id, upload_files=validated)
-    _require_monotonic(previous, snapshot)
-    plan = selection_plan(validated, main_assembly, snapshot.observations)
+    snapshot = endpoint.staging_snapshot(run_id, upload_files=validated)
     if snapshot.state == "awaiting_files":
-        if plan["state"] != "requesting" or plan["requested_files"] != snapshot.requested_files:
-            raise EndpointProtocolError("selection request differs from the recorded dependency graph")
         batch_dir = Path(batch_dir)
         batch_dir.mkdir(parents=True, exist_ok=True)
-        archive = batch_dir / f"batch-{snapshot.round_id}-{uuid.uuid4().hex}.zip"
+        archive = batch_dir / f"staging-{digest(validated)}.zip"
         try:
-            metadata = prepare_selection_batch(
-                Path(intake_dir), archive, plan["requested_files"], expected_upload=validated
-            )
-            if metadata["files"] != plan["requested_files"]:
-                raise EndpointProtocolError("prepared batch differs from the requested dependency graph")
-            response = endpoint.push_selection_batch(
-                run_id=run_id,
-                round_id=snapshot.round_id,
-                archive=archive,
-                batch=plan["requested_files"],
-                upload_files=validated,
-            )
+            metadata = prepare_staging_archive(Path(intake_dir), archive, validated)
+            if metadata["files"] != validated:
+                raise EndpointProtocolError("the prepared staging archive differs from the upload index")
+            response = endpoint.stage_folder_archive(run_id, archive, upload_files=validated)
         finally:
             archive.unlink(missing_ok=True)
-        pushed = _selection_block(response, upload_files=validated)
-        _require_monotonic(_selection_progress(snapshot), pushed)
-        return {
-            "action": "pushed",
-            "state": pushed.state,
-            "requested": sorted(plan["requested_files"]),
-            "progress": _selection_progress(pushed),
-        }
+        staged = _selection_block(response, upload_files=validated)
+        if staged.state not in {"reading", "sealed"} or staged.staged_files != validated:
+            raise EndpointProtocolError("endpoint did not stage the full indexed folder")
+        return {"action": "staged", "state": staged.state, "sealed": staged.state == "sealed"}
     if snapshot.state == "reading":
-        return {"action": "wait", "state": "reading", "progress": _selection_progress(snapshot)}
-    if plan["state"] != "complete" or plan["requested_files"]:
-        raise EndpointProtocolError("selection is ready before the dependency graph is complete")
-    staged = snapshot.staged_files
-    if staged != plan["selected_files"]:
-        raise EndpointProtocolError("staged bytes differ from the recorded assembly selection")
-    manifest = seal_selection(
-        validated,
-        main_assembly,
-        snapshot.observations,
-        selected_files=staged,
-        reader_sha256=snapshot.reader_sha256,
-    )
-    if snapshot.state == "ready":
-        response = endpoint.post_selection_seal(run_id=run_id, manifest=manifest)
-        sealed = _selection_block(response, upload_files=validated)
-        if sealed.state != "sealed" or sealed.requested_files or sealed.staged_files != staged:
-            raise EndpointProtocolError("endpoint did not seal the validated selection")
-    verify_selection(manifest, validated, staged, reader_sha256=snapshot.reader_sha256)
-    return {
-        "action": "sealed",
-        "state": "sealed",
-        "manifest": manifest,
-        "progress": _selection_progress(snapshot),
-    }
+        return {"action": "wait", "state": "reading", "sealed": False}
+    manifest = _require_closure(validated, main_assembly, snapshot)
+    return {"action": "sealed", "state": "sealed", "sealed": True, "manifest": manifest}
 
 
 def verified_result(result: dict | None) -> dict:

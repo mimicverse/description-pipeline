@@ -40,6 +40,7 @@ from description_pipeline.orchestration.airflow_client import (
     verified_result,
 )
 from description_pipeline.sources.solidworks.handoff import HANDOFF_SCHEMA
+from description_pipeline.io import digest
 from description_pipeline.orchestration.stage_transfer import CAPTURE_ARCHIVE
 
 TOKEN = "test-token"
@@ -94,10 +95,10 @@ SELECTION_FILES = {"assembly.SLDASM": "c" * 64, "part.SLDPRT": "e" * 64}
 READER_SHA256 = "d" * 64
 
 
-def start_selection(endpoint, run_id: str = RUN_ID, **overrides) -> dict:
+def start_staging(endpoint, run_id: str = RUN_ID, **overrides) -> dict:
     payload = {"run_id": run_id, "upload_files": SELECTION_FILES, "main_assembly": "assembly.SLDASM"}
     payload.update(overrides)
-    return endpoint.start_selection_job(**payload)
+    return endpoint.start_staging_job(**payload)
 
 
 class MockEndpoint:
@@ -373,30 +374,27 @@ class MockEndpoint:
                     "request": payload,
                 }
                 if "upload_files" in payload:
+                    upload = dict(payload["upload_files"])
                     job["native_tool"] = {"source_sha256": READER_SHA256, "role": "native"}
                     if "resume" in payload:
-                        sealed = dict(payload["upload_files"])
                         job["selection"] = {
                             "state": "sealed",
-                            "round_id": "f" * 64,
                             "reader_sha256": READER_SHA256,
-                            "observations": {
-                                name: {"sha256": checksum, "references": []} for name, checksum in sealed.items()
+                            "upload_sha256": payload["upload_sha256"],
+                            "staged_files": upload,
+                            "manifest": {
+                                "main_assembly": payload["main_assembly"],
+                                "files": upload,
+                                "upload_sha256": payload["upload_sha256"],
+                                "handoff_sha256": digest(upload),
                             },
-                            "staged_files": sealed,
-                            "requested_files": {},
-                            "manifest": {"main_assembly": payload["main_assembly"], "files": sealed},
                         }
                     else:
                         job["selection"] = {
                             "state": "awaiting_files",
-                            "round_id": "f" * 64,
                             "reader_sha256": READER_SHA256,
-                            "observations": {},
+                            "upload_sha256": payload["upload_sha256"],
                             "staged_files": {},
-                            "requested_files": {
-                                payload["main_assembly"]: payload["upload_files"][payload["main_assembly"]]
-                            },
                         }
                 outer.jobs[run_id] = job
                 self._send(202, {k: v for k, v in job.items() if k != "pokes"})
@@ -432,29 +430,29 @@ class ClientTests(unittest.TestCase):
     def test_start_is_idempotent_and_conflicts_on_mismatch(self) -> None:
         with MockEndpoint() as server:
             endpoint = self.endpoint(server)
-            first = start_selection(endpoint)
-            second = start_selection(endpoint)
+            first = start_staging(endpoint)
+            second = start_staging(endpoint)
             self.assertEqual(first["run_id"], second["run_id"])
             self.assertEqual(len(server.jobs), 1)
             with self.assertRaises(EndpointConflict):
-                start_selection(endpoint, upload_files={"assembly.SLDASM": "9" * 64})
+                start_staging(endpoint, upload_files={"assembly.SLDASM": "9" * 64})
 
     def test_native_job_binds_only_index_digest_and_main(self) -> None:
         from description_pipeline.io import digest
 
         with MockEndpoint() as server:
             endpoint = self.endpoint(server)
-            job = start_selection(endpoint)
+            job = start_staging(endpoint)
             self.assertEqual(job["request"]["upload_sha256"], digest(SELECTION_FILES))
             self.assertEqual(job["request"]["main_assembly"], "assembly.SLDASM")
             self.assertNotIn("package", job["request"])
             with self.assertRaises(EndpointConflict):
-                start_selection(endpoint, upload_files={"assembly.SLDASM": "9" * 64})
+                start_staging(endpoint, upload_files={"assembly.SLDASM": "9" * 64})
 
     def test_native_job_resolves_routing_after_cad_discovery(self) -> None:
         with MockEndpoint() as server:
             endpoint = self.endpoint(server)
-            start_selection(endpoint)
+            start_staging(endpoint)
             routing = resolved_routing(endpoint.get_job(RUN_ID))
             self.assertEqual(routing["hardware_id"], "m3.0")
             self.assertEqual(routing["repository_slug"], "example/m3.0")
@@ -469,7 +467,7 @@ class ClientTests(unittest.TestCase):
     def test_get_job_accepts_unresolved_routing_but_rejects_empty_values(self) -> None:
         with MockEndpoint() as server:
             endpoint = self.endpoint(server)
-            start_selection(endpoint)
+            start_staging(endpoint)
             self.assertNotIn("repository_slug", server.jobs[RUN_ID])
             endpoint.get_job(RUN_ID)
             server.jobs[RUN_ID]["repository_slug"] = " "
@@ -735,7 +733,7 @@ class ClientTests(unittest.TestCase):
     def test_open_artifact_streams_verified_bytes(self) -> None:
         with MockEndpoint() as server:
             endpoint = self.endpoint(server)
-            start_selection(endpoint)
+            start_staging(endpoint)
             endpoint.wait(RUN_ID, interval=0.05, timeout=5)
             with endpoint.open_artifact(RUN_ID, "urdf/robot.urdf") as response:
                 self.assertEqual(response.read(), b"<robot name='fixture'/>")
@@ -761,7 +759,7 @@ class ClientTests(unittest.TestCase):
     def test_wait_passes_and_fails_closed_on_result(self) -> None:
         with MockEndpoint() as server:
             endpoint = self.endpoint(server)
-            start_selection(endpoint)
+            start_staging(endpoint)
             job = endpoint.wait(RUN_ID, interval=0.05, timeout=5)
             self.assertEqual(job["status"], "passed")
             self.assertEqual(
@@ -805,7 +803,7 @@ class ClientTests(unittest.TestCase):
                     check_result(bad, expected_slug="example/m3.0", expected_base="feature/m3.0")
         with MockEndpoint(omit_quality=True) as server:
             endpoint = self.endpoint(server)
-            start_selection(endpoint)
+            start_staging(endpoint)
             with self.assertRaises(ResultNotPublishable):
                 check_result(
                     endpoint.wait(RUN_ID, interval=0.05, timeout=5)["result"],
@@ -818,7 +816,7 @@ class ClientTests(unittest.TestCase):
 
         with MockEndpoint(native_complete=True) as server:
             endpoint = self.endpoint(server)
-            start_selection(endpoint)
+            start_staging(endpoint)
             job = endpoint.wait(RUN_ID, interval=0.05, timeout=5)
             self.assertEqual(job["status"], "native_complete")
             archive = capture_archive_metadata(job)
@@ -881,14 +879,14 @@ class ClientTests(unittest.TestCase):
     def test_failed_job_raises(self) -> None:
         with MockEndpoint(fail_job=True) as server:
             endpoint = self.endpoint(server)
-            start_selection(endpoint)
+            start_staging(endpoint)
             with self.assertRaises(JobFailed):
                 endpoint.wait(RUN_ID, interval=0.05, timeout=5)
 
     def test_invalid_event_contract_is_refused(self) -> None:
         with MockEndpoint(invalid_events=True) as server:
             endpoint = self.endpoint(server)
-            start_selection(endpoint)
+            start_staging(endpoint)
             with self.assertRaises(EndpointProtocolError):
                 endpoint.get_job(RUN_ID)
 
@@ -937,7 +935,7 @@ class ClientTests(unittest.TestCase):
         self.addCleanup(server.shutdown)
         endpoint = WindowsEndpoint(EndpointConfig(base_url=f"http://127.0.0.1:{server.server_port}", token=TOKEN))
         with self.assertRaises(EndpointConflict) as caught:
-            start_selection(endpoint)
+            start_staging(endpoint)
         failure = caught.exception
         self.assertEqual(failure.status, 409)
         self.assertEqual(failure.code, "already_active")
@@ -963,32 +961,32 @@ class ClientTests(unittest.TestCase):
             EndpointConfig(base_url="http://127.0.0.1", token=TOKEN),
             opener=lambda *_args, **_kwargs: io.BytesIO(json.dumps(response).encode()),
         )
-        with self.assertRaisesRegex(EndpointProtocolError, "different selection request"):
-            start_selection(endpoint)
+        with self.assertRaisesRegex(EndpointProtocolError, "different staging request"):
+            start_staging(endpoint)
 
     def test_linked_start_forwards_resume_and_rerun_plan_round_trips(self) -> None:
         from description_pipeline.stages import STAGE_IDS
 
         with MockEndpoint() as server:
             endpoint = self.endpoint(server)
-            start_selection(endpoint, run_id=PARENT_ID)
+            start_staging(endpoint, run_id=PARENT_ID)
             plan = endpoint.rerun_plan(PARENT_ID)
             self.assertEqual(plan["run_id"], PARENT_ID)
             self.assertEqual([row["stage"] for row in plan["stage_reruns"]], list(STAGE_IDS))
-            child = start_selection(endpoint, resume={"parent_run": PARENT_ID, "from_stage": "verify"})
+            child = start_staging(endpoint, resume={"parent_run": PARENT_ID, "from_stage": "verify"})
             self.assertEqual(child["request"]["resume"], {"parent_run": PARENT_ID, "from_stage": "verify"})
             with self.assertRaises(EndpointConflict):
-                start_selection(endpoint, resume={"parent_run": PARENT_ID, "from_stage": "generate"})
+                start_staging(endpoint, resume={"parent_run": PARENT_ID, "from_stage": "generate"})
 
     def test_linked_bindings_and_plans_are_validated_before_they_are_trusted(self) -> None:
         with MockEndpoint() as server:
             endpoint = self.endpoint(server)
-            start_selection(endpoint, run_id=PARENT_ID)
+            start_staging(endpoint, run_id=PARENT_ID)
             broken = rerun_plan_payload(PARENT_ID)
             broken["stage_reruns"] = broken["stage_reruns"][:-1]
             with MockEndpoint(rerun_payload=broken) as bad_server:
                 bad = self.endpoint(bad_server)
-                start_selection(bad, run_id=PARENT_ID)
+                start_staging(bad, run_id=PARENT_ID)
                 with self.assertRaises(EndpointProtocolError):
                     bad.rerun_plan(PARENT_ID)
             for resume in (
@@ -998,7 +996,7 @@ class ClientTests(unittest.TestCase):
                 {"parent_run": RUN_ID, "from_stage": "verify"},
             ):
                 with self.subTest(resume=str(resume)), self.assertRaises(EndpointProtocolError):
-                    start_selection(endpoint, resume=resume)
+                    start_staging(endpoint, resume=resume)
 
     def test_invalid_url_timeout_and_redirect_fail_closed(self) -> None:
         for address in ("http://127.0.0.1:invalid", "http://127.0.0.1?token=x", "http://127.0.0.1#fragment"):

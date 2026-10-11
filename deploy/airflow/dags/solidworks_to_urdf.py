@@ -1,9 +1,9 @@
 """Submit one engineering folder to the Windows SolidWorks execution endpoint.
 
 The DAG carries ``handoff_path`` and an optional ``main_assembly`` (the explicit delivered
-assembly). A fresh run admits the sealed local intake, stages only the assembly-derived
-dependency closure to the endpoint and lets the native host read the raw discovery record;
-the prepared package is derived here on Linux over the sealed selection alone and returned as
+assembly). A fresh run admits the sealed local intake, stages the full indexed native folder to
+the endpoint, which resolves and seals the dependency closure before the native host reads the
+raw discovery record; the prepared package is derived here on Linux over the sealed selection and returned as
 the capture request, and a local derivation refusal aborts the waiting endpoint with a
 structured failure. A linked attempt (``parent_dag_run_id`` and ``resume_from``) reuses the
 parent native job's retained source selection - files, index digest and main assembly - and
@@ -33,7 +33,7 @@ from description_pipeline.orchestration.airflow_client import (
     capture_archive_metadata,
     check_result,
     config_from_airflow_connection,
-    drive_selection_round,
+    drive_staging,
     native_run_id,
     resolved_routing,
     validate_main_assembly,
@@ -419,31 +419,24 @@ def _poke(request: dict, **context) -> bool:
     if request.get("upload_files") and job.get("status") == "selecting":
         intake = request.get("intake_dir")
         if not isinstance(intake, str) or not intake:
-            raise AirflowFailException("Selection rounds require the sealed intake folder of a fresh source")
-        ti = context.get("ti")
-        previous = ti.xcom_pull(task_ids="wait_for_job", key="selection_progress") if ti is not None else None
+            raise AirflowFailException("Folder staging requires the sealed intake folder of a fresh source")
         try:
-            outcome = drive_selection_round(
+            outcome = drive_staging(
                 endpoint,
                 run_id=request["run_id"],
                 upload_files=request["upload_files"],
                 main_assembly=request["main_assembly"],
                 intake_dir=Path(intake),
-                batch_dir=Path(tempfile.gettempdir()) / f"selection-{request['run_id']}",
-                previous=previous,
+                batch_dir=Path(tempfile.gettempdir()) / f"staging-{request['run_id']}",
             )
         except (EndpointProtocolError, PipelineError) as error:
-            raise AirflowFailException(f"selection transport failed: {error}") from error
-        if ti is not None:
-            ti.xcom_push(key="selection_progress", value=outcome.get("progress"))
-            if outcome.get("action") == "sealed":
-                ti.xcom_push(key="selection_manifest", value=outcome["manifest"])
+            raise AirflowFailException(f"folder staging failed: {error}") from error
         log.info(
-            "selection run_id=%s action=%s state=%s requested=%s",
+            "staging run_id=%s action=%s state=%s sealed=%s",
             request["run_id"],
             outcome.get("action"),
             outcome.get("state"),
-            outcome.get("requested"),
+            outcome.get("sealed"),
         )
         return False
     if job.get("status") == "awaiting_definition":
@@ -632,7 +625,7 @@ def solidworks_to_urdf():
                 (request.get("resume") or {}).get("from_stage"),
             )
             return {**request, "status": "linux_owned"}
-        job = _endpoint(request["conn_id"]).start_selection_job(
+        job = _endpoint(request["conn_id"]).start_staging_job(
             run_id=request["run_id"],
             upload_files=request["upload_files"],
             main_assembly=request["main_assembly"],
@@ -799,7 +792,7 @@ def solidworks_to_urdf():
         poke_interval=POLL_INTERVAL,
         timeout=POLL_TIMEOUT,
         doc_md=(
-            "Transport polling and the definition exchange (selection rounds, raw-record derivation, "
+            "Transport polling and the definition exchange (folder staging, raw-record derivation, "
             "capture-request submission). Engineering stage/QC results are in these logs and the "
             "engineering_stages XCom."
         ),
