@@ -339,6 +339,95 @@ def _frame_for(entity: dict, frames):
     return frames.get(component) if isinstance(component, str) else None
 
 
+def _cached_materialization_reason(
+    component: dict,
+    provenance: dict,
+    slots: list[dict],
+    used: set[int],
+    carrier: object,
+    native: dict,
+) -> str | None:
+    """Exact sealed-carrier evidence for one cached native materialization.
+
+    A cached materialization is admitted only when the mandatory carrier records an
+    unambiguously matching entry: the same owner document with owner bytes equal to
+    the sealed selection and the frozen inventory, the same occurrence identity, the
+    same session temp materialization (IC~~ path component), the same author metadata
+    and the same current native suppression/virtual readings.  Nothing is guessed
+    from names or suffixes, and a present external file is never downgraded.
+    """
+
+    if not isinstance(carrier, dict) or not isinstance(carrier.get("closure"), dict):
+        return "the sealed selection carrier is absent"
+    owner = provenance.get("owner")
+    owner_sha = provenance.get("owner_sha256")
+    occurrence = provenance.get("occurrence")
+    materialization = (
+        provenance.get("materialization_path")
+        or provenance.get("materialization")
+        or provenance.get("native_document_path")
+    )
+    author = provenance.get("author_imported_path")
+    virtual = provenance.get("is_virtual")
+    anchor = provenance.get("defining_anchor")
+    if not (isinstance(owner, str) and owner.strip() and isinstance(occurrence, str) and occurrence.strip()):
+        return "the cached materialization evidence names no owner occurrence"
+    if anchor is not None and not isinstance(anchor, str):
+        return "the cached materialization defining anchor is unreadable"
+    if not isinstance(owner_sha, str) or _HEX.match(owner_sha) is None:
+        return "the cached materialization owner bytes are unproven"
+    if not (isinstance(materialization, str) and ntpath.isabs(materialization)):
+        return "the cached materialization evidence carries no absolute session materialization"
+    parts = materialization.replace("\\", "/").split("/")
+    if not any(part.casefold() == "ic~~" for part in parts if part):
+        return "the recorded materialization is not a session temp materialization"
+    if author is not None and not isinstance(author, str):
+        return "the cached materialization author metadata is unreadable"
+    if type(virtual) is not bool:
+        return "the cached materialization virtual state is unread"
+    files = carrier.get("files")
+    if not isinstance(files, dict) or files.get(owner) != owner_sha or native.get(owner) != owner_sha:
+        return "the cached materialization owner bytes are not bound to the sealed selection"
+
+    def folded(value: object) -> str:
+        return str(value or "").replace("\\", "/").casefold()
+
+    matches = []
+    for index, slot in enumerate(slots):
+        if index in used:
+            continue
+        slot_owner = slot.get("owner") if isinstance(slot.get("owner"), str) and slot.get("owner") else None
+        slot_owner = slot_owner or slot.get("document")
+        if folded(slot_owner) != folded(owner):
+            continue
+        if str(slot.get("instance") or "") != occurrence:
+            continue
+        if slot.get("owner_anchor") != anchor:
+            continue
+        if ntpath.normcase(str(slot.get("materialization") or "")) != ntpath.normcase(materialization):
+            continue
+        slot_author = slot.get("author_imported_path")
+        if (slot_author is None) != (author is None):
+            continue
+        if slot_author is not None and ntpath.normcase(slot_author) != ntpath.normcase(author):
+            continue
+        slot_owner_sha = slot.get("owner_sha256")
+        if slot_owner_sha is not None and slot_owner_sha != owner_sha:
+            continue
+        slot_state = slot.get("suppression_state")
+        if isinstance(slot_state, int) and slot_state != component.get("suppression_state"):
+            continue
+        if "is_virtual" in slot and slot.get("is_virtual") is not virtual:
+            continue
+        matches.append(index)
+    if not matches:
+        return "no sealed cached materialization matches this occurrence exactly"
+    if len(matches) > 1:
+        return "the sealed carrier records ambiguous cached materializations for this occurrence"
+    used.add(matches[0])
+    return None
+
+
 def _require_suppression_states(record: dict) -> None:
     """Every component must carry the documented raw suppression state.
 
@@ -1673,17 +1762,33 @@ def verify_discovery(package: Path) -> dict:
     def imported_sources():
         """Every recorded imported occurrence must bind to a frozen native source.
 
-        The accepted class mirrors the declared-member rule: a resolved native imported
-        document whose GetImportedPath names the captured document inside the frozen
-        root and whose bytes equal the frozen inventory. Nothing is guessed from raw
-        paths, and temp or external roots never qualify; every other recorded
-        occurrence yields a precise discovery.imported_source_unbound failure.
+        Two classes are accepted.  A resolved native imported document whose
+        GetImportedPath names the captured document inside the frozen root binds
+        directly.  A cached native materialization (a session temp document whose author
+        path is metadata) is accepted only through the mandatory sealed selection
+        carrier: exact owner, owner bytes, occurrence identity, session-temp
+        materialization inside the owned session temp area, author metadata and current
+        native suppression/virtual readings must all match one recorded cached
+        materialization, and every recorded cached materialization must be proven by a
+        current occurrence.  Nothing is guessed from raw paths, names or suffixes, and a
+        present external file is never downgraded; everything else yields a precise
+        discovery.imported_source_unbound failure.
         """
 
         payload = state["payload"]
         raw = payload.get("raw") or {}
         native = payload.get("native_files") or {}
         raw_files = raw.get("files") or {}
+        carrier = raw.get("source_selection")
+        closure = carrier.get("closure") if isinstance(carrier, dict) else None
+        cached_slots: list[dict] = []
+        if isinstance(closure, dict) and isinstance(closure.get("imports"), list):
+            cached_slots = [
+                item
+                for item in closure["imports"]
+                if isinstance(item, dict) and item.get("state") == "cached_materialization"
+            ]
+        cached_used: set[int] = set()
         unbound: list[dict] = []
         observed = 0
         for component in raw.get("components") or []:
@@ -1705,6 +1810,15 @@ def verify_discovery(package: Path) -> dict:
             }
             if not isinstance(provenance, dict):
                 unbound.append({**entry, "state": None, "reason": "imported provenance is not an object"})
+                continue
+            if provenance.get("state") == "cached_materialization":
+                reason = _cached_materialization_reason(
+                    component, provenance, cached_slots, cached_used, carrier, native
+                )
+                if reason is not None:
+                    unbound.append(
+                        {**entry, "state": provenance.get("state"), "reason": reason, "error": provenance.get("error")}
+                    )
                 continue
             reason = None
             if provenance.get("state") != "resolved":
@@ -1787,7 +1901,18 @@ def verify_discovery(package: Path) -> dict:
                     "samples": unbound[:20],
                 },
             )
-        return {"imported_occurrences": observed}
+        unmatched = [index for index in range(len(cached_slots)) if index not in cached_used]
+        if unmatched:
+            _require(
+                False,
+                "discovery.imported_source_unbound",
+                "the sealed carrier records cached materializations that no current occurrence proves",
+                {
+                    "unmatched": [cached_slots[index] for index in unmatched[:20]],
+                    "unmatched_count": len(unmatched),
+                },
+            )
+        return {"imported_occurrences": observed, "cached_materializations": len(cached_used)}
 
     def identity():
         payload, robot = state["payload"], state["robot"]

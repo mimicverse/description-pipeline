@@ -10,8 +10,16 @@ from pathlib import Path
 
 from description_pipeline.verification.native_discovery import DISCOVERY_SCHEMA, INPUT_SCHEMA, verify_discovery
 
+from .selection_support import sealed_selection
+
 ROOT = r"C:\description-v1-review\probe-46986340\input-copy"
 TEMP = r"C:\Users\33985\AppData\Local\Temp\swx42380\IC~~"
+CACHED_TEMP_ROOT = r"C:\Users\33985\AppData\Local\Temp\swx28528"
+CACHED_MATERIALIZATION = CACHED_TEMP_ROOT + r"\IC~~\HD-1910-C001-20260902.stp.SLDASM"
+CACHED_AUTHOR = r"D:\M2.2(9.17) DengJingjie - 副本\change11\HD-1910-C001-20260902.stp"
+CACHED_OWNER = "HD-1910-C001-20260902.SLDASM"
+CACHED_OCCURRENCE = "HD-1910-C001-20260902-21/HD-1910-C001-20260902.stp-2"
+CACHED_API = "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual"
 
 
 def canonical(files):
@@ -61,8 +69,64 @@ def foreign_component(name, *, containing=None):
     }
 
 
+def cached_provenance(owner_sha, **overrides):
+    provenance = {
+        "state": "cached_materialization",
+        "kind": "native_import_materialization",
+        "source_root": ROOT,
+        "owner": CACHED_OWNER,
+        "owner_sha256": owner_sha,
+        "occurrence": CACHED_OCCURRENCE,
+        "defining_anchor": None,
+        "materialization_path": CACHED_MATERIALIZATION,
+        "author_imported_path": CACHED_AUTHOR,
+        "is_virtual": False,
+        "used_api": CACHED_API,
+        "error": None,
+    }
+    provenance.update(overrides)
+    return provenance
+
+
+def cached_component(owner_sha, **overrides):
+    component = {
+        "name2": "HD-1910-C001-20260902.stp-2",
+        "document": None,
+        "suppressed": False,
+        "lightweight": False,
+        "suppression_state": 2,
+        "source_provenance": cached_provenance(owner_sha),
+    }
+    component.update(overrides)
+    return component
+
+
+def cached_slot(owner_sha, occurrence=CACHED_OCCURRENCE):
+    return {
+        "document": CACHED_OWNER,
+        "instance": occurrence,
+        "owner_anchor": None,
+        "state": "cached_materialization",
+        "binding": "author_metadata_only",
+        "materialization": CACHED_MATERIALIZATION,
+        "author_imported_path": CACHED_AUTHOR,
+        "owner_sha256": owner_sha,
+        "suppression_state": 2,
+        "is_virtual": False,
+    }
+
+
+def cached_carrier(owner_sha, imports=None):
+    return sealed_selection(
+        {CACHED_OWNER: owner_sha},
+        CACHED_OWNER,
+        edges={CACHED_OWNER: []},
+        imports=list(imports) if imports is not None else [cached_slot(owner_sha)],
+    )
+
+
 class ImportedSourceTests(unittest.TestCase):
-    def _package(self, directory, contents, components, *, raw_files=None):
+    def _package(self, directory, contents, components, *, raw_files=None, extra_raw=None):
         package = Path(directory)
         (package / "discovery").mkdir()
         native = {}
@@ -80,6 +144,7 @@ class ImportedSourceTests(unittest.TestCase):
                 "components": components,
                 "files": dict(native if raw_files is None else raw_files),
                 "identity": {},
+                **(extra_raw or {}),
             },
             "identity": {},
             "native_files": native,
@@ -159,9 +224,7 @@ class ImportedSourceTests(unittest.TestCase):
                     failed["details"]["code"],
                     {"discovery.suppression_state", "discovery.suppression_lightweight"},
                 )
-                self.assertTrue(
-                    any(str(item["code"]).startswith("discovery.suppression") for item in report["errors"])
-                )
+                self.assertTrue(any(str(item["code"]).startswith("discovery.suppression") for item in report["errors"]))
 
     def test_resealed_malformed_raw_fails_precisely_without_a_crash(self) -> None:
         """A None raw record fails the suppression check instead of crashing route selection."""
@@ -315,6 +378,82 @@ class ImportedSourceTests(unittest.TestCase):
         detail = self._unbound(report)["detail"]
         self.assertEqual(detail["unbound"], 1)
         self.assertIn("bound", detail["samples"][0]["reason"])
+
+    def test_cached_materialization_is_accepted_through_the_sealed_carrier(self):
+        content = b"cached HD bytes"
+        sha = hashlib.sha256(content).hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            package = self._package(
+                directory,
+                {CACHED_OWNER: content},
+                [cached_component(sha)],
+                extra_raw={"source_selection": cached_carrier(sha)},
+            )
+            report = verify_discovery(package)
+        check = self._check(report)
+        self.assertTrue(check["passed"], check["details"])
+        self.assertEqual(check["details"].get("cached_materializations"), 1)
+
+    def test_cached_materialization_requires_the_exact_carrier_evidence(self):
+        content = b"cached HD bytes"
+        sha = hashlib.sha256(content).hexdigest()
+        cases = {
+            "absent_carrier": (cached_component(sha), None, "carrier is absent"),
+            "owner_sha_mismatch": (
+                cached_component("f" * 64),
+                cached_carrier(sha),
+                "not bound to the sealed selection",
+            ),
+            "external_materialization": (
+                cached_component(sha, source_provenance=cached_provenance(sha, materialization_path=CACHED_AUTHOR)),
+                cached_carrier(sha),
+                "not a session temp materialization",
+            ),
+            "occurrence_mismatch": (
+                cached_component(sha, source_provenance=cached_provenance(sha, occurrence="other-1")),
+                cached_carrier(sha),
+                "no sealed cached materialization matches",
+            ),
+            "anchor_mismatch": (
+                cached_component(sha, source_provenance=cached_provenance(sha, defining_anchor="HD-...-21")),
+                cached_carrier(sha),
+                "no sealed cached materialization matches",
+            ),
+            "author_mismatch": (
+                cached_component(sha, source_provenance=cached_provenance(sha, author_imported_path=r"D:\other.stp")),
+                cached_carrier(sha),
+                "no sealed cached materialization matches",
+            ),
+            "unproven_owner_bytes": (
+                cached_component(sha, source_provenance=cached_provenance(sha, owner_sha256=None)),
+                cached_carrier(sha),
+                "owner bytes are unproven",
+            ),
+        }
+        for label, (component, carrier, token) in cases.items():
+            with self.subTest(case=label):
+                with tempfile.TemporaryDirectory() as directory:
+                    extra = {"source_selection": carrier} if carrier is not None else {}
+                    package = self._package(directory, {CACHED_OWNER: content}, [component], extra_raw=extra)
+                    report = verify_discovery(package)
+                detail = self._unbound(report)["detail"]
+                self.assertEqual(detail["unbound"], 1, detail)
+                self.assertIn(token, detail["samples"][0]["reason"])
+
+    def test_cached_materialization_coverage_is_two_sided(self):
+        content = b"cached HD bytes"
+        sha = hashlib.sha256(content).hexdigest()
+        carrier = cached_carrier(sha, imports=[cached_slot(sha), cached_slot(sha, occurrence="other-1")])
+        with tempfile.TemporaryDirectory() as directory:
+            package = self._package(
+                directory,
+                {CACHED_OWNER: content},
+                [cached_component(sha)],
+                extra_raw={"source_selection": carrier},
+            )
+            report = verify_discovery(package)
+        error = self._unbound(report)
+        self.assertEqual(error["detail"]["unmatched_count"], 1)
 
 
 if __name__ == "__main__":
