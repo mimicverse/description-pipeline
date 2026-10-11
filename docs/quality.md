@@ -46,10 +46,13 @@ when its closed inventory, every file hash, run ID, handoff digest and selected
 assembly agree with the request. Both hosts must use the same tool source release;
 their dependency records identify their different execution roles.
 
-The sealed native bytes stay raw: readings, configuration and meshes travel as
-captured (`raw/scene_raw.json`, `raw/source_config.json`, evidence and mesh
-files), while the canonical scene snapshot and the structural-team reports are
-derived on Linux — the Windows worker renders no report and stores no derived scene.
+The sealed native bytes are the captured inputs: readings, configuration and
+meshes travel as captured (`raw/scene_raw.json`, `raw/source_config.json`,
+evidence and mesh files), and the canonical scene snapshot and the
+structural-team reports are derived on Linux — the Windows worker renders no
+report and stores no derived scene. The native host still records its own
+derived capture diagnostics (mass-closure and component-context comparisons)
+and validates the exported meshes; the scene and report scope moved, nothing else.
 
 When present, the saved exporter declaration payload and its PID resolution rows
 travel with the sealed bundle. The declared structure is derived from the raw
