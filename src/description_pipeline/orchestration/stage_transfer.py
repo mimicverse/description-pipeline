@@ -46,8 +46,9 @@ MAX_MANIFEST_BYTES = 64 * 1024**2
 #: artifact and is deliberately excluded from the transfer payload.
 _REQUIRED_REPORTS = ("reports/input.json", "reports/native-tool.json", "reports/native-stages.json")
 #: The structural-team reports generated beside the native capture; they travel with the sealed
-#: payload so the Linux side can always hand them to the structural team.
-_TEAM_REPORTS = ("reports/structural-team.md", "reports/structural-team.json")
+#: payload so the Linux side can always hand them to the structural team, and the portable
+#: pipeline re-creates its own copy in a delivery.
+TEAM_REPORTS = ("reports/structural-team.md", "reports/structural-team.json")
 #: Known mutable receipts stamped by the endpoint; sealing ignores them, never transfers them.
 _LIVE_REPORTS = ("reports/stages.json", "reports/run.json")
 
@@ -64,7 +65,7 @@ def _require(condition, message: str) -> None:
 def _allowed_payload(name: str) -> bool:
     """Only the archived input, the evidence snapshot and the sealed reports are payload."""
 
-    return name.startswith(("input/", "evidence/")) or name in _REQUIRED_REPORTS or name in _TEAM_REPORTS
+    return name.startswith(("input/", "evidence/")) or name in _REQUIRED_REPORTS or name in TEAM_REPORTS
 
 
 def _is_sha256(value) -> bool:
@@ -600,13 +601,18 @@ def admit_capture(
             shutil.rmtree(staging, ignore_errors=True)
 
 
-def verify_transfer(bundle: Path) -> dict | None:
+def verify_transfer(bundle: Path, *, regenerated: tuple[str, ...] = ()) -> dict | None:
     """Revalidate transferred native provenance inside a delivery bundle.
 
     Returns ``None`` for a neutral delivery that carries no transfer.  A partial triplet is
     refused; a complete one re-hashes the sealed payload and re-reads the native tool record,
     stage receipts, input/discovery main-assembly binding and evidence snapshot, so a resealed
     but semantically invalid manifest cannot reach publication.
+
+    ``regenerated`` names payload members whose delivery copy the receiving pipeline
+    re-creates from its own receipt (the structural-team reports).  Admission still binds
+    them against the sealed manifest; a delivery is checked for everything else and may
+    carry its own regenerated copy or none at all.
     """
 
     bundle = Path(bundle)
@@ -616,6 +622,7 @@ def verify_transfer(bundle: Path) -> dict | None:
     missing = sorted(set(TRANSFER_FILES) - set(present))
     _require(not missing, f"Transferred capture provenance is incomplete; missing: {missing}")
 
+    derived = set(regenerated)
     manifest = read_data(confined(bundle, CAPTURE_MANIFEST))
     _require(isinstance(manifest, dict), "Transfer manifest must be an object")
     _require(manifest.get("schema_version") == TRANSFER_SCHEMA, "Transfer manifest uses an unknown schema")
@@ -633,6 +640,8 @@ def verify_transfer(bundle: Path) -> dict | None:
             f"Transfer manifest lists a member outside the capture payload: {name!r}",
         )
         _require(_is_sha256(checksum), f"Transfer manifest hash is not a sha256: {name}")
+        if name in derived:
+            continue
         _require(
             file_digest(confined(bundle, name)) == checksum,
             f"Delivered member differs from the transfer manifest: {name}",
@@ -640,18 +649,21 @@ def verify_transfer(bundle: Path) -> dict | None:
     actual_payload = {
         path.relative_to(bundle).as_posix()
         for path in bundle.rglob("*")
-        if path.is_file() and _allowed_payload(path.relative_to(bundle).as_posix())
+        if path.is_file()
+        and _allowed_payload(path.relative_to(bundle).as_posix())
+        and path.relative_to(bundle).as_posix() not in derived
     }
-    absent = sorted(set(files) - actual_payload)
+    absent = sorted(set(files) - derived - actual_payload)
     extra = sorted(actual_payload - set(files))
     _require(
         not absent and not extra,
         f"Delivered capture inventory differs from the transfer manifest: missing={absent[:5]}, extra={extra[:5]}",
     )
-    _require(
-        manifest.get("total_bytes") == sum(confined(bundle, name).stat().st_size for name in files),
-        "Transfer manifest size differs from its members",
-    )
+    if not derived & set(files):
+        _require(
+            manifest.get("total_bytes") == sum(confined(bundle, name).stat().st_size for name in files),
+            "Transfer manifest size differs from its members",
+        )
     _require(
         manifest.get("native_tool_sha256") == digest(manifest.get("native_tool")),
         "Transfer manifest native tool digest differs from its record",

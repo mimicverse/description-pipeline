@@ -250,6 +250,29 @@ class StageTransferTests(unittest.TestCase):
             sealed = archive.read(transfer.CAPTURE_MANIFEST)
         self.assertEqual((destination / transfer.CAPTURE_MANIFEST).read_bytes(), sealed)
 
+    def test_regenerated_team_reports_are_tolerated_only_in_deliveries(self) -> None:
+        manifest = seal(self.root, self.archive)
+        destination = self.base / "admitted"
+        admit(self.archive, destination)
+        summary = transfer.verify_transfer(destination)
+        self.assertEqual(summary["files"], manifest["file_count"])
+
+        # The admitted capture stays strict when the sealed report bytes change ...
+        (destination / "reports/structural-team.md").write_text("# regenerated\n", encoding="utf-8")
+        (destination / "reports/structural-team.json").write_text('{"findings": []}\n', encoding="utf-8")
+        with self.assertRaisesRegex(PipelineError, "differs from the transfer manifest"):
+            transfer.verify_transfer(destination)
+        # ... while a delivery may carry its own regenerated copy ...
+        summary = transfer.verify_transfer(destination, regenerated=transfer.TEAM_REPORTS)
+        self.assertEqual(summary["files"], manifest["file_count"])
+        # ... or none at all before the report is stamped.
+        (destination / "reports/structural-team.md").unlink()
+        (destination / "reports/structural-team.json").unlink()
+        summary = transfer.verify_transfer(destination, regenerated=transfer.TEAM_REPORTS)
+        self.assertEqual(summary["files"], manifest["file_count"])
+        with self.assertRaises(PipelineError):
+            transfer.verify_transfer(destination)
+
     def test_sealing_is_deterministic(self) -> None:
         first = self.base / "first.zip"
         second = self.base / "second.zip"

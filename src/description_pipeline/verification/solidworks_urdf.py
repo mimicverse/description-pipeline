@@ -418,10 +418,12 @@ def _tool(root):
     for version in runtime["packages"].values():
         _require(isinstance(version, str), "Invalid dependency versions")
         Version(version)
-    from ..orchestration.stage_transfer import verify_transfer
+    from ..orchestration.stage_transfer import TEAM_REPORTS, verify_transfer
 
     result = {"version": tool["version"], "source_sha256": tool["source_sha256"]}
-    provenance = verify_transfer(root)
+    # A delivery re-creates the structural-team report from its own receipt; the sealed
+    # native copy stays bound in the admitted capture.
+    provenance = verify_transfer(root, regenerated=TEAM_REPORTS)
     if provenance is not None:
         result["transfer"] = provenance
     return result
