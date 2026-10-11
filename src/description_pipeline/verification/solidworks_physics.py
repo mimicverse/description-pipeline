@@ -548,6 +548,12 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
                     name + ": surface fallback must record the unreadable part document",
                 )
                 _require(
+                    entry.get("fallback_reason")
+                    == row_reference.get("fallback_reason")
+                    == "cad_part_document_mass_unavailable",
+                    name + ": effective fallback reason marker changed",
+                )
+                _require(
                     entry.get("fallback_error_code") == row_reference.get("fallback_error_code") == "cad_empty_model",
                     name + ": effective fallback reason changed",
                 )

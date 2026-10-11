@@ -586,7 +586,7 @@ class PhysicsTests(unittest.TestCase):
                 "assembly_configuration": reference["assembly_configuration"],
                 "selected_components": copy.deepcopy(reference["selected_components"]),
                 "part_document_read": "unavailable",
-                "fallback_reason": "part_document_mass_unavailable",
+                "fallback_reason": "cad_part_document_mass_unavailable",
                 "fallback_error_code": reference["fallback_error_code"],
                 "solid_bodies": reference["solid_bodies"],
                 "sheet_bodies": reference["sheet_bodies"],
@@ -639,6 +639,7 @@ class PhysicsTests(unittest.TestCase):
                 "configuration": "Default",
                 "solid_bodies": 0,
                 "sheet_bodies": 2350,
+                "fallback_reason": "cad_part_document_mass_unavailable",
                 "fallback_error_code": "cad_empty_model",
                 "overrides": {
                     "OverrideMass": True,
