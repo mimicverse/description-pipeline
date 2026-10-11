@@ -87,9 +87,10 @@ class ScheduledSmokeTests(unittest.TestCase):
         self.assertEqual(report["verify"]["missing_required_gates"], [])
         self.assertEqual(report["qualification"], QUALIFICATION)
 
-        # The one supported two-leg transfer: both selection rounds, exactly one generated
-        # definition post, and both sealed artifacts (raw record and native capture) streamed.
-        self.assertEqual(report["selection_rounds"], 2)
+        # The one supported transfer: exactly one full-folder staging upload, exactly one
+        # generated definition post, and both sealed artifacts (raw record and native
+        # capture) streamed.
+        self.assertEqual(report["selection_uploads"], 1)
         self.assertEqual(len(report["definition_posts"]), 1)
         self.assertEqual(len(report["definition_posts"][0]["prepared_sha256"]), 64)
         self.assertGreater(report["definition_posts"][0]["size"], 0)

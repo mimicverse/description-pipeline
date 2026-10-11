@@ -6,9 +6,10 @@ a real authorized operator JWT.  Requires an installed environment; writes nothi
 AIRFLOW_HOME.
 
 The mocked Windows delivery is the sealed control fixture, served through the one supported
-two-leg contract: the endpoint answers the selection rounds from the staged intake, seals the raw
-native record bundle that Linux admits, accepts the generated text definition, and only then
-reports the sealed capture transfer at the ``native_complete`` boundary.  The Linux half derives
+contract: the endpoint stages the exact full indexed folder in one upload, resolves and seals the
+native closure and the raw native record bundle server-side, accepts the generated text
+definition, and only then reports the sealed capture transfer at the ``native_complete``
+boundary.  The Linux half derives
 the prepared package with the real pure derivation, then executes the real generate stage and the
 real verify stage, which must reject the control fixture on its documented limits while
 publication never executes.  This is an expected rejection proof of the scheduled transport,
@@ -81,19 +82,28 @@ def _native_record(fixture_root: Path) -> dict:
 def _mock_endpoint(
     fixture: dict, *, run_id: str, upload_files: dict[str, str], record: dict, bundle_dir: Path
 ) -> tuple[ThreadingHTTPServer, dict]:
-    """The two-leg endpoint contract: selection, raw record, definition, capture."""
+    """The one-workflow endpoint contract: full-folder staging, raw record, definition, capture."""
 
     from description_pipeline.io import digest  # noqa: PLC0415 - the checkout arrives via --root
     from description_pipeline.orchestration import discovery_transfer  # noqa: PLC0415
+    from description_pipeline.sources.solidworks.selection import seal_closure_selection  # noqa: PLC0415
+    from tests.sources.selection_support import closure_evidence  # noqa: PLC0415
 
     main_assembly = fixture["main_assembly"]
     dependencies = sorted(name for name in upload_files if name != main_assembly)
-    observations = {
-        main_assembly: {"sha256": upload_files[main_assembly], "references": list(dependencies)},
-        **{name: {"sha256": upload_files[name], "references": []} for name in dependencies},
-    }
-    state = {"jobs": {}, "artifact_paths": [], "definition_posts": [], "rounds": 0}
+    reader_sha256 = fixture["native_tool"]["source_sha256"]
+    stage_root = str(bundle_dir.parent / "native-stage")
+    edges = {main_assembly: list(dependencies), **{name: [] for name in dependencies}}
+    state = {"jobs": {}, "artifact_paths": [], "definition_posts": [], "uploads": 0}
     archive = Path(fixture["archive"]).read_bytes()
+
+    def sealed_manifest() -> dict:
+        """The closure the native endpoint seals server-side after the single full-folder upload."""
+
+        evidence = closure_evidence(
+            upload_files, main_assembly, edges=edges, reader_sha256=reader_sha256, stage_root=stage_root
+        )
+        return seal_closure_selection(upload_files, main_assembly, evidence, reader_sha256=reader_sha256)
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args) -> None:
@@ -182,11 +192,9 @@ def _mock_endpoint(
                     "events": [{"stage": "job", "state": "selecting", "at": "t0"}],
                     "selection": {
                         "state": "awaiting_files",
-                        "round_id": hashlib.sha256(b"start").hexdigest(),
-                        "reader_sha256": fixture["native_tool"]["source_sha256"],
+                        "reader_sha256": reader_sha256,
+                        "upload_sha256": digest(upload_files),
                         "staged_files": {},
-                        "requested_files": {main_assembly: upload_files[main_assembly]},
-                        "observations": {},
                     },
                     "result": None,
                     "error": None,
@@ -201,55 +209,25 @@ def _mock_endpoint(
                 return
             if len(segments) == 2 and segments[1] == "files":
                 block = job["selection"]
-                if block["state"] != "awaiting_files" or self.headers.get("X-Selection-Round") != block["round_id"]:
-                    self._send(409, {"error": "stale selection round"})
-                    return
                 try:
                     with zipfile.ZipFile(io.BytesIO(body)) as source:
                         members = {info.filename: source.read(info) for info in source.infolist()}
                 except (OSError, ValueError, zipfile.BadZipFile):
-                    self._send(400, {"error": "selection batch is not a readable ZIP"})
+                    self._send(400, {"error": "staging archive is not a readable ZIP"})
                     return
-                requested = block["requested_files"]
-                if set(members) != set(requested) or any(
-                    hashlib.sha256(members[name]).hexdigest() != checksum for name, checksum in requested.items()
+                if set(members) != set(upload_files) or any(
+                    hashlib.sha256(members[name]).hexdigest() != checksum for name, checksum in upload_files.items()
                 ):
-                    self._send(409, {"error": "selection batch differs from the requested staged bytes"})
+                    self._send(409, {"error": "staging archive differs from the upload index"})
                     return
-                staged = {**block["staged_files"], **requested}
-                observed = {**block["observations"], **{name: observations[name] for name in requested}}
-                remaining = sorted(name for name in dependencies if name not in staged)
-                block.update(
-                    state="awaiting_files" if remaining else "ready",
-                    round_id=hashlib.sha256(json.dumps(sorted(staged)).encode()).hexdigest(),
-                    staged_files=staged,
-                    requested_files={name: upload_files[name] for name in remaining},
-                    observations=observed,
-                )
-                state["rounds"] += 1
-                self._send(200, _view(job))
-                return
-            if len(segments) == 2 and segments[1] == "seal":
-                payload = json.loads(body or b"{}")
-                manifest = payload.get("selection")
-                block = job["selection"]
-                if (
-                    set(payload) != {"selection"}
-                    or block["state"] != "ready"
-                    or block["requested_files"]
-                    or not isinstance(manifest, dict)
-                    or manifest.get("files") != block["staged_files"]
-                ):
-                    self._send(409, {"error": "selection is not ready to seal"})
+                if block["state"] != "awaiting_files":
+                    # A logical retry of the exact full-index archive: no native rework.
+                    self._send(200, _view(job))
                     return
-                block.update(state="sealed", requested_files={}, manifest=manifest)
-                # The one supported server shape records the frozen handoff on the job.
-                job.update(
-                    handoff_sha256=manifest["handoff_sha256"],
-                    package_files=dict(block["staged_files"]),
-                )
+                state["uploads"] += 1
+                manifest = sealed_manifest()
                 sealed = discovery_transfer.seal_raw_record_bundle(
-                    record,
+                    {**record, "source_selection": manifest},
                     bundle_dir / "raw-record.zip",
                     run_id=run_id,
                     selection=manifest,
@@ -263,6 +241,12 @@ def _mock_endpoint(
                     "manifest_sha256": digest(sealed["manifest"]),
                     "manifest": sealed["manifest"],
                 }
+                block.update(state="sealed", staged_files=dict(upload_files), manifest=manifest)
+                # The sealed server shape records the frozen handoff on the job.
+                job.update(
+                    handoff_sha256=manifest["handoff_sha256"],
+                    package_files=dict(upload_files),
+                )
                 job["status"] = "awaiting_definition"
                 job["events"] = [
                     *fixture["native_stages"]["events"],
@@ -634,8 +618,8 @@ def main() -> int:
         jobs = list(state["jobs"].values())
         if len(jobs) != 1 or jobs[0].get("status") != "native_complete":
             problems.append("the mocked endpoint did not serve exactly one native_complete job")
-        if state["rounds"] < 2:
-            problems.append("the selection rounds did not stage the fixture closure")
+        if state["uploads"] != 1:
+            problems.append("the full-folder staging upload did not happen exactly once")
         if not state["definition_posts"]:
             problems.append("the generated text definition was never submitted")
         if len(state["artifact_paths"]) < 2:
@@ -656,7 +640,7 @@ def main() -> int:
                     "triggering_user_name": triggering_user_name,
                     "dag_state": dag_state,
                     "task_states": task_states,
-                    "selection_rounds": state["rounds"],
+                    "selection_uploads": state["uploads"],
                     "definition_posts": state["definition_posts"],
                     "artifact_paths": state["artifact_paths"],
                     "handoff_sha256": fixture["handoff_sha256"],
