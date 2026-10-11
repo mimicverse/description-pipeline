@@ -71,12 +71,12 @@ Implementation paths below are relative to `src/description_pipeline/`.
 | Declared native facts | Exporter declaration ingested at discovery and independently re-decoded at verification; declared membership, topology, frames, axes and limits reconciled with native observations and with the generated source (`discovery.declarations`); contradictions fail closed | `sources/solidworks/exporter.py`, `verification/v14_declarations.py`, `verification/native_declarations.py` |
 | Native source | Native SolidWorks evidence, qualified API/build, matching collection identity and environment | `verification/solidworks_urdf.py` |
 | Dependency closure | No unresolved reference: the full uploaded folder is staged, the native engine resolves its references, and the closure seals only when every engine-reported binding lies inside the staged root and matches the upload index — or is an engine-materialized import admitted only through the sealed owner/occurrence evidence matched to its staged source by native identity (never by temporary path or file name); a missing or outside-stage reference fails the run after resolution (closure admission over reported bindings, not an OS sandbox); original CAD belongs to the sealed selection; collected-copy hashes and configuration agree | `verification/solidworks_urdf.py` |
-| Occurrence coverage | Every included native occurrence belongs to exactly one body; unowned occurrences are stage warnings for engineering inspection, and qualification still requires complete material coverage and exact whole-CAD mass equality - instances or their mass are never excluded to clear a warning; identity survives normalization | `verification/solidworks_urdf.py` |
+| Occurrence coverage | Every included native occurrence belongs to exactly one body; unowned occurrences and missing explicit material assignments are stage warnings for engineering inspection (material warnings retain the measured CAD mass/centre-of-mass/inertia and never claim verified material); exact whole-CAD mass equality remains a strict check - instances or their mass are never excluded to clear a warning; identity survives normalization | `verification/solidworks_urdf.py` |
 | Coordinates | Finite SI homogeneous transforms, orthonormal right-handed bases, CAD-derived body/joint/reference frames | `verification/solidworks_urdf.py` |
 | Shaft alignment | Numeric shaft line from the independently re-read reference axis or cylindrical interface, stable native identity, origin on shaft and axis collinearity | `verification/solidworks_urdf.py` |
 | Names and topology | Unique snake_case names; exactly one `base_link`; connected acyclic tree; input/model/XML entity agreement | `verification/solidworks_urdf.py` |
 | Joint semantics | Exact type, parent/child, signed axis and limits; evidence bound to archived inputs | `verification/solidworks_urdf.py` |
-| Physical authority | Explicit material coverage or complete documented masses; no implicit density or unknown convention | `verification/solidworks_physics.py` |
+| Physical authority | Native numerical consistency for the recorded CAD values; missing explicit material coverage is warning-level with the measured values preserved and no verified-material claim — real material, density and mass boundaries remain external engineering confirmation; no implicit density or unknown convention is ever evidence | `verification/solidworks_physics.py` |
 | Mass, COM and tensor | Independently rotate/translate raw part readings, apply the parallel-axis theorem and convert to each CAD link datum | `verification/solidworks_physics.py` |
 | Assembly closure | Independent part sum agrees with full whole-assembly mass/COM/tensor and complete component-context readings | `verification/solidworks_physics.py` |
 | Whole-CAD mass equality | Delivered URDF XML inertial mass sum equals the bound full whole-assembly reading; missing or invalid whole evidence fails; masses are never normalized | `verification/solidworks_physics.py` |
@@ -192,10 +192,12 @@ drive capability, material correctness or full-range clearance. Those facts
 require engineering confirmation. Simulation, training and control require
 their own acceptance evidence.
 
-Unassigned rigid ownership and explicit zero parameters are stage warnings so
-generation can continue; complete material coverage, exact whole-CAD mass
-equality and usable motion remain strict independent qualification checks, and
-conflicting comparable authored operating limits still fail.
+Unassigned rigid ownership, explicit zero parameters and missing explicit
+material assignments are stage warnings so generation can continue; material
+warnings retain the measured CAD mass/centre-of-mass/inertia and never claim
+verified material; exact whole-CAD mass equality and usable motion remain
+strict independent qualification checks, and conflicting comparable authored
+operating limits still fail.
 
 Administrative metadata (hardware ID, revision, owner, control record) is a
 publication-readiness requirement, not a measurement blocker: capture,
@@ -205,8 +207,10 @@ invented to fill it.
 
 Stage warnings never substitute for acceptance: they stay visible with their
 objects, and the warned facts (material coverage, usable ranges or drives) are
-not verified until the corresponding independent checks pass. Missing required
-evidence remains a failure.
+not verified until the corresponding independent checks pass; a material
+warning must never be reported as verified material, and numeric evidence that
+is unreadable, non-positive or non-physical still fails closed. Missing
+required evidence remains a failure.
 
 Source integrity is required before evidence can be used. Every imported CAD
 occurrence must bind to a file in the frozen handoff — or, for an

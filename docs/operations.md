@@ -189,7 +189,7 @@ an unsupported native pattern is not proof of a mechanical design error.
 | Ambiguous body, joint, name or frame | Check native evidence coverage, then correct the reader or the unresolved engineering definition |
 | Zero, direction, limit or drive disagreement | Correct its mechanical definition or controlled specification; authored zero-width ranges and zero drives stay stage warnings until a usable controlled record is supplied - never fill defaults |
 | Unowned occurrence (stage warning) | Bind the occurrence in the declaration or correct the native structure; qualification still requires complete coverage and exact whole-CAD mass equality - never exclude an instance or its mass to clear the warning |
-| Material, mass or inertia disagreement | Correct material assignments, scope or the documented physical source |
+| Material, mass or inertia disagreement | Missing explicit material assignment alone is a retained warning (CAD-measured values preserved, no verified-material claim); correct the assignment for physical qualification. A material/mass/inertia disagreement with reviewed evidence still blocks - correct scope or the documented physical source |
 | Independent verification disagreement | Trace the native evidence and generation rule; preserve the failed diagnostics |
 | Infrastructure error | Restore the service; continue transport or rerun from the earliest valid engineering step shown |
 | PR error | Restore publication access and rerun from publication using the retained verified delivery |
