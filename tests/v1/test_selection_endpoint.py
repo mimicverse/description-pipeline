@@ -405,6 +405,26 @@ class SelectionEndpointTests(unittest.TestCase):
         self.assertEqual(blocker["severity"], "blocker")
         self.assertTrue(str(blocker["object"] or "").strip())
 
+    def test_failure_diagnostics_seal_exactly_once_after_finalization(self) -> None:
+        from unittest.mock import patch as mock_patch
+
+        identifier = self.create()
+        original = type(self.jobs)._seal_failure_diagnostics
+        sealed = []
+
+        def spy(jobs_self, job):
+            sealed.append(dict(job))
+            return original(jobs_self, job)
+
+        with mock_patch.object(type(self.jobs), "_seal_failure_diagnostics", spy):
+            self.jobs.submit_files(identifier, self.archive())
+            self.wait_failed(self.jobs, identifier)
+        self.assertEqual(len(sealed), 1)
+        self.assertEqual(sealed[0]["status"], "failed")
+        self.assertIsInstance(sealed[0].get("completed_at"), str)
+        self.assertTrue(sealed[0]["events"])
+        self.assertEqual(sealed[0]["events"][-1]["state"], "failed")
+
     def test_closure_evidence_forgeries_are_refused(self) -> None:
         def drop_stage_root(evidence):
             evidence = copy.deepcopy(evidence)

@@ -1298,8 +1298,6 @@ class Jobs:
                         for key in ("detail", "diagnostic_path"):
                             if result.get(key) is not None:
                                 job[key] = result[key]
-                    if job["status"] == "failed":
-                        self._seal_failure_diagnostics(job)
             except Exception as error:
                 with self.mutex:
                     if job["status"] != "failed":
@@ -1312,14 +1310,17 @@ class Jobs:
                             job["detail"] = error.detail
                         elif isinstance(getattr(error, "details", None), dict):
                             job["detail"] = error.details
-                    self._seal_failure_diagnostics(job)
             finally:
                 with self.mutex:
                     if job["status"] == "failed" and (not job["events"] or job["events"][-1]["state"] != "failed"):
                         phase = (job["events"][-1] if job["events"] else {}).get("stage", "freeze")
                         self._event(identifier, {"stage": phase, "state": "failed", "error": job.get("error")})
                     job["completed_at"] = datetime.now(UTC).isoformat()
-                    self._seal_failure_diagnostics(job)
+                    if job["status"] == "failed":
+                        # Seal exactly once, after the final failure event and the completion
+                        # timestamp, so the sealed receipt includes both.  A successful job
+                        # seals nothing; restart and abort keep their own lifecycle seals.
+                        self._seal_failure_diagnostics(job)
                     self._save(job)
                 self.queue.task_done()
 
