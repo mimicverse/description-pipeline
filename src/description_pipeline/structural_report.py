@@ -153,8 +153,9 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                     "code": "report.material_provenance_invalid",
                     "object": receipt.get("main_assembly"),
                     "message": (
-                        "材料来源证据不符合当前 schema：按独立拒绝处理，不采用默认值、不做替代解释、"
-                        "不据此输出材料警告。请用当前生产者的规范记录替换该证据。"
+                        "材料来源证据不符合当前 schema：证据无效，必须由独立检查判为失败。"
+                        "本报告不采用默认值、不做替代解释、不据此输出材料警告；"
+                        "请用当前生产者的规范记录替换该证据。"
                     ),
                     "source": material_source,
                     "evidence": {
@@ -175,7 +176,7 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                     {
                         "severity": "warning",
                         "code": "native.material_provenance_missing",
-                        "object": item.get("document"),
+                        "object": item.get("component") or item.get("occurrence") or item.get("document"),
                         "message": (
                             "SolidWorks 实体缺少显式物理材料赋值（默认密度不作为材料证据）：按可警告缺陷记录——"
                             "流水线保留 CAD 实测质量、质心与惯量并继续生成与独立校验；本报告不据此声称材料已核验，"
@@ -184,6 +185,9 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                         "source": "evidence/raw/material_provenance.json/warnings",
                         "evidence": {
                             "code": item.get("code"),
+                            "component": item.get("component"),
+                            "occurrence": item.get("occurrence"),
+                            "document": item.get("document"),
                             "configuration": item.get("configuration"),
                             "missing_body_indices": item.get("missing_body_indices"),
                             "material_assignment": item.get("material_assignment"),

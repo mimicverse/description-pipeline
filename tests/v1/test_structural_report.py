@@ -280,7 +280,47 @@ class StructuralReportTests(unittest.TestCase):
                 invalid = next(
                     item for item in report["findings"] if item["code"] == "report.material_provenance_invalid"
                 )
+                self.assertIn("必须由独立检查判为失败", invalid["message"])
                 self.assertIn("不采用默认值", invalid["message"])
+
+    def test_warning_object_uses_component_and_keeps_repeat_occurrence_evidence(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_json(
+                root / "evidence/raw/material_provenance.json",
+                {
+                    "schema_version": "solidworks-to-urdf.material-provenance/v1",
+                    "warnings": [
+                        {
+                            "code": "cad_material_provenance_missing",
+                            "component": "arm-1",
+                            "document": "cad/arm.SLDPRT",
+                            "configuration": "默认",
+                            "missing_body_indices": [0],
+                            "measured": {"source": "cad_api", "bodies": [{"index": 0, "mass_kg": 0.02}]},
+                        },
+                        {
+                            "code": "cad_material_provenance_missing",
+                            "component": "arm-2",
+                            "document": "cad/arm.SLDPRT",
+                            "configuration": "tall",
+                            "missing_body_indices": [0],
+                            "measured": {"source": "cad_api", "bodies": [{"index": 0, "mass_kg": 0.1456}]},
+                        },
+                    ],
+                },
+            )
+            pins = write_structural_report(root, {"run_id": "m3", "state": "verified"}, evidence_root=root)
+            report = json.loads((root / pins["json"]["path"]).read_text())
+            warnings = [item for item in report["findings"] if item["code"] == "native.material_provenance_missing"]
+            self.assertEqual([item["object"] for item in warnings], ["arm-1", "arm-2"])
+            self.assertEqual([item["evidence"]["configuration"] for item in warnings], ["默认", "tall"])
+            self.assertEqual(
+                [item["evidence"]["measured"]["bodies"][0]["mass_kg"] for item in warnings],
+                [0.02, 0.1456],
+            )
+            self.assertTrue(all(item["evidence"]["document"] == "cad/arm.SLDPRT" for item in warnings))
+            self.assertEqual(report["summary"], {"warnings": 2, "blockers": 0})
 
 
 if __name__ == "__main__":
