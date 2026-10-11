@@ -363,9 +363,12 @@ class ImportedSourceBindingTests(unittest.TestCase):
                     provenance["author_imported_relative"] = "missing-under-root.step"
                 return result
 
-            with _com_stubs(), patch.object(N, "_component_source_document", side_effect=forged):
-                with self.assertRaises(CadError) as caught:
-                    backend.discover_native(root, {"main_assembly": "robot.SLDASM"})
+            with (
+                _com_stubs(),
+                patch.object(N, "_component_source_document", side_effect=forged),
+                self.assertRaises(CadError) as caught,
+            ):
+                backend.discover_native(root, {"main_assembly": "robot.SLDASM"})
             self.assertEqual(caught.exception.code, "cad_import_source_unavailable")
 
     def test_current_import_api_records_cached_materialization_with_in_stage_source(self):
