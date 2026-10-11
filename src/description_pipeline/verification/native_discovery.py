@@ -419,11 +419,37 @@ def _cached_materialization_reason(
             continue
         if not _session_temp_path(slot.get("materialization"), slot.get("session_temp_root")):
             continue
-        slot_author = slot.get("author_imported_path")
-        if (slot_author is None) != (author is None):
-            continue
-        if slot_author is not None and ntpath.normcase(slot_author) != ntpath.normcase(author):
-            continue
+        if provenance.get("author_imported_in_source_root") is True:
+            # In-root author sources are re-resolved by the engine to whichever root
+            # holds the bytes, so the absolute author path is relocation-dependent on
+            # each side.  Match the recorded root-relative name and the sealed bytes,
+            # with each side's containment proven independently.
+            relative = provenance.get("author_imported_relative")
+            source_root = provenance.get("source_root")
+            bound = slot.get("bound_source")
+            if not (
+                slot.get("author_metadata_in_stage") is True
+                and isinstance(relative, str)
+                and relative.strip()
+                and isinstance(source_root, str)
+                and ntpath.isabs(source_root)
+                and isinstance(author, str)
+                and ntpath.isabs(author)
+                and _owned_relative_match(author, source_root, relative)
+                and isinstance(bound, str)
+                and bound.strip()
+                and bound.replace("\\", "/").casefold() == relative.replace("\\", "/").casefold()
+            ):
+                continue
+            sealed, recorded = files.get(bound), native.get(relative)
+            if not (isinstance(sealed, str) and sealed and sealed == recorded):
+                continue
+        else:
+            slot_author = slot.get("author_imported_path")
+            if (slot_author is None) != (author is None):
+                continue
+            if slot_author is not None and ntpath.normcase(slot_author) != ntpath.normcase(author):
+                continue
         slot_state = slot.get("suppression_state")
         if isinstance(slot_state, int) and slot_state != component.get("suppression_state"):
             continue
@@ -452,6 +478,20 @@ def _session_temp_path(value: object, root: object) -> bool:
     except ValueError:
         return False
     return relative != ".." and not relative.startswith("..\\") and not ntpath.isabs(relative)
+
+
+def _owned_relative_match(value: object, root: object, relative: str) -> bool:
+    """True when ``value`` is inside ``root`` at exactly the ``relative`` location."""
+
+    if not (isinstance(value, str) and isinstance(root, str)):
+        return False
+    try:
+        computed = ntpath.relpath(value, root)
+    except ValueError:
+        return False
+    if computed == ".." or computed.startswith("..\\") or ntpath.isabs(computed):
+        return False
+    return computed.replace("\\", "/").casefold() == relative.replace("\\", "/").casefold()
 
 
 def _require_suppression_states(record: dict) -> None:

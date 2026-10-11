@@ -131,6 +131,37 @@ def cached_carrier(owner_sha, imports=None):
     )
 
 
+DISCOVERY_ROOT = r"C:\discovery\m3-flat"
+SELECTION_ROOT = r"C:\selection\m3-flat-absence"
+NP_RELATIVE = "NP-F550.step"
+
+
+def relocated_component(owner_sha):
+    provenance = cached_provenance(
+        owner_sha,
+        author_imported_in_source_root=True,
+        author_imported_relative=NP_RELATIVE,
+        author_imported_path=DISCOVERY_ROOT + r"\NP-F550.step",
+        source_root=DISCOVERY_ROOT,
+    )
+    return cached_component(owner_sha, source_provenance=provenance)
+
+
+def relocated_carrier(owner_sha, np_sha):
+    slot = cached_slot(owner_sha)
+    slot.update(
+        author_metadata_in_stage=True,
+        bound_source=NP_RELATIVE,
+        author_imported_path=SELECTION_ROOT + r"\NP-F550.step",
+    )
+    return sealed_selection(
+        {CACHED_OWNER: owner_sha, NP_RELATIVE: np_sha},
+        CACHED_OWNER,
+        edges={CACHED_OWNER: [NP_RELATIVE], NP_RELATIVE: []},
+        imports=[slot],
+    )
+
+
 class ImportedSourceTests(unittest.TestCase):
     def _package(self, directory, contents, components, *, raw_files=None, extra_raw=None):
         package = Path(directory)
@@ -485,6 +516,65 @@ class ImportedSourceTests(unittest.TestCase):
             report = verify_discovery(package)
         error = self._unbound(report)
         self.assertEqual(error["detail"]["unmatched_count"], 1)
+
+    def test_relocated_in_root_author_source_matches_by_relative_name_and_bytes(self):
+        owner_bytes, np_bytes = b"cached HD bytes", b"NP bytes"
+        owner_sha = hashlib.sha256(owner_bytes).hexdigest()
+        np_sha = hashlib.sha256(np_bytes).hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            package = self._package(
+                directory,
+                {CACHED_OWNER: owner_bytes, NP_RELATIVE: np_bytes},
+                [relocated_component(owner_sha)],
+                raw_files={CACHED_OWNER: owner_sha, NP_RELATIVE: np_sha},
+                extra_raw={"source_selection": relocated_carrier(owner_sha, np_sha)},
+            )
+            report = verify_discovery(package)
+        check = self._check(report)
+        self.assertTrue(check["passed"], check["details"])
+
+        cases = {
+            "substituted_relative": lambda component, carrier, files: component["source_provenance"].update(
+                author_imported_relative="other.step"
+            ),
+            "substituted_bound_source": lambda component, carrier, files: carrier["closure"]["imports"][0].update(
+                bound_source="other.step"
+            ),
+            "author_outside_root": lambda component, carrier, files: component["source_provenance"].update(
+                author_imported_path=r"D:\elsewhere\NP-F550.step"
+            ),
+            "slot_not_in_stage": lambda component, carrier, files: carrier["closure"]["imports"][0].update(
+                author_metadata_in_stage=False
+            ),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(case=label):
+                component = relocated_component(owner_sha)
+                carrier = relocated_carrier(owner_sha, np_sha)
+                raw_files = {CACHED_OWNER: owner_sha, NP_RELATIVE: np_sha}
+                mutate(component, carrier, raw_files)
+                with tempfile.TemporaryDirectory() as directory:
+                    package = self._package(
+                        directory,
+                        {CACHED_OWNER: owner_bytes, NP_RELATIVE: np_bytes},
+                        [component],
+                        raw_files=raw_files,
+                        extra_raw={"source_selection": carrier},
+                    )
+                    report = verify_discovery(package)
+                self.assertFalse(self._check(report)["passed"], label)
+
+        # A recorded bound source whose frozen bytes differ from the sealed source refuses.
+        with tempfile.TemporaryDirectory() as directory:
+            package = self._package(
+                directory,
+                {CACHED_OWNER: owner_bytes, NP_RELATIVE: b"different NP bytes"},
+                [relocated_component(owner_sha)],
+                raw_files={CACHED_OWNER: owner_sha, NP_RELATIVE: np_sha},
+                extra_raw={"source_selection": relocated_carrier(owner_sha, np_sha)},
+            )
+            report = verify_discovery(package)
+        self.assertFalse(self._check(report)["passed"], "file_bytes_mismatch")
 
 
 if __name__ == "__main__":
