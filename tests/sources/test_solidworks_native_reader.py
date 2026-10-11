@@ -2478,6 +2478,7 @@ class MainAssemblySelectionTests(unittest.TestCase):
             self.assertEqual(error.code, "cad_document_open_failed")
             self.assertEqual(error.detail["errors"], 2)
 
+
 class EntityGeometryTests(unittest.TestCase):
     """The reader decodes real surface/curve/vertex primitives, never heuristics."""
 
@@ -3460,9 +3461,7 @@ class ComponentSuppressionStateTests(unittest.TestCase):
             resolved = _Component("arm-1", _write(root, "arm.SLDPRT"), suppression=2)
             lightweight = _Component("arm-2", _write(root, "arm2.SLDPRT"), suppression=1)
             assembly = _write(root, "robot.SLDASM")
-            record = _read(
-                root, _App({assembly: _Doc(assembly, doc_type=2, children=[resolved, lightweight])})
-            )
+            record = _read(root, _App({assembly: _Doc(assembly, doc_type=2, children=[resolved, lightweight])}))
             by_name = {item["name2"]: item for item in record["components"]}
 
             def triple(name):
@@ -3512,7 +3511,9 @@ class ComponentSourceDocumentTests(unittest.TestCase):
         from description_pipeline.sources.solidworks.native import _component_source_document
 
         outside = r"C:\Users\Mi\Documents\IC~~\X.step.SLDPRT"
-        result = _component_source_document(self.component(outside, imported=r"C:\Users\Mi\Desktop\X.stp"), self.source_root)
+        result = _component_source_document(
+            self.component(outside, imported=r"C:\Users\Mi\Desktop\X.stp"), self.source_root
+        )
         provenance = result["source_provenance"]
         self.assertEqual(provenance["state"], "unread")
         self.assertEqual(provenance["materialization_path"], outside)

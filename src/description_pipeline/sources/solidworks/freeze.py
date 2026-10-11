@@ -11,7 +11,6 @@ number in ``raw/`` comes from the CAD API during this capture.
 
 from __future__ import annotations
 
-import inspect
 import math
 import os
 import re

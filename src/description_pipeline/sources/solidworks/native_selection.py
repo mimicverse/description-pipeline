@@ -333,7 +333,6 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
         imported = imported if isinstance(imported, str) and imported.strip() else None
         lightweight = state in (_COMPONENT_LIGHTWEIGHT, _COMPONENT_FULLY_LIGHTWEIGHT)
         cached_defining = bool(raw_defining) and cached_key(raw_defining) in cached_materializations
-        under = _under_stage(stage_root, resolved) if resolved else None
         structural = bool(resolved) and session_materialization_path(resolved)
         importish = cached_defining or structural or (not resolved and imported is not None)
         if importish:
