@@ -287,17 +287,48 @@ def seal_closure_selection(
     imports = evidence.get("imports", [])
     if not isinstance(imports, list) or any(not isinstance(item, Mapping) for item in imports):
         raise SelectionError("selection_closure_invalid", "Imported-source evidence must be a verbatim evidence list")
+    import_targets: dict[str, set[str]] = {}
     for item in imports:
-        if (
-            item.get("state") != "cached_materialization"
-            or item.get("binding") != "author_metadata_only"
-            or not isinstance(item.get("materialization"), str)
-            or not item.get("materialization").strip()
-        ):
+        owner = folded_graph.get(str(item.get("document") or "").replace("\\", "/").casefold())
+        if owner is None or owner not in evidence_map:
             raise SelectionError(
                 "selection_closure_invalid",
-                "An imported occurrence must be recorded as an unbound cached materialization; "
-                "author import metadata never binds a staged source",
+                "An imported source names a document outside the resolved graph",
+                path=str(item.get("document")),
+            )
+        state = item.get("state")
+        if state == "bound":
+            target = canonical_target(item.get("resolved"))
+            recorded_sha = item.get("sha256")
+            if recorded_sha is not None and recorded_sha != files[target]:
+                raise SelectionError(
+                    "selection_closure_invalid", "A bound import differs from the staged bytes", path=target
+                )
+            import_targets.setdefault(owner, set()).add(target)
+        elif state == "cached_materialization":
+            if item.get("binding") != "author_metadata_only":
+                raise SelectionError(
+                    "selection_closure_invalid",
+                    "A cached materialization is author metadata only; it never binds a staged source",
+                )
+            materialization = item.get("materialization")
+            if not isinstance(materialization, str) or not materialization.strip():
+                raise SelectionError(
+                    "selection_closure_invalid", "A cached materialization records no materialization path"
+                )
+            if not isinstance(item.get("instance"), str) or not item["instance"].strip():
+                raise SelectionError(
+                    "selection_closure_invalid", "A cached materialization records no occurrence identity"
+                )
+            owner_sha = item.get("owner_sha256")
+            if owner_sha is not None and owner_sha != files[owner]:
+                raise SelectionError(
+                    "selection_closure_invalid", "A cached materialization owner differs from the staged bytes"
+                )
+        else:
+            raise SelectionError(
+                "selection_closure_invalid",
+                "An imported source is neither bound nor a recorded cached materialization",
             )
     warnings = evidence.get("warnings")
     if warnings is not None and (
@@ -344,10 +375,10 @@ def seal_closure_selection(
                     path=name,
                 )
             targets.add(target)
-        if set(checked[name]["references"]) != targets:
+        if set(checked[name]["references"]) != targets | import_targets.get(name, set()):
             raise SelectionError(
                 "selection_closure_incoherent",
-                "The resolved graph references must equal the resolved native edges",
+                "The resolved graph references must equal the resolved native edges plus bound imported sources",
                 path=name,
             )
     reachable = reachable_closure(checked, main)

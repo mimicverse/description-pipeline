@@ -116,8 +116,45 @@ class ClosureSealContractTests(unittest.TestCase):
                     "resolved_path": closure["stage_root"].rstrip("\\/") + "\\cad\\base.SLDPRT",
                 }
             ),
-            "import_claims_binding": lambda closure: closure["imports"].append(
-                {"document": MAIN, "instance": "hd-1", "state": "bound", "resolved": "cad/base.SLDPRT"}
+            "import_state_unknown": lambda closure: closure["imports"].append(
+                {"document": MAIN, "instance": "hd-1", "state": "unbound", "resolved": "cad/base.SLDPRT"}
+            ),
+            "import_outside_graph": lambda closure: closure["imports"].append(
+                {
+                    "document": "cad/other.SLDASM",
+                    "instance": "hd-1",
+                    "state": "cached_materialization",
+                    "binding": "author_metadata_only",
+                    "materialization": "C:\\Temp\\IC~~\\hd.step.SLDPRT",
+                }
+            ),
+            "import_cached_not_metadata": lambda closure: closure["imports"].append(
+                {
+                    "document": MAIN,
+                    "instance": "hd-1",
+                    "state": "cached_materialization",
+                    "binding": "proven",
+                    "materialization": "C:\\Temp\\IC~~\\hd.step.SLDPRT",
+                }
+            ),
+            "import_bound_sha_mismatch": lambda closure: closure["imports"].append(
+                {
+                    "document": MAIN,
+                    "instance": "hd-1",
+                    "state": "bound",
+                    "resolved": "cad/base.SLDPRT",
+                    "sha256": "00" * 32,
+                }
+            ),
+            "import_owner_sha_mismatch": lambda closure: closure["imports"].append(
+                {
+                    "document": MAIN,
+                    "instance": "hd-1",
+                    "state": "cached_materialization",
+                    "binding": "author_metadata_only",
+                    "materialization": "C:\\Temp\\IC~~\\hd.step.SLDPRT",
+                    "owner_sha256": "00" * 32,
+                }
             ),
         }
         for label, mutate in cases.items():
@@ -147,7 +184,15 @@ class ClosureSealContractTests(unittest.TestCase):
                     "binding": "author_metadata_only",
                     "materialization": "C:\\Temp\\IC~~\\hd.step.SLDPRT",
                     "author_imported_path": "D:\\old\\hd.step",
-                }
+                    "owner_sha256": self.upload[MAIN],
+                },
+                {
+                    "document": MAIN,
+                    "instance": "hd-2",
+                    "state": "bound",
+                    "resolved": "cad/base.SLDPRT",
+                    "sha256": self.upload["cad/base.SLDPRT"],
+                },
             ],
         )
         evidence["warnings"] = [
@@ -162,6 +207,7 @@ class ClosureSealContractTests(unittest.TestCase):
         self.assertEqual(set(manifest["files"]), {"cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT"})
         self.assertEqual(manifest["closure"]["suppressed"][0]["justification"], "authored_suppression_clean_open")
         self.assertEqual(manifest["closure"]["imports"][0]["binding"], "author_metadata_only")
+        self.assertEqual(manifest["closure"]["imports"][1]["state"], "bound")
         self.assertEqual(manifest["closure"]["warnings"][0]["code"], "import_cached_materialization")
 
     def _staged_session(self):
