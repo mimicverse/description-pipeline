@@ -81,6 +81,74 @@ class StructuralReportTests(unittest.TestCase):
             self.assertIn("report.evidence_unreadable", [item["code"] for item in data["findings"]])
             self.assertIn("original native failure", (root / pins["markdown"]["path"]).read_text())
 
+    def test_stale_stored_references_are_warnings_with_exact_document_evidence(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_json(
+                root / "evidence/raw/dependency_closure.json",
+                {
+                    "stale_stored_references": [
+                        {
+                            "document": "cad/shank.SLDPRT",
+                            "location": r"C:\author\stale\stale_part.SLDASM",
+                            "resolved_path": r"C:\author\stale\stale_part.SLDASM",
+                            "exists": False,
+                        },
+                        {
+                            "document": "cad/arm.SLDPRT",
+                            "location": r"D:\outside\external_part.SLDASM",
+                            "resolved_path": r"D:\outside\external_part.SLDASM",
+                            "exists": True,
+                        },
+                    ]
+                },
+            )
+            receipt = {"run_id": "m3", "state": "verified", "passed": True}
+            before = dict(receipt)
+            pins = write_structural_report(root, receipt, evidence_root=root)
+            report = json.loads((root / pins["json"]["path"]).read_text())
+            self.assertEqual(before, receipt)
+            warnings = [item for item in report["findings"] if item["code"] == "native.stale_stored_reference"]
+            self.assertEqual(len(warnings), 2)
+            self.assertTrue(all(item["severity"] == "warning" for item in warnings))
+            first = next(item for item in warnings if item["evidence"]["document"] == "cad/shank.SLDPRT")
+            self.assertEqual(first["evidence"]["location"], r"C:\author\stale\stale_part.SLDASM")
+            self.assertEqual(first["evidence"]["resolved_path"], r"C:\author\stale\stale_part.SLDASM")
+            self.assertIs(first["evidence"]["exists"], False)
+            self.assertEqual(first["object"], "cad/shank.SLDPRT")
+            self.assertIn("未读取", first["message"])
+            self.assertEqual(report["summary"], {"warnings": 2, "blockers": 0})
+            markdown = (root / pins["markdown"]["path"]).read_text()
+            self.assertIn("stale_part.SLDASM", markdown)
+
+    def test_failed_run_reports_stale_references_beside_the_failure(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_json(
+                root / "evidence/raw/dependency_closure.json",
+                {
+                    "stale_stored_references": [
+                        {
+                            "document": "cad/shank.SLDPRT",
+                            "location": r"C:\author\stale\stale_part.SLDASM",
+                            "resolved_path": r"C:\author\stale\stale_part.SLDASM",
+                            "exists": False,
+                        }
+                    ]
+                },
+            )
+            pins = write_structural_report(
+                root,
+                {"run_id": "m3", "status": "failed", "error": "capture failed", "error_code": "cad_capture_failed"},
+                evidence_root=root,
+            )
+            report = json.loads((root / pins["json"]["path"]).read_text())
+            codes = [item["code"] for item in report["findings"]]
+            self.assertIn("native.stale_stored_reference", codes)
+            self.assertIn("cad_capture_failed", codes)
+            self.assertEqual(report["summary"], {"warnings": 1, "blockers": 1})
+            self.assertIn("capture failed", (root / pins["markdown"]["path"]).read_text())
+
 
 if __name__ == "__main__":
     unittest.main()

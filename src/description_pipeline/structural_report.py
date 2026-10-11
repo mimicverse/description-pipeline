@@ -66,6 +66,7 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
             "reports/quality.json",
             "input/discovery/findings.json",
             "input/discovery/native-discovery.json",
+            "evidence/raw/dependency_closure.json",
         ):
             path = Path(evidence_root) / name
             if path.is_file():
@@ -100,6 +101,33 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                 "evidence": opened,
             }
         )
+    dependency_closure = sources.get("evidence/raw/dependency_closure.json")
+    if isinstance(dependency_closure, dict):
+        # Every recorded automation issue is reported, even when it can remain a
+        # warning: evidence-covered unused stored references were never read or
+        # copied, so they are projected verbatim as warnings with their exact
+        # document/location evidence instead of disappearing into the raw record.
+        for item in dependency_closure.get("stale_stored_references") or []:
+            if not isinstance(item, dict):
+                continue
+            entries.append(
+                {
+                    "severity": "warning",
+                    "code": "native.stale_stored_reference",
+                    "object": item.get("document") or item.get("resolved_path"),
+                    "message": (
+                        "SolidWorks 的保存引用未被所选闭包使用（未解析为活动边，位置可能已失效且在交付包外）；"
+                        "流水线未读取、未复制该外部文件，仅按原文保留记录，不阻断生成与独立校验。"
+                    ),
+                    "source": "evidence/raw/dependency_closure.json/stale_stored_references",
+                    "evidence": {
+                        "document": item.get("document"),
+                        "location": item.get("location"),
+                        "resolved_path": item.get("resolved_path"),
+                        "exists": item.get("exists"),
+                    },
+                }
+            )
     # The same warning may appear in discovery, input validation and a stage
     # event. Preserve its first evidence location without repeating it.
     unique = {}
