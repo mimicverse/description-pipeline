@@ -17,6 +17,61 @@ MARKDOWN_PATH = "reports/structural-team.md"
 JSON_PATH = "reports/structural-team.json"
 _FINDING_LISTS = {"findings", "warnings", "errors", "problems", "diagnostics", "checks"}
 
+#: The single canonical material-provenance record (producer: 71f489a): written for every
+#: capture under ``evidence/raw/material_provenance.json``, bound by the snapshot manifest.
+_MATERIAL_SCHEMA = "solidworks-to-urdf.material-provenance/v1"
+_MATERIAL_TOP_KEYS = ("schema_version", "assembly", "configuration", "material_source", "measured_source")
+_MATERIAL_ENTRY_KEYS = (
+    "code",
+    "message",
+    "blocking",
+    "component",
+    "document",
+    "configuration",
+    "missing_body_indices",
+    "material_assignment",
+    "measured",
+)
+_MATERIAL_MEASURED_KEYS = (
+    "source",
+    "scope",
+    "mass_kg",
+    "center_of_mass_m",
+    "inertia_kg_m2",
+    "volume_m3",
+    "density_kg_m3",
+)
+
+
+def _canonical_material_warnings(value) -> list | None:
+    """The canonical warning list of the material-provenance record, or ``None``."""
+
+    if not isinstance(value, dict):
+        return None
+    if value.get("schema_version") != _MATERIAL_SCHEMA:
+        return None
+    if any(key not in value for key in _MATERIAL_TOP_KEYS):
+        return None
+    if value.get("measured_source") != "cad_api":
+        return None
+    warnings = value.get("warnings")
+    if not isinstance(warnings, list):
+        return None
+    for item in warnings:
+        if not isinstance(item, dict) or any(key not in item for key in _MATERIAL_ENTRY_KEYS):
+            return None
+        if not isinstance(item.get("code"), str) or not isinstance(item.get("message"), str):
+            return None
+        if not isinstance(item.get("blocking"), bool):
+            return None
+        if not isinstance(item.get("material_assignment"), dict) or not isinstance(item.get("measured"), dict):
+            return None
+        if any(key not in item["measured"] for key in _MATERIAL_MEASURED_KEYS):
+            return None
+        if item["measured"].get("source") != "cad_api":
+            return None
+    return warnings
+
 
 def _findings(value, source, *, severity=None):
     if isinstance(value, list):
@@ -140,13 +195,8 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
     elif material_provenance is not None:
         # One canonical schema only; anything else is independently rejected instead of
         # being reinterpreted, defaulted or accepted through an alternate interface.
-        canonical = (
-            isinstance(material_provenance, dict)
-            and material_provenance.get("schema_version") == "solidworks-to-urdf.material-provenance/v1"
-            and isinstance(material_provenance.get("warnings"), list)
-            and all(isinstance(item, dict) for item in material_provenance.get("warnings") or [])
-        )
-        if not canonical:
+        material_warnings = _canonical_material_warnings(material_provenance)
+        if material_warnings is None:
             entries.append(
                 {
                     "severity": "blocker",
@@ -171,16 +221,19 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
             # Missing explicit material is a warnable defect: the report renders the exact
             # reported assignment, body indices and native measured values, and never
             # claims the material or the physical/dynamic behaviour is verified.
-            for item in material_provenance["warnings"]:
+            for item in material_warnings:
+                blocking = item["blocking"] is True
                 entries.append(
                     {
-                        "severity": "warning",
+                        "severity": "blocker" if blocking else "warning",
                         "code": "native.material_provenance_missing",
                         "object": item.get("component") or item.get("occurrence") or item.get("document"),
-                        "message": (
-                            "SolidWorks 实体缺少显式物理材料赋值（默认密度不作为材料证据）：按可警告缺陷记录——"
-                            "流水线保留 CAD 实测质量、质心与惯量并继续生成与独立校验；本报告不据此声称材料已核验，"
-                            "材料真实性与物理/动力学合格仍属外部工程确认。"
+                        "message": "SolidWorks 实体缺少显式物理材料赋值（默认密度不作为材料证据）："
+                        + (
+                            "该记录标记为阻断，必须由独立检查判为失败。"
+                            if blocking
+                            else "按可警告缺陷记录——流水线保留 CAD 实测质量、质心与惯量并继续生成与独立校验；"
+                            "本报告不据此声称材料已核验，材料真实性与物理/动力学合格仍属外部工程确认。"
                         ),
                         "source": "evidence/raw/material_provenance.json/warnings",
                         "evidence": {
