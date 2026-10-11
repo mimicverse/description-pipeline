@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import struct
 import json
 import tempfile
 import unittest
@@ -1155,51 +1157,148 @@ class OptionalDesignExpectationTests(unittest.TestCase):
 class SurfaceOnlyGeometryExemptionTests(unittest.TestCase):
     """The zero-volume gate accepts only sealed, qualified surface-only CAD records."""
 
-    def _delivery(self, tmp, record):
+    QUALIFICATION = (
+        "cad_authored_effective_instance; not geometry-derived, not independently physically qualified"
+    )
+
+    def _delivery(self, tmp, *, qualified=True):
         root = Path(tmp)
         (root / "evidence/raw").mkdir(parents=True, exist_ok=True)
-        write_json(root / "evidence/raw/effective_instances.json", record)
-        return root
-
-    def _qualified(self, occurrence="pcb-1"):
-        return {
+        occurrence = "pcb-1"
+        record = {
             "schema_version": "solidworks-to-urdf.effective-instances/v1",
             "assembly": "robot.SLDASM",
             "configuration": "默认",
-            "readings": {},
-            "warnings": [
-                {
-                    "code": "cad_surface_only_effective_instance",
-                    "blocking": False,
-                    "component": occurrence,
-                    "document": "board.SLDPRT",
-                    "part_document_read": "unavailable",
-                    "solid_bodies": 0,
-                    "sheet_bodies": 2350,
-                }
-            ],
+            "readings": {occurrence: {"role": "leaf", "document_type": "part"}} if qualified else {},
+            "warnings": (
+                [
+                    {
+                        "code": "cad_surface_only_effective_instance",
+                        "blocking": False,
+                        "component": occurrence,
+                        "document": "board.SLDPRT",
+                        "part_document_read": "unavailable",
+                        "solid_bodies": 0,
+                        "sheet_bodies": 2350,
+                        "qualification": self.QUALIFICATION,
+                    }
+                ]
+                if qualified
+                else []
+            ),
         }
+        write_json(root / "evidence/raw/effective_instances.json", record)
+        write_json(
+            root / "evidence/raw/mass_properties.json",
+            {
+                occurrence: {
+                    "mode": "effective_instance",
+                    "state": "effective_instance",
+                    "reference": {"solid_bodies": 0, "sheet_bodies": 2350},
+                }
+            },
+        )
+        return root
 
     def test_qualified_surface_only_record_is_accepted(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = self._delivery(tmp, self._qualified())
+            root = self._delivery(tmp)
             self.assertTrue(quality._qualified_surface_only(root, "pcb-1"))
-
-    def test_unqualified_zero_volume_paths_are_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = self._delivery(tmp, self._qualified())
             self.assertFalse(quality._qualified_surface_only(root, "other-1"))
-        unqualified = self._qualified()
-        unqualified["warnings"][0]["solid_bodies"] = 3
-        with tempfile.TemporaryDirectory() as tmp:
-            root = self._delivery(tmp, unqualified)
+            record = json.loads((root / "evidence/raw/effective_instances.json").read_text(encoding="utf-8"))
+            record["warnings"][0]["solid_bodies"] = False
+            write_json(root / "evidence/raw/effective_instances.json", record)
             self.assertFalse(quality._qualified_surface_only(root, "pcb-1"))
-        blocking = self._qualified()
-        blocking["warnings"][0]["blocking"] = True
-        with tempfile.TemporaryDirectory() as tmp:
-            root = self._delivery(tmp, blocking)
+            mass = json.loads((root / "evidence/raw/mass_properties.json").read_text(encoding="utf-8"))
+            mass["pcb-1"]["reference"]["solid_bodies"] = False
+            write_json(root / "evidence/raw/mass_properties.json", mass)
+            self.assertFalse(quality._qualified_surface_only(root, "pcb-1"))
+            mass["pcb-1"]["reference"]["solid_bodies"] = 0
+            mass["pcb-1"]["mode"] = "document"
+            write_json(root / "evidence/raw/mass_properties.json", mass)
             self.assertFalse(quality._qualified_surface_only(root, "pcb-1"))
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self.assertFalse(quality._qualified_surface_only(root, "pcb-1"))
+
+    def _stl_bytes(self, *, collinear):
+        header = b"planar test mesh".ljust(80, b" ")
+        if collinear:
+            # One valid planar triangle plus one zero-area triangle: the mesh keeps
+            # positive area and must be rejected by the degenerate-ratio gate.
+            triangles = [
+                ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+                ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+            ]
+        else:
+            triangles = [
+                ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+                ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0)),
+            ]
+        payload = b"".join(struct.pack("<12fH", 0.0, 0.0, 1.0, *a, *b, *c, 0) for a, b, c in triangles)
+        return header + struct.pack("<I", len(triangles)) + payload
+
+    def _geometry_fixture(self, root, *, qualified, collinear):
+        payload = self._stl_bytes(collinear=collinear)
+        (root / "evidence/geometry").mkdir(parents=True, exist_ok=True)
+        (root / "meshes").mkdir(parents=True, exist_ok=True)
+        (root / "evidence/geometry/0001_mesh.stl").write_bytes(payload)
+        (root / "meshes/0001_mesh.stl").write_bytes(payload)
+        digest = hashlib.sha256(payload).hexdigest()
+        occurrence = "pcb-1"
+        if qualified:
+            self._delivery(root)
+        node = ET.fromstring(
+            '<link name="board"><visual><origin xyz="0 0 0" rpy="0 0 0"/>'
+            '<geometry><mesh filename="../meshes/0001_mesh.stl" scale="1 1 1"/></geometry></visual></link>'
+        )
+        body = {"components": [occurrence]}
+        model_link = {
+            "inertial": {"xyz": [0.0, 0.0, 0.0], "inertia": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "mass": 0.0},
+            "visuals": [
+                {
+                    "filename": "geometry/0001_mesh.stl",
+                    "scale": [1, 1, 1],
+                    "xyz": [0, 0, 0],
+                    "rpy": [0, 0, 0],
+                }
+            ],
+            "collisions": [],
+        }
+        geometry = {
+            occurrence: {
+                "path": "geometry/0001_mesh.stl",
+                "sha256": digest,
+                "triangles": 2,
+                "scale": [1, 1, 1],
+                "xyz": [0, 0, 0],
+                "rpy": [0, 0, 0],
+            }
+        }
+        components = {occurrence: np.identity(4)}
+        return node, body, model_link, geometry, components
+
+    def _run_geometry(self, root, *, qualified, collinear):
+        node, body, model_link, geometry, components = self._geometry_fixture(
+            root, qualified=qualified, collinear=collinear
+        )
+        return quality._geometry(
+            root, body, node, model_link, geometry, components, np.identity(4), np.identity(4), set()
+        )
+
+    def test_zero_volume_planar_mesh_is_accepted_when_qualified(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._run_geometry(Path(tmp), qualified=True, collinear=False)
+
+    def test_zero_volume_planar_mesh_is_rejected_when_unqualified(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(PipelineError) as caught:
+                self._run_geometry(Path(tmp), qualified=False, collinear=False)
+            self.assertIn("Zero-volume", str(caught.exception))
+
+    def test_degenerate_plane_is_still_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(PipelineError) as caught:
+                self._run_geometry(Path(tmp), qualified=True, collinear=True)
+            self.assertIn("degenerate", str(caught.exception))
 

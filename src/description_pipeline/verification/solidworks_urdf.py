@@ -831,36 +831,64 @@ def _tree(document, base_pose):
 def _qualified_surface_only(root, occurrence: str) -> bool:
     """Whether the sealed evidence carries this occurrence's qualified surface-only CAD record.
 
-    Sheet-only components (no solid bodies) legitimately tessellate to zero
-    volume; acceptance rides on the canonical CAD-authored effective-instance
-    warning in the sealed evidence, never on a fabricated exclusion or an
-    inferred mass.
+    Sheet-only components (no solid bodies) legitimately tessellate to zero volume.
+    Acceptance requires the canonical sealed record: a leaf effective-instance
+    reading for this exact occurrence, its surface-only warning with the exact
+    qualification string, and the raw mass row in effective-instance mode with a
+    state and reference counts of zero solid bodies and at least one sheet body.
+    Integer identity checks reject booleans, so ``False`` never satisfies a zero
+    count; nothing is inferred from mass.
     """
 
     try:
         record = read_data(confined(root / "evidence", "raw/effective_instances.json"))
+        mass_properties = read_data(confined(root / "evidence", "raw/mass_properties.json"))
     except (PipelineError, OSError, ValueError):
         return False
     if not isinstance(record, dict) or record.get("schema_version") != "solidworks-to-urdf.effective-instances/v1":
         return False
+    readings = record.get("readings")
+    if not isinstance(readings, dict):
+        return False
+    reading = readings.get(occurrence)
+    if not isinstance(reading, dict) or reading.get("role") != "leaf":
+        return False
     warnings = record.get("warnings")
     if not isinstance(warnings, list):
         return False
+    qualification = (
+        "cad_authored_effective_instance; not geometry-derived, not independently physically qualified"
+    )
+    qualified = False
     for item in warnings:
-        if not isinstance(item, dict):
-            continue
-        sheets = item.get("sheet_bodies")
         if (
-            item.get("code") == "cad_surface_only_effective_instance"
+            isinstance(item, dict)
+            and item.get("code") == "cad_surface_only_effective_instance"
             and item.get("component") == occurrence
             and item.get("blocking") is False
-            and item.get("solid_bodies") == 0
-            and isinstance(sheets, int)
-            and not isinstance(sheets, bool)
-            and sheets > 0
+            and item.get("qualification") == qualification
+            and item.get("part_document_read") == "unavailable"
+            and type(item.get("solid_bodies")) is int
+            and item["solid_bodies"] == 0
+            and type(item.get("sheet_bodies")) is int
+            and item["sheet_bodies"] > 0
         ):
-            return True
-    return False
+            qualified = True
+            break
+    if not qualified:
+        return False
+    row = mass_properties.get(occurrence) if isinstance(mass_properties, dict) else None
+    if not isinstance(row, dict) or row.get("mode") != "effective_instance":
+        return False
+    state = row.get("state")
+    if not isinstance(state, str) or not state.strip():
+        return False
+    reference = row.get("reference")
+    if not isinstance(reference, dict):
+        return False
+    solids = reference.get("solid_bodies")
+    sheets = reference.get("sheet_bodies")
+    return type(solids) is int and solids == 0 and type(sheets) is int and sheets > 0
 
 
 def _geometry(root, body, node, model_link, geometry, components, body_pose, urdf_pose, exclusions):
