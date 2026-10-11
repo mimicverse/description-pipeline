@@ -237,11 +237,17 @@ class FixtureCadBackend(CadBackend):
         skip_missing=(),
         skip_session_temp: bool = False,
         excluded_paths=(),
+        required_names=(),
+        admitted_roots=(),
+        closure_documents=None,
     ) -> dict[str, Any]:
         self.collect_skips = {
             "skip_missing": sorted(str(item) for item in skip_missing),
             "skip_session_temp": bool(skip_session_temp),
             "excluded_paths": sorted(str(item) for item in excluded_paths),
+            "required_names": sorted(str(item) for item in required_names),
+            "admitted_roots": [str(item) for item in admitted_roots],
+            "closure_documents": sorted((closure_documents or {}).keys()) if isinstance(closure_documents, dict) else None,
         }
         target = Path(destination_dir)
         target.mkdir(parents=True, exist_ok=True)

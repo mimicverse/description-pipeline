@@ -799,6 +799,27 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         )
     # The collector contract is explicit: skipped/author-excluded paths are
     # always passed, empty when the coverage proof did not authorize a skip.
+    closure_documents: dict[str, dict] = {}
+    for name, entry in (closure.get("documents") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        closure_documents[str(name)] = {
+            "stored_locations": [
+                str(item.get("location"))
+                for item in entry.get("stored_references") or []
+                if isinstance(item, dict) and isinstance(item.get("location"), str)
+            ],
+            "resolved_targets": [
+                str(edge.get("resolved"))
+                for edge in entry.get("resolved_edges") or []
+                if isinstance(edge, dict) and isinstance(edge.get("resolved"), str)
+            ],
+            "resolved_paths": [
+                str(edge.get("resolved_path"))
+                for edge in entry.get("resolved_edges") or []
+                if isinstance(edge, dict) and isinstance(edge.get("resolved_path"), str)
+            ],
+        }
     collected = dict(
         pack(
             cfg["assembly"],
@@ -806,9 +827,18 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
             skip_missing=sorted(suppressed_paths),
             skip_session_temp=materializations_verified,
             excluded_paths=sorted(author_metadata_external) if materializations_verified else (),
+            required_names=sorted((closure.get("graph") or {}).keys()),
+            admitted_roots=[str(source_dir), *(cfg.get("allowed_roots") or [])],
+            closure_documents=closure_documents,
         )
         or {}
     )
+    stale_stored: list[dict] = [dict(item) for item in collected.get("skipped_stale") or [] if isinstance(item, dict)]
+    stale_resolved_normalized = {
+        os.path.normcase(os.path.abspath(str(item.get("resolved_path"))))
+        for item in stale_stored
+        if item.get("resolved_path")
+    }
     source_mapping = collected.get("mapping") or {}
     if {os.path.normcase(os.path.abspath(path)) for path in source_mapping} != {
         os.path.normcase(os.path.abspath(path)) for path in original_files
@@ -856,6 +886,14 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         path = str(entry.get("path") or "")
         if path and os.path.normcase(os.path.abspath(path)) in suppressed_paths:
             suppressed_skipped.append(path)
+            continue
+        if path and os.path.normcase(os.path.abspath(path)) in stale_resolved_normalized:
+            # The copy still stores an evidence-covered unused reference; it
+            # was never ingested and is recorded (no name matching involved).
+            if not any(item.get("resolved_path") == path for item in stale_stored):
+                stale_stored.append(
+                    {"document": None, "location": None, "resolved_path": path, "exists": os.path.isfile(path)}
+                )
             continue
         if path and materializations_verified and os.path.normcase(os.path.abspath(path)) in author_metadata_external:
             stale_source_links.append(path)
@@ -1088,6 +1126,9 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         "suppressed_skipped": sorted(set(suppressed_skipped)),
         "session_temp_dependencies": sorted(set(session_temp_dependencies)),
         "stale_source_links": sorted(set(stale_source_links)),
+        "stale_stored_references": sorted(
+            stale_stored, key=lambda item: (str(item.get("document")), str(item.get("location")), str(item.get("resolved_path")))
+        ),
         "materializations_verified": materializations_verified,
         "materialization_keys": sorted([token[0], token[1], instance] for token, instance in materialization_keys),
         "import_temp_documents": sorted(set(import_temp_documents)),

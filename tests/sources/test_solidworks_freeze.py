@@ -126,6 +126,51 @@ class FreezeTests(unittest.TestCase):
         self.assertIn("suppressed_skipped", payload)
         self.assertIn("session_temp_dependencies", payload)
 
+    def test_freeze_records_evidence_covered_stale_stored_references(self) -> None:
+        config = json.loads(json.dumps(self.config))
+        config["closure"] = {
+            "schema_version": "solidworks-to-urdf.native-closure/v1",
+            "graph": {
+                "robot.SLDASM": {"sha256": "0" * 64, "references": ["base.SLDPRT", "arm.SLDPRT"]},
+                "base.SLDPRT": {"sha256": "0" * 64, "references": []},
+                "arm.SLDPRT": {"sha256": "0" * 64, "references": []},
+            },
+            "documents": {
+                "robot.SLDASM": {
+                    "resolved_edges": [
+                        {"instance": "base-1", "resolved": "base.SLDPRT"},
+                        {"instance": "arm-1", "resolved": "arm.SLDPRT"},
+                    ],
+                    "stored_references": [],
+                }
+            },
+            "imports": [],
+            "suppressed": [],
+        }
+        stale_path = str(self.tmp / "CopyDesignTemp" / "lowerbody.SLDASM")
+        real_collect = self.backend.collect_dependencies
+
+        def collect_with_stale(path, destination, **kwargs):
+            payload = real_collect(path, destination, **kwargs)
+            payload["skipped_stale"] = [
+                {"document": "robot.SLDASM", "location": stale_path, "resolved_path": stale_path, "exists": False}
+            ]
+            return payload
+
+        self.backend.collect_dependencies = collect_with_stale  # type: ignore[method-assign]
+        real_resolve = self.backend.resolve_dependencies
+
+        def resolve_with_stale(path):
+            return [*real_resolve(path), {"path": stale_path, "exists": False, "type": ".sldasm"}]
+
+        self.backend.resolve_dependencies = resolve_with_stale  # type: ignore[method-assign]
+        freeze(config, self.destination, backend=self.backend)
+        payload = json.loads((self.destination / "raw" / "dependency_closure.json").read_text(encoding="utf-8"))
+        stale = payload["stale_stored_references"]
+        self.assertEqual(len(stale), 1)
+        self.assertEqual(stale[0]["resolved_path"], stale_path)
+        self.assertEqual(stale[0]["location"], stale_path)
+
     def test_freeze_refuses_uncovered_materializations(self) -> None:
         config = json.loads(json.dumps(self.config))
         config["closure"] = {

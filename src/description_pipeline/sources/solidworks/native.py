@@ -3523,7 +3523,16 @@ class SolidWorksBackend(CadBackend):
         return self.list_dependencies(path)
 
     def collect_dependencies(
-        self, path, destination_dir, *, skip_missing=(), skip_session_temp=False, excluded_paths=()
+        self,
+        path,
+        destination_dir,
+        *,
+        skip_missing=(),
+        skip_session_temp=False,
+        excluded_paths=(),
+        required_names=None,
+        admitted_roots=(),
+        closure_documents=None,
     ):
         """Copy saved native files and rewrite references in a second application.
 
@@ -3537,14 +3546,51 @@ class SolidWorksBackend(CadBackend):
         ``skip_session_temp`` is set after the occurrence coverage proof,
         session 3D-Interconnect materializations are likewise reported and
         never copied or rewritten.
+
+        ``required_names`` (the sealed closure's selected canonical document
+        names), ``admitted_roots`` and ``closure_documents`` bind
+        missing-reference policy to the sealed acquisition: a stored reference
+        that is missing on disk is admissible stale metadata only when it is
+        not a selected document, the scanning document has closure evidence,
+        and the verbatim stored location is recorded in that document's
+        ``stored_references`` without a resolved edge for it.  Exact
+        containment and verbatim strings only -- never a basename.  Everything
+        else still refuses ``dependency_missing``.
         """
         source_path = str(Path(path).resolve())
         source_app = self._app_for_path(source_path)
         skipped_normalized = {os.path.normcase(os.path.abspath(str(item))) for item in skip_missing}
         excluded_normalized = {os.path.normcase(os.path.abspath(str(item))) for item in excluded_paths}
+        required_folded = (
+            {str(name).replace("\\", "/").casefold(): str(name) for name in required_names}
+            if required_names is not None
+            else None
+        )
+        roots_normalized = [os.path.normcase(os.path.abspath(str(item))) for item in admitted_roots]
+        closure_docs_folded: dict[str, dict] = {}
+        if isinstance(closure_documents, dict):
+            for name, evidence in closure_documents.items():
+                if not isinstance(evidence, dict):
+                    continue
+                closure_docs_folded[str(name).casefold()] = {
+                    "stored_locations": [
+                        str(item) for item in evidence.get("stored_locations") or [] if isinstance(item, str)
+                    ],
+                    "resolved_targets": {
+                        str(item).casefold()
+                        for item in evidence.get("resolved_targets") or []
+                        if isinstance(item, str)
+                    },
+                    "resolved_paths": {
+                        os.path.normcase(os.path.abspath(str(item)))
+                        for item in evidence.get("resolved_paths") or []
+                        if isinstance(item, str) and item
+                    },
+                }
         graph_skipped: list[str] = []
         graph_skipped_temp: list[str] = []
         graph_excluded: list[str] = []
+        graph_stale: list[dict] = []
         graph = {}
         pending = [source_path]
         while pending:
@@ -3570,6 +3616,55 @@ class SolidWorksBackend(CadBackend):
                     # rewritten; the copy regenerates its own materializations.
                     graph_skipped_temp.append(reference)
                     continue
+                if required_folded is not None:
+                    normalized_ref = os.path.normcase(os.path.abspath(reference))
+                    contained = next(
+                        (root for root in roots_normalized if normalized_ref.startswith(root + os.sep)),
+                        None,
+                    )
+                    artifact_canonical = (
+                        os.path.relpath(normalized_ref, contained).replace("\\", "/")
+                        if contained is not None
+                        else None
+                    )
+                    selected = artifact_canonical is not None and artifact_canonical.casefold() in required_folded
+                    document_normalized = os.path.normcase(os.path.abspath(document))
+                    document_root = next(
+                        (root for root in roots_normalized if document_normalized.startswith(root + os.sep)),
+                        None,
+                    )
+                    document_canonical = (
+                        os.path.relpath(document_normalized, document_root).replace("\\", "/")
+                        if document_root is not None
+                        else None
+                    )
+                    evidence = (
+                        closure_docs_folded.get(document_canonical.casefold())
+                        if isinstance(document_canonical, str)
+                        else None
+                    )
+                    if not selected and evidence is not None:
+                        recorded = value in evidence["stored_locations"]
+                        resolved_hit = (
+                            (artifact_canonical is not None and artifact_canonical.casefold() in evidence["resolved_targets"])
+                            or os.path.normcase(os.path.abspath(reference)) in evidence["resolved_paths"]
+                        )
+                        if recorded and not resolved_hit:
+                            # Evidence-covered UNUSED stored reference: the
+                            # closure recorded exactly this verbatim location
+                            # for this document, resolved no active edge to it
+                            # and did not select it.  It is never ingested,
+                            # copied or rewritten -- whether or not the stale
+                            # artifact still exists out of closure.
+                            graph_stale.append(
+                                {
+                                    "document": document_canonical or str(document),
+                                    "location": value,
+                                    "resolved_path": reference,
+                                    "exists": os.path.isfile(reference),
+                                }
+                            )
+                            continue
                 if not Path(reference).is_file():
                     if os.path.normcase(os.path.abspath(reference)) in skipped_normalized:
                         graph_skipped.append(reference)
@@ -3633,6 +3728,9 @@ class SolidWorksBackend(CadBackend):
             "skipped_missing": sorted(graph_skipped),
             "skipped_session_temp": sorted(graph_skipped_temp),
             "skipped_excluded": sorted(graph_excluded),
+            "skipped_stale": sorted(
+                graph_stale, key=lambda item: (str(item.get("document")), str(item.get("location")))
+            ),
             "configured": ["GetDocumentDependencies2", "ReplaceReferencedDocument"],
         }
 

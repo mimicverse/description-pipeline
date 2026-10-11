@@ -152,6 +152,146 @@ class NativeReferenceCopyTests(unittest.TestCase):
             self.assertEqual(len(result["files"]), 2)  # assembly + part only
             self.assertEqual(len(rewritten), 1)  # only the real reference is rewritten
 
+    def _stale_collect(
+        self, root, outside, *, write_outside, closure_documents, required_names=None, location=None
+    ):
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from description_pipeline.sources.solidworks.native import SolidWorksBackend
+
+        assembly, sub = root / "robot.SLDASM", root / "sub.SLDASM"
+        assembly.write_bytes(b"assembly")
+        sub.write_bytes(b"sub")
+        location = location if location is not None else str(outside / "CopyDesignTemp" / "lowerbody.SLDASM")
+        if write_outside:
+            target = Path(location)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"stale external artifact")
+        graph = {str(assembly): ["sub", str(sub)], str(sub): ["lowerbody", str(location)]}
+        copied = SimpleNamespace(ReplaceReferencedDocument=lambda *args: True)
+        backend = SolidWorksBackend()
+        backend._app_for_path = Mock(  # type: ignore[method-assign]
+            side_effect=[SimpleNamespace(GetDocumentDependencies2=lambda path, *args: graph.get(path, [])), copied]
+        )
+        kwargs = {
+            "admitted_roots": [str(root)],
+            "closure_documents": closure_documents,
+        }
+        if required_names is not None:
+            kwargs["required_names"] = required_names
+        return backend.collect_dependencies(str(assembly), str(root / "copy"), **kwargs)
+
+    def test_evidence_covered_unused_missing_reference_is_skipped_with_record(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as outside:
+            root, out = Path(folder), Path(outside)
+            location = str(out / "CopyDesignTemp" / "lowerbody.SLDASM")
+            result = self._stale_collect(
+                root,
+                out,
+                write_outside=False,
+                required_names=["sub.SLDASM"],
+                closure_documents={
+                    "sub.SLDASM": {"stored_locations": [location], "resolved_targets": [], "resolved_paths": []}
+                },
+            )
+            self.assertEqual(len(result["skipped_stale"]), 1)
+            entry = result["skipped_stale"][0]
+            self.assertEqual(entry["document"], "sub.SLDASM")
+            self.assertEqual(entry["location"], location)
+            self.assertFalse(entry["exists"])
+            self.assertEqual(len(result["files"]), 2)  # assembly + sub; stale never copied
+
+    def test_evidence_covered_existing_stale_reference_is_never_ingested(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as outside:
+            root, out = Path(folder), Path(outside)
+            location = str(out / "CopyDesignTemp" / "lowerbody.SLDASM")
+            result = self._stale_collect(
+                root,
+                out,
+                write_outside=True,
+                required_names=["sub.SLDASM"],
+                closure_documents={
+                    "sub.SLDASM": {"stored_locations": [location], "resolved_targets": [], "resolved_paths": []}
+                },
+            )
+            entry = result["skipped_stale"][0]
+            self.assertTrue(entry["exists"])
+            self.assertEqual(len(result["files"]), 2)  # the present external file is not ingested
+            self.assertNotIn(str(Path(location).resolve()), result["files"])
+
+    def test_missing_selected_or_unrecorded_or_active_reference_stays_hard(self):
+        import tempfile
+        from pathlib import Path
+
+        from description_pipeline.sources.solidworks.errors import CadError
+
+        with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as outside:
+            root, out = Path(folder), Path(outside)
+            # Selected missing file: evidence does not excuse it.  The artifact
+            # lies inside the admitted root, so its canonical name is selected.
+            selected_location = str(root / "missing.SLDPRT")
+            with self.assertRaises(CadError) as caught:
+                self._stale_collect(
+                    root,
+                    out,
+                    write_outside=False,
+                    required_names=["sub.SLDASM", "missing.SLDPRT"],
+                    location=selected_location,
+                    closure_documents={
+                        "sub.SLDASM": {
+                            "stored_locations": [selected_location],
+                            "resolved_targets": [],
+                            "resolved_paths": [],
+                        }
+                    },
+                )
+            self.assertEqual(caught.exception.code, "dependency_missing")
+            location = str(out / "CopyDesignTemp" / "lowerbody.SLDASM")
+            # Unrecorded location: hard.
+            with self.assertRaises(CadError) as caught:
+                self._stale_collect(
+                    root,
+                    out,
+                    write_outside=False,
+                    required_names=["sub.SLDASM"],
+                    closure_documents={
+                        "sub.SLDASM": {"stored_locations": [], "resolved_targets": [], "resolved_paths": []}
+                    },
+                )
+            self.assertEqual(caught.exception.code, "dependency_missing")
+            # Active resolved edge path for the same artifact: hard.
+            with self.assertRaises(CadError) as caught:
+                self._stale_collect(
+                    root,
+                    out,
+                    write_outside=False,
+                    required_names=["sub.SLDASM"],
+                    closure_documents={
+                        "sub.SLDASM": {
+                            "stored_locations": [location],
+                            "resolved_targets": [],
+                            "resolved_paths": [location],
+                        }
+                    },
+                )
+            self.assertEqual(caught.exception.code, "dependency_missing")
+            # No closure authorisation at all: legacy hard refusal.
+            with self.assertRaises(CadError) as caught:
+                self._stale_collect(
+                    root,
+                    out,
+                    write_outside=False,
+                    closure_documents=None,
+                )
+            self.assertEqual(caught.exception.code, "dependency_missing")
+
     def test_ungated_session_materializations_are_not_skipped(self):
         import tempfile
         from pathlib import Path
