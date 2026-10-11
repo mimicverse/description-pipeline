@@ -358,24 +358,49 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                     if candidate is not None and staged_ok(candidate):
                         bound_source = candidate
                 if bound_source is not None:
-                    graph_entry(defining_name)["references"].add(bound_source)
-                    graph_entry(bound_source)
-                    document_entry(bound_source)
-                    document_entry(defining_name)["resolved_edges"].append(
-                        {
-                            "name": record.get("name"),
-                            "instance": instance,
-                            "kind": "native_imported_document",
-                            "resolved": bound_source,
-                            "resolved_path": imported,
-                            "configuration": record.get("configuration"),
-                            "suppression_state": state,
-                            "lightweight": lightweight,
-                            "evidence": "in-stage author import source retained",
-                        }
-                    )
+                    # The bound edge hangs off the validated ultimate owner (a
+                    # resolved-graph key); a nested descendant's raw defining is
+                    # a temp materialization and is never used as a graph key.
+                    # Without a validated ultimate owner nothing is mutated:
+                    # the run refuses with the structured problem protocol.
+                    bound_owner = owner if isinstance(owner, str) and owner in files else None
+                    if bound_owner is None:
+                        problems.append(
+                            _problem(
+                                "selection_closure_invalid",
+                                "a cached materialization retains an in-stage bound source "
+                                "without a validated ultimate owner",
+                                document=label,
+                                instance=instance,
+                                resolved=bound_source,
+                                **({"owner": owner} if isinstance(owner, str) and owner else {}),
+                            )
+                        )
+                    else:
+                        graph_entry(bound_owner)["references"].add(bound_source)
+                        graph_entry(bound_source)
+                        document_entry(bound_source)
+                        document_entry(bound_owner)["resolved_edges"].append(
+                            {
+                                "name": record.get("name"),
+                                "instance": instance,
+                                "kind": "native_imported_document",
+                                "resolved": bound_source,
+                                "resolved_path": imported,
+                                "configuration": record.get("configuration"),
+                                "suppression_state": state,
+                                "lightweight": lightweight,
+                                "evidence": "in-stage author import source retained",
+                            }
+                        )
                 imports.append(
                     {
+                        # Verbatim raw evidence: the defining label (a session
+                        # materialization path for nested import descendants).
+                        # Graph membership is proven separately by `owner`
+                        # (ultimate delivered owner) + owner_sha256, which the
+                        # seal resolves and corroborates; the raw label is never
+                        # used as a graph key.
                         "document": label,
                         "owner": owner,
                         "owner_anchor": raw_anchor,

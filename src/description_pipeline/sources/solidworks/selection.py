@@ -289,14 +289,24 @@ def seal_closure_selection(
         raise SelectionError("selection_closure_invalid", "Imported-source evidence must be a verbatim evidence list")
     import_targets: dict[str, set[str]] = {}
     for item in imports:
-        owner = folded_graph.get(str(item.get("document") or "").replace("\\", "/").casefold())
+        state = item.get("state")
+        document_label = str(item.get("document") or "")
+        if state == "cached_materialization":
+            # The raw document label of a cached materialization stays verbatim
+            # evidence (a session temp path for nested import descendants); its
+            # graph membership is resolved from the validated ultimate owner,
+            # falling back to the document label for carriers that spell the
+            # owner there (both must name a resolved-graph key below).
+            candidate = str(item.get("owner") or item.get("document") or "")
+            owner = folded_graph.get(candidate.replace("\\", "/").casefold())
+        else:
+            owner = folded_graph.get(document_label.replace("\\", "/").casefold())
         if owner is None or owner not in evidence_map:
             raise SelectionError(
                 "selection_closure_invalid",
                 "An imported source names a document outside the resolved graph",
-                path=str(item.get("document")),
+                path=document_label or str(item.get("owner")),
             )
-        state = item.get("state")
         if state == "bound":
             target = canonical_target(item.get("resolved"))
             recorded_sha = item.get("sha256")
@@ -321,9 +331,19 @@ def seal_closure_selection(
                     "selection_closure_invalid", "A cached materialization records no occurrence identity"
                 )
             owner_sha = item.get("owner_sha256")
-            if owner_sha is not None and owner_sha != files[owner]:
+            if not isinstance(owner_sha, str) or owner_sha != files[owner]:
                 raise SelectionError(
                     "selection_closure_invalid", "A cached materialization owner differs from the staged bytes"
+                )
+            anchor = item.get("owner_anchor")
+            if anchor is not None and (
+                not isinstance(anchor, str)
+                or not anchor.strip()
+                or not item["instance"].startswith(anchor + "/")
+            ):
+                raise SelectionError(
+                    "selection_closure_invalid",
+                    "A cached materialization anchor does not corroborate its occurrence",
                 )
         else:
             raise SelectionError(

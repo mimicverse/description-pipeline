@@ -332,6 +332,131 @@ class ClosureAdmissionTests(unittest.TestCase):
         for entry in payload["imports"]:
             self.assertEqual(entry["owner"], "robot.SLDASM")
             self.assertEqual(entry["owner_sha256"], self.files["robot.SLDASM"])
+        by_instance = {entry["instance"]: entry for entry in payload["imports"]}
+        # document stays verbatim raw evidence: canonical for the top-level
+        # import, the temp parent materialization for the nested descendant.
+        self.assertEqual(by_instance["HD-1910-C001-20260902.stp-2"]["document"], "robot.SLDASM")
+        self.assertEqual(
+            by_instance["HD-1910-C001-20260902.stp-2/HL-3608_ASM_52_ASM.stp-1"]["document"], parent
+        )
+        # The seal resolves graph membership from the validated ultimate owner.
+        manifest = seal_closure_selection(self.files, "robot.SLDASM", payload, reader_sha256=READER)
+        # Cached imports add no edges, so only the main is reachable here; the
+        # staged parts remain reported as excluded, never silently dropped.
+        self.assertEqual(sorted(manifest["files"]), ["robot.SLDASM"])
+
+    def _nested_payload(self):
+        parent = session_temp("swx25524", "IC~~", "HD-1910-C001-20260902.stp.SLDASM")
+        child = session_temp("swx25524", "IC~~", "HL-3608_ASM_52_ASM.stp.SLDASM")
+        payload = self.observe(
+            [
+                occurrence(
+                    "HD-1910-C001-20260902.stp-2",
+                    parent,
+                    imported=r"D:\M2.2\change11\HD.stp",
+                    native_owner="robot.SLDASM",
+                ),
+                occurrence(
+                    "HD-1910-C001-20260902.stp-2/HL-3608_ASM_52_ASM.stp-1",
+                    child,
+                    defining=parent,
+                    imported=r"D:\M2.2\change11\HD.stp",
+                    native_owner="robot.SLDASM",
+                ),
+            ]
+        )
+        return parent, child, payload
+
+    def test_seal_refuses_missing_or_forged_cached_owner(self) -> None:
+        import copy
+
+        _, _, payload = self._nested_payload()
+        child_instance = "HD-1910-C001-20260902.stp-2/HL-3608_ASM_52_ASM.stp-1"
+
+        def drop_owner(entry):
+            entry.pop("owner")
+
+        def ghost_owner(entry):
+            entry["owner"] = "ghost.SLDASM"
+
+        def forged_sha(entry):
+            entry["owner_sha256"] = "0" * 64
+
+        def wrong_anchor(entry):
+            entry["owner_anchor"] = "not-an-ancestor"
+
+        for tamper in (drop_owner, ghost_owner, forged_sha, wrong_anchor):
+            forged = copy.deepcopy(payload)
+            entry = next(item for item in forged["imports"] if item["instance"] == child_instance)
+            tamper(entry)
+            with self.subTest(tamper=tamper.__name__), self.assertRaises(SelectionError) as caught:
+                seal_closure_selection(self.files, "robot.SLDASM", forged, reader_sha256=READER)
+            self.assertEqual(caught.exception.code, "selection_closure_invalid")
+
+    def test_nested_bound_source_is_retained_under_the_ultimate_owner(self) -> None:
+        extra = write_stage(self.stage, {"NP-F550.step": b"np-bytes"})
+        files = {**self.files, **extra}
+        parent = session_temp("swx25524", "IC~~", "HD-1910-C001-20260902.stp.SLDASM")
+        child = session_temp("swx25524", "IC~~", "HL-3608_ASM_52_ASM.stp.SLDASM")
+        payload = self.observe(
+            [
+                occurrence(
+                    "HD-1910-C001-20260902.stp-2",
+                    parent,
+                    imported=r"D:\M2.2\change11\HD.stp",
+                    native_owner="robot.SLDASM",
+                ),
+                occurrence(
+                    "HD-1910-C001-20260902.stp-2/HL-3608_ASM_52_ASM.stp-1",
+                    child,
+                    defining=parent,
+                    imported=str(self.stage / "NP-F550.step"),
+                    native_owner="robot.SLDASM",
+                ),
+            ],
+            files=files,
+        )
+        child_entry = next(
+            entry
+            for entry in payload["imports"]
+            if entry["instance"].endswith("HL-3608_ASM_52_ASM.stp-1")
+        )
+        self.assertEqual(child_entry["bound_source"], "NP-F550.step")
+        self.assertEqual(child_entry["document"], parent)  # verbatim raw evidence
+        self.assertEqual(child_entry["owner"], "robot.SLDASM")
+        # The retained edge hangs off the ultimate owner (never the temp parent).
+        self.assertEqual(payload["graph"]["robot.SLDASM"]["references"], ["NP-F550.step"])
+        manifest = seal_closure_selection(files, "robot.SLDASM", payload, reader_sha256=READER)
+        self.assertIn("NP-F550.step", manifest["files"])
+
+    def test_bound_source_without_valid_ultimate_owner_refuses_before_mutation(self) -> None:
+        extra = write_stage(self.stage, {"NP-F550.step": b"np-bytes"})
+        files = {**self.files, **extra}
+        parent = session_temp("swx25524", "IC~~", "HD-1910-C001-20260902.stp.SLDASM")
+        child = session_temp("swx25524", "IC~~", "HL-3608_ASM_52_ASM.stp.SLDASM")
+        with self.assertRaises(SelectionError) as caught:
+            self.observe(
+                [
+                    occurrence(
+                        "HD-1910-C001-20260902.stp-2",
+                        parent,
+                        imported=r"D:\M2.2\change11\HD.stp",
+                        native_owner="ghost.SLDASM",
+                    ),
+                    occurrence(
+                        "HD-1910-C001-20260902.stp-2/HL-3608_ASM_52_ASM.stp-1",
+                        child,
+                        defining=parent,
+                        imported=str(self.stage / "NP-F550.step"),
+                        native_owner="ghost.SLDASM",
+                    ),
+                ],
+                files=files,
+            )
+        self.assertEqual(caught.exception.code, "selection_closure_invalid")
+        item = caught.exception.detail["problems"][0]
+        self.assertEqual(item["instance"], "HD-1910-C001-20260902.stp-2/HL-3608_ASM_52_ASM.stp-1")
+        self.assertEqual(item["resolved"], "NP-F550.step")
 
     def test_import_without_materialization_refused(self) -> None:
         with self.assertRaises(SelectionError) as caught:
@@ -596,6 +721,107 @@ class BackendShapeIntegrationTests(unittest.TestCase):
             walker=lambda stage_root, main, index: readings, reader_sha256=READER
         ).observe(stage, "robot.SLDASM", files)
         self.assertEqual(payload["graph"]["robot.SLDASM"]["references"], ["arm.SLDPRT"])
+        manifest = seal_closure_selection(files, "robot.SLDASM", payload, reader_sha256=READER)
+        self.assertEqual(manifest["main_assembly"], "robot.SLDASM")
+        self.assertEqual(sorted(manifest["files"]), ["arm.SLDPRT", "robot.SLDASM"])
+
+    def test_real_walk_nested_materialization_seals_with_ultimate_owner(self) -> None:
+        from .test_solidworks_native_reader import _Component, _Doc
+        from description_pipeline.sources.solidworks.native import SolidWorksBackend
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        stage = Path(tmp.name).resolve()
+        files = write_stage(stage, {"robot.SLDASM": b"robot", "arm.SLDPRT": b"arm"})
+        parent_doc = session_temp("swx25524", "IC~~", "HD-1910-C001-20260902.stp.SLDASM")
+        child_doc = session_temp("swx25524", "IC~~", "3915_ASM_2_ASM.stp.SLDASM")
+        child = _Component("3915_ASM_2_ASM.stp-1", child_doc, doc=_Doc(child_doc))
+        parent = _Component(
+            "HD-1910-C001-20260902.stp-2", parent_doc, doc=_Doc(parent_doc), children=(child,)
+        )
+        arm = _Component("arm-1", str(stage / "arm.SLDPRT"), doc=_Doc(str(stage / "arm.SLDPRT")))
+        robot = _Doc(str(stage / "robot.SLDASM"), children=(arm, parent), configuration="默认")
+
+        class FakeApp:
+            RevisionNumber = "34.0.0"
+
+            def __init__(self):
+                self.folders = ""
+
+            def GetSearchFolders(self, folder_type):  # noqa: N802
+                return self.folders
+
+            def SetSearchFolders(self, folder_type, folders):  # noqa: N802
+                self.folders = folders
+                return True
+
+            def GetProcessID(self):  # noqa: N802
+                return 111
+
+            def GetDocumentCount(self):  # noqa: N802
+                return 0
+
+            def GetDocumentDependencies2(self, path, traverse, search, read_only):  # noqa: N802
+                assert (traverse, search, read_only) == (False, False, False)
+                return []
+
+        app = FakeApp()
+
+        class FakeSession:
+            def __init__(self):
+                self.closed = False
+
+            def connect(self, cancelled):
+                return app
+
+            def current_application(self):
+                return app
+
+            def identity(self):
+                return {
+                    "pid": 111,
+                    "executable": "fake",
+                    "ownership": "windows_job",
+                    "state": "closed" if self.closed else "active",
+                }
+
+            def close(self):
+                self.closed = True
+
+            def terminate(self):
+                self.closed = True
+
+        backend = SolidWorksBackend(session_factory=FakeSession)
+        backend._probe_document = lambda path: {
+            "doc": robot,
+            "errors": 0,
+            "warnings": 0,
+            "open_exception": None,
+            "already_open": False,
+        }
+        readings = backend.closure_readings(stage, "robot.SLDASM", files)
+        payload = NativeSelectionReader(
+            walker=lambda stage_root, main, index: readings, reader_sha256=READER
+        ).observe(stage, "robot.SLDASM", files)
+        self.assertEqual(sorted(payload["graph"]), ["arm.SLDPRT", "robot.SLDASM"])
+        entries = payload["imports"]
+        self.assertEqual(len(entries), 2)
+        by_instance = {entry["instance"]: entry for entry in entries}
+        # document stays verbatim evidence; owner is the validated ultimate
+        # owner on every cached slot (the real failure mode: the seal must
+        # resolve via owner, not via the temp parent label).
+        self.assertEqual(by_instance["HD-1910-C001-20260902.stp-2"]["document"], "robot.SLDASM")
+        self.assertEqual(
+            by_instance["HD-1910-C001-20260902.stp-2/3915_ASM_2_ASM.stp-1"]["document"], parent_doc
+        )
+        for entry in entries:
+            self.assertEqual(entry["owner"], "robot.SLDASM")
+            self.assertIn(entry["owner"], payload["graph"])
+        self.assertIsNone(by_instance["HD-1910-C001-20260902.stp-2"]["owner_anchor"])
+        self.assertEqual(
+            by_instance["HD-1910-C001-20260902.stp-2/3915_ASM_2_ASM.stp-1"]["owner_anchor"],
+            "HD-1910-C001-20260902.stp-2",
+        )
         manifest = seal_closure_selection(files, "robot.SLDASM", payload, reader_sha256=READER)
         self.assertEqual(manifest["main_assembly"], "robot.SLDASM")
         self.assertEqual(sorted(manifest["files"]), ["arm.SLDPRT", "robot.SLDASM"])
