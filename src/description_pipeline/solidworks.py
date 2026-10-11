@@ -125,10 +125,22 @@ def _install(staging: Path, target: Path) -> None:
             shutil.rmtree(backup)
 
 
-def _stamp(root: Path, receipt: dict) -> None:
-    from .structural_report import write_structural_report
+#: The portable stage set; a receipt renders a report only when its executed
+#: scope declares at least one of these stages (the Windows capture boundary
+#: receipts carry no portable scope, so the native host renders nothing).
+_PORTABLE_SCOPE = frozenset(STAGE_IDS[3:])
 
-    receipt["structural_report"] = write_structural_report(root, receipt, evidence_root=root)
+
+def _stamp(root: Path, receipt: dict) -> None:
+    # The native host renders no report: only a receipt whose executed scope
+    # includes a portable stage (generate/verify/publish) renders one, and the
+    # Linux portable stages re-create the structural-team report from this same
+    # receipt inside their own delivery.
+    scope = receipt.get("execution_scope")
+    if isinstance(scope, (list, tuple)) and any(stage in _PORTABLE_SCOPE for stage in scope):
+        from .structural_report import write_structural_report
+
+        receipt["structural_report"] = write_structural_report(root, receipt, evidence_root=root)
     receipt["artifacts"] = inventory(root, exclude=("reports/run.json", "reports/stages.json"))
     write_json(root / "reports/stages.json", stage_view(receipt))
     receipt["stage_report"] = {"path": "reports/stages.json", "sha256": file_digest(root / "reports/stages.json")}

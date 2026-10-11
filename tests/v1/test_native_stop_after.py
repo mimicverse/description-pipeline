@@ -67,6 +67,10 @@ class StopAfterRunTests(unittest.TestCase):
             calls["capture"] += 1
             fixture = build_capture_root(Path(staging).parent / "fixture", handoff=handoff_sha256)
             shutil.copytree(fixture, Path(staging), dirs_exist_ok=True)
+            # The shared fixture models a legacy captured tree; the native boundary
+            # now seals raw evidence only and renders no report.
+            for name in ("reports/structural-team.md", "reports/structural-team.json"):
+                (Path(staging) / name).unlink(missing_ok=True)
             if on_event is not None:
                 for event in stage_events("capture"):
                     on_event(event)
@@ -128,10 +132,12 @@ class StopAfterRunTests(unittest.TestCase):
         with zipfile.ZipFile(archive) as opened:
             names = opened.namelist()
         self.assertIn("reports/native-stages.json", names)
-        self.assertIn("reports/structural-team.md", names)
-        self.assertIn("reports/structural-team.json", names)
         self.assertNotIn("reports/stages.json", names)
         self.assertNotIn("reports/run.json", names)
+        # The native capture seals raw evidence only: no rendered report travels
+        # with it, and the Linux side re-creates the report from its receipt.
+        self.assertNotIn("reports/structural-team.md", names)
+        self.assertNotIn("reports/structural-team.json", names)
         destination = self.root / "admitted"
         transfer.admit_capture(
             archive,
@@ -145,13 +151,10 @@ class StopAfterRunTests(unittest.TestCase):
             (destination / "reports" / "native-stages.json").read_bytes(),
             native_stages.read_bytes(),
         )
-        # The structural-team report of this capture-only run is sealed into the payload and
-        # reinstalled byte-for-byte beside it.
+        # A native capture-only run carries no rendered report on either side.
         for name in ("structural-team.md", "structural-team.json"):
-            self.assertEqual(
-                (destination / "reports" / name).read_bytes(),
-                (self.output / "reports" / name).read_bytes(),
-            )
+            self.assertFalse((self.output / "reports" / name).exists())
+            self.assertFalse((destination / "reports" / name).exists())
 
     def test_generate_stop_installs_unverified_checkpoint(self) -> None:
         seed = make_seed(self.root)
