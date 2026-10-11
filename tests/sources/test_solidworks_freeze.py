@@ -210,9 +210,15 @@ class FreezeTests(unittest.TestCase):
     def test_capture_never_builds_a_scene_and_linux_derivation_keeps_snapshot_immutable(self) -> None:
         from description_pipeline.io import inventory
 
-        with patch(
-            "description_pipeline.sources.solidworks.scene.build_scene",
-            side_effect=AssertionError("scene construction is portable work"),
+        with (
+            patch(
+                "description_pipeline.sources.solidworks.scene.build_scene",
+                side_effect=AssertionError("scene construction is portable work"),
+            ),
+            patch(
+                "description_pipeline.sources.solidworks.closure.derive_mass_closure",
+                side_effect=AssertionError("closure comparison is portable work"),
+            ),
         ):
             freeze(self.config, self.destination, backend=self.backend)
         before = inventory(self.destination)
