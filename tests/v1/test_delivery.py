@@ -40,6 +40,15 @@ class DeliveryTests(unittest.TestCase):
         with self.assertRaises(PipelineError):
             subject_digest(self.root)
 
+    def test_linux_mass_closure_receipt_is_bound_to_the_subject(self):
+        receipt = self.root / "reports/mass-closure.json"
+        receipt.write_text('{"derived": {"mass": 1}}')
+        expected = subject_digest(self.root)
+        receipt.write_text('{"derived": {"mass": 2}}')
+        self.assertNotEqual(subject_digest(self.root), expected)
+        receipt.unlink()
+        self.assertNotEqual(subject_digest(self.root), expected)
+
     @unittest.skipIf(__import__("os").name == "nt", "symlink creation needs Windows privileges")
     def test_symlink_in_delivery_fails(self):
         target = self.root / "meshes/subject.txt"

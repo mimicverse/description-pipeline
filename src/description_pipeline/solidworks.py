@@ -101,6 +101,10 @@ def _seed_resume(staging: Path, seed_dir: Path | None, resume_from: str) -> None
             target = staging / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
+    if resume_from == "verify" and (seed / "reports/mass-closure.json").is_file():
+        target = staging / "reports/mass-closure.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(seed / "reports/mass-closure.json", target)
 
 
 def _install(staging: Path, target: Path) -> None:

@@ -390,7 +390,7 @@ def capture_evidence(
 def generate_model(staging: Path, definition: dict, input_report: dict, *, on_event=None) -> str:
     """Generate one canonical model and bind every derived file before independent checking."""
     _state(on_event, "generate", "running")
-    checked(
+    snapshot = checked(
         on_event,
         "generate",
         "input",
@@ -398,6 +398,10 @@ def generate_model(staging: Path, definition: dict, input_report: dict, *, on_ev
         lambda: verify_snapshot(staging / "evidence"),
         describe=lambda value: _snapshot_details(staging, value),
     )
+    if snapshot.get("kind") == "solidworks":
+        from .sources.solidworks.closure import derive_mass_closure
+
+        write_json(staging / "reports/mass-closure.json", derive_mass_closure(staging / "evidence"))
     name = definition["source"]["robot_name"]
     (staging / "README.md").write_text(_delivery_readme(name), encoding="utf-8", newline="\n")
     write_json(staging / "reports/input.json", input_report)

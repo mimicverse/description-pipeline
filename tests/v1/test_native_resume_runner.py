@@ -117,6 +117,8 @@ class RunnerResumeTests(unittest.TestCase):
 
     def test_verify_resume_recomputes_subject_and_rejects_mismatch(self) -> None:
         seed = make_seed(self.root)
+        closure = seed / "reports/mass-closure.json"
+        closure.write_text('{"native": {}, "derived": {"mass": 3}}\n')
         expected = digest(subject_inventory(seed))
         with (
             patch.object(steps, "inspect_prepared_input", return_value=REPLAYED_INSPECTION),
@@ -137,6 +139,7 @@ class RunnerResumeTests(unittest.TestCase):
                 self.package, self.output, resume_from="verify", seed_dir=seed, expected_subject=expected
             )
             self.assertTrue(ok["passed"], ok)
+            self.assertEqual((self.output / "reports/mass-closure.json").read_bytes(), closure.read_bytes())
             mismatch = solidworks.run(
                 self.package,
                 self.root / "delivery-mismatch",
