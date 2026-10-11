@@ -828,6 +828,41 @@ def _tree(document, base_pose):
     return poses
 
 
+def _qualified_surface_only(root, occurrence: str) -> bool:
+    """Whether the sealed evidence carries this occurrence's qualified surface-only CAD record.
+
+    Sheet-only components (no solid bodies) legitimately tessellate to zero
+    volume; acceptance rides on the canonical CAD-authored effective-instance
+    warning in the sealed evidence, never on a fabricated exclusion or an
+    inferred mass.
+    """
+
+    try:
+        record = read_data(confined(root / "evidence", "raw/effective_instances.json"))
+    except (PipelineError, OSError, ValueError):
+        return False
+    if not isinstance(record, dict) or record.get("schema_version") != "solidworks-to-urdf.effective-instances/v1":
+        return False
+    warnings = record.get("warnings")
+    if not isinstance(warnings, list):
+        return False
+    for item in warnings:
+        if not isinstance(item, dict):
+            continue
+        sheets = item.get("sheet_bodies")
+        if (
+            item.get("code") == "cad_surface_only_effective_instance"
+            and item.get("component") == occurrence
+            and item.get("blocking") is False
+            and item.get("solid_bodies") == 0
+            and isinstance(sheets, int)
+            and not isinstance(sheets, bool)
+            and sheets > 0
+        ):
+            return True
+    return False
+
+
 def _geometry(root, body, node, model_link, geometry, components, body_pose, urdf_pose, exclusions):
     visuals = node.findall("visual")
     canonical = model_link["visuals"]
@@ -863,7 +898,12 @@ def _geometry(root, body, node, model_link, geometry, components, body_pose, urd
         _require(stats.triangles > 0 and stats.area > 0, "Empty mesh")
         _require(stats.degenerate / stats.triangles <= 0.001, "More than 0.1% degenerate triangles")
         _require(row["triangles"] == stats.triangles, "Geometry receipt differs from actual mesh")
-        _require(stats.volume > 1e-15 or occurrence in exclusions, "Zero-volume geometry needs a documented exclusion")
+        _require(
+            stats.volume > 1e-15
+            or occurrence in exclusions
+            or _qualified_surface_only(root, occurrence),
+            "Zero-volume geometry needs a documented exclusion",
+        )
         points = stl.vertices(delivered)
         world = urdf_pose @ _xml_pose(visual)
         native = components[occurrence]

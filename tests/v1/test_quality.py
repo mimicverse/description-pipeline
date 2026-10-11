@@ -1150,3 +1150,56 @@ class OptionalDesignExpectationTests(unittest.TestCase):
             self.assertIn("physics.expected_mass", quality.required_checks(candidate))
             self.assertEqual(len(gates.checks), 1)
             self.assertFalse(gates.checks[0]["passed"], value)
+
+
+class SurfaceOnlyGeometryExemptionTests(unittest.TestCase):
+    """The zero-volume gate accepts only sealed, qualified surface-only CAD records."""
+
+    def _delivery(self, tmp, record):
+        root = Path(tmp)
+        (root / "evidence/raw").mkdir(parents=True, exist_ok=True)
+        write_json(root / "evidence/raw/effective_instances.json", record)
+        return root
+
+    def _qualified(self, occurrence="pcb-1"):
+        return {
+            "schema_version": "solidworks-to-urdf.effective-instances/v1",
+            "assembly": "robot.SLDASM",
+            "configuration": "默认",
+            "readings": {},
+            "warnings": [
+                {
+                    "code": "cad_surface_only_effective_instance",
+                    "blocking": False,
+                    "component": occurrence,
+                    "document": "board.SLDPRT",
+                    "part_document_read": "unavailable",
+                    "solid_bodies": 0,
+                    "sheet_bodies": 2350,
+                }
+            ],
+        }
+
+    def test_qualified_surface_only_record_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._delivery(tmp, self._qualified())
+            self.assertTrue(quality._qualified_surface_only(root, "pcb-1"))
+
+    def test_unqualified_zero_volume_paths_are_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._delivery(tmp, self._qualified())
+            self.assertFalse(quality._qualified_surface_only(root, "other-1"))
+        unqualified = self._qualified()
+        unqualified["warnings"][0]["solid_bodies"] = 3
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._delivery(tmp, unqualified)
+            self.assertFalse(quality._qualified_surface_only(root, "pcb-1"))
+        blocking = self._qualified()
+        blocking["warnings"][0]["blocking"] = True
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._delivery(tmp, blocking)
+            self.assertFalse(quality._qualified_surface_only(root, "pcb-1"))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertFalse(quality._qualified_surface_only(root, "pcb-1"))
+
