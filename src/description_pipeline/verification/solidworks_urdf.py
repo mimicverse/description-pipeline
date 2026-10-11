@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import ntpath
 import re
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -305,6 +306,7 @@ def _native_discovery(package, diagnostics=None):
 def _dependencies(root, definition):
     closure = read_data(confined(root / "evidence", "raw/dependency_closure.json"))
     _require(not closure["declared_unresolved"], "Unresolved CAD references")
+    stale_skips = _stale_stored_reference_skips(root, closure)
     _require(closure["configuration"] == definition["source"]["configuration"], "Captured another configuration")
     original = closure["original_files"]
     _require(bool(original) and bool(closure["mapping"]), "Missing dependency mapping")
@@ -329,7 +331,149 @@ def _dependencies(root, definition):
         "native_documents": len(original),
         "collected_documents": len(actual),
         "suppressed_instances": closure["suppressed_instances"],
+        "stale_stored_reference_skips": stale_skips,
     }
+
+
+def _stale_stored_reference_skips(root: Path, closure: dict) -> int:
+    """Capture skips of dangling stored references must be exact closure evidence.
+
+    Every recorded skip must be covered by the sealed closure: a validated entry names
+    a closure document and a verbatim stored location recorded for it; a replay entry
+    from the post-copy reopening (document/location absent) must repeat a validated
+    absolute path.  No entry may name a required captured source (original files or
+    mapping sources, exact paths) or an actively resolved edge path, and a contained
+    artifact must not be a selected source or a resolved target.  Fake coverage,
+    missing coverage, selected targets and active resolutions refuse; no basename
+    matching anywhere.
+    """
+
+    if "stale_stored_references" not in closure:
+        return 0
+    skips = closure["stale_stored_references"]
+    _require(isinstance(skips, list), "Stored-reference skip record is malformed")
+    from .native_discovery import DISCOVERY_FILE  # noqa: PLC0415 - mirrors _handoff_native_hashes
+
+    record = read_data(confined(root / "input", DISCOVERY_FILE))
+    manifest = (record.get("raw") or {}).get("source_selection") or {}
+    sealed = manifest.get("closure") or {}
+    files = manifest.get("files") or {}
+    documents = sealed.get("documents") or {}
+    folded_docs = {
+        str(name).replace("\\", "/").casefold(): entry for name, entry in documents.items() if isinstance(entry, dict)
+    }
+    selected_names = {str(name).replace("\\", "/").casefold() for name in files}
+    required_paths = {ntpath.normcase(str(path)) for path in (closure.get("original_files") or {})}
+    source_paths = [str(path) for path in (closure.get("original_files") or {})]
+    for row in closure.get("mapping") or []:
+        if isinstance(row, dict) and isinstance(row.get("source"), str):
+            required_paths.add(ntpath.normcase(row["source"]))
+            source_paths.append(row["source"])
+    edge_paths = set()
+    for entry in folded_docs.values():
+        for edge in entry.get("resolved_edges") or []:
+            resolved_path = edge.get("resolved_path") if isinstance(edge, dict) else None
+            if isinstance(resolved_path, str) and resolved_path:
+                edge_paths.add(ntpath.normcase(resolved_path))
+
+    def _same_path(left: object, right: object) -> bool:
+        return (
+            isinstance(left, str)
+            and isinstance(right, str)
+            and bool(left)
+            and bool(right)
+            and ntpath.normcase(left) == ntpath.normcase(right)
+        )
+
+    def _bind_location(document: str, location: str, resolved_path: str) -> None:
+        """The resolved path must be the recorded location joined to its scanning document."""
+
+        if ntpath.isabs(location):
+            _require(
+                ntpath.normcase(ntpath.normpath(location)) == ntpath.normcase(ntpath.normpath(resolved_path)),
+                "Stored-reference skip does not bind its resolved path to the recorded location",
+            )
+            return
+        fragment = ntpath.normcase(document.replace("/", "\\"))
+        derived = [
+            ntpath.normcase(ntpath.normpath(ntpath.join(ntpath.dirname(source), location)))
+            for source in source_paths
+            if fragment and ntpath.normcase(ntpath.normpath(source)).endswith("\\" + fragment)
+        ]
+        _require(
+            ntpath.normcase(ntpath.normpath(resolved_path)) in derived,
+            "Stored-reference skip does not bind its resolved path to the recorded location",
+        )
+
+    def _validated(document: object, location: object, resolved_path: object) -> bool:
+        _require(
+            isinstance(resolved_path, str) and ntpath.isabs(resolved_path),
+            "Stored-reference skip entry is malformed",
+        )
+        if not (isinstance(document, str) and document and isinstance(location, str) and location):
+            return False
+        entry = folded_docs.get(document.replace("\\", "/").casefold())
+        _require(entry is not None, "Stored-reference skip names a document outside the sealed closure")
+        recorded = [
+            str(reference["location"])
+            for reference in entry.get("stored_references") or []
+            if isinstance(reference, dict) and isinstance(reference.get("location"), str) and reference["location"]
+        ]
+        _require(
+            location in recorded,
+            "Stored-reference skip is not recorded by the sealed closure",
+        )
+        _bind_location(document, location, str(resolved_path))
+        _require(
+            ntpath.normcase(str(resolved_path)) not in required_paths
+            and ntpath.normcase(str(location)) not in required_paths,
+            "Stored-reference skip names a required captured source",
+        )
+        _require(
+            ntpath.normcase(str(resolved_path)) not in edge_paths and ntpath.normcase(str(location)) not in edge_paths,
+            "Stored-reference skip covers an actively resolved reference",
+        )
+        edges = [edge for edge in entry.get("resolved_edges") or [] if isinstance(edge, dict)]
+        for edge in edges:
+            _require(
+                not _same_path(edge.get("resolved_path"), resolved_path)
+                and not _same_path(edge.get("resolved_path"), location),
+                "Stored-reference skip covers an actively resolved reference",
+            )
+        stage_root = sealed.get("stage_root")
+        if isinstance(stage_root, str) and ntpath.isabs(stage_root):
+            try:
+                relative = ntpath.relpath(str(resolved_path), stage_root)
+            except ValueError:
+                relative = None
+            if relative and not relative.startswith("..") and not ntpath.isabs(relative):
+                artifact = relative.replace("\\", "/")
+                _require(
+                    artifact.casefold() not in selected_names,
+                    "Stored-reference skip names a selected source",
+                )
+                _require(
+                    all(str(edge.get("resolved") or "").casefold() != artifact.casefold() for edge in edges),
+                    "Stored-reference skip covers an actively resolved reference",
+                )
+        return True
+
+    validated: set[str] = set()
+    replays: list[dict] = []
+    for item in skips:
+        _require(isinstance(item, dict), "Stored-reference skip entry is malformed")
+        if "exists" in item:
+            _require(type(item["exists"]) is bool, "Stored-reference skip entry is malformed")
+        if _validated(item.get("document"), item.get("location"), item.get("resolved_path")):
+            validated.add(ntpath.normcase(str(item["resolved_path"])))
+        else:
+            replays.append(item)
+    for item in replays:
+        path = ntpath.normcase(str(item["resolved_path"]))
+        _require(path in validated, "Stored-reference replay is not covered by a validated skip")
+        _require(path not in required_paths, "Stored-reference skip names a required captured source")
+        _require(path not in edge_paths, "Stored-reference skip covers an actively resolved reference")
+    return len(skips)
 
 
 def _handoff_native_hashes(input_root: Path) -> set[str]:
