@@ -71,6 +71,65 @@ def _pid_occurrence(row, components, raw):
         "the PID lacks a proven occurrence document",
         component=row["name2"],
     )
+    left, right = row.get("source_provenance"), component.get("source_provenance")
+    if left is None and right is None:
+        return component
+    _require(
+        isinstance(left, dict) and isinstance(right, dict),
+        "v14.imported_binding",
+        "PID and occurrence imported-source proofs differ",
+        component=row["name2"],
+    )
+    if right.get("state") == "cached_materialization":
+        # A cached native materialization is a complete identity without a confined
+        # package document: the PID document is the occurrence's own engine-resolved
+        # session materialization, spelled exactly as the active walk records it, and
+        # the delivered bytes binding lives in the sealed selection carrier.
+        from .native_discovery import _cached_materialization_reason, _session_temp_path  # noqa: PLC0415
+
+        materialization = right.get("materialization_path")
+        session_root = right.get("session_temp_root")
+        _require(
+            left.get("state") == "cached_materialization"
+            and left.get("kind") == right.get("kind")
+            and left.get("used_api") == right.get("used_api")
+            and left.get("materialization_path") == materialization
+            and left.get("session_temp_root") == session_root
+            and left.get("is_virtual") == right.get("is_virtual"),
+            "v14.imported_binding",
+            "the PID and the active occurrence record different cached materializations",
+            component=row["name2"],
+        )
+        _require(
+            isinstance(materialization, str)
+            and _session_temp_path(materialization, session_root)
+            and document == materialization.replace("/", "\\").strip().lower(),
+            "v14.imported_binding",
+            "the cached PID document is not the recorded session temp materialization",
+            component=row["name2"],
+        )
+        author = right.get("author_imported_path")
+        _require(
+            author is None or (isinstance(author, str) and bool(author)),
+            "v14.imported_binding",
+            "the cached occurrence author metadata is unreadable",
+            component=row["name2"],
+        )
+        carrier = raw.get("source_selection")
+        closure = carrier.get("closure") if isinstance(carrier, dict) else None
+        slots = [
+            item
+            for item in (closure.get("imports") if isinstance(closure, dict) else None) or []
+            if isinstance(item, dict) and item.get("state") == "cached_materialization"
+        ]
+        reason = _cached_materialization_reason(component, right, slots, set(), carrier, raw.get("files") or {})
+        _require(
+            reason is None,
+            "v14.imported_binding",
+            reason or "the cached occurrence is not covered by the sealed selection carrier",
+            component=row["name2"],
+        )
+        return component
     _require(
         not PurePosixPath(document).is_absolute()
         and ".." not in PurePosixPath(document).parts
@@ -80,44 +139,40 @@ def _pid_occurrence(row, components, raw):
         "the occurrence document is not a confined package path",
         component=row["name2"],
     )
-    left, right = row.get("source_provenance"), component.get("source_provenance")
-    if left is not None or right is not None:
-        fields = ("state", "kind", "used_api", "document", "sha256", "is_virtual", "source_root", "imported_path")
-        _require(
-            isinstance(left, dict)
-            and isinstance(right, dict)
-            and all(left.get(key) == right.get(key) for key in fields),
-            "v14.imported_binding",
-            "PID and occurrence imported-source proofs differ",
-            component=row["name2"],
-        )
-        _require(
-            left.get("state") == "resolved"
-            and left.get("kind") == "native_imported_document"
-            and left.get("used_api") == "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual"
-            and left.get("document") == document
-            and type(left.get("is_virtual")) is bool
-            and isinstance(left.get("sha256"), str)
-            and re.fullmatch(r"[0-9a-f]{64}", left["sha256"])
-            and (raw.get("files") or {}).get(document) == left["sha256"],
-            "v14.imported_binding",
-            "the imported document is not bound to captured file bytes",
-            component=row["name2"],
-        )
-        origin, root = left.get("imported_path"), left.get("source_root")
-        _require(
-            isinstance(origin, str) and ntpath.isabs(origin) and isinstance(root, str) and ntpath.isabs(root),
-            "v14.imported_binding",
-            "the imported-source confinement evidence is incomplete",
-        )
-        relative = ntpath.relpath(origin, root)
-        _require(
-            relative != ".."
-            and not relative.startswith("..\\")
-            and ntpath.normcase(relative) == ntpath.normcase(document.replace("/", "\\")),
-            "v14.imported_binding",
-            "GetImportedPath does not name the captured source inside the frozen root",
-        )
+    fields = ("state", "kind", "used_api", "document", "sha256", "is_virtual", "source_root", "imported_path")
+    _require(
+        all(left.get(key) == right.get(key) for key in fields),
+        "v14.imported_binding",
+        "PID and occurrence imported-source proofs differ",
+        component=row["name2"],
+    )
+    _require(
+        left.get("state") == "resolved"
+        and left.get("kind") == "native_imported_document"
+        and left.get("used_api") == "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual"
+        and left.get("document") == document
+        and type(left.get("is_virtual")) is bool
+        and isinstance(left.get("sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", left["sha256"])
+        and (raw.get("files") or {}).get(document) == left["sha256"],
+        "v14.imported_binding",
+        "the imported document is not bound to captured file bytes",
+        component=row["name2"],
+    )
+    origin, root = left.get("imported_path"), left.get("source_root")
+    _require(
+        isinstance(origin, str) and ntpath.isabs(origin) and isinstance(root, str) and ntpath.isabs(root),
+        "v14.imported_binding",
+        "the imported-source confinement evidence is incomplete",
+    )
+    relative = ntpath.relpath(origin, root)
+    _require(
+        relative != ".."
+        and not relative.startswith("..\\")
+        and ntpath.normcase(relative) == ntpath.normcase(document.replace("/", "\\")),
+        "v14.imported_binding",
+        "GetImportedPath does not name the captured source inside the frozen root",
+    )
     return component
 
 

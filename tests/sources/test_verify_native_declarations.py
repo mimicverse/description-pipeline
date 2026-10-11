@@ -268,6 +268,74 @@ class NativeDeclarationsTests(unittest.TestCase):
         rewrite(raw, lambda root: setattr(root.find(NS + "SWMainComponentPID"), "text", "REVG"))
         self.assertIn("v14.main_component", self.errors(raw))
 
+    def test_cached_materialization_pid_binds_through_the_sealed_carrier(self):
+        """A cached import PID is a complete identity: engine materialization + carrier."""
+
+        materialization = r"C:\Users\33985\AppData\Local\Temp\swx16840\IC~~\NP-F550.step.SLDPRT"
+        session_root = r"C:\Users\33985\AppData\Local\Temp\swx16840"
+        document = materialization.replace("/", "\\").strip().lower()
+        owner, occurrence = "module.SLDASM", "module-1/tool_part"
+        owner_sha = "a" * 64
+        provenance = {
+            "state": "cached_materialization",
+            "kind": "native_import_materialization",
+            "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
+            "source_root": "C:\\locked-copy",
+            "native_document_path": materialization,
+            "materialization_path": materialization,
+            "session_temp_root": session_root,
+            "author_imported_path": r"D:\author\NP-F550.step",
+            "author_imported_in_source_root": False,
+            "author_imported_relative": None,
+            "is_virtual": False,
+            "owner": owner,
+            "owner_sha256": owner_sha,
+            "occurrence": occurrence,
+            "defining_anchor": None,
+            "document": None,
+        }
+        slot = {
+            "document": owner,
+            "instance": occurrence,
+            "owner_anchor": None,
+            "state": "cached_materialization",
+            "binding": "author_metadata_only",
+            "materialization": materialization,
+            "session_temp_root": session_root,
+            "author_imported_path": r"D:\author\NP-F550.step",
+            "owner_sha256": owner_sha,
+            "configuration": "Default",
+            "suppression_state": 2,
+            "is_virtual": False,
+        }
+        raw = fixture()
+        raw["files"] = {owner: owner_sha}
+        raw["source_selection"] = sealed_selection({owner: owner_sha}, owner, edges={owner: []}, imports=[slot])
+        row = raw["exporter"]["pid_bindings"][2]
+        item = next(entry for entry in raw["components"] if entry["name2"] == row["name2"])
+        self.assertEqual(item["name2"], occurrence)
+        row.update(document=document, source_provenance=copy.deepcopy(provenance))
+        item.update(document=document, source_provenance=copy.deepcopy(provenance))
+        errors = self.errors(raw)
+        self.assertNotIn("v14.imported_binding", errors)
+        self.assertNotIn("v14.pid_document_unread", errors)
+        self.assertNotIn("v14.pid_binding", errors)
+
+        cases = {
+            "outside_owned_temp": {"materialization_path": r"C:\elsewhere\IC~~\NP-F550.step.SLDPRT"},
+            "root_mismatch": {"session_temp_root": r"C:\Users\33985\AppData\Local\Temp\swx99999"},
+            "not_cached_in_pid": {"state": "unread"},
+            "external_document": {"materialization_path": r"D:\author\NP-F550.step"},
+        }
+        for label, patch in cases.items():
+            with self.subTest(case=label):
+                candidate = copy.deepcopy(raw)
+                candidate["exporter"]["pid_bindings"][-1]["source_provenance"].update(patch)
+                self.assertIn("v14.imported_binding", self.errors(candidate), patch)
+        candidate = copy.deepcopy(raw)
+        candidate["source_selection"]["closure"]["imports"] = []
+        self.assertIn("v14.imported_binding", self.errors(candidate))
+
     def test_serialized_origin_is_claim_only_when_customized(self):
         raw = fixture()  # stored origin differs from native datums, but isCustomized=false
         self.assertTrue(verify_declarations(raw)["passed"])
