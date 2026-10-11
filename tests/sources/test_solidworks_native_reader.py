@@ -1443,6 +1443,46 @@ class CaptureSceneTests(unittest.TestCase):
             self.assertEqual(expired_reads, [])
             backend.verify_sources_unchanged()
 
+    def test_leaf_mass_failure_names_the_occurrence_and_recorded_body_counts(self):
+        """A failed leaf mass read keeps its classification and gains context.
+
+        Regression for the native7 ``cad_empty_model`` capture failure that
+        carried ``detail: null``: the next capture must name the occurrence,
+        its document, the referenced configuration and the already-recorded
+        native solid/sheet counts without re-probing or skipping anything.
+        """
+
+        class FailingBackend(_CaptureBackend):
+            def _body_count(self, holder, body_type, component):
+                return len(holder.GetBodies2(body_type))
+
+            def _mass_properties_document(self, doc, require_material=True):
+                raise CadError("cad_empty_model", "part has no solid bodies", {"marker": "kept"})
+
+        class SheetOnlyComponent(_Component):
+            def GetBodies2(self, body_type):
+                return [] if body_type == 0 else [object()]
+
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            part = _write(root, "empty.SLDPRT")
+            shared = _Doc(part, configuration="Default", configuration_children={"Default": []})
+            component = SheetOnlyComponent("sub-1/empty-1", part, doc=shared, configuration="Default")
+            assembly = _write(root, "robot.SLDASM")
+            main = _Doc(assembly, doc_type=2, children=[component])
+            backend = FailingBackend(session_factory=lambda: _Session(_App({assembly: main, part: shared})))
+            with self.assertRaises(CadError) as caught:
+                backend.collect_scene(str(assembly), [])
+        error = caught.exception
+        self.assertEqual(error.code, "cad_empty_model")
+        self.assertEqual(error.message, "part has no solid bodies")
+        self.assertEqual(error.detail["marker"], "kept")
+        self.assertEqual(error.detail["component"], "sub-1/empty-1")
+        self.assertEqual(error.detail["document"], str(part))
+        self.assertEqual(error.detail["referenced_configuration"], "Default")
+        self.assertEqual(error.detail["bodies"], {"solid": 0, "sheet": 1})
+        self.assertEqual(error.detail["phase"], "leaf_mass_read")
+
     def test_geometry_phase_does_not_release_and_reacquire_parents_between_occurrences(self):
         from contextlib import contextmanager
 

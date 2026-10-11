@@ -2979,6 +2979,32 @@ class SolidWorksBackend(CadBackend):
             "save_flag_after": bool(_member(doc, "GetSaveFlag")),
         }
 
+    def _leaf_mass_failure(self, name, occurrence, referenced, error):
+        """Name the occurrence behind a leaf mass-read failure.
+
+        A failed leaf mass read must never be anonymous: the phase-one
+        traversal already recorded the occurrence identity and its native
+        solid/sheet counts, and both travel beside the original code, message
+        and detail.  Nothing is retried, skipped or re-probed -- the capture
+        still fails exactly as before, only with its context retained.
+        """
+
+        detail: dict = {}
+        if isinstance(error.detail, dict):
+            detail.update(error.detail)
+        elif error.detail is not None:
+            detail["detail"] = error.detail
+        detail.update(
+            {
+                "component": name,
+                "document": occurrence.path,
+                "referenced_configuration": referenced,
+                "bodies": dict(self.notes.get("bodies:" + name) or {}),
+                "phase": "leaf_mass_read",
+            }
+        )
+        return CadError(error.code, error.message, detail)
+
     def collect_scene(self, doc_path, coordinate_systems, progress=None, require_material=True):
         doc = self._document_by_path(doc_path)
         if _member(doc, "GetType") != 2:
@@ -3084,7 +3110,10 @@ class SolidWorksBackend(CadBackend):
                     continue
                 components.append(occurrence)
                 self._components.add(name)
-                properties[name] = self._mass_properties_document(part, require_material)
+                try:
+                    properties[name] = self._mass_properties_document(part, require_material)
+                except CadError as error:
+                    raise self._leaf_mass_failure(name, occurrence, referenced, error) from error
                 properties[name]["reference"]["configuration"] = referenced
                 self.notes["mass_property:" + name] = properties[name]["reference"]["used_api"]
         if not components:
