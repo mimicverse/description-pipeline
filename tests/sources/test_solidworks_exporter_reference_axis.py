@@ -296,10 +296,77 @@ class ImportedSourceBindingTests(unittest.TestCase):
             self.assertTrue(provenance["author_imported_in_source_root"])
             self.assertEqual(provenance["author_imported_relative"], "battery.step")
             # The generated temp file is never hashed into the delivered file
-            # map; the delivered bytes binding lives in the selection carrier
-            # (bound_source), not in a discovery-level document claim.
+            # map; the validated in-stage author source IS part of the acquired
+            # inventory (its staged bytes are hashed), matching the sealed
+            # selection's retained bound source.
             self.assertNotIn(str(generated), record["files"])
-            self.assertNotIn("battery.step", record["files"])
+            self.assertEqual(
+                record["files"]["battery.step"], hashlib.sha256(imported.read_bytes()).hexdigest()
+            )
+
+    def test_discovery_hashes_the_validated_in_stage_author_source(self) -> None:
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as native_tmp:
+            root = Path(tmp)
+            assembly = _write(root, "robot.SLDASM")
+            imported = _write(root, "NP-F550.step")
+            generated = session_materialization(Path(native_tmp), "NP-F550.step.SLDPRT")
+            component = _Component("NP-F550.step-1", generated)
+            component.GetImportedPath = lambda: str(imported)
+            component.IsVirtual = False
+            app = _App({assembly: _Doc(assembly, children=[component])})
+            backend = N.SolidWorksBackend(session_factory=lambda: _Session(app))
+            with _com_stubs():
+                record = backend.discover_native(root, {"main_assembly": "robot.SLDASM"})
+            # The validated in-stage author source is an acquired CAD document:
+            # its staged bytes are hashed into the native file inventory.
+            self.assertEqual(
+                record["files"]["NP-F550.step"], hashlib.sha256(imported.read_bytes()).hexdigest()
+            )
+            self.assertIn("robot.SLDASM", record["files"])
+
+    def test_discovery_never_hashes_external_author_metadata(self) -> None:
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as native_tmp, TemporaryDirectory() as outside:
+            root = Path(tmp)
+            assembly = _write(root, "robot.SLDASM")
+            external = Path(outside) / "NP-F550.step"
+            external.write_bytes(b"external author source")
+            generated = session_materialization(Path(native_tmp), "NP-F550.step.SLDPRT")
+            component = _Component("NP-F550.step-1", generated)
+            component.GetImportedPath = lambda: str(external)
+            component.IsVirtual = False
+            app = _App({assembly: _Doc(assembly, children=[component])})
+            backend = N.SolidWorksBackend(session_factory=lambda: _Session(app))
+            with _com_stubs():
+                record = backend.discover_native(root, {"main_assembly": "robot.SLDASM"})
+            self.assertNotIn("NP-F550.step", record["files"])
+            for name in record["files"]:
+                self.assertFalse(str(name).startswith("/"))
+
+    def test_discovery_refuses_a_missing_validated_in_stage_source(self) -> None:
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as native_tmp:
+            root = Path(tmp)
+            assembly = _write(root, "robot.SLDASM")
+            (root / "NP-F550.step").write_bytes(b"present at read time")
+            generated = session_materialization(Path(native_tmp), "NP-F550.step.SLDPRT")
+            component = _Component("NP-F550.step-1", generated)
+            component.GetImportedPath = lambda: str(root / "NP-F550.step")
+            component.IsVirtual = False
+            app = _App({assembly: _Doc(assembly, children=[component])})
+            backend = N.SolidWorksBackend(session_factory=lambda: _Session(app))
+            real = N._component_source_document
+
+            def forged(component_arg, source_root):
+                result = real(component_arg, source_root)
+                provenance = result.get("source_provenance") or {}
+                if provenance.get("state") == "cached_materialization":
+                    provenance["author_imported_in_source_root"] = True
+                    provenance["author_imported_relative"] = "missing-under-root.step"
+                return result
+
+            with _com_stubs(), patch.object(N, "_component_source_document", side_effect=forged):
+                with self.assertRaises(CadError) as caught:
+                    backend.discover_native(root, {"main_assembly": "robot.SLDASM"})
+            self.assertEqual(caught.exception.code, "cad_import_source_unavailable")
 
     def test_current_import_api_records_cached_materialization_with_in_stage_source(self):
         with TemporaryDirectory() as tmp, TemporaryDirectory() as native_tmp:

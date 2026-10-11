@@ -4628,6 +4628,28 @@ class SolidWorksBackend(CadBackend):
                 if relative and relative not in planned:
                     planned.add(relative)
                     hash_plan.append((source_root / relative, relative))
+                elif (
+                    provenance.get("state") == "cached_materialization"
+                    and provenance.get("author_imported_in_source_root")
+                ):
+                    # A validated in-stage author source of a cached
+                    # materialization is an acquired CAD document: hash the
+                    # staged bytes that the sealed selection retains as
+                    # bound_source, so the native file inventory carries the
+                    # same file.  Strictly confined to the source root;
+                    # external author metadata never enters the file map.
+                    bound_relative = provenance.get("author_imported_relative")
+                    if isinstance(bound_relative, str) and bound_relative:
+                        staged = source_root / bound_relative
+                        if _relative_document(staged, source_root) != bound_relative:
+                            raise CadError(
+                                "cad_import_source_unavailable",
+                                "the validated in-stage import source is missing from the acquired folder",
+                                {"path": bound_relative},
+                            )
+                        if bound_relative not in planned:
+                            planned.add(bound_relative)
+                            hash_plan.append((staged, bound_relative))
             for index, (path, relative) in enumerate(hash_plan):
                 activity.emit(
                     "hash_sources",
