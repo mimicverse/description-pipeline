@@ -8,11 +8,18 @@ import os
 import stat
 import tempfile
 import zipfile
+from contextlib import suppress
 from pathlib import Path
 
 from ..io import _filesystem_path, confined, digest, inventory
 from ..sources.solidworks.handoff import MAX_HANDOFF_BYTES, _directory
-from ..sources.solidworks.selection import SelectionError, selection_plan, validate_file_index, verify_selection
+from ..sources.solidworks.selection import (
+    SelectionError,
+    seal_closure_selection,
+    selection_plan,
+    validate_file_index,
+    verify_selection,
+)
 
 _CHUNK = 1024 * 1024
 
@@ -98,6 +105,8 @@ class StagedSelection:
         self.stage.mkdir(parents=True, exist_ok=False)
         self.state = "awaiting_files"
         self.round_id = self._round_id()
+        self.upload_sha256 = self.plan["upload_sha256"]
+        self.staged_identity: str | None = None
 
     def _round_id(self) -> str:
         return digest(
@@ -115,6 +124,7 @@ class StagedSelection:
             "state": self.state,
             "round_id": self.round_id,
             "reader_sha256": self.reader_sha256,
+            "upload_sha256": self.upload_sha256,
             "observations": self.observations,
             "staged_files": self.staged_files,
             "requested_files": self.plan["requested_files"],
@@ -122,6 +132,41 @@ class StagedSelection:
         if self.manifest is not None:
             snapshot["manifest"] = self.manifest
         return copy.deepcopy(snapshot)
+
+    def stage_full_upload(self, archive: Path) -> bool:
+        """Locked minimal contract: install the whole upload index in one provisional batch.
+
+        A logical retry (identical staged inventory) performs no native rework.
+        """
+
+        if self.staged_identity == self.upload_sha256:
+            return False
+        _refuse(
+            self.state == "awaiting_files",
+            "selection_round_stale",
+            "Provisional staging is no longer accepting the upload batch",
+        )
+        expected = dict(self.upload_files)
+        with tempfile.TemporaryDirectory(prefix=".selection-upload-", dir=self.stage.parent) as temporary:
+            incoming = Path(temporary)
+            sizes = _extract_batch(Path(archive), incoming, expected, remaining=MAX_HANDOFF_BYTES)
+            installed = []
+            try:
+                for name in sorted(expected):
+                    original = Path(_filesystem_path(confined(incoming, name)))
+                    target = Path(_filesystem_path(confined(self.stage, name, exists=False)))
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    os.link(original, target)
+                    installed.append(target)
+            except BaseException:
+                for target in installed:
+                    target.unlink(missing_ok=True)
+                raise
+        self.staged_files = dict(expected)
+        self.sizes = sizes
+        self.staged_identity = self.upload_sha256
+        self.state = "reading"
+        return True
 
     def accept_batch(self, archive: Path, round_id: str) -> bool:
         """Install one exact request once; an identical logical retry does no native work."""
@@ -205,3 +250,41 @@ class StagedSelection:
         self.manifest = checked
         self.state = "sealed"
         return copy.deepcopy(checked)
+
+    def seal_closure(self, evidence: dict) -> dict:
+        """Seal one native closure: prune only excluded bytes and freeze the selection.
+
+        The provisional staged inventory is re-hashed against the full upload index, the
+        closure graph is sealed by :func:`seal_closure_selection`, the excluded staged
+        files are removed, and the retained bytes must equal the selected files exactly.
+        ``snapshot()`` keeps the full original inventory as the upload proof.
+        """
+
+        _refuse(
+            self.state in {"reading", "sealed"} and self.staged_identity == self.upload_sha256,
+            "selection_incomplete",
+            "The full upload must be provisionally staged before sealing its closure",
+        )
+        actual = inventory(self.stage)
+        _refuse(
+            actual == self.upload_files,
+            "selection_inventory_changed",
+            "Provisional staging does not match the full upload index",
+        )
+        manifest = seal_closure_selection(
+            self.upload_files, self.main_assembly, evidence, reader_sha256=self.reader_sha256
+        )
+        for name in sorted(self.upload_files):
+            if name in manifest["files"]:
+                continue
+            with suppress(OSError, SelectionError):
+                Path(_filesystem_path(confined(self.stage, name))).unlink()
+        retained = inventory(self.stage)
+        _refuse(
+            retained == manifest["files"],
+            "selection_inventory_changed",
+            "Retained staged bytes differ from the sealed selection",
+        )
+        self.manifest = manifest
+        self.state = "sealed"
+        return copy.deepcopy(manifest)

@@ -339,6 +339,185 @@ def _upload_files(intake: Path) -> dict[str, str]:
     return package_inventory(intake)
 
 
+class ClosureSealContractTests(unittest.TestCase):
+    """Locked minimal contract: one provisional upload batch, native closure seal and prune."""
+
+    def setUp(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        self._temporary = tempfile.TemporaryDirectory(prefix="selection-closure-")
+        self.addCleanup(self._temporary.cleanup)
+        self.root = Path(self._temporary.name)
+
+    def _upload(self):
+        import hashlib
+
+        names = {
+            "cad/robot.SLDASM": b"main bytes",
+            "cad/base.SLDPRT": b"base bytes",
+            "cad/arm.SLDPRT": b"arm bytes",
+            "notes.txt": b"notes bytes",
+        }
+        return {name: hashlib.sha256(data).hexdigest() for name, data in names.items()}, names
+
+    def _closure(self, upload, *, edges=None, suppressed=None, **extras):
+        from description_pipeline.io import digest
+
+        edges = edges or {
+            "cad/robot.SLDASM": ["cad/base.SLDPRT", "cad/arm.SLDPRT"],
+            "cad/base.SLDPRT": [],
+            "cad/arm.SLDPRT": [],
+        }
+        documents = {
+            name: {
+                "stored_references": [],
+                "resolved_edges": [
+                    {
+                        "name": reference,
+                        "instance": reference,
+                        "kind": "native_document",
+                        "resolved": reference.replace("/", "\\"),
+                        "resolved_path": "C:\\stage\\" + reference,
+                        "configuration": "Default",
+                        "suppression_state": 2,
+                        "lightweight": False,
+                    }
+                    for reference in refs
+                ],
+            }
+            for name, refs in edges.items()
+        }
+        closure = {
+            "main_assembly": "cad/robot.SLDASM",
+            "stage_root": "C:\\stage\\run-1",
+            "upload_sha256": digest(upload),
+            "reader_sha256": "ab" * 32,
+            "session": {"pid": 1},
+            "suppressed": list(suppressed or []),
+            "graph": {name: {"sha256": upload[name], "references": refs} for name, refs in edges.items()},
+            "documents": documents,
+            "stored_references": [],
+            "resolved_edges": [],
+            "imports": [],
+            "open_status": {},
+        }
+        closure.update(extras)
+        return closure
+
+    def test_seal_reports_the_reachable_closure_and_excludes_the_rest(self) -> None:
+        from description_pipeline.io import digest
+        from description_pipeline.sources.solidworks.selection import (
+            SelectionError,
+            seal_closure_selection,
+            verify_selection,
+        )
+
+        upload, _ = self._upload()
+        manifest = seal_closure_selection(upload, "cad/robot.SLDASM", self._closure(upload), reader_sha256="ab" * 32)
+        self.assertEqual(set(manifest["files"]), {"cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT"})
+        self.assertEqual(set(manifest["excluded_files"]), {"notes.txt"})
+        self.assertEqual(manifest["handoff_sha256"], digest(manifest["files"]))
+        self.assertEqual(manifest["upload_sha256"], digest(upload))
+        digests = {manifest["upload_sha256"], manifest["handoff_sha256"], manifest["selection_sha256"]}
+        self.assertEqual(len(digests), 3)
+        self.assertEqual(manifest["closure"]["stage_root"], "C:\\stage\\run-1")
+        self.assertEqual(manifest["closure"]["session"], {"pid": 1})
+        verified = verify_selection(manifest, upload, manifest["files"], reader_sha256="ab" * 32)
+        self.assertEqual(verified, manifest)
+        tampered = {**manifest, "selection_sha256": "00" * 32}
+        with self.assertRaises(SelectionError):
+            verify_selection(tampered, upload, manifest["files"], reader_sha256="ab" * 32)
+
+    def test_closure_refusals_keep_the_evidence_structural(self) -> None:
+        from description_pipeline.sources.solidworks.selection import SelectionError, seal_closure_selection
+
+        upload, _ = self._upload()
+
+        def drop_one_edge(closure) -> None:
+            closure["documents"]["cad/robot.SLDASM"]["resolved_edges"].pop()
+
+        cases = {
+            "outside_index": lambda closure: closure["graph"]["cad/robot.SLDASM"]["references"].append("other.SLDAPRT"),
+            "repeated_edge": lambda closure: closure["graph"]["cad/robot.SLDASM"]["references"].append(
+                "cad/base.SLDPRT"
+            ),
+            "sha_mismatch": lambda closure: closure["graph"]["cad/base.SLDPRT"].update(sha256="00" * 32),
+            "missing_observation": lambda closure: closure["graph"].pop("cad/arm.SLDPRT"),
+            "bad_suppressed": lambda closure: closure["suppressed"].append({"document": "cad/base.SLDPRT"}),
+            "upload_mismatch": lambda closure: closure.update(upload_sha256="00" * 32),
+            "reader_mismatch": lambda closure: closure.update(reader_sha256="00" * 32),
+            "missing_stage_root": lambda closure: closure.pop("stage_root"),
+            "coherence_edge_missing": drop_one_edge,
+            "import_not_bound": lambda closure: closure["imports"].append(
+                {"document": "cad/robot.SLDASM", "resolved": "cad/base.SLDPRT", "state": "unbound"}
+            ),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(case=label):
+                closure = self._closure(upload)
+                mutate(closure)
+                with self.assertRaises(SelectionError):
+                    seal_closure_selection(upload, "cad/robot.SLDASM", closure, reader_sha256="ab" * 32)
+
+    def _staged_session(self):
+        import zipfile
+
+        from description_pipeline.orchestration.selection_transport import StagedSelection
+
+        upload, names = self._upload()
+        intake = self.root / "intake"
+        for name, data in names.items():
+            path = intake / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        archive = self.root / "batch.zip"
+        with zipfile.ZipFile(archive, "x", zipfile.ZIP_DEFLATED) as sink:
+            for name, data in names.items():
+                sink.writestr(name, data)
+        session = StagedSelection(self.root / "stage", upload, "cad/robot.SLDASM", reader_sha256="ab" * 32)
+        return session, upload, archive
+
+    def test_single_provisional_batch_prune_and_snapshot_proof(self) -> None:
+        from description_pipeline.io import inventory
+
+        session, upload, archive = self._staged_session()
+        snapshot = session.snapshot()
+        self.assertEqual(snapshot["state"], "awaiting_files")
+        self.assertEqual(snapshot["upload_sha256"], session.upload_sha256)
+        self.assertTrue(session.stage_full_upload(archive))
+        self.assertFalse(session.stage_full_upload(archive))
+        self.assertEqual(session.snapshot()["state"], "reading")
+        self.assertEqual(session.snapshot()["staged_files"], upload)
+        manifest = session.seal_closure(self._closure(upload))
+        self.assertEqual(session.snapshot()["state"], "sealed")
+        self.assertEqual(session.snapshot()["staged_files"], upload)
+        self.assertEqual(session.snapshot()["manifest"], manifest)
+        self.assertEqual(inventory(session.stage), manifest["files"])
+        self.assertEqual(set(manifest["excluded_files"]), {"notes.txt"})
+
+    def test_seal_refuses_a_tampered_provisional_stage_and_bad_archive(self) -> None:
+        import zipfile
+
+        from description_pipeline.io import inventory
+        from description_pipeline.orchestration.selection_transport import StagedSelection
+        from description_pipeline.sources.solidworks.selection import SelectionError
+
+        session, upload, archive = self._staged_session()
+        self.assertTrue(session.stage_full_upload(archive))
+        (session.stage / "cad/base.SLDPRT").write_bytes(b"tampered")
+        with self.assertRaises(SelectionError):
+            session.seal_closure(self._closure(upload))
+        self.assertTrue(inventory(session.stage))
+        broken = self.root / "broken.zip"
+        with zipfile.ZipFile(broken, "x", zipfile.ZIP_DEFLATED) as sink:
+            sink.writestr("cad/robot.SLDASM", b"main bytes")
+        fresh = StagedSelection(self.root / "stage2", upload, "cad/robot.SLDASM", reader_sha256="ab" * 32)
+        with self.assertRaises(SelectionError):
+            fresh.stage_full_upload(broken)
+        self.assertEqual(inventory(fresh.stage), {})
+
+
 class SelectionTransportTests(unittest.TestCase):
     def setUp(self) -> None:
         self.state = _FakeSelection()

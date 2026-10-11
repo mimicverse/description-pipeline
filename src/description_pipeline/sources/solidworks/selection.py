@@ -192,13 +192,211 @@ def verify_selection(
 
     if not isinstance(manifest, dict):
         raise SelectionError("selection_manifest_invalid", "Selection manifest must be an object")
-    expected = seal_selection(
-        upload_files,
-        manifest.get("main_assembly"),
-        manifest.get("observations"),
-        selected_files=selected_files,
-        reader_sha256=reader_sha256,
-    )
+    if manifest.get("scope") == "native_staged_folder_closure":
+        expected = seal_closure_selection(
+            upload_files,
+            manifest.get("main_assembly"),
+            manifest.get("closure") or {},
+            reader_sha256=reader_sha256,
+        )
+    else:
+        expected = seal_selection(
+            upload_files,
+            manifest.get("main_assembly"),
+            manifest.get("observations"),
+            selected_files=selected_files,
+            reader_sha256=reader_sha256,
+        )
     if manifest != expected:
         raise SelectionError("selection_manifest_changed", "Selection manifest differs from its recorded graph")
     return expected
+
+
+def reachable_closure(graph: Mapping[str, dict], main_assembly: str) -> set[str]:
+    """Canonical upload-index names reachable from the main over resolved graph edges."""
+
+    reachable: set[str] = set()
+    pending = [_path(main_assembly)]
+    while pending:
+        name = pending.pop()
+        if name in reachable:
+            continue
+        reachable.add(name)
+        record = graph.get(name)
+        if not isinstance(record, Mapping):
+            continue
+        for reference in record.get("references") or ():
+            if isinstance(reference, str) and reference not in reachable:
+                pending.append(reference)
+    return reachable
+
+
+def seal_closure_selection(
+    upload_files: Mapping[str, str],
+    main_assembly: str,
+    closure: Mapping[str, object],
+    *,
+    reader_sha256: str,
+) -> dict:
+    """Seal one native closure evidence block into the shared selection manifest.
+
+    The graph is the reachability proof: keys and references are canonical upload-index
+    names whose hashes equal the index, the selected set is everything reachable from the
+    main over resolved edges, and every other index entry is reported as excluded.  Stored
+    author references and further native evidence stay verbatim under ``closure``.
+    """
+
+    if not isinstance(reader_sha256, str) or _SHA.fullmatch(reader_sha256) is None:
+        raise SelectionError("selection_reader_invalid", "Selection requires a pinned native reader identity")
+    files = validate_file_index(upload_files)
+    main = _path(main_assembly)
+    if not main.lower().endswith(".sldasm") or main not in files:
+        raise SelectionError("selection_main_invalid", "Choose an indexed SolidWorks assembly", path=main)
+    if not isinstance(closure, Mapping):
+        raise SelectionError("selection_closure_invalid", "Closure evidence must be an object")
+    evidence = dict(closure)
+    declared_main = evidence.get("main_assembly")
+    if declared_main is not None and str(declared_main).replace("\\", "/") != main:
+        raise SelectionError(
+            "selection_closure_invalid", "Closure evidence names another main assembly", path=str(declared_main)
+        )
+    graph = evidence.get("graph")
+    if not isinstance(graph, Mapping) or not graph:
+        raise SelectionError("selection_closure_invalid", "Closure evidence carries no resolved graph")
+    stage_root = evidence.get("stage_root")
+    if not isinstance(stage_root, str) or not stage_root.strip():
+        raise SelectionError("selection_closure_invalid", "Closure evidence must name its stage root")
+    suppressed = evidence.get("suppressed", [])
+    if not isinstance(suppressed, list):
+        raise SelectionError("selection_closure_invalid", "Suppressed placements must be a verbatim evidence list")
+    for item in suppressed:
+        if (
+            not isinstance(item, Mapping)
+            or item.get("suppression_state") != 0
+            or not isinstance(item.get("document"), str)
+            or not item.get("document")
+            or (item.get("instance") is not None and not isinstance(item.get("instance"), str))
+            or (item.get("resolved_path") is not None and not isinstance(item.get("resolved_path"), str))
+        ):
+            raise SelectionError(
+                "selection_closure_invalid",
+                "A suppressed placement record is incomplete; suppressed placements are excluded "
+                "from the closure and recorded verbatim",
+            )
+    if "upload_sha256" in evidence and evidence["upload_sha256"] != digest(files):
+        raise SelectionError("selection_closure_invalid", "Closure evidence carries another upload digest")
+    if "reader_sha256" in evidence and evidence["reader_sha256"] != reader_sha256:
+        raise SelectionError("selection_closure_invalid", "Closure evidence carries another reader identity")
+    checked: dict[str, dict] = {}
+    for name, record in graph.items():
+        name = _path(name)
+        if name not in files:
+            raise SelectionError(
+                "selection_closure_invalid", "The resolved graph names a document outside the upload index", path=name
+            )
+        if not isinstance(record, Mapping) or record.get("sha256") != files[name]:
+            raise SelectionError(
+                "selection_closure_invalid", "A resolved graph entry differs from the staged upload index", path=name
+            )
+        references = record.get("references")
+        if not isinstance(references, list):
+            raise SelectionError(
+                "selection_closure_invalid", "A resolved graph entry carries no reference list", path=name
+            )
+        edges: list[str] = []
+        for reference in references:
+            reference = _path(reference)
+            if reference not in files:
+                raise SelectionError(
+                    "selection_closure_invalid",
+                    "A resolved reference is not part of the upload index",
+                    path=reference,
+                )
+            if reference in edges:
+                raise SelectionError("selection_closure_invalid", "Repeated resolved reference edge", path=reference)
+            edges.append(reference)
+        checked[name] = {"sha256": files[name], "references": sorted(edges)}
+
+    def canonical_target(value: object) -> str:
+        normalized = str(value or "").replace("\\", "/")
+        if not normalized.strip():
+            raise SelectionError("selection_closure_invalid", "A resolved native edge carries no resolved name")
+        if normalized in files:
+            return normalized
+        folded = {candidate.casefold(): candidate for candidate in files}
+        match = folded.get(normalized.casefold())
+        if match is None:
+            raise SelectionError(
+                "selection_closure_invalid",
+                "A resolved native edge targets a file outside the upload index",
+                path=normalized,
+            )
+        return match
+
+    documents = evidence.get("documents")
+    if not isinstance(documents, Mapping) or not documents:
+        raise SelectionError("selection_closure_invalid", "Closure evidence carries no document evidence map")
+    folded_graph = {name.casefold(): name for name in checked}
+    evidence_map: dict[str, Mapping] = {}
+    for name, entry in documents.items():
+        canonical = folded_graph.get(str(name).replace("\\", "/").casefold())
+        if canonical is None or not isinstance(entry, Mapping):
+            raise SelectionError(
+                "selection_closure_invalid", "Document evidence does not match the resolved graph", path=str(name)
+            )
+        evidence_map[canonical] = entry
+    if set(evidence_map) != set(checked):
+        raise SelectionError("selection_closure_invalid", "Document evidence keys differ from the resolved graph keys")
+    imports = evidence.get("imports", [])
+    if not isinstance(imports, list) or any(not isinstance(item, Mapping) for item in imports):
+        raise SelectionError("selection_closure_invalid", "Imported-source evidence must be a verbatim evidence list")
+    import_targets: dict[str, set[str]] = {}
+    for item in imports:
+        if item.get("state") != "bound":
+            raise SelectionError("selection_closure_invalid", "An imported source is not bound to the staged tree")
+        target = canonical_target(item.get("resolved"))
+        recorded_sha = item.get("sha256")
+        if recorded_sha is not None and recorded_sha != files[target]:
+            raise SelectionError(
+                "selection_closure_invalid", "A bound import differs from the staged bytes", path=target
+            )
+        owner = folded_graph.get(str(item.get("document") or "").replace("\\", "/").casefold())
+        if owner is None or owner not in evidence_map:
+            raise SelectionError(
+                "selection_closure_invalid",
+                "An imported source names a document outside the resolved graph",
+                path=str(item.get("document")),
+            )
+        import_targets.setdefault(owner, set()).add(target)
+    for name, entry in evidence_map.items():
+        edges_raw = entry.get("resolved_edges", [])
+        if not isinstance(edges_raw, list) or any(not isinstance(item, Mapping) for item in edges_raw):
+            raise SelectionError(
+                "selection_closure_invalid", "Resolved native edges must be a verbatim evidence list", path=name
+            )
+        targets = {canonical_target(item.get("resolved")) for item in edges_raw}
+        if set(checked[name]["references"]) != targets | import_targets.get(name, set()):
+            raise SelectionError(
+                "selection_closure_incoherent",
+                "The resolved graph references must equal the resolved native edges plus bound imported sources",
+                path=name,
+            )
+    reachable = reachable_closure(checked, main)
+    missing = sorted(name for name in reachable if name not in checked)
+    if missing:
+        raise SelectionError(
+            "selection_closure_incomplete", "A reachable document has no resolved observation", paths=missing
+        )
+    selected = {name: files[name] for name in sorted(reachable)}
+    manifest = {
+        "schema_version": SELECTION_SCHEMA,
+        "scope": "native_staged_folder_closure",
+        "reader_sha256": reader_sha256,
+        "upload_sha256": digest(files),
+        "main_assembly": main,
+        "files": selected,
+        "handoff_sha256": digest(selected),
+        "closure": {**evidence, "main_assembly": main, "graph": checked},
+        "excluded_files": {name: value for name, value in files.items() if name not in selected},
+    }
+    return {**manifest, "selection_sha256": digest(manifest)}
