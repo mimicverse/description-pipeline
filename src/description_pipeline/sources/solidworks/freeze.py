@@ -558,12 +558,28 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
 
     lister = getattr(backend, "list_dependencies", None)
     dependencies = list(lister(cfg["assembly"]) or []) if callable(lister) else []
-    unresolved = [str(entry["path"]) for entry in dependencies if not entry.get("exists", True)]
-    outside = [
-        entry["path"]
-        for entry in dependencies
-        if entry.get("exists", True) and cfg["allowed_roots"] and not _under(str(entry["path"]), cfg["allowed_roots"])
-    ]
+    # Suppressed placements are omitted from the sealed closure graph; a stored
+    # reference that only exists because of a suppressed placement must not fail
+    # the capture later.  Paths recorded as suppressed by the closure are
+    # skipped here (and in the collector) and reported as evidence.
+    closure = cfg.get("closure") or {}
+    suppressed_paths = {
+        os.path.normcase(os.path.abspath(str(entry.get("resolved_path"))))
+        for entry in closure.get("suppressed") or []
+        if isinstance(entry, dict) and entry.get("resolved_path")
+    }
+    suppressed_skipped: list[str] = []
+    unresolved = []
+    outside = []
+    for entry in dependencies:
+        path = str(entry.get("path") or "")
+        if path and os.path.normcase(os.path.abspath(path)) in suppressed_paths:
+            suppressed_skipped.append(path)
+            continue
+        if not entry.get("exists", True):
+            unresolved.append(path)
+        elif cfg["allowed_roots"] and not _under(path, cfg["allowed_roots"]):
+            outside.append(path)
     if outside:
         raise BridgeError(
             "dependency_outside_allowed_roots",
@@ -584,8 +600,20 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
     original = dict(inspector(cfg["assembly"]) or {})
     original_files: dict[str, str] = {}
     original_documents = [str(cfg["assembly"])]
-    original_documents.extend(str(entry.get("document") or "") for entry in original.get("instances") or [])
-    original_documents.extend(str(entry.get("path") or "") for entry in dependencies)
+    import_temp_documents: list[str] = []
+    for entry in original.get("instances") or []:
+        document = str(entry.get("document") or "")
+        if not document:
+            continue
+        if entry.get("virtual") is True or "IC~~" in document:
+            import_temp_documents.append(document)
+            continue
+        original_documents.append(document)
+    for entry in dependencies:
+        path = str(entry.get("path") or "")
+        if not path or os.path.normcase(os.path.abspath(path)) in suppressed_paths:
+            continue
+        original_documents.append(path)
     original_states: dict[str, dict[str, Any]] = {}
     unreadable: list[dict[str, Any]] = []
     save_flags: list[str] = []
@@ -625,7 +653,10 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
             "the backend cannot collect dependencies; a verified copy is required to freeze a source",
             exit_code=3,
         )
-    collected = dict(pack(cfg["assembly"], str(source_dir)) or {})
+    if suppressed_paths:
+        collected = dict(pack(cfg["assembly"], str(source_dir), skip_missing=sorted(suppressed_paths)) or {})
+    else:
+        collected = dict(pack(cfg["assembly"], str(source_dir)) or {})
     source_mapping = collected.get("mapping") or {}
     if {os.path.normcase(os.path.abspath(path)) for path in source_mapping} != {
         os.path.normcase(os.path.abspath(path)) for path in original_files
@@ -671,6 +702,9 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
     problems: list[dict[str, Any]] = []
     for entry in entries:
         path = str(entry.get("path") or "")
+        if path and os.path.normcase(os.path.abspath(path)) in suppressed_paths:
+            suppressed_skipped.append(path)
+            continue
         if not path or not _under(path, [str(source_dir)]):
             problems.append({"path": path, "problem": "outside_snapshot"})
         elif not os.path.isfile(path):
@@ -801,6 +835,9 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         path = str(entry.get("document") or "")
         if not path:
             continue  # suppressed instances are tracked, not resolved
+        if entry.get("virtual") is True or "IC~~" in path:
+            import_temp_documents.append(path)
+            continue  # session materializations are evidence, not snapshot members
         if not _under(path, [str(source_dir)]):
             outside_copy.append(path)
         elif not os.path.isfile(path):
@@ -862,7 +899,7 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         mapping[(str(cfg["assembly"]), top)] = "top_level"
     for entry in copy.get("instances") or []:
         path = str(entry.get("document") or "")
-        if not path:
+        if not path or entry.get("virtual") is True or "IC~~" in path:
             continue
         for source_entry in original.get("instances") or []:
             if str(source_entry.get("instance")) == str(entry.get("instance")) and source_entry.get("document"):
@@ -879,6 +916,8 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         "top_level": top,
         "declared_dependencies": dependencies,
         "declared_unresolved": unresolved,
+        "suppressed_skipped": sorted(set(suppressed_skipped)),
+        "import_temp_documents": sorted(set(import_temp_documents)),
         "resolved_inside_snapshot": len(entries),
         "collected_files": len(collected.get("files") or []),
         "configuration": copy_config,

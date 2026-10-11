@@ -585,6 +585,89 @@ def document_paths_match(active, requested):
     return bool(a and b and (a == b or ("\\" not in b and a.rsplit("\\", 1)[-1] == b)))
 
 
+#: FolderType value used to pin and read the *session* search folders
+#: (documented ``ISldWorks.GetSearchFolders(FolderType)`` /
+#: ``SetSearchFolders(FolderType, Folders)``; local typelib dump
+#: reviews/urdf-pr277-20261006/sw-session-methods.json, CHM ids
+#: 1048618/1048619).  0 is what the local dump carried (member named
+#: ``swDocumentType``), but the documented enum name/value association is not
+#: independently verified and may be reserved; the Set return value and the
+#: Get read-back are the evidence, never this constant.
+SEARCH_FOLDER_DOCUMENT_TYPE = 0
+
+
+def _search_folder_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item for item in value.split(";") if item]
+    if isinstance(value, (tuple, list)):
+        return [str(item) for item in value if str(item)]
+    return [str(value)]
+
+
+def read_search_folders(app, folder_type=SEARCH_FOLDER_DOCUMENT_TYPE):
+    """The session search folders as SolidWorks reports them, with the raw value."""
+
+    try:
+        raw = _member(app, "GetSearchFolders", folder_type)
+    except Exception as error:  # noqa: BLE001 - an unreadable configuration is a refusal
+        raise CadError(
+            "cad_search_folders_unreadable",
+            "session search folders could not be read",
+            {"error": f"{type(error).__name__}: {error}"[:200]},
+        ) from error
+    return {"raw": repr(raw)[:300], "folders": _search_folder_list(raw)}
+
+
+def pin_search_folders(app, root, folder_type=SEARCH_FOLDER_DOCUMENT_TYPE):
+    """Pin the session search scope to exactly ``root`` and read back the result.
+
+    Only the staged root is written; a readable ``False`` return and any
+    read-back that does not show exactly the pinned root refuse the run, so
+    reference resolution can never proceed on machine search settings by
+    accident.
+    """
+
+    before = read_search_folders(app, folder_type)
+    try:
+        written = _member(app, "SetSearchFolders", folder_type, str(root))
+    except Exception as error:  # noqa: BLE001 - fail closed instead of resolving by chance
+        raise CadError(
+            "cad_search_folders_unwritable",
+            "staged search folders could not be pinned",
+            {"root": str(root), "error": f"{type(error).__name__}: {error}"[:200]},
+        ) from error
+    after = read_search_folders(app, folder_type)
+    evidence = {
+        "folder_type": folder_type,
+        "before": before["folders"],
+        "before_raw": before["raw"],
+        "pinned": [str(root)],
+        "observed_after_pin": after["folders"],
+        "after_raw": after["raw"],
+        "set_return": repr(written)[:80],
+    }
+    observed = [str(item).casefold() for item in after["folders"]]
+    if written is False or observed != [str(root).casefold()]:
+        raise CadError(
+            "cad_search_folders_not_applied",
+            "the session did not report the pinned staged search root",
+            evidence,
+        )
+    return evidence
+
+
+def _stage_relative(root, value) -> str | None:
+    """Path of ``value`` under ``root`` in portable form, or ``None``."""
+
+    try:
+        relative = Path(str(value)).resolve().relative_to(Path(str(root)).resolve())
+    except (OSError, ValueError):
+        return None
+    return relative.as_posix()
+
+
 def _matches_assembly_root(reference, root, reference_full, reference_name, assembly_full) -> bool:
     """True when a mate entity references the owning assembly's own root component.
 
@@ -1839,6 +1922,12 @@ class SolidWorksBackend(CadBackend):
         #: ``None`` disables the pre-open gate; a set of normalized absolute
         #: source paths seals exactly which documents may be opened.
         self._sealed_documents: set[str] | None = None
+        #: Pinned staged search scope applied to every owned session before any
+        #: reference resolution happens (``None`` leaves machine search settings
+        #: untouched); evidence is recorded per owned process.
+        self._staged_search_root: str | None = None
+        self._staged_search_applied: set = set()
+        self._staged_search_evidence: list[dict] = []
         self._components = set()
         self._source_components = {}
         self._source_documents = {}
@@ -1892,6 +1981,13 @@ class SolidWorksBackend(CadBackend):
             app = session.current_application()
         if self._cancelled.is_set():
             raise EnvironmentError_("cad_session_cancelled", "Capture was cancelled")
+        if self._staged_search_root is not None:
+            key = session.identity().get("pid") if session is not None else id(app)
+            if key not in self._staged_search_applied:
+                evidence = pin_search_folders(app, self._staged_search_root)
+                evidence["pid"] = key
+                self._staged_search_applied.add(key)
+                self._staged_search_evidence.append(evidence)
         return app
 
     def _role_for_path(self, path):
@@ -1939,6 +2035,39 @@ class SolidWorksBackend(CadBackend):
         if self._sealed_documents is None:
             return None
         return sorted(self._sealed_documents)
+
+    def configure_staged_search(self, package):
+        """Pin the session search scope of every owned session to ``package``.
+
+        The endpoint calls this before opening staged documents: relocated or
+        authoring-absolute references may only resolve inside the provisional
+        staged folder, and the search scope is the documented session
+        ``SetSearchFolders`` configuration -- never machine File Locations or
+        any persistent preference.  ``None`` disables the pin.  Returns the
+        normalized pinned root, or ``None`` when the pin is disabled.
+        """
+
+        if package is None:
+            self._staged_search_root = None
+            self._staged_search_applied = set()
+            self._staged_search_evidence = []
+            return None
+        if not isinstance(package, (str, os.PathLike)):
+            raise CadError("cad_staged_search_invalid", "the staged search root must be a directory path")
+        value = os.fspath(package)
+        if not isinstance(value, str) or not value.strip():
+            raise CadError("cad_staged_search_invalid", "the staged search root must be a directory path")
+        root = str(Path(value).resolve())
+        if root != self._staged_search_root:
+            self._staged_search_root = root
+            self._staged_search_applied = set()
+            self._staged_search_evidence = []
+        return root
+
+    def staged_search_evidence(self):
+        """Recorded per-session search-scope evidence (before / pinned / after)."""
+
+        return [dict(item) for item in self._staged_search_evidence]
 
     def _require_sealed(self, path):
         """Refuse an unsealed source open before any COM call is made."""
@@ -3234,15 +3363,20 @@ class SolidWorksBackend(CadBackend):
 
         return self.list_dependencies(path)
 
-    def collect_dependencies(self, path, destination_dir):
+    def collect_dependencies(self, path, destination_dir, *, skip_missing=()):
         """Copy saved native files and rewrite references in a second application.
 
         ReplaceReferencedDocument requires unopened copies with the original
         internal IDs. Copy bytes, retire the source, rewrite every direct
         reference in a fresh application, then independently inspect the copy.
+        ``skip_missing`` lists absolute paths whose absence is already recorded
+        (suppressed placements): they are reported instead of failing the
+        collection, and they never enter the copied graph.
         """
         source_path = str(Path(path).resolve())
         source_app = self._app_for_path(source_path)
+        skipped_normalized = {os.path.normcase(os.path.abspath(str(item))) for item in skip_missing}
+        graph_skipped: list[str] = []
         graph = {}
         pending = [source_path]
         while pending:
@@ -3260,6 +3394,9 @@ class SolidWorksBackend(CadBackend):
                     raise CadError("dependency_list_invalid", document)
                 reference = str(Path(resolve_dependency_path(value, document)).resolve())
                 if not Path(reference).is_file():
+                    if os.path.normcase(os.path.abspath(reference)) in skipped_normalized:
+                        graph_skipped.append(reference)
+                        continue
                     raise CadError("dependency_missing", reference, {"document": document})
                 references.append(reference)
             graph[document] = sorted(set(references))
@@ -3311,8 +3448,130 @@ class SolidWorksBackend(CadBackend):
             "files": sorted(mapping.values()),
             "mapping": mapping,
             "reference_edges": replaced,
+            "skipped_missing": sorted(graph_skipped),
             "configured": ["GetDocumentDependencies2", "ReplaceReferencedDocument"],
         }
+
+    def closure_readings(self, stage_root, main_assembly, index):
+        """Raw native readings for the staged closure walk (mechanical only).
+
+        Pins the session search scope to ``stage_root``, seals the staged
+        inventory, opens the staged main read-only and records every
+        occurrence's identity, referenced configuration, raw suppression
+        state, resolved document path and virtual/import readings, plus
+        query-A stored references per unique resolved document.  State 5 and
+        unreadable/invalid states are recorded, not raised: admission policy
+        (``native_selection``) refuses with the exact instance.  Nothing is
+        saved, moved or exported.
+        """
+
+        stage = Path(stage_root).resolve()
+        names = sorted(str(name) for name in index)
+        self.configure_staged_search(stage)
+        sealed = self.seal_documents([str(stage / name) for name in names])
+        readings: dict = {"stage_root": str(stage), "main_assembly": str(main_assembly), "sealed": sealed}
+        with self.session():
+            app = self._app_obj()
+            readings["session"] = {
+                "native_api_pid": int(_method(app, "GetProcessID")),
+                "solidworks_revision": str(_member(app, "RevisionNumber")),
+            }
+            readings["search"] = {
+                "folder_type": SEARCH_FOLDER_DOCUMENT_TYPE,
+                "evidence": self.staged_search_evidence(),
+            }
+            # Query A over every staged native document BEFORE any document is
+            # opened: once an assembly is open, a false-Searchflag query reports
+            # the in-session resolution rather than the saved author references.
+            # The pre-open result is the verbatim stored-reference evidence.
+            stored = {}
+            for name in names:
+                if not name.lower().endswith((".sldasm", ".sldprt")):
+                    continue
+                try:
+                    entries = closed_document_dependencies(app, str(stage / name))
+                    stored[name] = [
+                        {"name": item.get("name"), "location": item.get("location")} for item in entries
+                    ]
+                except Exception as error:  # noqa: BLE001 - recorded; closure policy refuses elsewhere
+                    stored[name] = {"error": f"{type(error).__name__}: {error}"[:200]}
+            readings["stored_references"] = stored
+            readings["stored_references_phase"] = "preopen"
+            readings["stored_references_count"] = len(stored)
+            readings["documents_before"] = int(_member(app, "GetDocumentCount"))
+            entry = self._probe_document(str(stage / main_assembly))
+            readings["open"] = {
+                "already_open": entry.get("already_open"),
+                "open_exception": entry.get("open_exception"),
+                "errors": entry.get("errors"),
+                "warnings": entry.get("warnings"),
+            }
+            doc = entry.get("doc")
+            if doc is None:
+                raise CadError(
+                    "cad_staged_main_unopenable",
+                    "the staged main assembly could not be opened read-only in the owned session",
+                    {"main_assembly": str(main_assembly), "open": readings["open"]},
+                )
+            _manager, configuration = _active_configuration_view(doc)
+            root = _component(_member(configuration, "GetRootComponent3", True))
+            occurrences = []
+            stack = [
+                (child, "", 0, str(main_assembly))
+                for child in reversed(_as_list(_method(root, "GetChildren")))
+            ]
+            while stack:
+                item, context, depth, defining = stack.pop()
+                if depth > 40:
+                    raise CadError("cad_assembly_too_deep", str(stage / main_assembly), {"depth": depth})
+                component = _component(item)
+                name = str(_member(component, "Name2") or _member(component, "Name") or "")
+                instance = name if not context or name.startswith(context + "/") else f"{context}/{name}"
+                record = {"instance": instance, "name": name, "depth": depth, "defining": defining}
+                referenced = _member(component, "ReferencedConfiguration")
+                record["configuration"] = str(referenced) if referenced is not None else None
+                try:
+                    state = _method(component, "GetSuppression2")
+                    record["suppression_state"] = int(state) if type(state) is int else None
+                    if record["suppression_state"] is None:
+                        record["state_error"] = f"non-integer reading: {state!r}"[:200]
+                except Exception as error:  # noqa: BLE001 - recorded for the policy refusal
+                    record["suppression_state"] = None
+                    record["state_error"] = f"{type(error).__name__}: {error}"[:200]
+                try:
+                    record["resolved_path"] = str(_method(component, "GetPathName") or "")
+                except Exception as error:  # noqa: BLE001 - recorded for the policy refusal
+                    record["resolved_path"] = ""
+                    record["path_error"] = f"{type(error).__name__}: {error}"[:200]
+                virtual = None
+                try:
+                    reading = _member(component, "IsVirtual")
+                    virtual = reading if type(reading) is bool else None
+                except Exception:  # noqa: BLE001 - an unreadable virtual flag stays unknown
+                    virtual = None
+                record["is_virtual"] = virtual
+                resolved = record["resolved_path"]
+                relative = _stage_relative(stage, resolved) if resolved else None
+                record["resolved_relative"] = relative
+                if (not resolved) or relative is None or virtual is True or "IC~~" in resolved:
+                    try:
+                        imported = _method(component, "GetImportedPath")
+                        record["imported_path"] = (
+                            imported if isinstance(imported, str) and imported.strip() else None
+                        )
+                    except Exception as error:  # noqa: BLE001 - a non-imported component has no binding
+                        record["imported_path"] = None
+                        record["import_error"] = f"{type(error).__name__}: {error}"[:200]
+                occurrences.append(record)
+                if record["suppression_state"] == COMPONENT_SUPPRESSED:
+                    continue
+                child_defining = relative or resolved or defining
+                for child in reversed(_as_list(_method(component, "GetChildren"))):
+                    stack.append((child, instance, depth + 1, child_defining))
+            readings["occurrences"] = occurrences
+            readings["documents_after"] = int(_member(app, "GetDocumentCount"))
+            readings["search"]["evidence"] = self.staged_search_evidence()
+        return readings
 
     def inspect_copy(self, assembly_path):
         """Open a document read-only and report every component *instance*.
@@ -3359,6 +3618,19 @@ class SolidWorksBackend(CadBackend):
             referenced = _member(component, "ReferencedConfiguration")
             state = _component_state(component)
             suppressed = state == COMPONENT_SUPPRESSED
+            virtual = None
+            try:
+                reading = _member(component, "IsVirtual")
+                virtual = reading if type(reading) is bool else None
+            except Exception:  # noqa: BLE001 - an unreadable virtual flag stays unknown
+                virtual = None
+            imported_path = None
+            if (not document) or virtual is True or "IC~~" in str(document):
+                try:
+                    reading = _method(component, "GetImportedPath")
+                    imported_path = reading if isinstance(reading, str) and reading.strip() else None
+                except Exception:  # noqa: BLE001 - a non-imported component has no binding
+                    imported_path = None
             instances.append(
                 {
                     "instance": instance,
@@ -3366,6 +3638,8 @@ class SolidWorksBackend(CadBackend):
                     "document": str(document) if document else None,
                     "document_name": ntpath.basename(str(document)).lower() if document else None,
                     "configuration": str(referenced) if referenced is not None else None,
+                    "virtual": virtual,
+                    "imported_path": imported_path,
                     "suppressed": suppressed,
                     "suppression_state": state,
                     "depth": depth,
