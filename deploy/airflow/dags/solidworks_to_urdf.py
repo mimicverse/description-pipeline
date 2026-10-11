@@ -517,9 +517,11 @@ def _same_request(job: dict, request: dict) -> None:
     tags=["solidworks", "urdf", "windows"],
     default_args={"retries": 2, "retry_delay": timedelta(seconds=15)},
     doc_md=(
-        "# SolidWorks to URDF\n\nLinux admits the sealed engineering folder and stages the assembly-derived "
-        "dependency closure to the Windows endpoint; the native host reads the raw discovery record and, "
-        "after Linux derives the prepared package from the sealed selection, captures the native evidence. "
+        "# SolidWorks to URDF\n\nLinux admits the sealed engineering folder and stages the complete uploaded "
+        "folder to the Windows endpoint; the native engine resolves the main assembly's references inside "
+        "that staging and the sealed closure fixes what the capture reads. The native host reads the raw "
+        "discovery record and, after Linux derives the prepared package from the sealed selection, captures "
+        "the native evidence. "
         "Linux then generates the URDF, independently verifies it and publishes the PR. The graph "
         "coordinates these six engineering stages; transport and polling are orchestration tasks.\n\n"
         + contract_markdown()
@@ -538,8 +540,8 @@ def _same_request(job: dict, request: dict) -> None:
             type="string",
             title="Engineering folder path",
             description=(
-                "Sealed engineering folder on this Linux host whose dependency closure is staged to "
-                "the Windows endpoint (an absolute folder inside the configured handoff roots)"
+                "Sealed engineering folder on this Linux host that is staged to the Windows endpoint "
+                "for native reference resolution (an absolute folder inside the configured handoff roots)"
             ),
         ),
         "main_assembly": Param(

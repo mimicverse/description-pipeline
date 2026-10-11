@@ -111,6 +111,11 @@ _ARTIFACT_TYPES = {
     ".json": "application/json",
     ".png": "image/png",
 }
+#: Readable labels for the automatically retained structural-team reports.
+_STRUCTURAL_REPORT_LABELS = {
+    "reports/structural-team.md": "结构团队报告（可读 Markdown）",
+    "reports/structural-team.json": "结构团队报告（结构化发现与参数）",
+}
 _STATIC_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".css": "text/css; charset=utf-8",
@@ -1357,6 +1362,7 @@ class PortalApp:
             },
             "stage_view": stage_view_payload,
             "report": report,
+            "structural_report": self._retained_report_links(dag_run_id),
             "findings": _findings(job),
             "activity": activity_view(job),
             "automatic": _automatic_summary(job),
@@ -1934,6 +1940,31 @@ class PortalApp:
                     start_response("200 OK", _common_headers(headers, self.config))
                     return [data]
         raise PortalError(HTTPStatus.NOT_FOUND, "该运行还没有结构团队报告")
+
+    def _retained_report_links(self, dag_run_id: str) -> list[dict]:
+        """Downloadable entries of the automatically retained structural-team report.
+
+        The run page links these directly through the authorized artifact route when the
+        run retained a report (failed native fetch or failed portable receipt); a verified
+        delivery keeps listing its own preview files.
+        """
+
+        store = self._store()
+        if store is None or _RUN_ID.fullmatch(dag_run_id) is None:
+            return []
+        run_dir = store.run_dir(native_run_id(dag_run_id))
+        links = []
+        for artifact in TEAM_REPORTS:
+            name = Path(artifact).name
+            if any((run_dir / folder / name).is_file() for folder in ("structural-team", "reports")):
+                links.append(
+                    {
+                        "path": artifact,
+                        "label_zh": _STRUCTURAL_REPORT_LABELS.get(artifact, artifact),
+                        "url": f"/api/runs/{dag_run_id}/artifacts/{artifact}",
+                    }
+                )
+        return links
 
     # ---------------------------------------------------------------- static
     def _static(self, start_response: Callable, name: str) -> Iterable[bytes]:

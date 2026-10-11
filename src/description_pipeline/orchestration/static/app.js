@@ -1840,6 +1840,25 @@ function renderRun(run) {
 
   const findings = $("findings");
   findings.textContent = "";
+  // The automatically retained structural-team report stays directly downloadable on runs
+  // without a verified delivery (failed Windows or Linux runs); no URL hunting required.
+  const retainedReports = Array.isArray(run.structural_report) ? run.structural_report : [];
+  if (retainedReports.length) {
+    const item = document.createElement("li");
+    item.className = "report-download";
+    const label = document.createElement("span");
+    label.textContent = "结构团队报告（自动生成）：";
+    item.append(label, " ");
+    for (const entry of retainedReports) {
+      const link = document.createElement("a");
+      link.href = String(entry.url || "");
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.textContent = entry.label_zh || entry.path || "结构团队报告";
+      item.append(link, " ");
+    }
+    findings.append(item);
+  }
   const failure = report && report.failure ? report.failure : null;
   // The auto finding repeating the failure card's raw error would be a second
   // red container for the same fact; show each failure once.

@@ -1481,6 +1481,13 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(status, 200, body)
         self.assertEqual(body, report.read_bytes())
         self.assertEqual(headers.get("Content-Type"), "text/markdown; charset=utf-8")
+        # The run page itself links the retained report; no URL hunting required.
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 200, body)
+        links = json.loads(body)["structural_report"]
+        self.assertEqual([entry["path"] for entry in links], ["reports/structural-team.md"])
+        self.assertEqual(links[0]["url"], f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.md")
+        self.assertTrue(links[0]["label_zh"])
 
     def test_failed_native_run_serves_the_fetched_report_and_refuses_absent(self) -> None:
         self.client.login()
@@ -1500,6 +1507,10 @@ class PortalTests(unittest.TestCase):
         # A member the run never retained is a clear 404, never a substitute report.
         status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.json")
         self.assertEqual(status, 404)
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 200, body)
+        links = json.loads(body)["structural_report"]
+        self.assertEqual([entry["path"] for entry in links], ["reports/structural-team.md"])
 
     def test_stage_view_exposes_contract_evidence_and_only_verified_assets_are_linkable(self) -> None:
         from description_pipeline.stages import CONTRACT, STAGE_IDS
