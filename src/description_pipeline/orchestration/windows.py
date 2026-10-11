@@ -275,6 +275,7 @@ class Jobs:
                         error="Endpoint restarted during native execution; inspect diagnostics and use a new run_id",
                     )
                     self._clear_activity(job)
+                    self._structural_report(job)
                     self._save(job)
                 elif job["status"] == "queued":
                     self.selection_locks[identifier] = threading.RLock()
@@ -1245,6 +1246,8 @@ class Jobs:
                         for key in ("detail", "diagnostic_path"):
                             if result.get(key) is not None:
                                 job[key] = result[key]
+                    if job["status"] == "failed":
+                        self._structural_report(job)
             except Exception as error:
                 with self.mutex:
                     if job["status"] != "failed":
@@ -1257,6 +1260,7 @@ class Jobs:
                             job["detail"] = error.detail
                         elif isinstance(getattr(error, "details", None), dict):
                             job["detail"] = error.details
+                    self._structural_report(job)
             finally:
                 with self.mutex:
                     if job["status"] == "failed" and (not job["events"] or job["events"][-1]["state"] != "failed"):

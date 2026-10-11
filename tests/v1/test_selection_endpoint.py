@@ -228,12 +228,7 @@ class SelectionEndpointTests(unittest.TestCase):
             time.sleep(0.02)
 
     def await_report(self, jobs: Jobs, identifier: str, snapshot: dict, *, timeout: float = 5.0) -> dict:
-        """The failure stamp may land just after the failed status; poll for the receipt."""
-
-        deadline = time.monotonic() + timeout
-        while snapshot.get("structural_report") is None and time.monotonic() < deadline:
-            time.sleep(0.02)
-            snapshot = jobs.snapshot(identifier)
+        """A terminal snapshot must already carry its downloadable failure report."""
         self.assertIsNotNone(snapshot.get("structural_report"))
         return snapshot
 
@@ -322,6 +317,7 @@ class SelectionEndpointTests(unittest.TestCase):
         snapshot = restarted.snapshot(identifier)
         self.assertEqual(snapshot["status"], "failed")
         self.assertIn("restart", snapshot["error"].lower())
+        self.assertIsNotNone(snapshot.get("structural_report"))
         self.assertEqual(self.observe_events(), [])
         self.assertEqual(self.sentinel.calls, [])
         with self.assertRaises(RequestError) as caught:
