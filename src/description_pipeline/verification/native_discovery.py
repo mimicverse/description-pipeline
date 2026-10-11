@@ -349,12 +349,13 @@ def _cached_materialization_reason(
 ) -> str | None:
     """Exact sealed-carrier evidence for one cached native materialization.
 
-    A cached materialization is admitted only when the mandatory carrier records an
-    unambiguously matching entry: the same owner document with owner bytes equal to
-    the sealed selection and the frozen inventory, the same occurrence identity, the
-    same session temp materialization (IC~~ path component), the same author metadata
-    and the same current native suppression/virtual readings.  Nothing is guessed
-    from names or suffixes, and a present external file is never downgraded.
+    The selection session and the discovery session are different native sessions, so
+    their session temp roots differ and the two materialization paths can never be
+    compared directly.  The stable identity is the ultimate native owner (with its
+    frozen bytes), the scoped occurrence, the defining anchor and the recorded
+    configuration, while each materialization path must be structurally a session
+    temp document under its own recorded owned temp root.  Nothing is guessed from
+    names or suffixes, and a present external file is never downgraded.
     """
 
     if not isinstance(carrier, dict) or not isinstance(carrier.get("closure"), dict):
@@ -362,25 +363,32 @@ def _cached_materialization_reason(
     owner = provenance.get("owner")
     owner_sha = provenance.get("owner_sha256")
     occurrence = provenance.get("occurrence")
+    anchor = provenance.get("defining_anchor")
     materialization = (
         provenance.get("materialization_path")
         or provenance.get("materialization")
         or provenance.get("native_document_path")
     )
+    temp_root = provenance.get("session_temp_root")
     author = provenance.get("author_imported_path")
     virtual = provenance.get("is_virtual")
-    anchor = provenance.get("defining_anchor")
-    if not (isinstance(owner, str) and owner.strip() and isinstance(occurrence, str) and occurrence.strip()):
-        return "the cached materialization evidence names no owner occurrence"
+    if not (isinstance(owner, str) and owner.strip()):
+        return "the cached materialization evidence names no ultimate owner"
+    if not (isinstance(occurrence, str) and occurrence.strip()):
+        return "the cached materialization evidence names no occurrence"
     if anchor is not None and not isinstance(anchor, str):
         return "the cached materialization defining anchor is unreadable"
     if not isinstance(owner_sha, str) or _HEX.match(owner_sha) is None:
         return "the cached materialization owner bytes are unproven"
     if not (isinstance(materialization, str) and ntpath.isabs(materialization)):
         return "the cached materialization evidence carries no absolute session materialization"
-    parts = materialization.replace("\\", "/").split("/")
-    if not any(part.casefold() == "ic~~" for part in parts if part):
-        return "the recorded materialization is not a session temp materialization"
+    if not _session_temp_path(materialization, temp_root):
+        if not (isinstance(temp_root, str) and ntpath.isabs(temp_root)):
+            return "the cached materialization evidence carries no owned session temp root"
+        parts = materialization.replace("\\", "/").split("/")
+        if not any(part.casefold() == "ic~~" for part in parts if part):
+            return "the recorded materialization is not a session temp materialization"
+        return "the session materialization is outside its recorded owned session temp root"
     if author is not None and not isinstance(author, str):
         return "the cached materialization author metadata is unreadable"
     if type(virtual) is not bool:
@@ -398,21 +406,23 @@ def _cached_materialization_reason(
             continue
         slot_owner = slot.get("owner") if isinstance(slot.get("owner"), str) and slot.get("owner") else None
         slot_owner = slot_owner or slot.get("document")
-        if folded(slot_owner) != folded(owner):
+        if slot_owner is None or folded(slot_owner) != folded(owner):
             continue
         if str(slot.get("instance") or "") != occurrence:
             continue
         if slot.get("owner_anchor") != anchor:
             continue
-        if ntpath.normcase(str(slot.get("materialization") or "")) != ntpath.normcase(materialization):
+        if slot.get("owner_sha256") != owner_sha:
+            continue
+        slot_configuration = slot.get("configuration")
+        if slot_configuration is not None and component.get("configuration") != slot_configuration:
+            continue
+        if not _session_temp_path(slot.get("materialization"), slot.get("session_temp_root")):
             continue
         slot_author = slot.get("author_imported_path")
         if (slot_author is None) != (author is None):
             continue
         if slot_author is not None and ntpath.normcase(slot_author) != ntpath.normcase(author):
-            continue
-        slot_owner_sha = slot.get("owner_sha256")
-        if slot_owner_sha is not None and slot_owner_sha != owner_sha:
             continue
         slot_state = slot.get("suppression_state")
         if isinstance(slot_state, int) and slot_state != component.get("suppression_state"):
@@ -426,6 +436,22 @@ def _cached_materialization_reason(
         return "the sealed carrier records ambiguous cached materializations for this occurrence"
     used.add(matches[0])
     return None
+
+
+def _session_temp_path(value: object, root: object) -> bool:
+    """True when ``value`` is an absolute session temp document under ``root``."""
+
+    if not (isinstance(value, str) and ntpath.isabs(value)):
+        return False
+    if not (isinstance(root, str) and ntpath.isabs(root)):
+        return False
+    if not any(part.casefold() == "ic~~" for part in value.replace("\\", "/").split("/") if part):
+        return False
+    try:
+        relative = ntpath.relpath(value, root)
+    except ValueError:
+        return False
+    return relative != ".." and not relative.startswith("..\\") and not ntpath.isabs(relative)
 
 
 def _require_suppression_states(record: dict) -> None:

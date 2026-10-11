@@ -16,6 +16,8 @@ ROOT = r"C:\description-v1-review\probe-46986340\input-copy"
 TEMP = r"C:\Users\33985\AppData\Local\Temp\swx42380\IC~~"
 CACHED_TEMP_ROOT = r"C:\Users\33985\AppData\Local\Temp\swx28528"
 CACHED_MATERIALIZATION = CACHED_TEMP_ROOT + r"\IC~~\HD-1910-C001-20260902.stp.SLDASM"
+SELECTION_TEMP_ROOT = r"C:\Users\33985\AppData\Local\Temp\swx99123"
+SELECTION_MATERIALIZATION = SELECTION_TEMP_ROOT + r"\IC~~\HD-1910-C001-20260902.stp.SLDASM"
 CACHED_AUTHOR = r"D:\M2.2(9.17) DengJingjie - 副本\change11\HD-1910-C001-20260902.stp"
 CACHED_OWNER = "HD-1910-C001-20260902.SLDASM"
 CACHED_OCCURRENCE = "HD-1910-C001-20260902-21/HD-1910-C001-20260902.stp-2"
@@ -79,6 +81,7 @@ def cached_provenance(owner_sha, **overrides):
         "occurrence": CACHED_OCCURRENCE,
         "defining_anchor": None,
         "materialization_path": CACHED_MATERIALIZATION,
+        "session_temp_root": CACHED_TEMP_ROOT,
         "author_imported_path": CACHED_AUTHOR,
         "is_virtual": False,
         "used_api": CACHED_API,
@@ -92,6 +95,7 @@ def cached_component(owner_sha, **overrides):
     component = {
         "name2": "HD-1910-C001-20260902.stp-2",
         "document": None,
+        "configuration": "Default",
         "suppressed": False,
         "lightweight": False,
         "suppression_state": 2,
@@ -101,16 +105,18 @@ def cached_component(owner_sha, **overrides):
     return component
 
 
-def cached_slot(owner_sha, occurrence=CACHED_OCCURRENCE):
+def cached_slot(owner_sha, occurrence=CACHED_OCCURRENCE, configuration="Default"):
     return {
         "document": CACHED_OWNER,
         "instance": occurrence,
         "owner_anchor": None,
         "state": "cached_materialization",
         "binding": "author_metadata_only",
-        "materialization": CACHED_MATERIALIZATION,
+        "materialization": SELECTION_MATERIALIZATION,
+        "session_temp_root": SELECTION_TEMP_ROOT,
         "author_imported_path": CACHED_AUTHOR,
         "owner_sha256": owner_sha,
+        "configuration": configuration,
         "suppression_state": 2,
         "is_virtual": False,
     }
@@ -409,9 +415,34 @@ class ImportedSourceTests(unittest.TestCase):
                 cached_carrier(sha),
                 "not a session temp materialization",
             ),
+            "outside_temp_root": (
+                cached_component(
+                    sha,
+                    source_provenance=cached_provenance(
+                        sha, materialization_path=r"C:\other\swx00000\IC~~\HD-1910-C001-20260902.stp.SLDASM"
+                    ),
+                ),
+                cached_carrier(sha),
+                "outside its recorded owned session temp root",
+            ),
+            "missing_temp_root": (
+                cached_component(sha, source_provenance=cached_provenance(sha, session_temp_root=None)),
+                cached_carrier(sha),
+                "carries no owned session temp root",
+            ),
+            "missing_owner": (
+                cached_component(sha, source_provenance=cached_provenance(sha, owner=None)),
+                cached_carrier(sha),
+                "names no ultimate owner",
+            ),
             "occurrence_mismatch": (
                 cached_component(sha, source_provenance=cached_provenance(sha, occurrence="other-1")),
                 cached_carrier(sha),
+                "no sealed cached materialization matches",
+            ),
+            "configuration_mismatch": (
+                cached_component(sha),
+                cached_carrier(sha, imports=[cached_slot(sha, configuration="Other")]),
                 "no sealed cached materialization matches",
             ),
             "anchor_mismatch": (
