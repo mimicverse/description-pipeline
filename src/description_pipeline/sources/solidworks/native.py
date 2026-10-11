@@ -846,11 +846,15 @@ def _read_material(obj, method, configuration):
 
 
 def _material_assignments_document(doc, bodies):
-    """Require an explicit material for every included solid, without editing CAD.
+    """Read the physical material assignment of every included solid, without editing CAD.
 
     A positive Density is insufficient: an unassigned imported solid can still
     have a default density. Body material takes precedence over part material.
     This verifies assignment coverage, not correctness against real hardware.
+
+    A missing assignment raises ``cad_material_provenance_missing`` with the full
+    row evidence in the detail; callers decide whether that deficiency is fatal
+    (strict capture) or degrades to a recorded warning beside the measured values.
     """
     try:
         _manager, active = _active_configuration_view(doc)
@@ -905,11 +909,14 @@ def _material_assignments_document(doc, bodies):
 
 
 def unverified_material_record(exc, configuration) -> dict:
-    """The material evidence kept when a documented-table capture cannot verify a part.
+    """The material evidence kept when a capture cannot verify a part's assignment.
 
-    The CAD error carries the full part/body assignment in its detail; reducing the fallback to a
-    code and a message would throw away what the document actually held.  Every detail key the
-    reader produced travels with the record instead.
+    A missing explicit material is a warnable deficiency of the document: the measured CAD values
+    are still recorded, and the unverified assignment travels verbatim beside them.  In
+    documented-table mode an unreadable assignment also degrades to this record.  The CAD error
+    carries the full part/body assignment in its detail; reducing the fallback to a code and a
+    message would throw away what the document actually held.  Every detail key the reader
+    produced travels with the record instead.
     """
 
     record = {
@@ -2447,15 +2454,17 @@ class SolidWorksBackend(CadBackend):
         bodies = _part_bodies(doc)
         if not bodies:
             raise CadError("cad_empty_model", "part has no solid bodies")
-        if require_material:
+        # A missing explicit material is a warnable deficiency of the document, not a
+        # capture failure: the measured CAD values are kept and the unverified
+        # assignment travels verbatim beside them.  A strict (``cad``) capture still
+        # refuses an *unreadable* assignment; documented-table mode records every
+        # unreadable assignment instead.
+        try:
             materials = _material_assignments_document(doc, bodies)
-        else:
-            # Documented mass table: CAD materials are optional, but whatever the
-            # document does contain is still recorded verbatim as evidence.
-            try:
-                materials = _material_assignments_document(doc, bodies)
-            except CadError as exc:
-                materials = unverified_material_record(exc, configuration_name)
+        except CadError as exc:
+            if exc.code != "cad_material_provenance_missing" and require_material:
+                raise
+            materials = unverified_material_record(exc, configuration_name)
         mp = _member(_member(doc, "Extension"), "CreateMassProperty2")
         if mp is None:
             raise CadError("cad_empty_mass_property", "CreateMassProperty2 returned null")

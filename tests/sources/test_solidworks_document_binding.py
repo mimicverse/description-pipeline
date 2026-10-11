@@ -365,6 +365,76 @@ class ConfigurationPrimitiveTests(unittest.TestCase):
         self.assertEqual(result["reference"]["configuration"], "Default")
         self.assertEqual(result["reference"]["material_assignment"]["configuration"], "Default")
 
+    def test_strict_part_mass_reader_keeps_the_measured_values_for_a_missing_material(self):
+        body = object()
+        inner = types.SimpleNamespace(
+            GetType=Mock(spec=lambda: None, return_value=1),
+            ConfigurationManager=None,
+            GetPathName=Mock(spec=lambda: None, return_value="C:/captures/base.SLDPRT"),
+            GetTitle=Mock(spec=lambda: None, return_value="base"),
+        )
+        configuration = _Revocable(_Configuration(root=None))
+        inner.ConfigurationManager = types.SimpleNamespace(ActiveConfiguration=configuration)
+        document = _Revocable(inner)
+        mass_property = _MassProperty(document, configuration)
+        inner.Extension = _Extension(mass_property)
+        backend = SolidWorksBackend()
+        assignment = {
+            "schema_version": "swbridge.material-assignment/v1",
+            "configuration": "默认",
+            "part": {"name": "", "database": ""},
+            "body_count": 1,
+            "bodies": [
+                {
+                    "index": 0,
+                    "name": "拉伸-薄壁2",
+                    "material": {"name": "", "database": ""},
+                    "effective_source": "part",
+                }
+            ],
+        }
+        error = native.CadError(
+            "cad_material_provenance_missing",
+            "Every solid requires an explicit physical material; default density is not evidence",
+            {"missing_body_indices": [0], "material_assignment": assignment},
+        )
+        with (
+            patch.object(native, "_part_bodies", return_value=[body]),
+            patch.object(native, "_material_assignments_document", side_effect=error),
+        ):
+            result = backend._mass_properties_document(document, require_material=True)
+        record = result["reference"]["material_assignment"]
+        self.assertEqual(record["unverified_reason"], "cad_material_provenance_missing")
+        self.assertEqual(record["missing_body_indices"], [0])
+        self.assertEqual(record["material_assignment"]["bodies"][0]["name"], "拉伸-薄壁2")
+        # 测量值照常读出：默认密度不是证据，但读数本身不被猜测值替换。
+        self.assertEqual(result["mass"], 1.5)
+        self.assertEqual(result["reference"]["density_kg_m3"], 7900.0)
+        self.assertEqual(result["reference"]["configuration"], "Default")
+
+    def test_strict_part_mass_reader_still_refuses_an_unreadable_material(self):
+        body = object()
+        inner = types.SimpleNamespace(
+            GetType=Mock(spec=lambda: None, return_value=1),
+            ConfigurationManager=None,
+            GetPathName=Mock(spec=lambda: None, return_value="C:/captures/base.SLDPRT"),
+            GetTitle=Mock(spec=lambda: None, return_value="base"),
+        )
+        configuration = _Revocable(_Configuration(root=None))
+        inner.ConfigurationManager = types.SimpleNamespace(ActiveConfiguration=configuration)
+        document = _Revocable(inner)
+        mass_property = _MassProperty(document, configuration)
+        inner.Extension = _Extension(mass_property)
+        backend = SolidWorksBackend()
+        error = native.CadError("cad_material_read_failed", "Cannot verify physical material assignment")
+        with (
+            patch.object(native, "_part_bodies", return_value=[body]),
+            patch.object(native, "_material_assignments_document", side_effect=error),
+            self.assertRaises(native.CadError) as raised,
+        ):
+            backend._mass_properties_document(document, require_material=True)
+        self.assertEqual(raised.exception.code, "cad_material_read_failed")
+
     def test_unreadable_component_path_keeps_other_rows_and_records_the_error(self):
         ok_child = types.SimpleNamespace(
             Name2="ok-1",

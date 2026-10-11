@@ -1540,6 +1540,55 @@ def _capture_readings(
     return scene, raw
 
 
+def _material_provenance_record(scene: Any, cfg: dict[str, Any]) -> dict[str, Any]:
+    """The stable warning record for CAD masses read from unverified materials.
+
+    A pure projection of ``raw/mass_properties.json``: each entry carries the verbatim
+    material assignment the reader produced next to the measured CAD values it came
+    with.  Missing explicit material is a warnable deficiency - capture, model and
+    delivery continue - but no consumer may mistake the document's default density for
+    evidence.  The record is written for every capture, with an empty ``warnings`` list
+    when every included solid carries a verified assignment.
+    """
+
+    warnings: list[dict[str, Any]] = []
+    for name, payload in sorted((scene.mass_properties or {}).items()):
+        reference = payload.get("reference") if isinstance(payload, dict) else None
+        assignment = reference.get("material_assignment") if isinstance(reference, dict) else None
+        if not isinstance(assignment, dict) or not assignment.get("unverified_reason"):
+            continue
+        reference = reference if isinstance(reference, dict) else {}
+        warnings.append(
+            {
+                "code": str(assignment["unverified_reason"]),
+                "message": str(assignment.get("message") or "material assignment is not verified"),
+                "blocking": False,
+                "component": str(name),
+                "document": reference.get("part_document"),
+                "configuration": reference.get("configuration") or assignment.get("configuration"),
+                "missing_body_indices": assignment.get("missing_body_indices"),
+                "material_assignment": assignment,
+                "measured": {
+                    "source": "cad_api",
+                    "scope": reference.get("scope"),
+                    "mass_kg": payload.get("mass"),
+                    "center_of_mass_m": payload.get("com"),
+                    "inertia_kg_m2": payload.get("inertia"),
+                    "volume_m3": reference.get("volume_m3"),
+                    "density_kg_m3": reference.get("density_kg_m3"),
+                },
+            }
+        )
+    return {
+        "schema_version": "solidworks-to-urdf.material-provenance/v1",
+        "assembly": str(cfg.get("assembly") or ""),
+        "configuration": str(cfg.get("configuration") or ""),
+        "material_source": str(cfg.get("material_source") or "cad"),
+        "measured_source": "cad_api",
+        "warnings": warnings,
+    }
+
+
 def _verify_originals_unchanged(closure: dict[str, Any]) -> dict[str, Any]:
     """Rehash saved inputs without reopening the retired source application.
 
@@ -1714,6 +1763,10 @@ def _freeze_local(
         write_json(staging / "raw" / "dependency_closure.json", closure)
         write_json(staging / "raw" / "coordinate_systems.json", raw["coordinate_systems"])
         write_json(staging / "raw" / "mass_properties.json", raw["mass_properties"])
+        write_json(
+            staging / "raw" / "material_provenance.json",
+            _material_provenance_record(scene, cfg),
+        )
         axis_references = _capture_axis_references(backend, cfg)
         if axis_references:
             write_json(staging / "raw" / "axis_references.json", axis_references)

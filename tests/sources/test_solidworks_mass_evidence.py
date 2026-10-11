@@ -3,7 +3,7 @@
 覆盖三类错误注入（生成侧 + 独立校验侧）：
 * 表格漏条目 → documented_table 直接拒绝，校验侧 `source.normalization.mass_provenance` 也要报出来；
 * 表格拼错/多余键 → 配置、加载、校验三处都拒绝；
-* 严格 CAD 模式遇到"材料未验证"的读数 → 不允许把默认密度占位质量当读数（缺声明即失败）。
+* 严格 CAD 模式遇到"材料未验证"的读数 → 读数原样保留并记录非阻塞警告（默认密度不是证据）。
 """
 
 from __future__ import annotations
@@ -151,16 +151,45 @@ class MassEvidenceContractTests(unittest.TestCase):
             )
         self.assertEqual(_detail(raised.exception)["missing"], ["arm-1"])
 
-    def test_freeze_refuses_cad_mass_from_an_unverified_material(self) -> None:
+    def test_freeze_records_a_warning_for_cad_mass_from_an_unverified_material(self) -> None:
         # 真实读数会记录 material_assignment.unverified_reason；这里模拟那份派生 CAD
-        # （SolidWorks 默认密度 1000 kg/m³ 给出"看起来正常"的质量）。
+        # （SolidWorks 默认密度 1000 kg/m³ 给出"看起来正常"的质量）。默认密度不是证据，
+        # 但属于可警告缺陷：冻结成功，测量值原样保留，警告逐字携带原始读数。
         self.backend.components[1]["mass"]["reference"]["material_assignment"] = {
             "schema_version": "swbridge.material-assignment/v1",
+            "configuration": "默认",
             "unverified_reason": "cad_material_provenance_missing",
+            "message": "Every solid requires an explicit physical material; default density is not evidence",
+            "missing_body_indices": [0],
         }
-        with self.assertRaises(ConfigError) as raised:
-            self._freeze("unverified", material_source="cad")
-        self.assertEqual(_detail(raised.exception)["unverified_material"], ["arm-1"])
+        snapshot = self._freeze("unverified", material_source="cad")
+        record = json.loads((snapshot / "raw" / "material_provenance.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["schema_version"], "solidworks-to-urdf.material-provenance/v1")
+        self.assertEqual(len(record["warnings"]), 1)
+        warning = record["warnings"][0]
+        self.assertEqual(warning["code"], "cad_material_provenance_missing")
+        self.assertFalse(warning["blocking"])
+        self.assertEqual(warning["component"], "arm-1")
+        self.assertEqual(warning["configuration"], "默认")
+        self.assertEqual(warning["missing_body_indices"], [0])
+        self.assertEqual(warning["material_assignment"]["unverified_reason"], "cad_material_provenance_missing")
+        self.assertAlmostEqual(warning["measured"]["mass_kg"], 0.5, places=12)
+        # 读数不被猜测值替换：link 质量仍是 CAD 实测值，警告同时写进 scene 的 provenance。
+        scene = load_scene(snapshot)
+        arm = next(link for link in scene["links"] if link["name"] == "arm_link")
+        self.assertAlmostEqual(arm["inertial"]["mass"], 0.5, places=12)
+        self.assertEqual(
+            [entry["code"] for entry in scene["provenance"]["warnings"]],
+            ["cad_material_provenance_missing"],
+        )
+        self.assertEqual(scene["provenance"]["warnings"][0]["components"], ["arm-1"])
+
+    def test_freeze_records_an_empty_warning_list_for_verified_materials(self) -> None:
+        snapshot = self._freeze("verified", material_source="cad")
+        record = json.loads((snapshot / "raw" / "material_provenance.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["warnings"], [])
+        scene = load_scene(snapshot)
+        self.assertNotIn("warnings", scene["provenance"])
 
     def test_documented_masses_that_cover_everything_freeze_normally(self) -> None:
         snapshot = self._freeze(

@@ -303,9 +303,10 @@ def material_unverified(payload: Any) -> bool:
 
     真实采集会写 ``reference.material_assignment``：材料齐全时是逐实体材料读数，
     没有材料时带 ``unverified_reason``（如 ``cad_material_provenance_missing``）。
-    SolidWorks 的默认密度会给出一个"看起来正常"的 CAD 质量，所以这类组件的质量
-    只有在 ``documented_table`` 里被显式声明过才可用。夹具/历史读数完全没有这一段时
-    这里返回 False：无法证伪就不擅自判失败，但仍由下文的声明覆盖规则约束。
+    SolidWorks 的默认密度会给出一个"看起来正常"的 CAD 质量，所以这类读数不能当作
+    已验证质量：cad 模式下 build_scene 保留原值并记录非阻塞警告，documented_table
+    模式下质量必须由声明表覆盖。夹具/历史读数完全没有这一段时这里返回 False：
+    无法证伪就不擅自判失败，但仍由下文的声明覆盖规则约束。
     """
 
     reference = payload.get("reference") if isinstance(payload, dict) else None
@@ -313,13 +314,15 @@ def material_unverified(payload: Any) -> bool:
     return isinstance(assignment, dict) and bool(assignment.get("unverified_reason"))
 
 
-def check_mass_contract(cfg: dict[str, Any], included: Iterable[str], masses: dict[str, Any]) -> None:
+def check_mass_contract(cfg: dict[str, Any], included: Iterable[str], masses: dict[str, Any]) -> list[str]:
     """质量来源的模式合同（生成侧，基于实际纳入的组件）。
 
     * ``documented_table``：每个被纳入的组件都必须有声明质量；缺一个即拒绝，
       不能让某个组件悄悄落回 CAD 的默认密度占位值。
     * 任何模式：声明表里出现未被纳入的组件（拼错/改名）即拒绝——静默忽略等于质量没生效。
-    * ``cad``：质量只能来自**已验证材料**的读数；原始读数明确记录了材料未验证时拒绝。
+    * ``cad``：材料未验证属于**可警告缺陷**：读数与几何原样保留（不猜密度、不替换
+      数值），组件名返回给调用方记录成非阻塞警告；独立校验据此要求"使用未验证读数
+      必须留下警告记录"。
     """
 
     documented = dict(cfg.get("documented_masses") or {})
@@ -338,14 +341,42 @@ def check_mass_contract(cfg: dict[str, Any], included: Iterable[str], masses: di
                 "documented_table requires a mass for every included component",
                 {"missing": missing[:20]},
             )
-        return
-    unverified = sorted(name for name in included_set if material_unverified(masses.get(name)))
-    if unverified:
-        raise ConfigError(
-            "CAD mass came from an unverified material (default density is not evidence); "
-            "assign materials or declare documented masses",
-            {"unverified_material": unverified[:20], "material_source": mode},
-        )
+        return []
+    return sorted(name for name in included_set if material_unverified(masses.get(name)))
+
+
+def _material_warnings(unverified: Sequence[str], masses: dict[str, Any]) -> list[dict[str, Any]]:
+    """非阻塞警告：CAD 质量来自未经验证的材料（默认密度不是证据）。
+
+    读数保持原样——不猜密度、不替换数值；警告只保证下游无法把默认密度误当证据，
+    每个组件的原因逐字来自原始读数。
+    """
+
+    reasons = sorted(
+        {
+            str(
+                (((masses.get(name) or {}).get("reference") or {}).get("material_assignment") or {}).get(
+                    "unverified_reason"
+                )
+                or ""
+            )
+            for name in unverified
+        }
+        - {""}
+    )
+    return [
+        {
+            "code": "cad_material_provenance_missing",
+            "message": (
+                "CAD mass was measured from solids without an explicit physical material; "
+                "the document's default density is not evidence, and the values are kept "
+                "exactly as measured"
+            ),
+            "components": [str(name) for name in unverified],
+            "unverified_reasons": reasons,
+            "blocking": False,
+        }
+    ]
 
 
 def build_scene(
@@ -363,9 +394,9 @@ def build_scene(
         raise ConfigError("native discovery must define the rigid bodies")
 
     # 质量模式合同用**实际读数**复核（配置层只能查到声明层）：documented_table 必须覆盖
-    # 每个被纳入的组件；任何模式都不允许把"未验证材料"的 CAD 质量当作可用读数。
+    # 每个被纳入的组件；cad 模式下"材料未验证"的读数保留原值，但必须带警告记录。
     included = {str(item) for body in bodies for item in (body.get("components") or [])}
-    check_mass_contract(cfg, included, masses)
+    unverified_material = check_mass_contract(cfg, included, masses)
 
     links: list[dict[str, Any]] = []
     link_frames: dict[str, tuple[Matrix3, Vector3, str | None]] = {}
@@ -465,6 +496,19 @@ def build_scene(
                 "rpy": [float(value) for value in rpy_from_matrix(rotation_root)],
                 "source": f"cad_coordinate_system:{reference}",
             }
+    scene_provenance: dict[str, Any] = {
+        "provider": "solidworks",
+        "assembly": cfg.get("assembly"),
+        "configuration": cfg.get("configuration"),
+        "bodies_source": "native_derived",
+        "coordinate_systems_read": sorted((raw_scene.coordinate_systems or {}).keys()),
+        # every native entity that a consumer must account for; the common
+        # layer checks that the links below cover exactly this set
+        "expected_entities": sorted(placements),
+        "world_from_root": world_from_root,
+    }
+    if unverified_material:
+        scene_provenance["warnings"] = _material_warnings(unverified_material, masses)
     return {
         "schema_version": SCENE_SCHEMA,
         "name": cfg.get("robot_name", "robot"),
@@ -477,17 +521,7 @@ def build_scene(
         "constraints": list(cfg.get("constraints") or []),
         "control": dict(cfg.get("control") or {}),
         "contact_excludes": list(cfg.get("contact_excludes") or []),
-        "provenance": {
-            "provider": "solidworks",
-            "assembly": cfg.get("assembly"),
-            "configuration": cfg.get("configuration"),
-            "bodies_source": "native_derived",
-            "coordinate_systems_read": sorted((raw_scene.coordinate_systems or {}).keys()),
-            # every native entity that a consumer must account for; the common
-            # layer checks that the links below cover exactly this set
-            "expected_entities": sorted(placements),
-            "world_from_root": world_from_root,
-        },
+        "provenance": scene_provenance,
     }
 
 
