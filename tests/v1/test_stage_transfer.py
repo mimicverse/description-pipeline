@@ -120,6 +120,20 @@ def capture_root(base: Path, *, run_id: str = RUN_ID, handoff: str = HANDOFF, ma
     )
     write_json(root / "reports/native-tool.json", native_tool())
     write_json(root / "reports/native-stages.json", stage_view(run_id=run_id, handoff=handoff))
+    # The native capture stamps the structural-team reports beside the sealed payload; they
+    # must travel with the archive so the Linux side can always hand them to the team.
+    write_json(
+        root / "reports/structural-team.json",
+        {
+            "schema_version": "solidworks-to-urdf.structural-report/v1",
+            "run_id": run_id,
+            "state": "native_complete",
+            "main_assembly": main,
+            "summary": {"warnings": 0, "blockers": 0},
+            "findings": [],
+        },
+    )
+    (root / "reports/structural-team.md").write_text("# Structural team report\n\nNo findings.\n", encoding="utf-8")
     return root
 
 
@@ -225,6 +239,9 @@ class StageTransferTests(unittest.TestCase):
         self.assertEqual(admitted, manifest)
         installed = {path.relative_to(destination).as_posix() for path in destination.rglob("*") if path.is_file()}
         self.assertEqual(installed, set(manifest["files"]) | {transfer.CAPTURE_MANIFEST})
+        for name in ("reports/structural-team.md", "reports/structural-team.json"):
+            self.assertIn(name, manifest["files"])
+            self.assertEqual(file_digest(destination / name), file_digest(self.root / name))
         self.assertEqual(
             file_digest(destination / "reports/native-tool.json"),
             manifest["files"]["reports/native-tool.json"],

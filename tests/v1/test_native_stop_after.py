@@ -128,6 +128,8 @@ class StopAfterRunTests(unittest.TestCase):
         with zipfile.ZipFile(archive) as opened:
             names = opened.namelist()
         self.assertIn("reports/native-stages.json", names)
+        self.assertIn("reports/structural-team.md", names)
+        self.assertIn("reports/structural-team.json", names)
         self.assertNotIn("reports/stages.json", names)
         self.assertNotIn("reports/run.json", names)
         destination = self.root / "admitted"
@@ -143,6 +145,13 @@ class StopAfterRunTests(unittest.TestCase):
             (destination / "reports" / "native-stages.json").read_bytes(),
             native_stages.read_bytes(),
         )
+        # The structural-team report of this capture-only run is sealed into the payload and
+        # reinstalled byte-for-byte beside it.
+        for name in ("structural-team.md", "structural-team.json"):
+            self.assertEqual(
+                (destination / "reports" / name).read_bytes(),
+                (self.output / "reports" / name).read_bytes(),
+            )
 
     def test_generate_stop_installs_unverified_checkpoint(self) -> None:
         seed = make_seed(self.root)

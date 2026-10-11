@@ -45,6 +45,9 @@ MAX_MANIFEST_BYTES = 64 * 1024**2
 #: The immutable native provenance reports; the live ``reports/stages.json`` view is a Linux-side
 #: artifact and is deliberately excluded from the transfer payload.
 _REQUIRED_REPORTS = ("reports/input.json", "reports/native-tool.json", "reports/native-stages.json")
+#: The structural-team reports generated beside the native capture; they travel with the sealed
+#: payload so the Linux side can always hand them to the structural team.
+_TEAM_REPORTS = ("reports/structural-team.md", "reports/structural-team.json")
 #: Known mutable receipts stamped by the endpoint; sealing ignores them, never transfers them.
 _LIVE_REPORTS = ("reports/stages.json", "reports/run.json")
 
@@ -59,9 +62,9 @@ def _require(condition, message: str) -> None:
 
 
 def _allowed_payload(name: str) -> bool:
-    """Only the archived input, the evidence snapshot and the three reports are payload."""
+    """Only the archived input, the evidence snapshot and the sealed reports are payload."""
 
-    return name.startswith(("input/", "evidence/")) or name in _REQUIRED_REPORTS
+    return name.startswith(("input/", "evidence/")) or name in _REQUIRED_REPORTS or name in _TEAM_REPORTS
 
 
 def _is_sha256(value) -> bool:
