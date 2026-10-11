@@ -72,64 +72,73 @@ def _pid_occurrence(row, components, raw):
         component=row["name2"],
     )
     left, right = row.get("source_provenance"), component.get("source_provenance")
-    if left is None and right is None:
-        return component
-    _require(
-        isinstance(left, dict) and isinstance(right, dict),
-        "v14.imported_binding",
-        "PID and occurrence imported-source proofs differ",
-        component=row["name2"],
-    )
-    if right.get("state") == "cached_materialization":
-        # A cached native materialization is a complete identity without a confined
-        # package document: the PID document is the occurrence's own engine-resolved
-        # session materialization, spelled exactly as the active walk records it, and
-        # the delivered bytes binding lives in the sealed selection carrier.
-        from .native_discovery import _cached_materialization_reason, _session_temp_path  # noqa: PLC0415
+    if left is not None or right is not None:
+        _require(
+            isinstance(left, dict) and isinstance(right, dict),
+            "v14.imported_binding",
+            "PID and occurrence imported-source proofs differ",
+            component=row["name2"],
+        )
+        if right.get("state") == "cached_materialization":
+            # A cached native materialization is a complete identity without a confined
+            # package document: the PID document is the occurrence's own engine-resolved
+            # session materialization, spelled exactly as the active walk records it, and
+            # the delivered bytes binding lives in the sealed selection carrier.
+            from .native_discovery import _cached_materialization_reason, _session_temp_path  # noqa: PLC0415
 
-        materialization = right.get("materialization_path")
-        session_root = right.get("session_temp_root")
-        _require(
-            left.get("state") == "cached_materialization"
-            and left.get("kind") == right.get("kind")
-            and left.get("used_api") == right.get("used_api")
-            and left.get("materialization_path") == materialization
-            and left.get("session_temp_root") == session_root
-            and left.get("is_virtual") == right.get("is_virtual"),
-            "v14.imported_binding",
-            "the PID and the active occurrence record different cached materializations",
-            component=row["name2"],
-        )
-        _require(
-            isinstance(materialization, str)
-            and _session_temp_path(materialization, session_root)
-            and document == materialization.replace("/", "\\").strip().lower(),
-            "v14.imported_binding",
-            "the cached PID document is not the recorded session temp materialization",
-            component=row["name2"],
-        )
-        author = right.get("author_imported_path")
-        _require(
-            author is None or (isinstance(author, str) and bool(author)),
-            "v14.imported_binding",
-            "the cached occurrence author metadata is unreadable",
-            component=row["name2"],
-        )
-        carrier = raw.get("source_selection")
-        closure = carrier.get("closure") if isinstance(carrier, dict) else None
-        slots = [
-            item
-            for item in (closure.get("imports") if isinstance(closure, dict) else None) or []
-            if isinstance(item, dict) and item.get("state") == "cached_materialization"
-        ]
-        reason = _cached_materialization_reason(component, right, slots, set(), carrier, raw.get("files") or {})
-        _require(
-            reason is None,
-            "v14.imported_binding",
-            reason or "the cached occurrence is not covered by the sealed selection carrier",
-            component=row["name2"],
-        )
-        return component
+            materialization = right.get("materialization_path")
+            session_root = right.get("session_temp_root")
+            _require(
+                left.get("state") == "cached_materialization"
+                and left.get("kind") == right.get("kind")
+                and left.get("used_api") == right.get("used_api")
+                and left.get("materialization_path") == materialization
+                and left.get("session_temp_root") == session_root
+                and left.get("is_virtual") == right.get("is_virtual"),
+                "v14.imported_binding",
+                "the PID and the active occurrence record different cached materializations",
+                component=row["name2"],
+            )
+            if left.get("author_imported_path") is not None and right.get("author_imported_path") is not None:
+                _require(
+                    left.get("author_imported_path") == right.get("author_imported_path")
+                    and left.get("author_imported_in_source_root") == right.get("author_imported_in_source_root")
+                    and left.get("author_imported_relative") == right.get("author_imported_relative"),
+                    "v14.imported_binding",
+                    "the PID and the active occurrence record different author metadata",
+                    component=row["name2"],
+                )
+            _require(
+                isinstance(materialization, str)
+                and _session_temp_path(materialization, session_root)
+                and document == materialization.replace("/", "\\").strip().lower(),
+                "v14.imported_binding",
+                "the cached PID document is not the recorded session temp materialization",
+                component=row["name2"],
+            )
+            author = right.get("author_imported_path")
+            _require(
+                author is None or (isinstance(author, str) and bool(author)),
+                "v14.imported_binding",
+                "the cached occurrence author metadata is unreadable",
+                component=row["name2"],
+            )
+            carrier = raw.get("source_selection")
+            closure = carrier.get("closure") if isinstance(carrier, dict) else None
+            slots = [
+                item
+                for item in (closure.get("imports") if isinstance(closure, dict) else None) or []
+                if isinstance(item, dict) and item.get("state") == "cached_materialization"
+            ]
+            reason = _cached_materialization_reason(component, right, slots, set(), carrier, raw.get("files") or {})
+            _require(
+                reason is None,
+                "v14.imported_binding",
+                reason or "the cached occurrence is not covered by the sealed selection carrier",
+                component=row["name2"],
+            )
+            return component
+    # Non-cached documents must stay confined package paths, with or without provenance.
     _require(
         not PurePosixPath(document).is_absolute()
         and ".." not in PurePosixPath(document).parts
@@ -139,6 +148,8 @@ def _pid_occurrence(row, components, raw):
         "the occurrence document is not a confined package path",
         component=row["name2"],
     )
+    if left is None and right is None:
+        return component
     fields = ("state", "kind", "used_api", "document", "sha256", "is_virtual", "source_root", "imported_path")
     _require(
         all(left.get(key) == right.get(key) for key in fields),

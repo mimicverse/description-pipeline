@@ -326,15 +326,28 @@ class NativeDeclarationsTests(unittest.TestCase):
             "root_mismatch": {"session_temp_root": r"C:\Users\33985\AppData\Local\Temp\swx99999"},
             "not_cached_in_pid": {"state": "unread"},
             "external_document": {"materialization_path": r"D:\author\NP-F550.step"},
+            "author_metadata_divergence": {"author_imported_path": r"D:\elsewhere\NP-F550.step"},
         }
         for label, patch in cases.items():
             with self.subTest(case=label):
                 candidate = copy.deepcopy(raw)
-                candidate["exporter"]["pid_bindings"][-1]["source_provenance"].update(patch)
+                candidate["exporter"]["pid_bindings"][2]["source_provenance"].update(patch)
                 self.assertIn("v14.imported_binding", self.errors(candidate), patch)
         candidate = copy.deepcopy(raw)
         candidate["source_selection"]["closure"]["imports"] = []
         self.assertIn("v14.imported_binding", self.errors(candidate))
+
+    def test_unproven_absolute_document_stays_refused_without_provenance(self):
+        """A provenance-less PID document must still be a confined package path."""
+
+        raw = fixture()
+        row = raw["exporter"]["pid_bindings"][2]
+        item = next(entry for entry in raw["components"] if entry["name2"] == row["name2"])
+        row.pop("source_provenance", None)
+        item.pop("source_provenance", None)
+        row.update(document=r"C:\external\tool_part.SLDPRT")
+        item.update(document=r"C:\external\tool_part.SLDPRT")
+        self.assertIn("v14.pid_binding", self.errors(raw))
 
     def test_serialized_origin_is_claim_only_when_customized(self):
         raw = fixture()  # stored origin differs from native datums, but isCustomized=false
