@@ -946,48 +946,77 @@ class ClientTests(unittest.TestCase):
         self.assertIn("request conflict (409)", str(failure))
         self.assertIn("selection is bound to another run", str(failure))
 
-    def test_structural_report_downloads_hash_bound_artifacts(self) -> None:
+    def test_failure_diagnostics_downloads_hash_bound_members(self) -> None:
         from description_pipeline.orchestration.airflow_client import (
             EndpointNotFound,
-            _validate_structural_report,
+            _validate_failure_diagnostics,
         )
 
-        markdown = b"# structural team report\n"
-        payload = b'{"schema_version": "solidworks-to-urdf.structural-team/v1"}'
-        with MockEndpoint() as server:
-            server.artifacts["reports/structural-team.md"] = markdown
-            server.artifacts["reports/structural-team.json"] = payload
-            endpoint = self.endpoint(server)
-            job = {
-                "structural_report": {
-                    "markdown": {
-                        "path": "reports/structural-team.md",
-                        "sha256": hashlib.sha256(markdown).hexdigest(),
-                    },
-                    "json": {
-                        "path": "reports/structural-team.json",
-                        "sha256": hashlib.sha256(payload).hexdigest(),
-                    },
-                }
+        receipt = json.dumps({"run_id": RUN_ID, "error": "boom", "main_assembly": "robot.SLDASM"}).encode()
+        evidence = b'{"findings": []}'
+        manifest = json.dumps(
+            {
+                "schema": "solidworks-to-urdf.failure-diagnostics/v1",
+                "run_id": RUN_ID,
+                "receipt": {"path": "receipt.json", "sha256": hashlib.sha256(receipt).hexdigest()},
+                "files": {"input/discovery/findings.json": hashlib.sha256(evidence).hexdigest()},
             }
+        ).encode()
+        with MockEndpoint() as server:
+            server.artifacts["diagnostic.json"] = manifest
+            server.artifacts["receipt.json"] = receipt
+            server.artifacts["evidence/input/discovery/findings.json"] = evidence
+            endpoint = self.endpoint(server)
+            job = {"failure_diagnostics": {"path": "diagnostic.json", "sha256": hashlib.sha256(manifest).hexdigest()}}
             with tempfile.TemporaryDirectory() as tmp:
-                written = endpoint.download_structural_report(RUN_ID, job, Path(tmp))
-                self.assertEqual(Path(written["markdown"]).read_bytes(), markdown)
-                self.assertEqual(Path(written["json"]).read_bytes(), payload)
-                tampered = {
-                    "structural_report": {
-                        **job["structural_report"],
-                        "markdown": {**job["structural_report"]["markdown"], "sha256": "0" * 64},
-                    }
-                }
+                written = endpoint.download_failure_diagnostics(RUN_ID, job, Path(tmp))
+                self.assertEqual(Path(written["receipt.json"]).read_bytes(), receipt)
+                self.assertEqual(Path(written["evidence/input/discovery/findings.json"]).read_bytes(), evidence)
+                self.assertEqual(Path(written["diagnostic.json"]).read_bytes(), manifest)
+                tampered = {"failure_diagnostics": {"path": "diagnostic.json", "sha256": "0" * 64}}
                 with self.assertRaises(EndpointProtocolError):
-                    endpoint.download_structural_report(RUN_ID, tampered, Path(tmp) / "tampered")
+                    endpoint.download_failure_diagnostics(RUN_ID, tampered, Path(tmp) / "tampered")
                 with self.assertRaises(EndpointNotFound):
-                    endpoint.download_structural_report(RUN_ID, {}, Path(tmp) / "absent")
+                    endpoint.download_failure_diagnostics(RUN_ID, {}, Path(tmp) / "absent")
+                with self.assertRaises(EndpointProtocolError):
+                    endpoint.download_failure_diagnostics(RUN_ID, job, Path(tmp) / "tiny", limit=8)
         with self.assertRaises(EndpointProtocolError):
-            _validate_structural_report(
-                {"structural_report": {"markdown": {"path": "other.md", "sha256": "0" * 64}, "json": {}}}
+            _validate_failure_diagnostics(
+                {"failure_diagnostics": {"path": "other.json", "sha256": "0" * 64}}
             )
+
+    def test_failure_diagnostics_refuses_cross_run_receipt_and_unknown_members(self) -> None:
+        foreign = b'{"run_id": "not-this-run", "error": "boom"}'
+        manifest = json.dumps(
+            {
+                "schema": "solidworks-to-urdf.failure-diagnostics/v1",
+                "run_id": RUN_ID,
+                "receipt": {"path": "receipt.json", "sha256": hashlib.sha256(foreign).hexdigest()},
+                "files": {},
+            }
+        ).encode()
+        with MockEndpoint() as server:
+            server.artifacts["diagnostic.json"] = manifest
+            server.artifacts["receipt.json"] = foreign
+            endpoint = self.endpoint(server)
+            job = {"failure_diagnostics": {"path": "diagnostic.json", "sha256": hashlib.sha256(manifest).hexdigest()}}
+            with tempfile.TemporaryDirectory() as tmp, self.assertRaises(EndpointProtocolError):
+                endpoint.download_failure_diagnostics(RUN_ID, job, Path(tmp))
+
+        unknown = json.dumps(
+            {
+                "schema": "solidworks-to-urdf.failure-diagnostics/v1",
+                "run_id": RUN_ID,
+                "receipt": {"path": "receipt.json", "sha256": hashlib.sha256(foreign).hexdigest()},
+                "files": {"notes/extra.json": "0" * 64},
+            }
+        ).encode()
+        with MockEndpoint() as server:
+            server.artifacts["diagnostic.json"] = unknown
+            endpoint = self.endpoint(server)
+            job = {"failure_diagnostics": {"path": "diagnostic.json", "sha256": hashlib.sha256(unknown).hexdigest()}}
+            with tempfile.TemporaryDirectory() as tmp, self.assertRaises(EndpointProtocolError):
+                endpoint.download_failure_diagnostics(RUN_ID, job, Path(tmp))
 
     def test_start_rejects_a_different_echoed_request(self) -> None:
         response = {

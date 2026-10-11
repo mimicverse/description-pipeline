@@ -276,7 +276,7 @@ class Jobs:
                         error="Endpoint restarted during native execution; inspect diagnostics and use a new run_id",
                     )
                     self._clear_activity(job)
-                    self._structural_report(job)
+                    self._seal_failure_diagnostics(job)
                     self._save(job)
                 elif job["status"] == "queued":
                     self.selection_locks[identifier] = threading.RLock()
@@ -290,12 +290,41 @@ class Jobs:
     def _save(self, job):
         write_json(self.directory / (job["run_id"] + ".json"), job)
 
-    def _structural_report(self, job):
-        from ..structural_report import write_structural_report
+    def _seal_failure_diagnostics(self, job):
+        """Seal the raw failure diagnostics; the Linux side renders the report from these bytes."""
 
-        root = self.config["state_root"] / "structural_reports" / job["run_id"]
+        from ..structural_report import DIAGNOSTIC_SCHEMA, sealable_diagnostic_files
+
+        run_id = job["run_id"]
+        root = self.config["state_root"] / "diagnostics" / run_id
+        if root.exists():
+            shutil.rmtree(root)
+        root.mkdir(parents=True)
+        receipt = root / "receipt.json"
+        staged = copy.deepcopy(job)
+        staged.pop("failure_diagnostics", None)
+        write_json(receipt, staged)
         evidence = self._delivery_dir(job)
-        job["structural_report"] = write_structural_report(root, job, evidence_root=evidence)
+        files: dict[str, str] = {}
+        for name in sealable_diagnostic_files(evidence):
+            source = confined(Path(evidence), name)
+            target = confined(root / "evidence", name, exists=False)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            with target.open("rb") as stream:
+                files[name] = hashlib.file_digest(stream, "sha256").hexdigest()
+        with receipt.open("rb") as stream:
+            receipt_digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        manifest = {
+            "schema": DIAGNOSTIC_SCHEMA,
+            "run_id": run_id,
+            "receipt": {"path": "receipt.json", "sha256": receipt_digest},
+            "files": files,
+        }
+        write_json(root / "diagnostic.json", manifest)
+        with (root / "diagnostic.json").open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        job["failure_diagnostics"] = {"path": "diagnostic.json", "sha256": digest}
 
     def validate(self, request):
         expected = {"run_id", "upload_files", "upload_sha256", "main_assembly"}
@@ -638,21 +667,37 @@ class Jobs:
 
     def artifact(self, identifier, name):
         job = self.snapshot(identifier)
-        reports = job.get("structural_report") or {}
-        report = next(
-            (entry for entry in reports.values() if isinstance(entry, dict) and name == entry.get("path")), None
-        )
-        if report is not None:
-            path = confined(self.config["state_root"] / "structural_reports" / identifier, name)
-            stream = path.open("rb")
-            try:
-                if hashlib.file_digest(stream, "sha256").hexdigest() != report.get("sha256"):
-                    raise RequestError("Structural report differs from its recorded digest", 409)
-                stream.seek(0)
-                return stream, os.fstat(stream.fileno()).st_size
-            except BaseException:
-                stream.close()
-                raise
+        diagnostics = job.get("failure_diagnostics")
+        if isinstance(diagnostics, dict) and diagnostics.get("path") == "diagnostic.json":
+            from ..structural_report import is_sealed_diagnostic_member
+
+            root = self.config["state_root"] / "diagnostics" / identifier
+            manifest = json.loads(confined(root, "diagnostic.json").read_text(encoding="utf-8"))
+            allowed: dict[str, str] = {"diagnostic.json": diagnostics.get("sha256")}
+            receipt_entry = manifest.get("receipt") if isinstance(manifest, dict) else None
+            if isinstance(receipt_entry, dict) and receipt_entry.get("path") == "receipt.json":
+                allowed["receipt.json"] = receipt_entry.get("sha256")
+            files = manifest.get("files") if isinstance(manifest, dict) else None
+            if isinstance(files, dict):
+                for relative, checksum in files.items():
+                    if (
+                        isinstance(relative, str)
+                        and isinstance(checksum, str)
+                        and is_sealed_diagnostic_member(relative)
+                    ):
+                        allowed[f"evidence/{relative}"] = checksum
+            expected = allowed.get(name)
+            if isinstance(expected, str):
+                path = confined(root, name)
+                stream = path.open("rb")
+                try:
+                    if hashlib.file_digest(stream, "sha256").hexdigest() != expected:
+                        raise RequestError("Failure diagnostics differ from their recorded digest", 409)
+                    stream.seek(0)
+                    return stream, os.fstat(stream.fileno()).st_size
+                except BaseException:
+                    stream.close()
+                    raise
         record = job.get("native_record")
         if isinstance(record, dict) and name == record.get("name"):
             path = confined(self.config["state_root"] / "native_records" / identifier, name)
@@ -967,7 +1012,7 @@ class Jobs:
             if isinstance(discovery, dict) and discovery.get("passed") is False:
                 job["discovery"] = copy.deepcopy(discovery)
             self._clear_activity(job)
-            self._structural_report(job)
+            self._seal_failure_diagnostics(job)
             self._save(job)
             self.condition.notify_all()
         return self.snapshot(identifier)
@@ -1254,7 +1299,7 @@ class Jobs:
                             if result.get(key) is not None:
                                 job[key] = result[key]
                     if job["status"] == "failed":
-                        self._structural_report(job)
+                        self._seal_failure_diagnostics(job)
             except Exception as error:
                 with self.mutex:
                     if job["status"] != "failed":
@@ -1267,14 +1312,14 @@ class Jobs:
                             job["detail"] = error.detail
                         elif isinstance(getattr(error, "details", None), dict):
                             job["detail"] = error.details
-                    self._structural_report(job)
+                    self._seal_failure_diagnostics(job)
             finally:
                 with self.mutex:
                     if job["status"] == "failed" and (not job["events"] or job["events"][-1]["state"] != "failed"):
                         phase = (job["events"][-1] if job["events"] else {}).get("stage", "freeze")
                         self._event(identifier, {"stage": phase, "state": "failed", "error": job.get("error")})
                     job["completed_at"] = datetime.now(UTC).isoformat()
-                    self._structural_report(job)
+                    self._seal_failure_diagnostics(job)
                     self._save(job)
                 self.queue.task_done()
 

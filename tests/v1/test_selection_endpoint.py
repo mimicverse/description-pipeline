@@ -228,8 +228,8 @@ class SelectionEndpointTests(unittest.TestCase):
             time.sleep(0.02)
 
     def await_report(self, jobs: Jobs, identifier: str, snapshot: dict, *, timeout: float = 5.0) -> dict:
-        """A terminal snapshot must already carry its downloadable failure report."""
-        self.assertIsNotNone(snapshot.get("structural_report"))
+        """A terminal snapshot must already carry its sealed failure diagnostics."""
+        self.assertIsNotNone(snapshot.get("failure_diagnostics"))
         return snapshot
 
     def observe_events(self) -> list:
@@ -317,7 +317,7 @@ class SelectionEndpointTests(unittest.TestCase):
         snapshot = restarted.snapshot(identifier)
         self.assertEqual(snapshot["status"], "failed")
         self.assertIn("restart", snapshot["error"].lower())
-        self.assertIsNotNone(snapshot.get("structural_report"))
+        self.assertIsNotNone(snapshot.get("failure_diagnostics"))
         self.assertEqual(self.observe_events(), [])
         self.assertEqual(self.sentinel.calls, [])
         with self.assertRaises(RequestError) as caught:
@@ -338,14 +338,21 @@ class SelectionEndpointTests(unittest.TestCase):
         self.assertEqual(snapshot["selection"]["state"], "sealed")
         self.assertEqual(snapshot["selection"]["staged_files"], self.upload_files)
         self.assertEqual(snapshot["selection"]["manifest"], self.expected_manifest())
-        receipt = snapshot.get("structural_report") or {}
-        self.assertEqual(set(receipt), {"markdown", "json"})
-        self.assertEqual(receipt["markdown"]["path"], "reports/structural-team.md")
-        self.assertEqual(receipt["json"]["path"], "reports/structural-team.json")
-        for kind in ("markdown", "json"):
-            report = self.root / "state" / "structural_reports" / identifier / receipt[kind]["path"]
-            self.assertTrue(report.is_file())
-            self.assertEqual(file_digest(report), receipt[kind]["sha256"])
+        receipt = snapshot.get("failure_diagnostics") or {}
+        self.assertEqual(set(receipt), {"path", "sha256"})
+        self.assertEqual(receipt["path"], "diagnostic.json")
+        root = self.root / "state" / "diagnostics" / identifier
+        manifest_path = root / "diagnostic.json"
+        self.assertTrue(manifest_path.is_file())
+        self.assertEqual(file_digest(manifest_path), receipt["sha256"])
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["schema"], "solidworks-to-urdf.failure-diagnostics/v1")
+        self.assertEqual(manifest["run_id"], identifier)
+        self.assertEqual(file_digest(root / "receipt.json"), manifest["receipt"]["sha256"])
+        for relative, checksum in manifest["files"].items():
+            self.assertEqual(file_digest(root / "evidence" / relative), checksum)
+        # The native host stores raw diagnostics only: no report is rendered here.
+        self.assertFalse((self.root / "state" / "structural_reports").exists())
 
     def test_identical_staging_retry_does_not_requery(self) -> None:
         self.reader_wait = threading.Event()
@@ -376,10 +383,27 @@ class SelectionEndpointTests(unittest.TestCase):
         self.assertEqual(snapshot["detail"]["problems"][0]["problem"], "outside_stage")
         self.assertEqual(snapshot["selection"]["state"], "reading")
         self.assertEqual(self.sentinel.calls, [])
-        receipt = snapshot.get("structural_report") or {}
-        self.assertEqual(set(receipt), {"markdown", "json"})
-        markdown = self.root / "state" / "structural_reports" / identifier / receipt["markdown"]["path"]
-        self.assertEqual(file_digest(markdown), receipt["markdown"]["sha256"])
+        receipt = snapshot.get("failure_diagnostics") or {}
+        self.assertEqual(set(receipt), {"path", "sha256"})
+        root = self.root / "state" / "diagnostics" / identifier
+        self.assertEqual(file_digest(root / "diagnostic.json"), receipt["sha256"])
+        manifest = json.loads((root / "diagnostic.json").read_text(encoding="utf-8"))
+        self.assertEqual(file_digest(root / "receipt.json"), manifest["receipt"]["sha256"])
+
+    def test_sealed_failure_diagnostics_render_on_linux(self) -> None:
+        from description_pipeline.structural_report import build_structural_report
+
+        identifier = self.create()
+        self.jobs.submit_files(identifier, self.archive())
+        snapshot = self.wait_failed(self.jobs, identifier)
+        self.await_report(self.jobs, identifier, snapshot)
+        root = self.root / "state" / "diagnostics" / identifier
+        receipt = json.loads((root / "receipt.json").read_text(encoding="utf-8"))
+        report = build_structural_report(receipt, evidence_root=root / "evidence")
+        self.assertEqual(report["summary"]["blockers"], 1)
+        blocker = next(item for item in report["findings"] if item["source"] == "run/error")
+        self.assertEqual(blocker["severity"], "blocker")
+        self.assertTrue(str(blocker["object"] or "").strip())
 
     def test_closure_evidence_forgeries_are_refused(self) -> None:
         def drop_stage_root(evidence):

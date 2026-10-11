@@ -567,21 +567,27 @@ def _record_block(record: AwaitingDefinition | dict) -> dict:
     return _native_record_block(record)
 
 
-def _validate_structural_report(job: dict) -> dict | None:
-    """The hash-bound structural-team report receipt of one job, or None when absent."""
+def _validate_failure_diagnostics(job: dict) -> dict | None:
+    """The hash-bound raw failure-diagnostics receipt of one job, or None when absent."""
 
-    value = job.get("structural_report")
+    value = job.get("failure_diagnostics")
     if value is None:
         return None
-    if not isinstance(value, dict) or set(value) != {"markdown", "json"}:
-        raise EndpointProtocolError("structural_report must carry exactly markdown and json receipts")
-    receipt: dict[str, dict] = {}
-    for kind, path in (("markdown", "reports/structural-team.md"), ("json", "reports/structural-team.json")):
-        entry = value.get(kind)
-        if not isinstance(entry, dict) or set(entry) != {"path", "sha256"} or entry.get("path") != path:
-            raise EndpointProtocolError(f"structural_report {kind} must name {path}")
-        receipt[kind] = {"path": path, "sha256": validate_sha256(entry.get("sha256"))}
-    return receipt
+    if not isinstance(value, dict) or set(value) != {"path", "sha256"} or value.get("path") != "diagnostic.json":
+        raise EndpointProtocolError("failure_diagnostics must name diagnostic.json with its sha256")
+    return {"path": "diagnostic.json", "sha256": validate_sha256(value.get("sha256"))}
+
+
+def _sealed_diagnostic_member(relative: object) -> str | None:
+    """One allowlisted sealed member name, or None when it is unsafe or unknown."""
+
+    from ..structural_report import is_sealed_diagnostic_member
+
+    if not isinstance(relative, str) or not relative or "\\" in relative or relative.startswith("/"):
+        return None
+    if any(part in {"", ".", ".."} for part in relative.split("/")):
+        return None
+    return relative if is_sealed_diagnostic_member(relative) else None
 
 
 def _awaiting_definition(job: dict, *, upload_files: dict[str, str] | None = None) -> AwaitingDefinition:
@@ -836,50 +842,124 @@ class WindowsEndpoint:
             raise EndpointProtocolError(f"unexpected job status: {response.get('status')!r}")
         return response
 
-    def download_structural_report(
+    def download_failure_diagnostics(
         self, run_id: str, job: dict, destination: Path, *, limit: int = MAX_TRANSFER_BYTES
     ) -> dict:
-        """Stream the hash-bound structural-team report artifacts next to the run evidence."""
+        """Stream the hash-bound raw failure diagnostics of one failed job.
 
-        receipt = _validate_structural_report(job)
+        The bundle carries the exact sealed receipt and supporting evidence files
+        the Linux side renders the structural-team report from; the native host
+        never writes the report itself.  ``limit`` bounds the whole bundle,
+        manifest included.
+        """
+
+        from ..structural_report import DIAGNOSTIC_SCHEMA
+
+        receipt = _validate_failure_diagnostics(job)
         if receipt is None:
-            raise EndpointNotFound("this run carries no structural-team report")
+            raise EndpointNotFound("this run carries no failure diagnostics")
         if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
-            raise EndpointProtocolError("report size limit must be a positive integer")
+            raise EndpointProtocolError("diagnostics size limit must be a positive integer")
+        canonical = validate_run_id(run_id)
         destination = Path(destination)
         destination.mkdir(parents=True, exist_ok=True)
+        manifest_bytes = self._read_artifact(
+            canonical, receipt["path"], receipt["sha256"], limit=min(limit, 1 << 22)
+        )
+        try:
+            manifest = json.loads(manifest_bytes)
+        except ValueError as error:
+            raise EndpointProtocolError("failure diagnostics manifest is not JSON") from error
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("schema") != DIAGNOSTIC_SCHEMA
+            or manifest.get("run_id") != canonical
+        ):
+            raise EndpointProtocolError("failure diagnostics manifest is invalid")
+        receipt_entry = manifest.get("receipt")
+        if not isinstance(receipt_entry, dict) or receipt_entry.get("path") != "receipt.json":
+            raise EndpointProtocolError("failure diagnostics carry no receipt entry")
+        files = manifest.get("files")
+        if not isinstance(files, dict):
+            raise EndpointProtocolError("failure diagnostics carry no file list")
+        members: dict[str, str] = {"receipt.json": validate_sha256(receipt_entry.get("sha256"))}
+        for relative, checksum in files.items():
+            safe = _sealed_diagnostic_member(relative)
+            if safe is None:
+                raise EndpointProtocolError(f"failure diagnostics name an unsafe or unknown member: {relative!r}")
+            members[f"evidence/{safe}"] = validate_sha256(checksum)
+        budget = limit - len(manifest_bytes)
+        if budget < 0:
+            raise EndpointProtocolError("failure diagnostics exceed the configured size limit")
         written: dict[str, str] = {}
-        for kind, entry in receipt.items():
-            name = "structural-team.md" if kind == "markdown" else "structural-team.json"
+        for name, expected in members.items():
             target = destination / name
-            hasher = hashlib.sha256()
-            total = 0
-            with (
-                self.open_artifact(run_id, entry["path"]) as response,
-                tempfile.NamedTemporaryFile(prefix=f".{name}-", dir=destination, delete=False) as handle,
-            ):
-                temporary = Path(handle.name)
-                try:
-                    while True:
-                        chunk = response.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        total += len(chunk)
-                        if total > limit:
-                            raise EndpointProtocolError("structural report exceeds the configured size limit")
-                        hasher.update(chunk)
-                        handle.write(chunk)
-                except BaseException:
-                    with suppress(OSError):
-                        temporary.unlink()
-                    raise
-            if hasher.hexdigest() != entry["sha256"]:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            self._download_artifact(canonical, name, target, expected, limit=budget)
+            size = target.stat().st_size
+            budget -= size
+            if budget < 0:
+                raise EndpointProtocolError("failure diagnostics exceed the configured size limit")
+            written[name] = str(target)
+        try:
+            sealed_receipt = json.loads((destination / "receipt.json").read_bytes())
+        except ValueError as error:
+            raise EndpointProtocolError("failure diagnostics receipt is not JSON") from error
+        if not isinstance(sealed_receipt, dict) or sealed_receipt.get("run_id") != canonical:
+            raise EndpointProtocolError("failure diagnostics receipt belongs to a different run")
+        (destination / "diagnostic.json").write_bytes(manifest_bytes)
+        written["diagnostic.json"] = str(destination / "diagnostic.json")
+        return written
+
+    def _read_artifact(self, run_id: str, name: str, expected_sha256: str, *, limit: int) -> bytes:
+        """Read one bounded artifact and require its recorded digest."""
+
+        hasher = hashlib.sha256()
+        total = 0
+        chunks: list[bytes] = []
+        with self.open_artifact(run_id, name) as response:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit:
+                    raise EndpointProtocolError(f"artifact {name!r} exceeds the configured size limit")
+                hasher.update(chunk)
+                chunks.append(chunk)
+        if hasher.hexdigest() != expected_sha256:
+            raise EndpointProtocolError(f"artifact {name!r} does not match its recorded digest")
+        return b"".join(chunks)
+
+    def _download_artifact(self, run_id: str, name: str, target: Path, expected_sha256: str, *, limit: int) -> None:
+        """Stream one bounded artifact to disk under its recorded digest."""
+
+        hasher = hashlib.sha256()
+        total = 0
+        with (
+            self.open_artifact(run_id, name) as response,
+            tempfile.NamedTemporaryFile(prefix=f".{target.name}-", dir=target.parent, delete=False) as handle,
+        ):
+            temporary = Path(handle.name)
+            try:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > limit:
+                        raise EndpointProtocolError(f"artifact {name!r} exceeds the configured size limit")
+                    hasher.update(chunk)
+                    handle.write(chunk)
+            except BaseException:
                 with suppress(OSError):
                     temporary.unlink()
-                raise EndpointProtocolError(f"structural report {name} does not match its recorded digest")
-            os.replace(temporary, target)
-            written[kind] = str(target)
-        return written
+                raise
+        if hasher.hexdigest() != expected_sha256:
+            with suppress(OSError):
+                temporary.unlink()
+            raise EndpointProtocolError(f"artifact {name!r} does not match its recorded digest")
+        os.replace(temporary, target)
 
     def abort_job(self, run_id: str, *, error: str, error_code: str, detail: dict | None = None) -> dict:
         """Abort one awaiting-definition job after a local derivation failure; never hangs the endpoint."""

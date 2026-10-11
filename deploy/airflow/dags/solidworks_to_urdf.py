@@ -253,25 +253,44 @@ def _linked_source(retained: object, supplied) -> tuple[dict[str, str], str, str
     return validated, upload_sha256, main
 
 
-def _store_structural_report(endpoint: WindowsEndpoint, request: dict, job: dict) -> None:
-    """Best-effort fetch of the endpoint structural-team report; never masks the failure."""
+def _store_failure_report(endpoint: WindowsEndpoint, request: dict, job: dict) -> None:
+    """Best-effort Linux-rendered structural-team report of one failed native job.
 
-    downloader = getattr(endpoint, "download_structural_report", None)
+    The endpoint seals raw diagnostics only; the report is rendered here, from
+    the hash-bound sealed receipt and evidence, so the native host never writes
+    Markdown.  A fetch or render failure is logged and never masks the run
+    failure itself.
+    """
+
+    from description_pipeline.structural_report import write_structural_report
+
+    downloader = getattr(endpoint, "download_failure_diagnostics", None)
     if downloader is None:
         return
+    run_id = request["run_id"]
     try:
         store = _linux_store(request["conn_id"])
-        written = downloader(request["run_id"], job, store.run_dir(request["run_id"]) / "structural-team")
+        run_dir = store.run_dir(run_id)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=".failure-diagnostics-", dir=run_dir))
+        try:
+            downloader(run_id, job, staging)
+            receipt = read_data(staging / "receipt.json")
+            if not isinstance(receipt, dict) or receipt.get("run_id") != run_id:
+                raise PipelineError("sealed failure diagnostics do not belong to this run")
+            written = write_structural_report(run_dir, receipt, evidence_root=staging / "evidence")
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
         log.info(
             "structural report run_id=%s markdown=%s json=%s",
-            request["run_id"],
+            run_id,
             written.get("markdown"),
             written.get("json"),
         )
     except EndpointNotFound:
-        log.info("structural report run_id=%s absent", request["run_id"])
-    except (AirflowFailException, EndpointError, EndpointProtocolError, PipelineError, OSError) as error:
-        log.warning("structural report unavailable run_id=%s error=%s", request["run_id"], error)
+        log.info("structural report run_id=%s absent", run_id)
+    except (AirflowFailException, EndpointError, EndpointProtocolError, PipelineError, OSError, ValueError) as error:
+        log.warning("structural report unavailable run_id=%s error=%s", run_id, error)
 
 
 def _materialize_selection(intake: Path, files: dict[str, str], target: Path) -> Path:
@@ -496,7 +515,7 @@ def _poke(request: dict, **context) -> bool:
     if job["status"] == "failed":
         result = job.get("result") or {}
         log.error("native diagnostics=%s events=%s", result.get("diagnostic_path"), job["events"])
-        _store_structural_report(endpoint, request, job)
+        _store_failure_report(endpoint, request, job)
         raise AirflowFailException(f"SolidWorks job {request['run_id']} failed: {job.get('error')}")
     return job["status"] in {"passed", "native_complete"}
 

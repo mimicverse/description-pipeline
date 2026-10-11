@@ -15,6 +15,54 @@ from .io import file_digest, read_data, write_json
 REPORT_SCHEMA = "solidworks-to-urdf.structural-report/v1"
 MARKDOWN_PATH = "reports/structural-team.md"
 JSON_PATH = "reports/structural-team.json"
+
+#: Diagnostic-bundle schema the native worker seals and the Linux side renders from.
+DIAGNOSTIC_SCHEMA = "solidworks-to-urdf.failure-diagnostics/v1"
+
+#: Evidence files the report builder projects into findings.
+REPORT_EVIDENCE_FILES = (
+    "reports/input.json",
+    "reports/quality.json",
+    "input/discovery/findings.json",
+    "input/discovery/native-discovery.json",
+    "evidence/raw/dependency_closure.json",
+    "evidence/raw/material_provenance.json",
+)
+
+#: Files sealed for one failed job: the projected evidence plus the snapshot
+#: manifest the builder consults for its fail-closed material checks.
+SEALED_DIAGNOSTIC_FILES = (*REPORT_EVIDENCE_FILES, "evidence/manifest.json")
+
+
+def sealable_diagnostic_files(evidence_root: Path | None) -> list[str]:
+    """Existing diagnostic files of one delivery tree, delivery-relative paths.
+
+    The native side seals exactly these files and the Linux side renders from the
+    same bytes, so no report ever depends on where it was rendered.
+    """
+
+    if evidence_root is None:
+        return []
+    root = Path(evidence_root)
+    names = [name for name in SEALED_DIAGNOSTIC_FILES if (root / name).is_file()]
+    urdf = root / "urdf"
+    if urdf.is_dir():
+        names.extend(sorted(path.relative_to(root).as_posix() for path in urdf.rglob("*.urdf")))
+    return names
+
+
+def is_sealed_diagnostic_member(relative: str) -> bool:
+    """Whether one member name is a known sealed diagnostic (projected evidence or URDF)."""
+
+    if relative in SEALED_DIAGNOSTIC_FILES:
+        return True
+    parts = relative.split("/")
+    return (
+        len(parts) >= 2
+        and parts[0] == "urdf"
+        and parts[-1].endswith(".urdf")
+        and all(part not in {"", ".", ".."} for part in parts)
+    )
 _FINDING_LISTS = {"findings", "warnings", "errors", "problems", "diagnostics", "checks"}
 
 #: The single canonical material-provenance record (producer: 71f489a): written for every
@@ -120,14 +168,7 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
     material_source = "evidence/raw/material_provenance.json"
     sources = {"run": receipt}
     if evidence_root is not None:
-        for name in (
-            "reports/input.json",
-            "reports/quality.json",
-            "input/discovery/findings.json",
-            "input/discovery/native-discovery.json",
-            "evidence/raw/dependency_closure.json",
-            "evidence/raw/material_provenance.json",
-        ):
+        for name in REPORT_EVIDENCE_FILES:
             path = Path(evidence_root) / name
             if path.is_file():
                 try:
