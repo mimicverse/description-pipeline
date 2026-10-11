@@ -46,6 +46,11 @@ when its closed inventory, every file hash, run ID, handoff digest and selected
 assembly agree with the request. Both hosts must use the same tool source release;
 their dependency records identify their different execution roles.
 
+The sealed native bytes stay raw: readings, configuration and meshes travel as
+captured (`raw/scene_raw.json`, `raw/source_config.json`, evidence and mesh
+files), while the canonical scene snapshot and the structural-team reports are
+derived on Linux — the Windows worker renders no report and stores no derived scene.
+
 When present, the saved exporter declaration payload and its PID resolution rows
 travel with the sealed bundle. The declared structure is derived from the raw
 native record during Linux derivation; Linux verification re-decodes the sealed
@@ -113,8 +118,14 @@ not establish the convention.
 
 Each reading declares its scope, axes, COM reference, SI-unit setting and
 override flags. Per-part readings use part-document axes; whole-assembly
-readings use assembly-document axes. Missing declarations or effective
-mass/COM/inertia overrides block publication.
+readings use assembly-document axes. Missing declarations block publication. A
+CAD-authored effective instance — an overridden instance, or a surface-only
+component whose part document cannot answer mass questions — is admitted as a
+non-blocking warning that keeps its exact scope, axes and override flags: a
+parent override replaces its subtree only within one rigid body and is never
+distributed to moving links, the whole mass/COM/inertia closure must still hold
+exactly, and the report states plainly that the value is CAD-authored, not
+geometry-derived and not independently physically qualified.
 
 Native capture rebuilds the collected read-only assembly in its owned session
 before measurements. This refreshes assembly caches, including mass properties;
@@ -268,7 +279,11 @@ and engineering annotations. Comparing generated YAML with a model does not
 establish these facts. Controlled physical and drive records must be fixed,
 retrievable and applicable to the engineering revision.
 
-Effective native mass, COM and inertia overrides are rejected. Complete physical
-source records remain subject to independent checks. The
+Effective native mass, COM and inertia overrides are carried as qualified
+warnings, not rejections: their scope, axes and override flags are recorded, a
+parent override replaces its subtree only within one rigid body without
+distribution to moving links, and the whole mass/COM/inertia closure is checked
+strictly. No physical accuracy is claimed; complete physical source records
+remain subject to independent checks. The
 [per-item responsibility table](mechanical-handoff-spec.md#111-自动检查与工程师确认)
 separates automatic coverage from engineer-confirmed physical meaning.
