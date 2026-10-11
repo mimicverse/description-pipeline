@@ -107,20 +107,47 @@ class FreezeTests(unittest.TestCase):
         config["closure"] = {
             "schema_version": "solidworks-to-urdf.native-closure/v1",
             "graph": {},
+            "documents": {
+                "robot.SLDASM": {
+                    "resolved_edges": [
+                        {"instance": "base-1", "resolved": "base.SLDPRT"},
+                        {"instance": "arm-1", "resolved": "arm.SLDPRT"},
+                    ]
+                }
+            },
+            "imports": [],
+            "suppressed": [],
+        }
+        freeze(config, self.destination, backend=self.backend)
+        payload = json.loads((self.destination / "raw" / "dependency_closure.json").read_text(encoding="utf-8"))
+        self.assertTrue(payload["materializations_verified"])
+        self.assertEqual(payload["materialization_keys"], [])
+        self.assertEqual(payload["stale_source_links"], [])
+        self.assertIn("suppressed_skipped", payload)
+        self.assertIn("session_temp_dependencies", payload)
+
+    def test_freeze_refuses_uncovered_materializations(self) -> None:
+        config = json.loads(json.dumps(self.config))
+        config["closure"] = {
+            "schema_version": "solidworks-to-urdf.native-closure/v1",
+            "graph": {},
+            "documents": {
+                "robot.SLDASM": {
+                    "resolved_edges": [{"instance": "base-1", "resolved": "base.SLDPRT"}]
+                }
+            },
             "imports": [
                 {
-                    "instance": "linear-import-1",
+                    "instance": "ghost-import-1",
                     "state": "cached_materialization",
                     "materialization": r"C:\Temp\swx1\IC~~\X.step.SLDASM",
                 }
             ],
-            "suppressed": [{"instance": "cover-3", "resolved_path": str(self.tmp / "cad" / "missing.SLDPRT")}],
+            "suppressed": [],
         }
-        freeze(config, self.destination, backend=self.backend)
-        payload = json.loads((self.destination / "raw" / "dependency_closure.json").read_text(encoding="utf-8"))
-        self.assertEqual(payload["materialization_instances"], ["linear-import-1"])
-        self.assertIn("suppressed_skipped", payload)
-        self.assertIn("session_temp_dependencies", payload)
+        with self.assertRaises(BridgeError) as raised:
+            freeze(config, self.destination, backend=self.backend)
+        self.assertEqual(raised.exception.code, "dependency_materialization_uncovered")
 
     def test_freeze_produces_a_verified_snapshot(self) -> None:
         manifest = freeze(self.config, self.destination, backend=self.backend, worker_version="test-worker")
@@ -337,7 +364,7 @@ class FreezeTests(unittest.TestCase):
             dependencies=self.parts,
         )
 
-        def broken_pack(path, destination_dir):
+        def broken_pack(path, destination_dir, **kwargs):
             payload = support.FixtureCadBackend.collect_dependencies(backend, path, destination_dir)
             payload["top_level"] = str(self.tmp / "not-collected.SLDASM")
             return payload
@@ -491,7 +518,7 @@ class FreezeTests(unittest.TestCase):
         original_lock.write_bytes(b"user session")
         collect = backend.collect_dependencies
 
-        def collect_with_locks(path, destination):
+        def collect_with_locks(path, destination, **kwargs):
             result = collect(path, destination)
             (Path(destination) / "~$base.SLDPRT").write_bytes(b"capture session")
             (Path(destination) / "~$notes.txt").write_bytes(b"not a native lock")

@@ -229,7 +229,20 @@ class FixtureCadBackend(CadBackend):
             for item in self._dependencies
         ]
 
-    def collect_dependencies(self, path: str, destination_dir: str) -> dict[str, Any]:
+    def collect_dependencies(
+        self,
+        path: str,
+        destination_dir: str,
+        *,
+        skip_missing=(),
+        skip_session_temp: bool = False,
+        excluded_paths=(),
+    ) -> dict[str, Any]:
+        self.collect_skips = {
+            "skip_missing": sorted(str(item) for item in skip_missing),
+            "skip_session_temp": bool(skip_session_temp),
+            "excluded_paths": sorted(str(item) for item in excluded_paths),
+        }
         target = Path(destination_dir)
         target.mkdir(parents=True, exist_ok=True)
         self.collected = []
@@ -264,6 +277,9 @@ class FixtureCadBackend(CadBackend):
                 "ok": bool(self.collected),
             },
             "files": list(self.collected),
+            "skipped_missing": self.collect_skips["skip_missing"],
+            "skipped_session_temp": [],
+            "skipped_excluded": self.collect_skips["excluded_paths"],
             "mapping": {
                 str(item): str(target / Path(item).name)
                 for item in [self.document, *self._dependencies]
@@ -325,6 +341,8 @@ class FixtureCadBackend(CadBackend):
                     "document": str(document) if document is not None else None,
                     "document_name": document.name.lower() if document is not None else None,
                     "configuration": configuration,
+                    "defining": str(Path(assembly_path)),
+                    "defining_anchor": None,
                     "suppressed": is_suppressed,
                     "depth": 0,
                 }

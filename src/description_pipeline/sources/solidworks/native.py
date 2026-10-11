@@ -16,6 +16,7 @@ import re
 import shutil
 import struct
 import sys
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -679,6 +680,29 @@ def import_materialization_path(value) -> bool:
 
     text = str(value or "").replace("\\", "/")
     return any(part.casefold() == "ic~~" for part in text.split("/") if part)
+
+
+def session_materialization_path(value) -> bool:
+    """True only for a session materialization inside the owned temp area.
+
+    A cached import requires an ``IC~~`` path component *under the system
+    temporary directory* (the owned session temp area): the bare marker or a
+    virtual/imported reading alone must never convert an actual out-of-stage
+    on-disk file into cached geometry.  Path flavour follows the value, so the
+    same rule answers Windows engine paths and portable test paths.
+    """
+
+    if not import_materialization_path(value):
+        return False
+    text = str(value)
+    module = ntpath if (re.match(r"^[A-Za-z]:", text) or text.startswith("\\\\") or "\\" in text) else posixpath
+    try:
+        candidate = module.normcase(module.normpath(text))
+        root = module.normcase(module.normpath(str(tempfile.gettempdir())))
+    except (TypeError, ValueError):
+        return False
+    separator = "\\" if module is ntpath else "/"
+    return candidate == root or candidate.startswith(root.rstrip("\\/") + separator)
 
 
 def _matches_assembly_root(reference, root, reference_full, reference_name, assembly_full) -> bool:
@@ -3377,7 +3401,9 @@ class SolidWorksBackend(CadBackend):
 
         return self.list_dependencies(path)
 
-    def collect_dependencies(self, path, destination_dir, *, skip_missing=()):
+    def collect_dependencies(
+        self, path, destination_dir, *, skip_missing=(), skip_session_temp=False, excluded_paths=()
+    ):
         """Copy saved native files and rewrite references in a second application.
 
         ReplaceReferencedDocument requires unopened copies with the original
@@ -3385,13 +3411,19 @@ class SolidWorksBackend(CadBackend):
         reference in a fresh application, then independently inspect the copy.
         ``skip_missing`` lists absolute paths whose absence is already recorded
         (suppressed placements): they are reported instead of failing the
-        collection, and they never enter the copied graph.
+        collection, and they never enter the copied graph.  ``excluded_paths``
+        (closure-recorded stale author source links) and, when
+        ``skip_session_temp`` is set after the occurrence coverage proof,
+        session 3D-Interconnect materializations are likewise reported and
+        never copied or rewritten.
         """
         source_path = str(Path(path).resolve())
         source_app = self._app_for_path(source_path)
         skipped_normalized = {os.path.normcase(os.path.abspath(str(item))) for item in skip_missing}
+        excluded_normalized = {os.path.normcase(os.path.abspath(str(item))) for item in excluded_paths}
         graph_skipped: list[str] = []
         graph_skipped_temp: list[str] = []
+        graph_excluded: list[str] = []
         graph = {}
         pending = [source_path]
         while pending:
@@ -3408,7 +3440,10 @@ class SolidWorksBackend(CadBackend):
                 if not isinstance(value, str) or not value:
                     raise CadError("dependency_list_invalid", document)
                 reference = str(Path(resolve_dependency_path(value, document)).resolve())
-                if import_materialization_path(reference):
+                if os.path.normcase(os.path.abspath(reference)) in excluded_normalized:
+                    graph_excluded.append(reference)
+                    continue
+                if skip_session_temp and import_materialization_path(reference):
                     # A session 3D-Interconnect materialization is not a saved
                     # document: it is never copied into the snapshot and never
                     # rewritten; the copy regenerates its own materializations.
@@ -3476,6 +3511,7 @@ class SolidWorksBackend(CadBackend):
             "reference_edges": replaced,
             "skipped_missing": sorted(graph_skipped),
             "skipped_session_temp": sorted(graph_skipped_temp),
+            "skipped_excluded": sorted(graph_excluded),
             "configured": ["GetDocumentDependencies2", "ReplaceReferencedDocument"],
         }
 
@@ -3550,17 +3586,23 @@ class SolidWorksBackend(CadBackend):
                 root = _component(_member(configuration, "GetRootComponent3", True))
                 occurrences = []
                 stack = [
-                    (child, "", 0, str(main_assembly))
+                    (child, "", 0, str(main_assembly), None)
                     for child in reversed(_as_list(_method(root, "GetChildren")))
                 ]
                 while stack:
-                    item, context, depth, defining = stack.pop()
+                    item, context, depth, defining, anchor = stack.pop()
                     if depth > 40:
                         raise CadError("cad_assembly_too_deep", str(stage / main_assembly), {"depth": depth})
                     component = _component(item)
                     name = str(_member(component, "Name2") or _member(component, "Name") or "")
                     instance = name if not context or name.startswith(context + "/") else f"{context}/{name}"
-                    record = {"instance": instance, "name": name, "depth": depth, "defining": defining}
+                    record = {
+                        "instance": instance,
+                        "name": name,
+                        "depth": depth,
+                        "defining": defining,
+                        "defining_anchor": anchor,
+                    }
                     referenced = _member(component, "ReferencedConfiguration")
                     record["configuration"] = str(referenced) if referenced is not None else None
                     try:
@@ -3586,6 +3628,8 @@ class SolidWorksBackend(CadBackend):
                     resolved = record["resolved_path"]
                     relative = _stage_relative(stage, resolved) if resolved else None
                     record["resolved_relative"] = relative
+                    materialized = session_materialization_path(resolved) or virtual is True
+                    anchor_for_children = instance if materialized else anchor
                     if (not resolved) or relative is None or virtual is True or "IC~~" in resolved:
                         try:
                             imported = _method(component, "GetImportedPath")
@@ -3600,7 +3644,7 @@ class SolidWorksBackend(CadBackend):
                         continue
                     child_defining = relative or resolved or defining
                     for child in reversed(_as_list(_method(component, "GetChildren"))):
-                        stack.append((child, instance, depth + 1, child_defining))
+                        stack.append((child, instance, depth + 1, child_defining, anchor_for_children))
                 readings["occurrences"] = occurrences
                 readings["documents_after"] = int(_member(app, "GetDocumentCount"))
             finally:
@@ -3662,9 +3706,12 @@ class SolidWorksBackend(CadBackend):
         instances = []
         read_only_paths = set()
 
-        stack = [(child, "", 0) for child in reversed(_as_list(_method(root, "GetChildren")))]
+        stack = [
+            (child, "", 0, document_path, None)
+            for child in reversed(_as_list(_method(root, "GetChildren")))
+        ]
         while stack:
-            item, context, depth = stack.pop()
+            item, context, depth, defining, anchor = stack.pop()
             if depth > 40:
                 raise CadError("cad_assembly_too_deep", assembly_path, {"depth": depth})
             component = _component(item)
@@ -3692,6 +3739,8 @@ class SolidWorksBackend(CadBackend):
                     imported_path = reading if isinstance(reading, str) and reading.strip() else None
                 except Exception:  # noqa: BLE001 - a non-imported component has no binding
                     imported_path = None
+            materialized = session_materialization_path(str(document)) or virtual is True
+            anchor_for_children = instance if materialized else anchor
             instances.append(
                 {
                     "instance": instance,
@@ -3701,6 +3750,8 @@ class SolidWorksBackend(CadBackend):
                     "configuration": str(referenced) if referenced is not None else None,
                     "virtual": virtual,
                     "imported_path": imported_path,
+                    "defining": defining,
+                    "defining_anchor": anchor,
                     "suppressed": suppressed,
                     "suppression_state": state,
                     "depth": depth,
@@ -3711,7 +3762,8 @@ class SolidWorksBackend(CadBackend):
                 # part of the resolved instance set of either side
                 continue
             for child in reversed(_as_list(_method(component, "GetChildren"))):
-                stack.append((child, instance, depth + 1))
+                child_defining = str(document) if document else defining
+                stack.append((child, instance, depth + 1, child_defining, anchor_for_children))
 
         # Finish borrowing occurrence interfaces before any native state change.
         component = item = child = model = root = configuration = doc = stack = None

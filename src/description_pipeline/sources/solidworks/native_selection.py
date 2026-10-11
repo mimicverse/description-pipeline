@@ -42,6 +42,7 @@ from pathlib import Path
 
 from ...io import PipelineError, _filesystem_path, artifact_path_parts, digest
 from .handoff import MAX_HANDOFF_BYTES, _directory
+from .native import session_materialization_path
 from .selection import MAX_SELECTION_FILES, SelectionError, validate_file_index
 
 __all__ = ["MAX_SELECTION_FILES", "NativeSelectionReader"]
@@ -276,6 +277,8 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
         defining = record.get("defining")
         raw_defining = defining if isinstance(defining, str) and defining else None
         defining_name = raw_defining if raw_defining in files else None
+        anchor = record.get("defining_anchor")
+        raw_anchor = anchor if isinstance(anchor, str) and anchor else None
         resolved = record.get("resolved_path")
         resolved = resolved if isinstance(resolved, str) else ""
         state = record.get("suppression_state")
@@ -315,6 +318,7 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
             suppressed.append(
                 {
                     "document": defining_name or raw_defining,
+                    "owner_anchor": raw_anchor,
                     "instance": instance,
                     "name": record.get("name"),
                     "suppression_state": 0,
@@ -329,12 +333,11 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
         lightweight = state in (_COMPONENT_LIGHTWEIGHT, _COMPONENT_FULLY_LIGHTWEIGHT)
         cached_defining = bool(raw_defining) and cached_key(raw_defining) in cached_materializations
         under = _under_stage(stage_root, resolved) if resolved else None
-        importish = cached_defining or (
-            under is None and ("IC~~" in resolved or virtual is True or imported is not None)
-        )
+        structural = bool(resolved) and session_materialization_path(resolved)
+        importish = cached_defining or structural or (not resolved and imported is not None)
         if importish:
             label = defining_name or raw_defining
-            if resolved:
+            if resolved and (structural or cached_defining):
                 # A materialized imported occurrence: geometry comes from the
                 # session materialization; GetImportedPath is author-path
                 # metadata, never an in-package binding.  Recorded as a warning
@@ -346,6 +349,7 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                     {
                         "document": label,
                         "owner": defining_name,
+                        "owner_anchor": raw_anchor,
                         "owner_sha256": owner_sha256,
                         "defining_materialization": raw_defining if cached_defining else None,
                         "instance": instance,
@@ -366,6 +370,7 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                         "message": "an imported occurrence contributes geometry from a session materialization; the author import path is metadata, not a proven in-package binding",
                         "document": label,
                         "owner": defining_name,
+                        "owner_anchor": raw_anchor,
                         "owner_sha256": owner_sha256,
                         "instance": instance,
                         "materialization": resolved,
@@ -375,14 +380,27 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                     }
                 )
                 continue
+            if not resolved:
+                problems.append(
+                    _problem(
+                        "selection_import_unresolved",
+                        "an imported occurrence has no materialization and no staged source",
+                        document=label,
+                        instance=instance,
+                        imported_path=imported,
+                        defining_materialization=raw_defining if cached_defining else None,
+                    )
+                )
+                continue
             problems.append(
                 _problem(
-                    "selection_import_unresolved",
-                    "an imported occurrence has no materialization and no staged source",
+                    "selection_resolved_outside_stage",
+                    "an out-of-stage resolved document is not a session materialization",
                     document=label,
                     instance=instance,
+                    resolved=resolved,
                     imported_path=imported,
-                    defining_materialization=raw_defining if cached_defining else None,
+                    note="a present external file is never downgraded to a cached import",
                 )
             )
             continue

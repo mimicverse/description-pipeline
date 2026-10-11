@@ -19,8 +19,7 @@ from description_pipeline.sources.solidworks.native_selection import (  # noqa: 
 )
 from description_pipeline.sources.solidworks.selection import (  # noqa: E402
     SelectionError,
-    seal_selection,
-    selection_plan,
+    seal_closure_selection,
 )
 
 READER = "a" * 64
@@ -28,6 +27,10 @@ READER = "a" * 64
 
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def session_temp(*parts: str) -> str:
+    return str(Path(tempfile.gettempdir()).joinpath(*parts))
 
 
 def write_stage(root: Path, files: dict[str, bytes]) -> dict[str, str]:
@@ -148,18 +151,11 @@ class ClosureAdmissionTests(unittest.TestCase):
         self.assertIsNone(payload["search_configuration"]["restore_error"])
         self.assertTrue(payload["session"]["sealed"])
         self.assertTrue(payload["session"]["closed"])
-        # The produced graph is exactly B's seal contract.
-        plan = selection_plan(self.files, "robot.SLDASM", payload["graph"])
-        self.assertEqual(plan["state"], "complete")
-        manifest = seal_selection(
-            self.files,
-            "robot.SLDASM",
-            payload["graph"],
-            selected_files={name: self.files[name] for name in payload["graph"]},
-            reader_sha256=READER,
-        )
-        self.assertEqual(manifest["handoff_sha256"], plan["upload_sha256"])
+        # The produced payload is exactly the current seal contract.
+        manifest = seal_closure_selection(self.files, "robot.SLDASM", payload, reader_sha256=READER)
+        self.assertEqual(sorted(manifest["files"]), ["arm.SLDPRT", "base.SLDPRT", "robot.SLDASM"])
         self.assertEqual(manifest["excluded_files"], {})
+        self.assertEqual(manifest["closure"]["main_assembly"], "robot.SLDASM")
 
     def test_excluded_lists_unresolved_staged_files(self) -> None:
         payload = self.observe([occurrence("arm-1", self.resolved("arm.SLDPRT"))])
@@ -197,7 +193,7 @@ class ClosureAdmissionTests(unittest.TestCase):
         self.assertEqual(caught.exception.detail["problems"][0]["instance"], "arm-1")
 
     def test_materialized_import_is_a_recorded_warning_not_a_binding(self) -> None:
-        temp = r"C:\Users\Mi\AppData\Local\Temp\swx39388\IC~~\NP-F550.step.SLDPRT"
+        temp = session_temp("swx39388", "IC~~", "NP-F550.step.SLDPRT")
         payload = self.observe(
             [
                 occurrence(
@@ -224,7 +220,7 @@ class ClosureAdmissionTests(unittest.TestCase):
     def test_in_stage_author_metadata_is_flagged_but_not_a_binding(self) -> None:
         extra = write_stage(self.stage, {"NP-F550.step": b"np-bytes"})
         files = {**self.files, **extra}
-        temp = r"C:\Users\33985\AppData\Local\Temp\swx28528\IC~~\NP-F550.step.SLDPRT"
+        temp = session_temp("swx28528", "IC~~", "NP-F550.step.SLDPRT")
         payload = self.observe(
             [
                 occurrence(
@@ -240,9 +236,25 @@ class ClosureAdmissionTests(unittest.TestCase):
         self.assertEqual(entry["state"], "cached_materialization")
         self.assertNotIn("NP-F550.step", payload["graph"])
 
+    def test_import_marker_outside_session_temp_is_not_a_cache(self) -> None:
+        fake_temp = r"C:\Users\Mi\Documents\IC~~\NP-F550.step.SLDPRT"
+        with self.assertRaises(SelectionError) as caught:
+            self.observe(
+                [
+                    occurrence(
+                        "NP-F550.step-1",
+                        fake_temp,
+                        imported=r"C:\Users\Mi\Desktop\NP-F550.step",
+                    )
+                ]
+            )
+        self.assertEqual(caught.exception.code, "selection_resolved_outside_stage")
+        item = caught.exception.detail["problems"][0]
+        self.assertEqual(item["resolved"], fake_temp)
+
     def test_cached_import_subtree_is_recorded_without_refusal(self) -> None:
-        parent = r"C:\Users\Mi\AppData\Local\Temp\swx25524\IC~~\HD-1910-C001-20260902.stp.SLDASM"
-        child = r"C:\Users\Mi\AppData\Local\Temp\swx25524\IC~~\HL-3608_ASM_52_ASM.stp.SLDASM"
+        parent = session_temp("swx25524", "IC~~", "HD-1910-C001-20260902.stp.SLDASM")
+        child = session_temp("swx25524", "IC~~", "HL-3608_ASM_52_ASM.stp.SLDASM")
         payload = self.observe(
             [
                 occurrence("HD-1910-C001-20260902.stp-2", parent, imported=r"D:\M2.2\change11\HD.stp"),
@@ -520,16 +532,9 @@ class BackendShapeIntegrationTests(unittest.TestCase):
             walker=lambda stage_root, main, index: readings, reader_sha256=READER
         ).observe(stage, "robot.SLDASM", files)
         self.assertEqual(payload["graph"]["robot.SLDASM"]["references"], ["arm.SLDPRT"])
-        plan = selection_plan(files, "robot.SLDASM", payload["graph"])
-        self.assertEqual(plan["state"], "complete")
-        manifest = seal_selection(
-            files,
-            "robot.SLDASM",
-            payload["graph"],
-            selected_files={name: files[name] for name in payload["graph"]},
-            reader_sha256=READER,
-        )
+        manifest = seal_closure_selection(files, "robot.SLDASM", payload, reader_sha256=READER)
         self.assertEqual(manifest["main_assembly"], "robot.SLDASM")
+        self.assertEqual(sorted(manifest["files"]), ["arm.SLDPRT", "robot.SLDASM"])
 
 
 if __name__ == "__main__":

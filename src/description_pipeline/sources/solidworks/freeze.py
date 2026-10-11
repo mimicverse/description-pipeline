@@ -22,7 +22,7 @@ from typing import Any
 from collections.abc import Callable
 
 from .errors import BridgeError, ConfigError
-from .native import import_materialization_path
+from .native import session_materialization_path
 from .evidence import build_evidence, capture_environment
 from .jsonio import digest_json, sha256_file, write_json
 from .scene import assembly_leaf_total, build_scene, closure_delta
@@ -565,18 +565,6 @@ def _source_inputs(cfg: dict[str, Any], closure: dict[str, Any]) -> dict[str, st
     return inputs
 
 
-def _accepts_keyword(function: Any, name: str) -> bool:
-    """True when ``function`` can be called with keyword ``name``."""
-
-    try:
-        parameters = inspect.signature(function).parameters
-    except (TypeError, ValueError):
-        return False
-    return name in parameters or any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
-    )
-
-
 def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> dict[str, Any]:
     """Collect the source with its dependencies and prove the closure.
 
@@ -609,15 +597,108 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
     }
     # Exact-occurrence binding: the closure records which occurrences were
     # session materializations.  The current session's materialization paths
-    # differ from the selection session's, so the occurrence identity (and its
-    # native owner document) is the stable key -- never a path pattern.
-    materialization_instances = {
-        str(entry.get("instance"))
+    # differ from the selection session's, so the stable key is the exact
+    # (owner, occurrence) pair: the owning document's canonical name, or -- for
+    # occurrences inside a materialization subtree -- the anchoring
+    # materialization occurrence.  Never a name alone, never a path pattern.
+    def _closure_owner_token(item: dict) -> tuple[str, str] | None:
+        anchor = item.get("owner_anchor")
+        if isinstance(anchor, str) and anchor:
+            return ("anchor", anchor)
+        owner = item.get("owner") if isinstance(item.get("owner"), str) and item.get("owner") else item.get("document")
+        if not isinstance(owner, str) or not owner:
+            return None
+        return ("document", owner.replace("\\", "/").casefold())
+
+    materialization_keys: set[tuple[str, str]] = set()
+    for entry in closure.get("imports") or []:
+        if not isinstance(entry, dict) or entry.get("state") != "cached_materialization":
+            continue
+        instance = entry.get("instance")
+        token = _closure_owner_token(entry)
+        if isinstance(instance, str) and instance and token is not None:
+            materialization_keys.add((token, instance))
+    # Stale author source links recorded by the closure (import metadata): the
+    # exact author path may still be listed by the engine, but after the
+    # coverage proof below it is excluded from the required graph and copied
+    # graph as recorded evidence -- never a broad STEP or name rule.
+    author_metadata_paths = {
+        os.path.normcase(os.path.abspath(str(entry.get("author_imported_path"))))
         for entry in closure.get("imports") or []
-        if isinstance(entry, dict) and entry.get("state") == "cached_materialization" and entry.get("instance")
+        if isinstance(entry, dict)
+        and entry.get("state") == "cached_materialization"
+        and entry.get("author_imported_path")
     }
+    inspector = getattr(backend, "inspect_copy", None)
+    if not callable(inspector):
+        raise BridgeError(
+            "dependency_resolution_unverified",
+            "the backend cannot re-open the copy to verify component coverage",
+            exit_code=3,
+        )
+    original = dict(inspector(cfg["assembly"]) or {})
+    # Occurrence coverage gate: every current occurrence must be covered by the
+    # admitted closure (a resolved edge, a recorded cached materialization or a
+    # recorded suppressed placement) by exact owner+occurrence identity.  Only
+    # then may session materializations or stale author links be excluded from
+    # the required/copied graph; otherwise nothing is skipped.
+    covered_keys: set[tuple[str, str]] = set()
+    for name, entry in (closure.get("documents") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        token = ("document", str(name).replace("\\", "/").casefold())
+        for edge in entry.get("resolved_edges") or []:
+            if isinstance(edge, dict) and isinstance(edge.get("instance"), str) and edge["instance"]:
+                covered_keys.add((token, edge["instance"]))
+    for item in closure.get("imports") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("instance"), str) or not item["instance"]:
+            continue
+        token = _closure_owner_token(item)
+        if token is not None:
+            covered_keys.add((token, item["instance"]))
+    for item in closure.get("suppressed") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("instance"), str) or not item["instance"]:
+            continue
+        token = _closure_owner_token(item)
+        if token is not None:
+            covered_keys.add((token, item["instance"]))
+
+    def _actual_owner_token(entry: dict) -> tuple[str, str]:
+        anchor = entry.get("defining_anchor")
+        if isinstance(anchor, str) and anchor:
+            return ("anchor", anchor)
+        defining = str(entry.get("defining") or "")
+        for root in cfg.get("allowed_roots") or []:
+            try:
+                relative = Path(defining).resolve().relative_to(Path(str(root)).resolve()).as_posix()
+                return ("document", relative.casefold())
+            except (OSError, ValueError):
+                continue
+        return ("document", os.path.normcase(os.path.abspath(defining)) if defining else "")
+
+    actual_keys = {
+        (_actual_owner_token(entry), str(entry.get("instance") or ""))
+        for entry in original.get("instances") or []
+        if entry.get("instance")
+    }
+    materializations_verified = False
+    if closure:
+        if actual_keys != covered_keys:
+            raise BridgeError(
+                "dependency_materialization_uncovered",
+                "the source occurrence inventory differs from the admitted closure; a session "
+                "materialization can never be dropped without a recorded owner/occurrence",
+                {
+                    "missing_from_closure": sorted(str(item) for item in (actual_keys - covered_keys))[:20],
+                    "missing_from_session": sorted(str(item) for item in (covered_keys - actual_keys))[:20],
+                    "instances": len(actual_keys),
+                },
+                exit_code=3,
+            )
+        materializations_verified = True
     suppressed_skipped: list[str] = []
     session_temp_dependencies: list[str] = []
+    stale_source_links: list[str] = []
     unresolved = []
     outside = []
     for entry in dependencies:
@@ -625,7 +706,11 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         if path and os.path.normcase(os.path.abspath(path)) in suppressed_paths:
             suppressed_skipped.append(path)
             continue
-        if path and import_materialization_path(path):
+        normalized = os.path.normcase(os.path.abspath(path)) if path else ""
+        if path and materializations_verified and normalized in author_metadata_paths:
+            stale_source_links.append(path)
+            continue
+        if path and materializations_verified and session_materialization_path(path):
             session_temp_dependencies.append(path)
             continue
         if not entry.get("exists", True):
@@ -641,15 +726,7 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
             exit_code=3,
         )
 
-    inspector = getattr(backend, "inspect_copy", None)
-    if not callable(inspector):
-        raise BridgeError(
-            "dependency_resolution_unverified",
-            "the backend cannot re-open the copy to verify component coverage",
-            exit_code=3,
-        )
     # Bind every saved source file before copying, then recheck after all reads.
-    original = dict(inspector(cfg["assembly"]) or {})
     original_files: dict[str, str] = {}
     original_documents = [str(cfg["assembly"])]
     import_temp_documents: list[str] = []
@@ -657,8 +734,9 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         document = str(entry.get("document") or "")
         if not document:
             continue
+        key = (_actual_owner_token(entry), str(entry.get("instance") or ""))
         if (
-            str(entry.get("instance") or "") in materialization_instances
+            key in materialization_keys
             or os.path.normcase(os.path.abspath(document)) in cached_import_paths
         ):
             import_temp_documents.append(document)
@@ -668,7 +746,9 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         path = str(entry.get("path") or "")
         if not path or os.path.normcase(os.path.abspath(path)) in suppressed_paths:
             continue
-        if import_materialization_path(path):
+        if materializations_verified and session_materialization_path(path):
+            continue
+        if materializations_verified and os.path.normcase(os.path.abspath(path)) in author_metadata_paths:
             continue
         original_documents.append(path)
     original_states: dict[str, dict[str, Any]] = {}
@@ -710,10 +790,18 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
             "the backend cannot collect dependencies; a verified copy is required to freeze a source",
             exit_code=3,
         )
-    pack_kwargs: dict[str, Any] = {}
-    if suppressed_paths and _accepts_keyword(pack, "skip_missing"):
-        pack_kwargs["skip_missing"] = sorted(suppressed_paths)
-    collected = dict(pack(cfg["assembly"], str(source_dir), **pack_kwargs) or {})
+    # The collector contract is explicit: skipped/author-excluded paths are
+    # always passed, empty when the coverage proof did not authorize a skip.
+    collected = dict(
+        pack(
+            cfg["assembly"],
+            str(source_dir),
+            skip_missing=sorted(suppressed_paths),
+            skip_session_temp=materializations_verified,
+            excluded_paths=sorted(author_metadata_paths) if materializations_verified else (),
+        )
+        or {}
+    )
     source_mapping = collected.get("mapping") or {}
     if {os.path.normcase(os.path.abspath(path)) for path in source_mapping} != {
         os.path.normcase(os.path.abspath(path)) for path in original_files
@@ -762,7 +850,10 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         if path and os.path.normcase(os.path.abspath(path)) in suppressed_paths:
             suppressed_skipped.append(path)
             continue
-        if path and import_materialization_path(path):
+        if path and materializations_verified and os.path.normcase(os.path.abspath(path)) in author_metadata_paths:
+            stale_source_links.append(path)
+            continue
+        if path and materializations_verified and session_materialization_path(path):
             session_temp_dependencies.append(path)
             continue
         if not path or not _under(path, [str(source_dir)]):
@@ -895,10 +986,11 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         path = str(entry.get("document") or "")
         if not path:
             continue  # suppressed instances are tracked, not resolved
+        key = (_actual_owner_token(entry), str(entry.get("instance") or ""))
         if (
-            str(entry.get("instance") or "") in materialization_instances
+            key in materialization_keys
             or os.path.normcase(os.path.abspath(path)) in cached_import_paths
-            or import_materialization_path(path)
+            or (materializations_verified and session_materialization_path(path))
         ):
             import_temp_documents.append(path)
             continue  # session materializations are evidence, not snapshot members
@@ -963,11 +1055,12 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         mapping[(str(cfg["assembly"]), top)] = "top_level"
     for entry in copy.get("instances") or []:
         path = str(entry.get("document") or "")
+        key = (_actual_owner_token(entry), str(entry.get("instance") or ""))
         if (
             not path
-            or str(entry.get("instance") or "") in materialization_instances
+            or key in materialization_keys
             or os.path.normcase(os.path.abspath(path)) in cached_import_paths
-            or import_materialization_path(path)
+            or (materializations_verified and session_materialization_path(path))
         ):
             continue
         for source_entry in original.get("instances") or []:
@@ -987,7 +1080,9 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         "declared_unresolved": unresolved,
         "suppressed_skipped": sorted(set(suppressed_skipped)),
         "session_temp_dependencies": sorted(set(session_temp_dependencies)),
-        "materialization_instances": sorted(materialization_instances),
+        "stale_source_links": sorted(set(stale_source_links)),
+        "materializations_verified": materializations_verified,
+        "materialization_keys": sorted([token[0], token[1], instance] for token, instance in materialization_keys),
         "import_temp_documents": sorted(set(import_temp_documents)),
         "resolved_inside_snapshot": len(entries),
         "collected_files": len(collected.get("files") or []),
