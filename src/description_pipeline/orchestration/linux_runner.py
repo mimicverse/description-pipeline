@@ -226,10 +226,9 @@ def _capture_selection(job: dict, run_id: str, native_tool: dict) -> dict:
         reader_sha256=native_tool.get("source_sha256"),
     )
     if (
-        selection.get("staged_files") != manifest["files"]
-        or selection.get("observations") != manifest["observations"]
+        selection.get("staged_files") != upload
         or selection.get("reader_sha256") != manifest["reader_sha256"]
-        or selection.get("requested_files") != {}
+        or selection.get("upload_sha256") != manifest["upload_sha256"]
         or job.get("handoff_sha256") != manifest["handoff_sha256"]
         or request.get("main_assembly") != manifest["main_assembly"]
         or job.get("main_assembly") != manifest["main_assembly"]
