@@ -200,10 +200,63 @@ class FreezeTests(unittest.TestCase):
         # the fixture backend must never be published as native CAD evidence
         self.assertEqual(manifest["evidence_class"], "fixture")
         self.assertTrue((self.destination / "manifest.json").is_file())
-        self.assertTrue((self.destination / "scene.json").is_file())
-        self.assertIn("scene.json", manifest["files"])
+        self.assertFalse((self.destination / "scene.json").exists())
+        self.assertEqual(manifest["scene"], "raw/scene_raw.json")
+        self.assertEqual(manifest["source_config"], "raw/source_config.json")
+        self.assertIn("raw/source_config.json", manifest["files"])
         self.assertIn("raw/scene_raw.json", manifest["files"])
         self.assertTrue(any(name.startswith("geometry/") for name in manifest["files"]))
+
+    def test_capture_never_builds_a_scene_and_linux_derivation_keeps_snapshot_immutable(self) -> None:
+        from description_pipeline.io import inventory
+
+        with patch(
+            "description_pipeline.sources.solidworks.scene.build_scene",
+            side_effect=AssertionError("scene construction is portable work"),
+        ):
+            freeze(self.config, self.destination, backend=self.backend)
+        before = inventory(self.destination)
+        scene = load_scene(self.destination)
+        self.assertEqual(scene["schema_version"], "description.scene/v1")
+        self.assertEqual(inventory(self.destination), before)
+        self.assertNotIn("scene.json", before)
+
+    def test_resealed_source_configuration_cannot_change_capture_identity(self) -> None:
+        from description_pipeline.io import write_json
+        from description_pipeline.sources.snapshot import verify_snapshot, write_manifest
+
+        manifest = freeze(self.config, self.destination, backend=self.backend)
+        path = self.destination / "raw/source_config.json"
+        config = json.loads(path.read_text(encoding="utf-8"))
+        config["assembly"] = "another-assembly.SLDASM"
+        write_json(path, config)
+        write_manifest(
+            self.destination,
+            kind="solidworks",
+            identity=manifest["identity"],
+            evidence_class=manifest["evidence_class"],
+        )
+        verify_snapshot(self.destination)
+        with self.assertRaisesRegex(ValueError, "names another assembly"):
+            load_scene(self.destination)
+
+    def test_resealed_duplicate_native_readings_cannot_disagree(self) -> None:
+        from description_pipeline.io import write_json
+        from description_pipeline.sources.snapshot import write_manifest
+
+        manifest = freeze(self.config, self.destination, backend=self.backend)
+        path = self.destination / "raw/mass_properties.json"
+        masses = json.loads(path.read_text(encoding="utf-8"))
+        masses["base-1"]["mass"] *= 2
+        write_json(path, masses)
+        write_manifest(
+            self.destination,
+            kind="solidworks",
+            identity=manifest["identity"],
+            evidence_class=manifest["evidence_class"],
+        )
+        with self.assertRaisesRegex(ValueError, "dedicated raw records"):
+            load_scene(self.destination)
 
     def test_nested_unicode_instance_names_fit_native_filesystem_limits(self) -> None:
         from description_pipeline.sources.solidworks.freeze import _export_geometry
@@ -287,7 +340,7 @@ class FreezeTests(unittest.TestCase):
 
         self.assertEqual(manifest["kind"], "solidworks")
         self.assertTrue((self.destination / "manifest.json").is_file())
-        self.assertTrue((self.destination / "scene.json").is_file())
+        self.assertTrue((self.destination / "raw/scene_raw.json").is_file())
 
     def test_non_empty_destination_is_refused(self) -> None:
         self.destination.mkdir(parents=True)
@@ -472,14 +525,15 @@ class FreezeTests(unittest.TestCase):
         config = json.loads(json.dumps(self.config))
         config["joints"][0]["xyz"] = [0.0, 0.0, 0.2]
 
+        freeze(config, self.destination, backend=self.backend)
         with self.assertRaises(ConfigError) as raised:
-            freeze(config, self.destination, backend=self.backend)
+            load_scene(self.destination)
 
         self.assertEqual(raised.exception.code, "invalid_config")
 
     def test_tampered_snapshot_is_rejected(self) -> None:
         freeze(self.config, self.destination, backend=self.backend)
-        target = self.destination / "scene.json"
+        target = self.destination / "raw/scene_raw.json"
         payload = json.loads(target.read_text(encoding="utf-8"))
         payload["name"] = "tampered"
         target.write_text(json.dumps(payload), encoding="utf-8")
@@ -1317,10 +1371,10 @@ class DocumentedMassTests(unittest.TestCase):
 
     def test_documented_mass_is_applied_at_load_time_and_records_raw_used(self) -> None:
         freeze(self.config, self.tmp / "snapshot", backend=self.backend)
-        raw_scene = json.loads((self.tmp / "snapshot" / "scene.json").read_text(encoding="utf-8"))
+        raw_scene = json.loads((self.tmp / "snapshot" / "raw/scene_raw.json").read_text(encoding="utf-8"))
         # the snapshot keeps the CAD reading: nothing is replaced on disk
-        self.assertAlmostEqual(raw_scene["links"][0]["inertial"]["mass"], 1.0, places=9)
-        self.assertEqual(raw_scene["links"][0]["provenance"]["mass"], "raw/mass_properties.json")
+        self.assertAlmostEqual(raw_scene["mass_properties"]["base-1"]["mass"], 1.0, places=9)
+        self.assertFalse((self.tmp / "snapshot" / "scene.json").exists())
 
         scene = load_scene(self.tmp / "snapshot")
         link = scene["links"][0]

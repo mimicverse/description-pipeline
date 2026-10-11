@@ -92,7 +92,7 @@ def combine_mass_properties(entries: Sequence[dict[str, Any]]) -> dict[str, Any]
     """Combine per-part mass properties about the combined COM (parallel axis).
 
     The canonical layer owns the authoritative combination; this source-side
-    result exists so a snapshot carries usable semantics, and its provenance
+    result derives usable semantics from the snapshot, and its provenance
     points at the raw per-part readings it came from.
     """
 
@@ -384,7 +384,7 @@ def build_scene(
     raw_scene: Any,
     geometry_entries: Sequence[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Assemble ``scene.json`` from the CAD readings and the source definition."""
+    """Assemble the portable scene from sealed CAD readings and source definition."""
 
     placements = {component.name: list(component.transform) for component in raw_scene.components}
     masses = {name: dict(payload) for name, payload in (raw_scene.mass_properties or {}).items()}
@@ -428,7 +428,7 @@ def build_scene(
                     "component has no CAD mass properties; capture materials or declare the body mass explicitly",
                     {"body": body_id, "component": component},
                 )
-            # scene.json holds what CAD read.  Declared masses are applied later,
+            # This initial scene holds what CAD read. Declared masses are applied later,
             # by load_scene, and only there do they become "used" values.
             payload = dict(payload, mass_source="cad")
             readings.append(_PartReading(component, placements[component], payload, link_rotation, link_translation))
@@ -664,7 +664,7 @@ def _build_frames(
 
 
 def load_scene(snapshot_root: Path) -> dict[str, Any]:
-    """Read a frozen snapshot and return its scene, after verifying the snapshot.
+    """Verify a frozen snapshot and derive its scene on the portable host.
 
     The snapshot itself stays raw.  Declared author decisions - currently the
     documented mass table - are applied *here*: every applied value is recorded
@@ -676,10 +676,9 @@ def load_scene(snapshot_root: Path) -> dict[str, Any]:
 
     root = Path(snapshot_root).resolve()
     manifest = verify_snapshot(root)
-    scene_path = root / str(manifest.get("scene") or "scene.json")
-    if not scene_path.is_file():
-        raise ConfigError("snapshot has no scene.json", {"snapshot": str(root)})
-    scene = read_json(scene_path)
+    from .captured import derive_scene
+
+    scene = derive_scene(root, manifest)
     if not isinstance(scene, dict) or scene.get("schema_version") != SCENE_SCHEMA:
         raise ConfigError("unexpected scene schema", {"snapshot": str(root)})
     if scene.get("units") != "SI":

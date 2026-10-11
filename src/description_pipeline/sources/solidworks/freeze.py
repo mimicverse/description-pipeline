@@ -24,7 +24,7 @@ from .errors import BridgeError, ConfigError
 from .native import session_materialization_path
 from .evidence import build_evidence, capture_environment
 from .jsonio import digest_json, sha256_file, write_json
-from .scene import assembly_leaf_total, build_scene, closure_delta
+from .scene import assembly_leaf_total, closure_delta
 
 # The pipeline-wide STL reader owns the acceptance standard for meshes; the
 # adapter only writes geometry and then asks that reader what it produced.
@@ -1809,8 +1809,9 @@ def _freeze_local(
                 exit_code=3,
             )
 
-        scene_payload = build_scene(cfg, scene, geometry_entries)
-        write_json(staging / "scene.json", scene_payload)
+        # Scene construction is portable work. Seal its exact inputs here;
+        # Linux derives the scene without rewriting this native snapshot.
+        write_json(staging / "raw" / "source_config.json", cfg)
 
         source_inputs = _source_inputs(cfg, closure)
         identity = {
