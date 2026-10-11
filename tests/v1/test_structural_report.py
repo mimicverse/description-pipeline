@@ -149,6 +149,106 @@ class StructuralReportTests(unittest.TestCase):
             self.assertEqual(report["summary"], {"warnings": 1, "blockers": 1})
             self.assertIn("capture failed", (root / pins["markdown"]["path"]).read_text())
 
+    def test_missing_material_is_a_warning_with_measured_cad_values(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            assignment = {
+                "schema_version": "swbridge.material-assignment/v1",
+                "configuration": "默认",
+                "query_configuration": "",
+                "part_api": "IPartDoc.GetMaterialPropertyName2",
+                "body_api": "IBody2.GetMaterialPropertyName",
+                "part": {"name": "", "database": ""},
+                "body_count": 1,
+                "bodies": [
+                    {
+                        "index": 0,
+                        "name": "block-1",
+                        "material": {"name": "", "database": ""},
+                        "effective_source": "part",
+                    }
+                ],
+            }
+            write_json(
+                root / "evidence/raw/material_provenance.json",
+                {
+                    "schema_version": "solidworks-to-urdf.material-provenance/v1",
+                    "warnings": [
+                        {
+                            "code": "cad_material_provenance_missing",
+                            "message": "Every solid requires an explicit physical material",
+                            "document": "cad/arm.SLDPRT",
+                            "missing_body_indices": [0],
+                            "material_assignment": assignment,
+                            "measured": {
+                                "source": "cad_api",
+                                "bodies": [
+                                    {
+                                        "index": 0,
+                                        "name": "block-1",
+                                        "mass_kg": 0.1256,
+                                        "center_of_mass_m": [0.015, 0.001, 0.02],
+                                        "inertia_kg_m2": [
+                                            [1.0e-5, 2.0e-6, 0.0],
+                                            [2.0e-6, 3.0e-5, 0.0],
+                                            [0.0, 0.0, 4.0e-5],
+                                        ],
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                },
+            )
+            receipt = {"run_id": "m3", "state": "verified", "passed": True}
+            before = dict(receipt)
+            pins = write_structural_report(root, receipt, evidence_root=root)
+            report = json.loads((root / pins["json"]["path"]).read_text())
+            self.assertEqual(before, receipt)
+            warnings = [item for item in report["findings"] if item["code"] == "native.material_provenance_missing"]
+            self.assertEqual(len(warnings), 1)
+            finding = warnings[0]
+            self.assertEqual(finding["severity"], "warning")
+            self.assertEqual(finding["object"], "cad/arm.SLDPRT")
+            self.assertEqual(finding["evidence"]["missing_body_indices"], [0])
+            self.assertEqual(finding["evidence"]["configuration"], "默认")
+            self.assertEqual(finding["evidence"]["material_assignment"], assignment)
+            measured = finding["evidence"]["measured"]
+            self.assertEqual(measured["source"], "cad_api")
+            self.assertEqual(measured["bodies"][0]["mass_kg"], 0.1256)
+            self.assertEqual(measured["bodies"][0]["center_of_mass_m"], [0.015, 0.001, 0.02])
+            self.assertEqual(measured["bodies"][0]["inertia_kg_m2"][0][1], 2.0e-6)
+            self.assertIn("不据此声称材料已核验", finding["message"])
+            self.assertEqual(report["summary"], {"warnings": 1, "blockers": 0})
+            markdown = (root / pins["markdown"]["path"]).read_text()
+            self.assertIn("native.material_provenance_missing", markdown)
+
+    def test_missing_material_warning_sits_beside_a_failed_run(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_json(
+                root / "evidence/raw/material_provenance.json",
+                [
+                    {
+                        "document": "cad/base.SLDPRT",
+                        "missing_body_indices": [1],
+                        "measured": {"source": "cad_api", "bodies": [{"index": 1, "mass_kg": 0.02}]},
+                    }
+                ],
+            )
+            pins = write_structural_report(
+                root, {"run_id": "m3", "status": "failed", "error": "capture failed"}, evidence_root=root
+            )
+            report = json.loads((root / pins["json"]["path"]).read_text())
+            codes = [item["code"] for item in report["findings"]]
+            self.assertIn("native.material_provenance_missing", codes)
+            self.assertIn("pipeline.execution_failed", codes)
+            self.assertEqual(report["summary"], {"warnings": 1, "blockers": 1})
+            finding = next(item for item in report["findings"] if item["code"] == "native.material_provenance_missing")
+            self.assertIsNone(finding["evidence"]["material_assignment"])
+            self.assertEqual(finding["evidence"]["measured"]["bodies"][0]["mass_kg"], 0.02)
+            self.assertEqual(finding["evidence"]["code"], "cad_material_provenance_missing")
+
 
 if __name__ == "__main__":
     unittest.main()

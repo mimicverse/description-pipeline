@@ -59,6 +59,7 @@ def _findings(value, source, *, severity=None):
 
 def build_structural_report(receipt: dict, *, evidence_root: Path | None = None) -> dict:
     """Retain exact findings and source locations, including pre-capture refusals."""
+    material_source = "evidence/raw/material_provenance.json"
     sources = {"run": receipt}
     if evidence_root is not None:
         for name in (
@@ -67,6 +68,7 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
             "input/discovery/findings.json",
             "input/discovery/native-discovery.json",
             "evidence/raw/dependency_closure.json",
+            "evidence/raw/material_provenance.json",
         ):
             path = Path(evidence_root) / name
             if path.is_file():
@@ -87,6 +89,10 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
             }
         )
     for source, value in sources.items():
+        if source == material_source:
+            # Projected explicitly below: the raw warning entries carry their own
+            # code/message and must not be double-reported by the generic walk.
+            continue
         entries.extend(_findings(value, source))
     closure = ((receipt.get("selection") or {}).get("manifest") or {}).get("closure") or {}
     opened = closure.get("open_status") or {}
@@ -125,6 +131,43 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                         "location": item.get("location"),
                         "resolved_path": item.get("resolved_path"),
                         "exists": item.get("exists"),
+                    },
+                }
+            )
+    material_provenance = sources.get(material_source)
+    material_warnings = None
+    if isinstance(material_provenance, dict):
+        material_warnings = material_provenance.get("warnings")
+        if material_warnings is None and material_provenance.get("errors"):
+            entries.extend(_findings(material_provenance, material_source))
+    elif isinstance(material_provenance, list):
+        material_warnings = material_provenance
+    if isinstance(material_warnings, list):
+        # Missing explicit material is a warnable defect: the report keeps the exact
+        # assignment evidence and the measured CAD mass/centre-of-mass/inertia, and
+        # never claims the material or the physical/dynamic behaviour is verified.
+        for item in material_warnings:
+            if not isinstance(item, dict):
+                continue
+            assignment = item.get("material_assignment") if isinstance(item.get("material_assignment"), dict) else None
+            measured = item.get("measured") if isinstance(item.get("measured"), dict) else None
+            entries.append(
+                {
+                    "severity": "warning",
+                    "code": "native.material_provenance_missing",
+                    "object": item.get("document"),
+                    "message": (
+                        "SolidWorks 实体缺少显式物理材料赋值（默认密度不作为材料证据）：按可警告缺陷记录——"
+                        "流水线保留 CAD 实测质量、质心与惯量并继续生成与独立校验；本报告不据此声称材料已核验，"
+                        "材料真实性与物理/动力学合格仍属外部工程确认。"
+                    ),
+                    "source": "evidence/raw/material_provenance.json/warnings",
+                    "evidence": {
+                        "code": item.get("code") or "cad_material_provenance_missing",
+                        "configuration": item.get("configuration") or (assignment or {}).get("configuration"),
+                        "missing_body_indices": item.get("missing_body_indices"),
+                        "material_assignment": assignment,
+                        "measured": measured,
                     },
                 }
             )
