@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import tempfile
 import unittest
@@ -98,6 +99,34 @@ class SelectionTransportTests(unittest.TestCase):
         with self.assertRaises(SelectionError):
             session.seal_closure(self._evidence())
         self.assertEqual(session.snapshot()["state"], "reading")
+
+    def test_logical_retry_revalidates_the_incoming_archive(self) -> None:
+        session = self._session()
+        self.assertTrue(session.accept_batch(self._archive(self.root / "batch.zip", DATA)))
+        self.assertFalse(session.accept_batch(self._archive(self.root / "retry.zip", DATA)))
+        tampered = dict(DATA)
+        tampered["parts/link.SLDPRT"] = b"tampered retry bytes"
+        with self.assertRaises(SelectionError):
+            session.accept_batch(self._archive(self.root / "tampered.zip", tampered))
+        missing = {name: data for name, data in DATA.items() if name != "decoy.SLDPRT"}
+        with self.assertRaises(SelectionError):
+            session.accept_batch(self._archive(self.root / "missing.zip", missing))
+        self.assertEqual(session.snapshot()["state"], "reading")
+        self.assertEqual(inventory(session.stage), self.upload)
+
+    def test_reseal_is_idempotent_only_for_identical_evidence(self) -> None:
+        session = self._session()
+        self.assertTrue(session.accept_batch(self._archive(self.root / "batch.zip", DATA)))
+        evidence = self._evidence()
+        manifest = session.seal_closure(evidence)
+        self.assertEqual(session.snapshot()["state"], "sealed")
+        self.assertEqual(session.seal_closure(copy.deepcopy(evidence)), manifest)
+        other = self._evidence()
+        other["documents"][MAIN]["resolved_edges"] = []
+        with self.assertRaises(SelectionError):
+            session.seal_closure(other)
+        self.assertEqual(session.snapshot()["state"], "sealed")
+        self.assertEqual(inventory(session.stage), manifest["files"])
 
 
 if __name__ == "__main__":

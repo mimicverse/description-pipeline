@@ -23,6 +23,45 @@ def _refuse(condition: bool, code: str, message: str) -> None:
         raise SelectionError(code, message)
 
 
+def _validated_members(incoming: zipfile.ZipFile, expected: dict, remaining: int) -> list[zipfile.ZipInfo]:
+    """Validate the whole member list before any member bytes are read or written."""
+
+    members = incoming.infolist()
+    names = [member.filename for member in members]
+    _refuse(
+        len(names) == len(expected) and len(set(names)) == len(names) and set(names) == set(expected),
+        "selection_batch_inventory",
+        "Source batch must contain exactly the requested files",
+    )
+    total = sum(member.file_size for member in members)
+    _refuse(total <= remaining, "selection_batch_size", "Selected source exceeds its byte limit")
+    for member in members:
+        mode = stat.S_IFMT(member.external_attr >> 16)
+        _refuse(
+            not member.is_dir()
+            and mode in {0, stat.S_IFREG}
+            and not member.flag_bits & 1
+            and member.compress_type in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED},
+            "selection_batch_member",
+            "Source batches require unencrypted regular files",
+        )
+    return members
+
+
+def _read_member(incoming: zipfile.ZipFile, member: zipfile.ZipInfo, sink) -> tuple[int, str]:
+    """Stream one bounded member, optionally into ``sink``, and hash what was read."""
+
+    count, checksum = 0, hashlib.sha256()
+    with incoming.open(member) as source:
+        while block := source.read(min(_CHUNK, member.file_size - count + 1)):
+            count += len(block)
+            _refuse(count <= member.file_size, "selection_batch_size", "Source member exceeds its declared size")
+            checksum.update(block)
+            if sink is not None:
+                sink.write(block)
+    return count, checksum.hexdigest()
+
+
 def _extract_batch(archive: Path, destination: Path, expected: dict, *, remaining: int) -> dict[str, int]:
     """Validate the whole member list before extracting any bounded, hash-checked bytes."""
 
@@ -33,48 +72,41 @@ def _extract_batch(archive: Path, destination: Path, expected: dict, *, remainin
     )
     try:
         with zipfile.ZipFile(archive) as incoming:
-            members = incoming.infolist()
-            names = [member.filename for member in members]
-            _refuse(
-                len(names) == len(expected) and len(set(names)) == len(names) and set(names) == set(expected),
-                "selection_batch_inventory",
-                "Source batch must contain exactly the requested files",
-            )
-            total = sum(member.file_size for member in members)
-            _refuse(total <= remaining, "selection_batch_size", "Selected source exceeds its byte limit")
-            for member in members:
-                mode = stat.S_IFMT(member.external_attr >> 16)
-                _refuse(
-                    not member.is_dir()
-                    and mode in {0, stat.S_IFREG}
-                    and not member.flag_bits & 1
-                    and member.compress_type in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED},
-                    "selection_batch_member",
-                    "Source batches require unencrypted regular files",
-                )
             sizes = {}
-            for member in members:
+            for member in _validated_members(incoming, expected, remaining):
                 name = member.filename
                 target = Path(_filesystem_path(confined(destination, name, exists=False)))
                 target.parent.mkdir(parents=True, exist_ok=True)
-                count, checksum = 0, hashlib.sha256()
-                with incoming.open(member) as source, target.open("xb") as output:
-                    while block := source.read(min(_CHUNK, member.file_size - count + 1)):
-                        count += len(block)
-                        _refuse(
-                            count <= member.file_size,
-                            "selection_batch_size",
-                            "Source member exceeds its declared size",
-                        )
-                        checksum.update(block)
-                        output.write(block)
+                with target.open("xb") as output:
+                    count, checksum = _read_member(incoming, member, output)
                 _refuse(
-                    count == member.file_size and checksum.hexdigest() == expected[name],
+                    count == member.file_size and checksum == expected[name],
                     "selection_source_changed",
                     f"Source batch differs from the upload identity: {name}",
                 )
                 sizes[name] = count
             return sizes
+    except (zipfile.BadZipFile, EOFError, RuntimeError) as error:
+        raise SelectionError("selection_batch_invalid", f"Invalid source batch: {error}") from error
+
+
+def _verify_batch(archive: Path, expected: dict, *, remaining: int) -> None:
+    """Validate a logical retry against the staged index without touching the stage."""
+
+    _refuse(
+        0 < archive.stat().st_size <= MAX_HANDOFF_BYTES,
+        "selection_batch_size",
+        "Source batch archive exceeds its byte limit",
+    )
+    try:
+        with zipfile.ZipFile(archive) as incoming:
+            for member in _validated_members(incoming, expected, remaining):
+                count, checksum = _read_member(incoming, member, None)
+                _refuse(
+                    count == member.file_size and checksum == expected[member.filename],
+                    "selection_source_changed",
+                    f"Source batch differs from the upload identity: {member.filename}",
+                )
     except (zipfile.BadZipFile, EOFError, RuntimeError) as error:
         raise SelectionError("selection_batch_invalid", f"Invalid source batch: {error}") from error
 
@@ -96,6 +128,7 @@ class StagedSelection:
         self.state = "awaiting_files"
         self.upload_sha256 = digest(self.upload_files)
         self.staged_identity: str | None = None
+        self.sealed_evidence: object | None = None
 
     def snapshot(self) -> dict:
         snapshot = {
@@ -111,17 +144,19 @@ class StagedSelection:
     def accept_batch(self, archive: Path) -> bool:
         """Locked contract: install the whole upload index in one provisional batch.
 
-        A logical retry (identical staged inventory) performs no native rework.
+        A logical retry performs no native rework, but only after the incoming archive
+        proves the identical member list and hashes against the staged index.
         """
 
+        expected = dict(self.upload_files)
         if self.staged_identity == self.upload_sha256:
+            _verify_batch(Path(archive), expected, remaining=MAX_HANDOFF_BYTES)
             return False
         _refuse(
             self.state == "awaiting_files",
             "selection_round_stale",
             "Provisional staging is no longer accepting the upload batch",
         )
-        expected = dict(self.upload_files)
         with tempfile.TemporaryDirectory(prefix=".selection-upload-", dir=self.stage.parent) as temporary:
             incoming = Path(temporary)
             sizes = _extract_batch(Path(archive), incoming, expected, remaining=MAX_HANDOFF_BYTES)
@@ -149,11 +184,20 @@ class StagedSelection:
         The provisional staged inventory is re-hashed against the full upload index, the
         closure graph is sealed by :func:`seal_closure_selection`, the excluded staged
         files are removed, and the retained bytes must equal the selected files exactly.
-        ``snapshot()`` keeps the full original inventory as the upload proof.
+        ``snapshot()`` keeps the full original inventory as the upload proof.  Sealing is
+        idempotent only for the identical evidence, because the excluded bytes no longer
+        exist on disk once the closure is sealed.
         """
 
+        if self.state == "sealed":
+            _refuse(
+                evidence == self.sealed_evidence,
+                "selection_sealed",
+                "The provisional stage is already sealed from other closure evidence",
+            )
+            return copy.deepcopy(self.manifest)
         _refuse(
-            self.state in {"reading", "sealed"} and self.staged_identity == self.upload_sha256,
+            self.state == "reading" and self.staged_identity == self.upload_sha256,
             "selection_incomplete",
             "The full upload must be provisionally staged before sealing its closure",
         )
@@ -178,5 +222,6 @@ class StagedSelection:
             "Retained staged bytes differ from the sealed selection",
         )
         self.manifest = manifest
+        self.sealed_evidence = copy.deepcopy(evidence)
         self.state = "sealed"
         return copy.deepcopy(manifest)
