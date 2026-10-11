@@ -135,42 +135,62 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                 }
             )
     material_provenance = sources.get(material_source)
-    material_warnings = None
-    if isinstance(material_provenance, dict):
-        material_warnings = material_provenance.get("warnings")
-        if material_warnings is None and material_provenance.get("errors"):
-            entries.extend(_findings(material_provenance, material_source))
-    elif isinstance(material_provenance, list):
-        material_warnings = material_provenance
-    if isinstance(material_warnings, list):
-        # Missing explicit material is a warnable defect: the report keeps the exact
-        # assignment evidence and the measured CAD mass/centre-of-mass/inertia, and
-        # never claims the material or the physical/dynamic behaviour is verified.
-        for item in material_warnings:
-            if not isinstance(item, dict):
-                continue
-            assignment = item.get("material_assignment") if isinstance(item.get("material_assignment"), dict) else None
-            measured = item.get("measured") if isinstance(item.get("measured"), dict) else None
+    if isinstance(material_provenance, dict) and material_provenance.get("errors"):
+        entries.extend(_findings(material_provenance, material_source))
+    elif material_provenance is not None:
+        # One canonical schema only; anything else is independently rejected instead of
+        # being reinterpreted, defaulted or accepted through an alternate interface.
+        canonical = (
+            isinstance(material_provenance, dict)
+            and material_provenance.get("schema_version") == "solidworks-to-urdf.material-provenance/v1"
+            and isinstance(material_provenance.get("warnings"), list)
+            and all(isinstance(item, dict) for item in material_provenance.get("warnings") or [])
+        )
+        if not canonical:
             entries.append(
                 {
-                    "severity": "warning",
-                    "code": "native.material_provenance_missing",
-                    "object": item.get("document"),
+                    "severity": "blocker",
+                    "code": "report.material_provenance_invalid",
+                    "object": receipt.get("main_assembly"),
                     "message": (
-                        "SolidWorks 实体缺少显式物理材料赋值（默认密度不作为材料证据）：按可警告缺陷记录——"
-                        "流水线保留 CAD 实测质量、质心与惯量并继续生成与独立校验；本报告不据此声称材料已核验，"
-                        "材料真实性与物理/动力学合格仍属外部工程确认。"
+                        "材料来源证据不符合当前 schema：按独立拒绝处理，不采用默认值、不做替代解释、"
+                        "不据此输出材料警告。请用当前生产者的规范记录替换该证据。"
                     ),
-                    "source": "evidence/raw/material_provenance.json/warnings",
+                    "source": material_source,
                     "evidence": {
-                        "code": item.get("code") or "cad_material_provenance_missing",
-                        "configuration": item.get("configuration") or (assignment or {}).get("configuration"),
-                        "missing_body_indices": item.get("missing_body_indices"),
-                        "material_assignment": assignment,
-                        "measured": measured,
+                        "type": type(material_provenance).__name__,
+                        "schema_version": (
+                            material_provenance.get("schema_version") if isinstance(material_provenance, dict) else None
+                        ),
+                        "keys": sorted(material_provenance) if isinstance(material_provenance, dict) else None,
                     },
                 }
             )
+        else:
+            # Missing explicit material is a warnable defect: the report renders the exact
+            # reported assignment, body indices and native measured values, and never
+            # claims the material or the physical/dynamic behaviour is verified.
+            for item in material_provenance["warnings"]:
+                entries.append(
+                    {
+                        "severity": "warning",
+                        "code": "native.material_provenance_missing",
+                        "object": item.get("document"),
+                        "message": (
+                            "SolidWorks 实体缺少显式物理材料赋值（默认密度不作为材料证据）：按可警告缺陷记录——"
+                            "流水线保留 CAD 实测质量、质心与惯量并继续生成与独立校验；本报告不据此声称材料已核验，"
+                            "材料真实性与物理/动力学合格仍属外部工程确认。"
+                        ),
+                        "source": "evidence/raw/material_provenance.json/warnings",
+                        "evidence": {
+                            "code": item.get("code"),
+                            "configuration": item.get("configuration"),
+                            "missing_body_indices": item.get("missing_body_indices"),
+                            "material_assignment": item.get("material_assignment"),
+                            "measured": item.get("measured"),
+                        },
+                    }
+                )
     # The same warning may appear in discovery, input validation and a stage
     # event. Preserve its first evidence location without repeating it.
     unique = {}

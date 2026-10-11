@@ -178,6 +178,7 @@ class StructuralReportTests(unittest.TestCase):
                             "code": "cad_material_provenance_missing",
                             "message": "Every solid requires an explicit physical material",
                             "document": "cad/arm.SLDPRT",
+                            "configuration": "默认",
                             "missing_body_indices": [0],
                             "material_assignment": assignment,
                             "measured": {
@@ -228,13 +229,18 @@ class StructuralReportTests(unittest.TestCase):
             root = Path(directory)
             write_json(
                 root / "evidence/raw/material_provenance.json",
-                [
-                    {
-                        "document": "cad/base.SLDPRT",
-                        "missing_body_indices": [1],
-                        "measured": {"source": "cad_api", "bodies": [{"index": 1, "mass_kg": 0.02}]},
-                    }
-                ],
+                {
+                    "schema_version": "solidworks-to-urdf.material-provenance/v1",
+                    "warnings": [
+                        {
+                            "code": "cad_material_provenance_missing",
+                            "document": "cad/base.SLDPRT",
+                            "configuration": "默认",
+                            "missing_body_indices": [1],
+                            "measured": {"source": "cad_api", "bodies": [{"index": 1, "mass_kg": 0.02}]},
+                        }
+                    ],
+                },
             )
             pins = write_structural_report(
                 root, {"run_id": "m3", "status": "failed", "error": "capture failed"}, evidence_root=root
@@ -248,6 +254,33 @@ class StructuralReportTests(unittest.TestCase):
             self.assertIsNone(finding["evidence"]["material_assignment"])
             self.assertEqual(finding["evidence"]["measured"]["bodies"][0]["mass_kg"], 0.02)
             self.assertEqual(finding["evidence"]["code"], "cad_material_provenance_missing")
+
+    def test_malformed_material_provenance_is_independently_rejected(self):
+        payloads = {
+            "wrong_schema": {
+                "schema_version": "solidworks-to-urdf.material-provenance/v2",
+                "warnings": [],
+            },
+            "warnings_not_a_list": {
+                "schema_version": "solidworks-to-urdf.material-provenance/v1",
+                "warnings": {"document": "cad/base.SLDPRT"},
+            },
+            "bare_list": [{"document": "cad/base.SLDPRT", "missing_body_indices": [0]}],
+        }
+        for label, payload in payloads.items():
+            with self.subTest(label=label), TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_json(root / "evidence/raw/material_provenance.json", payload)
+                pins = write_structural_report(root, {"run_id": "m3", "state": "verified"}, evidence_root=root)
+                report = json.loads((root / pins["json"]["path"]).read_text())
+                codes = [item["code"] for item in report["findings"]]
+                self.assertIn("report.material_provenance_invalid", codes)
+                self.assertNotIn("native.material_provenance_missing", codes)
+                self.assertEqual(report["summary"]["blockers"], 1)
+                invalid = next(
+                    item for item in report["findings"] if item["code"] == "report.material_provenance_invalid"
+                )
+                self.assertIn("不采用默认值", invalid["message"])
 
 
 if __name__ == "__main__":
