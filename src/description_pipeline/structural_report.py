@@ -136,14 +136,25 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                     sources[name] = {"errors": [{"code": "report.evidence_unreadable", "message": str(error)}]}
     entries = []
     if receipt.get("error"):
+        detail = receipt.get("detail")
+        failure_object = receipt.get("main_assembly")
+        if isinstance(detail, dict):
+            # The native failure context names the exact failing leaf. Use it
+            # verbatim and never invent a component the record does not carry.
+            component = detail.get("component")
+            document = detail.get("document")
+            if isinstance(component, str) and component.strip():
+                failure_object = component
+            elif isinstance(document, str) and document.strip():
+                failure_object = document
         entries.append(
             {
                 "severity": "blocker",
                 "code": receipt.get("error_code") or "pipeline.execution_failed",
-                "object": receipt.get("main_assembly"),
+                "object": failure_object,
                 "message": str(receipt["error"]),
                 "source": "run/error",
-                "evidence": {"detail": receipt.get("detail"), "stage": receipt.get("stage")},
+                "evidence": {"detail": detail, "stage": receipt.get("stage")},
             }
         )
     for source, value in sources.items():

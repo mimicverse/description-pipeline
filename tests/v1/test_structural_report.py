@@ -377,6 +377,64 @@ class StructuralReportTests(unittest.TestCase):
             self.assertIn("标记为阻断", findings[0]["message"])
             self.assertEqual(report["summary"], {"warnings": 0, "blockers": 1})
 
+    def test_primary_blocker_uses_the_exact_component_from_the_native_detail(self):
+        from description_pipeline.structural_report import build_structural_report
+
+        receipt = {
+            "run_id": "m3",
+            "state": "failed",
+            "passed": False,
+            "error": "The part has no solid bodies",
+            "error_code": "cad_empty_model",
+            "main_assembly": "robot.SLDASM",
+            "detail": {
+                "component": "arm-2",
+                "document": "arm.SLDPRT",
+                "referenced_configuration": "tall",
+                "bodies": 0,
+                "phase": "capture",
+            },
+        }
+        report = build_structural_report(receipt)
+        blocker = next(item for item in report["findings"] if item["source"] == "run/error")
+        self.assertEqual(blocker["severity"], "blocker")
+        self.assertEqual(blocker["object"], "arm-2")
+        self.assertNotEqual(blocker["object"], receipt["main_assembly"])
+        self.assertEqual(
+            blocker["evidence"]["detail"],
+            {
+                "component": "arm-2",
+                "document": "arm.SLDPRT",
+                "referenced_configuration": "tall",
+                "bodies": 0,
+                "phase": "capture",
+            },
+        )
+        self.assertEqual(report["summary"], {"warnings": 0, "blockers": 1})
+
+    def test_primary_blocker_falls_back_without_inventing_a_component(self):
+        from description_pipeline.structural_report import build_structural_report
+
+        report = build_structural_report(
+            {
+                "run_id": "m3",
+                "state": "failed",
+                "error": "collected files changed",
+                "error_code": "cad_copy_changed",
+                "main_assembly": "robot.SLDASM",
+                "detail": {"document": "base.SLDPRT", "changed": ["a.sldprt"]},
+            }
+        )
+        blocker = next(item for item in report["findings"] if item["source"] == "run/error")
+        self.assertEqual(blocker["object"], "base.SLDPRT")
+
+        report = build_structural_report(
+            {"run_id": "m3", "state": "failed", "error": "boom", "main_assembly": "robot.SLDASM"}
+        )
+        blocker = next(item for item in report["findings"] if item["source"] == "run/error")
+        self.assertEqual(blocker["object"], "robot.SLDASM")
+        self.assertIsNone(blocker["evidence"]["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()
