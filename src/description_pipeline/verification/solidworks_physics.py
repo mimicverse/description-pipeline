@@ -272,9 +272,20 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
             "Material provenance does not describe this capture's material source",
         )
         _require(record.get("measured_source") == "cad_api", "Material provenance measured source changed")
+        # The record quotes the assembly path of the capture session; the archived
+        # definition names the same assembly package-relative. The sealed snapshot
+        # identity (manifest, kept equal to the collection identity) is the
+        # legitimate binding, never the relative archive path.
+        sealed = read_data(confined(root, "manifest.json"))
+        identity = sealed.get("identity") if isinstance(sealed, dict) else None
+        _require(isinstance(identity, dict), "Sealed capture identity is missing")
         _require(
-            record.get("assembly") == str(source.get("assembly") or ""),
-            "Material provenance assembly differs from the captured input",
+            isinstance(identity.get("assembly"), str) and bool(identity["assembly"]),
+            "Sealed capture identity carries no assembly",
+        )
+        _require(
+            record.get("assembly") == identity["assembly"],
+            "Material provenance assembly differs from the sealed capture identity",
         )
         _require(
             record.get("configuration") == str(source.get("configuration") or ""),

@@ -29,7 +29,7 @@ class PhysicsTests(unittest.TestCase):
         datum = np.array([[0, -1, 0, 0.05], [1, 0, 0, -0.03], [0, 0, 1, 0.1], [0, 0, 0, 1]], dtype=float)
         self.source = {
             "material_source": "cad",
-            "assembly": "C:\\fixture\\assembly.SLDASM",
+            "assembly": "robot.SLDASM",
             "configuration": "Default",
             "bodies": [
                 {
@@ -39,6 +39,12 @@ class PhysicsTests(unittest.TestCase):
                     "frame": {"coordinate_system": "base_datum"},
                 }
             ],
+        }
+        # The capture session seals its own assembly identity (absolute native
+        # path); the archived definition keeps the package-relative name.
+        self.captured_identity = {
+            "assembly": "C:\\endpoint\\prepared\\robot.SLDASM",
+            "configuration": "Default",
         }
         material = {
             "part": {"name": "Analytic control material", "database": "unit-test"},
@@ -148,6 +154,7 @@ class PhysicsTests(unittest.TestCase):
         write_json(self.root / "raw/coordinate_systems.json", self.raw["coordinate_systems"])
         write_json(self.root / "raw/declared_masses.json", {"items": {}, "evidence": None})
         write_json(self.root / "raw/mass_closure.json", self.closure)
+        write_json(self.root / "manifest.json", {"identity": copy.deepcopy(self.captured_identity)})
 
     def failures(self):
         self.write()
@@ -214,7 +221,7 @@ class PhysicsTests(unittest.TestCase):
             self.root / "raw/material_provenance.json",
             {
                 "schema_version": "solidworks-to-urdf.material-provenance/v1",
-                "assembly": self.source["assembly"],
+                "assembly": self.captured_identity["assembly"],
                 "configuration": self.source["configuration"],
                 "material_source": "cad",
                 "measured_source": "cad_api",
@@ -256,7 +263,7 @@ class PhysicsTests(unittest.TestCase):
             self.root / "raw/material_provenance.json",
             {
                 "schema_version": "solidworks-to-urdf.material-provenance/v1",
-                "assembly": self.source["assembly"],
+                "assembly": self.captured_identity["assembly"],
                 "configuration": self.source["configuration"],
                 "material_source": "cad",
                 "measured_source": "cad_api",
@@ -448,6 +455,11 @@ class PhysicsTests(unittest.TestCase):
             payload["assembly"] = "C:\\elsewhere.SLDASM"
             store(payload)
 
+        def changed_captured_assembly() -> None:
+            self._record_unverified_material()
+            self.captured_identity["assembly"] = "C:\\endpoint\\prepared\\other.SLDASM"
+            self.write()
+
         def changed_record_configuration() -> None:
             self._record_unverified_material()
             payload = load()
@@ -490,6 +502,7 @@ class PhysicsTests(unittest.TestCase):
             ("changed_measured_scope", changed_measured_scope),
             ("invented_scope", invented_scope),
             ("changed_assembly", changed_assembly),
+            ("changed_captured_assembly", changed_captured_assembly),
             ("changed_record_configuration", changed_record_configuration),
             ("changed_material_source", changed_material_source),
             ("changed_measured_source", changed_measured_source),
