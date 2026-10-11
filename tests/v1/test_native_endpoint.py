@@ -59,13 +59,34 @@ class NativeEndpointTests(EndpointFixture, unittest.TestCase):
                 request = self.request()
                 jobs.create(request)
                 self.stage_and_seal(jobs, request["run_id"])
-                if mutation == "staged":
-                    staged = jobs._source_dir(jobs.jobs[request["run_id"]]) / PART
-                    staged.write_bytes(b"changed after sealing\n")
                 finished = self.wait_state_any_status(jobs, request["run_id"], {"awaiting_definition"})
                 if finished["status"] != "failed":
-                    self.complete_definition(jobs, request["run_id"])
-                    finished = self.await_terminal(jobs, request["run_id"])
+                    if mutation == "staged":
+                        # Derive a valid request from the intact staging first; only then change
+                        # the server-side staged bytes, so the endpoint's definition admission —
+                        # never the local derivation — makes the deterministic refusal.
+                        self.complete_definition(jobs, request["run_id"], submit=False)
+                        staged = jobs._source_dir(jobs.jobs[request["run_id"]]) / PART
+                        staged.write_bytes(b"changed after sealing\n")
+                        with self.assertRaisesRegex(PipelineError, "Transferred files differ"):
+                            jobs.submit_definition(
+                                request["run_id"],
+                                self.last_definition["archive"],
+                                self.last_definition["prepared_sha256"],
+                            )
+                        # The refused exchange can never reach capture; terminate it the way the
+                        # pipeline records a dead definition exchange.
+                        finished = jobs.abort(
+                            request["run_id"],
+                            {
+                                "error": "the endpoint refused the changed staged source",
+                                "error_code": "definition_refused_after_staged_change",
+                                "detail": {"staged": PART},
+                            },
+                        )
+                    else:
+                        self.complete_definition(jobs, request["run_id"])
+                        finished = self.await_terminal(jobs, request["run_id"])
                 self.assertEqual("failed", finished["status"])
                 self.assertEqual([], calls)
 
