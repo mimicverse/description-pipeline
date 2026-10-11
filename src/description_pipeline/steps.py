@@ -363,7 +363,7 @@ def capture_evidence(
             from .runtime import native_readiness
 
             return native_readiness()
-        return {"scope": "injected regression backend; no native qualification"}
+        return {"scope": "provided CAD backend; native qualification is recorded in the capture evidence"}
 
     checked(on_event, "capture", "input", "runtime.ready", ready)
     _require(package_inventory(package) == original_files, "Prepared inputs changed before native capture")
