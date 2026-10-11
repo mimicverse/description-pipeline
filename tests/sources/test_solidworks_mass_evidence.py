@@ -155,6 +155,9 @@ class MassEvidenceContractTests(unittest.TestCase):
         # 真实读数会记录 material_assignment.unverified_reason；这里模拟那份派生 CAD
         # （SolidWorks 默认密度 1000 kg/m³ 给出"看起来正常"的质量）。默认密度不是证据，
         # 但属于可警告缺陷：冻结成功，测量值原样保留，警告逐字携带原始读数。
+        self.backend.components[1]["mass"]["reference"].update(
+            part_document="C:/cad/arm.SLDPRT", scope="part_document", volume_m3=6.25e-5, density_kg_m3=7900.0
+        )
         self.backend.components[1]["mass"]["reference"]["material_assignment"] = {
             "schema_version": "swbridge.material-assignment/v1",
             "configuration": "默认",
@@ -174,6 +177,17 @@ class MassEvidenceContractTests(unittest.TestCase):
         self.assertEqual(warning["missing_body_indices"], [0])
         self.assertEqual(warning["material_assignment"]["unverified_reason"], "cad_material_provenance_missing")
         self.assertAlmostEqual(warning["measured"]["mass_kg"], 0.5, places=12)
+        # 逐字对齐校验侧合同：记录条目与 raw/mass_properties.json 的原始行完全一致。
+        raw_rows = json.loads((snapshot / "raw" / "mass_properties.json").read_text(encoding="utf-8"))
+        raw_row = raw_rows["arm-1"]
+        self.assertEqual(warning["document"], raw_row["reference"]["part_document"])
+        self.assertEqual(warning["material_assignment"], raw_row["reference"]["material_assignment"])
+        self.assertEqual(warning["measured"]["mass_kg"], raw_row["mass"])
+        self.assertEqual(warning["measured"]["center_of_mass_m"], raw_row["com"])
+        self.assertEqual(warning["measured"]["inertia_kg_m2"], raw_row["inertia"])
+        self.assertEqual(warning["measured"]["volume_m3"], raw_row["reference"]["volume_m3"])
+        self.assertEqual(warning["measured"]["density_kg_m3"], raw_row["reference"]["density_kg_m3"])
+        self.assertEqual(warning["measured"]["scope"], "part_document")
         # 读数不被猜测值替换：link 质量仍是 CAD 实测值，警告同时写进 scene 的 provenance。
         scene = load_scene(snapshot)
         arm = next(link for link in scene["links"] if link["name"] == "arm_link")
