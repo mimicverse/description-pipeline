@@ -1792,12 +1792,15 @@ def _component_source_document(component, source_root):
     A resident delivered document binds directly; otherwise the raw readings
     are recorded independently of any selection carrier: the engine-reported
     materialization path, the virtual flag and the author import path
-    (GetImportedPath is author metadata, never an in-package binding).  A
-    structural session materialization is classified ``cached_materialization``
-    only when it is an IC~~ path component under the owned session temp area;
-    a genuinely delivered imported source (GetImportedPath resolving inside the
-    source root) keeps the historical ``resolved`` binding.  Temporary names
-    and basenames are never proof.
+    (GetImportedPath is author metadata, never an in-package binding).  An
+    occurrence whose engine-resolved document is a structural session
+    materialization -- IC~~ path component under the owned session temp area --
+    is always classified ``cached_materialization`` on both the raw and the
+    carrier side, even when the author import path itself points into the
+    source root; that in-stage source is then reported as validated author
+    metadata (``author_imported_in_source_root``/``author_imported_relative``)
+    and retained as a selection-level bound edge, never as a raw binding.
+    Temporary names and basenames are never proof.
     """
 
     native_path = str(_method(component, "GetPathName") or "")
@@ -1814,15 +1817,14 @@ def _component_source_document(component, source_root):
         "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
     }
     result = {"document": None, "source_provenance": provenance}
+    imported_path = None
     try:
         imported_path = _method(component, "GetImportedPath")
         provenance["author_imported_path"] = (
             imported_path if isinstance(imported_path, str) and imported_path.strip() else None
         )
-        imported = _relative_document(imported_path, source_root) if _is_text_name(imported_path) else None
     except Exception as error:  # noqa: BLE001 - a temp or foreign path is never an implicit source
         provenance["author_imported_error"] = f"{type(error).__name__}: {error}"[:300]
-        imported = None
     virtual = None
     try:
         reading = _member(component, "IsVirtual")
@@ -1830,28 +1832,22 @@ def _component_source_document(component, source_root):
     except Exception as error:  # noqa: BLE001 - an unreadable virtual flag stays unknown
         provenance["virtual_error"] = f"{type(error).__name__}: {error}"[:200]
     provenance["is_virtual"] = virtual
-    if imported:
-        result["document"] = imported
-        provenance.update(
-            {
-                "state": "resolved",
-                "kind": "native_imported_document",
-                "document": imported,
-                "sha256": _hash(str(Path(source_root) / imported)),
-            }
-        )
-    elif session_materialization_path(native_path):
+    if session_materialization_path(native_path):
+        author_relative = _relative_document(imported_path, source_root) if imported_path else None
         provenance.update(
             {
                 "state": "cached_materialization",
                 "kind": "native_import_materialization",
                 "document": None,
                 "session_temp_root": session_temp_root(native_path),
+                "author_imported_in_source_root": author_relative is not None,
+                "author_imported_relative": author_relative,
             }
         )
     else:
         provenance["error"] = (
-            "ValueError: native imported source does not resolve to a file inside the delivered folder"
+            "ValueError: the resolved document is not a delivered file and not a structural "
+            "session materialization (IC~~ under the owned session temp area)"
         )
     return result
 

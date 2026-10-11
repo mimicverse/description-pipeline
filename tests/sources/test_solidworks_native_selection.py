@@ -246,6 +246,49 @@ class ClosureAdmissionTests(unittest.TestCase):
         self.assertEqual(edge["kind"], "native_imported_document")
         self.assertEqual(edge["resolved"], "NP-F550.step")
 
+    def test_np_real_shape_selection_and_raw_agree_on_the_cached_class(self) -> None:
+        from description_pipeline.sources.solidworks.native import _component_source_document
+
+        extra = write_stage(self.stage, {"NP-F550.step": b"np-bytes"})
+        files = {**self.files, **extra}
+        temp = session_temp("swx28528", "IC~~", "NP-F550.step.SLDPRT")
+        payload = self.observe(
+            [
+                occurrence(
+                    "NP-F550.step-1",
+                    temp,
+                    imported=str(self.stage / "NP-F550.step"),
+                    native_owner="robot.SLDASM",
+                )
+            ],
+            files=files,
+        )
+        slot = payload["imports"][0]
+        self.assertEqual(slot["state"], "cached_materialization")
+        self.assertEqual(slot["bound_source"], "NP-F550.step")
+        self.assertEqual(slot["owner"], "robot.SLDASM")
+        self.assertEqual(slot["owner_sha256"], files["robot.SLDASM"])
+        self.assertEqual(payload["graph"]["robot.SLDASM"]["references"], ["NP-F550.step"])
+
+        class RawComponent:
+            def __init__(self, path, imported):
+                self._path = path
+                self.GetImportedPath = lambda: imported
+                self.IsVirtual = False
+
+            def GetPathName(self):
+                return self._path
+
+        raw = _component_source_document(
+            RawComponent(temp, str(self.stage / "NP-F550.step")), self.stage
+        )
+        self.assertEqual(raw["source_provenance"]["state"], "cached_materialization")
+        # Two-sided class parity: the raw occurrence and the carrier slot agree
+        # on the cached class for the same occurrence, so the independent gate
+        # matches exactly one raw occurrence per cached slot.
+        self.assertEqual(slot["instance"], "NP-F550.step-1")
+        self.assertTrue(raw["source_provenance"]["author_imported_in_source_root"])
+
     def test_import_marker_outside_session_temp_is_not_a_cache(self) -> None:
         fake_temp = r"C:\Users\Mi\Documents\IC~~\NP-F550.step.SLDPRT"
         with self.assertRaises(SelectionError) as caught:

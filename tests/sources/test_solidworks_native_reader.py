@@ -3533,6 +3533,23 @@ class ComponentSourceDocumentTests(unittest.TestCase):
         self.assertEqual(provenance["state"], "unread")
         self.assertIs(provenance["is_virtual"], True)
 
+    def test_in_stage_author_source_does_not_override_the_cached_class(self) -> None:
+        from description_pipeline.sources.solidworks.native import _component_source_document
+
+        (self.source_root / "NP-F550.step").write_bytes(b"np-bytes")
+        result = _component_source_document(
+            self.component(self.materialization, imported=str(self.source_root / "NP-F550.step")),
+            self.source_root,
+        )
+        provenance = result["source_provenance"]
+        # The engine-resolved document is a structural session materialization,
+        # so the class stays cached on both sides; the in-stage author source is
+        # validated metadata (retained as a selection-level bound edge).
+        self.assertEqual(provenance["state"], "cached_materialization")
+        self.assertIsNone(result["document"])
+        self.assertTrue(provenance["author_imported_in_source_root"])
+        self.assertEqual(provenance["author_imported_relative"], "NP-F550.step")
+
 
 if __name__ == "__main__":
     unittest.main()
