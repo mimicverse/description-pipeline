@@ -28,6 +28,8 @@ REPORT_EVIDENCE_FILES = (
     "evidence/raw/dependency_closure.json",
     "evidence/raw/material_provenance.json",
     "evidence/raw/effective_instances.json",
+    "evidence/raw/mass_closure.json",
+    "reports/mass-closure.json",
 )
 
 #: Files sealed for one failed job: the projected evidence plus the snapshot

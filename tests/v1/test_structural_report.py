@@ -563,3 +563,40 @@ class StructuralReportTests(unittest.TestCase):
 if __name__ == "__main__":
 
     unittest.main()
+
+    def test_mass_closure_records_are_projected_and_allowlisted(self):
+        from description_pipeline.structural_report import is_sealed_diagnostic_member
+
+        self.assertTrue(is_sealed_diagnostic_member("evidence/raw/mass_closure.json"))
+        self.assertTrue(is_sealed_diagnostic_member("reports/mass-closure.json"))
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_json(
+                root / "reports/mass-closure.json",
+                {
+                    "findings": [
+                        {
+                            "code": "closure.effective_total_mismatch",
+                            "object": "board-1",
+                            "blocking": True,
+                            "message": "有效实例总质量与闭包不一致",
+                        }
+                    ]
+                },
+            )
+            write_json(
+                root / "evidence/raw/mass_closure.json",
+                {
+                    "status": "recorded",
+                    "errors": [{"code": "closure.context_missing", "message": "缺少组件上下文读数"}],
+                },
+            )
+            pins = write_structural_report(root, {"run_id": "m3", "state": "failed"}, evidence_root=root)
+            report = json.loads((root / pins["json"]["path"]).read_text())
+            codes = [item["code"] for item in report["findings"]]
+            self.assertIn("closure.effective_total_mismatch", codes)
+            self.assertIn("closure.context_missing", codes)
+            blocker = next(item for item in report["findings"] if item["code"] == "closure.effective_total_mismatch")
+            self.assertEqual(blocker["severity"], "blocker")
+            self.assertEqual(blocker["object"], "board-1")
+
