@@ -910,8 +910,9 @@ def verify_normalization(
     #  * a component that is included but has no declared mass (documented_table),
     #    so its CAD default-density placeholder silently becomes the model mass;
     #  * declared entries that match no component (typo/renamed instance);
-    #  * in strict CAD mode, a component whose raw reading says its material is
-    #    unverified, so its CAD mass is a default-density placeholder.
+    #  * in CAD mode, unverified material readings silently used without the
+    #    exact occurrence warning coverage. Numerical agreement does not qualify
+    #    the material; missing assignments may only pass with that distinction.
     material_source = str(((definition or {}).get("source") or {}).get("material_source") or "cad")
     included = sorted(defined_entities)
     missing_declared = (
@@ -919,14 +920,46 @@ def verify_normalization(
     )
     unknown_declared = sorted(name for name in declared if name not in defined_entities)
     unverified_cad: list[str] = []
+    unsupported_material_reasons: dict[str, object] = {}
+    warning_coverage_errors: list[str] = []
+    material_warning: dict | None = None
     if material_source != "documented_table":
         for name in included:
             payload = masses.get(name)
             reference = payload.get("reference") if isinstance(payload, dict) else None
             assignment = reference.get("material_assignment") if isinstance(reference, dict) else None
-            if name not in declared and isinstance(assignment, dict) and assignment.get("unverified_reason"):
+            if isinstance(assignment, dict) and "unverified_reason" in assignment:
                 unverified_cad.append(name)
-    mass_provenance_ok = not (missing_declared or unknown_declared or unverified_cad)
+                if assignment["unverified_reason"] != "cad_material_provenance_missing":
+                    unsupported_material_reasons[name] = assignment["unverified_reason"]
+        provenance = canonical.get("provenance")
+        warnings = provenance.get("warnings", []) if isinstance(provenance, dict) else []
+        if not isinstance(warnings, list) or any(not isinstance(entry, dict) for entry in warnings):
+            warning_coverage_errors.append("material warnings must be a list of objects")
+            matching = []
+        else:
+            matching = [entry for entry in warnings if entry.get("code") == "cad_material_provenance_missing"]
+        if unverified_cad:
+            if len(matching) != 1:
+                warning_coverage_errors.append("unverified CAD occurrences require exactly one aggregate warning")
+            else:
+                warning = matching[0]
+                if warning.get("blocking") is not False:
+                    warning_coverage_errors.append("material warning must explicitly have blocking=false")
+                if warning.get("components") != unverified_cad:
+                    warning_coverage_errors.append("material warning components differ from sorted raw occurrences")
+                if warning.get("unverified_reasons") != ["cad_material_provenance_missing"]:
+                    warning_coverage_errors.append("material warning reasons differ from the raw allowed reason")
+                if not isinstance(warning.get("message"), str) or not warning["message"].strip():
+                    warning_coverage_errors.append("material warning must explain the missing assignment")
+                if not warning_coverage_errors and not unsupported_material_reasons:
+                    material_warning = warning
+        elif matching:
+            warning_coverage_errors.append("material warning claims occurrences without raw unverified readings")
+    rejected_cad = unverified_cad if material_warning is None else []
+    mass_provenance_ok = not (
+        missing_declared or unknown_declared or rejected_cad or unsupported_material_reasons or warning_coverage_errors
+    )
     mass_details: dict[str, object] = {
         "material_source": material_source,
         "included": included,
@@ -934,7 +967,14 @@ def verify_normalization(
         "missing_declared": missing_declared,
         "unknown_declared": unknown_declared,
         "cad_mass_without_verified_material": unverified_cad,
+        "unsupported_material_reasons": unsupported_material_reasons,
+        "warning_coverage_errors": warning_coverage_errors,
     }
+    if material_source != "documented_table":
+        mass_details["material_assignment_verified"] = not unverified_cad
+        if material_warning is not None:
+            mass_details["warnings"] = [material_warning]
+            mass_details["verification_scope"] = "native numerical consistency; physical material remains unqualified"
     if declared:
         mass_details["inertia_model"] = "scaled_cad_uniform_density"
         mass_details["inertia_model_scope"] = (
@@ -948,7 +988,7 @@ def verify_normalization(
             "source.normalization.mass_provenance",
             mass_provenance_ok and bool(included),
             expected=included,
-            checked=sorted(set(included) - set(missing_declared) - set(unverified_cad)),
+            checked=sorted(set(included) - set(missing_declared) - set(rejected_cad)),
             details=mass_details,
         )
     )

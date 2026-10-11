@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import tempfile
 import unittest
 from pathlib import Path
@@ -253,6 +254,83 @@ class MassEvidenceContractTests(unittest.TestCase):
         self.assertIn("incomplete or changed", str(raised.exception))
 
     # --- 独立校验 -----------------------------------------------------
+
+    def _warned_oracle_input(self) -> tuple[Path, dict, dict, dict]:
+        self.backend.components[1]["mass"]["reference"]["material_assignment"] = {
+            "schema_version": "swbridge.material-assignment/v1",
+            "unverified_reason": "cad_material_provenance_missing",
+            "missing_body_indices": [0],
+        }
+        snapshot = self._freeze("oracle-warned", material_source="cad")
+        raw_scene = support.read_scene(snapshot)
+        definition = self._definition(material_source="cad")
+        return snapshot, raw_scene, definition, canonical_for(raw_scene, definition, snapshot)
+
+    def _mass_check(self, snapshot: Path, raw_scene: dict, definition: dict, canonical: dict) -> dict:
+        return next(
+            entry
+            for entry in verify_normalization(raw_scene, definition, snapshot, canonical)
+            if entry["id"] == "source.normalization.mass_provenance"
+        )
+
+    def test_oracle_accepts_native_numbers_with_exact_material_warning_coverage(self) -> None:
+        snapshot, raw_scene, definition, canonical = self._warned_oracle_input()
+        check = self._mass_check(snapshot, raw_scene, definition, canonical)
+        self.assertEqual(check["status"], "passed", check)
+        self.assertEqual(check["checked"], ["arm-1", "base-1"])
+        self.assertFalse(check["details"]["material_assignment_verified"])
+        self.assertEqual(check["details"]["warnings"], canonical["provenance"]["warnings"])
+        self.assertEqual(check["details"]["cad_mass_without_verified_material"], ["arm-1"])
+
+    def test_oracle_rejects_removed_duplicate_and_false_material_warning_coverage(self) -> None:
+        snapshot, raw_scene, definition, canonical = self._warned_oracle_input()
+        original = canonical["provenance"]["warnings"][0]
+        mutations = {
+            "removed": [],
+            "duplicated": [original, original],
+            "missing_occurrence": [dict(original, components=[])],
+            "invented_occurrence": [dict(original, components=["arm-1", "ghost-1"])],
+            "duplicate_occurrence": [dict(original, components=["arm-1", "arm-1"])],
+            "wrong_reason": [dict(original, unverified_reasons=["cad_material_read_failed"])],
+            "omitted_reason": [dict(original, unverified_reasons=[])],
+            "wrong_code": [dict(original, code="cad_material_read_failed")],
+            "blocking_true": [dict(original, blocking=True)],
+            "blocking_zero": [dict(original, blocking=0)],
+            "blocking_null": [dict(original, blocking=None)],
+            "missing_flag": [{key: value for key, value in original.items() if key != "blocking"}],
+            "empty_message": [dict(original, message="")],
+            "malformed_list": original,
+            "malformed_entry": [None],
+        }
+        for case, warnings in mutations.items():
+            with self.subTest(case=case):
+                altered = copy.deepcopy(canonical)
+                altered["provenance"]["warnings"] = warnings
+                check = self._mass_check(snapshot, raw_scene, definition, altered)
+                self.assertEqual(check["status"], "failed", check)
+                self.assertTrue(check["details"]["warning_coverage_errors"], check)
+
+    def test_oracle_rejects_unknown_and_falsy_raw_material_reasons(self) -> None:
+        snapshot, raw_scene, definition, canonical = self._warned_oracle_input()
+        path = snapshot / "raw" / "mass_properties.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        for reason in ("cad_material_read_failed", "unknown", "", None, False, 0):
+            with self.subTest(reason=reason):
+                payload["arm-1"]["reference"]["material_assignment"]["unverified_reason"] = reason
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                check = self._mass_check(snapshot, raw_scene, definition, canonical)
+                self.assertEqual(check["status"], "failed", check)
+                self.assertEqual(check["details"]["unsupported_material_reasons"], {"arm-1": reason})
+
+    def test_oracle_rejects_fabricated_material_warning_for_verified_readings(self) -> None:
+        snapshot = self._freeze("oracle-clean", material_source="cad")
+        raw_scene = support.read_scene(snapshot)
+        definition = self._definition(material_source="cad")
+        canonical = canonical_for(raw_scene, definition, snapshot)
+        canonical["provenance"]["warnings"] = [{"code": "cad_material_provenance_missing", "components": ["arm-1"]}]
+        check = self._mass_check(snapshot, raw_scene, definition, canonical)
+        self.assertEqual(check["status"], "failed", check)
+        self.assertTrue(check["details"]["warning_coverage_errors"])
 
     def test_oracle_rediscovers_a_missing_declared_mass(self) -> None:
         snapshot = self._freeze(
