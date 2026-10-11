@@ -27,6 +27,7 @@ REPORT_EVIDENCE_FILES = (
     "input/discovery/native-discovery.json",
     "evidence/raw/dependency_closure.json",
     "evidence/raw/material_provenance.json",
+    "evidence/raw/effective_instances.json",
 )
 
 #: Files sealed for one failed job: the projected evidence plus the snapshot
@@ -124,6 +125,56 @@ def _canonical_material_warnings(value) -> list | None:
     return warnings
 
 
+#: The single canonical effective-instance record (producer: the native freeze): written for
+#: every capture under ``evidence/raw/effective_instances.json``, bound by the manifest.
+_EFFECTIVE_SCHEMA = "solidworks-to-urdf.effective-instances/v1"
+_EFFECTIVE_TOP_KEYS = ("schema_version", "assembly", "configuration", "readings", "warnings")
+_EFFECTIVE_CODES = ("cad_instance_override_effective", "cad_surface_only_effective_instance")
+_EFFECTIVE_QUALIFICATION = (
+    "cad_authored_effective_instance; not geometry-derived, not independently physically qualified"
+)
+
+
+def _canonical_effective_warnings(value) -> list | None:
+    """The canonical warning list of the effective-instance record, or ``None``."""
+
+    if not isinstance(value, dict) or value.get("schema_version") != _EFFECTIVE_SCHEMA:
+        return None
+    if any(key not in value for key in _EFFECTIVE_TOP_KEYS):
+        return None
+    if not isinstance(value.get("readings"), dict):
+        return None
+    warnings = value.get("warnings")
+    if not isinstance(warnings, list):
+        return None
+    for item in warnings:
+        if not isinstance(item, dict):
+            return None
+        code = item.get("code")
+        if code not in _EFFECTIVE_CODES:
+            # Unknown codes fail closed instead of being rendered as warnings.
+            return None
+        if item.get("blocking") is not False:
+            return None
+        if not isinstance(item.get("component"), str) or not item["component"].strip():
+            return None
+        if item.get("qualification") != _EFFECTIVE_QUALIFICATION:
+            return None
+        if not isinstance(item.get("measurement"), dict):
+            return None
+        overrides = item.get("overrides")
+        if not isinstance(overrides, dict) or any(not isinstance(flag, bool) for flag in overrides.values()):
+            return None
+        required = (
+            ("document", "part_document_read", "solid_bodies", "sheet_bodies")
+            if code == "cad_surface_only_effective_instance"
+            else ("role", "document_type", "part_document", "assembly_document")
+        )
+        if any(key not in item for key in required):
+            return None
+    return warnings
+
+
 def _findings(value, source, *, severity=None):
     if isinstance(value, list):
         for index, entry in enumerate(value):
@@ -169,6 +220,7 @@ def _findings(value, source, *, severity=None):
 def build_structural_report(receipt: dict, *, evidence_root: Path | None = None) -> dict:
     """Retain exact findings and source locations, including pre-capture refusals."""
     material_source = "evidence/raw/material_provenance.json"
+    effective_source = "evidence/raw/effective_instances.json"
     sources = {"run": receipt}
     if evidence_root is not None:
         for name in REPORT_EVIDENCE_FILES:
@@ -202,7 +254,7 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
             }
         )
     for source, value in sources.items():
-        if source == material_source:
+        if source in {material_source, effective_source}:
             # Projected explicitly below: the raw warning entries carry their own
             # code/message and must not be double-reported by the generic walk.
             continue
@@ -248,6 +300,7 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                 }
             )
     material_required = False
+    effective_required = False
     if evidence_root is not None:
         snapshot_manifest = Path(evidence_root) / "evidence/manifest.json"
         if snapshot_manifest.is_file():
@@ -257,6 +310,93 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                 snapshot = None
             if isinstance(snapshot, dict) and isinstance(snapshot.get("files"), dict):
                 material_required = "raw/material_provenance.json" in snapshot["files"]
+                effective_required = "raw/effective_instances.json" in snapshot["files"]
+    effective_instances = sources.get(effective_source)
+    if isinstance(effective_instances, dict) and effective_instances.get("errors"):
+        entries.extend(_findings(effective_instances, effective_source))
+        entries.append(
+            {
+                "severity": "blocker",
+                "code": "report.effective_instances_invalid",
+                "object": receipt.get("main_assembly"),
+                "message": (
+                    "有效实例证据不可读：证据无效，必须由独立检查判为失败。"
+                    "本报告不采用默认值、不做替代解释、不据此输出有效实例警告。"
+                ),
+                "source": effective_source,
+                "evidence": {"unreadable": True},
+            }
+        )
+    elif effective_instances is None:
+        if effective_required:
+            # The manifest binds the record for every current capture; a deleted or
+            # absent record is required evidence and fails closed.
+            entries.append(
+                {
+                    "severity": "blocker",
+                    "code": "report.effective_instances_missing",
+                    "object": receipt.get("main_assembly"),
+                    "message": (
+                        "快照清单要求有效实例记录（evidence/raw/effective_instances.json），但该证据缺失："
+                        "证据无效，必须由独立检查判为失败。本报告不采用默认值或替代解释。"
+                    ),
+                    "source": effective_source,
+                    "evidence": {"required_by_manifest": True},
+                }
+            )
+    else:
+        # One canonical schema only; anything else is independently rejected instead of
+        # being reinterpreted, defaulted or accepted through an alternate interface.
+        effective_warnings = _canonical_effective_warnings(effective_instances)
+        if effective_warnings is None:
+            entries.append(
+                {
+                    "severity": "blocker",
+                    "code": "report.effective_instances_invalid",
+                    "object": receipt.get("main_assembly"),
+                    "message": (
+                        "有效实例证据不符合当前 schema：证据无效，必须由独立检查判为失败。"
+                        "本报告不采用默认值、不做替代解释、不据此输出有效实例警告；"
+                        "请用当前生产者的规范记录替换该证据。"
+                    ),
+                    "source": effective_source,
+                    "evidence": {
+                        "type": type(effective_instances).__name__,
+                        "schema_version": (
+                            effective_instances.get("schema_version")
+                            if isinstance(effective_instances, dict)
+                            else None
+                        ),
+                        "keys": sorted(effective_instances) if isinstance(effective_instances, dict) else None,
+                    },
+                }
+            )
+        else:
+            # CAD-authored effective values are warnable: the report keeps the native
+            # flags and readings verbatim, states the instance scope plainly, and never
+            # claims geometric derivation or independent physical qualification.
+            override_message = (
+                "CAD 在装配实例上按有效覆盖值记录该组件（assembly_component_group 范围，使用装配文档坐标轴）："
+                "父级实例的覆盖值在单个刚体范围内整体替换其子树，未向运动链分摊；"
+                "该值为 CAD 编写的有效值，未经几何推导与独立物理校核，本报告不据此声称物理准确性。"
+            )
+            surface_message = (
+                "该组件仅有曲面（无实体），零件文档无法回答质量属性，CAD 改按装配实例记录有效值"
+                "（assembly_component_group 范围，使用装配文档坐标轴）：质量、质心与惯量来自 CAD 编写的有效值，"
+                "未经几何推导与独立物理校核，本报告不据此声称物理准确性，也不做分摊或替代。"
+            )
+            for item in effective_warnings:
+                surface_only = item["code"] == "cad_surface_only_effective_instance"
+                entries.append(
+                    {
+                        "severity": "warning",
+                        "code": item["code"],
+                        "object": item.get("component") or item.get("document") or item.get("part_document"),
+                        "message": surface_message if surface_only else override_message,
+                        "source": "evidence/raw/effective_instances.json/warnings",
+                        "evidence": item,
+                    }
+                )
     material_provenance = sources.get(material_source)
     if isinstance(material_provenance, dict) and material_provenance.get("errors"):
         entries.extend(_findings(material_provenance, material_source))

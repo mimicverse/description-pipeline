@@ -454,6 +454,112 @@ class StructuralReportTests(unittest.TestCase):
             [item["source"] for item in reloaded["findings"]],
         )
 
+    def _effective_record(self, warnings, *, readings=None):
+        return {
+            "schema_version": "solidworks-to-urdf.effective-instances/v1",
+            "assembly": "robot.SLDASM",
+            "configuration": "默认",
+            "readings": readings if readings is not None else {},
+            "warnings": warnings,
+        }
+
+    def _effective_warning(self, code, component):
+        item = {
+            "code": code,
+            "blocking": False,
+            "component": component,
+            "configuration": "默认",
+            "overrides": {"mass": True, "center_of_mass": False, "inertia": True},
+            "qualification": (
+                "cad_authored_effective_instance; not geometry-derived, not independently physically qualified"
+            ),
+            "measurement": {
+                "scope": "assembly_component_group",
+                "axes": "assembly_document_axes",
+                "mass_kg": 0.0632,
+                "center_of_mass_m": [0.0, 0.0, 0.07],
+                "inertia_kg_m2": [[0.001, 0.0, 0.0], [0.0, 0.001, 0.0], [0.0, 0.0, 0.0004]],
+            },
+        }
+        if code == "cad_surface_only_effective_instance":
+            item.update(
+                document="board.SLDPRT",
+                part_document_read="unavailable",
+                solid_bodies=0,
+                sheet_bodies=2350,
+            )
+        else:
+            item.update(
+                role="parent",
+                document_type="assembly",
+                part_document="board.SLDPRT",
+                assembly_document="robot.SLDASM",
+            )
+        return item
+
+    def test_effective_instance_warnings_render_with_honest_qualification(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._effective_record(
+                [
+                    self._effective_warning("cad_instance_override_effective", "board-1"),
+                    self._effective_warning("cad_surface_only_effective_instance", "pcb-1"),
+                ],
+                readings={"board-1": {"role": "parent", "mass": 0.0632}, "pcb-1": {"role": "leaf", "mass": 0.03}},
+            )
+            write_json(root / "evidence/raw/effective_instances.json", record)
+            pins = write_structural_report(root, {"run_id": "m3", "state": "verified"}, evidence_root=root)
+            report = json.loads((root / pins["json"]["path"]).read_text())
+            findings = [item for item in report["findings"] if item["code"].startswith("cad_")]
+            self.assertEqual(
+                [item["code"] for item in findings],
+                ["cad_instance_override_effective", "cad_surface_only_effective_instance"],
+            )
+            self.assertTrue(all(item["severity"] == "warning" for item in findings))
+            self.assertEqual([item["object"] for item in findings], ["board-1", "pcb-1"])
+            self.assertTrue(all("未经几何推导与独立物理校核" in item["message"] for item in findings))
+            self.assertIn("未向运动链分摊", findings[0]["message"])
+            self.assertEqual(
+                findings[0]["evidence"]["qualification"],
+                "cad_authored_effective_instance; not geometry-derived, not independently physically qualified",
+            )
+            self.assertEqual(
+                findings[0]["evidence"]["overrides"],
+                {"mass": True, "center_of_mass": False, "inertia": True},
+            )
+            self.assertEqual(report["summary"], {"warnings": 2, "blockers": 0})
+
+    def test_manifest_bound_effective_record_missing_fails_closed(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_json(root / "evidence/manifest.json", {"files": {"raw/effective_instances.json": "0" * 64}})
+            pins = write_structural_report(root, {"run_id": "m3", "state": "failed"}, evidence_root=root)
+            report = json.loads((root / pins["json"]["path"]).read_text())
+            missing = [item for item in report["findings"] if item["code"] == "report.effective_instances_missing"]
+            self.assertEqual(len(missing), 1)
+            self.assertEqual(missing[0]["severity"], "blocker")
+            self.assertEqual(missing[0]["evidence"], {"required_by_manifest": True})
+
+    def test_malformed_effective_record_is_rejected_and_unbound_absence_is_valid(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._effective_record([{"code": "cad_unknown", "blocking": False}])
+            write_json(root / "evidence/raw/effective_instances.json", record)
+            pins = write_structural_report(root, {"run_id": "m3", "state": "failed"}, evidence_root=root)
+            report = json.loads((root / pins["json"]["path"]).read_text())
+            invalid = [item for item in report["findings"] if item["code"] == "report.effective_instances_invalid"]
+            self.assertEqual(len(invalid), 1)
+            self.assertEqual(invalid[0]["severity"], "blocker")
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            pins = write_structural_report(root, {"run_id": "m3", "state": "failed"}, evidence_root=root)
+            report = json.loads((root / pins["json"]["path"]).read_text())
+            codes = [item["code"] for item in report["findings"]]
+            self.assertNotIn("report.effective_instances_missing", codes)
+            self.assertNotIn("report.effective_instances_invalid", codes)
+
 
 if __name__ == "__main__":
+
     unittest.main()
