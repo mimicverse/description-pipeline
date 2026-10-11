@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,6 +29,8 @@ class PhysicsTests(unittest.TestCase):
         datum = np.array([[0, -1, 0, 0.05], [1, 0, 0, -0.03], [0, 0, 1, 0.1], [0, 0, 0, 1]], dtype=float)
         self.source = {
             "material_source": "cad",
+            "assembly": "C:\\fixture\\assembly.SLDASM",
+            "configuration": "Default",
             "bodies": [
                 {
                     "id": "base",
@@ -48,6 +51,10 @@ class PhysicsTests(unittest.TestCase):
             "axes": "part_document_axes",
             "reference_point": "center_of_mass",
             "use_system_units": True,
+            "configuration": "Default",
+            "part_document": "C:\\fixture\\a.SLDPRT",
+            "volume_m3": 0.001,
+            "density_kg_m3": 1000.0,
             "overrides": {"OverrideMass": False, "OverrideCenterOfMass": False, "OverrideMomentsOfInertia": False},
             "material_assignment": material,
         }
@@ -148,6 +155,7 @@ class PhysicsTests(unittest.TestCase):
         return [check["id"] for check in checks if not check["passed"]]
 
     def test_analytic_rotated_translated_parts_and_link_datum_match(self):
+        self._record_clean_provenance()
         self.assertEqual([], self.failures())
 
     def test_translation_mutation_is_rejected_after_resealing_all_raw_copies(self):
@@ -198,6 +206,306 @@ class PhysicsTests(unittest.TestCase):
     def test_missing_material_is_rejected(self):
         self.masses["a"]["reference"]["material_assignment"].pop("part")
         self.assertIn("physics.authority", self.failures())
+
+    def _record_clean_provenance(self) -> None:
+        """The canonical record a current CAD capture seals when every material is verified."""
+
+        write_json(
+            self.root / "raw/material_provenance.json",
+            {
+                "schema_version": "solidworks-to-urdf.material-provenance/v1",
+                "assembly": self.source["assembly"],
+                "configuration": self.source["configuration"],
+                "material_source": "cad",
+                "measured_source": "cad_api",
+                "warnings": [],
+            },
+        )
+
+    def _mark_unverified_material(self) -> None:
+        """Mark a's captured assignment with the recorded missing-material wrapper."""
+
+        verbatim = {
+            "schema_version": "swbridge.material-assignment/v1",
+            "configuration": "Default",
+            "query_configuration": "Default",
+            "part_api": "IPartDoc.GetMaterialPropertyName2",
+            "body_api": "IBody2.GetMaterialPropertyName",
+            "part": {"name": "", "database": ""},
+            "body_count": 1,
+            "bodies": [
+                {"index": 0, "name": "solid", "material": {"name": "", "database": ""}, "effective_source": "part"}
+            ],
+        }
+        assignment = {
+            "schema_version": "swbridge.material-assignment/v1",
+            "configuration": "Default",
+            "unverified_reason": "cad_material_provenance_missing",
+            "message": "Every solid requires an explicit physical material; default density is not evidence",
+            "missing_body_indices": [0],
+            "material_assignment": copy.deepcopy(verbatim),
+        }
+        self.masses["a"]["reference"]["material_assignment"] = copy.deepcopy(assignment)
+        self.write()
+
+    def _record_unverified_material(self) -> None:
+        self._mark_unverified_material()
+        reference = self.masses["a"]["reference"]
+        assignment = reference["material_assignment"]
+        write_json(
+            self.root / "raw/material_provenance.json",
+            {
+                "schema_version": "solidworks-to-urdf.material-provenance/v1",
+                "assembly": self.source["assembly"],
+                "configuration": self.source["configuration"],
+                "material_source": "cad",
+                "measured_source": "cad_api",
+                "warnings": [
+                    {
+                        "code": "cad_material_provenance_missing",
+                        "message": assignment["message"],
+                        "blocking": False,
+                        "component": "a",
+                        "document": reference["part_document"],
+                        "configuration": reference["configuration"],
+                        "missing_body_indices": copy.deepcopy(assignment["missing_body_indices"]),
+                        "material_assignment": copy.deepcopy(assignment),
+                        "measured": {
+                            "source": "cad_api",
+                            "scope": reference.get("scope"),
+                            "mass_kg": self.masses["a"]["mass"],
+                            "center_of_mass_m": copy.deepcopy(self.masses["a"]["com"]),
+                            "inertia_kg_m2": copy.deepcopy(self.masses["a"]["inertia"]),
+                            "volume_m3": reference["volume_m3"],
+                            "density_kg_m3": reference["density_kg_m3"],
+                        },
+                    }
+                ],
+            },
+        )
+
+    def test_unverified_material_is_a_warning_not_a_failure(self):
+        self._record_unverified_material()
+        checks = verify_physics(self.root, self.source, self.model)
+        by_id = {check["id"]: check for check in checks}
+        self.assertTrue(by_id["physics.authority"]["passed"], by_id["physics.authority"])
+        self.assertEqual(by_id["physics.authority"]["details"]["unverified_material"], ["a"])
+        provenance = by_id["physics.material_provenance"]
+        self.assertTrue(provenance["passed"], provenance)
+        self.assertTrue(provenance["details"]["recorded"])
+        self.assertEqual(provenance["details"]["unverified_material"], ["a"])
+        self.assertFalse(provenance["details"]["warnings"][0]["blocking"])
+
+    def test_material_provenance_record_is_required_even_without_warnings(self):
+        self._record_clean_provenance()
+        (self.root / "raw/material_provenance.json").unlink()
+        self.assertIn("physics.material_provenance", self.failures())
+
+    def test_material_provenance_record_is_required_and_bound_to_the_readings(self):
+        def load() -> dict:
+            return json.loads((self.root / "raw/material_provenance.json").read_text())
+
+        def store(payload: dict) -> None:
+            write_json(self.root / "raw/material_provenance.json", payload)
+
+        def warning(payload: dict) -> dict:
+            return payload["warnings"][0]
+
+        def silent_use() -> None:
+            self._mark_unverified_material()
+
+        def deletion_after_sealing() -> None:
+            self._record_unverified_material()
+            (self.root / "raw/material_provenance.json").unlink()
+
+        def empty_warnings() -> None:
+            self._record_unverified_material()
+            payload = load()
+            payload["warnings"] = []
+            store(payload)
+
+        def wrong_code() -> None:
+            self._record_unverified_material()
+            payload = load()
+            warning(payload)["code"] = "cad_material_read_failed"
+            store(payload)
+
+        def changed_assignment() -> None:
+            self._record_unverified_material()
+            payload = load()
+            warning(payload)["material_assignment"]["material_assignment"]["part"]["name"] = "Invented"
+            store(payload)
+
+        def changed_document() -> None:
+            self._record_unverified_material()
+            payload = load()
+            warning(payload)["document"] = "C:\\elsewhere.SLDPRT"
+            store(payload)
+
+        def changed_configuration() -> None:
+            self._record_unverified_material()
+            payload = load()
+            warning(payload)["configuration"] = "Other"
+            store(payload)
+
+        def changed_body_indices() -> None:
+            self._record_unverified_material()
+            payload = load()
+            warning(payload)["missing_body_indices"] = [1]
+            store(payload)
+
+        def blocking_flag() -> None:
+            self._record_unverified_material()
+            payload = load()
+            warning(payload)["blocking"] = True
+            store(payload)
+
+        def unknown_component() -> None:
+            self._record_unverified_material()
+            payload = load()
+            warning(payload)["component"] = "zzz"
+            store(payload)
+
+        def uncovered_component() -> None:
+            self._record_unverified_material()
+            payload = load()
+            entry = json.loads(json.dumps(warning(payload)))
+            entry["component"] = "b"
+            payload["warnings"].append(entry)
+            store(payload)
+
+        def repeated_component() -> None:
+            self._record_unverified_material()
+            payload = load()
+            payload["warnings"].append(json.loads(json.dumps(warning(payload))))
+            store(payload)
+
+        def changed_measured_mass() -> None:
+            self._record_unverified_material()
+            payload = load()
+            warning(payload)["measured"]["mass_kg"] = 0.5
+            store(payload)
+
+        def changed_measured_com() -> None:
+            self._record_unverified_material()
+            payload = load()
+            warning(payload)["measured"]["center_of_mass_m"] = [0.0, 0.0, 1.0]
+            store(payload)
+
+        def changed_measured_inertia() -> None:
+            self._record_unverified_material()
+            payload = load()
+            warning(payload)["measured"]["inertia_kg_m2"][0][0] = 0.02
+            store(payload)
+
+        def changed_measured_volume() -> None:
+            self._record_unverified_material()
+            payload = load()
+            warning(payload)["measured"]["volume_m3"] = 0.002
+            store(payload)
+
+        def changed_measured_density() -> None:
+            self._record_unverified_material()
+            payload = load()
+            warning(payload)["measured"]["density_kg_m3"] = 900.0
+            store(payload)
+
+        def negative_measured_mass() -> None:
+            self._record_unverified_material()
+            payload = load()
+            warning(payload)["measured"]["mass_kg"] = -1.0
+            store(payload)
+
+        def deleted_blocking() -> None:
+            self._record_unverified_material()
+            payload = load()
+            warning(payload).pop("blocking")
+            store(payload)
+
+        def changed_measured_scope() -> None:
+            self._record_unverified_material()
+            payload = load()
+            warning(payload)["measured"]["scope"] = "component"
+            store(payload)
+
+        def invented_scope() -> None:
+            self._record_unverified_material()
+            self.masses["a"]["reference"]["scope"] = "assembly_document"
+            self.write()
+            payload = load()
+            warning(payload)["measured"]["scope"] = "assembly_document"
+            store(payload)
+
+        def changed_assembly() -> None:
+            self._record_unverified_material()
+            payload = load()
+            payload["assembly"] = "C:\\elsewhere.SLDASM"
+            store(payload)
+
+        def changed_record_configuration() -> None:
+            self._record_unverified_material()
+            payload = load()
+            payload["configuration"] = "Other"
+            store(payload)
+
+        def changed_material_source() -> None:
+            self._record_unverified_material()
+            payload = load()
+            payload["material_source"] = "documented_table"
+            store(payload)
+
+        def changed_measured_source() -> None:
+            self._record_unverified_material()
+            payload = load()
+            payload["measured_source"] = "swbridge"
+            store(payload)
+
+        for label, mutate in (
+            ("silent_use", silent_use),
+            ("deletion_after_sealing", deletion_after_sealing),
+            ("empty_warnings", empty_warnings),
+            ("wrong_code", wrong_code),
+            ("changed_assignment", changed_assignment),
+            ("changed_document", changed_document),
+            ("changed_configuration", changed_configuration),
+            ("changed_body_indices", changed_body_indices),
+            ("blocking_flag", blocking_flag),
+            ("unknown_component", unknown_component),
+            ("uncovered_component", uncovered_component),
+            ("repeated_component", repeated_component),
+            ("changed_measured_mass", changed_measured_mass),
+            ("changed_measured_com", changed_measured_com),
+            ("changed_measured_inertia", changed_measured_inertia),
+            ("changed_measured_volume", changed_measured_volume),
+            ("changed_measured_density", changed_measured_density),
+            ("negative_measured_mass", negative_measured_mass),
+            ("deleted_blocking", deleted_blocking),
+            ("changed_measured_scope", changed_measured_scope),
+            ("invented_scope", invented_scope),
+            ("changed_assembly", changed_assembly),
+            ("changed_record_configuration", changed_record_configuration),
+            ("changed_material_source", changed_material_source),
+            ("changed_measured_source", changed_measured_source),
+        ):
+            with self.subTest(case=label):
+                self.setUp()
+                mutate()
+                self.assertIn("physics.material_provenance", self.failures())
+
+    def test_unknown_unverified_reasons_are_not_warnable(self):
+        def unknown_reason() -> None:
+            self._record_unverified_material()
+            self.masses["a"]["reference"]["material_assignment"]["unverified_reason"] = "cad_material_read_failed"
+
+        def boolean_reason() -> None:
+            self._record_unverified_material()
+            self.masses["a"]["reference"]["material_assignment"]["unverified_reason"] = False
+
+        for label, mutate in (("unknown_reason", unknown_reason), ("boolean_reason", boolean_reason)):
+            with self.subTest(case=label):
+                self.setUp()
+                mutate()
+                self.assertIn("physics.authority", self.failures())
 
     def test_override_and_incomplete_context_are_rejected(self):
         self.closure["component_context"]["instances"][0]["overrides"]["OverrideCenterOfMass"] = True

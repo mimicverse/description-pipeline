@@ -28,6 +28,49 @@ def _require(passed, message):
         raise PipelineError(message)
 
 
+def _finite_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+
+
+def _finite_vector3(value: object) -> bool:
+    return isinstance(value, list) and len(value) == 3 and all(_finite_number(item) for item in value)
+
+
+def _finite_matrix3(value: object) -> bool:
+    return isinstance(value, list) and len(value) == 3 and all(_finite_vector3(row) for row in value)
+
+
+def _require_measured_reading(measured: dict, row: dict, reference: dict, name: str) -> None:
+    """The recorded measurement must quote the captured component reading exactly."""
+
+    scope = reference.get("scope")
+    _require(scope in ("component", "part_document"), name + ": captured reading carries no valid native scope")
+    _require(measured.get("scope") == scope, name + ": measured scope differs from the captured reading")
+    mass = measured.get("mass_kg")
+    _require(_finite_number(mass) and float(mass) > 0.0, name + ": measured mass is not finite and positive")
+    _require(mass == row.get("mass"), name + ": measured mass differs from the captured reading")
+    com = measured.get("center_of_mass_m")
+    _require(_finite_vector3(com), name + ": measured center of mass is malformed")
+    _require(com == row.get("com"), name + ": measured center of mass differs from the captured reading")
+    inertia = measured.get("inertia_kg_m2")
+    _require(_finite_matrix3(inertia), name + ": measured inertia is malformed")
+    _require(inertia == row.get("inertia"), name + ": measured inertia differs from the captured reading")
+    volume = measured.get("volume_m3")
+    captured_volume = reference.get("volume_m3")
+    _require(volume == captured_volume, name + ": measured volume differs from the captured reading")
+    _require(
+        captured_volume is None or (_finite_number(volume) and float(volume) > 0.0),
+        name + ": measured volume is not finite and positive",
+    )
+    density = measured.get("density_kg_m3")
+    captured_density = reference.get("density_kg_m3")
+    _require(density == captured_density, name + ": measured density differs from the captured reading")
+    _require(
+        captured_density is None or (_finite_number(density) and float(density) > 0.0),
+        name + ": measured density is not finite and positive",
+    )
+
+
 def verify_urdf_mass_equality(bundle_root: Path) -> dict:
     """Mandatory whole-CAD equality for the delivered URDF.
 
@@ -174,20 +217,126 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
                 _require(bool(entry["reason"]) and bool(entry["evidence"]), "Missing mass authority reason/evidence")
         else:
             _require(not declared, "CAD authority cannot carry replacement masses")
+            unverified: list[str] = []
             for name, record in masses.items():
                 assignment = record["reference"]["material_assignment"]
-                _require(
-                    not assignment.get("unverified_reason") and bool(assignment.get("bodies")),
-                    name + ": unverified material",
-                )
+                _require(isinstance(assignment, dict), name + ": material assignment is not an object")
+                if "unverified_reason" in assignment:
+                    # A missing explicit physical assignment is a warnable engineering
+                    # deficiency: the native-measured mass properties stay authoritative
+                    # and the condition is recorded, never silently claimed as verified.
+                    # Only the recorded deficiency code is warnable; any other value is
+                    # an unreadable or hand-written reading and fails closed.
+                    _require(
+                        assignment.get("unverified_reason") == "cad_material_provenance_missing",
+                        name + ": unknown unverified material reason",
+                    )
+                    unverified.append(name)
+                    continue
+                _require(bool(assignment.get("bodies")), name + ": unverified material")
                 for body in assignment["bodies"]:
                     selected = body["material"] if body["effective_source"] == "body" else assignment["part"]
                     _require(
                         bool(selected["name"]) and bool(selected["database"]), name + ": missing material assignment"
                     )
-        return {"mode": mode, "inertia_model": "scaled_cad_uniform_density" if declared else "cad_mass_properties"}
+        return {
+            "mode": mode,
+            "inertia_model": "scaled_cad_uniform_density" if declared else "cad_mass_properties",
+            "unverified_material": sorted(unverified) if mode == "cad" else [],
+        }
 
     gate("physics.authority", authority)
+
+    def material_provenance():
+        path = root / "raw/material_provenance.json"
+        if source.get("material_source") != "cad":
+            # Only CAD-sourced masses depend on material provenance; documented
+            # tables carry their own bound evidence.
+            return {"recorded": path.is_file(), "unverified_material": []}
+        affected = sorted(
+            name
+            for name, item in masses.items()
+            if isinstance(item.get("reference"), dict)
+            and isinstance(item["reference"].get("material_assignment"), dict)
+            and "unverified_reason" in item["reference"]["material_assignment"]
+        )
+        _require(path.is_file(), "Material provenance record is missing from the CAD capture")
+        record = read_data(path)
+        _require(isinstance(record, dict), "Material provenance record is not an object")
+        _require(
+            record.get("schema_version") == "solidworks-to-urdf.material-provenance/v1",
+            "Material provenance schema changed",
+        )
+        _require(
+            record.get("material_source") == source.get("material_source"),
+            "Material provenance does not describe this capture's material source",
+        )
+        _require(record.get("measured_source") == "cad_api", "Material provenance measured source changed")
+        _require(
+            record.get("assembly") == str(source.get("assembly") or ""),
+            "Material provenance assembly differs from the captured input",
+        )
+        _require(
+            record.get("configuration") == str(source.get("configuration") or ""),
+            "Material provenance configuration differs from the captured input",
+        )
+        warnings = record.get("warnings")
+        _require(isinstance(warnings, list), "Material provenance warnings must be a list")
+        recorded: dict[str, dict] = {}
+        for entry in warnings:
+            _require(isinstance(entry, dict), "Material provenance warning is malformed")
+            _require(
+                entry.get("code") == "cad_material_provenance_missing",
+                "Material provenance warning carries another code",
+            )
+            _require(entry.get("blocking") is False, "Material provenance warning must be explicitly non-blocking")
+            name = entry.get("component")
+            _require(
+                isinstance(name, str) and name in masses, "Material provenance warning names an unknown occurrence"
+            )
+            _require(name not in recorded, "Material provenance repeats an occurrence")
+            reference = masses[name].get("reference")
+            _require(isinstance(reference, dict), name + ": captured reading has no reference block")
+            assignment = reference.get("material_assignment")
+            _require(
+                isinstance(assignment, dict)
+                and assignment.get("unverified_reason") == "cad_material_provenance_missing",
+                name + ": captured reading does not carry the recorded material deficiency",
+            )
+            _require(
+                entry.get("material_assignment") == assignment,
+                name + ": material provenance differs from the captured reading",
+            )
+            _require(
+                entry.get("document") == reference.get("part_document"),
+                name + ": material provenance document differs from the captured reading",
+            )
+            _require(
+                entry.get("configuration") == (reference.get("configuration") or assignment.get("configuration")),
+                name + ": material provenance configuration differs from the captured reading",
+            )
+            _require(
+                entry.get("missing_body_indices") == assignment.get("missing_body_indices"),
+                name + ": material provenance body indices differ from the captured reading",
+            )
+            measured = entry.get("measured")
+            _require(
+                isinstance(measured, dict) and measured.get("source") == "cad_api",
+                name + ": measured material evidence is missing",
+            )
+            _require_measured_reading(measured, masses[name], reference, name)
+            recorded[name] = {**entry, "blocking": False}
+        _require(
+            sorted(recorded) == affected,
+            "Material provenance does not cover the unverified materials exactly",
+        )
+        return {
+            "recorded": True,
+            "unverified_material": affected,
+            "warnings": list(recorded.values()),
+        }
+
+    gate("physics.material_provenance", material_provenance)
     links = {row["name"]: row for row in model.get("links", [])}
     for body in source["bodies"]:
 
