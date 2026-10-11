@@ -23,6 +23,7 @@ from description_pipeline.sources.solidworks.input import (  # noqa: E402
     INSPECTION_SCHEMA,
     INPUT_SCHEMA,
     ROBOT_FILE,
+    _selection_matches_acquisition,
     inspect_package,
     load_package,
     native_source_closure,
@@ -852,6 +853,45 @@ class InputPackageTests(unittest.TestCase):
         self.assertIsInstance(inspection, dict)
         self.assertFalse(inspection["passed"])
         self.assertIn("input.provider_invalid", str(error))
+
+
+class SelectionAcquisitionContractTests(unittest.TestCase):
+    """Strict identity between the sealed selection and both acquired inventories."""
+
+    def _inputs(self):
+        selected = {
+            "robot.SLDASM": "a" * 64,
+            "arm.SLDPRT": "b" * 64,
+            "NP-F550.step": "c" * 64,
+        }
+        record = {"native_files": dict(selected)}
+        raw = {"files": dict(selected)}
+        manifest = {"files": dict(selected), "excluded_files": {"decoy.SLDPRT": "d" * 64}}
+        return record, raw, manifest
+
+    def test_full_inventories_match_the_sealed_selection(self):
+        _selection_matches_acquisition(*self._inputs())
+
+    def test_missing_or_mutated_retained_source_is_refused(self):
+        cases = {
+            "raw_missing": lambda record, raw, manifest: raw["files"].pop("NP-F550.step"),
+            "raw_mutated": lambda record, raw, manifest: raw["files"].update({"NP-F550.step": "e" * 64}),
+            "acquired_missing": lambda record, raw, manifest: record["native_files"].pop("NP-F550.step"),
+            "acquired_mutated": lambda record, raw, manifest: record["native_files"].update({"NP-F550.step": "e" * 64}),
+            "raw_extra": lambda record, raw, manifest: raw["files"].update({"extra.step": "e" * 64}),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(case=label):
+                record, raw, manifest = self._inputs()
+                mutate(record, raw, manifest)
+                with self.assertRaises(PipelineError):
+                    _selection_matches_acquisition(record, raw, manifest)
+
+    def test_overlapping_inventories_are_refused(self):
+        record, raw, manifest = self._inputs()
+        manifest["excluded_files"]["robot.SLDASM"] = "a" * 64
+        with self.assertRaises(PipelineError):
+            _selection_matches_acquisition(record, raw, manifest)
 
 
 if __name__ == "__main__":

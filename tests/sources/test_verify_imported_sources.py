@@ -580,6 +580,28 @@ class ImportedSourceTests(unittest.TestCase):
             report = verify_discovery(package)
         self.assertFalse(self._check(report)["passed"], "file_bytes_mismatch")
 
+        for label, mutate in {
+            "retained_source_missing_from_raw": lambda files: files.pop(NP_RELATIVE, None),
+            "retained_source_hash_mutated": lambda files: files.update({NP_RELATIVE: "f" * 64}),
+        }.items():
+            with self.subTest(case=label):
+                raw_files = {CACHED_OWNER: owner_sha, NP_RELATIVE: np_sha}
+                mutate(raw_files)
+                with tempfile.TemporaryDirectory() as directory:
+                    package = self._package(
+                        directory,
+                        {CACHED_OWNER: owner_bytes, NP_RELATIVE: np_bytes},
+                        [relocated_component(owner_sha)],
+                        raw_files=raw_files,
+                        extra_raw={"source_selection": relocated_carrier(owner_sha, np_sha)},
+                    )
+                    report = verify_discovery(package)
+                failed = [
+                    item for item in report["checks"] if item["id"] == "discovery.selection" and not item["passed"]
+                ]
+                self.assertTrue(failed, label)
+                self.assertIn("not bound by the raw record", str(failed[0]["details"]))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -126,6 +126,23 @@ def native_metadata(package: Path, definition: dict) -> dict:
     return identity
 
 
+def _selection_matches_acquisition(record: dict, raw: dict, manifest: dict) -> None:
+    """The sealed selection must equal both the acquired and the raw file inventories.
+
+    ``record['native_files']`` is the acquired full package inventory and ``raw['files']``
+    the native record's file map; with the producer recording every validated in-stage
+    author source in both, the two must agree byte-for-byte with the sealed selection,
+    so a missing or mutated retained source refuses here.
+    """
+
+    selected = manifest.get("files")
+    excluded = manifest.get("excluded_files")
+    if not isinstance(selected, dict) or not isinstance(excluded, dict) or set(selected) & set(excluded):
+        raise PipelineError("Native source selection has invalid file inventories")
+    if selected != record.get("native_files") or selected != raw.get("files"):
+        raise PipelineError("Native source selection differs from the acquired CAD inventory")
+
+
 def native_source_closure(package: Path, definition: dict) -> dict:
     """Bind capture policy to the sealed native acquisition, never authored YAML.
 
@@ -143,10 +160,7 @@ def native_source_closure(package: Path, definition: dict) -> dict:
         raise PipelineError("Native acquisition lacks its sealed source selection")
     selected = manifest.get("files")
     excluded = manifest.get("excluded_files")
-    if not isinstance(selected, dict) or not isinstance(excluded, dict) or set(selected) & set(excluded):
-        raise PipelineError("Native source selection has invalid file inventories")
-    if selected != record.get("native_files") or selected != raw.get("files"):
-        raise PipelineError("Native source selection differs from the acquired CAD inventory")
+    _selection_matches_acquisition(record, raw, manifest)
     if manifest.get("main_assembly") != definition["source"].get("assembly"):
         raise PipelineError("Native source selection names another main assembly")
     verify_selection(manifest, {**excluded, **selected}, selected, reader_sha256=manifest.get("reader_sha256"))
