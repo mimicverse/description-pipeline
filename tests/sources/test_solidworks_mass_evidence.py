@@ -282,6 +282,26 @@ class MassEvidenceContractTests(unittest.TestCase):
         self.assertEqual(check["details"]["warnings"], canonical["provenance"]["warnings"])
         self.assertEqual(check["details"]["cad_mass_without_verified_material"], ["arm-1"])
 
+    def test_oracle_requires_sorted_coverage_of_all_unverified_occurrences(self) -> None:
+        assignment = {
+            "schema_version": "swbridge.material-assignment/v1",
+            "unverified_reason": "cad_material_provenance_missing",
+            "missing_body_indices": [0],
+        }
+        for component in self.backend.components:
+            component["mass"]["reference"]["material_assignment"] = copy.deepcopy(assignment)
+        snapshot = self._freeze("oracle-warned-all", material_source="cad")
+        raw_scene = support.read_scene(snapshot)
+        definition = self._definition(material_source="cad")
+        canonical = canonical_for(raw_scene, definition, snapshot)
+        self.assertEqual(self._mass_check(snapshot, raw_scene, definition, canonical)["status"], "passed")
+        for components in (["arm-1"], ["base-1", "arm-1"]):
+            with self.subTest(components=components):
+                altered = copy.deepcopy(canonical)
+                altered["provenance"]["warnings"][0]["components"] = components
+                check = self._mass_check(snapshot, raw_scene, definition, altered)
+                self.assertEqual(check["status"], "failed", check)
+
     def test_oracle_rejects_removed_duplicate_and_false_material_warning_coverage(self) -> None:
         snapshot, raw_scene, definition, canonical = self._warned_oracle_input()
         original = canonical["provenance"]["warnings"][0]
