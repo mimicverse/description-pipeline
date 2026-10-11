@@ -308,6 +308,10 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
                 name + ": material provenance differs from the captured reading",
             )
             _require(
+                entry.get("message") == str(assignment.get("message") or "material assignment is not verified"),
+                name + ": material warning message differs from the captured reading",
+            )
+            _require(
                 entry.get("document") == reference.get("part_document"),
                 name + ": material provenance document differs from the captured reading",
             )

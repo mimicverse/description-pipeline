@@ -422,6 +422,12 @@ class PhysicsTests(unittest.TestCase):
             warning(payload).pop("blocking")
             store(payload)
 
+        def changed_warning_message() -> None:
+            self._record_unverified_material()
+            payload = load()
+            warning(payload)["message"] = "All physical materials are qualified"
+            store(payload)
+
         def changed_measured_scope() -> None:
             self._record_unverified_material()
             payload = load()
@@ -461,6 +467,7 @@ class PhysicsTests(unittest.TestCase):
             store(payload)
 
         for label, mutate in (
+            ("changed_warning_message", changed_warning_message),
             ("silent_use", silent_use),
             ("deletion_after_sealing", deletion_after_sealing),
             ("empty_warnings", empty_warnings),
