@@ -830,6 +830,7 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
             required_names=sorted((closure.get("graph") or {}).keys()),
             admitted_roots=[str(source_dir), *(cfg.get("allowed_roots") or [])],
             closure_documents=closure_documents,
+            required_paths=sorted(original_files),
         )
         or {}
     )
@@ -1130,6 +1131,7 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
             stale_stored,
             key=lambda item: (str(item.get("document")), str(item.get("location")), str(item.get("resolved_path"))),
         ),
+        "seeded_required_leaves": sorted(collected.get("seeded_required_leaves") or []),
         "materializations_verified": materializations_verified,
         "materialization_keys": sorted([token[0], token[1], instance] for token, instance in materialization_keys),
         "import_temp_documents": sorted(set(import_temp_documents)),

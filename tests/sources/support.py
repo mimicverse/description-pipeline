@@ -240,6 +240,7 @@ class FixtureCadBackend(CadBackend):
         required_names=(),
         admitted_roots=(),
         closure_documents=None,
+        required_paths=(),
     ) -> dict[str, Any]:
         self.collect_skips = {
             "skip_missing": sorted(str(item) for item in skip_missing),
@@ -250,6 +251,7 @@ class FixtureCadBackend(CadBackend):
             "closure_documents": (
                 sorted((closure_documents or {}).keys()) if isinstance(closure_documents, dict) else None
             ),
+            "required_paths": sorted(str(item) for item in required_paths),
         }
         target = Path(destination_dir)
         target.mkdir(parents=True, exist_ok=True)

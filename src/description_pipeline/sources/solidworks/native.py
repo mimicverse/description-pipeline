@@ -3533,6 +3533,7 @@ class SolidWorksBackend(CadBackend):
         required_names=None,
         admitted_roots=(),
         closure_documents=None,
+        required_paths=(),
     ):
         """Copy saved native files and rewrite references in a second application.
 
@@ -3556,6 +3557,13 @@ class SolidWorksBackend(CadBackend):
         ``stored_references`` without a resolved edge for it.  Exact
         containment and verbatim strings only -- never a basename.  Everything
         else still refuses ``dependency_missing``.
+
+        ``required_paths`` are exact proven source paths (the freeze stage's
+        ``original_files``): any required path the saved-reference walk did not
+        reach -- e.g. a retained native import source leaf -- is copied
+        byte-for-byte as a leaf under the mirrored layout without creating any
+        synthetic native graph edge.  Exact paths only; a missing or
+        out-of-root required path refuses.
         """
         source_path = str(Path(path).resolve())
         source_app = self._app_for_path(source_path)
@@ -3681,6 +3689,7 @@ class SolidWorksBackend(CadBackend):
         if destination.exists() and any(destination.iterdir()):
             raise CadError("dependency_destination_not_empty", str(destination))
         destination.mkdir(parents=True, exist_ok=True)
+        seeded_leaves: list[str] = []
         # Preserve filenames and relative layout, including dependencies outside
         # the assembly directory. Distinct volumes get separate directories.
         volumes: dict[str, list[str]] = {}
@@ -3699,6 +3708,34 @@ class SolidWorksBackend(CadBackend):
                 copied.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(document, copied)
                 mapping[document] = str(copied)
+
+        # Seed the exact proven required paths the saved-reference walk cannot
+        # reach (a retained native import source materializes as a session temp
+        # document, so the closed-document raw query never exposes it).  The
+        # leaf is copied byte-for-byte under the mirrored layout; it never
+        # creates a synthetic native graph edge and is never rewritten.
+        covered_normalized = {os.path.normcase(os.path.abspath(str(item))) for item in mapping}
+        for required in required_paths:
+            normalized_required = os.path.normcase(os.path.abspath(str(required)))
+            if normalized_required in covered_normalized:
+                continue
+            required_file = Path(str(required))
+            if not required_file.is_file():
+                raise CadError("dependency_missing", str(required), {"required": True})
+            containing = next(
+                (root for root in roots_normalized if normalized_required.startswith(root + os.sep)),
+                None,
+            )
+            if containing is None:
+                raise CadError(
+                    "dependency_missing", str(required), {"required": True, "reason": "outside admitted roots"}
+                )
+            mirrored = destination / Path(os.path.relpath(required_file, containing))
+            mirrored.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(required_file, mirrored)
+            mapping[str(required_file)] = str(mirrored)
+            seeded_leaves.append(str(required_file))
+            covered_normalized.add(normalized_required)
 
         top = mapping[source_path]
         self._capture_roots.append(normalize_document_path(str(destination)))
@@ -3731,6 +3768,7 @@ class SolidWorksBackend(CadBackend):
             "skipped_missing": sorted(graph_skipped),
             "skipped_session_temp": sorted(graph_skipped_temp),
             "skipped_excluded": sorted(graph_excluded),
+            "seeded_required_leaves": sorted(seeded_leaves),
             "skipped_stale": sorted(
                 graph_stale, key=lambda item: (str(item.get("document")), str(item.get("location")))
             ),
