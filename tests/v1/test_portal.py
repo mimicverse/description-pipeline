@@ -534,8 +534,14 @@ class PreviewStore:
     store's own tests.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, root: Path | None = None) -> None:
         self.runs: dict[str, dict] = {}
+        self.root = Path(root) if root is not None else Path("/bounded-store")
+
+    def run_dir(self, run_id: str) -> Path:
+        path = self.root / run_id
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     def add(
         self,
@@ -621,9 +627,9 @@ class PortalTests(unittest.TestCase):
         self.endpoint_server.__enter__()
         self.addCleanup(self.endpoint_server.__exit__, None, None, None)
         self.endpoint = WindowsEndpoint(EndpointConfig(base_url=self.endpoint_server.url, token="test-token"))
-        self.store = PreviewStore()
         self.store_root = Path(tempfile.mkdtemp(prefix="portal-store-"))
         self.addCleanup(shutil.rmtree, self.store_root, ignore_errors=True)
+        self.store = PreviewStore(self.store_root)
         store_patch = patch("description_pipeline.orchestration.portal.LinuxStore", lambda root: self.store)
         store_patch.start()
         self.addCleanup(store_patch.stop)
@@ -1457,6 +1463,43 @@ class PortalTests(unittest.TestCase):
         self.assertNotIn(b"tampered", body)
         # Previews and artifacts are store-owned; the endpoint is never consulted for them.
         self.assertFalse(any("preview" in path for path in self.endpoint_server.requests))
+
+    def test_failed_linux_run_serves_the_retained_structural_report(self) -> None:
+        self.client.login()
+        self._seed_airflow_run(DAG_RUN_ID, state="failed")
+        self._seed_job(DAG_RUN_ID)
+        self._fail_job(DAG_RUN_ID)
+        run_id = native_run_id(DAG_RUN_ID)
+        self.store.add(run_id, meta={"handoff_sha256": "d" * 64})
+        report = self.store.run_dir(run_id) / "reports/structural-team.md"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_bytes("# 结构团队报告\n\n阻塞项与警告见结构化证据。\n".encode())
+
+        status, headers, body = self.client.request(
+            "GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.md"
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body, report.read_bytes())
+        self.assertEqual(headers.get("Content-Type"), "text/markdown; charset=utf-8")
+
+    def test_failed_native_run_serves_the_fetched_report_and_refuses_absent(self) -> None:
+        self.client.login()
+        self._seed_airflow_run(DAG_RUN_ID, state="failed")
+        self._seed_job(DAG_RUN_ID)
+        self._fail_job(DAG_RUN_ID)
+        run_id = native_run_id(DAG_RUN_ID)
+        self.store.add(run_id, meta={"handoff_sha256": "d" * 64})
+        markdown = self.store.run_dir(run_id) / "structural-team/structural-team.md"
+        markdown.parent.mkdir(parents=True, exist_ok=True)
+        markdown.write_bytes(b"native capture blocked\n")
+
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.md")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body, markdown.read_bytes())
+
+        # A member the run never retained is a clear 404, never a substitute report.
+        status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.json")
+        self.assertEqual(status, 404)
 
     def test_stage_view_exposes_contract_evidence_and_only_verified_assets_are_linkable(self) -> None:
         from description_pipeline.stages import CONTRACT, STAGE_IDS

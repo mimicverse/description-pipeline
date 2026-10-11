@@ -54,6 +54,7 @@ from .airflow_client import (
 )
 from ..io import PipelineError
 from .linux_store import LinuxStore
+from .stage_transfer import TEAM_REPORTS
 from .feishu_oauth import (
     TRIGGERING_USER_NAME_DELIMITER,
     TRIGGERING_USER_NAME_LIMIT,
@@ -101,6 +102,7 @@ _ACTIVE_TASK_STATES = {"running", "queued", "scheduled", "up_for_retry", "up_for
 #: Task states that are terminal; anything else (including new Airflow states) fails closed.
 _TERMINAL_TASK_STATES = {"success", "failed", "upstream_failed", "skipped"}
 _ARTIFACT_TYPES = {
+    ".md": "text/markdown; charset=utf-8",
     ".urdf": "application/xml",
     ".xml": "application/xml",
     ".stl": "model/stl",
@@ -1826,7 +1828,7 @@ class PortalApp:
         )
 
     # --------------------------------------------------------------- preview
-    def _preview_payload(self, session: PortalSession, dag_run_id: str) -> dict:
+    def _preview_payload(self, session: PortalSession, dag_run_id: str, *, missing_ok: bool = False) -> dict | None:
         if _RUN_ID.fullmatch(dag_run_id) is None:
             raise PortalError(HTTPStatus.BAD_REQUEST, "运行标识不合法")
         # Every preview and every artifact re-authorizes against Airflow first: an expired or
@@ -1849,12 +1851,16 @@ class PortalApp:
             try:
                 preview = store.preview(run_id)
             except PipelineError as error:
+                if missing_ok:
+                    return None
                 if store.delivery_dir(run_id) is None:
                     raise PortalError(HTTPStatus.NOT_FOUND, "该运行还没有可展示的已验证交付") from error
                 raise PortalError(HTTPStatus.CONFLICT, f"模型尚未通过独立校验：{error}") from error
             with self._lock:
                 self._previews[run_id] = (now, preview)
             return preview
+        if missing_ok:
+            return None
         raise PortalError(HTTPStatus.NOT_FOUND, "该运行还没有可展示的已验证交付")
 
     def _preview(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
@@ -1867,8 +1873,14 @@ class PortalApp:
             artifact = validate_artifact_name(name)
         except EndpointProtocolError as error:
             raise PortalError(HTTPStatus.BAD_REQUEST, str(error)) from error
-        preview = self._preview_payload(session, dag_run_id)
-        digest = preview["files"].get(artifact)
+        # The automatically generated structural-team report must stay downloadable on
+        # failed runs, which carry no verified delivery: fall back to the copy the
+        # pipeline retained in the run's evidence.
+        retained = artifact in TEAM_REPORTS
+        preview = self._preview_payload(session, dag_run_id, missing_ok=retained)
+        digest = (preview or {}).get("files", {}).get(artifact)
+        if not isinstance(digest, str) and retained:
+            return self._retained_report(start_response, dag_run_id, artifact)
         if not isinstance(digest, str):
             raise PortalError(HTTPStatus.NOT_FOUND, "该文件不在已验证交付清单中")
         store = self._store()
@@ -1898,6 +1910,30 @@ class PortalApp:
             start_response("200 OK", _common_headers(headers, self.config))
             return [bytes(data)]
         raise PortalError(HTTPStatus.NOT_FOUND, "该运行还没有可展示的已验证交付")
+
+    def _retained_report(self, start_response: Callable, dag_run_id: str, artifact: str) -> Iterable[bytes]:
+        """Serve a failed run's retained structural-team report from the pipeline store.
+
+        Failed native runs retain the fetched report under ``<run>/structural-team/`` and
+        failed portable runs under ``<run>/reports/``; both are the automatically generated
+        reports, never a derived engineering fact.
+        """
+
+        store = self._store()
+        if store is not None:
+            name = Path(artifact).name
+            run_dir = store.run_dir(native_run_id(dag_run_id))
+            for candidate in (run_dir / "structural-team" / name, run_dir / "reports" / name):
+                if candidate.is_file():
+                    data = candidate.read_bytes()
+                    headers = [
+                        ("Content-Type", _ARTIFACT_TYPES.get(candidate.suffix.lower(), "application/octet-stream")),
+                        ("Content-Length", str(len(data))),
+                        ("Cache-Control", "private, max-age=60"),
+                    ]
+                    start_response("200 OK", _common_headers(headers, self.config))
+                    return [data]
+        raise PortalError(HTTPStatus.NOT_FOUND, "该运行还没有结构团队报告")
 
     # ---------------------------------------------------------------- static
     def _static(self, start_response: Callable, name: str) -> Iterable[bytes]:

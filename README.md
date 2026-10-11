@@ -26,10 +26,14 @@ The page is **SolidWorks2URDF 交付操作台**.
    assembly is selected automatically. The choice is recorded with the run and its
    evidence, is kept by retries and reruns, and only fixes the entry point —
    identity and physical checks still run on the native data.
-   Only the selected assembly's dependency closure is staged to the Windows
-   worker; the worker reads the raw native record and later captures that
-   staging, while the robot definition is derived on Linux and returns to the
-   worker only as generated text. The full folder is never re-imported on
+   The complete uploaded folder is staged to the Windows worker; the native
+   engine resolves the main assembly's references inside that staging and the
+   sealed closure admits only bindings that lie inside the staged root and match
+   the upload index — an engine-materialized import only through the sealed
+   owner/occurrence evidence matched by native identity, never by its temporary
+   path or file name. The worker reads the raw native record and later captures
+   that staging, while the robot definition is derived on Linux and returns to
+   the worker only as generated text. The full folder is never re-imported on
    Windows.
 3. Review each step's actual check results, warnings and failure diagnoses.
    Automatic passes need no manual

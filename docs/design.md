@@ -123,10 +123,12 @@ value and no neutral technical name is promoted to authored identity.
 The whole uploaded native folder is staged provisionally, then the native
 engine itself resolves the main assembly's references; the pipeline seals the
 dependency closure only when every engine-reported binding lies inside the
-staged root and matches the uploaded index. A missing, outside or temporarily
-materialized reference fails the run after resolution, before capture. This is
-a closure-admission rule over reported bindings, not an operating-system
-sandbox and not a pre-geometry read gate.
+staged root and matches the uploaded index — or is an engine-materialized import
+admitted only through the sealed closure's owner/occurrence evidence matched to
+its staged source by native identity, never by temporary path or file name. A
+missing or outside-stage reference fails the run after resolution, before
+capture. This is a closure-admission rule over reported bindings, not an
+operating-system sandbox and not a pre-geometry read gate.
 
 Both hosts use the same tool source release and record their own runtime
 requirements. Windows checks SolidWorks and COM readiness. Linux checks MuJoCo

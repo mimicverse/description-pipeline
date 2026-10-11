@@ -70,7 +70,7 @@ Implementation paths below are relative to `src/description_pipeline/`.
 | Native definition | Independently reconstruct membership, adjacency, motion, names, frames and limits from native observations; required gate `source.native_discovery` | `verification/native_discovery.py` |
 | Declared native facts | Exporter declaration ingested at discovery and independently re-decoded at verification; declared membership, topology, frames, axes and limits reconciled with native observations and with the generated source (`discovery.declarations`); contradictions fail closed | `sources/solidworks/exporter.py`, `verification/v14_declarations.py`, `verification/native_declarations.py` |
 | Native source | Native SolidWorks evidence, qualified API/build, matching collection identity and environment | `verification/solidworks_urdf.py` |
-| Dependency closure | No unresolved reference: the full uploaded folder is staged, the native engine resolves its references, and the closure seals only when every engine-reported binding lies inside the staged root and matches the upload index — a missing, outside or temporarily materialized reference fails the run after resolution (closure admission over reported bindings, not an OS sandbox); original CAD belongs to the staged selection; collected-copy hashes and configuration agree | `verification/solidworks_urdf.py` |
+| Dependency closure | No unresolved reference: the full uploaded folder is staged, the native engine resolves its references, and the closure seals only when every engine-reported binding lies inside the staged root and matches the upload index — or is an engine-materialized import admitted only through the sealed owner/occurrence evidence matched to its staged source by native identity (never by temporary path or file name); a missing or outside-stage reference fails the run after resolution (closure admission over reported bindings, not an OS sandbox); original CAD belongs to the staged selection; collected-copy hashes and configuration agree | `verification/solidworks_urdf.py` |
 | Occurrence coverage | Every included native occurrence belongs to exactly one body; unowned occurrences are stage warnings for engineering inspection, and qualification still requires complete material coverage and exact whole-CAD mass equality - instances or their mass are never excluded to clear a warning; identity survives normalization | `verification/solidworks_urdf.py` |
 | Coordinates | Finite SI homogeneous transforms, orthonormal right-handed bases, CAD-derived body/joint/reference frames | `verification/solidworks_urdf.py` |
 | Shaft alignment | Numeric shaft line from the independently re-read reference axis or cylindrical interface, stable native identity, origin on shaft and axis collinearity | `verification/solidworks_urdf.py` |
@@ -209,9 +209,12 @@ not verified until the corresponding independent checks pass. Missing required
 evidence remains a failure.
 
 Source integrity is required before evidence can be used. Every imported CAD
-occurrence must bind to a file in the frozen handoff; a temporary native document
-or visible cached geometry is insufficient. Unbound or external sources remain
-errors, with the affected occurrences and reference paths retained in diagnostics.
+occurrence must bind to a file in the frozen handoff — or, for an
+engine-materialized import, to the sealed closure's owner/occurrence evidence
+matched to that staged source by native identity. A temporary document or
+visible cached geometry without that sealed binding, and any external source,
+remain errors, with the affected occurrences and reference paths retained in
+diagnostics.
 
 Mechanical review owns input meaning and measured authority. v1 exports visual
 meshes and physical properties; collision simplification, contact behavior,
