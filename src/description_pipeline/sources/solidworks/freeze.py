@@ -11,6 +11,7 @@ number in ``raw/`` comes from the CAD API during this capture.
 
 from __future__ import annotations
 
+import inspect
 import math
 import os
 import re
@@ -21,6 +22,7 @@ from typing import Any
 from collections.abc import Callable
 
 from .errors import BridgeError, ConfigError
+from .native import import_materialization_path
 from .evidence import build_evidence, capture_environment
 from .jsonio import digest_json, sha256_file, write_json
 from .scene import assembly_leaf_total, build_scene, closure_delta
@@ -40,6 +42,7 @@ SOURCE_KEYS = {
     "assembly",
     "configuration",
     "allowed_roots",
+    "closure",
     "document_suffixes",
     "geometry",
     "coordinate_systems",
@@ -237,6 +240,20 @@ def validate_source_config(config: object) -> dict[str, Any]:
     )
     allowed_roots = config.get("allowed_roots") or []
     _require(isinstance(allowed_roots, list), "source.allowed_roots must be a list of directories")
+    closure = config.get("closure")
+    if closure is not None:
+        # Internal carrier: the sealed native closure travels with the source
+        # config so the freeze stage can bind the admitted resolution (graph
+        # owner documents, cached materializations, suppressed placements)
+        # instead of pre-listing saved author paths.
+        _require(isinstance(closure, dict), "source.closure must be the sealed native closure mapping")
+        _require(
+            closure.get("schema_version") in (None, "solidworks-to-urdf.native-closure/v1"),
+            "source.closure must carry the native closure schema",
+        )
+        for name in ("graph", "documents", "imports", "suppressed"):
+            if name in closure:
+                _require(isinstance(closure[name], (dict, list)), f"source.closure.{name} has the wrong shape")
     geometry = config.get("geometry") or {}
     _require(isinstance(geometry, dict), "source.geometry must be a mapping")
     if geometry.get("enabled"):
@@ -389,6 +406,7 @@ def validate_source_config(config: object) -> dict[str, Any]:
         "assembly": str(assembly),
         "configuration": str(configuration),
         "allowed_roots": [str(root) for root in allowed_roots],
+        "closure": dict(closure) if isinstance(closure, dict) else None,
         "document_suffixes": suffixes,
         "geometry": dict(geometry),
         "coordinate_systems": [str(name) for name in coordinate_systems],
@@ -547,6 +565,18 @@ def _source_inputs(cfg: dict[str, Any], closure: dict[str, Any]) -> dict[str, st
     return inputs
 
 
+def _accepts_keyword(function: Any, name: str) -> bool:
+    """True when ``function`` can be called with keyword ``name``."""
+
+    try:
+        parameters = inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
+
+
 def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> dict[str, Any]:
     """Collect the source with its dependencies and prove the closure.
 
@@ -577,13 +607,26 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         for entry in closure.get("imports") or []
         if isinstance(entry, dict) and entry.get("materialization")
     }
+    # Exact-occurrence binding: the closure records which occurrences were
+    # session materializations.  The current session's materialization paths
+    # differ from the selection session's, so the occurrence identity (and its
+    # native owner document) is the stable key -- never a path pattern.
+    materialization_instances = {
+        str(entry.get("instance"))
+        for entry in closure.get("imports") or []
+        if isinstance(entry, dict) and entry.get("state") == "cached_materialization" and entry.get("instance")
+    }
     suppressed_skipped: list[str] = []
+    session_temp_dependencies: list[str] = []
     unresolved = []
     outside = []
     for entry in dependencies:
         path = str(entry.get("path") or "")
         if path and os.path.normcase(os.path.abspath(path)) in suppressed_paths:
             suppressed_skipped.append(path)
+            continue
+        if path and import_materialization_path(path):
+            session_temp_dependencies.append(path)
             continue
         if not entry.get("exists", True):
             unresolved.append(path)
@@ -614,13 +657,18 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         document = str(entry.get("document") or "")
         if not document:
             continue
-        if os.path.normcase(os.path.abspath(document)) in cached_import_paths:
+        if (
+            str(entry.get("instance") or "") in materialization_instances
+            or os.path.normcase(os.path.abspath(document)) in cached_import_paths
+        ):
             import_temp_documents.append(document)
             continue
         original_documents.append(document)
     for entry in dependencies:
         path = str(entry.get("path") or "")
         if not path or os.path.normcase(os.path.abspath(path)) in suppressed_paths:
+            continue
+        if import_materialization_path(path):
             continue
         original_documents.append(path)
     original_states: dict[str, dict[str, Any]] = {}
@@ -662,10 +710,10 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
             "the backend cannot collect dependencies; a verified copy is required to freeze a source",
             exit_code=3,
         )
-    if suppressed_paths:
-        collected = dict(pack(cfg["assembly"], str(source_dir), skip_missing=sorted(suppressed_paths)) or {})
-    else:
-        collected = dict(pack(cfg["assembly"], str(source_dir)) or {})
+    pack_kwargs: dict[str, Any] = {}
+    if suppressed_paths and _accepts_keyword(pack, "skip_missing"):
+        pack_kwargs["skip_missing"] = sorted(suppressed_paths)
+    collected = dict(pack(cfg["assembly"], str(source_dir), **pack_kwargs) or {})
     source_mapping = collected.get("mapping") or {}
     if {os.path.normcase(os.path.abspath(path)) for path in source_mapping} != {
         os.path.normcase(os.path.abspath(path)) for path in original_files
@@ -713,6 +761,9 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         path = str(entry.get("path") or "")
         if path and os.path.normcase(os.path.abspath(path)) in suppressed_paths:
             suppressed_skipped.append(path)
+            continue
+        if path and import_materialization_path(path):
+            session_temp_dependencies.append(path)
             continue
         if not path or not _under(path, [str(source_dir)]):
             problems.append({"path": path, "problem": "outside_snapshot"})
@@ -844,7 +895,11 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         path = str(entry.get("document") or "")
         if not path:
             continue  # suppressed instances are tracked, not resolved
-        if os.path.normcase(os.path.abspath(path)) in cached_import_paths:
+        if (
+            str(entry.get("instance") or "") in materialization_instances
+            or os.path.normcase(os.path.abspath(path)) in cached_import_paths
+            or import_materialization_path(path)
+        ):
             import_temp_documents.append(path)
             continue  # session materializations are evidence, not snapshot members
         if not _under(path, [str(source_dir)]):
@@ -908,7 +963,12 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         mapping[(str(cfg["assembly"]), top)] = "top_level"
     for entry in copy.get("instances") or []:
         path = str(entry.get("document") or "")
-        if not path or os.path.normcase(os.path.abspath(path)) in cached_import_paths:
+        if (
+            not path
+            or str(entry.get("instance") or "") in materialization_instances
+            or os.path.normcase(os.path.abspath(path)) in cached_import_paths
+            or import_materialization_path(path)
+        ):
             continue
         for source_entry in original.get("instances") or []:
             if str(source_entry.get("instance")) == str(entry.get("instance")) and source_entry.get("document"):
@@ -926,6 +986,8 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         "declared_dependencies": dependencies,
         "declared_unresolved": unresolved,
         "suppressed_skipped": sorted(set(suppressed_skipped)),
+        "session_temp_dependencies": sorted(set(session_temp_dependencies)),
+        "materialization_instances": sorted(materialization_instances),
         "import_temp_documents": sorted(set(import_temp_documents)),
         "resolved_inside_snapshot": len(entries),
         "collected_files": len(collected.get("files") or []),

@@ -340,13 +340,18 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                 # metadata, never an in-package binding.  Recorded as a warning
                 # (no graph edge); the absence test decides cache provenance.
                 cached_materializations.add(cached_key(resolved))
+                author_in_stage = _indexed(stage_root, imported, files) is not None if imported else None
+                owner_sha256 = files.get(defining_name) if defining_name else None
                 imports.append(
                     {
                         "document": label,
+                        "owner": defining_name,
+                        "owner_sha256": owner_sha256,
                         "defining_materialization": raw_defining if cached_defining else None,
                         "instance": instance,
                         "name": record.get("name"),
                         "author_imported_path": imported,
+                        "author_metadata_in_stage": author_in_stage,
                         "is_virtual": virtual if type(virtual) is bool else None,
                         "materialization": resolved,
                         "configuration": record.get("configuration"),
@@ -360,9 +365,12 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                         "code": "import_cached_materialization",
                         "message": "an imported occurrence contributes geometry from a session materialization; the author import path is metadata, not a proven in-package binding",
                         "document": label,
+                        "owner": defining_name,
+                        "owner_sha256": owner_sha256,
                         "instance": instance,
                         "materialization": resolved,
                         "author_imported_path": imported,
+                        "author_metadata_in_stage": author_in_stage,
                         "needs_absence_test": True,
                     }
                 )

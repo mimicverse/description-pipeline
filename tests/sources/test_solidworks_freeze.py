@@ -81,6 +81,47 @@ class FreezeTests(unittest.TestCase):
     def tearDown(self) -> None:
         support.cleanup(self.tmp)
 
+    def test_source_config_carries_the_sealed_native_closure(self) -> None:
+        from description_pipeline.sources.solidworks.freeze import validate_source_config
+
+        closure = {
+            "schema_version": "solidworks-to-urdf.native-closure/v1",
+            "graph": {"robot.SLDASM": {"sha256": "0" * 64, "references": ["arm.SLDPRT"]}},
+            "imports": [
+                {
+                    "instance": "HD-1910-C001-20260902.stp-2",
+                    "state": "cached_materialization",
+                    "materialization": r"C:\Temp\swx1\IC~~\HD.stp.SLDASM",
+                }
+            ],
+            "suppressed": [],
+        }
+        validated = validate_source_config(json.loads(json.dumps({**self.config, "closure": closure})))
+        self.assertEqual(validated["closure"], closure)
+        for bad in ("nope", {"schema_version": "other"}, {"graph": 3}):
+            with self.assertRaises(ConfigError):
+                validate_source_config(json.loads(json.dumps({**self.config, "closure": bad})))
+
+    def test_freeze_retains_the_closure_carrier_evidence(self) -> None:
+        config = json.loads(json.dumps(self.config))
+        config["closure"] = {
+            "schema_version": "solidworks-to-urdf.native-closure/v1",
+            "graph": {},
+            "imports": [
+                {
+                    "instance": "linear-import-1",
+                    "state": "cached_materialization",
+                    "materialization": r"C:\Temp\swx1\IC~~\X.step.SLDASM",
+                }
+            ],
+            "suppressed": [{"instance": "cover-3", "resolved_path": str(self.tmp / "cad" / "missing.SLDPRT")}],
+        }
+        freeze(config, self.destination, backend=self.backend)
+        payload = json.loads((self.destination / "raw" / "dependency_closure.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload["materialization_instances"], ["linear-import-1"])
+        self.assertIn("suppressed_skipped", payload)
+        self.assertIn("session_temp_dependencies", payload)
+
     def test_freeze_produces_a_verified_snapshot(self) -> None:
         manifest = freeze(self.config, self.destination, backend=self.backend, worker_version="test-worker")
         self.assertEqual(manifest["kind"], "solidworks")

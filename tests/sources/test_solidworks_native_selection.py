@@ -213,9 +213,32 @@ class ClosureAdmissionTests(unittest.TestCase):
         self.assertEqual(entry["binding"], "author_metadata_only")
         self.assertEqual(entry["author_imported_path"], r"C:\Users\Mi\Desktop\NP-F550.step")
         self.assertEqual(entry["materialization"], temp)
+        self.assertEqual(entry["owner"], "robot.SLDASM")
+        self.assertEqual(entry["owner_sha256"], self.files["robot.SLDASM"])
+        self.assertFalse(entry["author_metadata_in_stage"])
         warning = payload["warnings"][0]
         self.assertEqual(warning["code"], "import_cached_materialization")
         self.assertTrue(warning["needs_absence_test"])
+        self.assertEqual(warning["owner_sha256"], self.files["robot.SLDASM"])
+
+    def test_in_stage_author_metadata_is_flagged_but_not_a_binding(self) -> None:
+        extra = write_stage(self.stage, {"NP-F550.step": b"np-bytes"})
+        files = {**self.files, **extra}
+        temp = r"C:\Users\33985\AppData\Local\Temp\swx28528\IC~~\NP-F550.step.SLDPRT"
+        payload = self.observe(
+            [
+                occurrence(
+                    "NP-F550.step-1",
+                    temp,
+                    imported=str(self.stage / "NP-F550.step"),
+                )
+            ],
+            files=files,
+        )
+        entry = payload["imports"][0]
+        self.assertTrue(entry["author_metadata_in_stage"])
+        self.assertEqual(entry["state"], "cached_materialization")
+        self.assertNotIn("NP-F550.step", payload["graph"])
 
     def test_cached_import_subtree_is_recorded_without_refusal(self) -> None:
         parent = r"C:\Users\Mi\AppData\Local\Temp\swx25524\IC~~\HD-1910-C001-20260902.stp.SLDASM"

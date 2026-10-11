@@ -116,6 +116,36 @@ class NativeReferenceCopyTests(unittest.TestCase):
             self.assertEqual(result["top_level"], str(root / "copy/robot.SLDASM"))
             self.assertEqual({str(path): path.read_bytes() for path in paths}, before)
 
+    def test_session_materialization_references_are_skipped_and_recorded(self):
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from description_pipeline.sources.solidworks.native import SolidWorksBackend
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            assembly, part = root / "robot.SLDASM", root / "part.SLDPRT"
+            assembly.write_bytes(b"assembly")
+            part.write_bytes(b"part")
+            materialization = root / "swx00000" / "IC~~" / "X.step.SLDASM"
+            materialization.parent.mkdir(parents=True)
+            materialization.write_bytes(b"temp")
+            graph = {
+                str(assembly): ["X.step", str(materialization), "part", str(part)],
+                str(part): [],
+            }
+            rewritten: list = []
+            copied = SimpleNamespace(ReplaceReferencedDocument=lambda *args: rewritten.append(args) or True)
+            backend = SolidWorksBackend()
+            backend._app_for_path = Mock(  # type: ignore[method-assign]
+                side_effect=[SimpleNamespace(GetDocumentDependencies2=lambda path, *args: graph[path]), copied]
+            )
+            result = backend.collect_dependencies(str(assembly), str(root / "copy"))
+            self.assertEqual(result["skipped_session_temp"], [str(materialization)])
+            self.assertEqual(len(result["files"]), 2)  # assembly + part only
+            self.assertEqual(len(rewritten), 1)  # only the real reference is rewritten
+
     def test_rejected_reference_rewrite_never_reports_success(self):
         import tempfile
         from pathlib import Path

@@ -668,6 +668,19 @@ def _stage_relative(root, value) -> str | None:
     return relative.as_posix()
 
 
+def import_materialization_path(value) -> bool:
+    """True for a session 3D-Interconnect materialization path (``...\\IC~~\\...``).
+
+    ``IC~~`` is the documented SolidWorks session temp materialization marker
+    (the selection reader has classified it that way since its first release);
+    this is an exact path-*component* test, never a basename, suffix or
+    machine-specific rule.
+    """
+
+    text = str(value or "").replace("\\", "/")
+    return any(part.casefold() == "ic~~" for part in text.split("/") if part)
+
+
 def _matches_assembly_root(reference, root, reference_full, reference_name, assembly_full) -> bool:
     """True when a mate entity references the owning assembly's own root component.
 
@@ -2050,7 +2063,6 @@ class SolidWorksBackend(CadBackend):
         if package is None:
             self._staged_search_root = None
             self._staged_search_applied = set()
-            self._staged_search_evidence = []
             return None
         if not isinstance(package, (str, os.PathLike)):
             raise CadError("cad_staged_search_invalid", "the staged search root must be a directory path")
@@ -2061,7 +2073,9 @@ class SolidWorksBackend(CadBackend):
         if root != self._staged_search_root:
             self._staged_search_root = root
             self._staged_search_applied = set()
-            self._staged_search_evidence = []
+            # Search evidence is append-only across root changes: sessions
+            # created earlier keep their recorded pin (the collector re-pins
+            # the copy session to the snapshot directory before it starts).
         return root
 
     def staged_search_evidence(self):
@@ -3377,6 +3391,7 @@ class SolidWorksBackend(CadBackend):
         source_app = self._app_for_path(source_path)
         skipped_normalized = {os.path.normcase(os.path.abspath(str(item))) for item in skip_missing}
         graph_skipped: list[str] = []
+        graph_skipped_temp: list[str] = []
         graph = {}
         pending = [source_path]
         while pending:
@@ -3393,6 +3408,12 @@ class SolidWorksBackend(CadBackend):
                 if not isinstance(value, str) or not value:
                     raise CadError("dependency_list_invalid", document)
                 reference = str(Path(resolve_dependency_path(value, document)).resolve())
+                if import_materialization_path(reference):
+                    # A session 3D-Interconnect materialization is not a saved
+                    # document: it is never copied into the snapshot and never
+                    # rewritten; the copy regenerates its own materializations.
+                    graph_skipped_temp.append(reference)
+                    continue
                 if not Path(reference).is_file():
                     if os.path.normcase(os.path.abspath(reference)) in skipped_normalized:
                         graph_skipped.append(reference)
@@ -3431,6 +3452,11 @@ class SolidWorksBackend(CadBackend):
             normalize_document_path(source_path), ""
         )
         del source_app
+        if self._staged_search_root is not None:
+            # The copy must resolve inside the snapshot it now lives in, so its
+            # session search scope is re-pinned to the snapshot directory; the
+            # source session keeps the pin it received at creation.
+            self.configure_staged_search(destination)
         copy_app = self._app_for_path(top)
         replaced = 0
         for document, references in graph.items():
@@ -3449,6 +3475,7 @@ class SolidWorksBackend(CadBackend):
             "mapping": mapping,
             "reference_edges": replaced,
             "skipped_missing": sorted(graph_skipped),
+            "skipped_session_temp": sorted(graph_skipped_temp),
             "configured": ["GetDocumentDependencies2", "ReplaceReferencedDocument"],
         }
 
