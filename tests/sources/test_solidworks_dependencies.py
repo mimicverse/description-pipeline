@@ -178,7 +178,13 @@ class NativeReferenceCopyTests(unittest.TestCase):
                 str(root / "copy"),
                 required_names=["robot.SLDASM", "sub.SLDASM", "NP-F550.step"],
                 admitted_roots=[str(root)],
-                closure_documents={"robot.SLDASM": {"stored_locations": [], "resolved_targets": ["sub.SLDASM"], "resolved_paths": [str(sub)]}},
+                closure_documents={
+                    "robot.SLDASM": {
+                        "stored_locations": [],
+                        "resolved_targets": ["sub.SLDASM"],
+                        "resolved_paths": [str(sub)],
+                    }
+                },
                 required_paths=[str(leaf)],
             )
             self.assertEqual(result["seeded_required_leaves"], [str(leaf)])
@@ -209,14 +215,19 @@ class NativeReferenceCopyTests(unittest.TestCase):
             def run(required, label):
                 backend = SolidWorksBackend()
                 backend._app_for_path = Mock(  # type: ignore[method-assign]
-                    side_effect=[SimpleNamespace(GetDocumentDependencies2=lambda path, *args: graph.get(path, [])), copied]
+                    side_effect=[
+                        SimpleNamespace(GetDocumentDependencies2=lambda path, *args: graph.get(path, [])),
+                        copied,
+                    ]
                 )
                 return backend.collect_dependencies(
                     str(assembly),
                     str(root / f"copy-{label}"),
                     required_names=["robot.SLDASM"],
                     admitted_roots=[str(root)],
-                    closure_documents={"robot.SLDASM": {"stored_locations": [], "resolved_targets": [], "resolved_paths": []}},
+                    closure_documents={
+                        "robot.SLDASM": {"stored_locations": [], "resolved_targets": [], "resolved_paths": []}
+                    },
                     required_paths=required,
                 )
 
@@ -273,9 +284,7 @@ class NativeReferenceCopyTests(unittest.TestCase):
             mirrored = Path(result["mapping"][str(prepared_np)])
             self.assertEqual(mirrored.read_bytes(), b"sealed np bytes")
 
-    def _stale_collect(
-        self, root, outside, *, write_outside, closure_documents, required_names=None, location=None
-    ):
+    def _stale_collect(self, root, outside, *, write_outside, closure_documents, required_names=None, location=None):
         from pathlib import Path
         from types import SimpleNamespace
         from unittest.mock import Mock
