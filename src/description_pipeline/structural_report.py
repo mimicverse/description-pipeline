@@ -60,7 +60,10 @@ def _canonical_material_warnings(value) -> list | None:
     for item in warnings:
         if not isinstance(item, dict) or any(key not in item for key in _MATERIAL_ENTRY_KEYS):
             return None
-        if not isinstance(item.get("code"), str) or not isinstance(item.get("message"), str):
+        if item.get("code") != "cad_material_provenance_missing":
+            # Unknown reason values fail closed instead of being rendered as warnings.
+            return None
+        if not isinstance(item.get("message"), str):
             return None
         if not isinstance(item.get("blocking"), bool):
             return None
@@ -189,10 +192,50 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                     },
                 }
             )
+    material_required = False
+    if evidence_root is not None:
+        snapshot_manifest = Path(evidence_root) / "evidence/manifest.json"
+        if snapshot_manifest.is_file():
+            try:
+                snapshot = read_data(snapshot_manifest)
+            except (OSError, ValueError):
+                snapshot = None
+            if isinstance(snapshot, dict) and isinstance(snapshot.get("files"), dict):
+                material_required = "raw/material_provenance.json" in snapshot["files"]
     material_provenance = sources.get(material_source)
     if isinstance(material_provenance, dict) and material_provenance.get("errors"):
         entries.extend(_findings(material_provenance, material_source))
-    elif material_provenance is not None:
+        entries.append(
+            {
+                "severity": "blocker",
+                "code": "report.material_provenance_invalid",
+                "object": receipt.get("main_assembly"),
+                "message": (
+                    "材料来源证据不可读：证据无效，必须由独立检查判为失败。"
+                    "本报告不采用默认值、不做替代解释、不据此输出材料警告。"
+                ),
+                "source": material_source,
+                "evidence": {"unreadable": True},
+            }
+        )
+    elif material_provenance is None:
+        if material_required:
+            # The snapshot manifest binds the record for every current capture; a deleted or
+            # absent record is required evidence and fails closed.
+            entries.append(
+                {
+                    "severity": "blocker",
+                    "code": "report.material_provenance_missing",
+                    "object": receipt.get("main_assembly"),
+                    "message": (
+                        "快照清单要求材料来源记录（evidence/raw/material_provenance.json），但该证据缺失："
+                        "证据无效，必须由独立检查判为失败。本报告不采用默认值或替代解释。"
+                    ),
+                    "source": material_source,
+                    "evidence": {"required_by_manifest": True},
+                }
+            )
+    else:
         # One canonical schema only; anything else is independently rejected instead of
         # being reinterpreted, defaulted or accepted through an alternate interface.
         material_warnings = _canonical_material_warnings(material_provenance)
@@ -227,7 +270,7 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                     {
                         "severity": "blocker" if blocking else "warning",
                         "code": "native.material_provenance_missing",
-                        "object": item.get("component") or item.get("occurrence") or item.get("document"),
+                        "object": item.get("component") or item.get("document"),
                         "message": "SolidWorks 实体缺少显式物理材料赋值（默认密度不作为材料证据）："
                         + (
                             "该记录标记为阻断，必须由独立检查判为失败。"
@@ -239,7 +282,6 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                         "evidence": {
                             "code": item.get("code"),
                             "component": item.get("component"),
-                            "occurrence": item.get("occurrence"),
                             "document": item.get("document"),
                             "configuration": item.get("configuration"),
                             "missing_body_indices": item.get("missing_body_indices"),

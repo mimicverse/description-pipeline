@@ -262,6 +262,7 @@ class StructuralReportTests(unittest.TestCase):
         del measured_missing_key["measured"]["density_kg_m3"]
         measured_wrong_source = self._provenance_entry()
         measured_wrong_source["measured"]["source"] = "author_default"
+        unknown_reason = self._provenance_entry(code="cad_other_reason")
         payloads = {
             "wrong_schema": {**self._provenance([]), "schema_version": "solidworks-to-urdf.material-provenance/v2"},
             "missing_top_key": missing_top_key,
@@ -270,6 +271,7 @@ class StructuralReportTests(unittest.TestCase):
             "entry_missing_measured": self._provenance([entry_without_measured]),
             "measured_missing_key": self._provenance([measured_missing_key]),
             "measured_wrong_source": self._provenance([measured_wrong_source]),
+            "unknown_reason": self._provenance([unknown_reason]),
         }
         for label, payload in payloads.items():
             with self.subTest(label=label), TemporaryDirectory() as directory:
@@ -286,6 +288,63 @@ class StructuralReportTests(unittest.TestCase):
                 )
                 self.assertIn("必须由独立检查判为失败", invalid["message"])
                 self.assertIn("不采用默认值", invalid["message"])
+
+    def test_manifest_required_missing_material_record_is_a_blocker(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_json(
+                root / "evidence/manifest.json",
+                {
+                    "schema_version": "description.source/v1",
+                    "kind": "solidworks",
+                    "identity": {"main_assembly": "robot.SLDASM"},
+                    "evidence_class": "cad",
+                    "scene": "scene.json",
+                    "files": {"scene.json": "0" * 64, "raw/material_provenance.json": "1" * 64},
+                },
+            )
+            pins = write_structural_report(root, {"run_id": "m3", "state": "verified"}, evidence_root=root)
+            report = json.loads((root / pins["json"]["path"]).read_text())
+            codes = [item["code"] for item in report["findings"]]
+            self.assertIn("report.material_provenance_missing", codes)
+            self.assertNotIn("native.material_provenance_missing", codes)
+            missing = next(item for item in report["findings"] if item["code"] == "report.material_provenance_missing")
+            self.assertEqual(missing["severity"], "blocker")
+            self.assertIn("证据缺失", missing["message"])
+            self.assertEqual(report["summary"]["blockers"], 1)
+
+    def test_legacy_snapshot_without_the_required_record_is_unaffected(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_json(
+                root / "evidence/manifest.json",
+                {
+                    "schema_version": "description.source/v1",
+                    "kind": "solidworks",
+                    "identity": {"main_assembly": "robot.SLDASM"},
+                    "evidence_class": "cad",
+                    "scene": "scene.json",
+                    "files": {"scene.json": "0" * 64},
+                },
+            )
+            pins = write_structural_report(root, {"run_id": "m3", "state": "verified"}, evidence_root=root)
+            report = json.loads((root / pins["json"]["path"]).read_text())
+            self.assertEqual(report["findings"], [])
+            self.assertEqual(report["summary"], {"warnings": 0, "blockers": 0})
+
+    def test_unreadable_material_record_is_a_blocker(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "evidence/raw").mkdir(parents=True)
+            (root / "evidence/raw/material_provenance.json").write_text("{invalid json", encoding="utf-8")
+            pins = write_structural_report(root, {"run_id": "m3", "state": "verified"}, evidence_root=root)
+            report = json.loads((root / pins["json"]["path"]).read_text())
+            codes = [item["code"] for item in report["findings"]]
+            self.assertIn("report.evidence_unreadable", codes)
+            invalid = next(item for item in report["findings"] if item["code"] == "report.material_provenance_invalid")
+            self.assertEqual(invalid["severity"], "blocker")
+            self.assertEqual(invalid["evidence"], {"unreadable": True})
+            self.assertNotIn("native.material_provenance_missing", codes)
 
     def test_warning_object_uses_component_and_keeps_repeat_occurrence_evidence(self):
         with TemporaryDirectory() as directory:
