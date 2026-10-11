@@ -571,7 +571,7 @@ class PreviewStore:
 
     def delivery_dir(self, run_id: str) -> Path | None:
         entry = self.runs.get(run_id)
-        return Path("/bounded-store") / run_id if entry and entry["delivery"] else None
+        return self.root / run_id / "delivery" if entry and entry["delivery"] else None
 
     def preview(self, run_id: str) -> dict:
         entry = self.runs.get(run_id)
@@ -1511,6 +1511,49 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(status, 200, body)
         links = json.loads(body)["structural_report"]
         self.assertEqual([entry["path"] for entry in links], ["reports/structural-team.md"])
+
+    def test_verified_but_unpublished_run_serves_the_report_from_the_bound_delivery(self) -> None:
+        self.client.login()
+        self._seed_airflow_run(DAG_RUN_ID, state="failed")
+        self._seed_job(DAG_RUN_ID)
+        self._fail_job(DAG_RUN_ID)
+        run_id = native_run_id(DAG_RUN_ID)
+        # Verify green, publish unroutable: the bound delivery resolves to the verify
+        # checkpoint through store.delivery_dir and still carries the report.
+        self.store.add(run_id, meta={"handoff_sha256": "d" * 64}, delivery=True)
+        report = self.store.delivery_dir(run_id) / "reports/structural-team.md"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_bytes(b"verify checkpoint report\n")
+
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.md")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body, report.read_bytes())
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 200, body)
+        links = json.loads(body)["structural_report"]
+        self.assertEqual([entry["path"] for entry in links], ["reports/structural-team.md"])
+        # Authorization is unchanged: without a session the route refuses outright.
+        anonymous = PortalClient(self.client.base)
+        status, _, _ = anonymous.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.md")
+        self.assertEqual(status, 401)
+
+    def test_failed_publish_diagnostics_take_precedence_over_older_copies(self) -> None:
+        self.client.login()
+        self._seed_airflow_run(DAG_RUN_ID, state="failed")
+        self._seed_job(DAG_RUN_ID)
+        self._fail_job(DAG_RUN_ID)
+        run_id = native_run_id(DAG_RUN_ID)
+        self.store.add(run_id, meta={"handoff_sha256": "d" * 64}, delivery=True)
+        delivery = self.store.delivery_dir(run_id) / "reports/structural-team.md"
+        delivery.parent.mkdir(parents=True, exist_ok=True)
+        delivery.write_bytes(b"older delivered copy\n")
+        failed = self.store.run_dir(run_id) / "output.failed/reports/structural-team.md"
+        failed.parent.mkdir(parents=True, exist_ok=True)
+        failed.write_bytes(b"newest failed publish diagnostics\n")
+
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.md")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body, failed.read_bytes())
 
     def test_stage_view_exposes_contract_evidence_and_only_verified_assets_are_linkable(self) -> None:
         from description_pipeline.stages import CONTRACT, STAGE_IDS

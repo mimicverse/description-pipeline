@@ -1917,54 +1917,72 @@ class PortalApp:
             return [bytes(data)]
         raise PortalError(HTTPStatus.NOT_FOUND, "该运行还没有可展示的已验证交付")
 
-    def _retained_report(self, start_response: Callable, dag_run_id: str, artifact: str) -> Iterable[bytes]:
-        """Serve a failed run's retained structural-team report from the pipeline store.
+    def _structural_report_files(self, dag_run_id: str) -> dict[str, Path]:
+        """Resolve the automatically retained structural-team report members of one run.
 
-        Failed native runs retain the fetched report under ``<run>/structural-team/`` and
-        failed portable runs under ``<run>/reports/``; both are the automatically generated
-        reports, never a derived engineering fact.
+        Shared by the artifact route and the run-page links so both can never diverge.
+        The candidates are display projections, never part of the engineering subject:
+        the newest failed-publish diagnostics under ``<run>/output.failed/reports/``
+        take precedence, then the bound delivery that ``store.delivery_dir`` resolves
+        (the published output or the verified-but-unpublished checkpoint), then the
+        fetched native report of ``<run>/structural-team/`` and a recorded failure
+        receipt under ``<run>/reports/``.  Names are fixed to ``TEAM_REPORTS`` and
+        every candidate stays inside this run's store directory.
         """
 
         store = self._store()
-        if store is not None:
+        if store is None or _RUN_ID.fullmatch(dag_run_id) is None:
+            return {}
+        run_id = native_run_id(dag_run_id)
+        run_dir = store.run_dir(run_id)
+        delivery = store.delivery_dir(run_id)
+        resolved: dict[str, Path] = {}
+        for artifact in TEAM_REPORTS:
             name = Path(artifact).name
-            run_dir = store.run_dir(native_run_id(dag_run_id))
-            for candidate in (run_dir / "structural-team" / name, run_dir / "reports" / name):
+            candidates = [
+                run_dir / "output.failed" / "reports" / name,
+                *([delivery / "reports" / name] if delivery is not None else []),
+                run_dir / "structural-team" / name,
+                run_dir / "reports" / name,
+            ]
+            for candidate in candidates:
                 if candidate.is_file():
-                    data = candidate.read_bytes()
-                    headers = [
-                        ("Content-Type", _ARTIFACT_TYPES.get(candidate.suffix.lower(), "application/octet-stream")),
-                        ("Content-Length", str(len(data))),
-                        ("Cache-Control", "private, max-age=60"),
-                    ]
-                    start_response("200 OK", _common_headers(headers, self.config))
-                    return [data]
+                    resolved[artifact] = candidate
+                    break
+        return resolved
+
+    def _retained_report(self, start_response: Callable, dag_run_id: str, artifact: str) -> Iterable[bytes]:
+        """Serve one retained structural-team report member through the authorized route."""
+
+        path = self._structural_report_files(dag_run_id).get(artifact)
+        if path is not None:
+            data = path.read_bytes()
+            headers = [
+                ("Content-Type", _ARTIFACT_TYPES.get(path.suffix.lower(), "application/octet-stream")),
+                ("Content-Length", str(len(data))),
+                ("Cache-Control", "private, max-age=60"),
+            ]
+            start_response("200 OK", _common_headers(headers, self.config))
+            return [data]
         raise PortalError(HTTPStatus.NOT_FOUND, "该运行还没有结构团队报告")
 
     def _retained_report_links(self, dag_run_id: str) -> list[dict]:
         """Downloadable entries of the automatically retained structural-team report.
 
-        The run page links these directly through the authorized artifact route when the
-        run retained a report (failed native fetch or failed portable receipt); a verified
-        delivery keeps listing its own preview files.
+        The run page links these directly through the authorized artifact route; the
+        same resolver backs the download so a link can never point at a missing member.
         """
 
-        store = self._store()
-        if store is None or _RUN_ID.fullmatch(dag_run_id) is None:
-            return []
-        run_dir = store.run_dir(native_run_id(dag_run_id))
-        links = []
-        for artifact in TEAM_REPORTS:
-            name = Path(artifact).name
-            if any((run_dir / folder / name).is_file() for folder in ("structural-team", "reports")):
-                links.append(
-                    {
-                        "path": artifact,
-                        "label_zh": _STRUCTURAL_REPORT_LABELS.get(artifact, artifact),
-                        "url": f"/api/runs/{dag_run_id}/artifacts/{artifact}",
-                    }
-                )
-        return links
+        resolved = self._structural_report_files(dag_run_id)
+        return [
+            {
+                "path": artifact,
+                "label_zh": _STRUCTURAL_REPORT_LABELS.get(artifact, artifact),
+                "url": f"/api/runs/{dag_run_id}/artifacts/{artifact}",
+            }
+            for artifact in TEAM_REPORTS
+            if artifact in resolved
+        ]
 
     # ---------------------------------------------------------------- static
     def _static(self, start_response: Callable, name: str) -> Iterable[bytes]:
