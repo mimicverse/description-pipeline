@@ -435,6 +435,25 @@ class StructuralReportTests(unittest.TestCase):
         self.assertEqual(blocker["object"], "robot.SLDASM")
         self.assertIsNone(blocker["evidence"]["detail"])
 
+    def test_finding_order_is_independent_of_stored_key_order(self):
+        from description_pipeline.structural_report import build_structural_report
+
+        receipt = {
+            "run_id": "m3",
+            "state": "failed",
+            "error": "native readings missing",
+            "selection": {"manifest": {"closure": {"findings": [{"code": "closure.open_failed", "object": "a"}]}}},
+            "native_record": {"diagnostics": [{"code": "reader.absent", "object": "b", "message": "gone"}]},
+            "warnings": [{"code": "cad.warning", "object": "c", "message": "w"}],
+        }
+        direct = build_structural_report(receipt)
+        reloaded = build_structural_report(json.loads(json.dumps(receipt, sort_keys=True)))
+        self.assertEqual(direct, reloaded)
+        self.assertEqual(
+            [item["source"] for item in direct["findings"]],
+            [item["source"] for item in reloaded["findings"]],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

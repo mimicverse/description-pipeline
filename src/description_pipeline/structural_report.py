@@ -149,7 +149,10 @@ def _findings(value, source, *, severity=None):
             "evidence": value,
         }
         return
-    for key, child in value.items():
+    # Deterministic traversal: a persisted (sorted) receipt must render exactly
+    # like the live one, so neither finding order nor the first-seen duplicate
+    # anchor depends on how the job record was serialized.
+    for key, child in sorted(value.items(), key=lambda item: str(item[0])):
         if key in {"structural_report", "artifacts", "owned_files", "request", "client_failure"}:
             continue
         child_severity = (
