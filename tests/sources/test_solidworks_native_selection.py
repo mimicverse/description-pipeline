@@ -74,17 +74,20 @@ def readings(stage: Path, occurrences: list[dict], *, stored=None, **extra) -> d
         "stored_references": stored or {},
         "search": {
             "folder_type": 0,
-            "evidence": [
-                {
-                    "pid": 111,
-                    "before": [],
-                    "pinned": [str(stage)],
-                    "observed_after_pin": [str(stage)],
-                }
-            ],
+            "apis": ["ISldWorks.GetSearchFolders", "ISldWorks.SetSearchFolders"],
+            "before": [],
+            "pinned": [str(stage)],
+            "observed_after_pin": [str(stage)],
+            "restored": True,
+            "restore_error": None,
         },
         "open": {"errors": 0, "warnings": 0},
-        "session": {"native_api_pid": 111, "solidworks_revision": "34.0.0"},
+        "session": {
+            "native_api_pid": 111,
+            "solidworks_revision": "34.0.0",
+            "sealed": True,
+            "closed": True,
+        },
         "sealed": ["sealed"],
         "documents_before": 0,
         "documents_after": 0,
@@ -140,7 +143,11 @@ class ClosureAdmissionTests(unittest.TestCase):
         self.assertEqual(payload["excluded"], [])
         self.assertEqual(payload["suppressed"], [])
         self.assertEqual(payload["imports"], [])
-        self.assertEqual(payload["search_configuration"]["evidence"][0]["pid"], 111)
+        self.assertEqual(payload["search_configuration"]["pinned"], [str(self.stage)])
+        self.assertTrue(payload["search_configuration"]["restored"])
+        self.assertIsNone(payload["search_configuration"]["restore_error"])
+        self.assertTrue(payload["session"]["sealed"])
+        self.assertTrue(payload["session"]["closed"])
         # The produced graph is exactly B's seal contract.
         plan = selection_plan(self.files, "robot.SLDASM", payload["graph"])
         self.assertEqual(plan["state"], "complete")
@@ -189,48 +196,77 @@ class ClosureAdmissionTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "selection_dependency_unresolved")
         self.assertEqual(caught.exception.detail["problems"][0]["instance"], "arm-1")
 
-    def test_bound_import_admitted_by_documented_evidence(self) -> None:
-        extra = write_stage(self.stage, {"NP-F550.step": b"np-bytes"})
-        files = {**self.files, **extra}
+    def test_materialized_import_is_a_recorded_warning_not_a_binding(self) -> None:
         temp = r"C:\Users\Mi\AppData\Local\Temp\swx39388\IC~~\NP-F550.step.SLDPRT"
         payload = self.observe(
             [
                 occurrence(
                     "NP-F550.step-1",
                     temp,
-                    virtual=True,
-                    imported=str(self.stage / "NP-F550.step"),
+                    imported=r"C:\Users\Mi\Desktop\NP-F550.step",
                 )
-            ],
-            files=files,
+            ]
         )
-        self.assertEqual(payload["graph"]["robot.SLDASM"]["references"], ["NP-F550.step"])
-        self.assertIn("NP-F550.step", payload["graph"])
-        self.assertEqual(payload["imports"][0]["state"], "bound")
-        self.assertEqual(payload["imports"][0]["sha256"], files["NP-F550.step"])
-        edge = payload["documents"]["robot.SLDASM"]["resolved_edges"][0]
-        self.assertEqual(edge["kind"], "native_imported_document")
-        self.assertEqual(edge["temp_document"] if "temp_document" in edge else edge["resolved_path"], temp)
+        self.assertEqual(sorted(payload["graph"]), ["robot.SLDASM"])
+        entry = payload["imports"][0]
+        self.assertEqual(entry["state"], "cached_materialization")
+        self.assertEqual(entry["binding"], "author_metadata_only")
+        self.assertEqual(entry["author_imported_path"], r"C:\Users\Mi\Desktop\NP-F550.step")
+        self.assertEqual(entry["materialization"], temp)
+        warning = payload["warnings"][0]
+        self.assertEqual(warning["code"], "import_cached_materialization")
+        self.assertTrue(warning["needs_absence_test"])
 
-    def test_unbound_import_refused_with_needed_evidence(self) -> None:
-        temp = r"C:\Users\Mi\AppData\Local\Temp\swx39388\IC~~\NP-F550.step.SLDPRT"
+    def test_cached_import_subtree_is_recorded_without_refusal(self) -> None:
+        parent = r"C:\Users\Mi\AppData\Local\Temp\swx25524\IC~~\HD-1910-C001-20260902.stp.SLDASM"
+        child = r"C:\Users\Mi\AppData\Local\Temp\swx25524\IC~~\HL-3608_ASM_52_ASM.stp.SLDASM"
+        payload = self.observe(
+            [
+                occurrence("HD-1910-C001-20260902.stp-2", parent, imported=r"D:\M2.2\change11\HD.stp"),
+                occurrence(
+                    "HD-1910-C001-20260902.stp-2/HL-3608_ASM_52_ASM.stp-1",
+                    child,
+                    defining=parent,
+                    imported=r"D:\M2.2\change11\HD.stp",
+                ),
+            ]
+        )
+        self.assertEqual(len(payload["imports"]), 2)
+        self.assertEqual(sorted(payload["graph"]), ["robot.SLDASM"])
+
+    def test_import_without_materialization_refused(self) -> None:
         with self.assertRaises(SelectionError) as caught:
             self.observe(
                 [
                     occurrence(
                         "NP-F550.step-1",
-                        temp,
-                        virtual=True,
+                        "",
                         imported=r"C:\Users\Mi\Desktop\NP-F550.step",
                     )
                 ]
             )
         error = caught.exception
-        self.assertEqual(error.code, "selection_import_unsupported")
+        self.assertEqual(error.code, "selection_import_unresolved")
         item = error.detail["problems"][0]
         self.assertEqual(item["imported_path"], r"C:\Users\Mi\Desktop\NP-F550.step")
-        self.assertEqual(item["temp_document"], temp)
-        self.assertIn("GetImportedPath", item["needed_evidence"])
+
+    def test_in_stage_import_suffixed_document_is_a_native_delivery(self) -> None:
+        extra = write_stage(self.stage, {"HD-1910-C001-20260902.step.SLDPRT": b"cached-brep"})
+        files = {**self.files, **extra}
+        payload = self.observe(
+            [
+                occurrence(
+                    "HD-1910-C001-20260902.stp-2",
+                    self.resolved("HD-1910-C001-20260902.step.SLDPRT"),
+                    imported=r"D:\author\HD-1910-C001-20260902.stp",
+                )
+            ],
+            files=files,
+        )
+        self.assertEqual(
+            payload["graph"]["robot.SLDASM"]["references"], ["HD-1910-C001-20260902.step.SLDPRT"]
+        )
+        self.assertEqual(payload["imports"], [])
 
     def test_state5_and_unreadable_states_refuse_with_instance(self) -> None:
         with self.assertRaises(SelectionError) as caught:
@@ -251,16 +287,40 @@ class ClosureAdmissionTests(unittest.TestCase):
                 occurrence("arm-1", self.resolved("arm.SLDPRT")),
             ]
         )
-        self.assertEqual(payload["suppressed"], [
-            {
-                "document": "robot.SLDASM",
-                "instance": "cover-3",
-                "name": "cover-3",
-                "suppression_state": 0,
-                "resolved_path": r"C:\elsewhere\cover.SLDPRT",
-            }
-        ])
+        entry = payload["suppressed"][0]
+        self.assertEqual(entry["document"], "robot.SLDASM")
+        self.assertEqual(entry["instance"], "cover-3")
+        self.assertEqual(entry["suppression_state"], 0)
+        self.assertEqual(entry["resolved_path"], r"C:\elsewhere\cover.SLDPRT")
+        # A suppressed placement is only author intent after a clean open
+        # (errors == 0), and it is recorded with that justification.
+        self.assertEqual(entry["justification"], "authored_suppression_clean_open")
         self.assertNotIn("cover.SLDPRT", payload["graph"])
+
+    def test_suppressed_without_resolvable_document_refused(self) -> None:
+        with self.assertRaises(SelectionError) as caught:
+            self.observe([occurrence("cover-3", "", state=0)])
+        self.assertEqual(caught.exception.code, "selection_suppressed_unresolved")
+
+    def test_open_errors_refuse_the_closure(self) -> None:
+        with self.assertRaises(SelectionError) as caught:
+            self.observe(
+                [occurrence("arm-1", self.resolved("arm.SLDPRT"))],
+                open={"errors": 2, "warnings": 0},
+            )
+        error = caught.exception
+        self.assertEqual(error.code, "selection_open_errors")
+        item = error.detail["problems"][0]
+        self.assertEqual(item["open_errors"], 2)
+        self.assertEqual(item["document"], "robot.SLDASM")
+
+    def test_unreadable_open_status_refused(self) -> None:
+        with self.assertRaises(SelectionError) as caught:
+            self.observe(
+                [occurrence("arm-1", self.resolved("arm.SLDPRT"))],
+                open={"errors": None, "warnings": None},
+            )
+        self.assertEqual(caught.exception.code, "selection_open_status_unreadable")
 
     def test_lightweight_placement_admitted_and_flagged(self) -> None:
         payload = self.observe([occurrence("arm-1", self.resolved("arm.SLDPRT"), state=1)])
@@ -349,6 +409,104 @@ class SearchFolderPinTests(unittest.TestCase):
         self.assertEqual(read_search_folders(app)["folders"], [r"C:\a", r"C:\b"])
         app.value = None
         self.assertEqual(read_search_folders(app)["folders"], [])
+
+
+class BackendShapeIntegrationTests(unittest.TestCase):
+    """The policy consumes what the real backend walk produces, not a payload."""
+
+    def test_backend_closure_readings_feed_policy_and_seal(self) -> None:
+        from .test_solidworks_native_reader import _Component, _Doc
+        from description_pipeline.sources.solidworks.native import SolidWorksBackend
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        stage = Path(tmp.name).resolve()
+        files = write_stage(stage, {"robot.SLDASM": b"robot", "arm.SLDPRT": b"arm"})
+        arm = _Component("arm-1", str(stage / "arm.SLDPRT"), doc=_Doc(str(stage / "arm.SLDPRT")))
+        robot = _Doc(str(stage / "robot.SLDASM"), children=(arm,), configuration="默认")
+
+        class FakeApp:
+            RevisionNumber = "34.0.0"
+
+            def __init__(self):
+                self.folders = ""
+
+            def GetSearchFolders(self, folder_type):  # noqa: N802
+                return self.folders
+
+            def SetSearchFolders(self, folder_type, folders):  # noqa: N802
+                self.folders = folders
+                return True
+
+            def GetProcessID(self):  # noqa: N802
+                return 111
+
+            def GetDocumentCount(self):  # noqa: N802
+                return 0
+
+            def GetDocumentDependencies2(self, path, traverse, search, read_only):  # noqa: N802
+                assert (traverse, search, read_only) == (False, False, False)
+                return []
+
+        app = FakeApp()
+
+        class FakeSession:
+            def __init__(self):
+                self.closed = False
+
+            def connect(self, cancelled):
+                return app
+
+            def current_application(self):
+                return app
+
+            def identity(self):
+                return {
+                    "pid": 111,
+                    "executable": "fake",
+                    "ownership": "windows_job",
+                    "state": "closed" if self.closed else "active",
+                }
+
+            def close(self):
+                self.closed = True
+
+            def terminate(self):
+                self.closed = True
+
+        backend = SolidWorksBackend(session_factory=FakeSession)
+        backend._probe_document = lambda path: {
+            "doc": robot,
+            "errors": 0,
+            "warnings": 0,
+            "open_exception": None,
+            "already_open": False,
+        }
+        readings = backend.closure_readings(stage, "robot.SLDASM", files)
+
+        for key in ("before", "pinned", "observed_after_pin", "restored", "restore_error", "apis"):
+            self.assertIn(key, readings["search"])
+        self.assertEqual(readings["search"]["observed_after_pin"], [str(stage)])
+        self.assertTrue(readings["search"]["restored"])
+        self.assertIsNone(readings["search"]["restore_error"])
+        self.assertTrue(readings["session"]["sealed"])
+        self.assertTrue(readings["session"]["closed"])
+        self.assertEqual(readings["stored_references_phase"], "preopen")
+
+        payload = NativeSelectionReader(
+            walker=lambda stage_root, main, index: readings, reader_sha256=READER
+        ).observe(stage, "robot.SLDASM", files)
+        self.assertEqual(payload["graph"]["robot.SLDASM"]["references"], ["arm.SLDPRT"])
+        plan = selection_plan(files, "robot.SLDASM", payload["graph"])
+        self.assertEqual(plan["state"], "complete")
+        manifest = seal_selection(
+            files,
+            "robot.SLDASM",
+            payload["graph"],
+            selected_files={name: files[name] for name in payload["graph"]},
+            reader_sha256=READER,
+        )
+        self.assertEqual(manifest["main_assembly"], "robot.SLDASM")
 
 
 if __name__ == "__main__":

@@ -183,8 +183,14 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
     documents: dict[str, dict] = {}
     imports: list[dict] = []
     suppressed: list[dict] = []
+    warnings: list[dict] = []
     problems: list[dict] = []
     hashes: dict[str, str] = {}
+    cached_materializations: set[str] = set()
+
+    def cached_key(value):
+        text = str(value or "").strip()
+        return os.path.normcase(os.path.abspath(text)) if text else None
 
     def staged_digest(name: str) -> str:
         if name not in hashes:
@@ -223,6 +229,45 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
 
     graph_entry(main)
     document_entry(main)
+    open_status = readings.get("open")
+    open_status = dict(open_status) if isinstance(open_status, Mapping) else {}
+    open_errors = open_status.get("errors")
+    if type(open_errors) is not int:
+        raise SelectionError(
+            "selection_open_status_unreadable",
+            "the staged main open status is not an integer; a complete closure cannot be proven",
+            stage_root=str(stage_root),
+            problems=[
+                _problem(
+                    "selection_open_status_unreadable",
+                    "the staged main open status is not an integer",
+                    document=main,
+                    open_status=open_status,
+                )
+            ],
+            open_status=open_status,
+        )
+    if open_errors != 0:
+        # A nonzero CAD open status means references were not all resolved as
+        # saved; missing references can auto-suppress components (M3 original:
+        # two formerly active HD(2) assemblies and their 34 children), so a
+        # suppressed placement can never be assumed to be author intent here
+        # and a complete closure cannot be claimed.
+        raise SelectionError(
+            "selection_open_errors",
+            "the staged main opened with CAD-reported errors; missing references may have auto-suppressed occurrences, so a complete closure cannot be claimed",
+            stage_root=str(stage_root),
+            problems=[
+                _problem(
+                    "selection_open_errors",
+                    "the staged main opened with CAD-reported errors",
+                    document=main,
+                    open_errors=open_errors,
+                    open_warnings=open_status.get("warnings"),
+                )
+            ],
+            open_status=open_status,
+        )
     for record in occurrences:
         if not isinstance(record, Mapping):
             problems.append(_problem("selection_reader_result_invalid", "an occurrence record is not a mapping"))
@@ -257,14 +302,80 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
             )
             continue
         if state == _COMPONENT_SUPPRESSED:
+            if not resolved:
+                problems.append(
+                    _problem(
+                        "selection_suppressed_unresolved",
+                        "a suppressed occurrence has no resolvable document even though the main opened cleanly",
+                        document=defining_name or raw_defining,
+                        instance=instance,
+                    )
+                )
+                continue
             suppressed.append(
                 {
                     "document": defining_name or raw_defining,
                     "instance": instance,
                     "name": record.get("name"),
                     "suppression_state": 0,
-                    "resolved_path": resolved or None,
+                    "resolved_path": resolved,
+                    "justification": "authored_suppression_clean_open",
                 }
+            )
+            continue
+        virtual = record.get("is_virtual")
+        imported = record.get("imported_path")
+        imported = imported if isinstance(imported, str) and imported.strip() else None
+        lightweight = state in (_COMPONENT_LIGHTWEIGHT, _COMPONENT_FULLY_LIGHTWEIGHT)
+        cached_defining = bool(raw_defining) and cached_key(raw_defining) in cached_materializations
+        under = _under_stage(stage_root, resolved) if resolved else None
+        importish = cached_defining or (
+            under is None and ("IC~~" in resolved or virtual is True or imported is not None)
+        )
+        if importish:
+            label = defining_name or raw_defining
+            if resolved:
+                # A materialized imported occurrence: geometry comes from the
+                # session materialization; GetImportedPath is author-path
+                # metadata, never an in-package binding.  Recorded as a warning
+                # (no graph edge); the absence test decides cache provenance.
+                cached_materializations.add(cached_key(resolved))
+                imports.append(
+                    {
+                        "document": label,
+                        "defining_materialization": raw_defining if cached_defining else None,
+                        "instance": instance,
+                        "name": record.get("name"),
+                        "author_imported_path": imported,
+                        "is_virtual": virtual if type(virtual) is bool else None,
+                        "materialization": resolved,
+                        "configuration": record.get("configuration"),
+                        "suppression_state": state,
+                        "state": "cached_materialization",
+                        "binding": "author_metadata_only",
+                    }
+                )
+                warnings.append(
+                    {
+                        "code": "import_cached_materialization",
+                        "message": "an imported occurrence contributes geometry from a session materialization; the author import path is metadata, not a proven in-package binding",
+                        "document": label,
+                        "instance": instance,
+                        "materialization": resolved,
+                        "author_imported_path": imported,
+                        "needs_absence_test": True,
+                    }
+                )
+                continue
+            problems.append(
+                _problem(
+                    "selection_import_unresolved",
+                    "an imported occurrence has no materialization and no staged source",
+                    document=label,
+                    instance=instance,
+                    imported_path=imported,
+                    defining_materialization=raw_defining if cached_defining else None,
+                )
             )
             continue
         if defining_name is None:
@@ -280,64 +391,13 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
             continue
         graph_entry(defining_name)
         document_entry(defining_name)
-        virtual = record.get("is_virtual")
-        imported = record.get("imported_path")
-        imported = imported if isinstance(imported, str) and imported.strip() else None
-        lightweight = state in (_COMPONENT_LIGHTWEIGHT, _COMPONENT_FULLY_LIGHTWEIGHT)
-        if not resolved and imported is None and virtual is not True:
+        if not resolved:
             problems.append(
                 _problem(
                     "selection_dependency_unresolved",
                     "a non-suppressed occurrence has no resolved document",
                     document=defining_name,
                     instance=instance,
-                )
-            )
-            continue
-        if (not resolved) or virtual is True or "IC~~" in resolved:
-            bound = _indexed(stage_root, imported, files) if imported else None
-            if bound is not None and staged_ok(bound):
-                graph_entry(defining_name)["references"].add(bound)
-                graph_entry(bound)
-                document_entry(bound)
-                document_entry(defining_name)["resolved_edges"].append(
-                    {
-                        "name": record.get("name"),
-                        "instance": instance,
-                        "kind": "native_imported_document",
-                        "resolved": bound,
-                        "resolved_path": resolved or None,
-                        "imported_path": imported,
-                        "is_virtual": virtual if type(virtual) is bool else None,
-                        "configuration": record.get("configuration"),
-                        "suppression_state": state,
-                        "lightweight": lightweight,
-                    }
-                )
-                imports.append(
-                    {
-                        "document": defining_name,
-                        "instance": instance,
-                        "name": record.get("name"),
-                        "imported_path": imported,
-                        "is_virtual": virtual if type(virtual) is bool else None,
-                        "resolved": bound,
-                        "resolved_path": resolved or None,
-                        "sha256": files[bound],
-                        "state": "bound",
-                    }
-                )
-                continue
-            problems.append(
-                _problem(
-                    "selection_import_unsupported",
-                    "an imported occurrence is not bound to a staged source file",
-                    document=defining_name,
-                    instance=instance,
-                    resolved=resolved or None,
-                    imported_path=imported,
-                    temp_document=resolved if (resolved and ("IC~~" in resolved or virtual is True)) else None,
-                    needed_evidence="engine-reported GetImportedPath inside the staged root with matching sha256",
                 )
             )
             continue
@@ -419,6 +479,9 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
         "graph": graph_out,
         "documents": documents_out,
         "imports": sorted(imports, key=lambda item: (str(item.get("document")), str(item.get("instance")))),
+        "warnings": sorted(
+            warnings, key=lambda item: (str(item.get("code")), str(item.get("document")), str(item.get("instance")))
+        ),
         "suppressed": sorted(
             suppressed, key=lambda item: (str(item.get("document")), str(item.get("instance")))
         ),

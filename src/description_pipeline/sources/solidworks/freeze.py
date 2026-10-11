@@ -568,6 +568,15 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         for entry in closure.get("suppressed") or []
         if isinstance(entry, dict) and entry.get("resolved_path")
     }
+    # Session materializations recorded by the closure walk (imported
+    # occurrences): they are evidence, not snapshot members, and are excluded
+    # from the required file graph by the manifest itself -- never by a path
+    # string heuristic.
+    cached_import_paths = {
+        os.path.normcase(os.path.abspath(str(entry.get("materialization"))))
+        for entry in closure.get("imports") or []
+        if isinstance(entry, dict) and entry.get("materialization")
+    }
     suppressed_skipped: list[str] = []
     unresolved = []
     outside = []
@@ -605,7 +614,7 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         document = str(entry.get("document") or "")
         if not document:
             continue
-        if entry.get("virtual") is True or "IC~~" in document:
+        if os.path.normcase(os.path.abspath(document)) in cached_import_paths:
             import_temp_documents.append(document)
             continue
         original_documents.append(document)
@@ -835,7 +844,7 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         path = str(entry.get("document") or "")
         if not path:
             continue  # suppressed instances are tracked, not resolved
-        if entry.get("virtual") is True or "IC~~" in path:
+        if os.path.normcase(os.path.abspath(path)) in cached_import_paths:
             import_temp_documents.append(path)
             continue  # session materializations are evidence, not snapshot members
         if not _under(path, [str(source_dir)]):
@@ -899,7 +908,7 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         mapping[(str(cfg["assembly"]), top)] = "top_level"
     for entry in copy.get("instances") or []:
         path = str(entry.get("document") or "")
-        if not path or entry.get("virtual") is True or "IC~~" in path:
+        if not path or os.path.normcase(os.path.abspath(path)) in cached_import_paths:
             continue
         for source_entry in original.get("instances") or []:
             if str(source_entry.get("instance")) == str(entry.get("instance")) and source_entry.get("document"):
