@@ -247,7 +247,9 @@ class FixtureCadBackend(CadBackend):
             "excluded_paths": sorted(str(item) for item in excluded_paths),
             "required_names": sorted(str(item) for item in required_names),
             "admitted_roots": [str(item) for item in admitted_roots],
-            "closure_documents": sorted((closure_documents or {}).keys()) if isinstance(closure_documents, dict) else None,
+            "closure_documents": (
+                sorted((closure_documents or {}).keys()) if isinstance(closure_documents, dict) else None
+            ),
         }
         target = Path(destination_dir)
         target.mkdir(parents=True, exist_ok=True)

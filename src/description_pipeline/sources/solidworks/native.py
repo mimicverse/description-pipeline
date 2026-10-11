@@ -3646,7 +3646,10 @@ class SolidWorksBackend(CadBackend):
                     if not selected and evidence is not None:
                         recorded = value in evidence["stored_locations"]
                         resolved_hit = (
-                            (artifact_canonical is not None and artifact_canonical.casefold() in evidence["resolved_targets"])
+                            (
+                                artifact_canonical is not None
+                                and artifact_canonical.casefold() in evidence["resolved_targets"]
+                            )
                             or os.path.normcase(os.path.abspath(reference)) in evidence["resolved_paths"]
                         )
                         if recorded and not resolved_hit:

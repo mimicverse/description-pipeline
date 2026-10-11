@@ -1127,7 +1127,8 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         "session_temp_dependencies": sorted(set(session_temp_dependencies)),
         "stale_source_links": sorted(set(stale_source_links)),
         "stale_stored_references": sorted(
-            stale_stored, key=lambda item: (str(item.get("document")), str(item.get("location")), str(item.get("resolved_path")))
+            stale_stored,
+            key=lambda item: (str(item.get("document")), str(item.get("location")), str(item.get("resolved_path"))),
         ),
         "materializations_verified": materializations_verified,
         "materialization_keys": sorted([token[0], token[1], instance] for token, instance in materialization_keys),
