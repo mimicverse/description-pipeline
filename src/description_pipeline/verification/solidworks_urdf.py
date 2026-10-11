@@ -24,6 +24,7 @@ from ..geometry import stl
 from ..io import PipelineError, confined, file_digest, inventory, read_data
 from ..sources.snapshot import verify_snapshot
 from ..sources.solidworks.input import inspect_package
+from ..sources.solidworks.revision import NATIVE_SUFFIXES
 from ..sources.solidworks.revision import package_inventory, read_revision
 from .consumer import load as load_consumer
 
@@ -321,6 +322,53 @@ def _dependencies(root, definition):
     for row in closure["mapping"]:
         _require(original.get(row["source"]) == row["source_sha256"], "Source mapping hash differs")
         _require(actual.get(row["copy"]) == row["copy_sha256"], "Copied mapping hash differs")
+    _require(
+        {ntpath.normcase(str(row["source"])) for row in closure["mapping"]}
+        == {ntpath.normcase(str(path)) for path in original},
+        "The copied graph does not cover the captured original files",
+    )
+    from .native_discovery import DISCOVERY_FILE  # noqa: PLC0415 - mirrors _handoff_native_hashes
+
+    record = read_data(confined(root / "input", DISCOVERY_FILE))
+    selected = ((record.get("raw") or {}).get("source_selection") or {}).get("files") or {}
+    for name, checksum in sorted(selected.items()):
+        suffix = ntpath.normcase(str(name).replace("/", "\\"))
+        matches = [
+            row
+            for row in closure["mapping"]
+            if isinstance(row, dict)
+            and ntpath.normcase(str(row.get("source") or "").replace("/", "\\")).endswith("\\" + suffix)
+        ]
+        _require(matches, f"A retained source is missing from the copied graph: {name}")
+        _require(
+            any(row.get("source_sha256") == checksum for row in matches),
+            f"A retained source does not bind its selected original bytes: {name}",
+        )
+        if Path(str(name)).suffix.lower() not in NATIVE_SUFFIXES:
+            _require(
+                any(actual.get(row.get("copy")) == checksum for row in matches),
+                f"A retained non-native source differs from its selected bytes in the copied tree: {name}",
+            )
+    if "seeded_required_leaves" not in closure:
+        seeded: list = []
+    else:
+        seeded = closure["seeded_required_leaves"]
+        _require(
+            isinstance(seeded, list) and all(isinstance(item, str) and item for item in seeded),
+            "Seeded required leaves are malformed",
+        )
+    mapping_sources = {ntpath.normcase(str(row["source"])) for row in closure["mapping"]}
+    selected_suffixes = {ntpath.normcase(str(name).replace("/", "\\")) for name in selected}
+    for path in seeded:
+        _require(
+            ntpath.normcase(path) in mapping_sources,
+            f"A seeded required leaf is not covered by the copied graph: {path}",
+        )
+        tail = ntpath.normcase(path.replace("/", "\\"))
+        _require(
+            any(tail == suffix or tail.endswith("\\" + suffix) for suffix in selected_suffixes),
+            f"A seeded required leaf is not a selected source: {path}",
+        )
     collection = read_data(root / "evidence/evidence/collection.json")
     _require(collection["dependency_closure"] == closure, "Collection dependency record differs")
     _require(
