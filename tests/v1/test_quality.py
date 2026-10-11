@@ -14,6 +14,7 @@ import numpy as np
 
 from description_pipeline.io import PipelineError, canonical, write_json
 from description_pipeline.sources.solidworks.freeze import _component_context_record
+from description_pipeline.sources.solidworks import verify as oracle
 from description_pipeline.verification import solidworks_urdf as quality
 from description_pipeline.verification.solidworks_physics import verify_physics, verify_urdf_mass_equality
 
@@ -79,6 +80,7 @@ class PhysicsTests(unittest.TestCase):
             },
         }
         self.raw = {
+            "document": "C:\\fixture\\captured.SLDASM",
             "components": [
                 {"name": "a", "transform": first.ravel().tolist()},
                 {"name": "b", "transform": second.ravel().tolist()},
@@ -215,7 +217,7 @@ class PhysicsTests(unittest.TestCase):
         self.assertIn("physics.authority", self.failures())
 
     def _record_clean_provenance(self) -> None:
-        """The canonical record a current CAD capture seals when every material is verified."""
+        """The canonical records a current CAD capture seals with every material verified."""
 
         write_json(
             self.root / "raw/material_provenance.json",
@@ -225,6 +227,16 @@ class PhysicsTests(unittest.TestCase):
                 "configuration": self.source["configuration"],
                 "material_source": "cad",
                 "measured_source": "cad_api",
+                "warnings": [],
+            },
+        )
+        write_json(
+            self.root / "raw/effective_instances.json",
+            {
+                "schema_version": "solidworks-to-urdf.effective-instances/v1",
+                "assembly": self.captured_identity["assembly"],
+                "configuration": self.source["configuration"],
+                "readings": {},
                 "warnings": [],
             },
         )
@@ -511,6 +523,255 @@ class PhysicsTests(unittest.TestCase):
                 self.setUp()
                 mutate()
                 self.assertIn("physics.material_provenance", self.failures())
+
+    def _write_effective(self) -> None:
+        """Seal the current a-row state as the canonical effective instance record."""
+
+        reference = self.masses["a"]["reference"]
+        reading = {
+            "role": "leaf",
+            "document_type": "part",
+            "mass": self.masses["a"]["mass"],
+            "com": copy.deepcopy(self.masses["a"]["com"]),
+            "inertia": copy.deepcopy(self.masses["a"]["inertia"]),
+            "reference": copy.deepcopy(reference),
+        }
+        context = self.closure["component_context"]
+        row = next(entry for entry in context["instances"] if entry["name"] == "a")
+        row["overrides"] = copy.deepcopy(reference["overrides"])
+        row["effective"] = copy.deepcopy(reading)
+        self.raw.setdefault("notes", {})["effective_instances"] = {"a": copy.deepcopy(reading)}
+        self.closure["effective_total"] = {
+            key: copy.deepcopy(self.closure["top_level"][key]) for key in ("mass", "com", "inertia")
+        }
+        self.write()
+        qualification = (
+            "cad_authored_effective_instance; not geometry-derived, not independently physically qualified"
+        )
+        measurement = {
+            "scope": reference["scope"],
+            "axes": reference["axes"],
+            "used_api": reference["used_api"],
+            "selection_api": reference["selection_api"],
+            "override_api": reference["override_api"],
+            "mass_kg": self.masses["a"]["mass"],
+            "center_of_mass_m": copy.deepcopy(self.masses["a"]["com"]),
+            "inertia_kg_m2": copy.deepcopy(self.masses["a"]["inertia"]),
+            "volume_m3": reference.get("volume_m3"),
+            "density_kg_m3": reference.get("density_kg_m3"),
+        }
+        warnings = [
+            {
+                "code": "cad_instance_override_effective",
+                "blocking": False,
+                "component": "a",
+                "role": reading["role"],
+                "document_type": reading["document_type"],
+                "configuration": reference["configuration"],
+                "part_document": reference["part_document"],
+                "assembly_document": reference["assembly_document"],
+                "assembly_configuration": reference["assembly_configuration"],
+                "selected_components": copy.deepcopy(reference["selected_components"]),
+                "overrides": copy.deepcopy(reference["overrides"]),
+                "qualification": qualification,
+                "measurement": copy.deepcopy(measurement),
+            },
+            {
+                "code": "cad_surface_only_effective_instance",
+                "blocking": False,
+                "component": "a",
+                "document": reference["part_document"],
+                "configuration": reference["configuration"],
+                "assembly_document": reference["assembly_document"],
+                "assembly_configuration": reference["assembly_configuration"],
+                "selected_components": copy.deepcopy(reference["selected_components"]),
+                "part_document_read": "unavailable",
+                "fallback_reason": "part_document_mass_unavailable",
+                "fallback_error_code": reference["fallback_error_code"],
+                "solid_bodies": reference["solid_bodies"],
+                "sheet_bodies": reference["sheet_bodies"],
+                "overrides": copy.deepcopy(reference["overrides"]),
+                "qualification": qualification,
+                "measurement": {**copy.deepcopy(measurement), "state": self.masses["a"]["state"],
+                               "measurement_basis": reference["measurement_basis"]},
+            },
+        ]
+        write_json(
+            self.root / "raw/effective_instances.json",
+            {
+                "schema_version": "solidworks-to-urdf.effective-instances/v1",
+                "assembly": self.captured_identity["assembly"],
+                "configuration": self.source["configuration"],
+                "readings": {"a": reading},
+                "warnings": warnings,
+            },
+        )
+
+    def _mark_effective_instance(self) -> None:
+        """Replace a's reading with the sealed surface-only effective instance."""
+
+        placement = next(row for row in self.raw["components"] if row["name"] == "a")
+        grid = np.array(placement["transform"]).reshape(4, 4)
+        rotation, translation = grid[:3, :3], grid[:3, 3]
+        local_com = np.array(self.masses["a"]["com"], dtype=float)
+        local_tensor = np.array(self.masses["a"]["inertia"], dtype=float)
+        # The sealed effective reading is recorded verbatim in assembly axes.
+        self.masses["a"]["com"] = (rotation @ local_com + translation).tolist()
+        self.masses["a"]["inertia"] = (rotation @ local_tensor @ rotation.T).tolist()
+        reference = self.masses["a"]["reference"]
+        reference.pop("material_assignment", None)
+        reference.update(
+            {
+                "used_api": "IMassProperty2.GetMomentOfInertia(0)",
+                "selection_api": "IMassProperty2.SelectedItems = (IComponent2)",
+                "override_api": "IMassProperty2.GetOverrideOptions",
+                "scope": "assembly_component_group",
+                "axes": "assembly_document_axes",
+                "product_convention": "solidworks_standard",
+                "reference_point": "center_of_mass",
+                "use_system_units": True,
+                "effective_instance": True,
+                "measurement_basis": "cad_authored_effective_instance",
+                "selected_components": ["a"],
+                "assembly_document": self.raw["document"],
+                "assembly_configuration": self.source["configuration"],
+                "part_document": "C:\\fixture\\a.SLDPRT",
+                "configuration": "Default",
+                "solid_bodies": 0,
+                "sheet_bodies": 2350,
+                "fallback_error_code": "cad_empty_model",
+                "overrides": {
+                    "OverrideMass": True,
+                    "OverrideCenterOfMass": True,
+                    "OverrideMomentsOfInertia": True,
+                },
+            }
+        )
+        self.masses["a"]["mode"] = "effective_instance"
+        self.masses["a"]["state"] = "sheet_only"
+        self.raw.setdefault("notes", {})["bodies:a"] = {"solid": 0, "sheet": 2350}
+        self._record_clean_provenance()
+        self._write_effective()
+
+    def test_effective_instance_is_accepted_and_bound(self):
+        self._mark_effective_instance()
+        checks = {check["id"]: check for check in verify_physics(self.root, self.source, self.model)}
+        self.assertTrue(checks["physics.effective_instances"]["passed"], checks["physics.effective_instances"])
+        self.assertTrue(checks["physics.reading.a"]["passed"], checks["physics.reading.a"])
+        self.assertEqual([], self.failures())
+
+    def test_effective_instance_evidence_is_required_and_bound(self):
+        def load() -> dict:
+            return json.loads((self.root / "raw/effective_instances.json").read_text())
+
+        def store(payload: dict) -> None:
+            write_json(self.root / "raw/effective_instances.json", payload)
+
+        def removed_record() -> None:
+            (self.root / "raw/effective_instances.json").unlink()
+
+        def changed_flags() -> None:
+            payload = load()
+            warning = next(w for w in payload["warnings"] if w["code"] == "cad_instance_override_effective")
+            warning["overrides"] = {
+                "OverrideMass": True,
+                "OverrideCenterOfMass": False,
+                "OverrideMomentsOfInertia": False,
+            }
+            store(payload)
+
+        def changed_measured_mass() -> None:
+            payload = load()
+            warning = next(w for w in payload["warnings"] if w["code"] == "cad_instance_override_effective")
+            warning["measurement"]["mass_kg"] = 1.5
+            store(payload)
+
+        def changed_warning_blocking() -> None:
+            payload = load()
+            warning = next(w for w in payload["warnings"] if w["code"] == "cad_surface_only_effective_instance")
+            warning["blocking"] = True
+            store(payload)
+
+        def changed_row_sheet_count() -> None:
+            self.masses["a"]["reference"]["sheet_bodies"] = 999
+            self._write_effective()
+
+        def inactive_overrides() -> None:
+            self.masses["a"]["reference"]["overrides"] = {
+                "OverrideMass": False,
+                "OverrideCenterOfMass": False,
+                "OverrideMomentsOfInertia": False,
+            }
+            self._write_effective()
+
+        def duplicated_selection() -> None:
+            self.masses["a"]["reference"]["selected_components"] = ["a", "b"]
+            self._write_effective()
+
+        def changed_assembly_identity() -> None:
+            self.masses["a"]["reference"]["assembly_document"] = "C:\\elsewhere.SLDASM"
+            self._write_effective()
+
+        for label, mutate in (
+            ("removed_record", removed_record),
+            ("changed_flags", changed_flags),
+            ("changed_measured_mass", changed_measured_mass),
+            ("changed_warning_blocking", changed_warning_blocking),
+            ("changed_row_sheet_count", changed_row_sheet_count),
+            ("inactive_overrides", inactive_overrides),
+            ("duplicated_selection", duplicated_selection),
+            ("changed_assembly_identity", changed_assembly_identity),
+        ):
+            with self.subTest(case=label):
+                self.setUp()
+                self._mark_effective_instance()
+                mutate()
+                self.assertIn("physics.effective_instances", self.failures())
+
+    def test_effective_parent_substitution_requires_one_body(self):
+        def transform(rotation, translation):
+            matrix = np.eye(4)
+            matrix[:3, :3] = rotation
+            matrix[:3, 3] = translation
+            return matrix.ravel().tolist()
+
+        parent_rotation = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+        parent = transform(parent_rotation, [-1.025, -1.066, -0.988])
+        child_a = transform(parent_rotation, [-0.925, -1.166, -0.888])
+        child_b = transform(parent_rotation, [-1.125, -0.966, -1.088])
+        leaf_q = transform(np.eye(3), [0.5, -0.25, 0.75])
+        raw = {
+            "components": [
+                {"name": "p/a", "transform": child_a},
+                {"name": "p/b", "transform": child_b},
+                {"name": "q", "transform": leaf_q},
+            ],
+            "coordinate_systems": copy.deepcopy(self.raw["coordinate_systems"]),
+            "notes": {
+                "effective_instances": {
+                    "p": {
+                        "mass": 4.0,
+                        "com": [-1.0, -1.05, -0.9],
+                        "inertia": np.diag([0.01, 0.02, 0.03]).tolist(),
+                        "reference": {"selected_components": ["p"]},
+                    }
+                }
+            },
+        }
+        masses = {
+            "p/a": {"mass": 1.0, "com": [0.1, 0.0, 0.0], "inertia": np.diag([0.001, 0.002, 0.003]).tolist(),
+                    "reference": {"scope": "part_document", "product_convention": "solidworks_standard"}},
+            "p/b": {"mass": 2.0, "com": [0.0, 0.1, 0.0], "inertia": np.diag([0.001, 0.002, 0.003]).tolist(),
+                    "reference": {"scope": "part_document", "product_convention": "solidworks_standard"}},
+            "q": {"mass": 1.0, "com": [0.0, 0.0, 0.0], "inertia": np.diag([0.004, 0.005, 0.006]).tolist(),
+                  "reference": {"scope": "part_document", "product_convention": "solidworks_standard"}},
+        }
+        world = oracle._raw_world({"id": "x", "components": ["p/a", "p/b", "q"]}, raw, masses, {})
+        self.assertAlmostEqual(world["mass"], 5.0, places=12)
+        expected_com = (4.0 * np.array([-1.0, -1.05, -0.9]) + 1.0 * np.array([0.5, -0.25, 0.75])) / 5.0
+        self.assertTrue(np.allclose(world["com"], expected_com, atol=1e-12))
+        with self.assertRaises(ValueError):
+            oracle._raw_world({"id": "x", "components": ["p/a"]}, raw, masses, {})
 
     def test_unknown_unverified_reasons_are_not_warnable(self):
         def unknown_reason() -> None:

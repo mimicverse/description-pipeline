@@ -30,6 +30,9 @@ _SCOPE_CONVENTIONS = {
     "assembly_component_group": "solidworks_standard",
     "assembly_document": "solidworks_standard",
 }
+EFFECTIVE_SCHEMA = "solidworks-to-urdf.effective-instances/v1"
+EFFECTIVE_CODE_SHEET_ONLY = "cad_surface_only_effective_instance"
+EFFECTIVE_CODE_INSTANCE = "cad_instance_override_effective"
 MASS_ATOL = 1e-12
 MASS_RTOL = 1e-9
 COM_ATOL = 1e-9
@@ -167,6 +170,7 @@ def _component_context_findings(
     material_source: str,
     assembly_mass: float | None,
     scene_masses: dict[str, float] | None,
+    covered: set[str] | None = None,
 ) -> tuple[dict[str, Any], str | None]:
     """Read the recorded component-context evidence; return ``(details, error)``.
 
@@ -383,8 +387,9 @@ def _component_context_findings(
             incomplete.append(f"{len(coverage['unexpected_nodes'])} unexpected node row(s)")
         if coverage["missing_parent_rows"]:
             incomplete.append(f"{len(coverage['missing_parent_rows'])} node row(s) whose parent row is absent")
+    covered_names = {str(name) for name in (covered or set())}
     if material_source != "documented_table":
-        if any_overridden:
+        if any_overridden and not set(any_overridden) <= covered_names:
             return details, (
                 "the CAD assembly carries component-level overrides "
                 f"({len(any_overridden)} instance(s): {len(mass_overridden)} mass, "
@@ -394,11 +399,12 @@ def _component_context_findings(
                 "a documented mass only rescales the CAD tensor at an unchanged center of mass — or "
                 "remove the overrides in CAD"
             )
-        if isinstance(coverage, dict) and coverage.get("effective_vs_document_mismatches"):
-            examples = coverage["effective_vs_document_mismatches"][:3]
+        mismatches = [row for row in equivalence if str(row.get("name")) not in covered_names]
+        if isinstance(coverage, dict) and mismatches:
+            examples = mismatches[:3]
             return details, (
                 "the assembly context's effective mass differs from the selected part-document "
-                f"reading for {len(equivalence)} node(s) with no recorded override "
+                f"reading for {len(mismatches)} node(s) with no recorded override "
                 f"(examples: {examples}); a pure-CAD (material_source=cad) model cannot claim "
                 "source equivalence — record the effective masses through source.documented_masses"
             )
@@ -612,17 +618,144 @@ def _component_mass(
     return mass, com, inertia, note
 
 
-def _recompute_link(body: dict, components: dict[str, dict], raw_scene: dict, masses: dict, declared: dict) -> dict:
+def load_effective_instances(evidence_root) -> dict[str, dict]:
+    """The sealed effective-instance warnings, keyed by occurrence name.
+
+    Both the sheet-only leaf fallback and non-leaf (group) native overrides are
+    recorded here; the raw math stays in ``mass_properties.json`` rows and
+    ``scene_raw.notes.effective_instances``, and this record binds them with
+    verbatim measured values.
+    """
+
+    path = Path(evidence_root) / "raw" / "effective_instances.json"
+    if not path.is_file():
+        raise PipelineError("the CAD capture has no effective instance record")
+    payload = read_json(path)
+    if not isinstance(payload, dict) or payload.get("schema_version") != EFFECTIVE_SCHEMA:
+        raise PipelineError("effective instance record schema changed")
+    warnings = payload.get("warnings")
+    if not isinstance(warnings, list):
+        raise PipelineError("effective instance record has no warnings list")
+    entries: dict[tuple[str, str], dict] = {}
+    for entry in warnings:
+        if not isinstance(entry, dict):
+            raise PipelineError("effective instance record carries a malformed warning")
+        component = entry.get("component")
+        code = entry.get("code")
+        if not isinstance(component, str) or not component or not isinstance(code, str) or not code:
+            raise PipelineError("effective instance record names an unknown or repeated occurrence")
+        if (component, code) in entries:
+            raise PipelineError("effective instance record names an unknown or repeated occurrence")
+        entries[(component, code)] = entry
+    return entries
+
+
+def _notes_effective(raw_scene: dict) -> dict[str, dict]:
+    notes = raw_scene.get("notes")
+    entries = notes.get("effective_instances") if isinstance(notes, dict) else None
+    if entries is None:
+        return {}
+    if not isinstance(entries, dict):
+        raise ValueError("scene_raw effective instances are malformed")
+    return {str(name): entry for name, entry in entries.items()}
+
+
+def effective_math_map(masses: dict, raw_scene: dict) -> dict[str, dict]:
+    """Verbatim effective measurements (assembly axes) keyed by occurrence.
+
+    Leaf rows carry their values inline; non-leaf occurrences are recorded in
+    ``scene_raw.notes.effective_instances``. Nothing is transformed here - the
+    conversion uses the recorded placement independently in each consumer.
+    """
+
+    math: dict[str, dict] = {}
+    for name, row in masses.items():
+        if isinstance(row, dict) and row.get("mode") == "effective_instance":
+            math[str(name)] = {"mass": row["mass"], "com": row["com"], "inertia": row["inertia"]}
+    for name, entry in _notes_effective(raw_scene).items():
+        if not isinstance(entry, dict) or not {"mass", "com", "inertia"} <= set(entry):
+            raise ValueError(f"effective instance {name!r} is malformed")
+        values = {"mass": entry["mass"], "com": entry["com"], "inertia": entry["inertia"]}
+        if name in math:
+            if math[name] != values:
+                raise ValueError(f"effective instance {name!r} disagrees with its captured row")
+            continue
+        math[name] = values
+    return math
+
+
+def _effective_ancestors(name: str) -> list[str]:
+    parts = name.split("/")
+    return ["/".join(parts[:index]) for index in range(1, len(parts) + 1)]
+
+
+def _resolved_contributions(body, raw_scene, masses, declared, effective):
+    """One contribution per authored occurrence, after top-down substitution.
+
+    A native effective instance replaces its whole subtree (SolidWorks uses the
+    overridden component value in its parent). The subtree must travel inside
+    exactly this body: an effective delta is never distributed across links.
+    """
+
     placements = {entry["name"]: entry["transform"] for entry in raw_scene.get("components") or []}
+    leaves = [entry["name"] for entry in raw_scene.get("components") or []]
+    owned = set(body.get("components") or [])
+    contributions = []
+    claimed: set[str] = set()
+    for component in body.get("components") or []:
+        if component not in placements or component not in masses:
+            raise ValueError(f"body {body.get('id')!r} references a component without raw readings: {component}")
+        provider = next((ancestor for ancestor in _effective_ancestors(component) if ancestor in effective), None)
+        if provider is None:
+            rotation, translation = _transform(placements[component])
+            mass, com_part, inertia_part, note = _component_mass(component, masses[component], declared)
+            contributions.append((rotation, translation, mass, com_part, inertia_part, note))
+            continue
+        if provider in claimed:
+            continue
+        claimed.add(provider)
+        subtree = [leaf for leaf in leaves if leaf == provider or leaf.startswith(provider + "/")]
+        if not set(subtree) <= owned:
+            raise ValueError(
+                f"effective instance {provider!r} spans several bodies; its delta cannot be distributed"
+            )
+        if declared.get(component):
+            raise ValueError(f"declared mass table cannot scale an effective instance: {component!r}")
+        payload = effective[provider]
+        mass = float(payload["mass"])
+        placement = placements.get(provider)
+        if placement is None:
+            # A group occurrence keeps its recorded assembly-axes values verbatim.
+            rotation, translation = np.eye(3), np.zeros(3)
+            com_part = np.array(payload["com"], dtype=float)
+            inertia_part = np.array(payload["inertia"], dtype=float)
+        else:
+            # A leaf fallback converts with its recorded placement on both sides.
+            rotation, translation = _transform(placement)
+            if not np.allclose(rotation @ rotation.T, np.eye(3), atol=1e-9):
+                raise ValueError(f"effective instance {provider!r} has a non-orthonormal placement")
+            com_part = rotation.T @ (np.array(payload["com"], dtype=float) - translation)
+            inertia_part = rotation.T @ np.array(payload["inertia"], dtype=float) @ rotation
+        note = {
+            "component": provider,
+            "raw_mass_kg": mass,
+            "used_mass_kg": mass,
+            "scale": 1.0,
+            "effective_instance": True,
+        }
+        contributions.append((rotation, translation, mass, com_part, inertia_part, note))
+    return contributions
+
+
+def _recompute_link(body: dict, components: dict[str, dict], raw_scene: dict, masses: dict, declared: dict) -> dict:
     rotation_link, translation_link = _link_frame(body, raw_scene)
     total_mass = 0.0
     weighted = np.zeros(3)
     per_component = []
-    for component in body.get("components") or []:
-        if component not in placements or component not in masses:
-            raise ValueError(f"body {body.get('id')!r} references a component without raw readings: {component}")
-        rotation, translation = _transform(placements[component])
-        mass, com_part, inertia_part, note = _component_mass(component, masses[component], declared)
+    effective = effective_math_map(masses, raw_scene)
+    for rotation, translation, mass, com_part, inertia_part, note in _resolved_contributions(
+        body, raw_scene, masses, declared, effective
+    ):
         com_assembly = rotation @ com_part + translation
         inertia_assembly = rotation @ inertia_part @ rotation.T
         total_mass += mass
@@ -665,7 +798,7 @@ def _canonical_in_link_frame(link: dict) -> tuple[float, np.ndarray, np.ndarray]
     )
 
 
-def _raw_world(body: dict, raw_scene: dict, masses: dict, declared: dict) -> dict:
+def _raw_world(body: dict, raw_scene: dict, masses: dict, declared: dict, *, use_effective: bool = True) -> dict:
     """COM and tensor in *assembly* axes, computed without any link frame.
 
     This is the frame-independent view: it uses only the raw component
@@ -673,15 +806,19 @@ def _raw_world(body: dict, raw_scene: dict, masses: dict, declared: dict) -> dic
     link-local comparison would happily agree with.
     """
 
-    placements = {entry["name"]: entry["transform"] for entry in raw_scene.get("components") or []}
+    effective = effective_math_map(masses, raw_scene)
+    if not use_effective:
+        effective = {
+            name: payload
+            for name, payload in effective.items()
+            if name in masses and isinstance(masses[name], dict) and masses[name].get("mode") == "effective_instance"
+        }
     total_mass = 0.0
     weighted = np.zeros(3)
     parts = []
-    for component in body.get("components") or []:
-        if component not in placements or component not in masses:
-            raise ValueError(f"body {body.get('id')!r} references a component without raw readings: {component}")
-        rotation, translation = _transform(placements[component])
-        mass, com_part, inertia_part, _note = _component_mass(component, masses[component], declared)
+    for rotation, translation, mass, com_part, inertia_part, _note in _resolved_contributions(
+        body, raw_scene, masses, declared, effective
+    ):
         com_world = rotation @ com_part + translation
         inertia_world = rotation @ inertia_part @ rotation.T
         total_mass += mass

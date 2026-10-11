@@ -219,6 +219,11 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
             _require(not declared, "CAD authority cannot carry replacement masses")
             unverified: list[str] = []
             for name, record in masses.items():
+                if record.get("mode") == "effective_instance":
+                    # An effective-instance reading (surface-only fallback or a native
+                    # override) carries no physical material claim; it is gated by
+                    # physics.effective_instances instead.
+                    continue
                 assignment = record["reference"]["material_assignment"]
                 _require(isinstance(assignment, dict), name + ": material assignment is not an object")
                 if "unverified_reason" in assignment:
@@ -352,6 +357,229 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
         }
 
     gate("physics.material_provenance", material_provenance)
+
+    def effective_instances():
+        path = root / "raw/effective_instances.json"
+        if source.get("material_source") != "cad":
+            return {"recorded": path.is_file(), "effective": []}
+        _require(path.is_file(), "Effective instance record is missing from the CAD capture")
+        record = read_data(path)
+        sealed = read_data(confined(root, "manifest.json"))
+        identity = sealed.get("identity") if isinstance(sealed, dict) else None
+        _require(
+            isinstance(identity, dict) and isinstance(identity.get("assembly"), str) and identity["assembly"],
+            "Sealed capture identity carries no assembly",
+        )
+        _require(
+            isinstance(record, dict)
+            and record.get("schema_version") == "solidworks-to-urdf.effective-instances/v1",
+            "Effective instance schema changed",
+        )
+        _require(
+            record.get("assembly") == identity["assembly"],
+            "Effective instance record belongs to another assembly",
+        )
+        _require(
+            record.get("configuration") == str(source.get("configuration") or ""),
+            "Effective instance record configuration differs from the captured input",
+        )
+        readings = record.get("readings")
+        _require(isinstance(readings, dict), "Effective instance readings must be an object")
+        warnings = record.get("warnings")
+        _require(isinstance(warnings, list), "Effective instance warnings must be a list")
+        notes = raw.get("notes") if isinstance(raw.get("notes"), dict) else {}
+        mirrored = notes.get("effective_instances") if isinstance(notes.get("effective_instances"), dict) else {}
+        _require(mirrored == readings, "Effective instance readings differ from the captured scene notes")
+        closure = read_data(confined(root, "raw/mass_closure.json"))
+        context = closure.get("component_context") if isinstance(closure, dict) else None
+        _require(isinstance(context, dict), "Effective instances need the component context")
+        instances = {str(row["name"]): row for row in context.get("instances") or [] if isinstance(row, dict)}
+        leaf_rows = {
+            name: row
+            for name, row in masses.items()
+            if isinstance(row, dict) and row.get("mode") == "effective_instance"
+        }
+        overridden = {name for name, row in instances.items() if any((row.get("overrides") or {}).values())}
+        expected = set(leaf_rows) | overridden
+        for name in sorted(overridden):
+            row = instances[name]
+            _require(
+                isinstance(row.get("effective"), dict) and not row.get("effective_error"),
+                name + ": native overrides carry no usable effective measurement",
+            )
+            _require(
+                row["effective"] == readings.get(name),
+                name + ": component context effective reading differs from the sealed record",
+            )
+        flag_keys = {"OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia"}
+        qualification = (
+            "cad_authored_effective_instance; not geometry-derived, not independently physically qualified"
+        )
+        capture_document = raw.get("document")
+        _require(isinstance(capture_document, str) and capture_document, "Captured scene names no document")
+        expected_pairs = sorted(
+            [(name, oracle.EFFECTIVE_CODE_SHEET_ONLY) for name in leaf_rows]
+            + [(name, oracle.EFFECTIVE_CODE_INSTANCE) for name in overridden]
+        )
+        core_reference_fields = (
+            "scope",
+            "axes",
+            "used_api",
+            "selection_api",
+            "override_api",
+            "effective_instance",
+            "measurement_basis",
+            "selected_components",
+            "assembly_document",
+            "assembly_configuration",
+            "part_document",
+            "configuration",
+            "overrides",
+        )
+        entries: dict[tuple[str, str], dict] = {}
+        for entry in warnings:
+            _require(isinstance(entry, dict), "Effective instance warning is malformed")
+            name = entry.get("component")
+            code = entry.get("code")
+            _require(
+                isinstance(name, str) and name and isinstance(code, str),
+                "Effective instance warning names an unknown occurrence",
+            )
+            _require((name, code) not in entries, "Effective instance warning is repeated")
+            _require(
+                code in (oracle.EFFECTIVE_CODE_SHEET_ONLY, oracle.EFFECTIVE_CODE_INSTANCE),
+                name + ": effective warning carries another code",
+            )
+            _require(entry.get("blocking") is False, name + ": effective warning must be explicitly non-blocking")
+            _require(entry.get("qualification") == qualification, name + ": effective qualification statement changed")
+            reading = readings.get(name)
+            _require(isinstance(reading, dict), name + ": effective warning has no sealed reading")
+            reference = reading.get("reference")
+            _require(isinstance(reference, dict), name + ": effective reading has no reference block")
+            flags = reference.get("overrides")
+            _require(
+                isinstance(flags, dict)
+                and set(flags) == flag_keys
+                and all(isinstance(value, bool) for value in flags.values()),
+                name + ": effective override flags are malformed",
+            )
+            _require(any(flags.values()), name + ": effective reading without an active override")
+            _require(
+                flags == (instances.get(name) or {}).get("overrides"),
+                name + ": effective flags differ from the native context",
+            )
+            _require(entry.get("overrides") == flags, name + ": warning flags differ from the sealed reading")
+            _require(
+                reference.get("effective_instance") is True
+                and reference.get("measurement_basis") == "cad_authored_effective_instance",
+                name + ": effective basis marker changed",
+            )
+            _require(
+                reference.get("selected_components") == [name]
+                and entry.get("selected_components") == reference.get("selected_components"),
+                name + ": effective selection must be exactly this occurrence",
+            )
+            _require(
+                reference.get("assembly_document") == capture_document
+                and entry.get("assembly_document") == reference.get("assembly_document"),
+                name + ": effective assembly document differs from the captured copy",
+            )
+            _require(
+                reference.get("assembly_configuration") == str(source.get("configuration") or "")
+                and entry.get("assembly_configuration") == reference.get("assembly_configuration"),
+                name + ": effective assembly configuration differs",
+            )
+            measurement = entry.get("measurement")
+            _require(isinstance(measurement, dict), name + ": warning measurement block is missing")
+            for field in ("scope", "axes", "used_api", "selection_api", "override_api"):
+                _require(
+                    measurement.get(field) == reference.get(field),
+                    name + ": warning measurement " + field + " differs from the sealed reading",
+                )
+            _require(
+                (measurement.get("mass_kg"), measurement.get("center_of_mass_m"), measurement.get("inertia_kg_m2"))
+                == (reading.get("mass"), reading.get("com"), reading.get("inertia")),
+                name + ": warning measured values differ from the sealed reading",
+            )
+            _require(
+                (measurement.get("volume_m3"), measurement.get("density_kg_m3"))
+                == (reference.get("volume_m3"), reference.get("density_kg_m3")),
+                name + ": warning volume/density differ from the sealed reading",
+            )
+            if code == oracle.EFFECTIVE_CODE_INSTANCE:
+                _require(name in overridden, name + ": override warning without an active override")
+                _require(
+                    entry.get("role") == reading.get("role")
+                    and entry.get("document_type") == reading.get("document_type"),
+                    name + ": override warning role differs from the sealed reading",
+                )
+                _require(
+                    entry.get("configuration") == reference.get("configuration")
+                    and entry.get("part_document") == reference.get("part_document"),
+                    name + ": override warning part identity differs from the sealed reading",
+                )
+            else:
+                row = leaf_rows.get(name)
+                _require(isinstance(row, dict), name + ": surface warning has no captured reading row")
+                row_reference = row.get("reference")
+                _require(isinstance(row_reference, dict), name + ": effective row has no reference block")
+                for field in core_reference_fields:
+                    _require(
+                        row_reference.get(field) == reference.get(field),
+                        name + ": captured row " + field + " differs from the sealed reading",
+                    )
+                _require(
+                    reading.get("role") == "leaf" and reading.get("document_type") == "part",
+                    name + ": surface reading must be a leaf part",
+                )
+                _require(row.get("state") == "sheet_only", name + ": effective row state changed")
+                _require(
+                    (row.get("mass"), row.get("com"), row.get("inertia"))
+                    == (reading.get("mass"), reading.get("com"), reading.get("inertia")),
+                    name + ": captured row values differ from the sealed reading",
+                )
+                _require(
+                    entry.get("document") == reference.get("part_document")
+                    and entry.get("configuration") == reference.get("configuration"),
+                    name + ": surface warning part identity differs from the sealed reading",
+                )
+                _require(
+                    entry.get("part_document_read") == "unavailable",
+                    name + ": surface fallback must record the unreadable part document",
+                )
+                _require(
+                    entry.get("fallback_error_code") == row_reference.get("fallback_error_code") == "cad_empty_model",
+                    name + ": effective fallback reason changed",
+                )
+                counts = notes.get("bodies:" + name)
+                _require(
+                    isinstance(counts, dict)
+                    and entry.get("solid_bodies") == row_reference.get("solid_bodies") == counts.get("solid") == 0
+                    and entry.get("sheet_bodies") == row_reference.get("sheet_bodies") == counts.get("sheet"),
+                    name + ": effective body counts differ from the captured reading",
+                )
+                _require(
+                    measurement.get("state") == row.get("state"),
+                    name + ": warning state differs from the captured row",
+                )
+                _require(
+                    measurement.get("measurement_basis")
+                    == row_reference.get("measurement_basis")
+                    == "cad_authored_effective_instance",
+                    name + ": effective measurement basis changed",
+                )
+            entries[(name, code)] = entry
+        _require(
+            sorted(entries) == expected_pairs,
+            "Effective instance record does not cover the native overrides exactly",
+        )
+        return {
+            "recorded": True,
+            "effective": sorted({name for name, _code in entries}),
+            "warnings": list(entries.values()),
+        }
+
+    gate("physics.effective_instances", effective_instances)
     links = {row["name"]: row for row in model.get("links", [])}
     for body in source["bodies"]:
 
@@ -377,31 +605,120 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
             "Full whole-assembly physics evidence is required",
         )
         top = _reading("whole assembly", payload["top_level"], "assembly_document")
+        context = payload["component_context"]
+        _require(context["status"] == "recorded" and not context["errors"], "Incomplete component-context evidence")
+        entries = oracle.load_effective_instances(root)
+        entry_names = sorted({name for name, _code in entries})
+        overridden = {
+            str(row["name"]): row
+            for row in context["instances"]
+            if any((row.get("overrides") or {}).values())
+        }
+        _require(
+            entry_names == sorted(overridden),
+            "Effective instance record does not cover the native overrides exactly",
+        )
+        for name, row in overridden.items():
+            _require(
+                entries[(name, oracle.EFFECTIVE_CODE_INSTANCE)].get("overrides") == row["overrides"],
+                name + ": effective flags differ from the native context",
+            )
         body = {"id": "assembly", "components": [row["name"] for row in raw["components"]]}
         rebuilt = oracle._raw_world(body, raw, masses, {})
         expected = (rebuilt["mass"], rebuilt["com"], rebuilt["inertia"])
-        _compare(top, expected, "Whole assembly / independent part sum")
+        _compare(top, expected, "Whole assembly / effective instance sum")
         leaf = payload["leaf_total"]
-        _compare(
-            (float(leaf["mass"]), np.asarray(leaf["com"]), np.asarray(leaf["inertia"])),
-            expected,
-            "Captured leaf closure",
-        )
-        context = payload["component_context"]
-        _require(context["status"] == "recorded" and not context["errors"], "Incomplete component-context evidence")
+        if oracle.effective_math_map(masses, raw):
+            recorded = payload.get("effective_total")
+            _require(isinstance(recorded, dict), "Effective total is missing")
+            _compare(
+                (float(recorded["mass"]), np.asarray(recorded["com"]), np.asarray(recorded["inertia"])),
+                expected,
+                "Captured effective closure",
+            )
+            plain = oracle._raw_world(body, raw, masses, {}, use_effective=False)
+            _compare(
+                (float(leaf["mass"]), np.asarray(leaf["com"]), np.asarray(leaf["inertia"])),
+                (plain["mass"], plain["com"], plain["inertia"]),
+                "Captured leaf closure",
+            )
+        else:
+            _compare(
+                (float(leaf["mass"]), np.asarray(leaf["com"]), np.asarray(leaf["inertia"])),
+                expected,
+                "Captured leaf closure",
+            )
         raw_masses = {name: float(row["mass"]) for name, row in masses.items()}
-        details, error = oracle._component_context_findings(payload, "cad", top[0], raw_masses)
+        details, error = oracle._component_context_findings(
+            payload, "cad", top[0], raw_masses, covered=set(entry_names)
+        )
         _require(error is None, "Component context: " + str(error))
-        # Effective native mass/COM/tensor overrides cannot qualify.
-        for row in context["instances"]:
-            _require(not any(row["overrides"].values()), "Unsupported native instance override: " + row["name"])
-        return {"assembly_mass_kg": top[0], "independent_mass_kg": expected[0], "component_context": details}
+        return {
+            "assembly_mass_kg": top[0],
+            "independent_mass_kg": expected[0],
+            "effective_instances": sorted(entries),
+            "component_context": details,
+        }
 
     gate("physics.closure", closure)
     return checks
 
 
+def _effective_reading_summary(name, record):
+    """A surface-only fallback or native override measured in the assembly context."""
+
+    reference = record["reference"]
+    _require(reference["used_api"] == "IMassProperty2.GetMomentOfInertia(0)", f"{name}: unqualified inertia API")
+    _require(
+        reference.get("scope") == "assembly_component_group",
+        f"{name}: effective instance scope must be assembly_component_group",
+    )
+    _require(reference.get("product_convention") == "solidworks_standard", f"{name}: unqualified inertia convention")
+    _require(reference.get("reference_point") == "center_of_mass", f"{name}: effective tensor must be about COM")
+    _require(reference.get("use_system_units") is True, f"{name}: native SI units are required")
+    _require(bool(reference.get("selection_api")), f"{name}: effective selection API is unrecorded")
+    _require(bool(reference.get("override_api")), f"{name}: effective override API is unrecorded")
+    _require(
+        reference.get("measurement_basis") == "cad_authored_effective_instance",
+        f"{name}: effective measurement basis changed",
+    )
+    _require(record.get("mode") == "effective_instance", f"{name}: effective mode changed")
+    _require(record.get("state") == "sheet_only", f"{name}: effective state changed")
+    _require(
+        reference.get("selected_components") == [name],
+        f"{name}: effective instance must select exactly this occurrence",
+    )
+    flags = reference.get("overrides")
+    flag_keys = {"OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia"}
+    _require(
+        isinstance(flags, dict)
+        and set(flags) == flag_keys
+        and all(isinstance(value, bool) for value in flags.values()),
+        f"{name}: missing override evidence",
+    )
+    _require(any(flags.values()), f"{name}: authored effective basis without an active override")
+    mass = oracle._finite_positive(record["mass"], name + " mass")
+    com = oracle._finite_vector(record["com"], name + " COM")
+    tensor = oracle._raw_tensor(name, record)
+    _require(np.isfinite(tensor).all(), f"{name}: nonfinite tensor")
+    eigenvalues = np.linalg.eigvalsh(tensor)
+    _require(
+        eigenvalues[0] > 0 and eigenvalues[-1] <= sum(eigenvalues[:2]) + 1e-10 * eigenvalues[-1],
+        f"{name}: nonphysical tensor",
+    )
+    return {
+        "mass_kg": mass,
+        "com_m": com.tolist(),
+        "inertia_kg_m2": oracle._tensor6(tensor),
+        "api": reference["used_api"],
+        "scope": reference["scope"],
+        "measurement_basis": reference["measurement_basis"],
+    }
+
+
 def _reading_summary(name, record):
+    if isinstance(record, dict) and record.get("mode") == "effective_instance":
+        return _effective_reading_summary(name, record)
     mass, com, tensor = _reading(name, record, "part_document")
     return {
         "mass_kg": mass,
