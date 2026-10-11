@@ -120,11 +120,13 @@ control record) is a publication-readiness requirement: when it is absent,
 measurement and inspection continue, the raw record keeps the absence, and no
 value and no neutral technical name is promoted to authored identity.
 
-Native reading is limited to the staged selected tree. A closed document's
-stored references must map to files inside that tree; a missing, outside or
-temporarily materialized reference refuses the run before any geometry is
-opened. This is a pipeline read-admission rule, not an operating-system
-sandbox.
+The whole uploaded native folder is staged provisionally, then the native
+engine itself resolves the main assembly's references; the pipeline seals the
+dependency closure only when every engine-reported binding lies inside the
+staged root and matches the uploaded index. A missing, outside or temporarily
+materialized reference fails the run after resolution, before capture. This is
+a closure-admission rule over reported bindings, not an operating-system
+sandbox and not a pre-geometry read gate.
 
 Both hosts use the same tool source release and record their own runtime
 requirements. Windows checks SolidWorks and COM readiness. Linux checks MuJoCo

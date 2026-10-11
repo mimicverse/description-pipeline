@@ -1,12 +1,9 @@
-"""Endpoint contract: staged selection rounds seal before any native discovery.
+"""Endpoint contract: the full indexed folder stages once and the native closure seals once.
 
-Written against the integration contract (``Jobs`` with ``selection_reader_factory``
-and ``native_reader`` plus the ``/v1/jobs/<id>/(files|seal)`` routes).  The
-selection worker itself belongs to root's endpoint wiring, so the loop-driven
-tests fail (fast, with the actual error) until that wiring lands; the
-synchronous refusal and restart tests do not depend on it.
-
-No CAD, no Windows and no network beyond an ephemeral loopback server.
+Written against the locked staging workflow (``Jobs`` with ``selection_reader_factory``
+returning closure evidence and the single ``POST /v1/jobs/<id>/files`` route).  The
+staging worker resolves and seals the closure server-side; only then may native
+discovery run.  No CAD, no Windows and no network beyond an ephemeral loopback server.
 """
 
 from __future__ import annotations
@@ -26,44 +23,38 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from description_pipeline.io import digest, write_json
+from description_pipeline.io import digest, file_digest, write_json
 from description_pipeline.orchestration.windows import Jobs, RequestError, handler, read_config
-from description_pipeline.sources.solidworks.selection import SelectionError, seal_selection
+from description_pipeline.sources.solidworks.selection import SelectionError
+from tests.sources.selection_support import closure_evidence
 
 MAIN = "assembly.SLDASM"
 FRAME = "parts/frame.SLDASM"
 LINK = "parts/link.SLDPRT"
 TOOL_SHA = "f" * 64
-SENTINEL = "native discovery must not run during selection"
+SENTINEL = "native discovery must not run before the closure seals"
 
 
 class SentinelNativeReader:
-    """Selection-only tests: reaching discovery is a contract violation sentinel.
-
-    The stated contract is ``read_native_record(stage, settings, on_activity=...)``;
-    the endpoint snapshot under test currently calls ``native_reader(frozen,
-    settings, on_activity=...)``, so this fake supports both shapes until the
-    integration settles (reported as an API mismatch).
-    """
+    """Selection-only tests: successful discovery after the seal is a contract sentinel."""
 
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
-    def read_native_record(self, stage, settings, on_activity=None):
-        self.calls.append({"stage": str(stage), "settings": settings})
+    def __call__(self, frozen, settings, on_activity=None):
+        self.calls.append({"frozen": str(frozen), "settings": settings})
         raise RuntimeError(SENTINEL)
 
-    def __call__(self, stage, settings, on_activity=None):
-        return self.read_native_record(stage, settings, on_activity=on_activity)
 
+class StagingReader:
+    """Same-thread staging reader returning the shared closure evidence."""
 
-class FakeSelectionReader:
-    """Same-thread closed-query reader: exactly the pending names, nothing else."""
-
-    def __init__(self, documents: dict[str, list[str]], log: list, refuse: bool = False):
-        self.documents = documents
+    def __init__(self, edges, log, *, refuse=False, transform=None, wait=None):
+        self.edges = edges
         self.log = log
         self.refuse = refuse
+        self.transform = transform
+        self.wait = wait
 
     def __enter__(self):
         self.log.append(("enter", threading.get_ident()))
@@ -73,25 +64,39 @@ class FakeSelectionReader:
         self.log.append(("exit", threading.get_ident()))
         return False
 
-    def observe(self, stage, pending, upload_files):
-        self.log.append(("observe", threading.get_ident(), Path(stage).name, tuple(sorted(pending))))
-        if self.refuse:
-            raise SelectionError(
-                "selection_dependencies_refused",
-                "Stored references cannot be admitted into the staged selection",
-                problems=[
-                    {
-                        "document": MAIN,
-                        "name": "link",
-                        "location": "C:\\elsewhere\\link.SLDPRT",
-                        "problem": "outside_stage",
-                    }
-                ],
-                count=1,
+    def observe(self, stage, main_assembly, upload_files):
+        # The native reader owns its session inside one observe call.
+        self.log.append(("enter", threading.get_ident()))
+        try:
+            self.log.append(("observe", threading.get_ident(), str(stage), main_assembly))
+            if self.wait is not None:
+                self.wait.wait(10)
+            if self.refuse:
+                raise SelectionError(
+                    "selection_dependencies_refused",
+                    "Stored references cannot be admitted into the staged closure",
+                    problems=[
+                        {
+                            "document": MAIN,
+                            "name": "link",
+                            "location": "C:\\elsewhere\\link.SLDPRT",
+                            "problem": "outside_stage",
+                        }
+                    ],
+                    count=1,
+                )
+            evidence = closure_evidence(
+                upload_files,
+                main_assembly,
+                reader_sha256=TOOL_SHA,
+                stage_root=str(stage),
+                edges=self.edges,
             )
-        return {
-            name: {"sha256": upload_files[name], "references": sorted(self.documents.get(name, []))} for name in pending
-        }
+            if self.transform is not None:
+                evidence = self.transform(evidence)
+            return evidence
+        finally:
+            self.log.append(("exit", threading.get_ident()))
 
 
 class SelectionEndpointTests(unittest.TestCase):
@@ -138,14 +143,16 @@ class SelectionEndpointTests(unittest.TestCase):
         self.documents = {MAIN: [FRAME], FRAME: [LINK], LINK: []}
         self.upload_files = {name: hashlib.sha256(value).hexdigest() for name, value in self.data.items()}
         self.upload_sha = digest(self.upload_files)
-        self.selected_files = {name: self.upload_files[name] for name in self.documents}
         self.reader_log: list = []
         self.sentinel = SentinelNativeReader()
         self.runner_calls: list = []
         self.refusing = False
+        self.transform = None
+        self.reader_wait = None
+        self._current_jobs: Jobs | None = None
         self.jobs = self.new_jobs()
 
-    def new_jobs(self) -> Jobs:
+    def new_jobs(self, *, native_reader=None) -> Jobs:
         previous = getattr(self, "_current_jobs", None)
         if previous is not None:
             previous.close()
@@ -157,8 +164,14 @@ class SelectionEndpointTests(unittest.TestCase):
         jobs = Jobs(
             self.config,
             runner=runner,
-            selection_reader_factory=lambda: FakeSelectionReader(self.documents, self.reader_log, refuse=self.refusing),
-            native_reader=self.sentinel,
+            selection_reader_factory=lambda: StagingReader(
+                self.documents,
+                self.reader_log,
+                refuse=self.refusing,
+                transform=self.transform,
+                wait=self.reader_wait,
+            ),
+            native_reader=native_reader or self.sentinel,
         )
         self.addCleanup(jobs.close)
         self._current_jobs = jobs
@@ -181,38 +194,28 @@ class SelectionEndpointTests(unittest.TestCase):
         self.assertEqual(snapshot["run_id"], identifier)
         return identifier
 
-    def archive(self, names) -> Path:
-        path = self.root / f"batch-{uuid.uuid4().hex}.zip"
+    def archive(self, names=None) -> Path:
+        path = self.root / f"upload-{uuid.uuid4().hex}.zip"
         with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as output:
-            for name in names:
+            for name in names if names is not None else sorted(self.data):
                 output.writestr(name, self.data[name])
         return path
 
-    def start_round(self, jobs: Jobs, identifier: str) -> str:
-        snapshot = self.wait_state(jobs, identifier, {"awaiting_files"})
-        round_id = snapshot["selection"]["round_id"]
-        requested = snapshot["selection"]["requested_files"]
-        jobs.submit_files(identifier, self.archive(requested), round_id)
-        return round_id
+    def stage(self, jobs: Jobs, identifier: str) -> dict:
+        jobs.submit_files(identifier, self.archive())
+        return self.await_failed_or_running(jobs, identifier)
 
-    def wait_state(self, jobs: Jobs, identifier: str, states, *, round_id: str | None = None, timeout: float = 8.0):
+    def await_failed_or_running(self, jobs: Jobs, identifier: str, *, timeout: float = 8.0) -> dict:
         deadline = time.monotonic() + timeout
         while True:
             snapshot = jobs.snapshot(identifier)
-            if snapshot["status"] == "failed":
-                raise AssertionError(
-                    "native job failed during selection: "
-                    f"{snapshot.get('error')!r} (error_code={snapshot.get('error_code')!r})"
-                )
-            selection = snapshot.get("selection") or {}
-            if selection.get("state") in states and (round_id is None or selection.get("round_id") != round_id):
+            if snapshot["status"] in {"failed", "native_complete", "passed"}:
+                return snapshot
+            if snapshot["status"] == "running" and self.reader_wait is None:
                 return snapshot
             if time.monotonic() >= deadline:
-                raise AssertionError(f"timed out waiting for {sorted(states)}; last state {selection.get('state')!r}")
+                return snapshot
             time.sleep(0.02)
-
-    def finish_round(self, jobs: Jobs, identifier: str, previous_round: str) -> dict:
-        return self.wait_state(jobs, identifier, {"awaiting_files", "ready"}, round_id=previous_round)
 
     def wait_failed(self, jobs: Jobs, identifier: str, timeout: float = 8.0) -> dict:
         deadline = time.monotonic() + timeout
@@ -224,67 +227,87 @@ class SelectionEndpointTests(unittest.TestCase):
                 raise AssertionError(f"timed out waiting for the refusal; last status {snapshot['status']!r}")
             time.sleep(0.02)
 
-    def complete_selection(self, jobs: Jobs, identifier: str) -> dict:
-        for _ in range(4):
-            previous = self.start_round(jobs, identifier)
-            snapshot = self.finish_round(jobs, identifier, previous)
-            if snapshot["selection"]["state"] == "ready":
-                return snapshot
-        raise AssertionError("the selection did not reach ready")
+    def await_report(self, jobs: Jobs, identifier: str, snapshot: dict, *, timeout: float = 5.0) -> dict:
+        """The failure stamp may land just after the failed status; poll for the receipt."""
 
-    def manifest(self, jobs: Jobs, identifier: str) -> dict:
-        observations = jobs.snapshot(identifier)["selection"]["observations"]
-        return seal_selection(
-            self.upload_files, MAIN, observations, selected_files=self.selected_files, reader_sha256=TOOL_SHA
-        )
+        deadline = time.monotonic() + timeout
+        while snapshot.get("structural_report") is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+            snapshot = jobs.snapshot(identifier)
+        self.assertIsNotNone(snapshot.get("structural_report"))
+        return snapshot
 
     def observe_events(self) -> list:
         return [entry for entry in self.reader_log if entry[0] == "observe"]
 
+    def observed_stage_root(self) -> str:
+        return str(self.observe_events()[-1][2])
+
+    def expected_manifest(self) -> dict:
+        from tests.sources.selection_support import sealed_selection
+
+        evidence = closure_evidence(
+            self.upload_files,
+            MAIN,
+            reader_sha256=TOOL_SHA,
+            stage_root=self.observed_stage_root(),
+            edges=self.documents,
+        )
+        if self.transform is not None:
+            evidence = self.transform(evidence)
+        return sealed_selection(
+            self.upload_files,
+            MAIN,
+            reader_sha256=TOOL_SHA,
+            stage_root=self.observed_stage_root(),
+            edges=self.documents,
+        )
+
     # -- synchronous contract -------------------------------------------------
 
-    def test_initial_stage_requests_only_the_main_assembly(self) -> None:
+    def test_initial_stage_awaits_one_full_folder_upload(self) -> None:
         identifier = self.create()
         snapshot = self.jobs.snapshot(identifier)
         self.assertEqual(snapshot["status"], "selecting")
+        self.assertEqual(
+            set(snapshot["selection"]),
+            {"state", "reader_sha256", "upload_sha256", "staged_files"},
+        )
         self.assertEqual(snapshot["selection"]["state"], "awaiting_files")
-        self.assertEqual(snapshot["selection"]["requested_files"], {MAIN: self.upload_files[MAIN]})
-        self.assertRegex(snapshot["selection"]["round_id"], r"^[0-9a-f]{64}$")
-        self.assertNotIn("manifest", snapshot["selection"])
+        self.assertEqual(snapshot["selection"]["staged_files"], {})
+        self.assertEqual(snapshot["selection"]["upload_sha256"], self.upload_sha)
+        self.assertEqual(snapshot["selection"]["reader_sha256"], TOOL_SHA)
         # No native work runs before any staged bytes arrive.
         self.assertEqual(self.observe_events(), [])
         self.assertEqual(self.sentinel.calls, [])
         self.assertEqual(self.jobs.queue.qsize(), 0)
 
-    def test_partial_extra_and_wrong_hash_batches_are_refused(self) -> None:
+    def test_incomplete_extra_invalid_and_changed_batches_are_refused(self) -> None:
         identifier = self.create()
-        round_id = self.jobs.snapshot(identifier)["selection"]["round_id"]
 
         extra = self.root / "extra-member.zip"
         with zipfile.ZipFile(extra, "w", zipfile.ZIP_DEFLATED) as output:
-            output.writestr(MAIN, self.data[MAIN])
+            for name in sorted(self.data):
+                output.writestr(name, self.data[name])
             output.writestr("decoy.SLDPRT", b"unrelated native document")
-        partial = self.archive([FRAME])  # missing the requested main assembly
+        partial = self.archive([FRAME])  # missing the assembly
         invalid = self.root / "not-a-zip.zip"
         invalid.write_bytes(b"not a zip archive")
         wrong = self.root / "wrong-hash.zip"
         with zipfile.ZipFile(wrong, "w") as output:
-            output.writestr(MAIN, b"different bytes")
+            for name in sorted(self.data):
+                output.writestr(name, b"different bytes" if name == MAIN else self.data[name])
         cases = {
             "selection_batch_inventory": [extra, partial],
             "selection_batch_invalid": [invalid],
             "selection_source_changed": [wrong],
         }
-
         for expected_code, archives in cases.items():
             for archive in archives:
                 with self.subTest(code=expected_code, archive=archive.name):
                     with self.assertRaises(SelectionError) as caught:
-                        self.jobs.submit_files(identifier, archive, round_id)
+                        self.jobs.submit_files(identifier, archive)
                     self.assertEqual(caught.exception.code, expected_code)
-        with self.assertRaises(SelectionError) as caught:
-            self.jobs.submit_files(identifier, self.archive([MAIN]), None)
-        self.assertEqual(caught.exception.code, "selection_round_stale")
 
         snapshot = self.jobs.snapshot(identifier)
         self.assertEqual(snapshot["selection"]["state"], "awaiting_files")
@@ -302,108 +325,118 @@ class SelectionEndpointTests(unittest.TestCase):
         self.assertEqual(self.observe_events(), [])
         self.assertEqual(self.sentinel.calls, [])
         with self.assertRaises(RequestError) as caught:
-            restarted.submit_files(identifier, self.archive([MAIN]), snapshot["selection"]["round_id"])
+            restarted.submit_files(identifier, self.archive())
         self.assertEqual(caught.exception.status, 409)
 
-    # -- loop-driven contract (fails until the selection worker is wired) -----
+    # -- stage once, seal once, then discovery --------------------------------
 
-    def test_happy_path_seals_and_never_runs_discovery_before_seal(self) -> None:
+    def test_staging_seals_the_closure_once_and_only_then_runs_discovery(self) -> None:
         identifier = self.create()
-        ready = self.complete_selection(self.jobs, identifier)
-        self.assertEqual(ready["selection"]["state"], "ready")
-        self.assertEqual(self.sentinel.calls, [])
-        self.assertGreaterEqual(len(self.observe_events()), 2)
-        sealed = self.jobs.seal_selection(identifier, {"selection": self.manifest(self.jobs, identifier)})
-        self.assertEqual(sealed["selection"]["state"], "sealed")
-        self.assertIn("manifest", sealed["selection"])
-        self.assertIn(sealed["status"], {"running", "failed"})
-        # Only after the seal may the native reader be reached; the sentinel
-        # then proves discovery was the next step, not geometry-free selection.
-        failed = self.wait_failed(self.jobs, identifier)
-        self.assertTrue(self.sentinel.calls, f"the sealed job never reached the native reader: {failed['error']!r}")
-        self.assertIn(SENTINEL, failed["error"])
+        self.jobs.submit_files(identifier, self.archive())
+        snapshot = self.wait_failed(self.jobs, identifier)
+        snapshot = self.await_report(self.jobs, identifier, snapshot)
+        self.assertEqual(len(self.observe_events()), 1)  # one staging observation, no rounds
+        self.assertEqual(self.sentinel.calls and True, True)
+        self.assertIn(SENTINEL, snapshot["error"])
         self.assertEqual(self.runner_calls, [])
+        self.assertEqual(snapshot["selection"]["state"], "sealed")
+        self.assertEqual(snapshot["selection"]["staged_files"], self.upload_files)
+        self.assertEqual(snapshot["selection"]["manifest"], self.expected_manifest())
+        receipt = snapshot.get("structural_report") or {}
+        self.assertEqual(set(receipt), {"markdown", "json"})
+        self.assertEqual(receipt["markdown"]["path"], "reports/structural-team.md")
+        self.assertEqual(receipt["json"]["path"], "reports/structural-team.json")
+        for kind in ("markdown", "json"):
+            report = self.root / "state" / "structural_reports" / identifier / receipt[kind]["path"]
+            self.assertTrue(report.is_file())
+            self.assertEqual(file_digest(report), receipt[kind]["sha256"])
 
-    def test_identical_batch_retry_does_not_requery(self) -> None:
+    def test_identical_staging_retry_does_not_requery(self) -> None:
+        self.reader_wait = threading.Event()
         identifier = self.create()
-        previous = self.start_round(self.jobs, identifier)
-        archive = self.archive([MAIN])
-        self.finish_round(self.jobs, identifier, previous)
+        archive = self.archive()
+        self.jobs.submit_files(identifier, archive)
+        deadline = time.monotonic() + 8
+        while not self.observe_events() and time.monotonic() < deadline:
+            time.sleep(0.02)
         observed = len(self.observe_events())
-        self.jobs.submit_files(identifier, archive, previous)
-        time.sleep(0.3)
+        self.assertEqual(observed, 1)
+        retry = self.jobs.submit_files(identifier, archive)
+        self.assertEqual(retry["selection"]["staged_files"], self.upload_files)
+        self.assertIn(retry["selection"]["state"], {"reading", "sealed"})
         self.assertEqual(len(self.observe_events()), observed)
-        ready = self.complete_selection(self.jobs, identifier)
-        self.assertEqual(ready["selection"]["state"], "ready")
+        self.reader_wait.set()
+        self.wait_failed(self.jobs, identifier)
 
-    def test_staged_missing_extra_and_drift_refuse_sealing(self) -> None:
-        for mutation in ("missing", "extra", "drift"):
-            with self.subTest(mutation=mutation):
-                self.reader_log.clear()
-                jobs = self.new_jobs()
-                identifier = self.create(jobs)
-                self.complete_selection(jobs, identifier)
-                stage = jobs.selections[identifier].stage
-                if mutation == "missing":
-                    (stage / LINK).unlink()
-                elif mutation == "extra":
-                    (stage / "extra.SLDASM").write_bytes(b"unrelated")
-                else:
-                    (stage / LINK).write_bytes(b"drifted bytes")
-                with self.assertRaises(SelectionError) as caught:
-                    jobs.seal_selection(identifier, {"selection": self.manifest(jobs, identifier)})
-                self.assertEqual(caught.exception.code, "selection_inventory_changed")
-
-    def test_false_graph_seal_is_rejected(self) -> None:
-        forgeries = (
-            ("empty_observations", "selection_incomplete"),
-            ("dropped_file", "selection_manifest_changed"),
-        )
-        for forge, expected in forgeries:
-            with self.subTest(forge=forge):
-                self.reader_log.clear()
-                jobs = self.new_jobs()
-                identifier = self.create(jobs)
-                self.complete_selection(jobs, identifier)
-                manifest = copy.deepcopy(self.manifest(jobs, identifier))
-                if forge == "empty_observations":
-                    manifest["observations"] = {}
-                else:
-                    manifest["files"] = {name: sha for name, sha in manifest["files"].items() if name != LINK}
-                with self.assertRaises(SelectionError) as caught:
-                    jobs.seal_selection(identifier, {"selection": manifest})
-                self.assertEqual(caught.exception.code, expected)
-
-    def test_structured_reader_refusal_is_retained(self) -> None:
+    def test_reader_refusal_fails_the_run_with_the_report_digest(self) -> None:
         self.refusing = True
         jobs = self.new_jobs()
         identifier = self.create(jobs)
-        self.start_round(jobs, identifier)
+        jobs.submit_files(identifier, self.archive())
         snapshot = self.wait_failed(jobs, identifier)
+        snapshot = self.await_report(jobs, identifier, snapshot)
         self.assertEqual(snapshot.get("error_code"), "selection_dependencies_refused")
         self.assertEqual(snapshot["detail"]["problems"][0]["location"], "C:\\elsewhere\\link.SLDPRT")
         self.assertEqual(snapshot["detail"]["problems"][0]["problem"], "outside_stage")
         self.assertEqual(snapshot["selection"]["state"], "reading")
         self.assertEqual(self.sentinel.calls, [])
-        self.assertEqual(self.runner_calls, [])
+        receipt = snapshot.get("structural_report") or {}
+        self.assertEqual(set(receipt), {"markdown", "json"})
+        markdown = self.root / "state" / "structural_reports" / identifier / receipt["markdown"]["path"]
+        self.assertEqual(file_digest(markdown), receipt["markdown"]["sha256"])
+
+    def test_closure_evidence_forgeries_are_refused(self) -> None:
+        def drop_stage_root(evidence):
+            evidence = copy.deepcopy(evidence)
+            evidence.pop("stage_root", None)
+            return evidence
+
+        def outside_reference(evidence):
+            evidence = copy.deepcopy(evidence)
+            evidence["graph"][MAIN]["references"] = [*evidence["graph"][MAIN]["references"], "outside.SLDASM"]
+            evidence["graph"]["outside.SLDPRT"] = {"sha256": "0" * 64, "references": []}
+            return evidence
+
+        def wrong_hash(evidence):
+            evidence = copy.deepcopy(evidence)
+            evidence["graph"][FRAME]["sha256"] = "0" * 64
+            return evidence
+
+        for forge, transform in (
+            ("missing_stage_root", drop_stage_root),
+            ("outside_reference", outside_reference),
+            ("wrong_hash", wrong_hash),
+        ):
+            with self.subTest(forge=forge):
+                self.reader_log.clear()
+                self.transform = transform
+                jobs = self.new_jobs()
+                try:
+                    identifier = self.create(jobs)
+                    jobs.submit_files(identifier, self.archive())
+                    snapshot = self.wait_failed(jobs, identifier)
+                    self.assertEqual(snapshot.get("error_code"), "selection_closure_invalid")
+                    self.assertEqual(self.sentinel.calls, [])
+                    self.assertEqual(self.runner_calls, [])
+                finally:
+                    jobs.close()
+                    self.transform = None
+                    self._current_jobs = None
 
     def test_two_jobs_serialize_native_contexts(self) -> None:
-        jobs = self.new_jobs()
+        self.reader_wait = threading.Event()
+        jobs = self.new_jobs(native_reader=lambda frozen, settings, on_activity=None: copy.deepcopy(self.records_ok()))
         first = self.create(jobs, run_id=str(uuid.uuid4()))
         second = self.create(jobs, run_id=str(uuid.uuid4()))
-        self.start_round(jobs, first)
-        second_round = jobs.snapshot(second)["selection"]["round_id"]
-        self.start_round(jobs, second)
-        # The single native worker may only observe the second job after the
-        # first job's context closed, which happens once its selection seals.
-        ready = self.complete_selection(jobs, first)
-        self.assertEqual(ready["selection"]["state"], "ready")
+        jobs.submit_files(first, self.archive())
+        deadline = time.monotonic() + 8
+        while not self.observe_events() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        jobs.submit_files(second, self.archive())
+        time.sleep(0.2)
         observed = [entry[2] for entry in self.observe_events()]
         self.assertTrue(observed)
-        self.assertEqual(set(observed), {first})
-        jobs.seal_selection(first, {"selection": self.manifest(jobs, first)})
-        self.wait_state(jobs, second, {"awaiting_files", "ready"}, round_id=second_round)
-        self.assertTrue(any(entry[2] == second for entry in self.observe_events()), "the second job was never observed")
+        self.assertEqual({entry[2] for entry in self.observe_events()}, {observed[0]})
         depth = 0
         for entry in self.reader_log:
             if entry[0] == "enter":
@@ -412,6 +445,16 @@ class SelectionEndpointTests(unittest.TestCase):
                 depth -= 1
             self.assertGreaterEqual(depth, 0)
             self.assertLessEqual(depth, 1, "native reader contexts overlapped across jobs")
+        self.reader_wait.set()
+        deadline = time.monotonic() + 8
+        while len(self.observe_events()) < 2 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(len({entry[2] for entry in self.observe_events()}), 2)
+
+    def records_ok(self) -> dict:
+        from tests.sources.test_solidworks_discovery import record as native_record
+
+        return native_record()
 
     # -- loopback HTTP adapter -------------------------------------------------
 
@@ -425,7 +468,7 @@ class SelectionEndpointTests(unittest.TestCase):
         except HTTPError as error:
             return error.code, json.loads(error.read().decode("utf-8"))
 
-    def test_http_routes_and_selection_round_header(self) -> None:
+    def test_http_routes_stage_the_full_folder_once(self) -> None:
         token = self.jobs.config["token"]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler(self.jobs, token))
         self.addCleanup(server.server_close)
@@ -444,37 +487,40 @@ class SelectionEndpointTests(unittest.TestCase):
         self.assertEqual(status, 401)
 
         identifier = str(uuid.uuid4())
-        created_body = json.dumps(self.request(identifier)).encode()
-        status, body = self.http_call(base, "POST", "/v1/jobs", created_body, json_headers)
+        status, body = self.http_call(
+            base, "POST", "/v1/jobs", json.dumps(self.request(identifier)).encode(), json_headers
+        )
         self.assertEqual(status, 202)
-        self.assertEqual(body["selection"]["requested_files"], {MAIN: self.upload_files[MAIN]})
-
-        status, body = self.http_call(base, "GET", f"/v1/jobs/{identifier}", headers=auth)
-        self.assertEqual(status, 200)
-        self.assertEqual(body["run_id"], identifier)
+        self.assertEqual(body["selection"]["state"], "awaiting_files")
+        self.assertEqual(body["selection"]["staged_files"], {})
 
         status, _body = self.http_call(
             base, "POST", f"/v1/jobs/{identifier}/files", b"xxxx", {**auth, "Content-Type": "text/plain"}
         )
         self.assertEqual(status, 400)
 
-        archive = self.archive([MAIN]).read_bytes()
+        partial = self.archive([MAIN]).read_bytes()
+        status, body = self.http_call(
+            base, "POST", f"/v1/jobs/{identifier}/files", partial, {**auth, "Content-Type": "application/zip"}
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(body.get("error_code"), "selection_batch_inventory")
+
+        archive = self.archive().read_bytes()
         status, body = self.http_call(
             base, "POST", f"/v1/jobs/{identifier}/files", archive, {**auth, "Content-Type": "application/zip"}
         )
-        self.assertEqual(status, 400)
-        self.assertEqual(body.get("error_code"), "selection_round_stale")
+        self.assertEqual(status, 202)
+        self.assertEqual(body["selection"]["staged_files"], self.upload_files)
 
-        snapshot = self.jobs.snapshot(identifier)["selection"]["round_id"]
         status, body = self.http_call(
-            base,
-            "POST",
-            f"/v1/jobs/{identifier}/files",
-            archive,
-            {**auth, "Content-Type": "application/zip", "X-Selection-Round": snapshot},
+            base, "POST", f"/v1/jobs/{identifier}/files", archive, {**auth, "Content-Type": "application/zip"}
         )
         self.assertEqual(status, 202)
-        self.assertIn("selection", body)
+        self.assertEqual(body["selection"]["staged_files"], self.upload_files)
+
+        status, _body = self.http_call(base, "POST", f"/v1/jobs/{identifier}/seal", b"{}", json_headers)
+        self.assertEqual(status, 404)
 
 
 if __name__ == "__main__":

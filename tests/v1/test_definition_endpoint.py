@@ -6,6 +6,7 @@ derivation are controlled by this fixture, so nothing here can qualify CAD.
 
 from __future__ import annotations
 
+import copy
 import json
 import threading
 import time
@@ -27,16 +28,15 @@ from description_pipeline.orchestration.discovery_transfer import (
     derive_from_raw_bundle,
     seal_capture_request,
 )
-from description_pipeline.orchestration.selection_client import prepare_selection_batch
+from description_pipeline.orchestration.selection_client import prepare_staging_archive
 from description_pipeline.orchestration.windows import RequestError, handler
 from description_pipeline.sources.solidworks.discovery import DISCOVERY_FILE, DiscoverySettings
-from description_pipeline.sources.solidworks.selection import seal_selection
 from .endpoint_support import MAIN, TOOL, EndpointFixture, source_bytes
 
 
 class DefinitionEndpointTests(EndpointFixture, unittest.TestCase):
     def reached_definition(self, jobs, run_id: str) -> dict:
-        sealed = self.seal_selection(jobs, run_id)
+        sealed = self.stage_and_seal(jobs, run_id)
         self.assertNotEqual("failed", sealed["status"], sealed.get("error"))
         snapshot = self.wait_state_any_status(jobs, run_id, {"awaiting_definition"})
         self.assertEqual("awaiting_definition", snapshot["status"], snapshot.get("error"))
@@ -240,7 +240,7 @@ class DefinitionClientLoopbackTests(EndpointFixture, unittest.TestCase):
             EndpointConfig(base_url=f"http://127.0.0.1:{server.server_port}", token=jobs.config["token"], timeout=5.0)
         )
         run_id = str(uuid.uuid4())
-        client.start_selection_job(run_id=run_id, upload_files=self.upload_files, main_assembly=MAIN)
+        client.start_staging_job(run_id=run_id, upload_files=self.upload_files, main_assembly=MAIN)
 
         source = Path(self.enterContext(TemporaryDirectory()))
         for name, payload in source_bytes().items():
@@ -248,33 +248,16 @@ class DefinitionClientLoopbackTests(EndpointFixture, unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(payload)
 
-        for _ in range(4):
-            snapshot = client.selection_snapshot(run_id, upload_files=self.upload_files)
-            if snapshot.state == "ready":
-                break
-            self.assertEqual("awaiting_files", snapshot.state)
-            archive = self.root / f"batch-{snapshot.round_id[:8]}.zip"
-            batch = prepare_selection_batch(
-                source, archive, snapshot.requested_files, expected_upload=self.upload_files
-            )
-            self.assertEqual(set(snapshot.requested_files), set(batch["files"]))
-            client.push_selection_batch(
-                run_id=run_id,
-                round_id=snapshot.round_id,
-                archive=archive,
-                batch=batch["files"],
-                upload_files=self.upload_files,
-            )
-        snapshot = client.selection_snapshot(run_id, upload_files=self.upload_files)
-        self.assertEqual("ready", snapshot.state)
-        selected = {name: self.upload_files[name] for name in self.documents}
-        manifest = seal_selection(
-            self.upload_files, MAIN, snapshot.observations, selected_files=selected, reader_sha256=TOOL["source_sha256"]
-        )
-        client.post_selection_seal(run_id=run_id, manifest=manifest)
+        archive = self.root / f"upload-{run_id}.zip"
+        batch = prepare_staging_archive(source, archive, self.upload_files)
+        self.assertEqual(set(batch["files"]), set(self.upload_files))
+        client.stage_folder_archive(run_id, archive, upload_files=self.upload_files)
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline and client.get_job(run_id)["status"] != "awaiting_definition":
             time.sleep(0.02)
+        snapshot = client.staging_snapshot(run_id, upload_files=self.upload_files)
+        self.assertEqual("sealed", snapshot.state)
+        manifest = snapshot.manifest
         record = client.definition_snapshot(run_id, upload_files=self.upload_files)
         bundle = client.stream_native_record(run_id, record, self.root / f"{run_id}-raw-record.zip")
         prepared = derive_from_raw_bundle(
@@ -286,9 +269,10 @@ class DefinitionClientLoopbackTests(EndpointFixture, unittest.TestCase):
             expected_native_tool=TOOL,
             settings=DiscoverySettings(record_roots=[self.records_dir()], frozen_names=dict(self.frozen_names)),
         )
-        archive = self.root / f"capture-request-{run_id}.zip"
-        seal_capture_request(prepared, archive, record=self.record, selection=manifest, native_tool=TOOL)
-        client.post_definition_archive(run_id, archive, prepared_sha256=prepared.prepared_sha256)
+        request_archive = self.root / f"capture-request-{run_id}.zip"
+        sealed_record = {**copy.deepcopy(self.record), "source_selection": copy.deepcopy(manifest)}
+        seal_capture_request(prepared, request_archive, record=sealed_record, selection=manifest, native_tool=TOOL)
+        client.post_definition_archive(run_id, request_archive, prepared_sha256=prepared.prepared_sha256)
         finished = self.await_terminal(jobs, run_id)
         self.assertEqual("native_complete", finished["status"], finished.get("error"))
         self.assertEqual(MAIN, finished["main_assembly"])

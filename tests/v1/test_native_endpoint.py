@@ -24,18 +24,20 @@ class NativeEndpointTests(EndpointFixture, unittest.TestCase):
                 jobs.create({**self.request(), **mutation})
         created = jobs.create(self.request())[0]
         self.assertEqual("awaiting_files", created["selection"]["state"])
-        self.assertEqual({MAIN: self.upload_files[MAIN]}, created["selection"]["requested_files"])
+        self.assertEqual({}, created["selection"]["staged_files"])
+        self.assertEqual(self.upload_sha, created["selection"]["upload_sha256"])
         self.assertEqual([], self.reader_log)
 
-    def test_selection_rounds_observe_only_staged_bytes(self):
+    def test_staging_observes_the_full_folder_once_then_seals(self):
         jobs = self.jobs(lambda *args, **kwargs: {"passed": False, "error": "expected"})
         request = self.request()
         jobs.create(request)
-        self.seal_selection(jobs, request["run_id"])
+        sealed = self.stage_and_seal(jobs, request["run_id"])
         observed = [entry for entry in self.reader_log if entry[0] == "observe"]
-        self.assertEqual(2, len(observed))
-        self.assertEqual({MAIN}, set(observed[0][3]))
-        self.assertEqual({PART, "cad/arm.SLDPRT"}, set(observed[1][3]))
+        self.assertEqual(1, len(observed))
+        self.assertEqual(MAIN, observed[0][3])
+        self.assertEqual("sealed", sealed["selection"]["state"])
+        self.assertEqual(sealed["selection"]["manifest"], self.expected_manifest())
 
     def test_changed_staged_bytes_or_record_identity_block_capture(self):
         for mutation in ("staged", "record"):
@@ -56,7 +58,7 @@ class NativeEndpointTests(EndpointFixture, unittest.TestCase):
                 )
                 request = self.request()
                 jobs.create(request)
-                self.seal_selection(jobs, request["run_id"])
+                self.stage_and_seal(jobs, request["run_id"])
                 if mutation == "staged":
                     staged = jobs._source_dir(jobs.jobs[request["run_id"]]) / PART
                     staged.write_bytes(b"changed after sealing\n")

@@ -69,7 +69,7 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
         self.addCleanup(release.set)
         request = self.request()
         jobs.create(request)
-        self.seal_selection(jobs, request["run_id"])
+        self.stage_and_seal(jobs, request["run_id"])
         self.assertTrue(started.wait(5))
         running = jobs.snapshot(request["run_id"])
         self.assertEqual("running", running["status"])
@@ -133,6 +133,7 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
             ),
         ):
             with self.subTest(error=type(error).__name__):
+
                 def native_reader(frozen, settings, on_activity=None, error=error):
                     raise error
 
@@ -169,7 +170,7 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
         for request in requests:
             jobs.create(request)
         for request in requests:
-            self.seal_selection(jobs, request["run_id"])
+            self.stage_and_seal(jobs, request["run_id"])
             self.wait_state_any_status(jobs, request["run_id"], {"awaiting_definition"})
             self.complete_definition(jobs, request["run_id"])
         for request in requests:

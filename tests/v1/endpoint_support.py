@@ -1,6 +1,6 @@
 """Synthetic native-boundary controls; these helpers cannot qualify a CAD model.
 
-The endpoint contract is now: staged selection rounds -> sealed selection ->
+The endpoint contract is now: full-folder staging -> sealed closure ->
 raw native record -> derived definition -> native capture transfer.  These
 helpers drive the *client* side of every leg with synthetic bytes and the real
 discovery-transfer bundles, so endpoint tests never touch CAD, COM or a Windows
@@ -46,29 +46,33 @@ def source_bytes() -> dict[str, bytes]:
     return {name: f"placeholder {name}\n".encode() for name in SOURCE_FILES}
 
 
-class RefusingSelectionReader:
-    """A same-thread selection reader that can refuse with structured evidence."""
+class StagingSelectionReader:
+    """A same-thread staging reader returning the shared native closure evidence."""
 
-    def __init__(self, documents, log, refusal=None):
-        self.documents = documents
+    def __init__(self, log, *, refusal=None, evidence_kwargs=None):
         self.log = log
         self.refusal = refusal
+        self.evidence_kwargs = dict(evidence_kwargs or {})
 
-    def __enter__(self):
+    def observe(self, stage, main_assembly, upload_files):
+        from tests.sources.selection_support import closure_evidence
+
+        # The native reader owns its session inside one observe call; the
+        # enter/exit pair proves exclusive native operation to the tests.
         self.log.append(("enter", threading.get_ident()))
-        return self
-
-    def __exit__(self, *exc_info):
-        self.log.append(("exit", threading.get_ident()))
-        return False
-
-    def observe(self, stage, pending, upload_files):
-        self.log.append(("observe", threading.get_ident(), Path(stage).name, tuple(sorted(pending))))
-        if self.refusal is not None:
-            raise self.refusal
-        return {
-            name: {"sha256": upload_files[name], "references": sorted(self.documents.get(name, []))} for name in pending
-        }
+        try:
+            self.log.append(("observe", threading.get_ident(), str(stage), main_assembly))
+            if self.refusal is not None:
+                raise self.refusal
+            return closure_evidence(
+                upload_files,
+                main_assembly,
+                reader_sha256=TOOL["source_sha256"],
+                stage_root=str(stage),
+                **self.evidence_kwargs,
+            )
+        finally:
+            self.log.append(("exit", threading.get_ident()))
 
 
 class CaptureBackend:
@@ -109,6 +113,7 @@ class EndpointFixture:
         self.documents = {MAIN: [PART, ARM], PART: [], ARM: []}
         self.reader_log: list = []
         self.selection_refusal = None
+        self.evidence_kwargs = {"edges": self.documents}
         #: A nonempty approved-name registry: the discovery contract must record
         #: its digest instead of digest({}).
         self.frozen_names = {"arm": "arm_link"}
@@ -147,7 +152,9 @@ class EndpointFixture:
         backend_factory=None,
     ) -> Jobs:
         def default_reader():
-            return RefusingSelectionReader(self.documents, self.reader_log, refusal=self.selection_refusal)
+            return StagingSelectionReader(
+                self.reader_log, refusal=self.selection_refusal, evidence_kwargs=self.evidence_kwargs
+            )
 
         record = self.record
         jobs = Jobs(
@@ -165,62 +172,42 @@ class EndpointFixture:
         self.addCleanup(jobs.close)
         return jobs
 
-    def start_round(self, jobs: Jobs, run_id: str, *, timeout: float = 15.0) -> str:
-        snapshot = self.wait_state(jobs, run_id, {"awaiting_files"}, timeout=timeout)
-        if snapshot["status"] == "failed":
-            raise AssertionError(f"the native job failed during selection: {snapshot.get('error')!r}")
-        round_id = snapshot["selection"]["round_id"]
-        jobs.submit_files(run_id, self.batch_zip(snapshot["selection"]["requested_files"]), round_id)
-        return round_id
+    def stage_and_seal(self, jobs: Jobs, run_id: str, *, timeout: float = 15.0) -> dict:
+        """Stage the exact full indexed folder once and wait for the sealed closure."""
 
-    def wait_state(self, jobs: Jobs, run_id: str, states, *, round_id: str | None = None, timeout: float = 15.0):
-        deadline = time.monotonic() + timeout
-        while True:
-            snapshot = jobs.snapshot(run_id)
-            if snapshot["status"] == "failed":
-                return snapshot
-            selection = snapshot.get("selection") or {}
-            if selection.get("state") in states and (round_id is None or selection.get("round_id") != round_id):
-                return snapshot
-            if time.monotonic() >= deadline:
-                raise AssertionError(
-                    f"timed out waiting for {sorted(states)}; last state {selection.get('state')!r} "
-                    f"(status {snapshot['status']!r})"
-                )
-            time.sleep(0.01)
+        snapshot = jobs.snapshot(run_id)
+        if snapshot["status"] != "selecting":
+            raise AssertionError(f"the native job is not staging: {snapshot['status']!r}")
+        jobs.submit_files(run_id, self.batch_zip())
+        return self.wait_state_any_status(jobs, run_id, {"running"}, timeout=timeout)
 
-    def selection_manifest(self, jobs: Jobs, run_id: str):
-        from description_pipeline.sources.solidworks.selection import seal_selection
+    def observed_stage_root(self) -> str:
+        for entry in reversed(self.reader_log):
+            if entry and entry[0] == "observe":
+                return str(entry[2])
+        raise AssertionError("the staging reader never observed a stage")
 
-        observations = jobs.snapshot(run_id)["selection"]["observations"]
-        selected = {name: self.upload_files[name] for name in self.documents}
-        return seal_selection(
+    def expected_manifest(self) -> dict:
+        """The manifest the transport must seal from the reader's closure evidence."""
+
+        from tests.sources.selection_support import sealed_selection
+
+        return sealed_selection(
             self.upload_files,
             MAIN,
-            observations,
-            selected_files=selected,
             reader_sha256=TOOL["source_sha256"],
+            stage_root=self.observed_stage_root(),
+            **self.evidence_kwargs,
         )
 
-    def seal_selection(self, jobs: Jobs, run_id: str) -> dict:
-        """Drive every selection round, then seal with the client manifest."""
-
-        for _ in range(4):
-            previous = self.start_round(jobs, run_id)
-            snapshot = self.wait_state(jobs, run_id, {"awaiting_files", "ready"}, round_id=previous)
-            if snapshot["status"] == "failed":
-                return snapshot
-            if snapshot["selection"]["state"] == "ready":
-                return jobs.seal_selection(run_id, {"selection": self.selection_manifest(jobs, run_id)})
-        raise AssertionError("the selection never became ready")
-
-    def batch_zip(self, names) -> Path:
+    def batch_zip(self, names=None) -> Path:
         import zipfile
 
         payloads = source_bytes()
-        path = self.root / f"batch-{uuid.uuid4().hex}.zip"
+        selected = list(names) if names is not None else sorted(payloads)
+        path = self.root / f"upload-{uuid.uuid4().hex}.zip"
         with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as output:
-            for name in names:
+            for name in selected:
                 output.writestr(name, payloads[name])
         return path
 
@@ -254,10 +241,11 @@ class EndpointFixture:
             settings=DiscoverySettings(record_roots=[self.records_dir()], frozen_names=dict(self.frozen_names)),
         )
         archive = self.root / f"capture-request-{run_id}.zip"
+        record = {**copy.deepcopy(self.record), "source_selection": copy.deepcopy(selection)}
         seal_capture_request(
             prepared,
             archive,
-            record=self.record,
+            record=record,
             selection=selection,
             native_tool=TOOL,
         )
@@ -285,7 +273,7 @@ class EndpointFixture:
     def run_to_terminal(self, jobs: Jobs, run_id: str, *, timeout: float = 20.0) -> dict:
         """The whole native boundary: selection -> definition -> capture."""
 
-        sealed = self.seal_selection(jobs, run_id)
+        sealed = self.stage_and_seal(jobs, run_id)
         if sealed["status"] == "failed":
             return sealed
         state = self.wait_state_any_status(jobs, run_id, {"awaiting_definition"}, timeout=timeout)

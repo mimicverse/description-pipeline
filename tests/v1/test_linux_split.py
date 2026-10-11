@@ -18,7 +18,6 @@ from description_pipeline.orchestration import linux_runner
 from description_pipeline.orchestration.linux_store import LinuxStore
 from description_pipeline.orchestration.stage_transfer import seal_capture
 from description_pipeline.runtime import RUNTIME_VERSIONS, required_packages
-from description_pipeline.sources.solidworks.selection import seal_selection
 from description_pipeline.stages import STAGE_IDS
 
 from .test_stage_transfer import MAIN_ASSEMBLY, capture_root, native_tool
@@ -31,12 +30,14 @@ HANDOFF = digest(SELECTED)
 
 def capture_job(run_id: str, archive: Path, tool: dict) -> dict:
     """A current server receipt whose upload differs from its selected closure."""
-    selection = seal_selection(
+    from tests.sources.selection_support import sealed_selection
+
+    selection = sealed_selection(
         UPLOAD,
         MAIN_ASSEMBLY,
-        {MAIN_ASSEMBLY: {"sha256": SELECTED[MAIN_ASSEMBLY], "references": []}},
-        selected_files=SELECTED,
         reader_sha256=tool["source_sha256"],
+        stage_root=r"C:\stage",
+        edges={MAIN_ASSEMBLY: []},
     )
     with zipfile.ZipFile(archive) as packed:
         manifest_sha256 = hashlib.sha256(packed.read("transfer-manifest.json")).hexdigest()
@@ -55,11 +56,9 @@ def capture_job(run_id: str, archive: Path, tool: dict) -> dict:
         },
         "selection": {
             "state": "sealed",
-            "round_id": selection["selection_sha256"],
             "reader_sha256": tool["source_sha256"],
-            "staged_files": dict(SELECTED),
-            "requested_files": {},
-            "observations": selection["observations"],
+            "upload_sha256": digest(UPLOAD),
+            "staged_files": dict(UPLOAD),
             "manifest": selection,
         },
         "result": {
