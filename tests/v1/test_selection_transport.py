@@ -128,6 +128,28 @@ class SelectionTransportTests(unittest.TestCase):
         self.assertEqual(session.snapshot()["state"], "sealed")
         self.assertEqual(inventory(session.stage), manifest["files"])
 
+    def test_native_lock_files_are_excluded_but_arbitrary_extras_refuse(self) -> None:
+        session = self._session()
+        self.assertTrue(session.accept_batch(self._archive(self.root / "batch.zip", DATA)))
+        (session.stage / "~$link.SLDPRT").write_bytes(b"transient solidworks lock")
+        (session.stage / "parts").mkdir(exist_ok=True)
+        (session.stage / "parts" / "~$link.SLDPRT").write_bytes(b"nested transient lock")
+        manifest = session.seal_closure(self._evidence())
+        self.assertEqual(set(manifest["files"]), {MAIN, "parts/link.SLDPRT"})
+        self.assertEqual(
+            set(inventory(session.stage)),
+            set(manifest["files"]) | {"~$link.SLDPRT", "parts/~$link.SLDPRT"},
+        )
+
+        for label, name in {"arbitrary_extra": "extra.bin", "non_native_lock": "~$notes.txt"}.items():
+            with self.subTest(case=label):
+                other = StagedSelection(self.root / f"stage-{label}", self.upload, MAIN, reader_sha256=self.reader)
+                self.assertTrue(other.accept_batch(self._archive(self.root / f"{label}.zip", DATA)))
+                (other.stage / name).write_bytes(b"not a transient native lock")
+                with self.assertRaises(SelectionError):
+                    other.seal_closure(self._evidence())
+                self.assertEqual(other.snapshot()["state"], "reading")
+
 
 if __name__ == "__main__":
     unittest.main()

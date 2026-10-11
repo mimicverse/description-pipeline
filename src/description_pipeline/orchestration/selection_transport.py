@@ -11,8 +11,9 @@ import zipfile
 from contextlib import suppress
 from pathlib import Path
 
-from ..io import _filesystem_path, confined, digest, inventory
+from ..io import _filesystem_path, confined, digest
 from ..sources.solidworks.handoff import MAX_HANDOFF_BYTES, _directory
+from ..sources.solidworks.revision import package_inventory
 from ..sources.solidworks.selection import SelectionError, seal_closure_selection, validate_file_index
 
 _CHUNK = 1024 * 1024
@@ -201,7 +202,9 @@ class StagedSelection:
             "selection_incomplete",
             "The full upload must be provisionally staged before sealing its closure",
         )
-        actual = inventory(self.stage)
+        # A live SolidWorks session leaves transient ``~$`` lock files in the stage;
+        # the established package inventory excludes exactly those, never normal extras.
+        actual = package_inventory(self.stage)
         _refuse(
             actual == self.upload_files,
             "selection_inventory_changed",
@@ -215,7 +218,7 @@ class StagedSelection:
                 continue
             with suppress(OSError, SelectionError):
                 Path(_filesystem_path(confined(self.stage, name))).unlink()
-        retained = inventory(self.stage)
+        retained = package_inventory(self.stage)
         _refuse(
             retained == manifest["files"],
             "selection_inventory_changed",
