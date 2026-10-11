@@ -427,6 +427,7 @@ def _cached_materialization_reason(
             relative = provenance.get("author_imported_relative")
             source_root = provenance.get("source_root")
             bound = slot.get("bound_source")
+            stage_root = carrier["closure"].get("stage_root")
             if not (
                 slot.get("author_metadata_in_stage") is True
                 and isinstance(relative, str)
@@ -436,6 +437,9 @@ def _cached_materialization_reason(
                 and isinstance(author, str)
                 and ntpath.isabs(author)
                 and _owned_relative_match(author, source_root, relative)
+                and isinstance(stage_root, str)
+                and ntpath.isabs(stage_root)
+                and _owned_relative_match(slot.get("author_imported_path"), stage_root, bound)
                 and isinstance(bound, str)
                 and bound.strip()
                 and bound.replace("\\", "/").casefold() == relative.replace("\\", "/").casefold()
@@ -2758,6 +2762,22 @@ def verify_discovery(package: Path) -> dict:
                 "a movable joint has no limits",
                 {"joint": joint.get("name")},
             )
+            for key in ("effort", "velocity"):
+                _require(
+                    _number(limits.get(key)) is not None and limits[key] >= 0,
+                    "discovery.joints",
+                    "the authored joint drive is not a proven non-negative value",
+                    {"joint": joint.get("name"), "key": key, "value": limits.get(key)},
+                )
+            if expected_type in {"revolute", "prismatic"}:
+                _require(
+                    _number(limits.get("lower")) is not None
+                    and _number(limits.get("upper")) is not None
+                    and limits["lower"] <= limits["upper"],
+                    "discovery.joints",
+                    "the authored position range is not proven ordered",
+                    {"joint": joint.get("name"), "lower": limits.get("lower"), "upper": limits.get("upper")},
+                )
             if expected_type == "continuous":
                 _require(
                     "lower" not in limits and "upper" not in limits,
@@ -2799,37 +2819,73 @@ def verify_discovery(package: Path) -> dict:
                     )
             else:
                 reference_record = properties.get("dp.joint.limits_record")
-                _require(
-                    isinstance(reference_record, str) and reference_record.strip(),
-                    "discovery.joints",
-                    "the joint has no native or controlled position range",
-                    {"joint": joint.get("name")},
-                )
-                entry = _find_record_entry(payload, reference_record)
+                if isinstance(reference_record, str) and reference_record.strip():
+                    entry = _find_record_entry(payload, reference_record)
+                    value = _record_value(package, entry["entry"], entry["key"])
+                    _require(
+                        _close(
+                            [limits.get("lower"), limits.get("upper")],
+                            [value.get("lower"), value.get("upper")],
+                            1e-12,
+                        ),
+                        "discovery.joints",
+                        "the joint limits differ from the controlled record",
+                        {"joint": joint.get("name")},
+                    )
+                else:
+                    diagnostics.append(
+                        {
+                            "code": "discovery.joint_evidence_unrecorded",
+                            "blocking": False,
+                            "message": (
+                                "no native or controlled position range; the authored limits are kept "
+                                "verbatim (motion/drive unqualified, not robot-ready)"
+                            ),
+                            "detail": {"joint": joint.get("name"), "limits": dict(limits)},
+                        }
+                    )
+            drive_reference = properties.get("dp.joint.drive_record")
+            if isinstance(drive_reference, str) and drive_reference.strip():
+                entry = _find_record_entry(payload, drive_reference)
                 value = _record_value(package, entry["entry"], entry["key"])
                 _require(
-                    _close([limits.get("lower"), limits.get("upper")], [value.get("lower"), value.get("upper")], 1e-12),
+                    _close(
+                        [limits.get("effort"), limits.get("velocity")],
+                        [value.get("effort"), value.get("velocity")],
+                        1e-12,
+                    ),
                     "discovery.joints",
-                    "the joint limits differ from the controlled record",
+                    "the joint drive differs from the controlled record",
                     {"joint": joint.get("name")},
                 )
-            drive_reference = properties.get("dp.joint.drive_record")
-            _require(
-                isinstance(drive_reference, str) and drive_reference.strip(),
-                "discovery.joints",
-                "the joint has no controlled drive record",
-                {"joint": joint.get("name")},
-            )
-            entry = _find_record_entry(payload, drive_reference)
-            value = _record_value(package, entry["entry"], entry["key"])
-            _require(
-                _close(
-                    [limits.get("effort"), limits.get("velocity")], [value.get("effort"), value.get("velocity")], 1e-12
-                ),
-                "discovery.joints",
-                "the joint drive differs from the controlled record",
-                {"joint": joint.get("name")},
-            )
+            else:
+                diagnostics.append(
+                    {
+                        "code": "discovery.joint_evidence_unrecorded",
+                        "blocking": False,
+                        "message": (
+                            "no controlled drive record; the authored drive values are kept verbatim "
+                            "(motion/drive unqualified, not robot-ready)"
+                        ),
+                        "detail": {"joint": joint.get("name"), "limits": dict(limits)},
+                    }
+                )
+            unqualified = [key for key in ("effort", "velocity") if limits[key] == 0]
+            if expected_type in {"revolute", "prismatic"} and limits["lower"] == limits["upper"]:
+                unqualified.append("degenerate_position_range")
+            if unqualified:
+                diagnostics.append(
+                    {
+                        "code": "discovery.joint_motion_unqualified",
+                        "blocking": False,
+                        "message": (
+                            "authored motion/drive values are zero or degenerate; consumers import the "
+                            "zero-range joint as unlimited while effort/velocity are dropped, so motion is "
+                            "unqualified and not robot-ready"
+                        ),
+                        "detail": {"joint": joint.get("name"), "values": unqualified, "limits": dict(limits)},
+                    }
+                )
             origin = [frame[0][3], frame[1][3], frame[2][3]]
             offset = _offset(group["point"], origin, native)
             _require(

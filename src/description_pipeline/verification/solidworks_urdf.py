@@ -483,7 +483,7 @@ def _link_physics(node, canonical):
     return {"mass_kg": mass, "principal_inertia_kg_m2": eigenvalues.tolist()}
 
 
-def _joint(node, authored, canonical, datums, body_datums):
+def _joint(node, authored, canonical, datums, body_datums, diagnostics):
     _require(node.get("type") == authored["type"] == canonical["type"], "Joint type changed")
     for key in ("parent", "child"):
         _require(_one(node, key).get("link") == authored[key] == canonical[key], f"Joint {key} changed")
@@ -507,13 +507,29 @@ def _joint(node, authored, canonical, datums, body_datums):
     limits = {key: float(value) for key, value in _one(node, "limit").attrib.items()}
     _require(limits == authored["limits"] == canonical["limits"], "Joint limits differ from author inputs")
     _require(
-        all(math.isfinite(value) for value in limits.values()) and limits["effort"] > 0 and limits["velocity"] > 0,
+        all(math.isfinite(value) for value in limits.values()) and limits["effort"] >= 0 and limits["velocity"] >= 0,
         "Invalid joint limits",
     )
     if authored["type"] in {"revolute", "prismatic"}:
-        _require(limits["lower"] < limits["upper"], "Unordered position limits")
+        _require(limits["lower"] <= limits["upper"], "Unordered position limits")
     else:
         _require("lower" not in limits and "upper" not in limits, "Continuous joint has position limits")
+    unqualified = [key for key in ("effort", "velocity") if limits[key] == 0]
+    if authored["type"] in {"revolute", "prismatic"} and limits["lower"] == limits["upper"]:
+        unqualified.append("degenerate_position_range")
+    if unqualified:
+        diagnostics.append(
+            {
+                "code": "urdf.motion_unqualified",
+                "blocking": False,
+                "message": (
+                    "authored motion/drive values are zero or degenerate; consumers import the zero-range "
+                    "joint as unlimited while effort/velocity are dropped, so motion is unqualified and not "
+                    "robot-ready"
+                ),
+                "detail": {"joint": authored["name"], "values": unqualified, "limits": limits},
+            }
+        )
     return {"type": authored["type"], "axis": axis.tolist(), "limits": limits}
 
 
@@ -707,7 +723,10 @@ def evaluate_bundle(root: Path) -> dict:
     if definition is not None and model is not None and raw is not None:
         source = definition["source"]
         gates.add("source.coverage", lambda: _entities(source, raw, model))
-        gates.add("verification.complete", lambda: _verify_model(root, gates, definition, model, raw))
+        gates.add(
+            "verification.complete",
+            lambda: _verify_model(root, gates, definition, model, raw, diagnostics),
+        )
     required = required_checks(definition)
     observed = {check["id"] for check in gates.checks}
     for identifier in required:
@@ -772,7 +791,7 @@ def _mass_closure_equality(root):
     return verify_urdf_mass_equality(root)
 
 
-def _verify_model(root, gates, definition, model, raw):
+def _verify_model(root, gates, definition, model, raw, diagnostics):
     from .solidworks_physics import verify_physics
 
     source = definition["source"]
@@ -817,7 +836,7 @@ def _verify_model(root, gates, definition, model, raw):
         name = authored["name"]
         gates.add(
             "joints." + name,
-            lambda a=authored: _joint(joints[a["name"]], a, model_joints[a["name"]], datums, body_datums),
+            lambda a=authored: _joint(joints[a["name"]], a, model_joints[a["name"]], datums, body_datums, diagnostics),
         )
         if authored["type"] != "fixed":
             gates.add(

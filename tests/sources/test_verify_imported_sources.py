@@ -159,6 +159,7 @@ def relocated_carrier(owner_sha, np_sha):
         CACHED_OWNER,
         edges={CACHED_OWNER: [NP_RELATIVE], NP_RELATIVE: []},
         imports=[slot],
+        stage_root=SELECTION_ROOT,
     )
 
 
@@ -545,6 +546,9 @@ class ImportedSourceTests(unittest.TestCase):
             ),
             "slot_not_in_stage": lambda component, carrier, files: carrier["closure"]["imports"][0].update(
                 author_metadata_in_stage=False
+            ),
+            "slot_author_outside_stage": lambda component, carrier, files: carrier["closure"]["imports"][0].update(
+                author_imported_path=r"C:\elsewhere\NP-F550.step"
             ),
         }
         for label, mutate in cases.items():

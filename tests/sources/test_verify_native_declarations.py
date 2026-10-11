@@ -189,19 +189,54 @@ class NativeDeclarationsTests(unittest.TestCase):
         self.assertNotIn("cover", report["members"]["base"])
         self.assertNotIn("cover", report["members"]["tool"])
 
-    def test_zero_parameters_are_preserved_and_all_failures_reported(self):
+    def test_zero_parameters_are_preserved_and_warn_as_motion_unqualified(self):
+        def limit_items(root):
+            return [
+                item
+                for item in root.iter()
+                if (item.get(Z + "Id") or "").startswith("joint_limit_") and item.find(NS + "Value") is not None
+            ]
+
+        def write(values):
+            def transform(root):
+                for item in limit_items(root):
+                    item.find(NS + "Value").text = values
+
+            return transform
+
         raw = fixture()
-
-        def zero(root):
-            for item in root.iter():
-                if (item.get(Z + "Id") or "").startswith("joint_limit_"):
-                    item.find(NS + "Value").text = "0"
-
-        rewrite(raw, zero)
+        rewrite(raw, write("0"))
         report = verify_declarations(raw)
-        error = next(item for item in report["errors"] if item["code"] == "v14.operating_parameters")
-        self.assertEqual(error["detail"]["limits"], dict.fromkeys(["lower", "upper", "effort", "velocity"], 0))
-        self.assertEqual(error["detail"]["invalid"], ["effort", "velocity", "ordered_bounds"])
+        self.assertNotIn("v14.operating_parameters", {item["code"] for item in report["errors"]})
+        warnings = [item for item in report["diagnostics"] if item["code"] == "v14.motion_unqualified"]
+        self.assertTrue(warnings)
+        self.assertFalse(warnings[0]["blocking"])
+        self.assertIn("unlimited", warnings[0]["message"])
+        self.assertEqual(
+            warnings[0]["detail"]["limits"],
+            dict.fromkeys(["lower", "upper", "effort", "velocity"], 0),
+        )
+
+        for label, values, expected in (
+            ("negative", "-1.0", {"v14.operating_parameters"}),
+            ("nonfinite", "inf", {"v14.invalid_scalar", "v14.operating_parameters"}),
+        ):
+            with self.subTest(case=label):
+                candidate = fixture()
+                rewrite(candidate, write(values))
+                self.assertTrue(expected & set(self.errors(candidate)), label)
+
+        candidate = fixture()
+
+        def drop_effort(root):
+            for item in limit_items(root):
+                kind = item.find(NS + "AttributeType")
+                if kind is not None and kind.text == "effort":
+                    item.remove(item.find(NS + "Value"))
+                    return
+
+        rewrite(candidate, drop_effort)
+        self.assertIn("v14.attribute_shape", self.errors(candidate))
 
     def test_boundary_tristate_exact_hash_document_configuration_and_pid(self):
         for change, code in [

@@ -527,19 +527,35 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
             return {"type": "fixed"}
         limits = joint.get("limit")
         _require(isinstance(limits, dict), "v14.limits", "moving joint has no authored limit record", joint=name)
-        invalid = [key for key in ("effort", "velocity") if not (_number(limits.get(key)) and limits[key] > 0)]
+        invalid = [key for key in ("effort", "velocity") if not (_number(limits.get(key)) and limits[key] >= 0)]
         if joint["type"] in {"revolute", "prismatic"} and not (
-            _number(limits.get("lower")) and _number(limits.get("upper")) and limits["lower"] < limits["upper"]
+            _number(limits.get("lower")) and _number(limits.get("upper")) and limits["lower"] <= limits["upper"]
         ):
             invalid.append("ordered_bounds")
         _require(
             not invalid,
             "v14.operating_parameters",
-            "authored bounds must be ordered and effort/velocity positive",
+            "authored bounds must be ordered and effort/velocity non-negative",
             joint=name,
             limits=limits,
             invalid=invalid,
         )
+        unqualified = [key for key in ("effort", "velocity") if limits[key] == 0]
+        if joint["type"] in {"revolute", "prismatic"} and limits["lower"] == limits["upper"]:
+            unqualified.append("degenerate_position_range")
+        if unqualified:
+            diagnostics.append(
+                {
+                    "code": "v14.motion_unqualified",
+                    "blocking": False,
+                    "message": (
+                        "authored motion/drive values are zero or degenerate; consumers import the "
+                        "zero-range joint as unlimited while effort/velocity are dropped, so motion is "
+                        "unqualified and not robot-ready"
+                    ),
+                    "detail": {"joint": name, "values": unqualified, "limits": dict(limits)},
+                }
+            )
         return {"limits": limits}
 
     def joint_geometry(name, joint):

@@ -269,10 +269,44 @@ class StructuralQualityTests(unittest.TestCase):
             '<limit effort="1" velocity="2"/></joint>'
         )
         frames = {"base_link": np.eye(4), "arm_link": np.eye(4)}
-        quality._joint(node, authored, canonical_joint, {}, frames)
+        diagnostics: list[dict] = []
+        quality._joint(node, authored, canonical_joint, {}, frames, diagnostics)
+        self.assertEqual(diagnostics, [])
         node.find("axis").set("xyz", "0 0 -1")
         with self.assertRaises(PipelineError):
-            quality._joint(node, authored, canonical_joint, {}, frames)
+            quality._joint(node, authored, canonical_joint, {}, frames, [])
+
+    def test_authored_zero_limits_load_with_a_motion_warning(self):
+        authored = {
+            "name": "joint",
+            "parent": "base_link",
+            "child": "arm_link",
+            "type": "continuous",
+            "axis": [0, 0, 1],
+            "limits": {"effort": 0.0, "velocity": 0.0},
+        }
+        canonical_joint = {**authored, "xyz": [0, 0, 0], "rpy": [0, 0, 0]}
+        node = ET.fromstring(
+            '<joint type="continuous"><parent link="base_link"/><child link="arm_link"/>'
+            '<origin xyz="0 0 0" rpy="0 0 0"/><axis xyz="0 0 1"/>'
+            '<limit effort="0" velocity="0"/></joint>'
+        )
+        frames = {"base_link": np.eye(4), "arm_link": np.eye(4)}
+        diagnostics: list[dict] = []
+        result = quality._joint(node, authored, canonical_joint, {}, frames, diagnostics)
+        self.assertEqual(result["limits"], {"effort": 0.0, "velocity": 0.0})
+        self.assertEqual([item["code"] for item in diagnostics], ["urdf.motion_unqualified"])
+        self.assertFalse(diagnostics[0]["blocking"])
+
+        negative = {**authored, "limits": {"effort": -1.0, "velocity": 0.0}}
+        canonical_negative = {**negative, "xyz": [0, 0, 0], "rpy": [0, 0, 0]}
+        node_negative = ET.fromstring(
+            '<joint type="continuous"><parent link="base_link"/><child link="arm_link"/>'
+            '<origin xyz="0 0 0" rpy="0 0 0"/><axis xyz="0 0 1"/>'
+            '<limit effort="-1" velocity="0"/></joint>'
+        )
+        with self.assertRaises(PipelineError):
+            quality._joint(node_negative, negative, canonical_negative, {}, frames, [])
 
     def test_incomplete_delivery_and_forged_green_report_fail_without_crashing(self):
         with tempfile.TemporaryDirectory() as directory:
