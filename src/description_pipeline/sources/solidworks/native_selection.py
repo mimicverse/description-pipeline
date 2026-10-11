@@ -256,7 +256,8 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
         # and a complete closure cannot be claimed.
         raise SelectionError(
             "selection_open_errors",
-            "the staged main opened with CAD-reported errors; missing references may have auto-suppressed occurrences, so a complete closure cannot be claimed",
+            "the staged main opened with CAD-reported errors; missing references may "
+            "have auto-suppressed occurrences, so a complete closure cannot be claimed",
             stage_root=str(stage_root),
             problems=[
                 _problem(
@@ -367,7 +368,10 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                 warnings.append(
                     {
                         "code": "import_cached_materialization",
-                        "message": "an imported occurrence contributes geometry from a session materialization; the author import path is metadata, not a proven in-package binding",
+                        "message": (
+                            "an imported occurrence contributes geometry from a session materialization; "
+                            "the author import path is metadata, not a proven in-package binding"
+                        ),
                         "document": label,
                         "owner": defining_name,
                         "owner_anchor": raw_anchor,

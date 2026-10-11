@@ -3473,5 +3473,64 @@ class ComponentSuppressionStateTests(unittest.TestCase):
             self.assertEqual(triple("arm-2"), (1, False, True))
 
 
+class ComponentSourceDocumentTests(unittest.TestCase):
+    """Raw import readings for the discovery walk (no selection carrier)."""
+
+    def setUp(self) -> None:
+        import tempfile
+
+        self.tmp = Path(tempfile.mkdtemp(prefix="sw-source-doc-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True))
+        self.source_root = self.tmp / "stage"
+        self.source_root.mkdir()
+        self.materialization = self.tmp / "swx1" / "IC~~" / "X.step.SLDPRT"
+        self.materialization.parent.mkdir(parents=True)
+        self.materialization.write_bytes(b"temp")
+
+    def component(self, path, *, imported, virtual=False):
+        component = _Component("X.step-1", str(path))
+        component.GetImportedPath = lambda: imported
+        component.IsVirtual = virtual
+        return component
+
+    def test_session_materialization_is_classified_with_raw_fields(self) -> None:
+        from description_pipeline.sources.solidworks.native import _component_source_document
+
+        result = _component_source_document(
+            self.component(self.materialization, imported=r"D:\author\X.stp"),
+            self.source_root,
+        )
+        self.assertIsNone(result["document"])
+        provenance = result["source_provenance"]
+        self.assertEqual(provenance["state"], "cached_materialization")
+        self.assertEqual(provenance["kind"], "native_import_materialization")
+        self.assertEqual(provenance["materialization_path"], str(self.materialization))
+        self.assertEqual(provenance["author_imported_path"], r"D:\author\X.stp")
+        self.assertIs(provenance["is_virtual"], False)
+
+    def test_ic_marker_outside_session_temp_is_unread_not_cached(self) -> None:
+        from description_pipeline.sources.solidworks.native import _component_source_document
+
+        outside = r"C:\Users\Mi\Documents\IC~~\X.step.SLDPRT"
+        result = _component_source_document(self.component(outside, imported=r"C:\Users\Mi\Desktop\X.stp"), self.source_root)
+        provenance = result["source_provenance"]
+        self.assertEqual(provenance["state"], "unread")
+        self.assertEqual(provenance["materialization_path"], outside)
+        self.assertNotIn("kind", provenance)
+
+    def test_virtual_flag_alone_requires_a_materialization_path(self) -> None:
+        from description_pipeline.sources.solidworks.native import _component_source_document
+
+        result = _component_source_document(
+            self.component(r"C:\elsewhere\X.SLDPRT", imported=r"D:\author\X.stp", virtual=True),
+            self.source_root,
+        )
+        # A virtual reading with an out-of-temp path is not a session
+        # materialization; it stays unread with the readings recorded verbatim.
+        provenance = result["source_provenance"]
+        self.assertEqual(provenance["state"], "unread")
+        self.assertIs(provenance["is_virtual"], True)
+
+
 if __name__ == "__main__":
     unittest.main()

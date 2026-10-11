@@ -1742,8 +1742,15 @@ def _component_source_document(component, source_root):
     """Bind an occurrence to a delivered file, including native linked imports.
 
     SolidWorks materializes 3D Interconnect parts in an owned temporary path.
-    Only GetImportedPath can bind that current native occurrence to a source
-    inside the delivered folder; temporary names and basenames are not proof.
+    A resident delivered document binds directly; otherwise the raw readings
+    are recorded independently of any selection carrier: the engine-reported
+    materialization path, the virtual flag and the author import path
+    (GetImportedPath is author metadata, never an in-package binding).  A
+    structural session materialization is classified ``cached_materialization``
+    only when it is an IC~~ path component under the owned session temp area;
+    a genuinely delivered imported source (GetImportedPath resolving inside the
+    source root) keeps the historical ``resolved`` binding.  Temporary names
+    and basenames are never proof.
     """
 
     native_path = str(_method(component, "GetPathName") or "")
@@ -1754,18 +1761,29 @@ def _component_source_document(component, source_root):
         "state": "unread",
         "source_root": str(Path(source_root).resolve()),
         "native_document_path": native_path,
+        "materialization_path": native_path or None,
+        "is_virtual": None,
+        "author_imported_path": None,
         "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
     }
     result = {"document": None, "source_provenance": provenance}
     try:
         imported_path = _method(component, "GetImportedPath")
-        provenance["imported_path"] = imported_path if isinstance(imported_path, str) else None
+        provenance["author_imported_path"] = (
+            imported_path if isinstance(imported_path, str) and imported_path.strip() else None
+        )
         imported = _relative_document(imported_path, source_root) if _is_text_name(imported_path) else None
-        if not imported:
-            raise ValueError("native imported source does not resolve to a file inside the delivered folder")
-        virtual = _member(component, "IsVirtual")
-        if type(virtual) is not bool:
-            raise ValueError("native virtual-component state is unreadable")
+    except Exception as error:  # noqa: BLE001 - a temp or foreign path is never an implicit source
+        provenance["author_imported_error"] = f"{type(error).__name__}: {error}"[:300]
+        imported = None
+    virtual = None
+    try:
+        reading = _member(component, "IsVirtual")
+        virtual = reading if type(reading) is bool else None
+    except Exception as error:  # noqa: BLE001 - an unreadable virtual flag stays unknown
+        provenance["virtual_error"] = f"{type(error).__name__}: {error}"[:200]
+    provenance["is_virtual"] = virtual
+    if imported:
         result["document"] = imported
         provenance.update(
             {
@@ -1773,11 +1791,20 @@ def _component_source_document(component, source_root):
                 "kind": "native_imported_document",
                 "document": imported,
                 "sha256": _hash(str(Path(source_root) / imported)),
-                "is_virtual": virtual,
             }
         )
-    except Exception as error:  # noqa: BLE001 - a temp or foreign path is never an implicit source
-        provenance["error"] = f"{type(error).__name__}: {error}"[:300]
+    elif session_materialization_path(native_path):
+        provenance.update(
+            {
+                "state": "cached_materialization",
+                "kind": "native_import_materialization",
+                "document": None,
+            }
+        )
+    else:
+        provenance["error"] = (
+            "ValueError: native imported source does not resolve to a file inside the delivered folder"
+        )
     return result
 
 
@@ -4012,6 +4039,7 @@ class SolidWorksBackend(CadBackend):
             components = []
             by_component = {}
             by_document: dict[str, str] = {}
+            owner_hashes: dict[str, str] = {}
             masses = []
             mates: list[dict] = []
             components_total = 0
@@ -4025,10 +4053,11 @@ class SolidWorksBackend(CadBackend):
                     configuration,
                     [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
                     (normalize_document_path(str(main_path)),),
+                    None,
                 )
             ]
             while stack:
-                assembly_path, prefix, referenced_configuration, parent_matrix, ancestor_paths = stack.pop()
+                assembly_path, prefix, referenced_configuration, parent_matrix, ancestor_paths, anchor = stack.pop()
                 activity.emit("open_document", current_object=_activity_object(assembly_path, source_root))
                 assembly = self._document_by_path(assembly_path)
                 activity.emit(
@@ -4066,6 +4095,25 @@ class SolidWorksBackend(CadBackend):
                     state = _component_state(component)
                     document_path = _method(component, "GetPathName")
                     source_document = _component_source_document(component, source_root)
+                    materialized = bool(source_document.get("materialization_path")) and session_materialization_path(
+                        source_document["materialization_path"]
+                    )
+                    anchor_for_children = path_name if materialized else anchor
+                    provenance = source_document.get("source_provenance")
+                    if provenance is not None:
+                        owner_relative = _relative_document(assembly_path, source_root)
+                        if not owner_relative:
+                            owner_relative = normalize_document_path(str(assembly_path))
+                        try:
+                            if assembly_path not in owner_hashes:
+                                owner_hashes[assembly_path] = _hash(str(assembly_path))
+                            provenance["owner_sha256"] = owner_hashes[assembly_path]
+                        except Exception as error:  # noqa: BLE001 - an unreadable owner hash stays explicit
+                            provenance["owner_sha256"] = None
+                            provenance["owner_sha256_error"] = f"{type(error).__name__}: {error}"[:200]
+                        provenance["occurrence"] = path_name
+                        provenance["owner"] = owner_relative
+                        provenance["defining_anchor"] = anchor
                     local_transform = []
                     # Mechanical placement is the fixed False form only; the True
                     # form includes the presentation transform and must never
@@ -4107,6 +4155,7 @@ class SolidWorksBackend(CadBackend):
                     }
                     if "source_provenance" in source_document:
                         entry["source_provenance"] = source_document["source_provenance"]
+                    entry["defining_anchor"] = anchor
                     entry["solver_observation"] = _solver_observation(
                         component,
                         assembly_path,
@@ -4183,6 +4232,7 @@ class SolidWorksBackend(CadBackend):
                                         transform[12:16],
                                     ],
                                     (*ancestor_paths, document_key),
+                                    anchor_for_children,
                                 )
                             )
                     components_done += 1
