@@ -7,14 +7,13 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from xml.etree import ElementTree as ET
 
 import numpy as np
 
 from description_pipeline.io import PipelineError, canonical, write_json
-from description_pipeline.sources.solidworks.freeze import _component_context_record
 from description_pipeline.sources.solidworks import verify as oracle
+from description_pipeline.sources.solidworks.scene import closure_delta
 from description_pipeline.verification import solidworks_urdf as quality
 from description_pipeline.verification.solidworks_physics import verify_physics, verify_urdf_mass_equality
 
@@ -23,7 +22,8 @@ class PhysicsTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        self.root = Path(directory.name)
+        self.bundle = Path(directory.name)
+        self.root = self.bundle / "evidence"
         first = np.eye(4)
         first[:3, 3] = [0.1, 0.2, 0]
         second = np.array([[0, -1, 0, -0.2], [1, 0, 0, 0.1], [0, 0, 1, 0.3], [0, 0, 0, 1]], dtype=float)
@@ -117,27 +117,32 @@ class PhysicsTests(unittest.TestCase):
             ]
         }
         flags = {"OverrideMass": False, "OverrideCenterOfMass": False, "OverrideMomentsOfInertia": False}
-        reading = {
+        # The split native record: observations only, as the capture writes them.
+        context = {
+            "schema_version": "description-pipeline.solidworks-component-mass-context/v1",
+            "status": "recorded",
+            "assembly_mass_kg": 3.0,
             "instances": [
                 {
                     "name": name,
                     "parent": None,
                     "depth": 0,
+                    "document": "C:\\fixture\\" + name + ".SLDPRT",
                     "document_type": "part",
                     "context_mass_kg": value["mass"],
                     "context_volume_m3": 0.001,
-                    "overrides": flags,
+                    "overrides": dict(flags),
+                    "effective": None,
+                    "effective_error": None,
                 }
                 for name, value in self.masses.items()
             ],
             "errors": [],
+            "reference": {"method": "IMassProperty2 (SelectedItems = component instance)"},
         }
-        scene = SimpleNamespace(
-            components=[SimpleNamespace(name=name) for name in self.masses], mass_properties=self.masses
-        )
-        context = _component_context_record(reading, scene, 3.0)
         world = {"mass": 3.0, "com": com_world.tolist(), "inertia": tensor_world.tolist()}
         self.closure = {
+            "schema_version": "description-pipeline.solidworks-mass-closure/v1",
             "status": "recorded",
             "mode": "full",
             "top_level": {
@@ -155,8 +160,108 @@ class PhysicsTests(unittest.TestCase):
         write_json(self.root / "raw/mass_properties.json", self.masses)
         write_json(self.root / "raw/coordinate_systems.json", self.raw["coordinate_systems"])
         write_json(self.root / "raw/declared_masses.json", {"items": {}, "evidence": None})
-        write_json(self.root / "raw/mass_closure.json", self.closure)
+        native = self._native_closure()
+        write_json(self.root / "raw/mass_closure.json", native)
+        write_json(
+            self.bundle / "reports/mass-closure.json",
+            {
+                "schema_version": "solidworks-to-urdf.mass-closure-report/v1",
+                "native": native,
+                "derived": self._derived_closure(),
+            },
+        )
         write_json(self.root / "manifest.json", {"identity": copy.deepcopy(self.captured_identity)})
+
+    def _native_closure(self):
+        """The split native record: observations only, no derived math."""
+
+        native = copy.deepcopy(self.closure)
+        context = native.get("component_context")
+        if isinstance(context, dict):
+            for row in context.get("instances") or []:
+                if isinstance(row, dict):
+                    row.pop("document_basis_mass_kg", None)
+                    row.pop("delta_kg", None)
+            for key in (
+                "totals",
+                "overridden",
+                "effective_total",
+                "blockers",
+                "leaf_documents",
+                "leaf_documents_covered",
+                "leaf_documents_uncovered",
+            ):
+                context.pop(key, None)
+        for key in ("leaf_total", "leaf_components", "delta", "effective_total", "blockers"):
+            native.pop(key, None)
+        return native
+
+    def _derived_closure(self):
+        """The Linux-side derived diagnostics the report must carry."""
+
+        context = self.closure["component_context"]
+        rows = [row for row in context.get("instances") or [] if isinstance(row, dict)]
+        leaves = [row["name"] for row in self.raw["components"]]
+        masses_by_name = {name: float(row["mass"]) for name, row in self.masses.items()}
+        basis = {
+            row["name"]: sum(
+                mass
+                for leaf, mass in masses_by_name.items()
+                if leaf == row["name"] or leaf.startswith(row["name"] + "/")
+            )
+            for row in rows
+        }
+        top_rows = [row for row in rows if row.get("depth") == 0]
+        context_kg = sum(float(row["context_mass_kg"]) for row in top_rows)
+        document_kg = sum(basis[row["name"]] for row in top_rows)
+        assembly_kg = context.get("assembly_mass_kg")
+        part_rows = {row["name"] for row in rows if row.get("document_type") == "part"}
+        covered = {leaf for leaf in leaves if leaf in part_rows}
+        effective = copy.deepcopy(self.closure.get("effective_total"))
+        if effective is None:
+            effective = {**copy.deepcopy(self.closure["leaf_total"]), "substituted": []}
+        effective.setdefault("substituted", [])
+        return {
+            "leaf_total": copy.deepcopy(self.closure["leaf_total"]),
+            "effective_total": effective,
+            "blockers": copy.deepcopy(self.closure.get("blockers") or []),
+            "delta": closure_delta(self.closure["top_level"], self.closure["leaf_total"]),
+            "totals": {
+                "context_kg": context_kg,
+                "document_kg": document_kg,
+                "assembly_kg": assembly_kg,
+                "context_minus_document_kg": context_kg - document_kg,
+                "context_minus_assembly_kg": None if assembly_kg is None else context_kg - assembly_kg,
+            },
+            "overridden": {
+                "top_level_instances": len(top_rows),
+                "mass": sum(1 for row in rows if (row.get("overrides") or {}).get("OverrideMass")),
+                "com": sum(1 for row in rows if (row.get("overrides") or {}).get("OverrideCenterOfMass")),
+                "inertia": sum(
+                    1 for row in rows if (row.get("overrides") or {}).get("OverrideMomentsOfInertia")
+                ),
+                "any": sum(1 for row in rows if any((row.get("overrides") or {}).values())),
+                "top_level_overridden": sum(
+                    1 for row in top_rows if any((row.get("overrides") or {}).values())
+                ),
+                "examples": [
+                    row["name"] for row in rows if (row.get("overrides") or {}).get("OverrideMass")
+                ][:50],
+            },
+            "coverage": {
+                "leaf_documents": len(leaves),
+                "leaf_documents_covered": len(covered),
+                "leaf_documents_uncovered": sorted(set(leaves) - covered)[:50],
+            },
+            "instances": {
+                row["name"]: {
+                    "name": row["name"],
+                    "document_basis_mass_kg": basis[row["name"]],
+                    "delta_kg": float(row["context_mass_kg"]) - basis[row["name"]],
+                }
+                for row in rows
+            },
+        }
 
     def failures(self):
         self.write()
@@ -544,6 +649,7 @@ class PhysicsTests(unittest.TestCase):
         self.closure["effective_total"] = {
             key: copy.deepcopy(self.closure["top_level"][key]) for key in ("mass", "com", "inertia")
         }
+        self.closure["effective_total"]["substituted"] = ["a"]
         self.write()
         qualification = (
             "cad_authored_effective_instance; not geometry-derived, not independently physically qualified"

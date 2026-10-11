@@ -606,12 +606,28 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
 
     def closure():
         payload = read_data(confined(root, "raw/mass_closure.json"))
+        report_path = Path(root).parent / "reports" / "mass-closure.json"
+        report = None
+        if report_path.is_file():
+            report = read_data(report_path)
+            _require(
+                isinstance(report, dict)
+                and report.get("schema_version") == "solidworks-to-urdf.mass-closure-report/v1",
+                "Mass closure report schema changed",
+            )
+            _require(
+                report.get("native") == payload,
+                "Mass closure report native section differs from the captured record",
+            )
+        elif source.get("material_source") == "cad":
+            _require(False, "The Linux mass closure report is missing")
         _require(
             payload["status"] == "recorded" and payload["mode"] == "full",
             "Full whole-assembly physics evidence is required",
         )
         top = _reading("whole assembly", payload["top_level"], "assembly_document")
         context = payload["component_context"]
+        _require(isinstance(context, dict), "Component mass context is not an object")
         _require(context["status"] == "recorded" and not context["errors"], "Incomplete component-context evidence")
         entries = oracle.load_effective_instances(root)
         entry_names = sorted({name for name, _code in entries})
@@ -629,34 +645,45 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
                 entries[(name, oracle.EFFECTIVE_CODE_INSTANCE)].get("overrides") == row["overrides"],
                 name + ": effective flags differ from the native context",
             )
+        derived = report.get("derived") if isinstance(report, dict) else None
+        if report is not None:
+            _require(isinstance(derived, dict), "Mass closure report carries no derived block")
+        mine = _derive_closure(payload, raw, masses, source)
+        if derived is not None:
+            _compare_derived(derived, mine, "derived", _require)
+            _require(not derived.get("blockers"), "Effective substitution blockers were recorded")
+        _require(not mine["blockers"], "Effective substitution spans bodies")
         body = {"id": "assembly", "components": [row["name"] for row in raw["components"]]}
         rebuilt = oracle._raw_world(body, raw, masses, {})
         expected = (rebuilt["mass"], rebuilt["com"], rebuilt["inertia"])
         _compare(top, expected, "Whole assembly / effective instance sum")
-        leaf = payload["leaf_total"]
-        if oracle.effective_math_map(masses, raw):
-            recorded = payload.get("effective_total")
-            _require(isinstance(recorded, dict), "Effective total is missing")
+        if derived is not None:
             _compare(
-                (float(recorded["mass"]), np.asarray(recorded["com"]), np.asarray(recorded["inertia"])),
+                (
+                    float(derived["effective_total"]["mass"]),
+                    np.asarray(derived["effective_total"]["com"]),
+                    np.asarray(derived["effective_total"]["inertia"]),
+                ),
                 expected,
-                "Captured effective closure",
+                "Reported effective closure",
             )
-            plain = oracle._raw_world(body, raw, masses, {}, use_effective=False)
-            _compare(
-                (float(leaf["mass"]), np.asarray(leaf["com"]), np.asarray(leaf["inertia"])),
-                (plain["mass"], plain["com"], plain["inertia"]),
-                "Captured leaf closure",
+        enriched_rows = []
+        for row in context["instances"]:
+            if not isinstance(row, dict):
+                enriched_rows.append(row)
+                continue
+            name = str(row.get("name"))
+            enriched_rows.append(
+                {
+                    **row,
+                    "document_basis_mass_kg": mine["instances"].get(name, {}).get("document_basis_mass_kg"),
+                    "delta_kg": mine["instances"].get(name, {}).get("delta_kg"),
+                }
             )
-        else:
-            _compare(
-                (float(leaf["mass"]), np.asarray(leaf["com"]), np.asarray(leaf["inertia"])),
-                expected,
-                "Captured leaf closure",
-            )
+        enriched = {"component_context": {**context, "instances": enriched_rows}}
         raw_masses = {name: float(row["mass"]) for name, row in masses.items()}
         details, error = oracle._component_context_findings(
-            payload, "cad", top[0], raw_masses, covered=set(entry_names)
+            enriched, "cad", top[0], raw_masses, covered=set(entry_names)
         )
         _require(error is None, "Component context: " + str(error))
         return {
@@ -733,3 +760,186 @@ def _reading_summary(name, record):
         "api": record["reference"]["used_api"],
         "scope": record["reference"].get("scope"),
     }
+
+
+def _closure_delta(top_level: dict, leaf_total: dict) -> dict:
+    """The verifier's own copy of the assembly-minus-leaves diagnostics."""
+
+    top_mass = float(top_level["mass"])
+    leaf_mass = float(leaf_total["mass"])
+    com_top = [float(value) for value in top_level["com"]]
+    com_leaf = [float(value) for value in leaf_total["com"]]
+    inertia_top = [[float(value) for value in row] for row in top_level["inertia"]]
+    inertia_leaf = [[float(value) for value in row] for row in leaf_total["inertia"]]
+    scale = max(max(abs(value) for row in inertia_top for value in row), 1e-12)
+    worst = max(abs(inertia_top[i][j] - inertia_leaf[i][j]) for i in range(3) for j in range(3))
+    return {
+        "mass_abs": abs(top_mass - leaf_mass),
+        "mass_rel": abs(top_mass - leaf_mass) / max(abs(top_mass), abs(leaf_mass), 1e-12),
+        "com_abs_max": max(abs(com_top[i] - com_leaf[i]) for i in range(3)),
+        "inertia_abs_max": worst,
+        "inertia_rel": worst / scale,
+    }
+
+
+def _derive_closure(native: dict, raw_scene: dict, masses: dict, source: dict) -> dict:
+    """Rebuild every derived closure finding from the sealed raw facts alone.
+
+    This never reads the Linux report: the report is a receipt to compare against.
+    """
+
+    context = native.get("component_context")
+    if not isinstance(context, dict):
+        raise ValueError("the native mass closure carries no component context")
+    rows = context.get("instances")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("the native component context carries no instance rows")
+    leaves = [row["name"] for row in raw_scene.get("components") or []]
+    body = {"id": "assembly", "components": leaves}
+    try:
+        leaf_total = oracle._raw_world(body, raw_scene, masses, {}, use_effective=False)
+    except ValueError:
+        leaf_total = None
+    effective_total = oracle._raw_world(body, raw_scene, masses, {})
+    effective = oracle.effective_math_map(masses, raw_scene)
+    parents = sorted(
+        name for name in effective if any(leaf == name or leaf.startswith(name + "/") for leaf in leaves)
+    )
+    top_most = [
+        name
+        for name in parents
+        if not any(other != name and (name == other or name.startswith(other + "/")) for other in parents)
+    ]
+    body_members: dict[str, str] = {}
+    for entry in source.get("bodies") or []:
+        if not isinstance(entry, dict):
+            continue
+        owner = str(entry.get("name") or entry.get("id") or "")
+        for member in entry.get("components") or []:
+            body_members[str(member)] = owner
+    blockers = []
+    for name in parents:
+        descendants = {leaf for leaf in leaves if leaf == name or leaf.startswith(name + "/")}
+        owners = sorted({body_members.get(leaf, "") for leaf in descendants} - {""})
+        if not owners or len(owners) != 1:
+            blockers.append(
+                {
+                    "code": "effective_instance_spans_bodies",
+                    "component": name,
+                    "bodies": owners,
+                    "descendants": sorted(descendants)[:50],
+                }
+            )
+    parsed = []
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("name"), str):
+            raise ValueError("the native component context carries a malformed instance row")
+        parsed.append((row["name"], row))
+    masses_by_name = {
+        name: float((payload or {}).get("mass") or 0.0)
+        for name, payload in masses.items()
+        if isinstance(payload, dict)
+    }
+    basis_by_node = {
+        name: sum(
+            mass for leaf, mass in masses_by_name.items() if leaf == name or leaf.startswith(name + "/")
+        )
+        for name, _row in parsed
+    }
+    instances = {}
+    for name, row in parsed:
+        basis = basis_by_node[name]
+        context_mass = float(row["context_mass_kg"])
+        instances[name] = {"document_basis_mass_kg": basis, "delta_kg": context_mass - basis}
+    top_rows = [row for name, row in parsed if row.get("depth") == 0]
+    if not top_rows:
+        raise ValueError("the native component context has no top-level rows")
+    context_kg = sum(float(row["context_mass_kg"]) for row in top_rows)
+    document_kg = sum(basis_by_node[name] for name, row in parsed if row.get("depth") == 0)
+    assembly_kg = context.get("assembly_mass_kg")
+    assembly_kg = None if assembly_kg is None else float(assembly_kg)
+    part_rows = {name for name, row in parsed if str(row.get("document_type") or "") == "part"}
+    covered_documents = {leaf for leaf in leaves if leaf in part_rows}
+    overridden = {
+        "top_level_instances": len(top_rows),
+        "mass": sum(1 for _name, row in parsed if (row.get("overrides") or {}).get("OverrideMass")),
+        "com": sum(1 for _name, row in parsed if (row.get("overrides") or {}).get("OverrideCenterOfMass")),
+        "inertia": sum(1 for _name, row in parsed if (row.get("overrides") or {}).get("OverrideMomentsOfInertia")),
+        "any": sum(1 for _name, row in parsed if any((row.get("overrides") or {}).values())),
+        "top_level_overridden": sum(1 for row in top_rows if any((row.get("overrides") or {}).values())),
+        "examples": [
+            name for name, row in parsed if (row.get("overrides") or {}).get("OverrideMass")
+        ][:50],
+    }
+    leaf_payload = (
+        None
+        if leaf_total is None
+        else {
+            "mass": leaf_total["mass"],
+            "com": leaf_total["com"].tolist(),
+            "inertia": leaf_total["inertia"].tolist(),
+        }
+    )
+    top_level = native.get("top_level")
+    delta = _closure_delta(top_level, leaf_total) if isinstance(top_level, dict) and leaf_total else None
+    return {
+        "leaf_total": leaf_payload,
+        "effective_total": {
+            "mass": effective_total["mass"],
+            "com": effective_total["com"].tolist(),
+            "inertia": effective_total["inertia"].tolist(),
+            "substituted": top_most,
+        },
+        "blockers": blockers,
+        "delta": delta,
+        "totals": {
+            "context_kg": context_kg,
+            "document_kg": document_kg,
+            "assembly_kg": assembly_kg,
+            "context_minus_document_kg": context_kg - document_kg,
+            "context_minus_assembly_kg": None if assembly_kg is None else context_kg - assembly_kg,
+        },
+        "overridden": overridden,
+        "coverage": {
+            "leaf_documents": len(leaves),
+            "leaf_documents_covered": len(covered_documents),
+            "leaf_documents_uncovered": sorted(set(leaves) - covered_documents)[:50],
+        },
+        "instances": {
+            name: {"name": name, **instances[name]} for name, _row in parsed
+        },
+    }
+
+
+def _compare_derived(recorded, mine, label: str, _require) -> None:
+    """Bind the Linux report's derived block to the verifier's own recomputation."""
+
+    if isinstance(mine, dict):
+        _require(isinstance(recorded, dict) and set(recorded) == set(mine), label + ": derived keys changed")
+        for key in sorted(mine):
+            _compare_derived(recorded[key], mine[key], label + "." + key, _require)
+        return
+    if isinstance(mine, list):
+        _require(isinstance(recorded, list) and len(recorded) == len(mine), label + ": derived list changed")
+        left = list(recorded)
+        right = list(mine)
+        if right and all(isinstance(item, str) for item in right):
+            left, right = sorted(left), sorted(right)
+        elif right and all(isinstance(item, dict) and "name" in item for item in right):
+            left = sorted(left, key=lambda item: item.get("name"))
+            right = sorted(right, key=lambda item: item.get("name"))
+        for index, (recorded_item, mine_item) in enumerate(zip(left, right)):
+            _compare_derived(recorded_item, mine_item, f"{label}[{index}]", _require)
+        return
+    if isinstance(mine, bool) or mine is None or isinstance(mine, str):
+        _require(recorded == mine, label + ": derived value changed")
+        return
+    if isinstance(mine, (int, float)):
+        _require(
+            isinstance(recorded, (int, float))
+            and not isinstance(recorded, bool)
+            and abs(float(recorded) - float(mine)) <= max(1e-12, 1e-6 * abs(float(mine))),
+            label + ": derived number changed",
+        )
+        return
+    _require(recorded == mine, label + ": derived value changed")
