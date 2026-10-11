@@ -715,6 +715,43 @@ def session_materialization_path(value) -> bool:
     return candidate == root or candidate.startswith(root.rstrip("\\/") + separator)
 
 
+def session_temp_root(value) -> str | None:
+    """Absolute per-session temp root that contains a materialization's IC~~ dir.
+
+    For ``<temp>\\swxNNNN\\IC~~\\X.ext`` this is ``<temp>\\swxNNNN`` -- the
+    owned session temp area -- returned only when the path has an ``IC~~``
+    component and the root lies under (or is) the system temp area.  Never a
+    basename or suffix rule; ``None`` when the shape is not a session
+    materialization.
+    """
+
+    text = str(value or "")
+    if not text.strip():
+        return None
+    module = ntpath if (re.match(r"^[A-Za-z]:", text) or text.startswith("\\\\") or "\\" in text) else posixpath
+    separator = "\\" if module is ntpath else "/"
+    try:
+        normalized = module.normpath(text)
+    except (TypeError, ValueError):
+        return None
+    parts = normalized.split(separator)
+    for position, part in enumerate(parts):
+        if part.casefold() == "ic~~":
+            head = separator.join(parts[:position]).rstrip("\\/")
+            break
+    else:
+        return None
+    try:
+        temp = module.normcase(module.normpath(str(tempfile.gettempdir())))
+        candidate = module.normcase(head)
+    except (TypeError, ValueError):
+        return None
+    prefix = temp.rstrip("\\/") + separator
+    if candidate == temp or candidate.startswith(prefix):
+        return head
+    return None
+
+
 def _matches_assembly_root(reference, root, reference_full, reference_name, assembly_full) -> bool:
     """True when a mate entity references the owning assembly's own root component.
 
@@ -1809,6 +1846,7 @@ def _component_source_document(component, source_root):
                 "state": "cached_materialization",
                 "kind": "native_import_materialization",
                 "document": None,
+                "session_temp_root": session_temp_root(native_path),
             }
         )
     else:

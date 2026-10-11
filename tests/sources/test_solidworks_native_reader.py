@@ -3504,6 +3504,7 @@ class ComponentSourceDocumentTests(unittest.TestCase):
         self.assertEqual(provenance["state"], "cached_materialization")
         self.assertEqual(provenance["kind"], "native_import_materialization")
         self.assertEqual(provenance["materialization_path"], str(self.materialization))
+        self.assertEqual(provenance["session_temp_root"], str(self.materialization.parent.parent))
         self.assertEqual(provenance["author_imported_path"], r"D:\author\X.stp")
         self.assertIs(provenance["is_virtual"], False)
 

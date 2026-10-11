@@ -43,7 +43,7 @@ from pathlib import Path
 
 from ...io import PipelineError, _filesystem_path, artifact_path_parts, digest
 from .handoff import MAX_HANDOFF_BYTES, _directory
-from .native import session_materialization_path
+from .native import session_materialization_path, session_temp_root
 from .selection import MAX_SELECTION_FILES, SelectionError, validate_file_index
 
 __all__ = ["MAX_SELECTION_FILES", "NativeSelectionReader"]
@@ -348,12 +348,39 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                 owner = record.get("native_owner")
                 owner = owner if isinstance(owner, str) and owner in files else (defining_name or raw_defining)
                 owner_sha256 = files.get(owner) if isinstance(owner, str) and owner in files else None
+                # An author import path that resolves to a staged index file is
+                # the actual delivered source: retain it as a bound graph edge
+                # so the sealed selection keeps it in the frozen folder (the
+                # collector needs it and pruning would otherwise lose it).
+                bound_source = None
+                if imported:
+                    candidate = _indexed(stage_root, imported, files)
+                    if candidate is not None and staged_ok(candidate):
+                        bound_source = candidate
+                if bound_source is not None:
+                    graph_entry(defining_name)["references"].add(bound_source)
+                    graph_entry(bound_source)
+                    document_entry(bound_source)
+                    document_entry(defining_name)["resolved_edges"].append(
+                        {
+                            "name": record.get("name"),
+                            "instance": instance,
+                            "kind": "native_imported_document",
+                            "resolved": bound_source,
+                            "resolved_path": imported,
+                            "configuration": record.get("configuration"),
+                            "suppression_state": state,
+                            "lightweight": lightweight,
+                            "evidence": "in-stage author import source retained",
+                        }
+                    )
                 imports.append(
                     {
                         "document": label,
                         "owner": owner,
                         "owner_anchor": raw_anchor,
                         "owner_sha256": owner_sha256,
+                        "bound_source": bound_source,
                         "defining_materialization": raw_defining if cached_defining else None,
                         "instance": instance,
                         "name": record.get("name"),
@@ -361,6 +388,7 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                         "author_metadata_in_stage": author_in_stage,
                         "is_virtual": virtual if type(virtual) is bool else None,
                         "materialization": resolved,
+                        "session_temp_root": session_temp_root(resolved),
                         "configuration": record.get("configuration"),
                         "suppression_state": state,
                         "state": "cached_materialization",
@@ -380,6 +408,7 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                         "owner_sha256": owner_sha256,
                         "instance": instance,
                         "materialization": resolved,
+                        "session_temp_root": session_temp_root(resolved),
                         "author_imported_path": imported,
                         "author_metadata_in_stage": author_in_stage,
                         "needs_absence_test": True,

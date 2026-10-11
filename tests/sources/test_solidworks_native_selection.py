@@ -212,6 +212,7 @@ class ClosureAdmissionTests(unittest.TestCase):
         self.assertEqual(entry["binding"], "author_metadata_only")
         self.assertEqual(entry["author_imported_path"], r"C:\Users\Mi\Desktop\NP-F550.step")
         self.assertEqual(entry["materialization"], temp)
+        self.assertEqual(entry["session_temp_root"], str(Path(tempfile.gettempdir()) / "swx39388"))
         self.assertEqual(entry["owner"], "robot.SLDASM")
         self.assertEqual(entry["owner_sha256"], self.files["robot.SLDASM"])
         self.assertFalse(entry["author_metadata_in_stage"])
@@ -237,7 +238,13 @@ class ClosureAdmissionTests(unittest.TestCase):
         entry = payload["imports"][0]
         self.assertTrue(entry["author_metadata_in_stage"])
         self.assertEqual(entry["state"], "cached_materialization")
-        self.assertNotIn("NP-F550.step", payload["graph"])
+        # The in-stage author source is the actual delivered source: it stays
+        # in the sealed graph so the frozen folder retains it for the collector.
+        self.assertEqual(entry["bound_source"], "NP-F550.step")
+        self.assertEqual(payload["graph"]["robot.SLDASM"]["references"], ["NP-F550.step"])
+        edge = payload["documents"]["robot.SLDASM"]["resolved_edges"][0]
+        self.assertEqual(edge["kind"], "native_imported_document")
+        self.assertEqual(edge["resolved"], "NP-F550.step")
 
     def test_import_marker_outside_session_temp_is_not_a_cache(self) -> None:
         fake_temp = r"C:\Users\Mi\Documents\IC~~\NP-F550.step.SLDPRT"
