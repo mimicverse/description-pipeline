@@ -1,975 +1,137 @@
-"""Focused selection-transport tests: client contract and DAG round wiring (fake HTTP).
-
-The fake endpoint implements the frozen selection contract: POST /v1/jobs with
-the upload index, GET snapshots, exact-batch pushes bound by X-Selection-Round,
-a seal that re-hashes its own stage, and the awaiting-definition leg (raw-record
-artifact download, definition submission, abort). The tests drive the real client
-and the real DAG poke loop against it; no SolidWorks, no deployed services.
-"""
+"""Locked selection contract: closure sealing and one-batch provisional transport."""
 
 from __future__ import annotations
 
-import importlib.util
 import hashlib
-import io
-import json
-import shutil
 import tempfile
-import threading
 import unittest
 import zipfile
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import patch
 
-from description_pipeline.io import PipelineError, digest
-from description_pipeline.orchestration.airflow_client import (
-    EndpointConfig,
-    EndpointConflict,
-    EndpointError,
-    EndpointProtocolError,
-    WindowsEndpoint,
-    drive_selection_round,
+from description_pipeline.io import digest, inventory
+from description_pipeline.orchestration.selection_transport import StagedSelection
+from description_pipeline.sources.solidworks.selection import (
+    SelectionError,
+    seal_closure_selection,
+    verify_selection,
 )
-from description_pipeline.orchestration.selection_client import prepare_selection_batch
-from description_pipeline.sources.solidworks.revision import package_inventory
-from description_pipeline.sources.solidworks.selection import seal_selection, selection_plan
 
-ROOT = Path(__file__).resolve().parents[2]
-DAG_PATH = ROOT / "deploy/airflow/dags/solidworks_to_urdf.py"
+from tests.sources.selection_support import closure_evidence, sealed_selection
 
-
-def _round_id(requested: dict[str, str]) -> str:
-    return digest({"requested": requested})
-
-
-class _FakeSelection:
-    """In-memory endpoint state machine for exactly one selection job."""
-
-    def __init__(self) -> None:
-        self.jobs: dict[str, dict] = {}
-        self.pushed_batches: list[list[str]] = []
-        self.initial_all = False
-        self.switch_reader_after_pushes: int | None = None
-        self.extra_staged_at_ready: dict[str, str] = {}
-        self.missing_staged_at_ready: bool = False
-        self.linked_manifest_main: str | None = None
-
-    def create(self, payload: dict) -> dict:
-        upload = payload["upload_files"]
-        if digest(upload) != payload["upload_sha256"]:
-            raise ValueError("upload digest mismatch")
-        main = payload["main_assembly"]
-        refs = {
-            main: ["零件.SLDPRT"],
-            "零件.SLDPRT": ["deps/子零件.SLDPRT"],
-            "deps/子零件.SLDPRT": [],
-        }
-        resume = payload.get("resume")
-        if resume is not None:
-            parent = self.jobs[resume["parent_run"]]
-            if parent["state"] != "sealed":
-                raise ValueError("linked parent selection is not sealed")
-            manifest = dict(parent["manifest"])
-            if self.linked_manifest_main is not None:
-                manifest["main_assembly"] = self.linked_manifest_main
-            job = {
-                "request": dict(payload),
-                "upload": dict(parent["upload"]),
-                "refs": refs,
-                "reader": parent["reader"],
-                "staged": dict(parent["staged"]),
-                "observations": dict(parent["observations"]),
-                "requested": {},
-                "state": "sealed",
-                "settle": None,
-                "status": "queued",
-                "pushes": 0,
-                "reading_gets": 0,
-                "manifest": manifest,
-            }
-            self.jobs[payload["run_id"]] = job
-            return self.snapshot(job)
-        requested = {name: upload[name] for name in upload} if self.initial_all else {main: upload[main]}
-        job = {
-            "request": dict(payload),
-            "upload": dict(upload),
-            "refs": refs,
-            "reader": "a" * 64,
-            "staged": {},
-            "observations": {},
-            "requested": requested,
-            "state": "awaiting_files",
-            "settle": None,
-            "status": "selecting",
-            "pushes": 0,
-            "reading_gets": 0,
-        }
-        self.jobs[payload["run_id"]] = job
-        return self.snapshot(job)
-
-    def snapshot(self, job: dict) -> dict:
-        selection = {
-            "state": job["state"],
-            "round_id": _round_id(job["requested"]),
-            "reader_sha256": job["reader"],
-            "observations": {name: dict(record) for name, record in job["observations"].items()},
-            "staged_files": dict(job["staged"]),
-            "requested_files": dict(job["requested"]),
-        }
-        if job.get("manifest") is not None:
-            selection["manifest"] = job["manifest"]
-        snapshot = {
-            "schema_version": "solidworks-to-urdf.job/v1",
-            "pipeline_id": "solidworks-to-urdf",
-            "run_id": job["request"]["run_id"],
-            "status": job["status"],
-            "events": [],
-            "request": dict(job["request"]),
-            "native_tool": {"source_sha256": job["reader"], "role": "native"},
-            "selection": selection,
-        }
-        if job.get("record") is not None:
-            snapshot["native_record"] = job["record"]
-        return snapshot
-
-    def _settle(self, job: dict) -> None:
-        if job["state"] != "reading":
-            return
-        job["reading_gets"] += 1
-        if job["reading_gets"] % 2:
-            return
-        plan = selection_plan(job["upload"], job["request"]["main_assembly"], job["observations"])
-        if plan["state"] == "complete":
-            job["state"] = "ready"
-            job["requested"] = {}
-            if self.missing_staged_at_ready:
-                job["staged"].pop(job["request"]["main_assembly"], None)
-            job["staged"].update(self.extra_staged_at_ready)
-        else:
-            job["state"] = "awaiting_files"
-            job["requested"] = plan["requested_files"]
-
-    def get(self, run_id: str) -> dict:
-        job = self.jobs[run_id]
-        self._settle(job)
-        return self.snapshot(job)
-
-    def push(self, run_id: str, round_id: str, members: dict[str, bytes]) -> dict:
-        job = self.jobs[run_id]
-        if round_id != _round_id(job["requested"]):
-            raise _Conflict("stale selection round")
-        for name, blob in members.items():
-            checksum = hashlib.sha256(blob).hexdigest()
-            if job["upload"].get(name) != checksum:
-                raise ValueError(f"unauthorized member: {name}")
-        retry = set(members) <= set(job["staged"]) and all(
-            job["staged"].get(name) == hashlib.sha256(blob).hexdigest() for name, blob in members.items()
-        )
-        if not retry and set(members) != set(job["requested"]):
-            raise ValueError("push differs from the current request")
-        if not retry:
-            job["staged"].update({name: job["upload"][name] for name in members})
-            for name in members:
-                job["observations"][name] = {
-                    "sha256": job["staged"][name],
-                    "references": list(job["refs"].get(name, [])),
-                }
-            job["pushes"] += 1
-            self.pushed_batches.append(sorted(members))
-            if self.switch_reader_after_pushes == job["pushes"]:
-                job["reader"] = "b" * 64
-            job["state"] = "reading"
-            job["reading_gets"] = 0
-        return self.snapshot(job)
-
-    def seal(self, run_id: str, manifest: dict) -> dict:
-        job = self.jobs[run_id]
-        expected = seal_selection(
-            job["upload"],
-            job["request"]["main_assembly"],
-            job["observations"],
-            selected_files=job["staged"],
-            reader_sha256=job["reader"],
-        )
-        if manifest != expected:
-            raise ValueError("seal differs from the endpoint graph")
-        job["state"] = "sealed"
-        job["requested"] = {}
-        job["status"] = "awaiting_definition"
-        job["manifest"] = expected
-        record_manifest = {
-            "schema_version": "solidworks-to-urdf.raw-record/v1",
-            "run_id": job["request"]["run_id"],
-            "selection_sha256": expected["selection_sha256"],
-            "files": {"record.json": "e" * 64},
-        }
-        buffer = io.BytesIO()
-        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as bundle:
-            bundle.writestr("record.json", json.dumps({"run_id": job["request"]["run_id"], "fixture": True}))
-            bundle.writestr("manifest.json", json.dumps(record_manifest))
-        blob = buffer.getvalue()
-        job["record_blob"] = blob
-        job["record"] = {
-            "name": "raw-record.zip",
-            "sha256": hashlib.sha256(blob).hexdigest(),
-            "size": len(blob),
-            "manifest_sha256": digest(record_manifest),
-            "manifest": record_manifest,
-        }
-        return self.snapshot(job)
-
-    def definition(self, run_id: str, prepared_sha256: str, members: dict) -> dict:
-        job = self.jobs[run_id]
-        if job["status"] != "awaiting_definition":
-            raise ValueError("job does not await a definition")
-        job["definition"] = {"prepared_sha256": prepared_sha256, "members": sorted(members)}
-        job["status"] = "running"
-        return self.snapshot(job)
-
-    def abort(self, run_id: str, payload: dict) -> dict:
-        job = self.jobs[run_id]
-        if job["status"] != "awaiting_definition":
-            raise ValueError("job does not await a definition")
-        job["abort"] = payload
-        job["status"] = "failed"
-        return self.snapshot(job)
-
-
-class _Conflict(Exception):
-    pass
-
-
-def _handler(state: _FakeSelection):
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *args):  # noqa: A003 - silence the test server
-            return
-
-        def _reply(self, status: int, payload: dict) -> None:
-            body = json.dumps(payload).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def _body(self) -> bytes:
-            length = int(self.headers.get("Content-Length", "0"))
-            return self.rfile.read(length)
-
-        def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler API
-            try:
-                if self.path == "/v1/jobs":
-                    payload = json.loads(self._body())
-                    self._reply(201, state.create(payload))
-                    return
-                parts = self.path.strip("/").split("/")
-                run_id = parts[2] if len(parts) > 2 else ""
-                if len(parts) == 4 and parts[3] == "files":
-                    members = {}
-                    with zipfile.ZipFile(io.BytesIO(self._body())) as archive:
-                        for name in archive.namelist():
-                            members[name] = archive.read(name)
-                    self._reply(200, state.push(run_id, self.headers.get("X-Selection-Round"), members))
-                    return
-                if len(parts) == 4 and parts[3] == "seal":
-                    manifest = json.loads(self._body())["selection"]
-                    self._reply(200, state.seal(run_id, manifest))
-                    return
-                if len(parts) == 4 and parts[3] == "definition":
-                    if self.headers.get("Content-Type", "").split(";")[0] != "application/zip":
-                        raise _Conflict("definition body must be a zip")
-                    prepared = self.headers.get("X-Prepared-SHA256")
-                    if prepared is None:
-                        raise _Conflict("missing prepared digest header")
-                    members = {}
-                    with zipfile.ZipFile(io.BytesIO(self._body())) as archive:
-                        for name in archive.namelist():
-                            members[name] = archive.read(name)
-                    self._reply(202, state.definition(run_id, prepared, members))
-                    return
-                if len(parts) == 4 and parts[3] == "abort":
-                    self._reply(200, state.abort(run_id, json.loads(self._body())))
-                    return
-            except _Conflict as error:
-                self._reply(409, {"error": str(error)})
-                return
-            except (ValueError, KeyError) as error:
-                self._reply(400, {"error": str(error)})
-                return
-            self._reply(404, {"error": "unknown route"})
-
-        def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler API
-            parts = self.path.strip("/").split("/")
-            if len(parts) == 5 and parts[0] == "v1" and parts[1] == "jobs" and parts[3] == "artifacts":
-                job = state.jobs.get(parts[2])
-                if job is None or parts[4] != "raw-record.zip" or "record_blob" not in job:
-                    self._reply(404, {"error": "no such artifact"})
-                    return
-                blob = job["record_blob"]
-                self.send_response(200)
-                self.send_header("Content-Type", "application/zip")
-                self.send_header("Content-Length", str(len(blob)))
-                self.end_headers()
-                self.wfile.write(blob)
-                return
-            if len(parts) == 3 and parts[0] == "v1" and parts[1] == "jobs":
-                try:
-                    self._reply(200, state.get(parts[2]))
-                except KeyError:
-                    self._reply(404, {"error": "no such job"})
-                return
-            self._reply(404, {"error": "unknown route"})
-
-    return Handler
-
-
-def _intake(root: Path) -> Path:
-    intake = root / "intake"
-    (intake / "deps").mkdir(parents=True)
-    (intake / "总装.SLDASM").write_bytes(b"assembly bytes")
-    (intake / "零件.SLDPRT").write_bytes(b"part bytes")
-    (intake / "deps" / "子零件.SLDPRT").write_bytes(b"child part bytes")
-    (intake / "notes.txt").write_bytes(b"not a dependency")
-    (intake / "decoy.SLDPRT").write_bytes(b"unrelated CAD decoy")
-    return intake
-
-
-def _upload_files(intake: Path) -> dict[str, str]:
-    return package_inventory(intake)
+UPLOAD_NAMES = {
+    "cad/robot.SLDASM": b"main bytes",
+    "cad/base.SLDPRT": b"base bytes",
+    "cad/arm.SLDPRT": b"arm bytes",
+    "notes.txt": b"notes bytes",
+}
+MAIN = "cad/robot.SLDASM"
 
 
 class ClosureSealContractTests(unittest.TestCase):
-    """Locked minimal contract: one provisional upload batch, native closure seal and prune."""
-
     def setUp(self) -> None:
-        import tempfile
-        from pathlib import Path
+        temporary = tempfile.TemporaryDirectory(prefix="selection-closure-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.upload = {name: hashlib.sha256(data).hexdigest() for name, data in UPLOAD_NAMES.items()}
+        self.stage_root = str(self.root / "stage")
 
-        self._temporary = tempfile.TemporaryDirectory(prefix="selection-closure-")
-        self.addCleanup(self._temporary.cleanup)
-        self.root = Path(self._temporary.name)
-
-    def _upload(self):
-        import hashlib
-
-        names = {
-            "cad/robot.SLDASM": b"main bytes",
-            "cad/base.SLDPRT": b"base bytes",
-            "cad/arm.SLDPRT": b"arm bytes",
-            "notes.txt": b"notes bytes",
-        }
-        return {name: hashlib.sha256(data).hexdigest() for name, data in names.items()}, names
-
-    def _closure(self, upload, *, edges=None, suppressed=None, **extras):
-        from description_pipeline.io import digest
-
-        edges = edges or {
-            "cad/robot.SLDASM": ["cad/base.SLDPRT", "cad/arm.SLDPRT"],
-            "cad/base.SLDPRT": [],
-            "cad/arm.SLDPRT": [],
-        }
-        documents = {
-            name: {
-                "stored_references": [],
-                "resolved_edges": [
-                    {
-                        "name": reference,
-                        "instance": reference,
-                        "kind": "native_document",
-                        "resolved": reference.replace("/", "\\"),
-                        "resolved_path": "C:\\stage\\" + reference,
-                        "configuration": "Default",
-                        "suppression_state": 2,
-                        "lightweight": False,
-                    }
-                    for reference in refs
-                ],
-            }
-            for name, refs in edges.items()
-        }
-        closure = {
-            "main_assembly": "cad/robot.SLDASM",
-            "stage_root": "C:\\stage\\run-1",
-            "upload_sha256": digest(upload),
-            "reader_sha256": "ab" * 32,
-            "session": {"pid": 1},
-            "suppressed": list(suppressed or []),
-            "graph": {name: {"sha256": upload[name], "references": refs} for name, refs in edges.items()},
-            "documents": documents,
-            "stored_references": [],
-            "resolved_edges": [],
-            "imports": [],
-            "open_status": {},
-        }
-        closure.update(extras)
-        return closure
+    def _evidence(self, **kwargs) -> dict:
+        kwargs.setdefault("stage_root", self.stage_root)
+        kwargs.setdefault(
+            "edges",
+            {MAIN: ["cad/base.SLDPRT", "cad/arm.SLDPRT"], "cad/base.SLDPRT": [], "cad/arm.SLDPRT": []},
+        )
+        return closure_evidence(self.upload, MAIN, **kwargs)
 
     def test_seal_reports_the_reachable_closure_and_excludes_the_rest(self) -> None:
-        from description_pipeline.io import digest
-        from description_pipeline.sources.solidworks.selection import (
-            SelectionError,
-            seal_closure_selection,
-            verify_selection,
+        manifest = sealed_selection(
+            self.upload,
+            MAIN,
+            edges={MAIN: ["cad/base.SLDPRT", "cad/arm.SLDPRT"], "cad/base.SLDPRT": [], "cad/arm.SLDPRT": []},
+            stage_root=self.stage_root,
         )
-
-        upload, _ = self._upload()
-        manifest = seal_closure_selection(upload, "cad/robot.SLDASM", self._closure(upload), reader_sha256="ab" * 32)
         self.assertEqual(set(manifest["files"]), {"cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT"})
         self.assertEqual(set(manifest["excluded_files"]), {"notes.txt"})
         self.assertEqual(manifest["handoff_sha256"], digest(manifest["files"]))
-        self.assertEqual(manifest["upload_sha256"], digest(upload))
-        digests = {manifest["upload_sha256"], manifest["handoff_sha256"], manifest["selection_sha256"]}
-        self.assertEqual(len(digests), 3)
-        self.assertEqual(manifest["closure"]["stage_root"], "C:\\stage\\run-1")
-        self.assertEqual(manifest["closure"]["session"], {"pid": 1})
-        verified = verify_selection(manifest, upload, manifest["files"], reader_sha256="ab" * 32)
+        self.assertEqual(manifest["upload_sha256"], digest(self.upload))
+        self.assertEqual(len({manifest["upload_sha256"], manifest["handoff_sha256"], manifest["selection_sha256"]}), 3)
+        self.assertEqual(manifest["closure"]["stage_root"], self.stage_root)
+        verified = verify_selection(manifest, self.upload, manifest["files"], reader_sha256=manifest["reader_sha256"])
         self.assertEqual(verified, manifest)
-        tampered = {**manifest, "selection_sha256": "00" * 32}
         with self.assertRaises(SelectionError):
-            verify_selection(tampered, upload, manifest["files"], reader_sha256="ab" * 32)
+            verify_selection(
+                {**manifest, "selection_sha256": "00" * 32},
+                self.upload,
+                manifest["files"],
+                reader_sha256=manifest["reader_sha256"],
+            )
 
     def test_closure_refusals_keep_the_evidence_structural(self) -> None:
-        from description_pipeline.sources.solidworks.selection import SelectionError, seal_closure_selection
-
-        upload, _ = self._upload()
-
-        def drop_one_edge(closure) -> None:
-            closure["documents"]["cad/robot.SLDASM"]["resolved_edges"].pop()
+        def drop_edge(closure) -> None:
+            closure["documents"][MAIN]["resolved_edges"].pop()
 
         cases = {
-            "outside_index": lambda closure: closure["graph"]["cad/robot.SLDASM"]["references"].append("other.SLDAPRT"),
-            "repeated_edge": lambda closure: closure["graph"]["cad/robot.SLDASM"]["references"].append(
-                "cad/base.SLDPRT"
-            ),
+            "outside_index": lambda closure: closure["graph"][MAIN]["references"].append("other.SLDAPRT"),
+            "repeated_edge": lambda closure: closure["graph"][MAIN]["references"].append("cad/base.SLDPRT"),
             "sha_mismatch": lambda closure: closure["graph"]["cad/base.SLDPRT"].update(sha256="00" * 32),
             "missing_observation": lambda closure: closure["graph"].pop("cad/arm.SLDPRT"),
-            "bad_suppressed": lambda closure: closure["suppressed"].append({"document": "cad/base.SLDPRT"}),
             "upload_mismatch": lambda closure: closure.update(upload_sha256="00" * 32),
             "reader_mismatch": lambda closure: closure.update(reader_sha256="00" * 32),
             "missing_stage_root": lambda closure: closure.pop("stage_root"),
-            "coherence_edge_missing": drop_one_edge,
+            "staged_sha_mismatch": lambda closure: closure["documents"]["cad/base.SLDPRT"].update(
+                staged_sha256="00" * 32
+            ),
+            "search_not_restored": lambda closure: closure["search_configuration"].update(restored=False),
+            "search_not_pinned": lambda closure: closure["search_configuration"].update(pinned=["/elsewhere"]),
+            "session_open": lambda closure: closure["session"].update(closed=False),
+            "open_status_bad": lambda closure: closure.update(open_status={"errors": "many", "warnings": 0}),
+            "coherence_edge_missing": drop_edge,
             "import_not_bound": lambda closure: closure["imports"].append(
-                {"document": "cad/robot.SLDASM", "resolved": "cad/base.SLDPRT", "state": "unbound"}
+                {"document": MAIN, "resolved": "cad/base.SLDPRT", "state": "unbound"}
             ),
         }
         for label, mutate in cases.items():
             with self.subTest(case=label):
-                closure = self._closure(upload)
-                mutate(closure)
+                evidence = self._evidence()
+                mutate(evidence)
                 with self.assertRaises(SelectionError):
-                    seal_closure_selection(upload, "cad/robot.SLDASM", closure, reader_sha256="ab" * 32)
+                    seal_closure_selection(self.upload, MAIN, evidence, reader_sha256="ab" * 32)
 
     def _staged_session(self):
-        import zipfile
-
-        from description_pipeline.orchestration.selection_transport import StagedSelection
-
-        upload, names = self._upload()
-        intake = self.root / "intake"
-        for name, data in names.items():
-            path = intake / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(data)
+        session = StagedSelection(self.root / "stage", self.upload, MAIN, reader_sha256="ab" * 32)
         archive = self.root / "batch.zip"
         with zipfile.ZipFile(archive, "x", zipfile.ZIP_DEFLATED) as sink:
-            for name, data in names.items():
+            for name, data in UPLOAD_NAMES.items():
                 sink.writestr(name, data)
-        session = StagedSelection(self.root / "stage", upload, "cad/robot.SLDASM", reader_sha256="ab" * 32)
-        return session, upload, archive
+        return session, archive
 
-    def test_single_provisional_batch_prune_and_snapshot_proof(self) -> None:
-        from description_pipeline.io import inventory
-
-        session, upload, archive = self._staged_session()
-        snapshot = session.snapshot()
-        self.assertEqual(snapshot["state"], "awaiting_files")
-        self.assertEqual(snapshot["upload_sha256"], session.upload_sha256)
-        self.assertTrue(session.stage_full_upload(archive))
-        self.assertFalse(session.stage_full_upload(archive))
+    def test_single_provisional_batch_seals_and_prunes_with_snapshot_proof(self) -> None:
+        session, archive = self._staged_session()
+        self.assertEqual(set(session.snapshot()), {"state", "reader_sha256", "upload_sha256", "staged_files"})
+        self.assertTrue(session.accept_batch(archive))
+        self.assertFalse(session.accept_batch(archive))
         self.assertEqual(session.snapshot()["state"], "reading")
-        self.assertEqual(session.snapshot()["staged_files"], upload)
-        manifest = session.seal_closure(self._closure(upload))
+        self.assertEqual(session.snapshot()["staged_files"], self.upload)
+        manifest = session.seal_closure(self._evidence())
         self.assertEqual(session.snapshot()["state"], "sealed")
-        self.assertEqual(session.snapshot()["staged_files"], upload)
+        self.assertEqual(session.snapshot()["staged_files"], self.upload)
         self.assertEqual(session.snapshot()["manifest"], manifest)
         self.assertEqual(inventory(session.stage), manifest["files"])
         self.assertEqual(set(manifest["excluded_files"]), {"notes.txt"})
 
-    def test_seal_refuses_a_tampered_provisional_stage_and_bad_archive(self) -> None:
-        import zipfile
-
-        from description_pipeline.io import inventory
-        from description_pipeline.orchestration.selection_transport import StagedSelection
-        from description_pipeline.sources.solidworks.selection import SelectionError
-
-        session, upload, archive = self._staged_session()
-        self.assertTrue(session.stage_full_upload(archive))
+    def test_transport_refuses_a_tampered_stage_and_a_wrong_index(self) -> None:
+        session, archive = self._staged_session()
+        self.assertTrue(session.accept_batch(archive))
         (session.stage / "cad/base.SLDPRT").write_bytes(b"tampered")
         with self.assertRaises(SelectionError):
-            session.seal_closure(self._closure(upload))
-        self.assertTrue(inventory(session.stage))
+            session.seal_closure(self._evidence())
         broken = self.root / "broken.zip"
         with zipfile.ZipFile(broken, "x", zipfile.ZIP_DEFLATED) as sink:
-            sink.writestr("cad/robot.SLDASM", b"main bytes")
-        fresh = StagedSelection(self.root / "stage2", upload, "cad/robot.SLDASM", reader_sha256="ab" * 32)
+            sink.writestr(MAIN, UPLOAD_NAMES[MAIN])
+        fresh = StagedSelection(self.root / "stage2", self.upload, MAIN, reader_sha256="ab" * 32)
         with self.assertRaises(SelectionError):
-            fresh.stage_full_upload(broken)
+            fresh.accept_batch(broken)
         self.assertEqual(inventory(fresh.stage), {})
-
-
-class SelectionTransportTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.state = _FakeSelection()
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _handler(self.state))
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-        self.addCleanup(self.server.server_close)
-        self.addCleanup(self.thread.join, 5)
-        self.addCleanup(self.server.shutdown)
-        self.endpoint = WindowsEndpoint(
-            EndpointConfig(base_url=f"http://127.0.0.1:{self.server.server_port}", token="t")
-        )
-        self.tmp = Path(tempfile.mkdtemp(prefix="selection-transport-"))
-        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-        self.intake = _intake(self.tmp)
-        self.upload = _upload_files(self.intake)
-        self.run_id = "1b3faa2a-0000-4000-8000-000000000001"
-        self.batch_dir = self.tmp / "batches"
-
-    def _start(self) -> dict:
-        return self.endpoint.start_selection_job(
-            run_id=self.run_id, upload_files=self.upload, main_assembly="总装.SLDASM"
-        )
-
-    def _drive(self, previous=None) -> dict:
-        return drive_selection_round(
-            self.endpoint,
-            run_id=self.run_id,
-            upload_files=self.upload,
-            main_assembly="总装.SLDASM",
-            intake_dir=self.intake,
-            batch_dir=self.batch_dir,
-            previous=previous,
-        )
-
-    def test_round_loop_reaches_a_sealed_manifest_without_decoys(self) -> None:
-        self._start()
-        actions: list[str] = []
-        previous = None
-        outcome = {}
-        for _ in range(8):
-            outcome = self._drive(previous)
-            actions.append(outcome["action"])
-            previous = outcome.get("progress")
-            if outcome["action"] == "sealed":
-                break
-        self.assertEqual(outcome["action"], "sealed")
-        self.assertIn("wait", actions)
-        manifest = outcome["manifest"]
-        self.assertEqual(set(manifest["files"]), {"总装.SLDASM", "零件.SLDPRT", "deps/子零件.SLDPRT"})
-        self.assertEqual(manifest["upload_sha256"], digest(self.upload))
-        self.assertEqual(manifest["handoff_sha256"], digest(manifest["files"]))
-        seal_free = {key: value for key, value in manifest.items() if key != "selection_sha256"}
-        self.assertEqual(manifest["selection_sha256"], digest(seal_free))
-        self.assertEqual(
-            manifest["excluded_files"],
-            {"notes.txt": self.upload["notes.txt"], "decoy.SLDPRT": self.upload["decoy.SLDPRT"]},
-        )
-        pushed = {name for batch in self.state.pushed_batches for name in batch}
-        self.assertEqual(pushed, {"总装.SLDASM", "零件.SLDPRT", "deps/子零件.SLDPRT"})
-        self.assertNotIn("decoy.SLDPRT", pushed)
-        self.assertNotIn("notes.txt", pushed)
-
-    def test_stale_round_push_is_refused(self) -> None:
-        self._start()
-        with self.assertRaises(EndpointConflict):
-            self.endpoint.push_selection_batch(
-                run_id=self.run_id,
-                round_id="0" * 64,
-                archive=self._sealed_batch(),
-                batch={"总装.SLDASM": self.upload["总装.SLDASM"]},
-                upload_files=self.upload,
-            )
-
-    def _sealed_batch(self) -> Path:
-        archive = self.tmp / "probe.zip"
-        prepare_selection_batch(
-            self.intake, archive, {"总装.SLDASM": self.upload["总装.SLDASM"]}, expected_upload=self.upload
-        )
-        return archive
-
-    def test_reader_identity_change_between_rounds_is_refused(self) -> None:
-        self.state.switch_reader_after_pushes = 1
-        self._start()
-        with self.assertRaises(EndpointProtocolError) as caught:
-            self._drive()
-        self.assertIn("reader identity changed", str(caught.exception))
-
-    def test_initial_request_must_be_main_only(self) -> None:
-        self.state.initial_all = True
-        with self.assertRaises(EndpointProtocolError) as caught:
-            self._start()
-        self.assertIn("main-assembly-only", str(caught.exception))
-
-    def test_missing_and_extra_stage_bytes_are_refused_before_sealing(self) -> None:
-        for knob in ("missing_staged_at_ready", "extra_staged_at_ready"):
-            with self.subTest(knob=knob):
-                self.state.jobs.clear()
-                self.state.pushed_batches.clear()
-                self.state.switch_reader_after_pushes = None
-                self.state.missing_staged_at_ready = False
-                self.state.extra_staged_at_ready = {}
-                setattr(
-                    self.state,
-                    knob,
-                    {"decoy.SLDPRT": self.upload["decoy.SLDPRT"]} if "extra" in knob else True,
-                )
-                self._start()
-                previous = None
-                with self.assertRaises(EndpointProtocolError):
-                    for _ in range(8):
-                        previous = self._drive(previous).get("progress")
-                self.assertNotEqual(self.state.jobs[self.run_id]["state"], "sealed")
-
-    def test_idempotent_retry_of_one_batch_is_tolerated(self) -> None:
-        self._start()
-        first = self._drive()
-        self.assertEqual(first["action"], "pushed")
-        archive = self._sealed_batch()
-        snapshot = self.state.get(self.run_id)
-        self.endpoint.push_selection_batch(
-            run_id=self.run_id,
-            round_id=snapshot["selection"]["round_id"],
-            archive=archive,
-            batch={"总装.SLDASM": self.upload["总装.SLDASM"]},
-            upload_files=self.upload,
-        )
-        self.assertEqual(self.state.jobs[self.run_id]["pushes"], 1)
-
-    def test_missing_local_member_is_refused(self) -> None:
-        self._start()
-        first = self._drive()
-        self.assertEqual(first["action"], "pushed")
-        (self.intake / "零件.SLDPRT").unlink()
-        previous = first["progress"]
-        with self.assertRaises(PipelineError) as caught:
-            for _ in range(4):
-                previous = self._drive(previous).get("progress")
-        self.assertIn("Missing artifact", str(caught.exception))
-
-    def _sealed_manifest(self) -> dict:
-        self._start()
-        previous = None
-        for _ in range(8):
-            outcome = self._drive(previous)
-            previous = outcome.get("progress")
-            if outcome["action"] == "sealed":
-                return outcome["manifest"]
-        self.fail("selection did not reach a sealed manifest")
-
-    def test_linked_rerun_inherits_the_sealed_parent_selection(self) -> None:
-        manifest = self._sealed_manifest()
-        child = "2b3faa2a-0000-4000-8000-000000000002"
-        resume = {"parent_run": self.run_id, "from_stage": "capture"}
-        response = self.endpoint.start_selection_job(
-            run_id=child, upload_files=self.upload, main_assembly="总装.SLDASM", resume=resume
-        )
-        self.assertEqual(response["status"], "queued")
-        self.assertEqual(response["selection"]["state"], "sealed")
-        self.assertEqual(response["selection"]["manifest"], manifest)
-        retry = self.endpoint.start_selection_job(
-            run_id=child, upload_files=self.upload, main_assembly="总装.SLDASM", resume=resume
-        )
-        self.assertEqual(retry["selection"]["manifest"], manifest)
-
-    def test_linked_rerun_refuses_a_foreign_or_unsealed_parent(self) -> None:
-        self._sealed_manifest()
-        self.state.linked_manifest_main = "零件.SLDPRT"
-        with self.assertRaises(EndpointProtocolError) as caught:
-            self.endpoint.start_selection_job(
-                run_id="2b3faa2a-0000-4000-8000-000000000003",
-                upload_files=self.upload,
-                main_assembly="总装.SLDASM",
-                resume={"parent_run": self.run_id, "from_stage": "capture"},
-            )
-        self.assertIn("different main assembly", str(caught.exception))
-        self.state.linked_manifest_main = None
-        with self.assertRaises(EndpointError):
-            self.endpoint.start_selection_job(
-                run_id="2b3faa2a-0000-4000-8000-000000000004",
-                upload_files=self.upload,
-                main_assembly="总装.SLDASM",
-                resume={"parent_run": "9e9e9e9e-0000-4000-8000-000000000005", "from_stage": "capture"},
-            )
-
-    def test_definition_snapshot_and_record_transport(self) -> None:
-        manifest = self._sealed_manifest()
-        snapshot = self.endpoint.definition_snapshot(self.run_id, upload_files=self.upload)
-        job = self.state.jobs[self.run_id]
-        self.assertEqual(snapshot.record_name, "raw-record.zip")
-        self.assertEqual(snapshot.record_sha256, job["record"]["sha256"])
-        self.assertEqual(snapshot.record_size, job["record"]["size"])
-        self.assertEqual(snapshot.record_manifest, job["record"]["manifest"])
-        self.assertEqual(snapshot.selection.manifest, manifest)
-        destination = self.tmp / "raw-record.zip"
-        self.endpoint.stream_native_record(self.run_id, job["record"], destination)
-        self.assertEqual(destination.read_bytes(), job["record_blob"])
-        self.assertEqual(hashlib.sha256(destination.read_bytes()).hexdigest(), job["record"]["sha256"])
-
-    def test_definition_hand_off_refuses_broken_blocks(self) -> None:
-        self._start()
-        with self.assertRaises(EndpointProtocolError):
-            self.endpoint.definition_snapshot(self.run_id)
-        self._sealed_manifest()
-        record = self.state.jobs[self.run_id]["record"]
-        for tampered in (
-            {**record, "manifest_sha256": "0" * 64},
-            {**record, "name": "native-evidence.zip"},
-            {**record, "size": 0},
-            {**record, "manifest": {}},
-        ):
-            with self.subTest(tampered=str(tampered)[:60]), self.assertRaises(EndpointProtocolError):
-                self.endpoint.stream_native_record(self.run_id, tampered, self.tmp / "tampered.zip")
-
-    def test_definition_submission_carries_the_prepared_digest(self) -> None:
-        self._sealed_manifest()
-        archive = self.tmp / "capture-request.zip"
-        with zipfile.ZipFile(archive, "w") as bundle:
-            bundle.writestr("robot.yaml", "robot:\n  name: fixture\n")
-        prepared = "f" * 64
-        response = self.endpoint.post_definition_archive(self.run_id, archive, prepared_sha256=prepared)
-        self.assertEqual(response["status"], "running")
-        accepted = self.state.jobs[self.run_id]["definition"]
-        self.assertEqual(accepted["prepared_sha256"], prepared)
-        self.assertEqual(accepted["members"], ["robot.yaml"])
-
-    def test_abort_reports_the_local_derivation_failure(self) -> None:
-        self._sealed_manifest()
-        response = self.endpoint.abort_job(
-            self.run_id,
-            error="derivation refused",
-            error_code="definition_derivation_failed",
-            detail={"findings": ["discovery.namespace_mismatch"], "work_dir": str(self.tmp)},
-        )
-        self.assertEqual(response["status"], "failed")
-        self.assertEqual(
-            self.state.jobs[self.run_id]["abort"],
-            {
-                "error": "derivation refused",
-                "error_code": "definition_derivation_failed",
-                "detail": {"findings": ["discovery.namespace_mismatch"], "work_dir": str(self.tmp)},
-            },
-        )
-        with self.assertRaises(EndpointProtocolError):
-            self.endpoint.abort_job(self.run_id, error="", error_code="definition_derivation_failed")
-        with self.assertRaises(EndpointProtocolError):
-            self.endpoint.abort_job(self.run_id, error="x", error_code="y", detail="findings")
-
-
-class SelectionDagTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        try:
-            import airflow.sdk  # noqa: F401
-        except ImportError:
-            raise unittest.SkipTest("Airflow is not installed in this interpreter") from None
-        spec = importlib.util.spec_from_file_location("solidworks_to_urdf_selection_test", DAG_PATH)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        cls.dag = module
-
-    def test_selection_main_is_explicit_or_sole_assembly(self) -> None:
-        upload = {"a.SLDASM": "0" * 64, "b.SLDPRT": "0" * 64}
-        self.assertEqual(self.dag._selection_main(upload, None), "a.SLDASM")
-        self.assertEqual(self.dag._selection_main(upload, "a.SLDASM"), "a.SLDASM")
-        with self.assertRaises(self.dag.AirflowFailException):
-            self.dag._selection_main({"a.SLDASM": "0" * 64, "b.SLDASM": "0" * 64}, None)
-        with self.assertRaises(self.dag.AirflowFailException):
-            self.dag._selection_main(upload, "missing.SLDASM")
-
-    def test_same_request_binds_the_selection_payload(self) -> None:
-        request = {
-            "run_id": "1b3faa2a-0000-4000-8000-000000000001",
-            "upload_files": {"a.SLDASM": "0" * 64},
-            "upload_sha256": digest({"a.SLDASM": "0" * 64}),
-            "main_assembly": "a.SLDASM",
-        }
-        job = {"request": dict(request)}
-        self.dag._same_request(job, request)
-        with self.assertRaises(self.dag.AirflowFailException):
-            self.dag._same_request({"request": {**request, "upload_sha256": "0" * 64}}, request)
-
-    def test_linked_source_reuses_the_parent_selection(self) -> None:
-        upload = {"a.SLDASM": "0" * 64, "b.SLDASM": "1" * 64, "c.SLDPRT": "2" * 64}
-        retained = {
-            "run_id": "parent",
-            "upload_files": upload,
-            "upload_sha256": digest(upload),
-            "main_assembly": "a.SLDASM",
-        }
-        files, checksum, main = self.dag._linked_source(retained, None)
-        self.assertEqual(files, upload)
-        self.assertEqual(checksum, digest(upload))
-        self.assertEqual(main, "a.SLDASM")
-        self.assertEqual(self.dag._linked_source(retained, "a.SLDASM")[2], "a.SLDASM")
-        for retained_payload, supplied in (
-            (retained, "b.SLDASM"),
-            ({**retained, "upload_sha256": "0" * 64}, None),
-            ({"package": "handoff/m3.0", "main_assembly": "a.SLDASM"}, None),
-            ({**retained, "upload_files": {"a.SLDASM": "not-a-digest"}}, None),
-        ):
-            with (
-                self.subTest(supplied=supplied, retained=str(retained_payload)[:48]),
-                self.assertRaises(self.dag.AirflowFailException),
-            ):
-                self.dag._linked_source(retained_payload, supplied)
-
-    def test_materialize_selection_copies_only_the_sealed_files(self) -> None:
-        root = Path(tempfile.mkdtemp(prefix="definition-selection-"))
-        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
-        intake = _intake(root)
-        files = _upload_files(intake)
-        selected = {"总装.SLDASM": files["总装.SLDASM"], "deps/子零件.SLDPRT": files["deps/子零件.SLDPRT"]}
-        target = root / "selected"
-        self.dag._materialize_selection(intake, selected, target)
-        self.assertEqual(self.dag.package_inventory(target), selected)
-        (intake / "deps" / "子零件.SLDPRT").write_bytes(b"tampered")
-        with self.assertRaises(self.dag.AirflowFailException):
-            self.dag._materialize_selection(intake, selected, root / "selected-again")
-
-    def test_definition_settings_pin_the_registry_and_main(self) -> None:
-        from types import SimpleNamespace
-
-        root = Path(tempfile.mkdtemp(prefix="definition-settings-"))
-        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
-        registry = root / "names.json"
-        registry.write_text(json.dumps({"平面": "base_plane"}), encoding="utf-8")
-        config = SimpleNamespace(discovery={"record_roots": [str(root)], "frozen_names_file": str(registry)})
-        settings = self.dag._definition_settings(config, "总装.SLDASM")
-        self.assertEqual(settings.main_assembly, "总装.SLDASM")
-        self.assertEqual(settings.frozen_names, {"平面": "base_plane"})
-        self.assertEqual(settings.record_roots, (root,))
-        broken = root / "broken.json"
-        broken.write_text("[1]", encoding="utf-8")
-        for discovery in ({"frozen_names_file": str(broken)}, {"record_roots": "not-a-list"}):
-            with (
-                self.subTest(discovery=discovery),
-                self.assertRaises(self.dag.AirflowFailException),
-            ):
-                self.dag._definition_settings(SimpleNamespace(discovery=discovery), "总装.SLDASM")
-
-    def test_linked_native_reruns_keep_the_sealed_intake(self) -> None:
-        from types import SimpleNamespace
-
-        from airflow.sdk.exceptions import AirflowFailException
-        from description_pipeline.orchestration.airflow_client import native_run_id
-
-        module = self.dag
-        dag = module.dag
-        root = Path(tempfile.mkdtemp(prefix="linked-intake-"))
-        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
-        intake = _intake(root)
-        upload = _upload_files(intake)
-        parent_job = {
-            "request": {
-                "run_id": native_run_id("portal-parent"),
-                "upload_files": upload,
-                "upload_sha256": digest(upload),
-                "main_assembly": "总装.SLDASM",
-            }
-        }
-
-        class Stub:
-            def get_job(self, run_id):
-                return parent_job
-
-            def authorized_intake_dir(self, path):
-                return intake
-
-        def context(stage, path):
-            return {
-                "dag_run": SimpleNamespace(
-                    conf={"parent_dag_run_id": "portal-parent", "resume_from": stage},
-                    run_id=f"portal-child-{stage}",
-                ),
-                "params": {"handoff_path": path, "main_assembly": ""},
-            }
-
-        with patch.object(module, "_endpoint", return_value=Stub()):
-            request = dag.task_dict["resolve_handoff"].python_callable(**context("discover", str(intake)))
-            capture = dag.task_dict["resolve_handoff"].python_callable(**context("capture", ""))
-        self.assertEqual(request["intake_dir"], str(intake))
-        self.assertEqual(request["resume"]["from_stage"], "discover")
-        self.assertNotIn("intake_dir", capture)
-        with patch.object(module, "_endpoint", return_value=Stub()), self.assertRaises(AirflowFailException):
-            dag.task_dict["resolve_handoff"].python_callable(**context("discover", ""))
-        drifted = root / "drifted"
-        drifted.mkdir()
-        (drifted / "总装.SLDASM").write_bytes(b"drifted assembly bytes")
-        (drifted / "零件.SLDPRT").write_bytes((intake / "零件.SLDPRT").read_bytes())
-
-        class DriftStub(Stub):
-            def authorized_intake_dir(self, path):
-                return drifted
-
-        with patch.object(module, "_endpoint", return_value=DriftStub()), self.assertRaises(AirflowFailException):
-            dag.task_dict["resolve_handoff"].python_callable(**context("discover", str(intake)))
-
-    def test_missing_intake_aborts_before_the_endpoint_waits(self) -> None:
-        from types import SimpleNamespace
-
-        from airflow.sdk.exceptions import AirflowFailException
-        from description_pipeline.orchestration.airflow_client import AwaitingDefinition, SelectionSnapshot
-        from description_pipeline.orchestration.linux_store import LinuxStore
-
-        module = self.dag
-        aborted = {}
-
-        class Stub:
-            config = SimpleNamespace(discovery={})
-
-            def definition_snapshot(self, run_id, upload_files=None):
-                return AwaitingDefinition(
-                    record_name="raw-record.zip",
-                    record_sha256="a" * 64,
-                    record_size=8,
-                    record_manifest={"schema_version": "fixture"},
-                    native_tool={"source_sha256": "b" * 64},
-                    selection=SelectionSnapshot(
-                        state="sealed",
-                        round_id="c" * 64,
-                        reader_sha256="b" * 64,
-                        observations={},
-                        staged_files={"a.SLDASM": "d" * 64},
-                        requested_files={},
-                        manifest={"main_assembly": "a.SLDASM", "files": {"a.SLDASM": "d" * 64}},
-                    ),
-                )
-
-            def stream_native_record(self, run_id, snapshot, destination, *, limit=None):
-                Path(destination).write_bytes(b"bundle")
-                return Path(destination)
-
-            def abort_job(self, run_id, **fields):
-                aborted.update(fields)
-                return {}
-
-        root = Path(tempfile.mkdtemp(prefix="definition-abort-"))
-        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
-        request = {
-            "run_id": "11111111-2222-4333-8444-555555555555",
-            "upload_files": {"a.SLDASM": "d" * 64},
-            "conn_id": "test",
-        }
-        with (
-            patch.object(module, "_linux_store", return_value=LinuxStore(root)),
-            self.assertRaises(AirflowFailException),
-        ):
-            module._provide_definition(Stub(), request)
-        self.assertEqual(aborted["error_code"], "definition_derivation_failed")
-        self.assertIn("intake", aborted["error"])
-        self.assertIn("work_dir", aborted["detail"])
 
 
 if __name__ == "__main__":

@@ -19,8 +19,6 @@ from unittest import mock
 from description_pipeline.io import PipelineError, canonical, digest, inventory
 from description_pipeline.orchestration import discovery_transfer as transfer
 from description_pipeline.sources.solidworks.discovery import DiscoverySettings, derive_native_package
-from description_pipeline.sources.solidworks.selection import seal_selection
-
 from tests.sources.test_solidworks_discovery import record
 
 SOURCE_FILES = ("cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT")
@@ -43,6 +41,7 @@ class DiscoveryTransferTests(unittest.TestCase):
         self.source, self.records = self._scene()
         self.payload = record()
         self.selection = self._selection()
+        self.payload["source_selection"] = self.selection
         self.tool = dict(TOOL)
 
     # -- fixtures ----------------------------------------------------------
@@ -71,19 +70,18 @@ class DiscoveryTransferTests(unittest.TestCase):
         return root, records
 
     def _selection(self, reader: str = "ab" * 32, *, decoys: bool = True) -> dict:
+        from tests.sources.selection_support import sealed_selection
+
         files = inventory(self.source)
         upload = {**files}
         if decoys:
             upload.update({"notes.txt": "cd" * 32, "cad/spare.SLDPRT": "ef" * 32})
-        observations = {
-            MAIN_ASSEMBLY: {
-                "sha256": files[MAIN_ASSEMBLY],
-                "references": ["cad/base.SLDPRT", "cad/arm.SLDPRT"],
-            },
-            "cad/base.SLDPRT": {"sha256": files["cad/base.SLDPRT"], "references": []},
-            "cad/arm.SLDPRT": {"sha256": files["cad/arm.SLDPRT"], "references": []},
+        edges = {
+            MAIN_ASSEMBLY: ["cad/base.SLDPRT", "cad/arm.SLDPRT"],
+            "cad/base.SLDPRT": [],
+            "cad/arm.SLDPRT": [],
         }
-        return seal_selection(upload, MAIN_ASSEMBLY, observations, selected_files=files, reader_sha256=reader)
+        return sealed_selection(upload, MAIN_ASSEMBLY, edges=edges, reader_sha256=reader, stage_root="/stage")
 
     def _settings(self) -> DiscoverySettings:
         return DiscoverySettings(record_roots=(self.records,))
@@ -237,8 +235,13 @@ class DiscoveryTransferTests(unittest.TestCase):
     def test_full_closure_selection_without_decoys_roundtrips(self) -> None:
         selection = self._selection(decoys=False)
         self.assertEqual(selection["upload_sha256"], selection["handoff_sha256"])
+        pinned = {**self.payload, "source_selection": selection}
         sealed = transfer.seal_raw_record_bundle(
-            self.payload, self._path("raw-record.zip"), run_id=RUN_ID, selection=selection, native_tool=self.tool
+            pinned,
+            self._path("raw-record.zip"),
+            run_id=RUN_ID,
+            selection=selection,
+            native_tool=self.tool,
         )
         admission = transfer.admit_raw_record_bundle(
             Path(sealed["artifact"]["path"]),
@@ -246,7 +249,7 @@ class DiscoveryTransferTests(unittest.TestCase):
             expected_selection=selection,
             expected_native_tool=self.tool,
         )
-        self.assertEqual(admission.record, self.payload)
+        self.assertEqual(admission.record, pinned)
         prepared = transfer.derive_from_raw_bundle(
             Path(sealed["artifact"]["path"]),
             self.source,
@@ -257,7 +260,7 @@ class DiscoveryTransferTests(unittest.TestCase):
             settings=self._settings(),
         )
         self.assertTrue(prepared.passed)
-        request = self._seal_capture_request(prepared, selection=selection)
+        request = self._seal_capture_request(prepared, selection=selection, record=pinned)
         destination = self._path("windows-prepared")
         for name in SOURCE_FILES:
             target = destination / name
@@ -268,7 +271,7 @@ class DiscoveryTransferTests(unittest.TestCase):
             destination,
             expected_run_id=RUN_ID,
             expected_selection=selection,
-            expected_record=self.payload,
+            expected_record=pinned,
             expected_native_tool=self.tool,
             expected_prepared_sha256=prepared.prepared_sha256,
         )
@@ -447,6 +450,9 @@ class DiscoveryTransferTests(unittest.TestCase):
     def test_seal_binds_the_record_to_the_selection(self) -> None:
         with self.assertRaises(PipelineError):
             self._seal_record_bundle(payload={**self.payload, "files": {}})
+        without_pin = {key: value for key, value in self.payload.items() if key != "source_selection"}
+        with self.assertRaisesRegex(PipelineError, "does not pin"):
+            self._seal_record_bundle(payload=without_pin)
         changed = json.loads(json.dumps(self.payload))
         changed["files"]["cad/unknown.SLDPRT"] = "ee" * 32
         with self.assertRaisesRegex(PipelineError, "not part of the selected staged bytes"):

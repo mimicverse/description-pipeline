@@ -1,192 +1,88 @@
-"""Only assembly-derived file requests can become an admitted source set."""
+"""Pure selection contract: index validation, closure sealing and the verifier check."""
 
 from __future__ import annotations
 
-import copy
 import unittest
 
-from description_pipeline.io import digest
 from description_pipeline.sources.solidworks.selection import (
     SelectionError,
-    seal_selection,
-    selection_plan,
+    reachable_closure,
+    seal_closure_selection,
     validate_file_index,
     verify_selection,
 )
+from description_pipeline.verification.native_discovery import _Failure, _require_source_selection
+
+from tests.sources.selection_support import closure_evidence, sealed_selection
+
+MAIN = "cad/robot.SLDASM"
+FILES = {
+    "cad/robot.SLDASM": "a" * 64,
+    "cad/base.SLDPRT": "b" * 64,
+    "cad/arm.SLDPRT": "c" * 64,
+    "notes.txt": "d" * 64,
+}
+EDGES = {MAIN: ["cad/base.SLDPRT", "cad/arm.SLDPRT"], "cad/base.SLDPRT": [], "cad/arm.SLDPRT": []}
 
 
-class SelectionTests(unittest.TestCase):
-    def setUp(self):
-        self.main = "总装.SLDASM"
-        self.files = {
-            self.main: "a" * 64,
-            "module/arm.SLDASM": "b" * 64,
-            "parts/link.SLDPRT": "c" * 64,
-            "sources/shape.step": "d" * 64,
-            "unused.SLDASM": "e" * 64,
-            "manual.urdf": "f" * 64,
-            "notes.md": "1" * 64,
-        }
-        self.reader = "2" * 64
-
-    def observed(self, name, references):
-        return {"sha256": self.files[name], "references": references}
-
-    def graph(self):
-        return {
-            self.main: self.observed(self.main, ["module/arm.SLDASM"]),
-            "module/arm.SLDASM": self.observed("module/arm.SLDASM", ["parts/link.SLDPRT"]),
-            "parts/link.SLDPRT": self.observed("parts/link.SLDPRT", ["sources/shape.step"]),
-            "sources/shape.step": self.observed("sources/shape.step", []),
-        }
-
-    def selected(self):
-        return {name: self.files[name] for name in self.graph()}
-
-    def test_initial_request_is_only_the_selected_assembly(self):
-        plan = selection_plan(self.files, self.main, {})
-        self.assertEqual(plan["state"], "requesting")
-        self.assertEqual(plan["requested_files"], {self.main: self.files[self.main]})
-
-    def test_each_round_requests_only_new_reachable_dependencies(self):
-        complete = self.graph()
-        observations = {}
-        for name in complete:
-            plan = selection_plan(self.files, self.main, observations)
-            self.assertEqual(plan["requested_files"], {name: self.files[name]})
-            observations[name] = complete[name]
-        plan = selection_plan(self.files, self.main, observations)
-        self.assertEqual(plan["state"], "complete")
-        self.assertEqual(plan["requested_files"], {})
-        self.assertEqual(set(plan["selected_files"]), set(complete))
-
-    def test_part_references_and_leaf_evidence_are_required(self):
-        graph = self.graph()
-        graph.pop("sources/shape.step")
-        self.assertEqual(
-            selection_plan(self.files, self.main, graph)["requested_files"],
-            {"sources/shape.step": self.files["sources/shape.step"]},
-        )
-        with self.assertRaises(SelectionError) as caught:
-            seal_selection(self.files, self.main, graph, selected_files=self.selected(), reader_sha256=self.reader)
-        self.assertEqual(caught.exception.code, "selection_incomplete")
-
-    def test_unrelated_observation_is_not_authorized_by_the_upload_index(self):
-        graph = self.graph()
-        graph["unused.SLDASM"] = self.observed("unused.SLDASM", [])
-        with self.assertRaises(SelectionError) as caught:
-            selection_plan(self.files, self.main, graph)
-        self.assertEqual(caught.exception.code, "selection_unrelated_document")
-
-    def test_external_missing_and_case_guessed_paths_are_refused(self):
-        for path in ("D:/old/shape.step", "../sources/shape.step", "absent.SLDPRT", "parts/LINK.SLDPRT"):
-            with self.subTest(path=path), self.assertRaises(SelectionError):
-                selection_plan(self.files, self.main, {self.main: self.observed(self.main, [path])})
-
-    def test_same_named_files_in_other_directories_are_not_substituted(self):
-        files = {**self.files, "other/link.SLDPRT": "3" * 64}
-        graph = self.graph()
-        graph["module/arm.SLDASM"]["references"] = ["missing/link.SLDPRT"]
-        with self.assertRaises(SelectionError) as caught:
-            selection_plan(files, self.main, graph)
-        self.assertEqual(caught.exception.detail["reference"], "missing/link.SLDPRT")
-
-    def test_changed_document_hash_cannot_be_sealed_as_a_new_source(self):
-        graph = self.graph()
-        graph[self.main]["sha256"] = "0" * 64
-        with self.assertRaises(SelectionError) as caught:
-            selection_plan(self.files, self.main, graph)
-        self.assertEqual(caught.exception.code, "selection_source_changed")
-
-    def test_graph_cycles_are_finite_file_dependencies_not_a_kinematic_claim(self):
-        graph = self.graph()
-        graph["parts/link.SLDPRT"]["references"].append(self.main)
-        manifest = seal_selection(
-            self.files, self.main, graph, selected_files=self.selected(), reader_sha256=self.reader
-        )
-        self.assertEqual(set(manifest["files"]), set(graph))
-
-    def test_seal_binds_upload_selected_files_and_graph_separately(self):
-        graph = self.graph()
-        manifest = seal_selection(
-            self.files, self.main, graph, selected_files=self.selected(), reader_sha256=self.reader
-        )
-        self.assertEqual(manifest["upload_sha256"], digest(self.files))
-        self.assertEqual(manifest["handoff_sha256"], digest(manifest["files"]))
-        self.assertNotEqual(manifest["upload_sha256"], manifest["handoff_sha256"])
-        self.assertEqual(set(manifest["excluded_files"]), {"unused.SLDASM", "manual.urdf", "notes.md"})
-        self.assertEqual(verify_selection(manifest, self.files, manifest["files"], reader_sha256=self.reader), manifest)
-        reordered = dict(reversed(list(self.files.items())))
-        self.assertEqual(
-            seal_selection(reordered, self.main, graph, selected_files=self.selected(), reader_sha256=self.reader),
-            manifest,
-        )
-
-    def test_complete_observations_cannot_seal_untransferred_or_extra_files(self):
-        graph = self.graph()
-        self.assertEqual(selection_plan(self.files, self.main, graph)["state"], "complete")
-        stages = (
-            {self.main: self.files[self.main]},
-            {**self.selected(), "notes.md": self.files["notes.md"]},
-            {**self.selected(), "parts/link.SLDPRT": "0" * 64},
-        )
-        for staged in stages:
-            with self.subTest(staged=staged), self.assertRaises(SelectionError) as caught:
-                seal_selection(self.files, self.main, graph, selected_files=staged, reader_sha256=self.reader)
-            self.assertEqual(caught.exception.code, "selection_inventory_changed")
-
-    def test_added_missing_or_changed_transferred_bytes_fail(self):
-        manifest = seal_selection(
-            self.files, self.main, self.graph(), selected_files=self.selected(), reader_sha256=self.reader
-        )
-        extra = {**manifest["files"], "manual.urdf": self.files["manual.urdf"]}
-        missing = {name: checksum for name, checksum in manifest["files"].items() if name != self.main}
-        changed = {**manifest["files"], self.main: "0" * 64}
-        for files in (extra, missing, changed):
-            with self.subTest(files=files), self.assertRaises(SelectionError) as caught:
-                verify_selection(manifest, self.files, files, reader_sha256=self.reader)
-            self.assertEqual(caught.exception.code, "selection_inventory_changed")
-
-    def test_forged_scope_reader_digest_or_exclusion_is_rejected(self):
-        manifest = seal_selection(
-            self.files, self.main, self.graph(), selected_files=self.selected(), reader_sha256=self.reader
-        )
-        for field, value in (
-            ("scope", "active_configuration"),
-            ("reader_sha256", "0" * 64),
-            ("upload_sha256", "0" * 64),
-            ("selection_sha256", "0" * 64),
-            ("excluded_files", {}),
-        ):
-            forged = {**manifest, field: value}
-            with self.subTest(field=field), self.assertRaises(SelectionError):
-                verify_selection(forged, self.files, manifest["files"], reader_sha256=self.reader)
-
-    def test_main_selection_and_observation_shape_are_strict(self):
-        for main in ("unused.SLDASM ", "parts/link.SLDPRT", "absent.SLDASM", None):
-            with self.subTest(main=main), self.assertRaises(SelectionError):
-                selection_plan(self.files, main, {})
-        for record in (None, {}, {"sha256": self.files[self.main], "references": None}):
-            with self.subTest(record=record), self.assertRaises(SelectionError):
-                selection_plan(self.files, self.main, {self.main: record})
-        duplicated = copy.deepcopy(self.graph())
-        duplicated[self.main]["references"] *= 2
+class IndexValidationTests(unittest.TestCase):
+    def test_index_validation_rejects_nonsha_and_noncanonical_names(self) -> None:
         with self.assertRaises(SelectionError):
-            selection_plan(self.files, self.main, duplicated)
+            validate_file_index({"a.SLDPRT": "not-a-digest"})
+        with self.assertRaises(SelectionError):
+            validate_file_index({"../a.SLDPRT": "a" * 64})
+        with self.assertRaises(SelectionError):
+            validate_file_index({"A.SLDPRT": "a" * 64, "a.SLDPRT": "b" * 64})
+        self.assertEqual(validate_file_index(FILES), dict(sorted(FILES.items())))
 
-    def test_nonportable_and_aliasing_metadata_never_authorizes_files(self):
-        for files in (
-            {},
-            {"x.SLDASM": "not a hash"},
-            {"x.SLDASM": "a" * 64, "X.SLDASM": "b" * 64},
-            {"X": "a" * 64, "x/child": "b" * 64},
-            {"Parts/a.SLDPRT": "a" * 64, "parts/b.SLDPRT": "b" * 64},
-            {"CON.SLDPRT": "a" * 64},
-            {"~$x.SLDASM": "a" * 64},
-            {"cad//x.SLDASM": "a" * 64},
-        ):
-            with self.subTest(files=files), self.assertRaises(SelectionError):
-                validate_file_index(files)
+
+class ClosureSelectionTests(unittest.TestCase):
+    def test_reachability_and_seal(self) -> None:
+        graph = {name: {"sha256": FILES[name], "references": refs} for name, refs in EDGES.items()}
+        self.assertEqual(reachable_closure(graph, MAIN), {"cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT"})
+        manifest = sealed_selection(FILES, MAIN, edges=EDGES)
+        self.assertEqual(set(manifest["files"]), {"cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT"})
+        self.assertEqual(set(manifest["excluded_files"]), {"notes.txt"})
+        self.assertEqual(
+            verify_selection(manifest, FILES, manifest["files"], reader_sha256=manifest["reader_sha256"]), manifest
+        )
+
+    def test_main_must_be_an_indexed_assembly(self) -> None:
+        evidence = closure_evidence(FILES, MAIN, edges=EDGES)
+        with self.assertRaises(SelectionError):
+            seal_closure_selection(FILES, "cad/base.SLDPRT", evidence, reader_sha256=evidence["reader_sha256"])
+        with self.assertRaises(SelectionError):
+            seal_closure_selection(FILES, "missing.SLDASM", evidence, reader_sha256=evidence["reader_sha256"])
+
+
+class SourceSelectionVerifierTests(unittest.TestCase):
+    def _payload(self, manifest: dict, *, include: bool = True, main_choice: str = MAIN) -> dict:
+        raw = {
+            "files": dict(manifest["files"]),
+            "selection": {"main_assembly": main_choice},
+        }
+        if include:
+            raw["source_selection"] = manifest
+        return {"raw": raw}
+
+    def test_absent_carrier_is_explicitly_not_applicable(self) -> None:
+        manifest = sealed_selection(FILES, MAIN, edges=EDGES)
+        _require_source_selection(self._payload(manifest, include=False))
+
+    def test_valid_carrier_recomputes_and_binds_the_raw_inventory(self) -> None:
+        manifest = sealed_selection(FILES, MAIN, edges=EDGES)
+        _require_source_selection(self._payload(manifest))
+
+    def test_tampered_manifest_or_unbound_source_is_refused(self) -> None:
+        manifest = sealed_selection(FILES, MAIN, edges=EDGES)
+        with self.assertRaises(_Failure):
+            _require_source_selection(self._payload({**manifest, "selection_sha256": "00" * 32}))
+        raw = self._payload(manifest)
+        raw["raw"]["files"] = {"cad/base.SLDPRT": "b" * 64}
+        with self.assertRaises(_Failure):
+            _require_source_selection(raw)
+        with self.assertRaises(_Failure):
+            _require_source_selection(self._payload(manifest, main_choice="cad/base.SLDPRT"))
 
 
 if __name__ == "__main__":

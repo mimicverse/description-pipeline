@@ -430,6 +430,10 @@ def seal_raw_record_bundle(record: dict, archive: Path, *, run_id: str, selectio
     bindings = _selection_bindings(selection)
     _record_bindings(record, bindings["files"], bindings["main_assembly"])
     _require_tool(native_tool)
+    _require(
+        record.get("source_selection") == bindings["selection"],
+        "the raw record does not pin the bound selection manifest",
+    )
     record_bytes = canonical(record)
     _require(len(record_bytes) <= MAX_RECORD_BYTES, "Raw native record exceeds the record transfer limit")
     record_sha256 = hashlib.sha256(record_bytes).hexdigest()
@@ -505,6 +509,10 @@ def admit_raw_record_bundle(
     )
     raw_record = members[RECORD_MEMBER]
     record = _parse_exact_json(raw_record, RECORD_MEMBER)
+    _require(
+        record.get("source_selection") == expected["selection"],
+        "the raw record does not pin the expected selection manifest",
+    )
     _require(
         manifest["record_sha256"] == hashlib.sha256(raw_record).hexdigest(),
         "raw record bytes do not match record_sha256",

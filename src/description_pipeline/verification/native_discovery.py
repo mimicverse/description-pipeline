@@ -91,7 +91,8 @@ def _authored_identity(raw: dict, namespace: str) -> dict:
     control = identity.get("control")
     _require(
         control is None or (isinstance(control, dict) and not set(control) - {"system", "reference"}),
-        "discovery.identity", "authored control metadata is malformed",
+        "discovery.identity",
+        "authored control metadata is malformed",
     )
 
     def value(key):
@@ -102,13 +103,19 @@ def _authored_identity(raw: dict, namespace: str) -> dict:
             if candidate is None:
                 continue
             _require(
-                isinstance(candidate, str) and bool(candidate.strip())
+                isinstance(candidate, str)
+                and bool(candidate.strip())
                 and not any(ord(char) < 32 or ord(char) == 127 for char in candidate),
-                "discovery.identity", "supplied metadata must be non-empty text", {"field": key},
+                "discovery.identity",
+                "supplied metadata must be non-empty text",
+                {"field": key},
             )
             normalized.append(candidate.strip())
         _require(
-            len(set(normalized)) <= 1, "discovery.identity", "native metadata readings disagree", {"field": key},
+            len(set(normalized)) <= 1,
+            "discovery.identity",
+            "native metadata readings disagree",
+            {"field": key},
         )
         return normalized[0] if normalized else None
 
@@ -117,24 +124,30 @@ def _authored_identity(raw: dict, namespace: str) -> dict:
     for key in ("hardware_id", "revision", "parent_revision"):
         _require(
             authored[key] is None or _ID.fullmatch(authored[key]),
-            "discovery.identity", "supplied metadata is not an ASCII identifier", {"field": key},
+            "discovery.identity",
+            "supplied metadata is not an ASCII identifier",
+            {"field": key},
         )
     _require(
         authored["parent_revision"] is None or authored["parent_revision"] != authored["revision"],
-        "discovery.identity", "a revision cannot name itself as its parent",
+        "discovery.identity",
+        "a revision cannot name itself as its parent",
     )
     _require(
         authored["robot_name"] is None or _SNAKE.fullmatch(authored["robot_name"]),
-        "discovery.identity", "authored robot name is not snake_case",
+        "discovery.identity",
+        "authored robot name is not snake_case",
     )
     system, reference = value("control.system"), value("control.reference")
     _require(
         system is None or system in {"git", "pdm", "handoff"},
-        "discovery.identity", "supplied control system is unsupported",
+        "discovery.identity",
+        "supplied control system is unsupported",
     )
     _require(
         system != "git" or reference is None or re.search(r"\b[0-9a-f]{40}(?:[0-9a-f]{24})?\b", reference),
-        "discovery.identity", "Git control reference lacks a full commit hash",
+        "discovery.identity",
+        "Git control reference lacks a full commit hash",
     )
     authored["control"] = {"system": system, "reference": reference} if system and reference else None
     authored["missing"] = [
@@ -394,6 +407,55 @@ def _require_suppression_states(record: dict) -> None:
             )
 
 
+def _require_source_selection(payload: dict) -> None:
+    """Independently recompute the sealed source selection carried by the raw record.
+
+    Production transported bundles carry ``raw.source_selection``; evidence without the
+    transport carrier is explicitly not applicable.  When present, the manifest must
+    recompute exactly, every selected source must be bound by the raw native file
+    inventory with a matching hash, and the raw main choice must agree.
+    """
+
+    from ..sources.solidworks.selection import verify_selection
+
+    raw = payload.get("raw") if isinstance(payload, dict) else None
+    if not isinstance(raw, dict):
+        return
+    manifest = raw.get("source_selection")
+    if manifest is None:
+        return
+    if not isinstance(manifest, dict) or manifest.get("scope") != "native_staged_folder_closure":
+        raise _Failure(
+            "discovery.selection",
+            "raw.source_selection is not a sealed closure selection manifest",
+            None,
+        )
+    files = manifest.get("files")
+    excluded = manifest.get("excluded_files")
+    if not isinstance(files, dict) or not isinstance(excluded, dict):
+        raise _Failure("discovery.selection", "sealed selection carries no file inventories", None)
+    upload = {**excluded, **files}
+    try:
+        verify_selection(manifest, upload, files, reader_sha256=manifest.get("reader_sha256"))
+    except Exception as error:  # noqa: BLE001 - reported as a structured verifier failure
+        raise _Failure("discovery.selection", f"sealed selection does not recompute: {error}", None) from error
+    native_files = raw.get("files")
+    if not isinstance(native_files, dict) or not native_files:
+        raise _Failure("discovery.selection", "the raw record carries no native file inventory", None)
+    for name, checksum in files.items():
+        if native_files.get(name) != checksum:
+            raise _Failure(
+                "discovery.selection",
+                f"selected source {name!r} is not bound by the raw record",
+                {"document": name},
+            )
+    raw_selection = raw.get("selection")
+    if isinstance(raw_selection, dict):
+        chosen = raw_selection.get("main_assembly")
+        if chosen is not None and str(chosen).replace("\\", "/") != manifest.get("main_assembly"):
+            raise _Failure("discovery.selection", "the raw main choice differs from the sealed selection", None)
+
+
 def _frames(record: dict) -> dict[str, list[list[float]] | None]:
     _require_suppression_states(record)
     frames: dict[str, list[list[float]] | None] = {}
@@ -614,12 +676,7 @@ def _geometry_agrees(kind: str, recorded: dict, localized: dict) -> bool:
         if abs(abs(_dot(recorded_normal, localized_normal)) - 1.0) > _CONFLICT_ANGLE_EPS:
             return False
         return (
-            abs(
-                sum(
-                    (localized_point[index] - recorded_point[index]) * recorded_normal[index]
-                    for index in range(3)
-                )
-            )
+            abs(sum((localized_point[index] - recorded_point[index]) * recorded_normal[index] for index in range(3)))
             <= _CONFLICT_POS_TOL_M
         )
     if kind == "line":
@@ -667,9 +724,7 @@ def _localized_values(geometry):
         if isinstance(values, (str, bytes)) or not hasattr(values, "__iter__"):
             return None
         items = list(values)
-        if len(items) != 3 or any(
-            not isinstance(item, (int, float)) or isinstance(item, bool) for item in items
-        ):
+        if len(items) != 3 or any(not isinstance(item, (int, float)) or isinstance(item, bool) for item in items):
             return None
         numbers = [float(item) for item in items]
         if not all(math.isfinite(item) for item in numbers):
@@ -693,9 +748,7 @@ def _localized_values(geometry):
         values["point"] = point
         return values
     if kind == "line":
-        point, direction = strict_triple(geometry.get("point") or ()), strict_unit(
-            geometry.get("direction") or ()
-        )
+        point, direction = strict_triple(geometry.get("point") or ()), strict_unit(geometry.get("direction") or ())
     elif kind == "plane":
         point, direction = strict_triple(geometry.get("point") or ()), strict_unit(geometry.get("normal") or ())
     else:  # cylinder
@@ -703,9 +756,7 @@ def _localized_values(geometry):
         if not isinstance(radius, (int, float)) or isinstance(radius, bool) or not math.isfinite(float(radius)):
             return None
         values["radius"] = float(radius)
-        point, direction = strict_triple(geometry.get("point") or ()), strict_unit(
-            geometry.get("direction") or ()
-        )
+        point, direction = strict_triple(geometry.get("point") or ()), strict_unit(geometry.get("direction") or ())
     if point is None or direction is None:
         return None
     values["point"], values["direction"] = point, direction
@@ -763,8 +814,7 @@ def _geometry(entity: dict, frames):
         if recorded_kind == "point":
             stored = _finite_triple(entity.get("point") or ())
             if stored is None or any(
-                abs(left - right) > _CONFLICT_POS_TOL_M
-                for left, right in zip(stored, values["point"], strict=True)
+                abs(left - right) > _CONFLICT_POS_TOL_M for left, right in zip(stored, values["point"], strict=True)
             ):
                 return None, None
             return point, None
@@ -822,10 +872,7 @@ def _rows_for(mate: dict, frames) -> dict | None:
     if nested is not None:
         # The scope's own frame entity resolves through the scope occurrence transform,
         # exactly like the same relation written as an ordinary in-scope pair.
-        entities = [
-            {**entity, "assembly_frame": False} if entity is nested else entity
-            for entity in entities
-        ]
+        entities = [{**entity, "assembly_frame": False} if entity is nested else entity for entity in entities]
     if len(entities) < 2:
         return None
     first, second = entities[0], entities[1]
@@ -913,12 +960,7 @@ def _rows_for(mate: dict, frames) -> dict | None:
     if kind == "coincident":
         left_point, left_axis = _geometry(first, frames)
         right_point, right_axis = _geometry(second, frames)
-        if (
-            left_axis is not None
-            and right_axis is not None
-            and _kind(first) == "plane"
-            and _kind(second) == "plane"
-        ):
+        if left_axis is not None and right_axis is not None and _kind(first) == "plane" and _kind(second) == "plane":
             if abs(abs(_dot(left_axis, right_axis)) - 1.0) > TOL:
                 return None
             normal = left_axis if _dot(left_axis, right_axis) >= 0 else [-value for value in left_axis]
@@ -965,6 +1007,7 @@ def _rows_for(mate: dict, frames) -> dict | None:
                 return None
             rows = [_translation_row(normal, circle_point)] + [_rotation_row(direction) for direction in plane]
             return {"rows": rows, "limits": limits, "axis": None, "point": circle_point}
+
         def line_plane_rows(line_entity: dict, plane_entity: dict):
             # A line coincident with a plane lies in that plane: the recorded solved state
             # must already show the direction perpendicular to the normal and the line's
@@ -975,15 +1018,11 @@ def _rows_for(mate: dict, frames) -> dict | None:
                 return None
             if abs(_dot(line_direction, plane_normal)) > TOL:
                 return None
-            separation = abs(
-                sum((line_point[index] - plane_point[index]) * plane_normal[index] for index in range(3))
-            )
+            separation = abs(sum((line_point[index] - plane_point[index]) * plane_normal[index] for index in range(3)))
             if separation > AXIS_OFFSET_TOL_M:
                 return None
             pivot = _unit_vector(_cross(line_direction, plane_normal))
-            rows = ([_rotation_row(pivot)] if pivot is not None else []) + [
-                _translation_row(plane_normal, line_point)
-            ]
+            rows = ([_rotation_row(pivot)] if pivot is not None else []) + [_translation_row(plane_normal, line_point)]
             return {"rows": rows, "limits": limits, "axis": None, "point": line_point}
 
         if _kind(first) == "line" and _kind(second) == "plane":
@@ -996,19 +1035,9 @@ def _rows_for(mate: dict, frames) -> dict | None:
         # Only the explicit plane-plus-vertex form remains: the face side must be a
         # recorded plane and the other side an explicit point.  A missing entity, a
         # cylinder, a circle, or any unrelated geometry is never treated as a vertex.
-        if (
-            _kind(first) == "plane"
-            and left_axis is not None
-            and _kind(second) == "point"
-            and right_point is not None
-        ):
+        if _kind(first) == "plane" and left_axis is not None and _kind(second) == "point" and right_point is not None:
             normal, point = left_axis, right_point
-        elif (
-            _kind(second) == "plane"
-            and right_axis is not None
-            and _kind(first) == "point"
-            and left_point is not None
-        ):
+        elif _kind(second) == "plane" and right_axis is not None and _kind(first) == "point" and left_point is not None:
             normal, point = right_axis, left_point
         else:
             return None
@@ -1746,9 +1775,7 @@ def verify_discovery(package: Path) -> dict:
                     "unbound": len(unbound),
                     "observations": observed,
                     "occurrences": [item["occurrence"] for item in unbound],
-                    "imported_paths": sorted(
-                        {str(item["imported_path"]) for item in unbound if item["imported_path"]}
-                    ),
+                    "imported_paths": sorted({str(item["imported_path"]) for item in unbound if item["imported_path"]}),
                     "samples": unbound[:20],
                 },
             )
@@ -1769,7 +1796,8 @@ def verify_discovery(package: Path) -> dict:
             )
         _require(
             robot.get("hardware_id") == authored["hardware_id"],
-            "discovery.identity", "robot.yaml hardware_id differs from authored native metadata",
+            "discovery.identity",
+            "robot.yaml hardware_id differs from authored native metadata",
         )
         technical_name = authored["robot_name"]
         label_source = "authored_robot_name"
@@ -1778,38 +1806,58 @@ def verify_discovery(package: Path) -> dict:
             technical_name = re.sub(r"[^0-9A-Za-z]+", "_", authored["hardware_id"] or "robot").strip("_").lower()
         _require(
             (robot.get("source") or {}).get("robot_name") == technical_name,
-            "discovery.identity", "generated robot label differs from its recorded naming source",
+            "discovery.identity",
+            "generated robot label differs from its recorded naming source",
         )
         if authored["missing"]:
-            diagnostics.append({
-                "code": "discovery.publication_metadata_incomplete", "blocking": False,
-                "message": "engineering evidence is inspectable; authored publication metadata is incomplete",
-                "detail": {"missing": authored["missing"]},
-            })
-        return {"missing_publication_fields": authored["missing"], "technical_label": technical_name,
-                "label_source": label_source}
+            diagnostics.append(
+                {
+                    "code": "discovery.publication_metadata_incomplete",
+                    "blocking": False,
+                    "message": "engineering evidence is inspectable; authored publication metadata is incomplete",
+                    "detail": {"missing": authored["missing"]},
+                }
+            )
+        return {
+            "missing_publication_fields": authored["missing"],
+            "technical_label": technical_name,
+            "label_source": label_source,
+        }
 
     def revision():
         robot = state["robot"]
         _require(not revision_path.is_symlink(), "discovery.revision", "cad-revision.json must be a regular file")
         _require(revision_path.is_file(), "discovery.revision", "cad-revision.json is missing")
         revision = _read_json(revision_path)
-        fields = {"schema_version", "hardware_id", "revision", "parent_revision", "owner", "change_summary",
-                  "control", "cad_files"}
+        fields = {
+            "schema_version",
+            "hardware_id",
+            "revision",
+            "parent_revision",
+            "owner",
+            "change_summary",
+            "control",
+            "cad_files",
+        }
         _require(
-            isinstance(revision, dict) and not set(revision) - fields
+            isinstance(revision, dict)
+            and not set(revision) - fields
             and revision.get("schema_version") == "solidworks-to-urdf.cad-revision/v1",
-            "discovery.revision", "the supplied revision manifest is malformed",
+            "discovery.revision",
+            "the supplied revision manifest is malformed",
         )
         authored = state.get("authored_identity")
         _require(
             authored is not None and not authored["missing"],
-            "discovery.revision", "the revision manifest lacks complete native author metadata",
+            "discovery.revision",
+            "the revision manifest lacks complete native author metadata",
         )
         for key in ("hardware_id", "revision", "parent_revision", "owner", "change_summary", "control"):
             _require(
-                revision.get(key) == authored[key], "discovery.revision",
-                "revision metadata differs from native author metadata", {"field": key},
+                revision.get(key) == authored[key],
+                "discovery.revision",
+                "revision metadata differs from native author metadata",
+                {"field": key},
             )
         _require(
             revision.get("hardware_id") == robot.get("hardware_id"),
@@ -2814,8 +2862,12 @@ def verify_discovery(package: Path) -> dict:
     def suppression():
         return _require_suppression_states((state.get("payload") or {}).get("raw") or {})
 
+    def source_selection():
+        return _require_source_selection(state.get("payload") or {})
+
     dependent = (
         ("discovery.suppression_state", suppression),
+        ("discovery.selection", source_selection),
         ("discovery.files", files),
         ("discovery.imported_sources", imported_sources),
         ("discovery.identity", identity),
@@ -2839,6 +2891,7 @@ def verify_discovery(package: Path) -> dict:
         # external design budget; never invent nominal mass or extent ranges.
         dependent = (
             ("discovery.suppression_state", suppression),
+            ("discovery.selection", source_selection),
             ("discovery.files", files),
             ("discovery.imported_sources", imported_sources),
             ("discovery.identity", identity),
@@ -2854,8 +2907,11 @@ def verify_discovery(package: Path) -> dict:
         document_properties = (raw_block.get("properties") or {}).get("document") or {}
         budget_reference = str(payload.get("namespace") or "dp") + ".design_budget_record"
         expectations = state["robot"].get("checks") or {}
-        if ("budget" not in payload and budget_reference not in document_properties
-                and not any(key in expectations for key in ("expected_mass_kg", "expected_extent_m"))):
+        if (
+            "budget" not in payload
+            and budget_reference not in document_properties
+            and not any(key in expectations for key in ("expected_mass_kg", "expected_extent_m"))
+        ):
             dependent = tuple(item for item in dependent if item[0] != "discovery.budgets")
     if bound["passed"]:
         for identifier, callback in dependent:
@@ -2896,12 +2952,20 @@ def verify_discovery(package: Path) -> dict:
     if checks and checks[0]["passed"]:
         report["discovery_sha256"] = checks[0]["details"].get("discovery_sha256")
         report["bodies"] = next(
-            (item["details"].get("bodies") for item in checks
-             if item["id"] in {"discovery.bodies", "discovery.declarations"}), None
+            (
+                item["details"].get("bodies")
+                for item in checks
+                if item["id"] in {"discovery.bodies", "discovery.declarations"}
+            ),
+            None,
         )
         report["joints"] = next(
-            (item["details"].get("joints") for item in checks
-             if item["id"] in {"discovery.joints", "discovery.declarations"}), None
+            (
+                item["details"].get("joints")
+                for item in checks
+                if item["id"] in {"discovery.joints", "discovery.declarations"}
+            ),
+            None,
         )
     return report
 
