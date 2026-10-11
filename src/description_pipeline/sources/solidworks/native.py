@@ -22,8 +22,6 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from ...geometry.stl import StlError
-from ...geometry.stl import read as read_stl
 from .errors import CadError, EnvironmentError_
 from .protocol import CadBackend, RawComponent, RawScene
 
@@ -3506,12 +3504,10 @@ class SolidWorksBackend(CadBackend):
                 if size == 0:
                     raise CadError("cad_mesh_degenerate", component)
                 handle.write(struct.pack("<12fH", *(t / size for t in n), *xyz, 0))
-        try:
-            triangles = read_stl(dest_path).triangles
-        except (StlError, OSError) as exc:
-            # SolidWorks wrote the file; a reader failure here is a CAD export
-            # problem and must surface as one instead of a bare traceback.
-            raise CadError("cad_mesh_invalid", str(exc), {"component": component}) from exc
+        # The count already written into the header is the writer's own
+        # tessellation count; no reader pass is needed (the Linux verifier
+        # parses the delivered bytes and owns all mesh quality checks).
+        triangles = len(values) // 9
         api = " + ".join(
             {
                 "solid_body_faces": ("IComponent2.GetBodies2(0)/IBody2.GetFaces/IFace2.GetTessTriangles(True)"),

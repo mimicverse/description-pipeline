@@ -34,7 +34,6 @@ from .scene import (
 
 # The pipeline-wide STL reader owns the acceptance standard for meshes; the
 # adapter only writes geometry and then asks that reader what it produced.
-from ...geometry.stl import read as read_stl
 from ...io import inventory
 
 FREEZE_SCHEMA = "description-pipeline.solidworks-freeze/v1"
@@ -1903,16 +1902,30 @@ def _export_geometry(
                 {"component": component},
                 exit_code=3,
             )
-        stats = read_stl(target)
+        # Raw identity plus the binary-header triangle count only: area, volume,
+        # topology and degeneracy stay with the independent Linux verifier.
+        with target.open("rb") as handle:
+            header = handle.read(84)
+        if len(header) < 84:
+            raise BridgeError(
+                "cad_mesh_invalid",
+                "geometry export produced no binary STL header",
+                {"component": component},
+                exit_code=3,
+            )
+        triangles = int.from_bytes(header[80:84], "little")
+        if triangles <= 0 or target.stat().st_size != 84 + 50 * triangles:
+            raise BridgeError(
+                "cad_mesh_invalid",
+                "geometry export produced an inconsistent mesh size",
+                {"component": component},
+                exit_code=3,
+            )
         exported.append(
             {
                 "component": component,
                 "path": target.relative_to(geometry_dir.parent).as_posix(),
-                "triangles": stats.triangles,
-                "volume_m3": stats.volume,
-                "area_m2": stats.area,
-                "degenerate_triangles": stats.degenerate,
-                "boundary_edges": stats.boundary_edges,
+                "triangles": triangles,
                 "used_api": info.get("used_api"),
                 "sha256": sha256_file(target),
             }

@@ -862,10 +862,7 @@ def _geometry(root, body, node, model_link, geometry, components, body_pose, urd
         stats = stl.read(delivered)
         _require(stats.triangles > 0 and stats.area > 0, "Empty mesh")
         _require(stats.degenerate / stats.triangles <= 0.001, "More than 0.1% degenerate triangles")
-        _require(
-            row["triangles"] == stats.triangles and row["degenerate_triangles"] == stats.degenerate,
-            "Geometry receipt differs from actual mesh",
-        )
+        _require(row["triangles"] == stats.triangles, "Geometry receipt differs from actual mesh")
         _require(stats.volume > 1e-15 or occurrence in exclusions, "Zero-volume geometry needs a documented exclusion")
         points = stl.vertices(delivered)
         world = urdf_pose @ _xml_pose(visual)
