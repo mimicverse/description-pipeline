@@ -75,7 +75,9 @@ def _revalidate_capture(store: LinuxStore, run_id: str) -> None:
 
 
 def _failure_receipt(store: LinuxStore, run_id: str, stage: str, error: Exception) -> dict:
-    return {
+    from ..structural_report import write_structural_report
+
+    receipt = {
         "run_id": run_id,
         "state": "failed",
         "passed": False,
@@ -85,6 +87,8 @@ def _failure_receipt(store: LinuxStore, run_id: str, stage: str, error: Exceptio
         "detail": getattr(error, "detail", None) or getattr(error, "details", None),
         "events": store.events(run_id),
     }
+    receipt["structural_report"] = write_structural_report(store.run_dir(run_id), receipt)
+    return receipt
 
 
 def run_portable_stage(
