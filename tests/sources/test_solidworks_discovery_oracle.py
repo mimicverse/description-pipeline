@@ -355,8 +355,8 @@ class OracleSemanticsTests(unittest.TestCase):
         passed, errors, _checks = self.check(package)
         self.assertTrue(passed, errors)
 
-    def test_unrecorded_zero_drive_joints_warn_instead_of_blocking(self):
-        """Authored zero drive with no controlled record is a warning, not a gate."""
+    def test_unrecorded_inferred_joint_records_stay_rejected(self):
+        """Without an exporter declaration, missing controlled records still refuse."""
 
         package = self.baseline()
 
@@ -367,22 +367,9 @@ class OracleSemanticsTests(unittest.TestCase):
                         group.pop(key, None)
 
         self._native(package, strip_annotations)
-        robot_path = package / "robot.yaml"
-        robot = yaml.safe_load(robot_path.read_text(encoding="utf-8"))
-        for joint in robot["source"]["joints"]:
-            if joint.get("type") == "fixed":
-                continue
-            joint["limits"] = (
-                {"lower": 0.0, "upper": 0.0, "effort": 0.0, "velocity": 0.0}
-                if joint.get("type") in {"revolute", "prismatic"}
-                else {"effort": 0.0, "velocity": 0.0}
-            )
-        robot_path.write_text(yaml.safe_dump(robot, sort_keys=False), encoding="utf-8")
         report = verify_discovery(package)
-        self.assertTrue(report["passed"], report["errors"])
-        codes = {item["code"] for item in report["diagnostics"]}
-        self.assertIn("discovery.joint_motion_unqualified", codes)
-        self.assertIn("discovery.joint_evidence_unrecorded", codes)
+        self.assertFalse(report["passed"])
+        self.assertIn("discovery.joints", {item["code"] for item in report["errors"]})
 
     def test_suppressed_mate_is_excluded_not_checked(self) -> None:
         package = self.baseline()
