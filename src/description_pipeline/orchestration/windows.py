@@ -805,14 +805,15 @@ class Jobs:
         if factory is None:
             from ..sources.solidworks.native_selection import NativeSelectionReader
 
-            factory = NativeSelectionReader
+            def factory():
+                return NativeSelectionReader(reader_sha256=self.jobs[identifier]["native_tool"]["source_sha256"])
         _require(session.state == "reading", "The complete uploaded folder must be staged before native resolution")
         _require(
             self._tool_identity() == self.jobs[identifier]["native_tool"],
             "Native reader identity changed before closure resolution",
         )
-        with factory() as reader:
-            evidence = reader.observe(session.stage, session.main_assembly, session.upload_files)
+        reader = factory()
+        evidence = reader.observe(session.stage, session.main_assembly, session.upload_files)
         # Close the native session before pruning excluded files. The admitted
         # source keeps the same absolute paths the resolver actually reported.
         with self.selection_locks[identifier], self.condition:
