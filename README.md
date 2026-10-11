@@ -4,9 +4,10 @@ One engineering folder, one operator page, one verified model PR.
 
 `solidworks-to-urdf` freezes native SolidWorks engineering, derives the robot
 model, generates URDF and meshes, independently verifies the delivery, and
-creates or updates its review PR. Airflow stages the selected CAD to the
-serialized Windows worker, which reads the raw native record and later captures
-the staged engineering; the robot definition is derived, generated,
+creates or updates its review PR. Airflow stages the complete uploaded
+engineering folder to the serialized Windows worker, which resolves the main
+assembly's references there, reads the raw native record and later captures the
+sealed engineering; the robot definition is derived, generated,
 independently MuJoCo-verified and published on Linux. Windows requires licensed
 SolidWorks; it runs no structure derivation, URDF generation, MuJoCo
 verification or Git operations, and needs no GitHub credentials.

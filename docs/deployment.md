@@ -3,7 +3,7 @@
 One Linux server hosts the HTTPS operator page, Airflow and PostgreSQL, and
 executes generation, independent MuJoCo verification and PR publication. One
 logged-in Windows computer with licensed SolidWorks serializes the native
-raw-record read for each staged selection and the native capture. Operators use **Feishu login → engineering folder → Start → checks,
+raw-record read and the native capture for each sealed selection. Operators use **Feishu login → engineering folder → Start → checks,
 URDF preview and review PR**.
 
 Use the same source-bound tool release on both hosts. This guide owns installation
@@ -60,7 +60,7 @@ C:\description-runtime\Scripts\description.exe doctor
 
 Create the directories below. The worker holds no operator source roots and no
 controlled-record library; it collects immutable copies of each run's staged
-selected documents into `C:\description-packages` and keeps managed deliveries,
+engineering into `C:\description-packages` and keeps managed deliveries,
 state and secrets separate.
 
 ```powershell
@@ -96,8 +96,9 @@ Replace `arm` with the CAD's `dp.hardware_id` and configure its model base.
 Publication requires a configured hardware target; extraction and inspection
 can proceed while routing is absent. The endpoint keeps no discovery settings:
 controlled records and approved interface names are Linux-side derivation
-settings (section 2). The endpoint only stages the selected documents it is
-given, reads the raw native record and captures that staging.
+settings (section 2). The endpoint stages the complete uploaded folder it is
+given, resolves the main assembly's references inside that staging, reads the
+raw native record and captures the sealed engineering.
 
 Start the endpoint in the logged-in desktop:
 
@@ -318,7 +319,7 @@ Commission the complete workflow with actual native CAD and live Feishu:
    not-run states and external engineering review scope, and the hashed `reports/stages.json`.
    Failed and delivered native runs likewise retain `reports/structural-team.md`
    and `reports/structural-team.json`; verify their hashes from the run evidence.
-   Verify the native record read, the staged selection binding and every
+   Verify the native record read, the sealed closure selection binding and every
    independent quality result.
    Confirm history and details show the original submitter's Feishu username
    after reload and when viewed by another authorized operator.

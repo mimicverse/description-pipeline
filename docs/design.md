@@ -104,8 +104,9 @@ execution. Transport retries reconnect to the same UUID and frozen inputs. A
 terminal native failure or source correction requires a new run. Frozen evidence
 can be rebuilt on Linux without reopening CAD.
 
-Airflow stages the selected CAD closure to the serialized Windows worker, which
-reads the raw native record and later captures the staged engineering. Linux
+Airflow stages the complete uploaded folder to the serialized Windows worker,
+which resolves the main assembly's references inside that staging, reads the raw
+native record and later captures the sealed engineering. Linux
 admits the record against the sealed selection, derives the prepared definition
 from the frozen selected bytes alone and returns only the generated text
 definition; no CAD is re-transferred. Windows then returns a sealed capture
