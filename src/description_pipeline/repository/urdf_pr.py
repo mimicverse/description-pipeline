@@ -43,7 +43,15 @@ GIT_ATTRIBUTES = (
     )
 ).encode("ascii")
 #: Immutable native provenance reports travel with the delivery whenever present.
-REPORTS_FILES = ("input.json", "tool.json", "quality.json", "native-tool.json", "native-stages.json")
+REPORTS_FILES = (
+    "input.json",
+    "tool.json",
+    "quality.json",
+    "native-tool.json",
+    "native-stages.json",
+    "structural-team.md",
+    "structural-team.json",
+)
 REQUIRED_FILES = (
     "README.md",
     "input/robot.yaml",

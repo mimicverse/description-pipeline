@@ -51,7 +51,7 @@ from ..runtime import tool_record
 from ..stages import ACTIVITY_HISTORY_LIMIT, STAGE_IDS, merge_activity, normalize_activity, stage_view
 from .stage_transfer import CAPTURE_MANIFEST as CAPTURE_MANIFEST_NAME
 from .selection_transport import StagedSelection
-from ..sources.solidworks.selection import selection_plan, validate_file_index, verify_selection
+from ..sources.solidworks.selection import validate_file_index, verify_selection
 from .recovery import stage_reruns, start_plan
 from ..sources.solidworks.handoff import MAX_HANDOFF_BYTES
 
@@ -288,6 +288,13 @@ class Jobs:
     def _save(self, job):
         write_json(self.directory / (job["run_id"] + ".json"), job)
 
+    def _structural_report(self, job):
+        from ..structural_report import write_structural_report
+
+        root = self.config["state_root"] / "structural_reports" / job["run_id"]
+        evidence = self._delivery_dir(job)
+        job["structural_report"] = write_structural_report(root, job, evidence_root=evidence)
+
     def validate(self, request):
         expected = {"run_id", "upload_files", "upload_sha256", "main_assembly"}
         _require(
@@ -301,7 +308,7 @@ class Jobs:
         )
         files = validate_file_index(request["upload_files"])
         _require(digest(files) == request["upload_sha256"], "Upload metadata differs from its bound identity")
-        selection_plan(files, request["main_assembly"], {})
+        _require(request["main_assembly"] in files, "Choose a main assembly present in the uploaded folder")
         return files
 
     def _source_dir(self, job):
@@ -624,6 +631,21 @@ class Jobs:
 
     def artifact(self, identifier, name):
         job = self.snapshot(identifier)
+        reports = job.get("structural_report") or {}
+        report = next(
+            (entry for entry in reports.values() if isinstance(entry, dict) and name == entry.get("path")), None
+        )
+        if report is not None:
+            path = confined(self.config["state_root"] / "structural_reports" / identifier, name)
+            stream = path.open("rb")
+            try:
+                if hashlib.file_digest(stream, "sha256").hexdigest() != report.get("sha256"):
+                    raise RequestError("Structural report differs from its recorded digest", 409)
+                stream.seek(0)
+                return stream, os.fstat(stream.fileno()).st_size
+            except BaseException:
+                stream.close()
+                raise
         record = job.get("native_record")
         if isinstance(record, dict) and name == record.get("name"):
             path = confined(self.config["state_root"] / "native_records" / identifier, name)
@@ -742,7 +764,7 @@ class Jobs:
             raise RequestError("This run has no active source selection", 409)
         return session
 
-    def submit_files(self, identifier, archive, round_id):
+    def submit_files(self, identifier, archive):
         session = self._selection(identifier)
         with self.selection_locks[identifier]:
             with self.mutex:
@@ -750,37 +772,13 @@ class Jobs:
                     self.jobs[identifier]["status"] not in {"failed", "native_complete", "passed"},
                     "The native run is already terminal",
                 )
-            accepted = session.accept_batch(archive, round_id)
+            accepted = session.accept_batch(archive)
             with self.condition:
                 job = self.jobs[identifier]
                 job["selection"] = session.snapshot()
-                if accepted and not job.get("selection_worker_started"):
-                    job["selection_worker_started"] = True
+                if accepted and not job.get("staging_worker_started"):
+                    job["staging_worker_started"] = True
                     self.queue.put(identifier)
-                self._save(job)
-                self.condition.notify_all()
-        return self.snapshot(identifier)
-
-    def seal_selection(self, identifier, request):
-        _require(isinstance(request, dict) and set(request) == {"selection"}, "Expected the selection manifest")
-        session = self._selection(identifier)
-        with self.selection_locks[identifier]:
-            prior_state = session.state
-            with self.mutex:
-                if prior_state != "sealed":
-                    _require(self.jobs[identifier]["status"] == "selecting", "The source selection is no longer active")
-            manifest = session.seal(request["selection"])
-            if prior_state == "sealed":
-                return self.snapshot(identifier)
-            with self.condition:
-                job = self.jobs[identifier]
-                _require(job["status"] == "selecting", "The source selection is no longer active")
-                job.update(
-                    selection=session.snapshot(),
-                    handoff_sha256=manifest["handoff_sha256"],
-                    package_files=manifest["files"],
-                )
-                job["status"] = "running"
                 self._save(job)
                 self.condition.notify_all()
         return self.snapshot(identifier)
@@ -801,28 +799,36 @@ class Jobs:
                 self.condition.wait(timeout=min(remaining, 10))
 
     def _select_native(self, identifier):
+        """Resolve the fully staged folder once, then retain its proven native closure."""
         session = self.selections[identifier]
         factory = self.selection_reader_factory
         if factory is None:
             from ..sources.solidworks.native_selection import NativeSelectionReader
 
             factory = NativeSelectionReader
+        _require(session.state == "reading", "The complete uploaded folder must be staged before native resolution")
+        _require(
+            self._tool_identity() == self.jobs[identifier]["native_tool"],
+            "Native reader identity changed before closure resolution",
+        )
         with factory() as reader:
-            while True:
-                self._await_client(identifier, lambda job: job["selection"]["state"] in {"reading", "sealed"})
-                if session.state == "sealed":
-                    return session.stage
-                _require(
-                    self._tool_identity() == self.jobs[identifier]["native_tool"],
-                    "Native reader identity changed during selection",
-                )
-                observations = reader.observe(session.stage, dict(session.pending), session.upload_files)
-                with self.selection_locks[identifier]:
-                    session.record_observations(observations)
-                    with self.condition:
-                        self.jobs[identifier]["selection"] = session.snapshot()
-                        self._save(self.jobs[identifier])
-                        self.condition.notify_all()
+            evidence = reader.observe(session.stage, session.main_assembly, session.upload_files)
+        # Close the native session before pruning excluded files. The admitted
+        # source keeps the same absolute paths the resolver actually reported.
+        with self.selection_locks[identifier], self.condition:
+            job = self.jobs[identifier]
+            _require(not self._stopping and job["status"] == "selecting", "Native staging is no longer active")
+            _require(self._tool_identity() == job["native_tool"], "Native reader identity changed during resolution")
+            manifest = session.seal_closure(evidence)
+            job.update(
+                selection=session.snapshot(),
+                handoff_sha256=manifest["handoff_sha256"],
+                package_files=manifest["files"],
+                status="running",
+            )
+            self._save(job)
+            self.condition.notify_all()
+        return session.stage
 
     def _record_and_await_definition(self, identifier, record):
         """Seal native observations, then wait for Linux's derived capture inputs."""
@@ -952,6 +958,7 @@ class Jobs:
             if isinstance(discovery, dict) and discovery.get("passed") is False:
                 job["discovery"] = copy.deepcopy(discovery)
             self._clear_activity(job)
+            self._structural_report(job)
             self._save(job)
             self.condition.notify_all()
         return self.snapshot(identifier)
@@ -1052,6 +1059,7 @@ class Jobs:
             record = read_native_record(frozen, settings, backend=backend, on_activity=activity)
         else:
             record = self.native_reader(frozen, settings, on_activity=activity)
+        record = {**record, "source_selection": copy.deepcopy(job["selection"]["manifest"])}
         prepared = self._record_and_await_definition(identifier, record)
         package, target, prepared, files = discover_structure(
             frozen,
@@ -1085,6 +1093,7 @@ class Jobs:
 
         native_readiness()
         backend = SolidWorksBackend()
+        backend.configure_staged_search(package)
         backend.seal_documents([confined(package, name) for name in files])
         return backend
 
@@ -1253,6 +1262,7 @@ class Jobs:
                         phase = (job["events"][-1] if job["events"] else {}).get("stage", "freeze")
                         self._event(identifier, {"stage": phase, "state": "failed", "error": job.get("error")})
                     job["completed_at"] = datetime.now(UTC).isoformat()
+                    self._structural_report(job)
                     self._save(job)
                 self.queue.task_done()
 
@@ -1302,6 +1312,9 @@ def handler(jobs, token):
             code = getattr(error, "code", None)
             if code:
                 body.setdefault("error_code", str(code))
+            detail = getattr(error, "detail", None)
+            if isinstance(detail, dict):
+                body.setdefault("detail", detail)
             self._reply(getattr(error, "status", 400), body)
 
         def do_GET(self):
@@ -1349,7 +1362,7 @@ def handler(jobs, token):
         def do_POST(self):
             if not self._authorized():
                 return
-            match = re.fullmatch(r"/v1/jobs/([0-9a-f-]+)/(files|seal|definition|abort)", self.path)
+            match = re.fullmatch(r"/v1/jobs/([0-9a-f-]+)/(files|definition|abort)", self.path)
             if self.path != "/v1/jobs" and match is None:
                 self._reply(404, {"error": "Unknown API route"})
                 return
@@ -1378,7 +1391,7 @@ def handler(jobs, token):
                                 output.write(chunk)
                                 remaining -= len(chunk)
                         if operation == "files":
-                            result = jobs.submit_files(identifier, archive, self.headers.get("X-Selection-Round"))
+                            result = jobs.submit_files(identifier, archive)
                         else:
                             result = jobs.submit_definition(identifier, archive, self.headers.get("X-Prepared-SHA256"))
                         self._reply(202, result)
@@ -1391,9 +1404,7 @@ def handler(jobs, token):
                 _require(0 < size <= 8 * 1024**2 and not self.headers.get("Transfer-Encoding"), "Invalid request size")
                 self.connection.settimeout(10)
                 request = json.loads(self.rfile.read(size))
-                if operation == "seal":
-                    self._reply(202, jobs.seal_selection(identifier, request))
-                elif operation == "abort":
+                if operation == "abort":
                     self._reply(200, jobs.abort(identifier, request))
                 else:
                     result, created = jobs.create(request)

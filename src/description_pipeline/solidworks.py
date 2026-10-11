@@ -126,6 +126,9 @@ def _install(staging: Path, target: Path) -> None:
 
 
 def _stamp(root: Path, receipt: dict) -> None:
+    from .structural_report import write_structural_report
+
+    receipt["structural_report"] = write_structural_report(root, receipt, evidence_root=root)
     receipt["artifacts"] = inventory(root, exclude=("reports/run.json", "reports/stages.json"))
     write_json(root / "reports/stages.json", stage_view(receipt))
     receipt["stage_report"] = {"path": "reports/stages.json", "sha256": file_digest(root / "reports/stages.json")}
@@ -566,8 +569,10 @@ def doctor() -> dict:
         except Exception as error:
             results.append(
                 {
-                    "id": "consumer.urdf", "passed": False,
-                    "message": str(error), "details": getattr(error, "details", {}),
+                    "id": "consumer.urdf",
+                    "passed": False,
+                    "message": str(error),
+                    "details": getattr(error, "details", {}),
                 }
             )
     result = {
