@@ -161,6 +161,11 @@ Unsupported items never become implicit passes.
 The detailed delivery receipt is `reports/stages.json`. Maintainers can also
 inspect native results in Airflow's `wait_for_job` task logs and portable results in
 the generation, verification and publication task logs; see [deployment maintenance](deployment.md#maintenance).
+Every delivered and failed native run additionally carries the structural-team
+report as `reports/structural-team.md` (readable findings) and
+`reports/structural-team.json` (structured findings and parameters); the operator
+page lists those two paths, and a failed run keeps the same files under the run's
+retained evidence.
 
 An engineer cannot override a failed automatic check by signing a review.
 Existing approvals may be reused only while the relevant structure,

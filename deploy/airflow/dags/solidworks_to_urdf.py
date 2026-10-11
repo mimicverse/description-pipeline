@@ -28,6 +28,7 @@ from airflow.sdk.exceptions import AirflowFailException
 from description_pipeline.orchestration.airflow_client import (
     EndpointConfig,
     EndpointError,
+    EndpointNotFound,
     EndpointProtocolError,
     WindowsEndpoint,
     capture_archive_metadata,
@@ -252,6 +253,27 @@ def _linked_source(retained: object, supplied) -> tuple[dict[str, str], str, str
     return validated, upload_sha256, main
 
 
+def _store_structural_report(endpoint: WindowsEndpoint, request: dict, job: dict) -> None:
+    """Best-effort fetch of the endpoint structural-team report; never masks the failure."""
+
+    downloader = getattr(endpoint, "download_structural_report", None)
+    if downloader is None:
+        return
+    try:
+        store = _linux_store(request["conn_id"])
+        written = downloader(request["run_id"], job, store.run_dir(request["run_id"]) / "structural-team")
+        log.info(
+            "structural report run_id=%s markdown=%s json=%s",
+            request["run_id"],
+            written.get("markdown"),
+            written.get("json"),
+        )
+    except EndpointNotFound:
+        log.info("structural report run_id=%s absent", request["run_id"])
+    except (AirflowFailException, EndpointError, EndpointProtocolError, PipelineError, OSError) as error:
+        log.warning("structural report unavailable run_id=%s error=%s", request["run_id"], error)
+
+
 def _materialize_selection(intake: Path, files: dict[str, str], target: Path) -> Path:
     """Copy exactly the sealed selection into one fresh run-owned directory."""
 
@@ -474,6 +496,7 @@ def _poke(request: dict, **context) -> bool:
     if job["status"] == "failed":
         result = job.get("result") or {}
         log.error("native diagnostics=%s events=%s", result.get("diagnostic_path"), job["events"])
+        _store_structural_report(endpoint, request, job)
         raise AirflowFailException(f"SolidWorks job {request['run_id']} failed: {job.get('error')}")
     return job["status"] in {"passed", "native_complete"}
 
@@ -504,6 +527,8 @@ def _same_request(job: dict, request: dict) -> None:
         "`run_publish` log Linux stage results. Their `engineering_stages` XComs retain stage summaries, "
         "including failures. The operator page shows "
         "inputs, checks, outputs and evidence per stage; `reports/stages.json` retains the detailed receipt. "
+        "Delivered and failed native runs also retain the structural-team report at "
+        "`reports/structural-team.md` and `reports/structural-team.json`. "
         "Engineering review scope stays with the bound review records; the platform reports it without "
         "claiming approvals are pending or complete."
     ),

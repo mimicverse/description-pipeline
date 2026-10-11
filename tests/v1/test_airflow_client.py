@@ -946,6 +946,49 @@ class ClientTests(unittest.TestCase):
         self.assertIn("request conflict (409)", str(failure))
         self.assertIn("selection is bound to another run", str(failure))
 
+    def test_structural_report_downloads_hash_bound_artifacts(self) -> None:
+        from description_pipeline.orchestration.airflow_client import (
+            EndpointNotFound,
+            _validate_structural_report,
+        )
+
+        markdown = b"# structural team report\n"
+        payload = b'{"schema_version": "solidworks-to-urdf.structural-team/v1"}'
+        with MockEndpoint() as server:
+            server.artifacts["reports/structural-team.md"] = markdown
+            server.artifacts["reports/structural-team.json"] = payload
+            endpoint = self.endpoint(server)
+            job = {
+                "structural_report": {
+                    "markdown": {
+                        "path": "reports/structural-team.md",
+                        "sha256": hashlib.sha256(markdown).hexdigest(),
+                    },
+                    "json": {
+                        "path": "reports/structural-team.json",
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                    },
+                }
+            }
+            with tempfile.TemporaryDirectory() as tmp:
+                written = endpoint.download_structural_report(RUN_ID, job, Path(tmp))
+                self.assertEqual(Path(written["markdown"]).read_bytes(), markdown)
+                self.assertEqual(Path(written["json"]).read_bytes(), payload)
+                tampered = {
+                    "structural_report": {
+                        **job["structural_report"],
+                        "markdown": {**job["structural_report"]["markdown"], "sha256": "0" * 64},
+                    }
+                }
+                with self.assertRaises(EndpointProtocolError):
+                    endpoint.download_structural_report(RUN_ID, tampered, Path(tmp) / "tampered")
+                with self.assertRaises(EndpointNotFound):
+                    endpoint.download_structural_report(RUN_ID, {}, Path(tmp) / "absent")
+        with self.assertRaises(EndpointProtocolError):
+            _validate_structural_report(
+                {"structural_report": {"markdown": {"path": "other.md", "sha256": "0" * 64}, "json": {}}}
+            )
+
     def test_start_rejects_a_different_echoed_request(self) -> None:
         response = {
             "run_id": RUN_ID,

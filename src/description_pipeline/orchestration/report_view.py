@@ -109,6 +109,8 @@ _FILE_PATH_LABELS_ZH = {
     "reports/quality.json": "确定性逐对象质量报告",
     "urdf/ + meshes/ + reports/quality.json": "已验证交付与配置的模型仓库",
     "reports/pr.json": "候选提交与评审回执",
+    "reports/structural-team.md": "结构团队报告（可读 Markdown）",
+    "reports/structural-team.json": "结构团队报告（结构化发现与参数）",
 }
 
 _INDEPENDENT_LABELS_ZH = {
@@ -887,8 +889,7 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
             "total": len(warning_items),
             "items": warning_items,
             "note_zh": (
-                "警告为记录、不阻断的观察项：不计为通过，也不作为验收结论；"
-                "无需逐项人工确认，按对应阶段的检查清单复核。"
+                "警告为记录、不阻断的观察项：不计为通过，也不作为验收结论；无需逐项人工确认，按对应阶段的检查清单复核。"
             ),
         },
         "stages": stages_out,

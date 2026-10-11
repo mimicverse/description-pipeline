@@ -567,6 +567,23 @@ def _record_block(record: AwaitingDefinition | dict) -> dict:
     return _native_record_block(record)
 
 
+def _validate_structural_report(job: dict) -> dict | None:
+    """The hash-bound structural-team report receipt of one job, or None when absent."""
+
+    value = job.get("structural_report")
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"markdown", "json"}:
+        raise EndpointProtocolError("structural_report must carry exactly markdown and json receipts")
+    receipt: dict[str, dict] = {}
+    for kind, path in (("markdown", "reports/structural-team.md"), ("json", "reports/structural-team.json")):
+        entry = value.get(kind)
+        if not isinstance(entry, dict) or set(entry) != {"path", "sha256"} or entry.get("path") != path:
+            raise EndpointProtocolError(f"structural_report {kind} must name {path}")
+        receipt[kind] = {"path": path, "sha256": validate_sha256(entry.get("sha256"))}
+    return receipt
+
+
 def _awaiting_definition(job: dict, *, upload_files: dict[str, str] | None = None) -> AwaitingDefinition:
     """Parse and validate one job's definition hand-off against the frozen contract."""
 
@@ -818,6 +835,51 @@ class WindowsEndpoint:
         if "status" in response and response["status"] not in RUN_STATES:
             raise EndpointProtocolError(f"unexpected job status: {response.get('status')!r}")
         return response
+
+    def download_structural_report(
+        self, run_id: str, job: dict, destination: Path, *, limit: int = MAX_TRANSFER_BYTES
+    ) -> dict:
+        """Stream the hash-bound structural-team report artifacts next to the run evidence."""
+
+        receipt = _validate_structural_report(job)
+        if receipt is None:
+            raise EndpointNotFound("this run carries no structural-team report")
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+            raise EndpointProtocolError("report size limit must be a positive integer")
+        destination = Path(destination)
+        destination.mkdir(parents=True, exist_ok=True)
+        written: dict[str, str] = {}
+        for kind, entry in receipt.items():
+            name = "structural-team.md" if kind == "markdown" else "structural-team.json"
+            target = destination / name
+            hasher = hashlib.sha256()
+            total = 0
+            with (
+                self.open_artifact(run_id, entry["path"]) as response,
+                tempfile.NamedTemporaryFile(prefix=f".{name}-", dir=destination, delete=False) as handle,
+            ):
+                temporary = Path(handle.name)
+                try:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > limit:
+                            raise EndpointProtocolError("structural report exceeds the configured size limit")
+                        hasher.update(chunk)
+                        handle.write(chunk)
+                except BaseException:
+                    with suppress(OSError):
+                        temporary.unlink()
+                    raise
+            if hasher.hexdigest() != entry["sha256"]:
+                with suppress(OSError):
+                    temporary.unlink()
+                raise EndpointProtocolError(f"structural report {name} does not match its recorded digest")
+            os.replace(temporary, target)
+            written[kind] = str(target)
+        return written
 
     def abort_job(self, run_id: str, *, error: str, error_code: str, detail: dict | None = None) -> dict:
         """Abort one awaiting-definition job after a local derivation failure; never hangs the endpoint."""

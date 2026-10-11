@@ -316,6 +316,8 @@ Commission the complete workflow with actual native CAD and live Feishu:
    input/input QC/output/output QC in the page, the DAG contract table,
    terminal task logs and `engineering_stages` XCom. Confirm failed, blocked,
    not-run states and external engineering review scope, and the hashed `reports/stages.json`.
+   Failed and delivered native runs likewise retain `reports/structural-team.md`
+   and `reports/structural-team.json`; verify their hashes from the run evidence.
    Verify the native record read, the staged selection binding and every
    independent quality result.
    Confirm history and details show the original submitter's Feishu username
