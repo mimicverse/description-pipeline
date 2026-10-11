@@ -410,9 +410,9 @@ def _require_suppression_states(record: dict) -> None:
 def _require_source_selection(payload: dict) -> None:
     """Independently recompute the sealed source selection carried by the raw record.
 
-    Production transported bundles carry ``raw.source_selection``; evidence without the
-    transport carrier is explicitly not applicable.  When present, the manifest must
-    recompute exactly, every selected source must be bound by the raw native file
+    The proof is mandatory: the one supported native capture carries
+    ``raw.source_selection``, and a bundle without it is not verifiable.  The manifest
+    must recompute exactly, every selected source must be bound by the raw native file
     inventory with a matching hash, and the raw main choice must agree.
     """
 
@@ -420,10 +420,18 @@ def _require_source_selection(payload: dict) -> None:
 
     raw = payload.get("raw") if isinstance(payload, dict) else None
     if not isinstance(raw, dict):
-        return
+        raise _Failure(
+            "discovery.selection",
+            "the native capture carries no raw record with the sealed source selection",
+            None,
+        )
     manifest = raw.get("source_selection")
     if manifest is None:
-        return
+        raise _Failure(
+            "discovery.selection",
+            "raw.source_selection is required: a capture without the sealed closure proof is not verifiable",
+            None,
+        )
     if not isinstance(manifest, dict) or manifest.get("scope") != "native_staged_folder_closure":
         raise _Failure(
             "discovery.selection",

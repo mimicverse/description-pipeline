@@ -83,11 +83,41 @@ class ClosureSealContractTests(unittest.TestCase):
             ),
             "search_not_restored": lambda closure: closure["search_configuration"].update(restored=False),
             "search_not_pinned": lambda closure: closure["search_configuration"].update(pinned=["/elsewhere"]),
+            "search_invented_folder_type": lambda closure: closure["search_configuration"].update(
+                folder_type={"name": "swDocumentType", "value": 0}
+            ),
             "session_open": lambda closure: closure["session"].update(closed=False),
             "open_status_bad": lambda closure: closure.update(open_status={"errors": "many", "warnings": 0}),
             "coherence_edge_missing": drop_edge,
-            "import_not_bound": lambda closure: closure["imports"].append(
-                {"document": MAIN, "resolved": "cad/base.SLDPRT", "state": "unbound"}
+            "edge_unknown_kind": lambda closure: closure["documents"][MAIN]["resolved_edges"][0].update(kind="guessed"),
+            "edge_without_instance": lambda closure: closure["documents"][MAIN]["resolved_edges"][0].update(
+                instance="  "
+            ),
+            "edge_state_suppressed": lambda closure: closure["documents"][MAIN]["resolved_edges"][0].update(
+                suppression_state=0
+            ),
+            "edge_state_not_integer": lambda closure: closure["documents"][MAIN]["resolved_edges"][0].update(
+                suppression_state="2"
+            ),
+            "edge_lightweight_incoherent": lambda closure: closure["documents"][MAIN]["resolved_edges"][0].update(
+                suppression_state=1, lightweight=False
+            ),
+            "edge_path_outside_stage": lambda closure: closure["documents"][MAIN]["resolved_edges"][0].update(
+                resolved_path="C:\\elsewhere\\cad\\base.SLDPRT"
+            ),
+            "edge_path_other_target": lambda closure: closure["documents"][MAIN]["resolved_edges"][0].update(
+                resolved_path=closure["stage_root"].rstrip("\\/") + "\\cad\\arm.SLDPRT"
+            ),
+            "suppressed_unjustified": lambda closure: closure["suppressed"].append(
+                {
+                    "document": MAIN,
+                    "instance": "cover-1",
+                    "suppression_state": 0,
+                    "resolved_path": closure["stage_root"].rstrip("\\/") + "\\cad\\base.SLDPRT",
+                }
+            ),
+            "import_claims_binding": lambda closure: closure["imports"].append(
+                {"document": MAIN, "instance": "hd-1", "state": "bound", "resolved": "cad/base.SLDPRT"}
             ),
         }
         for label, mutate in cases.items():
@@ -96,6 +126,43 @@ class ClosureSealContractTests(unittest.TestCase):
                 mutate(evidence)
                 with self.assertRaises(SelectionError):
                     seal_closure_selection(self.upload, MAIN, evidence, reader_sha256="ab" * 32)
+
+    def test_suppressed_placements_and_cached_imports_stay_evidence_only(self) -> None:
+        evidence = self._evidence(
+            suppressed=[
+                {
+                    "document": MAIN,
+                    "instance": "cover-1",
+                    "name": "cover-1",
+                    "suppression_state": 0,
+                    "resolved_path": self.stage_root + "\\cad\\base.SLDPRT",
+                    "justification": "authored_suppression_clean_open",
+                }
+            ],
+            imports=[
+                {
+                    "document": MAIN,
+                    "instance": "hd-1",
+                    "state": "cached_materialization",
+                    "binding": "author_metadata_only",
+                    "materialization": "C:\\Temp\\IC~~\\hd.step.SLDPRT",
+                    "author_imported_path": "D:\\old\\hd.step",
+                }
+            ],
+        )
+        evidence["warnings"] = [
+            {
+                "code": "import_cached_materialization",
+                "document": MAIN,
+                "instance": "hd-1",
+                "needs_absence_test": True,
+            }
+        ]
+        manifest = seal_closure_selection(self.upload, MAIN, evidence, reader_sha256="ab" * 32)
+        self.assertEqual(set(manifest["files"]), {"cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT"})
+        self.assertEqual(manifest["closure"]["suppressed"][0]["justification"], "authored_suppression_clean_open")
+        self.assertEqual(manifest["closure"]["imports"][0]["binding"], "author_metadata_only")
+        self.assertEqual(manifest["closure"]["warnings"][0]["code"], "import_cached_materialization")
 
     def _staged_session(self):
         session = StagedSelection(self.root / "stage", self.upload, MAIN, reader_sha256="ab" * 32)

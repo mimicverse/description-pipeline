@@ -65,9 +65,12 @@ class SourceSelectionVerifierTests(unittest.TestCase):
             raw["source_selection"] = manifest
         return {"raw": raw}
 
-    def test_absent_carrier_is_explicitly_not_applicable(self) -> None:
+    def test_missing_carrier_is_refused(self) -> None:
         manifest = sealed_selection(FILES, MAIN, edges=EDGES)
-        _require_source_selection(self._payload(manifest, include=False))
+        with self.assertRaises(_Failure):
+            _require_source_selection(self._payload(manifest, include=False))
+        with self.assertRaises(_Failure):
+            _require_source_selection({})
 
     def test_valid_carrier_recomputes_and_binds_the_raw_inventory(self) -> None:
         manifest = sealed_selection(FILES, MAIN, edges=EDGES)

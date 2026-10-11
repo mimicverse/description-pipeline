@@ -11,6 +11,7 @@ from xml.etree import ElementTree as ET
 from description_pipeline.verification.native_declarations import verify_declarations
 from description_pipeline.verification.native_discovery import verify_discovery
 from .test_verify_v14_declarations import document_xml
+from .selection_support import sealed_selection
 
 NS = "{http://schemas.datacontract.org/2004/07/SW2URDF}"
 Z = "{http://schemas.microsoft.com/2003/10/Serialization/}"
@@ -326,6 +327,7 @@ class NativeDeclarationsTests(unittest.TestCase):
             native_files = {"robot.SLDASM": hashlib.sha256(native).hexdigest()}
             raw = fixture()
             raw["files"] = native_files
+            raw["source_selection"] = sealed_selection(native_files, "robot.SLDASM", edges={"robot.SLDASM": []})
             raw["masses"] = [
                 {"component": item["name2"], "mass_kg": 1.0}
                 for item in raw["components"]
@@ -359,11 +361,13 @@ class NativeDeclarationsTests(unittest.TestCase):
             robot["source"]["robot_name"] = "fixture"
             (package / "robot.yaml").write_text(json.dumps(robot))
             (package / "cad-revision.json").write_text(
-                json.dumps({
-                    "schema_version": "solidworks-to-urdf.cad-revision/v1",
-                    **{key: value for key, value in raw["identity"].items() if key != "robot_name"},
-                    "cad_files": native_files,
-                })
+                json.dumps(
+                    {
+                        "schema_version": "solidworks-to-urdf.cad-revision/v1",
+                        **{key: value for key, value in raw["identity"].items() if key != "robot_name"},
+                        "cad_files": native_files,
+                    }
+                )
             )
             report = verify_discovery(package)
             self.assertTrue(report["passed"], report["errors"])

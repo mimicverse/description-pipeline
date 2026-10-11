@@ -27,6 +27,8 @@ from description_pipeline.sources.solidworks.discovery import (
 )
 from description_pipeline.verification.native_discovery import verify_discovery
 
+from .selection_support import sealed_selection
+
 RECORD_FILE = "discovery/native-discovery.json"
 
 IDENTITY = [
@@ -84,6 +86,20 @@ def _in_span(vector: list[float], basis: list[list[float]], tolerance: float = 1
 
 def native_record() -> dict:
     """Two bodies joined by a concentric shaft and a coincident plane (analytic fixture)."""
+
+    files = {
+        name: hashlib.sha256(f"placeholder {name}\n".encode()).hexdigest()
+        for name in ("cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT")
+    }
+    source_selection = sealed_selection(
+        files,
+        "cad/robot.SLDASM",
+        edges={
+            "cad/robot.SLDASM": ["cad/base.SLDPRT", "cad/arm.SLDPRT"],
+            "cad/base.SLDPRT": [],
+            "cad/arm.SLDPRT": [],
+        },
+    )
     return {
         "schema_version": DISCOVERY_SCHEMA,
         "contract": CONTRACT,
@@ -197,10 +213,8 @@ def native_record() -> dict:
         },
         # The fixture's frozen bytes are the deterministic placeholders written by
         # ``baseline``; the derive contract requires the record to bind them.
-        "files": {
-            name: hashlib.sha256(f"placeholder {name}\n".encode()).hexdigest()
-            for name in ("cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT")
-        },
+        "files": files,
+        "source_selection": source_selection,
     }
 
 

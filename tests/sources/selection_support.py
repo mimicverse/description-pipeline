@@ -68,11 +68,12 @@ def closure_evidence(
         "search_configuration": dict(
             search_configuration
             or {
-                "folder_type": {"name": "swDocumentType", "value": 0},
                 "apis": ["ISldWorks.GetSearchFolders", "ISldWorks.SetSearchFolders"],
+                "folder_type": 0,
                 "before": [],
                 "pinned": [stage_root],
                 "observed_after_pin": [stage_root],
+                "set_return": "True",
                 "restored": True,
                 "restore_error": None,
             }

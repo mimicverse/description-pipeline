@@ -38,6 +38,8 @@ from description_pipeline.sources.solidworks.discovery import (  # noqa: E402
 from description_pipeline.sources.solidworks.errors import CadError  # noqa: E402
 from description_pipeline.sources.solidworks.native import _merge_property_scopes  # noqa: E402
 from description_pipeline.verification.native_discovery import verify_discovery  # noqa: E402
+
+from .selection_support import sealed_selection  # noqa: E402
 from description_pipeline.verification.solidworks_urdf import _native_discovery  # noqa: E402
 
 IDENTITY = [
@@ -158,6 +160,19 @@ def _grounding_mates() -> list[dict]:
 def record() -> dict:
     """Two rigid bodies and one hinge: concentric shaft plus a coincident plane."""
 
+    files = {
+        name: hashlib.sha256(f"placeholder {name}\n".encode()).hexdigest()
+        for name in ("cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT")
+    }
+    source_selection = sealed_selection(
+        files,
+        "cad/robot.SLDASM",
+        edges={
+            "cad/robot.SLDASM": ["cad/base.SLDPRT", "cad/arm.SLDPRT"],
+            "cad/base.SLDPRT": [],
+            "cad/arm.SLDPRT": [],
+        },
+    )
     return {
         "schema_version": DISCOVERY_SCHEMA,
         "contract": CONTRACT,
@@ -261,10 +276,8 @@ def record() -> dict:
                 }
             },
         },
-        "files": {
-            name: hashlib.sha256(f"placeholder {name}\n".encode()).hexdigest()
-            for name in ("cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT")
-        },
+        "files": files,
+        "source_selection": source_selection,
     }
 
 

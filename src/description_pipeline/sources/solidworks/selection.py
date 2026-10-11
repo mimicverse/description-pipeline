@@ -41,6 +41,21 @@ def _path(value: object) -> str:
     return value
 
 
+def _within_stage(stage_root: str, resolved_path: str, canonical: str) -> bool:
+    """True when the engine-resolved path is exactly the staged canonical target."""
+
+    root = str(stage_root).replace("\\", "/").rstrip("/")
+    value = str(resolved_path).replace("\\", "/").rstrip("/")
+    if (
+        not root
+        or len(value) <= len(root)
+        or value[len(root)] != "/"
+        or value[: len(root)].casefold() != root.casefold()
+    ):
+        return False
+    return value[len(root) + 1 :].casefold() == canonical.casefold()
+
+
 def validate_file_index(files: Mapping[str, str]) -> dict[str, str]:
     """Validate metadata without reading or authorizing any candidate file."""
 
@@ -161,21 +176,25 @@ def seal_closure_selection(
             or not isinstance(item.get("document"), str)
             or not item.get("document")
             or (item.get("instance") is not None and not isinstance(item.get("instance"), str))
-            or (item.get("resolved_path") is not None and not isinstance(item.get("resolved_path"), str))
+            or not isinstance(item.get("resolved_path"), str)
+            or not item.get("resolved_path").strip()
+            or item.get("justification") != "authored_suppression_clean_open"
         ):
             raise SelectionError(
                 "selection_closure_invalid",
-                "A suppressed placement record is incomplete; suppressed placements are excluded "
-                "from the closure and recorded verbatim",
+                "A suppressed placement record is incomplete; only placements justified by a clean "
+                "native open are omitted from the closure and recorded verbatim",
             )
     if evidence.get("upload_sha256") != digest(files):
         raise SelectionError("selection_closure_invalid", "Closure evidence carries another upload digest")
     if evidence.get("reader_sha256") != reader_sha256:
         raise SelectionError("selection_closure_invalid", "Closure evidence carries another reader identity")
     search_configuration = evidence.get("search_configuration")
+    folder_type = search_configuration.get("folder_type") if isinstance(search_configuration, Mapping) else None
     if (
         not isinstance(search_configuration, Mapping)
-        or search_configuration.get("folder_type") != {"name": "swDocumentType", "value": 0}
+        or type(folder_type) is not int
+        or folder_type != 0
         or not isinstance(search_configuration.get("apis"), list)
         or "ISldWorks.GetSearchFolders" not in search_configuration["apis"]
         or "ISldWorks.SetSearchFolders" not in search_configuration["apis"]
@@ -268,35 +287,67 @@ def seal_closure_selection(
     imports = evidence.get("imports", [])
     if not isinstance(imports, list) or any(not isinstance(item, Mapping) for item in imports):
         raise SelectionError("selection_closure_invalid", "Imported-source evidence must be a verbatim evidence list")
-    import_targets: dict[str, set[str]] = {}
     for item in imports:
-        if item.get("state") != "bound":
-            raise SelectionError("selection_closure_invalid", "An imported source is not bound to the staged tree")
-        target = canonical_target(item.get("resolved"))
-        recorded_sha = item.get("sha256")
-        if recorded_sha is not None and recorded_sha != files[target]:
-            raise SelectionError(
-                "selection_closure_invalid", "A bound import differs from the staged bytes", path=target
-            )
-        owner = folded_graph.get(str(item.get("document") or "").replace("\\", "/").casefold())
-        if owner is None or owner not in evidence_map:
+        if (
+            item.get("state") != "cached_materialization"
+            or item.get("binding") != "author_metadata_only"
+            or not isinstance(item.get("materialization"), str)
+            or not item.get("materialization").strip()
+        ):
             raise SelectionError(
                 "selection_closure_invalid",
-                "An imported source names a document outside the resolved graph",
-                path=str(item.get("document")),
+                "An imported occurrence must be recorded as an unbound cached materialization; "
+                "author import metadata never binds a staged source",
             )
-        import_targets.setdefault(owner, set()).add(target)
+    warnings = evidence.get("warnings")
+    if warnings is not None and (
+        not isinstance(warnings, list) or any(not isinstance(item, Mapping) for item in warnings)
+    ):
+        raise SelectionError("selection_closure_invalid", "Closure warnings must be a verbatim evidence list")
     for name, entry in evidence_map.items():
         edges_raw = entry.get("resolved_edges", [])
         if not isinstance(edges_raw, list) or any(not isinstance(item, Mapping) for item in edges_raw):
             raise SelectionError(
                 "selection_closure_invalid", "Resolved native edges must be a verbatim evidence list", path=name
             )
-        targets = {canonical_target(item.get("resolved")) for item in edges_raw}
-        if set(checked[name]["references"]) != targets | import_targets.get(name, set()):
+        targets: set[str] = set()
+        for item in edges_raw:
+            if item.get("kind") not in {"native_document", "native_imported_document"}:
+                raise SelectionError(
+                    "selection_closure_invalid", "A resolved native edge carries an unknown kind", path=name
+                )
+            if not isinstance(item.get("instance"), str) or not item["instance"].strip():
+                raise SelectionError(
+                    "selection_closure_invalid", "A resolved native edge carries no instance identity", path=name
+                )
+            state = item.get("suppression_state")
+            if type(state) is not int or state not in {1, 2, 3, 4}:
+                raise SelectionError(
+                    "selection_closure_invalid",
+                    "A resolved native edge carries an undocumented suppression state; "
+                    "suppressed placements never contribute edges",
+                    path=name,
+                )
+            lightweight = item.get("lightweight")
+            if type(lightweight) is not bool or lightweight != (state in {1, 4}):
+                raise SelectionError(
+                    "selection_closure_invalid",
+                    "A resolved native edge is not coherent about its lightweight state",
+                    path=name,
+                )
+            target = canonical_target(item.get("resolved"))
+            resolved_path = item.get("resolved_path")
+            if not isinstance(resolved_path, str) or not _within_stage(stage_root, resolved_path, target):
+                raise SelectionError(
+                    "selection_closure_invalid",
+                    "A resolved native edge does not point at the staged canonical target",
+                    path=name,
+                )
+            targets.add(target)
+        if set(checked[name]["references"]) != targets:
             raise SelectionError(
                 "selection_closure_incoherent",
-                "The resolved graph references must equal the resolved native edges plus bound imported sources",
+                "The resolved graph references must equal the resolved native edges",
                 path=name,
             )
     reachable = reachable_closure(checked, main)
