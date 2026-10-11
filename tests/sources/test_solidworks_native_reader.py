@@ -3551,5 +3551,89 @@ class ComponentSourceDocumentTests(unittest.TestCase):
         self.assertEqual(provenance["author_imported_relative"], "NP-F550.step")
 
 
+class MaterializationSessionOwnershipTests(unittest.TestCase):
+    """Cached import capture routes the materialization to its owning session."""
+
+    def setUp(self) -> None:
+        import tempfile
+
+        self.tmp = Path(tempfile.mkdtemp(prefix="sw-materialization-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True))
+        self.materialization = self.tmp / "swx4242" / "IC~~" / "NP-F550.step.SLDPRT"
+        self.materialization.parent.mkdir(parents=True)
+        self.materialization.write_bytes(b"materialized")
+
+    class Session:
+        def __init__(self, app=None, closed=False):
+            self.app = app
+            self.closed = closed
+
+        def current_application(self):
+            return self.app
+
+        def identity(self):
+            return {
+                "pid": 1,
+                "executable": "fake",
+                "ownership": "windows_job",
+                "state": "closed" if self.closed else "active",
+            }
+
+        def close(self):
+            self.closed = True
+
+        def terminate(self):
+            self.closed = True
+
+    @staticmethod
+    def _doc(path):
+        return types.SimpleNamespace(IsOpenedReadOnly=True, GetPathName=lambda: str(path))
+
+    def test_collected_copy_owns_the_materialization_without_creating_a_source(self) -> None:
+        from description_pipeline.sources.solidworks import native as N
+
+        app = types.SimpleNamespace(GetOpenDocumentByName=lambda path: self._doc(path))
+        backend = N.SolidWorksBackend()
+        backend._sessions = {"source": self.Session(closed=True), "copy": self.Session(app=app)}
+        self.assertEqual(backend._role_for_path(self.materialization), "copy")
+        key = backend._record_source_document(self.materialization, "Default")
+        self.assertEqual(key[0], "copy")
+        doc = backend._document_by_path(str(self.materialization))
+        self.assertEqual(doc.GetPathName(), str(self.materialization))
+        # The retired source session is never revived and no new session exists.
+        self.assertEqual(sorted(backend._sessions), ["copy", "source"])
+        self.assertTrue(backend._sessions["source"].closed)
+
+    def test_walk_role_wins_when_explicitly_contextual(self) -> None:
+        from description_pipeline.sources.solidworks import native as N
+
+        backend = N.SolidWorksBackend()
+        backend._sessions = {"source": self.Session(app=object()), "copy": self.Session(app=object())}
+        backend._local.role = "copy"
+        self.assertEqual(backend._role_for_path(self.materialization), "copy")
+
+    def test_ambiguity_and_missing_owner_refuse_precisely(self) -> None:
+        from description_pipeline.sources.solidworks import native as N
+        from description_pipeline.sources.solidworks.errors import CadError
+
+        backend = N.SolidWorksBackend()
+        backend._sessions = {"source": self.Session(app=object()), "copy": self.Session(app=object())}
+        with self.assertRaises(CadError) as caught:
+            backend._role_for_path(self.materialization)
+        self.assertEqual(caught.exception.code, "cad_materialization_session_ambiguous")
+
+        backend2 = N.SolidWorksBackend()
+        backend2._sessions = {"source": self.Session(closed=True)}
+        with self.assertRaises(CadError) as caught:
+            backend2._role_for_path(self.materialization)
+        self.assertEqual(caught.exception.code, "cad_materialization_session_ambiguous")
+
+        backend3 = N.SolidWorksBackend()
+        backend3._role_for_path = lambda path: "ghost"  # type: ignore[method-assign]
+        with self.assertRaises(CadError) as caught:
+            backend3._record_source_document(self.materialization, "Default")
+        self.assertEqual(caught.exception.code, "cad_materialization_session_unavailable")
+
+
 if __name__ == "__main__":
     unittest.main()

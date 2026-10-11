@@ -2117,7 +2117,28 @@ class SolidWorksBackend(CadBackend):
 
     def _role_for_path(self, path):
         normalized = normalize_document_path(os.path.abspath(path))
-        return "copy" if any(normalized.startswith(root + "\\") for root in self._capture_roots) else "source"
+        if any(normalized.startswith(root + "\\") for root in self._capture_roots):
+            return "copy"
+        if session_materialization_path(path):
+            # An engine-resolved session materialization belongs to the session
+            # whose walk produced it, never to a path-derived role: during
+            # capture of a collected copy the source session is retired, and
+            # routing the materialization to "source" would look up (or worse,
+            # create) the wrong application.  Prefer the walk's current role;
+            # otherwise require exactly one live session.  Ambiguity refuses
+            # with a precise error instead of guessing.
+            role = getattr(self._local, "role", None)
+            if role is not None and role in self._sessions and not self._sessions[role].closed:
+                return role
+            live = sorted(name for name, session in self._sessions.items() if not session.closed)
+            if len(live) == 1:
+                return live[0]
+            raise CadError(
+                "cad_materialization_session_ambiguous",
+                "a session materialization has no unambiguous owning CAD session",
+                {"path": str(path), "sessions": live},
+            )
+        return "source"
 
     def seal_documents(self, documents):
         """Seal the exact source documents this backend may open.
@@ -3239,7 +3260,19 @@ class SolidWorksBackend(CadBackend):
     def _record_source_document(self, path, configuration):
         role = self._role_for_path(path)
         key = (role, normalize_document_path(os.path.abspath(path)))
-        session = self._sessions[role]
+        session = self._sessions.get(role)
+        if session is None or session.closed:
+            if session_materialization_path(path):
+                raise CadError(
+                    "cad_materialization_session_unavailable",
+                    "the owning CAD session for a session materialization is not available",
+                    {"path": str(path), "role": role},
+                )
+            raise CadError(
+                "cad_session_unavailable",
+                "the CAD session for a captured document is not available",
+                {"path": str(path), "role": role},
+            )
         previous = self._source_documents.setdefault(key, (path, role, configuration, session))
         if previous[2] != configuration or previous[3] is not session:
             raise CadError("cad_source_changed", "a shared document's captured state changed", {"path": path})
