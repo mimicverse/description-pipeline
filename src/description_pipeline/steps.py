@@ -313,7 +313,7 @@ def capture_evidence(
 ):
     """Inspect generated inputs, archive them and capture a complete immutable snapshot."""
     from .sources.solidworks.freeze import freeze
-    from .sources.solidworks.input import resolve_package
+    from .sources.solidworks.input import native_source_closure, resolve_package
 
     _state(on_event, "capture", "running")
 
@@ -327,6 +327,8 @@ def capture_evidence(
             error.details = {"errors": report.get("errors", [])}
             raise error
         definition = resolve_package(report)
+        if (definition.get("provenance") or {}).get("generator") == "native-discovery":
+            definition["source"]["closure"] = native_source_closure(package, report["input"])
         files = {row["path"]: row["sha256"] for row in report["input_receipt"]["inventory"]}
         if expected_inputs is not None:
             _require(files == expected_inputs, "Inspected inputs differ from native discovery")

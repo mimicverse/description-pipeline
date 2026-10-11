@@ -13,6 +13,7 @@ freeze can prove it read the same bytes.
 
 from __future__ import annotations
 
+import copy
 import math
 import re
 import time
@@ -123,6 +124,33 @@ def native_metadata(package: Path, definition: dict) -> dict:
     ):
         raise PipelineError("Generated identity differs from native discovery")
     return identity
+
+
+def native_source_closure(package: Path, definition: dict) -> dict:
+    """Bind capture policy to the sealed native acquisition, never authored YAML.
+
+    The prepared package may be relocated, while the closure retains the original
+    staging paths as evidence. Capture must resolve current occurrences against
+    these byte-bound native document identities.
+    """
+    from .selection import verify_selection
+
+    native_metadata(package, definition)
+    record = read_data(confined(package, "discovery/native-discovery.json"))
+    raw = record.get("raw") or {}
+    manifest = raw.get("source_selection")
+    if not isinstance(manifest, dict):
+        raise PipelineError("Native acquisition lacks its sealed source selection")
+    selected = manifest.get("files")
+    excluded = manifest.get("excluded_files")
+    if not isinstance(selected, dict) or not isinstance(excluded, dict) or set(selected) & set(excluded):
+        raise PipelineError("Native source selection has invalid file inventories")
+    if selected != record.get("native_files") or selected != raw.get("files"):
+        raise PipelineError("Native source selection differs from the acquired CAD inventory")
+    if manifest.get("main_assembly") != definition["source"].get("assembly"):
+        raise PipelineError("Native source selection names another main assembly")
+    verify_selection(manifest, {**excluded, **selected}, selected, reader_sha256=manifest.get("reader_sha256"))
+    return copy.deepcopy(manifest["closure"])
 
 
 def _as_mapping(value: Any, report: _Report, code: str, where: str) -> dict[str, Any] | None:

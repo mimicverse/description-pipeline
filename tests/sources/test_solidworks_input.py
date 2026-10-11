@@ -18,13 +18,14 @@ import yaml
 
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
-from description_pipeline.io import PipelineError, file_digest, inventory  # noqa: E402
+from description_pipeline.io import PipelineError, digest, file_digest, inventory, write_json  # noqa: E402
 from description_pipeline.sources.solidworks.input import (  # noqa: E402
     INSPECTION_SCHEMA,
     INPUT_SCHEMA,
     ROBOT_FILE,
     inspect_package,
     load_package,
+    native_source_closure,
 )
 
 SPEC_TEXT = """M3 demo documentation export (fixture)
@@ -541,6 +542,7 @@ class InputPackageTests(unittest.TestCase):
         ]
         for reference in malformed:
             with self.subTest(reference=reference):
+
                 def mutate(document, reference=reference):
                     document["source"]["joints"][0]["axis_reference"] = reference
 
@@ -550,7 +552,9 @@ class InputPackageTests(unittest.TestCase):
         def mutate(document):
             joint = document["source"]["joints"][0]
             joint["axis_reference"] = {
-                "kind": "reference_axis", "component": "", "feature_name": "shaft_axis",
+                "kind": "reference_axis",
+                "component": "",
+                "feature_name": "shaft_axis",
             }
             joint["limits"] = {"lower": 0, "upper": 0, "effort": 0, "velocity": 0}
 
@@ -762,6 +766,7 @@ class InputPackageTests(unittest.TestCase):
     def test_design_targets_are_optional_without_invented_ranges(self):
         for supplied in (None, {}, {"expected_mass_kg": [0.5, 2.0]}):
             with self.subTest(checks=supplied):
+
                 def optional(document, supplied=supplied):
                     if supplied is None:
                         document.pop("checks")
@@ -780,6 +785,7 @@ class InputPackageTests(unittest.TestCase):
     def test_explicit_invalid_design_targets_still_fail(self):
         for key in ("expected_mass_kg", "expected_extent_m"):
             with self.subTest(target=key):
+
                 def invalid(document, key=key):
                     document["checks"] = {key: None}
 
@@ -850,3 +856,62 @@ class InputPackageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NativeSourceClosureTests(unittest.TestCase):
+    def setUp(self):
+        from .selection_support import sealed_selection
+
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.main = "cad/robot.SLDASM"
+        (self.root / "cad").mkdir()
+        (self.root / self.main).write_bytes(b"synthetic native bytes")
+        files = {self.main: file_digest(self.root / self.main)}
+        self.manifest = sealed_selection(files, self.main, stage_root="C:\\original-stage")
+        self.record = {
+            "schema_version": "solidworks-to-urdf.native-discovery/v1",
+            "contract": "native-discovery/v1",
+            "run_id": "closure-test",
+            "native_files": files,
+            "handoff_sha256": digest(files),
+            "identity": {"hardware_id": "fixture", "main_assembly": self.main},
+            "raw": {"files": files, "source_selection": self.manifest},
+        }
+        self.definition = {
+            "hardware_id": "fixture",
+            "source": {"assembly": self.main},
+            "provenance": {
+                "generator": "native-discovery",
+                "contract": "native-discovery/v1",
+                "run_id": "closure-test",
+                "native_inventory_sha256": digest(files),
+            },
+        }
+        self.seal()
+
+    def seal(self):
+        path = self.root / "discovery/native-discovery.json"
+        write_json(path, self.record)
+        self.definition["provenance"]["discovery_sha256"] = file_digest(path)
+
+    def test_relocated_capture_retains_the_bound_stage_evidence(self):
+        closure = native_source_closure(self.root, self.definition)
+        self.assertEqual(closure, self.manifest["closure"])
+        closure["main_assembly"] = "mutated"
+        self.assertEqual(self.manifest["closure"]["main_assembly"], self.main)
+
+    def test_resealed_missing_or_changed_manifest_refuses_capture(self):
+        for forged in (None, {**self.manifest, "main_assembly": "foreign.SLDASM"}):
+            with self.subTest(manifest=forged):
+                self.record["raw"]["source_selection"] = forged
+                self.seal()
+                with self.assertRaises(PipelineError):
+                    native_source_closure(self.root, self.definition)
+
+    def test_native_inventory_must_equal_selected_inventory(self):
+        self.record["raw"]["files"] = {**self.record["native_files"], "foreign.SLDPRT": "aa" * 32}
+        self.seal()
+        with self.assertRaises(PipelineError):
+            native_source_closure(self.root, self.definition)
