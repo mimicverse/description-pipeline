@@ -37,6 +37,7 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
         self.assertEqual("selecting", created["status"])
         finished = self.run_to_terminal(jobs, request["run_id"])
         self.assertEqual("native_complete", finished["status"], finished.get("error"))
+        self.assertNotIn("failure_diagnostics", finished)
         self.assertEqual(1, len(calls))
         self.assertEqual(calls[0]["main_assembly"], MAIN)
         self.assertEqual(set(finished["capture_archive"]), {"name", "sha256", "size", "manifest_sha256"})
