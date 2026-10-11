@@ -10,6 +10,7 @@ import hashlib
 import json
 import unittest
 import uuid
+import zipfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -23,7 +24,7 @@ from description_pipeline.sources.solidworks.discovery import DISCOVERY_FILE
 from description_pipeline.sources.solidworks.revision import package_inventory
 from description_pipeline.steps import freeze_inputs
 
-from .endpoint_support import MAIN, EndpointFixture
+from .endpoint_support import MAIN, EndpointFixture, source_bytes
 
 
 class MainAssemblyFormatTests(unittest.TestCase):
@@ -162,10 +163,24 @@ class MainAssemblyResumeTests(EndpointFixture, unittest.TestCase):
         self.assertEqual(400, error.exception.status)
 
     def test_changed_selection_cannot_reuse_checkpoints(self):
+        extra = b"other assembly\n"
         upload = {**self.upload_files}
-        upload["cad/other.SLDASM"] = hashlib.sha256(b"other assembly\n").hexdigest()
+        upload["cad/other.SLDASM"] = hashlib.sha256(extra).hexdigest()
         self.upload_files = upload
         self.upload_sha = digest(upload)
+        payloads = {**source_bytes(), "cad/other.SLDASM": extra}
+
+        def batch_zip(names=None) -> Path:
+            """The exact full-index archive, extended with the second assembly."""
+
+            selected = sorted(payloads) if names is None else list(names)
+            path = self.root / f"upload-{uuid.uuid4().hex}.zip"
+            with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as output:
+                for name in selected:
+                    output.writestr(name, payloads[name])
+            return path
+
+        self.batch_zip = batch_zip
         parent_jobs, parent = self.native_parent()
         parent_jobs.close()
         jobs = self.jobs(native_reader=lambda *args, **kwargs: self.fail("discovery must not rerun"))

@@ -47,6 +47,7 @@ from ..io import (
 )
 from ..sources.snapshot import verify_snapshot
 from ..sources.solidworks.revision import package_inventory
+from ..sources.solidworks.selection import SelectionError
 from ..runtime import tool_record
 from ..stages import ACTIVITY_HISTORY_LIMIT, STAGE_IDS, merge_activity, normalize_activity, stage_view
 from .stage_transfer import CAPTURE_MANIFEST as CAPTURE_MANIFEST_NAME
@@ -309,7 +310,12 @@ class Jobs:
         )
         files = validate_file_index(request["upload_files"])
         _require(digest(files) == request["upload_sha256"], "Upload metadata differs from its bound identity")
-        _require(request["main_assembly"] in files, "Choose a main assembly present in the uploaded folder")
+        if request["main_assembly"] not in files:
+            raise SelectionError(
+                "selection_main_invalid",
+                "Choose a main assembly present in the uploaded folder",
+                path=request["main_assembly"],
+            )
         return files
 
     def _source_dir(self, job):
@@ -808,6 +814,7 @@ class Jobs:
 
             def factory():
                 return NativeSelectionReader(reader_sha256=self.jobs[identifier]["native_tool"]["source_sha256"])
+
         _require(session.state == "reading", "The complete uploaded folder must be staged before native resolution")
         _require(
             self._tool_identity() == self.jobs[identifier]["native_tool"],
