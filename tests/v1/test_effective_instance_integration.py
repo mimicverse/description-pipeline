@@ -414,6 +414,7 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        support.write_link_group_mass_record_from_recombination(self.bundle, self.source)
         write_manifest(
             self.evidence,
             kind="solidworks",
@@ -429,7 +430,6 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
     def _verify(self):
         loaded = scene_module.load_scene(self.evidence)
         model = {"links": [{"name": link["name"], "inertial": link["inertial"]} for link in loaded["links"]]}
-        support.write_link_group_mass_record(self.bundle, model, self.source)
         checks = verify_physics(self.evidence, self.source, model)
         return loaded, model, {check["id"]: check for check in checks}
 
@@ -476,6 +476,7 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
         raw_path.write_text(json.dumps(native), encoding="utf-8")
         # Re-seal the manifest so the snapshot integrity layer cannot mask the
         # report/native drift the physics gate must detect on its own.
+        support.write_link_group_mass_record_from_recombination(self.bundle, self.source)
         write_manifest(
             self.evidence,
             kind="solidworks",
@@ -726,6 +727,7 @@ class InstanceMeasurementIntegrationTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        support.write_link_group_mass_record_from_recombination(self.bundle, self.source)
         write_manifest(
             self.evidence,
             kind="solidworks",
@@ -740,7 +742,6 @@ class InstanceMeasurementIntegrationTests(unittest.TestCase):
     def _verify(self):
         loaded = scene_module.load_scene(self.evidence)
         model = {"links": [{"name": link["name"], "inertial": link["inertial"]} for link in loaded["links"]]}
-        support.write_link_group_mass_record(self.bundle, model, self.source)
         checks = verify_physics(self.evidence, self.source, model)
         return loaded, {check["id"]: check for check in checks}
 

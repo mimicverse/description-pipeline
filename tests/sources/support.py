@@ -632,6 +632,69 @@ def write_link_group_mass_record(bundle: Path, model: dict, source: dict) -> Non
     )
 
 
+def write_link_group_mass_record_from_recombination(bundle: Path, source: dict) -> None:
+    """Seed the direct link record from the recombination (fixtures without a model yet).
+
+    Used before ``load_scene``/manifest verification so a fixture bundle is
+    shaped exactly like a native12 capture; the scene that consumes it later
+    regenerates the same link inertials by construction.
+    """
+
+    import json as _json
+
+    from description_pipeline.sources.solidworks import verify as oracle
+
+    bundle = Path(bundle)
+    evidence = bundle / "evidence"
+    raw = _json.loads((evidence / "raw/scene_raw.json").read_text())
+    masses = _json.loads((evidence / "raw/mass_properties.json").read_text())
+    declared_path = evidence / "raw/declared_masses.json"
+    declared = (_json.loads(declared_path.read_text()).get("items") or {}) if declared_path.is_file() else {}
+    effective = oracle.effective_math_map(masses, raw)
+    payload = {
+        "schema_version": "solidworks-to-urdf.link-group-mass-properties/v1",
+        "assembly": raw.get("source_document") or raw.get("document"),
+        "configuration": str(source.get("configuration") or "Default"),
+        "used_api": "IMassProperty2 (SelectedItems = component set)",
+        "selection_rule": "top_most_providers+uncovered_leaves",
+        "links": {},
+    }
+    for body in source.get("bodies") or []:
+        name = str(body.get("name"))
+        selection = sorted(
+            str(note["component"])
+            for *_rest, note in oracle._resolved_contributions(body, raw, masses, declared, effective)
+        )
+        world = oracle._raw_world(body, raw, masses, declared)
+        read = {
+            "mass_kg": float(world["mass"]),
+            "volume_m3": None,
+            "density_kg_m3": None,
+            "com_m": [float(value) for value in world["com"]],
+            "inertia_tensor_about_com": [
+                [float(value) for value in row] for row in world["inertia"]
+            ],
+            "inertia_values_about_origin_api": {"error": "fixture"},
+            "overrides": {
+                "OverrideMass": False,
+                "OverrideCenterOfMass": False,
+                "OverrideMomentsOfInertia": False,
+            },
+        }
+        payload["links"][name] = {
+            "selection": selection,
+            "reads": [_json.loads(_json.dumps(read)), _json.loads(_json.dumps(read))],
+            "reproducibility": {
+                "mass_delta_kg": 0.0,
+                "com_delta_norm_m": 0.0,
+                "tensor_delta_max_abs": 0.0,
+            },
+        }
+    (evidence / "raw/link_group_mass_properties.json").write_text(
+        _json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+
+
 def read_scene(snapshot: Path) -> dict:
     """Read the raw scene a snapshot carries (shared loader when available)."""
 
