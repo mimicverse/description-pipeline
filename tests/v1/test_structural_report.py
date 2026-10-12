@@ -560,9 +560,7 @@ class StructuralReportTests(unittest.TestCase):
             self.assertNotIn("report.effective_instances_invalid", codes)
 
 
-if __name__ == "__main__":
 
-    unittest.main()
 
     def test_mass_closure_records_are_projected_and_allowlisted(self):
         from description_pipeline.structural_report import is_sealed_diagnostic_member
@@ -796,3 +794,6 @@ if __name__ == "__main__":
             self.assertIn("report.cad_unassigned_passive_joint_invalid", codes)
             self.assertNotIn("discovery.cad_unassigned_passive_joint", codes)
 
+
+if __name__ == "__main__":
+    unittest.main()

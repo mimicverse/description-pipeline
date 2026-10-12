@@ -68,12 +68,18 @@ def diagnostic_file_sources(evidence_root: Path | None, *, failure_roots: tuple[
         if (root / name).is_file():
             sources[name] = name
             continue
-        short = name[len("evidence/") :] if name.startswith("evidence/") else name
-        matches = [
-            f"{failure_root}/partial/{short}"
-            for failure_root in failure_roots
-            if (root / failure_root / "partial" / short).is_file()
-        ]
+        # Partial trees keep the staging spelling: raw readings live under
+        # partial/raw/..., other evidence-root files keep their evidence/ prefix.
+        spellings = [name]
+        if name.startswith("evidence/raw/"):
+            spellings.insert(0, name[len("evidence/") :])
+        matches = []
+        for failure_root in failure_roots:
+            for spelling in spellings:
+                candidate = f"{failure_root}/partial/{spelling}"
+                if (root / candidate).is_file():
+                    matches.append(candidate)
+                    break
         if len(matches) > 1:
             raise PipelineError(f"Conflicting partial evidence for {name!r}: {matches}")
         if matches:
