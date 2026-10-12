@@ -674,9 +674,22 @@ class MateRecordTests(unittest.TestCase):
             mates = {mate["name"]: mate for mate in record["mates"]}
             self.assertEqual(mates["locked_spin"]["type"], "concentric")
             self.assertIs(mates["locked_spin"]["lock_rotation"], True)
+            self.assertEqual(
+                mates["locked_spin"]["lock_rotation_api"], "IConcentricMateFeatureData.LockRotation"
+            )
             self.assertIs(mates["free_spin"]["lock_rotation"], False)
+            self.assertEqual(
+                mates["free_spin"]["lock_rotation_api"], "IConcentricMateFeatureData.LockRotation"
+            )
             self.assertIsNone(mates["no_definition"]["lock_rotation"])
+            self.assertNotIn("lock_rotation_api", mates["no_definition"])
             self.assertNotIn("lock_rotation", mates["seat"])
+            self.assertIn(
+                "mate_lock_rotation:locked_spin:read:IConcentricMateFeatureData.LockRotation", record["notes"]
+            )
+            self.assertIn(
+                "mate_lock_rotation:free_spin:read:IConcentricMateFeatureData.LockRotation", record["notes"]
+            )
             self.assertTrue(
                 any(str(note).startswith("mate_lock_rotation:no_definition") for note in record["notes"]),
                 record["notes"],

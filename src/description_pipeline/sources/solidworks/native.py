@@ -5062,14 +5062,15 @@ class SolidWorksBackend(CadBackend):
                     }
                     if mate_type == "concentric":
                         # Documented native rotation lock (IConcentricMateFeatureData
-                        # .LockRotation, SW2019+; typelib IID {D9E1EBDD-...}): a
-                        # concentric mate with rotation locked removes its spin;
-                        # axial translation still requires another constraint.
-                        # The value is read from
-                        # CAD through the same GetDefinition path the earlier manual
-                        # native scripts used; it is never inferred from any
-                        # reference output.
+                        # .LockRotation, SW2019+; typelib IID {D9E1EBDD-...}): the
+                        # flag removes ONE rotational degree of freedom; a locked
+                        # concentric is not by itself rigid because axial
+                        # translation remains until another mate constrains it.
+                        # The value is read from CAD through the same GetDefinition
+                        # path the earlier manual native scripts used; it is never
+                        # inferred from any reference output.
                         lock_rotation = None
+                        lock_rotation_api = None
                         try:
                             definition = _method(feature, "GetDefinition")
                             if definition is not None:
@@ -5077,6 +5078,10 @@ class SolidWorksBackend(CadBackend):
                                 raw_lock = _member(bound, "LockRotation")
                                 if isinstance(raw_lock, bool):
                                     lock_rotation = raw_lock
+                                    lock_rotation_api = "IConcentricMateFeatureData.LockRotation"
+                                    notes.append(
+                                        f"mate_lock_rotation:{name}:read:IConcentricMateFeatureData.LockRotation"
+                                    )
                                 else:
                                     notes.append(
                                         f"mate_lock_rotation:{name}:unreadable:{repr(raw_lock)[:60]}"
@@ -5088,6 +5093,8 @@ class SolidWorksBackend(CadBackend):
                                 f"mate_lock_rotation:{name}:{type(error).__name__}: {str(error)[:160]}"
                             )
                         mate_record["lock_rotation"] = lock_rotation
+                        if lock_rotation_api is not None:
+                            mate_record["lock_rotation_api"] = lock_rotation_api
                     mates.append(mate_record)
                     mates_done += 1
                 # The next assembly selection may invalidate this entire borrowed
