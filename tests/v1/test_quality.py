@@ -8,6 +8,7 @@ import struct
 import json
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -1327,6 +1328,87 @@ class UrdfMassEqualityTests(unittest.TestCase):
                 with self.assertRaises(PipelineError):
                     verify_urdf_mass_equality(self.root)
 
+    def _accounting(self, urdf_masses, whole, context, scene_names, bodies):
+        self.masses = list(urdf_masses)
+        self.write(whole=whole)
+        write_json(self.root / "evidence/raw/scene_raw.json", {"components": [{"name": name} for name in scene_names]})
+        write_json(
+            self.root / "evidence/raw/mass_closure.json",
+            {
+                "status": "recorded",
+                "mode": "full",
+                "top_level": {"mass": whole},
+                "component_context": {"status": "recorded", "errors": [], "instances": context},
+            },
+        )
+        return {"bodies": [{"name": "base", "components": bodies}]}
+
+    def test_unassigned_native_mass_closes_the_identity_and_withholds_qualification(self):
+        source = self._accounting(
+            [1.0],
+            3.0,
+            [
+                {"name": "a", "context_mass_kg": 1.0, "parent": None, "document": "a.SLDPRT"},
+                {"name": "b", "context_mass_kg": 2.0, "parent": "frame-9", "document": "b.SLDPRT"},
+            ],
+            ["a", "b"],
+            ["a"],
+        )
+        details = verify_urdf_mass_equality(self.root, source)
+        self.assertEqual(1.0, details["urdf_mass_kg"])
+        self.assertEqual(2.0, details["unassigned_mass_kg"])
+        self.assertEqual(3.0, details["accounted_mass_kg"])
+        self.assertEqual(0.0, details["delta_kg"])
+        self.assertFalse(details["whole_mass_qualified"])
+        self.assertEqual([item["component"] for item in details["warnings"]], ["b"])
+        self.assertEqual(details["unassigned"], [{"component": "b", "document": "b.SLDPRT", "mass_kg": 2.0}])
+
+    def test_unassigned_masses_do_not_explain_an_unrelated_gap(self):
+        source = self._accounting(
+            [1.0],
+            3.0,
+            [
+                {"name": "a", "context_mass_kg": 1.0},
+                {"name": "b", "context_mass_kg": 1.999999},
+            ],
+            ["a", "b"],
+            ["a"],
+        )
+        with self.assertRaises(PipelineError):
+            verify_urdf_mass_equality(self.root, source)
+
+    def test_unread_or_duplicated_unassigned_evidence_fails(self):
+        missing = self._accounting([1.0], 3.0, [{"name": "a", "context_mass_kg": 1.0}], ["a", "b"], ["a"])
+        with self.assertRaises(PipelineError):
+            verify_urdf_mass_equality(self.root, missing)
+        duplicated = self._accounting(
+            [1.0],
+            3.0,
+            [
+                {"name": "a", "context_mass_kg": 1.0},
+                {"name": "b", "context_mass_kg": 1.0},
+                {"name": "b", "context_mass_kg": 1.0},
+            ],
+            ["a", "b"],
+            ["a"],
+        )
+        with self.assertRaises(PipelineError):
+            verify_urdf_mass_equality(self.root, duplicated)
+
+    def test_assigned_components_leave_the_identity_strict(self):
+        source = self._accounting(
+            [1.0],
+            3.0,
+            [
+                {"name": "a", "context_mass_kg": 1.0},
+                {"name": "b", "context_mass_kg": 2.0},
+            ],
+            ["a", "b"],
+            ["a", "b"],
+        )
+        with self.assertRaises(PipelineError):
+            verify_urdf_mass_equality(self.root, source)
+
 
 class DerivedSelectionAccountingTests(unittest.TestCase):
     """The independent recomputation binds each native instance and its own measurements."""
@@ -1407,6 +1489,154 @@ class DerivedSelectionAccountingTests(unittest.TestCase):
         self.assertEqual(row["configuration"], "Other")
         self.assertEqual(row["parent"], "frame-9")
         self.assertAlmostEqual(row["mass_kg"], 2.0, places=12)
+
+
+class MeshChunkContractTests(unittest.TestCase):
+    """Delivered mesh parts must reproduce the captured source records exactly."""
+
+    def _mesh(self, triangles):
+        header = b"chunk contract test".ljust(80, b" ")
+        records = b"".join(struct.pack("<12fH", 0.0, 0.0, 1.0, *a, *b, *c, 0) for a, b, c in triangles)
+        return header + struct.pack("<I", len(triangles)) + records
+
+    def _parts(self, payload, limit):
+        total = struct.unpack("<I", payload[80:84])[0]
+        count = (total + limit - 1) // limit
+        parts = []
+        for part in range(count):
+            start = limit * part
+            size = min(limit, total - start)
+            parts.append(
+                payload[:80] + struct.pack("<I", size) + payload[84 + 50 * start : 84 + 50 * (start + size)]
+            )
+        return parts
+
+    def _fixture(self, root, *, limit, mutate):
+        triangles = [
+            ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+            ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+            ((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+            ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+        ]
+        payload = self._mesh(triangles)
+        parts = self._parts(payload, limit)
+        if mutate is not None:
+            mutate(payload, parts)
+        (root / "evidence/geometry").mkdir(parents=True, exist_ok=True)
+        (root / "meshes/visual").mkdir(parents=True, exist_ok=True)
+        (root / "evidence/geometry/0001_mesh.stl").write_bytes(payload)
+        names = []
+        for index, data in enumerate(parts):
+            name = f"meshes/visual/board_0_part_{index}.stl"
+            (root / name).write_bytes(data)
+            names.append(name)
+        visuals = "".join(
+            '<visual><origin xyz="0 0 0" rpy="0 0 0"/><geometry>'
+            f'<mesh filename="../{name}" scale="1 1 1"/></geometry></visual>'
+            for name in names
+        )
+        node = ET.fromstring(f'<link name="board">{visuals}</link>')
+        body = {"components": ["pcb-1"]}
+        model_link = {
+            "inertial": {
+                "xyz": [0.0, 0.0, 0.0],
+                "inertia": [1e-6, 0.0, 0.0, 1e-6, 0.0, 1e-6],
+                "mass": 1.0,
+            },
+            "visuals": [
+                {"filename": "geometry/0001_mesh.stl", "scale": [1, 1, 1], "xyz": [0, 0, 0], "rpy": [0, 0, 0]}
+            ],
+            "collisions": [],
+        }
+        geometry = {
+            "pcb-1": {
+                "path": "geometry/0001_mesh.stl",
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "triangles": 4,
+                "scale": [1, 1, 1],
+                "xyz": [0, 0, 0],
+                "rpy": [0, 0, 0],
+            }
+        }
+        components = {"pcb-1": np.identity(4)}
+        return node, body, model_link, geometry, components
+
+    def _run(self, root, *, limit=2, mutate=None):
+        node, body, model_link, geometry, components = self._fixture(root, limit=limit, mutate=mutate)
+        with mock.patch.object(quality, "CHUNK_TRIANGLES_MAX", limit):
+            return quality._geometry(
+                root, body, node, model_link, geometry, components, np.identity(4), np.identity(4), set()
+            )
+
+    def test_lossless_multipart_delivery_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            used, points = self._run(Path(tmp))
+            self.assertEqual(
+                used, ["meshes/visual/board_0_part_0.stl", "meshes/visual/board_0_part_1.stl"]
+            )
+            self.assertEqual(len(points), 12)
+
+    def test_any_part_deviation_fails(self):
+        mutations = {
+            "swapped_parts": lambda _payload, parts: parts.__setitem__(slice(0, 2), [parts[1], parts[0]]),
+            "truncated_part": lambda _payload, parts: parts.__setitem__(1, parts[1][:-50]),
+            "corrupt_header": lambda _payload, parts: parts.__setitem__(1, b"X" + parts[1][1:]),
+            "wrong_count": lambda _payload, parts: parts.__setitem__(
+                0, parts[0][:80] + struct.pack("<I", 1) + parts[0][84:]
+            ),
+            "dropped_record": lambda _payload, parts: parts.__setitem__(1, parts[1][:84] + parts[1][84 + 50 :]),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp, self.assertRaises(PipelineError):
+                self._run(Path(tmp), mutate=mutate)
+
+    def test_chunk_count_boundaries_are_deterministic(self):
+        self.assertEqual(quality._mesh_chunk_count(199_999), 1)
+        self.assertEqual(quality._mesh_chunk_count(200_000), 2)
+        self.assertEqual(quality._mesh_chunk_count(362_415), 2)
+        self.assertEqual(quality._mesh_chunk_count(399_998), 2)
+        self.assertEqual(quality._mesh_chunk_count(399_999), 3)
+
+
+class EntityPartitionTests(unittest.TestCase):
+    """Native, selected and unassigned entity partitions bind to the sealed scene."""
+
+    def _bundle(self):
+        source = {"bodies": [{"name": "base_link", "id": "base_link", "components": ["a", "b"]}]}
+        raw = {"components": [{"name": "a"}, {"name": "b"}, {"name": "c"}]}
+        model = {
+            "links": [{"name": "base_link", "id": "base_link", "provenance": {"source_entities": ["a", "b"]}}],
+            "provenance": {
+                "expected_entities": ["a", "b"],
+                "native_entities": ["a", "b", "c"],
+                "unassigned_entities": ["c"],
+            },
+        }
+        return source, raw, model
+
+    def test_partitions_are_bound_to_the_sealed_scene(self):
+        source, raw, model = self._bundle()
+        self.assertEqual(
+            quality._entities(source, raw, model),
+            {"occurrences": 3, "bodies": 1, "selected": 2, "unassigned": 1},
+        )
+        for key in ("expected_entities", "native_entities", "unassigned_entities"):
+            candidate = copy.deepcopy(model)
+            candidate["provenance"][key].pop()
+            with self.assertRaises(PipelineError):
+                quality._entities(source, raw, candidate)
+        missing = copy.deepcopy(model)
+        missing["provenance"]["unassigned_entities"] = []
+        with self.assertRaises(PipelineError):
+            quality._entities(source, raw, missing)
+        unknown = copy.deepcopy(source)
+        unknown["bodies"][0]["components"] = ["a", "z"]
+        with self.assertRaises(PipelineError):
+            quality._entities(unknown, raw, model)
+        duplicate = copy.deepcopy(raw)
+        duplicate["components"].append({"name": "a"})
+        with self.assertRaises(PipelineError):
+            quality._entities(source, duplicate, model)
 
 
 class OptionalDesignExpectationTests(unittest.TestCase):
