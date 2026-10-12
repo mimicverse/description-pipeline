@@ -1722,6 +1722,10 @@ def _capture_axis_references(backend: Any, cfg: dict[str, Any]) -> list[dict[str
         reference = joint.get("axis_reference")
         if not isinstance(reference, dict):
             continue
+        if reference.get("kind") == "mate_axis":
+            # Already sealed native mate geometry is resolved on Linux. Do not
+            # reopen CAD to reread the same line or manufacture a named datum.
+            continue
         joint_name = str(joint.get("name") or joint.get("id") or "")
         if not callable(reader):
             raise BridgeError(
@@ -1858,6 +1862,16 @@ def _freeze_local(
         stage = "environment"
         environment = capture_environment(backend, worker_version)
         write_json(staging / "evidence" / "environment.json", environment)
+        if any((joint.get("axis_reference") or {}).get("kind") == "mate_axis" for joint in cfg.get("joints", [])):
+            records = [Path(root) / "discovery/native-discovery.json" for root in cfg["allowed_roots"]]
+            records = [path for path in records if path.is_file()]
+            if len(records) != 1:
+                raise BridgeError(
+                    "cad_passive_source_missing", "Passive joints require one sealed native discovery record"
+                )
+            native_target = staging / "raw/native_discovery.json"
+            native_target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(records[0], native_target)
         stage = "readings"
         scene, raw = _capture_readings(backend, cfg, closure, staging / "source")
         write_json(staging / "raw" / "scene_raw.json", raw)

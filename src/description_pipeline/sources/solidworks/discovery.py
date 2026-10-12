@@ -2262,8 +2262,54 @@ def _exporter_reference(value: Any, findings: list[dict], obj: str) -> dict | No
 
 
 def _body_datum(record: dict, body: dict) -> dict | None:
+    if body.get("source") == "native_passive":
+        from .passive import resolve_mate_frame
+
+        frame = resolve_mate_frame(record, body["mate_axis"])
+        return {"array": frame["matrix"], "owner": body["mate_axis"]["component"], "name": body["name"]}
     owners = [body["datum_owner"]] if "datum_owner" in body else body["owners"]
     return _datum(record, body["datum"], owners)
+
+
+def _complete_passive_memberships(record, bodies, joints, clusters, findings):
+    from .passive import complete_passive_leaves
+
+    proofs = complete_passive_leaves(
+        record, clusters.of, {item["name"] for item in bodies} | {item["name"] for item in joints}
+    )
+    completed = {proof["component"] for proof in proofs}
+    for finding in list(findings):
+        if finding["code"] != "discovery.exporter_membership_uncovered":
+            continue
+        remaining = sorted(set(finding["detail"]["components"]) - completed)
+        if remaining:
+            finding["detail"]["components"] = remaining
+        else:
+            findings.remove(finding)
+    for proof in proofs:
+        component, name, selector = proof["component"], proof["body"], proof["axis_reference"]
+        bodies.append({
+            "root": name, "name": name, "identity": "native_passive:" + component,
+            "source": "native_passive", "components": [component], "owners": [component],
+            "datum": "", "mate_axis": selector,
+        })
+        joints.append({
+            "name": proof["joint"], "mate": "native_passive:" + component,
+            "mates": [item["name"] for item in selector["mates"]], "index": len(joints),
+            "type": "continuous", "parent": proof["parent"], "child": name,
+            "components": [proof["parent"], name], "passive": True,
+            "axis": {"point": proof["axis"]["point"], "direction": proof["axis"]["direction"],
+                     "source": "native_passive"},
+            "axis_reference": selector, "limits": None, "limit_evidence": None, "drive": None,
+        })
+        clusters.of[component] = name
+        clusters.members[name] = [component]
+        findings.append(_finding(
+            "discovery.cad_unassigned_passive_joint", "component:" + component,
+            "CAD mates prove one passive rotation for an undeclared leaf; its material is retained "
+            "without asserting authored intent, rigidity, drive or operating limits",
+            {key: value for key, value in proof.items() if key != "axis"}, blocking=False,
+        ))
 
 
 def _exporter_native_pairs(record: dict, findings: list[dict]) -> dict[tuple[str, str], dict]:
@@ -3987,6 +4033,7 @@ def derive_native_package(
                     )
                 )
             _exporter_constraint_checks(declaration, clusters, joints, findings)
+            _complete_passive_memberships(record, bodies, joints, clusters, findings)
             frames = _interface_frames(record, clusters, bodies, root, findings)
             for body in bodies:
                 if settings.frozen_names.get(body["identity"], body["name"]) != body["name"]:
@@ -4202,7 +4249,10 @@ def _robot_document(
                 "id": body["name"],
                 "name": body["name"],
                 "components": body["components"],
-                "frame": {"coordinate_system": body["datum"]},
+                "frame": (
+                    {"mate_axis": body["mate_axis"]} if body.get("source") == "native_passive"
+                    else {"coordinate_system": body["datum"]}
+                ),
             }
             for body in sorted(bodies, key=lambda item: item["name"])
             if body["components"]
@@ -4263,6 +4313,10 @@ def _robot_document(
             "axis": axis,
             "axis_reference": joint["axis_reference"],
         }
+        if joint.get("passive") is True:
+            entry["passive"] = True
+            source["joints"].append(entry)
+            continue
         if joint["axis"].get("source") == "exporter":
             entry["limits"] = {
                 key: float(joint["limits"][key])

@@ -271,10 +271,18 @@ def map_from_row_major(values: Sequence[float]) -> tuple[Matrix3, Vector3]:
     return _matrix_from_row_major(numbers, 0), _translation_from_row_major(numbers)
 
 
-def _link_frame(body: dict[str, Any], coordinate_systems: dict[str, Sequence[float]]) -> tuple[Matrix3, Vector3]:
+def _link_frame(
+    body: dict[str, Any], coordinate_systems: dict[str, Sequence[float]], mate_frames: dict | None = None,
+) -> tuple[Matrix3, Vector3]:
     """Read the body frame exclusively from its captured native datum."""
 
     frame = body.get("frame")
+    if isinstance(frame, dict) and set(frame) == {"mate_axis"}:
+        selector = frame["mate_axis"]
+        native = (mate_frames or {}).get(selector.get("component"))
+        if not isinstance(native, dict) or native.get("selector") != selector:
+            raise ConfigError("passive frame has no matching sealed native mate evidence", {"body": body.get("name")})
+        return map_from_row_major(native["matrix"])
     if not isinstance(frame, dict) or set(frame) != {"coordinate_system"}:
         raise ConfigError("every body frame must name one native CAD datum", {"body": body.get("name")})
     reference = frame["coordinate_system"]
@@ -398,6 +406,7 @@ def build_scene(
     """Assemble the portable scene from sealed CAD readings and source definition."""
 
     placements = {component.name: list(component.transform) for component in raw_scene.components}
+    mate_frames = getattr(raw_scene, "native_mate_frames", {})
     masses = {name: dict(payload) for name, payload in (raw_scene.mass_properties or {}).items()}
     geometry_by_component = {entry["component"]: entry for entry in geometry_entries}
     bodies = list(cfg.get("bodies") or [])
@@ -425,11 +434,11 @@ def build_scene(
                 "body references components that are not in the assembly",
                 {"body": body_id, "unknown": unknown[:10]},
             )
-        link_rotation, link_translation = _link_frame(body, raw_scene.coordinate_systems or {})
+        link_rotation, link_translation = _link_frame(body, raw_scene.coordinate_systems or {}, mate_frames)
         link_frames[str(name)] = (
             link_rotation,
             link_translation,
-            (body.get("frame") or {}).get("coordinate_system"),
+            (body.get("frame") or {}).get("coordinate_system") or "cad_mate_axis:" + components[0],
         )
         readings = []
         for component in components:
@@ -532,7 +541,10 @@ def build_scene(
                         for reading in readings
                     ],
                     "combination": "parallel_axis_from_part_readings",
-                    "link_frame": "cad_coordinate_system:" + body["frame"]["coordinate_system"],
+                    "link_frame": (
+                        "cad_coordinate_system:" + body["frame"]["coordinate_system"]
+                        if "coordinate_system" in body["frame"] else "cad_mate_axis:" + components[0]
+                    ),
                     "kinematics": "native_derived",
                 },
             }
@@ -558,7 +570,7 @@ def build_scene(
     if root_name is not None:
         root_body = next((body for body in bodies if str(body.get("name") or body.get("id")) == root_name), None)
         if root_body is not None:
-            rotation_root, translation_root = _link_frame(root_body, raw_scene.coordinate_systems or {})
+            rotation_root, translation_root = _link_frame(root_body, raw_scene.coordinate_systems or {}, mate_frames)
             reference = (root_body.get("frame") or {}).get("coordinate_system")
             world_from_root = {
                 "xyz": [float(value) for value in translation_root],
@@ -662,10 +674,16 @@ def _build_joints(
             entry["provenance"]["limits_evidence"] = {str(key): str(value) for key, value in limit_evidence.items()}
         if movable:
             entry["axis"] = [float(value) for value in axis]
+        passive = joint.get("passive") is True
+        if passive:
+            if (joint_type != "continuous" or not isinstance(axis_reference, dict)
+                    or axis_reference.get("kind") != "mate_axis" or joint.get("limits") is not None):
+                raise ConfigError("passive completion must preserve a native unlimited rotation", {"joint": joint_id})
+            entry["provenance"]["passive"] = True
         limits = joint.get("limits")
         if limits:
             entry["limits"] = {str(key): float(value) for key, value in limits.items()}
-        elif movable:
+        elif movable and not passive:
             raise ConfigError("movable joints need explicit limits; none are invented", {"joint": joint_id})
         dynamics = joint.get("dynamics")
         if dynamics:
