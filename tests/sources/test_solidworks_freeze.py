@@ -126,6 +126,29 @@ class FreezeTests(unittest.TestCase):
         self.assertIn("suppressed_skipped", payload)
         self.assertIn("session_temp_dependencies", payload)
 
+    def test_freeze_records_the_direct_link_group_read(self) -> None:
+        freeze(self.config, self.destination, backend=self.backend)
+        record = json.loads(
+            (self.destination / "raw" / "link_group_mass_properties.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(record["schema_version"], "solidworks-to-urdf.link-group-mass-properties/v1")
+        self.assertEqual(record["selection_rule"], "top_most_providers+uncovered_leaves")
+        self.assertEqual(sorted(record["links"]), ["arm_link", "base_link"])
+        base = record["links"]["base_link"]
+        self.assertEqual(base["selection"], ["base-1"])
+        self.assertEqual(len(base["reads"]), 2)
+        self.assertAlmostEqual(base["reads"][0]["mass_kg"], 1.0, places=12)
+        self.assertEqual(
+            base["reproducibility"], {"mass_delta_kg": 0.0, "com_delta_norm_m": 0.0, "tensor_delta_max_abs": 0.0}
+        )
+        scene = load_scene(self.destination)
+        link = next(row for row in scene["links"] if row["name"] == "base_link")
+        self.assertAlmostEqual(link["inertial"]["mass"], 1.0, places=12)
+        self.assertEqual(link["provenance"]["mass_properties"]["direct"]["selection"], ["base-1"])
+        self.assertAlmostEqual(
+            link["provenance"]["mass_properties"]["direct_vs_recombination"]["mass_delta_kg"], 0.0, places=12
+        )
+
     def test_freeze_records_evidence_covered_stale_stored_references(self) -> None:
         config = json.loads(json.dumps(self.config))
         config["closure"] = {

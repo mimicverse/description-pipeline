@@ -28,6 +28,29 @@ freeze_module = importlib.import_module("description_pipeline.sources.solidworks
 scene_module = importlib.import_module("description_pipeline.sources.solidworks.scene")
 closure_module = importlib.import_module("description_pipeline.sources.solidworks.closure")
 
+
+def _fixture_link_group_record(source, components, notes, masses, assembly):
+    """Direct link group record for the integration fixture (read 1 = recombination)."""
+
+    from tests.sources.support import compose_fixture_link_reads
+
+    scene_like = type("Scene", (), {"components": components, "mass_properties": masses})()
+    effective = (notes or {}).get("effective_instances") or {}
+    selections = freeze_module._link_group_selections(source, scene_like, effective)
+    return {
+        "schema_version": "solidworks-to-urdf.link-group-mass-properties/v1",
+        "assembly": assembly,
+        "configuration": "Default",
+        "used_api": "IMassProperty2 (SelectedItems = component set)",
+        "selection_rule": "top_most_providers+uncovered_leaves",
+        "links": compose_fixture_link_reads(
+            components,
+            effective,
+            {name: entry["selection"] for name, entry in selections.items()},
+            masses=masses,
+        ),
+    }
+
 ORIGINAL = "C:\\original\\3.0 总装1008.SLDASM"
 COLLECTED = "C:\\captured\\copy\\3.0 总装1008.SLDASM"
 PARENT = "board-1"
@@ -367,6 +390,14 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
         (raw / "mass_properties.json").write_text(json.dumps(self.masses), encoding="utf-8")
         (raw / "mass_closure.json").write_text(json.dumps(native), encoding="utf-8")
         (raw / "effective_instances.json").write_text(json.dumps(record), encoding="utf-8")
+        (raw / "link_group_mass_properties.json").write_text(
+            json.dumps(
+                _fixture_link_group_record(
+                    self.source, scene_obj.components, scene_obj.notes, scene_obj.mass_properties, ORIGINAL
+                )
+            ),
+            encoding="utf-8",
+        )
         (raw / "declared_masses.json").write_text(json.dumps({"items": {}, "evidence": None}), encoding="utf-8")
         (raw / "coordinate_systems.json").write_text(json.dumps(self.raw_scene["coordinate_systems"]), encoding="utf-8")
         (raw / "source_config.json").write_text(json.dumps(self.source), encoding="utf-8")
@@ -667,6 +698,18 @@ class InstanceMeasurementIntegrationTests(unittest.TestCase):
         (raw / "mass_properties.json").write_text(json.dumps(scene_payload["mass_properties"]), encoding="utf-8")
         (raw / "mass_closure.json").write_text(json.dumps(native), encoding="utf-8")
         (raw / "effective_instances.json").write_text(json.dumps(record), encoding="utf-8")
+        (raw / "link_group_mass_properties.json").write_text(
+            json.dumps(
+                _fixture_link_group_record(
+                    self.source,
+                    scene_obj.components,
+                    scene_payload["notes"],
+                    scene_payload["mass_properties"],
+                    ORIGINAL,
+                )
+            ),
+            encoding="utf-8",
+        )
         (raw / "declared_masses.json").write_text(json.dumps({"items": {}, "evidence": None}), encoding="utf-8")
         (raw / "coordinate_systems.json").write_text(json.dumps(scene_payload["coordinate_systems"]), encoding="utf-8")
         (raw / "source_config.json").write_text(json.dumps(self.source), encoding="utf-8")

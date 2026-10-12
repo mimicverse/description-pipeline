@@ -18,6 +18,7 @@ from .errors import ConfigError
 from .jsonio import read_json
 
 SCENE_SCHEMA = "description.scene/v1"
+LINK_GROUP_SCHEMA = "solidworks-to-urdf.link-group-mass-properties/v1"
 
 Matrix3 = tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]
 Vector3 = tuple[float, float, float]
@@ -399,6 +400,82 @@ def _material_warnings(unverified: Sequence[str], masses: dict[str, Any]) -> lis
     ]
 
 
+def _tensor_delta(actual: Matrix3, reference: Matrix3) -> tuple[float, float]:
+    worst = 0.0
+    scale = 0.0
+    for row in range(3):
+        for column in range(3):
+            worst = max(worst, abs(float(actual[row][column]) - float(reference[row][column])))
+            scale = max(scale, abs(float(reference[row][column])))
+    return worst, worst / max(scale, 1e-30)
+
+
+def _direct_link_reads(
+    raw_scene: Any, bodies: Sequence[dict[str, Any]]
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """Validate the recorded direct link group reads; read 1 is authoritative."""
+
+    record = getattr(raw_scene, "link_group_mass_properties", None)
+    if not isinstance(record, dict) or record.get("schema_version") != LINK_GROUP_SCHEMA:
+        raise ConfigError(
+            "the capture carries no direct link group mass properties record",
+            {"required": "raw/link_group_mass_properties.json", "schema": LINK_GROUP_SCHEMA},
+        )
+    links = record.get("links")
+    expected = {str(body.get("name") or body.get("id") or "") for body in bodies}
+    if not isinstance(links, dict) or set(links) != expected:
+        raise ConfigError(
+            "the link group record does not cover exactly the configured bodies",
+            {"expected": sorted(expected), "recorded": sorted(links or [])},
+        )
+    meta = {
+        "assembly": str(record.get("assembly") or ""),
+        "configuration": str(record.get("configuration") or ""),
+        "used_api": str(record.get("used_api") or ""),
+        "selection_rule": str(record.get("selection_rule") or ""),
+    }
+    reads: dict[str, dict[str, Any]] = {}
+    for name in sorted(expected):
+        entry = links[name]
+        selection = entry.get("selection") if isinstance(entry, dict) else None
+        rows = entry.get("reads") if isinstance(entry, dict) else None
+        if (
+            not isinstance(selection, list)
+            or not selection
+            or any(not isinstance(item, str) or not item for item in selection)
+        ):
+            raise ConfigError("a link group selection is malformed", {"body": name})
+        if not isinstance(rows, list) or len(rows) != 2:
+            raise ConfigError("a link group record must carry two reads", {"body": name})
+        read = rows[0]
+        if not isinstance(read, dict):
+            raise ConfigError("a direct link read is malformed", {"body": name})
+        mass = read.get("mass_kg")
+        com = read.get("com_m")
+        tensor = read.get("inertia_tensor_about_com")
+        if type(mass) not in (int, float) or not math.isfinite(float(mass)) or float(mass) <= 0.0:
+            raise ConfigError("a direct link read has an invalid mass", {"body": name})
+        if (
+            not isinstance(com, list)
+            or len(com) != 3
+            or any(type(value) not in (int, float) or not math.isfinite(float(value)) for value in com)
+        ):
+            raise ConfigError("a direct link read has an invalid COM", {"body": name})
+        if (
+            not isinstance(tensor, list)
+            or len(tensor) != 3
+            or any(
+                not isinstance(row, list)
+                or len(row) != 3
+                or any(type(value) not in (int, float) or not math.isfinite(float(value)) for value in row)
+                for row in tensor
+            )
+        ):
+            raise ConfigError("a direct link read has an invalid inertia tensor", {"body": name})
+        reads[name] = {"selection": list(selection), "read": read}
+    return meta, reads
+
+
 def build_scene(
     cfg: dict[str, Any],
     raw_scene: Any,
@@ -417,6 +494,10 @@ def build_scene(
     # 每个被纳入的组件；cad 模式下"材料未验证"的读数保留原值，但必须带警告记录。
     included = {str(item) for body in bodies for item in (body.get("components") or [])}
     unverified_material = check_mass_contract(cfg, included, masses)
+    # The direct one-shot link reads are the authoritative link inertials.  The
+    # recombination below stays only as an audit block; a capture without the
+    # record fails closed (one supported schema, no fallback path).
+    direct_meta, direct_links = _direct_link_reads(raw_scene, bodies)
 
     links: list[dict[str, Any]] = []
     link_frames: dict[str, tuple[Matrix3, Vector3, str | None]] = {}
@@ -503,6 +584,18 @@ def build_scene(
             entries.append(substituted.mass_entry())
         entries.extend(reading.mass_entry() for reading in readings if reading.name not in covered)
         combined = combine_mass_properties(entries)
+        direct = direct_links[name]
+        read = direct["read"]
+        link_rotation_t = _transpose(link_rotation)
+        direct_mass = float(read["mass_kg"])
+        direct_com_link = _matvec(
+            link_rotation_t,
+            tuple(float(value) - link_translation[index] for index, value in enumerate(read["com_m"])),
+        )
+        direct_inertia_link = _rotate_inertia(
+            link_rotation_t, [[float(value) for value in row] for row in read["inertia_tensor_about_com"]]
+        )
+        tensor_delta_max_abs, tensor_rel = _tensor_delta(combined["inertia"], direct_inertia_link)
         visuals = []
         for reading in readings:
             entry = geometry_by_component.get(reading.name)
@@ -522,10 +615,10 @@ def build_scene(
                 "id": body_id,
                 "name": name,
                 "inertial": {
-                    "mass": combined["mass"],
-                    "xyz": list(combined["com"]),
+                    "mass": direct_mass,
+                    "xyz": list(direct_com_link),
                     "rpy": [0.0, 0.0, 0.0],
-                    "inertia": _inertia6(combined["inertia"]),
+                    "inertia": _inertia6(direct_inertia_link),
                 },
                 "visuals": visuals,
                 "collisions": [],
@@ -545,6 +638,28 @@ def build_scene(
                     "combination": "parallel_axis_from_part_readings",
                     "link_frame": "cad_coordinate_system:" + body["frame"]["coordinate_system"],
                     "kinematics": "native_derived",
+                    "mass_properties": {
+                        "direct": {
+                            "selection": direct["selection"],
+                            "selection_rule": direct_meta["selection_rule"],
+                            "used_api": direct_meta["used_api"],
+                            "source": "raw/link_group_mass_properties.json",
+                        },
+                        "recombination": {
+                            "mass_kg": float(combined["mass"]),
+                            "com_link_m": [float(value) for value in combined["com"]],
+                            "inertia_link": _inertia6(combined["inertia"]),
+                        },
+                        "direct_vs_recombination": {
+                            "mass_delta_kg": float(combined["mass"]) - direct_mass,
+                            "com_delta_m": math.dist(
+                                [float(value) for value in combined["com"]],
+                                [float(value) for value in direct_com_link],
+                            ),
+                            "tensor_delta_max_abs": tensor_delta_max_abs,
+                            "tensor_rel": tensor_rel,
+                        },
+                    },
                 },
             }
         )

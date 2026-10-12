@@ -543,6 +543,8 @@ def _com_stubs():
     pythoncom.VT_BSTR = 8
     pythoncom.VT_BOOL = 11
     pythoncom.VT_I4 = 3
+    pythoncom.VT_DISPATCH = 9
+    pythoncom.VT_ARRAY = 0x2000
     pythoncom.COINIT_APARTMENTTHREADED = 2
     pythoncom.CoInitializeEx = lambda *_args, **_kwargs: None
     pythoncom.CoUninitialize = lambda: None
@@ -3889,6 +3891,136 @@ class MaterializationSessionOwnershipTests(unittest.TestCase):
         with self.assertRaises(CadError) as caught:
             backend3._record_source_document(self.materialization, "Default")
         self.assertEqual(caught.exception.code, "cad_materialization_session_unavailable")
+
+
+class _LinkMassProperty:
+    """Fake IMassProperty2 for the direct link group reader."""
+
+    def __init__(self, state, reads):
+        self.UseSystemUnits = None
+        self.IncludeHiddenBodiesOrComponents = None
+        self.SelectedItems = None
+        self.Mass = 0.0
+        self.Volume = 0.001
+        self.Density = 1.0
+        self.CenterOfMass = [0.0, 0.0, 0.0]
+        self._state = state
+        self._reads = reads
+        self._overrides = {"OverrideMass": False, "OverrideCenterOfMass": False, "OverrideMomentsOfInertia": False}
+        self._tensor = [[1e-6, 0.0, 0.0], [0.0, 1e-6, 0.0], [0.0, 0.0, 1e-6]]
+
+    def Recalculate(self):
+        names = tuple(component.Name2 for component in self.SelectedItems.value)
+        self._state.append(names)
+        seen = sum(1 for entry in self._state if entry == names)
+        payload = self._reads[names][seen - 1]
+        self.Mass = float(payload["mass_kg"])
+        self.CenterOfMass = [float(value) for value in payload["com_m"]]
+        self._tensor = [[float(value) for value in row] for row in payload["inertia_tensor_about_com"]]
+        self._overrides = dict(payload.get("overrides") or self._overrides)
+
+    def GetOverrideOptions(self):
+        return types.SimpleNamespace(**self._overrides)
+
+    def GetMomentOfInertia(self, kind):
+        if kind == 0:
+            return [value for row in self._tensor for value in row]
+        raise RuntimeError("about-origin read unavailable")
+
+
+class LinkGroupMassPropertiesTests(unittest.TestCase):
+    """The direct one-shot reader: exact paths, two fresh reads, fail closed."""
+
+    def _read(self, mass, com=(0.1, 0.2, 0.3), tensor=None, overrides=None):
+        return {
+            "mass_kg": mass,
+            "com_m": list(com),
+            "inertia_tensor_about_com": tensor or [[1e-6, 0.0, 0.0], [0.0, 2e-6, 0.0], [0.0, 0.0, 3e-6]],
+            "overrides": overrides
+            or {"OverrideMass": False, "OverrideCenterOfMass": False, "OverrideMomentsOfInertia": False},
+        }
+
+    @contextmanager
+    def _backend(self, reads, *, doc_type=2, extra_components=()):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            part = _write(root, "part.SLDPRT")
+            nested = _Component("sub-1", part, children=[_Component("sub-1/b-1", part)])
+            components = [nested, _Component("c-1", part), *extra_components]
+            assembly = _write(root, "robot.SLDASM")
+            doc = _Doc(assembly, doc_type=doc_type, children=components)
+            state: list = []
+            doc.Extension.CreateMassProperty2 = lambda: _LinkMassProperty(state, reads)
+            backend = _CaptureBackend(session_factory=lambda: _Session(_App({assembly: doc})))
+            yield backend, assembly, state
+
+    def test_reads_each_body_twice_with_the_exact_sorted_selection(self):
+        reads = {("c-1", "sub-1"): [self._read(2.0), self._read(2.0)]}
+        with self._backend(reads) as (backend, assembly, state):
+            payload = backend.link_group_mass_properties(str(assembly), {"body": ["sub-1", "c-1"]})
+        self.assertEqual(payload["used_api"], "IMassProperty2 (SelectedItems = component set)")
+        self.assertEqual(payload["selection_rule"], "top_most_providers+uncovered_leaves")
+        self.assertEqual(payload["assembly"], str(assembly))
+        row = payload["links"]["body"]
+        self.assertEqual(row["selection"], ["c-1", "sub-1"])
+        self.assertEqual(len(row["reads"]), 2)
+        self.assertEqual(
+            row["reproducibility"], {"mass_delta_kg": 0.0, "com_delta_norm_m": 0.0, "tensor_delta_max_abs": 0.0}
+        )
+        self.assertEqual(row["reads"][0]["mass_kg"], 2.0)
+        self.assertEqual(row["reads"][0]["volume_m3"], 0.001)
+        self.assertEqual(row["reads"][0]["density_kg_m3"], 1.0)
+        self.assertEqual(
+            row["reads"][0]["overrides"],
+            {"OverrideMass": False, "OverrideCenterOfMass": False, "OverrideMomentsOfInertia": False},
+        )
+        self.assertEqual(state, [("c-1", "sub-1"), ("c-1", "sub-1")])
+
+    def test_reproducibility_records_the_repeat_deltas(self):
+        first = self._read(2.0, (0.1, 0.2, 0.3))
+        second = self._read(2.001, (0.1, 0.2, 0.31), [[1.1e-6, 0.0, 0.0], [0.0, 2e-6, 0.0], [0.0, 0.0, 3e-6]])
+        with self._backend({("c-1", "sub-1"): [first, second]}) as (backend, assembly, _state):
+            payload = backend.link_group_mass_properties(str(assembly), {"body": ["c-1", "sub-1"]})
+        row = payload["links"]["body"]
+        self.assertAlmostEqual(row["reproducibility"]["mass_delta_kg"], 0.001, places=12)
+        self.assertAlmostEqual(row["reproducibility"]["com_delta_norm_m"], 0.01, places=12)
+        self.assertAlmostEqual(row["reproducibility"]["tensor_delta_max_abs"], 1e-7, places=15)
+
+    def test_missing_path_fails_closed_before_any_read(self):
+        with self._backend({}) as (backend, assembly, state):
+            with self.assertRaises(CadError) as caught:
+                backend.link_group_mass_properties(str(assembly), {"body": ["ghost-1"]})
+            self.assertEqual(caught.exception.code, "cad_missing_component")
+            self.assertEqual(caught.exception.detail["missing"], ["ghost-1"])
+            self.assertEqual(caught.exception.detail["link"], "body")
+            self.assertEqual(state, [])
+
+    def test_empty_and_duplicate_selections_fail(self):
+        with self._backend({}) as (backend, assembly, _state):
+            with self.assertRaises(CadError) as caught:
+                backend.link_group_mass_properties(str(assembly), {"body": []})
+            self.assertEqual(caught.exception.code, "cad_empty_selection")
+            with self.assertRaises(CadError) as caught:
+                backend.link_group_mass_properties(str(assembly), {})
+            self.assertEqual(caught.exception.code, "cad_empty_selection")
+            with self.assertRaises(CadError) as caught:
+                backend.link_group_mass_properties(str(assembly), {"body": ["c-1", "c-1"]})
+            self.assertEqual(caught.exception.code, "cad_duplicate_selection")
+
+    def test_object_level_override_fails_the_read(self):
+        overrides = {"OverrideMass": True, "OverrideCenterOfMass": False, "OverrideMomentsOfInertia": False}
+        reads = {("c-1", "sub-1"): [self._read(2.0, overrides=overrides), self._read(2.0, overrides=overrides)]}
+        with self._backend(reads) as (backend, assembly, _state), self.assertRaises(CadError) as caught:
+            backend.link_group_mass_properties(str(assembly), {"body": ["c-1", "sub-1"]})
+        self.assertEqual(caught.exception.code, "cad_mass_override")
+        self.assertEqual(caught.exception.detail["link"], "body")
+        self.assertTrue(caught.exception.detail["overrides"]["OverrideMass"])
+
+    def test_a_part_document_is_refused(self):
+        with self._backend({}, doc_type=1) as (backend, assembly, _state):
+            with self.assertRaises(CadError) as caught:
+                backend.link_group_mass_properties(str(assembly), {"body": ["c-1"]})
+            self.assertEqual(caught.exception.code, "cad_not_assembly")
 
 
 if __name__ == "__main__":

@@ -2626,6 +2626,147 @@ class SolidWorksBackend(CadBackend):
             },
         }
 
+    def link_group_mass_properties(self, path, selections):
+        """One-shot direct group readings for the rigid-body link selections.
+
+        ``selections`` maps each rigid body to the exact occurrence paths the
+        producer composer chose (top-most effective providers plus uncovered
+        leaves).  Every body is read twice with fresh ``CreateMassProperty2``
+        objects in the same session; values are in assembly-document axes about
+        the COM.  Component-level instance overrides are part of the CAD value
+        and are read as-is; only an active object-level override flag fails the
+        read, matching the whole-assembly reader.  Resolution is exact: an
+        unresolved path, an empty selection or a malformed request aborts the
+        whole call so the capture fails closed, never partially.
+        """
+
+        doc = self._document_by_path(path)
+        if _member(doc, "GetType") != 2:
+            raise CadError("cad_not_assembly", "link group mass reader requires a saved SLDASM")
+        document_path = str(_member(doc, "GetPathName"))
+        document_title = _member(doc, "GetTitle")
+        _manager, configuration, configuration_name = _configuration_context(doc)
+        root = _component(_member(configuration, "GetRootComponent3", True))
+        if root is None:
+            raise CadError("cad_empty_mass_property", "assembly has no root component")
+        if not isinstance(selections, dict) or not selections:
+            raise CadError("cad_empty_selection", "link group mass reader needs at least one body selection")
+        requested: dict[str, list[str]] = {}
+        wanted: set[str] = set()
+        for body, names in selections.items():
+            body_name = str(body)
+            paths = [str(name) for name in (names or [])]
+            if not paths:
+                raise CadError("cad_empty_selection", "link group selection is empty", {"link": body_name})
+            if len(set(paths)) != len(paths):
+                raise CadError(
+                    "cad_duplicate_selection",
+                    "link group selection repeats an occurrence",
+                    {"link": body_name},
+                )
+            requested[body_name] = sorted(paths)
+            wanted.update(paths)
+        found: dict[str, object] = {}
+        stack: list[object] = list(reversed(list(_method(root, "GetChildren") or ())))
+        while stack:
+            component = _component(stack.pop())
+            if _measured_component_state(component) == COMPONENT_SUPPRESSED:
+                continue
+            children = list(_method(component, "GetChildren") or ())
+            stack.extend(reversed(children))
+            name = str(_member(component, "Name2"))
+            if name in wanted:
+                found[name] = component
+        import pythoncom
+
+        def read_once(body_name: str, components: list[object]) -> dict:
+            mp = _member(_member(doc, "Extension"), "CreateMassProperty2")
+            if mp is None:
+                raise CadError(
+                    "cad_empty_mass_property", "CreateMassProperty2 returned null", {"link": body_name}
+                )
+            mp.UseSystemUnits = True
+            mp.IncludeHiddenBodiesOrComponents = True
+            selection = _win32().VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, tuple(components))
+            mp.SelectedItems = selection
+            _member(mp, "Recalculate")
+            override = _member(mp, "GetOverrideOptions")
+            overrides = {
+                key: bool(_member(override, key))
+                for key in ("OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia")
+            }
+            if any(overrides.values()):
+                raise CadError(
+                    "cad_mass_override",
+                    "direct link read refuses active overrides",
+                    {"link": body_name, "overrides": overrides},
+                )
+            mass = float(_member(mp, "Mass"))
+            com = [float(value) for value in _member(mp, "CenterOfMass")]
+            values = [float(value) for value in _member(mp, "GetMomentOfInertia", 0)]
+            if len(values) != 9:
+                raise CadError("cad_mass_property_inertia_unsupported", "GetMomentOfInertia(0) must return 9 values")
+            inertia, _axis = _inertia_from_raw(tuple(values), document_title)
+            if mass <= 0 or not math.isfinite(mass) or len(com) != 3 or not all(map(math.isfinite, com)):
+                raise CadError(
+                    "cad_mass_property_invalid", "mass/COM are not finite and positive", {"link": body_name}
+                )
+            read = {
+                "mass_kg": mass,
+                "com_m": com,
+                "inertia_tensor_about_com": [[float(value) for value in row] for row in inertia],
+                "overrides": overrides,
+            }
+            try:
+                origin = [float(value) for value in _member(mp, "GetMomentOfInertia", 1)]
+            except Exception as error:  # noqa: BLE001 - the about-origin read is diagnostic only
+                read["inertia_values_about_origin_api"] = {"error": " ".join(str(error).split())[:200]}
+            else:
+                read["inertia_values_about_origin_api"] = origin
+            for key, member in (("volume_m3", "Volume"), ("density_kg_m3", "Density")):
+                try:
+                    value = float(_member(mp, member))
+                except Exception:  # noqa: BLE001 - optional scalar, omitted as null when unreadable
+                    read[key] = None
+                else:
+                    read[key] = value if math.isfinite(value) else None
+            return read
+
+        links: dict[str, dict] = {}
+        for body_name, paths in requested.items():
+            missing = sorted(set(paths) - set(found))
+            if missing:
+                raise CadError(
+                    "cad_missing_component",
+                    "link group selection paths are not component instances of this assembly",
+                    {"link": body_name, "missing": missing},
+                )
+            components = [found[path] for path in paths]
+            first = read_once(body_name, components)
+            second = read_once(body_name, components)
+            tensor_delta = max(
+                abs(first["inertia_tensor_about_com"][row][column] - second["inertia_tensor_about_com"][row][column])
+                for row in range(3)
+                for column in range(3)
+            )
+            reproducibility = {
+                "mass_delta_kg": abs(first["mass_kg"] - second["mass_kg"]),
+                "com_delta_norm_m": math.dist(first["com_m"], second["com_m"]),
+                "tensor_delta_max_abs": tensor_delta,
+            }
+            links[body_name] = {
+                "selection": paths,
+                "reads": [first, second],
+                "reproducibility": reproducibility,
+            }
+        return {
+            "assembly": document_path,
+            "configuration": configuration_name,
+            "used_api": "IMassProperty2 (SelectedItems = component set)",
+            "selection_rule": "top_most_providers+uncovered_leaves",
+            "links": links,
+        }
+
     def assembly_component_mass_properties(self, path):
         """Per-instance mass in the *assembly context*, with the instance's override flags.
 

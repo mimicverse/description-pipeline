@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import struct
 from pathlib import Path
 from typing import Any, cast
@@ -115,6 +116,103 @@ def mass_payload(
         "inertia": tensor,
         "reference": {"used_api": "fixture", "product_convention": "solidworks_standard"},
     }
+
+
+def compose_fixture_link_reads(
+    components: Sequence[dict[str, Any]],
+    effective: dict[str, dict[str, Any]],
+    selections: dict[str, Sequence[str]],
+    masses: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Fixture 'CAD' direct reads: the assembly-frame recombination of a selection.
+
+    Used by the fixture backend (so capture and scene agree exactly) and by
+    scene tests that need a valid link group record; divergence cases inject
+    their own read values instead.  The math is convention-free on purpose:
+    the native reader returns raw assembly numbers, and product-convention
+    refusals belong to the part rows, not to this read.
+    """
+
+    from description_pipeline.sources.solidworks.scene import combine_mass_properties  # noqa: PLC0415
+
+    def placed(transform: Sequence[float], com: Sequence[float]) -> list[float]:
+        rows = [list(transform[index : index + 3]) for index in (0, 4, 8)]
+        translation = [transform[3], transform[7], transform[11]]
+        return [
+            sum(rows[row][column] * float(com[column]) for column in range(3)) + translation[row]
+            for row in range(3)
+        ]
+
+    def rotated(transform: Sequence[float], inertia: Sequence[Sequence[float]]) -> list[list[float]]:
+        rows = [list(transform[index : index + 3]) for index in (0, 4, 8)]
+        rotated_rows = [
+            [sum(rows[row][k] * float(inertia[k][column]) for k in range(3)) for column in range(3)]
+            for row in range(3)
+        ]
+        return [
+            [sum(rotated_rows[row][k] * rows[column][k] for k in range(3)) for column in range(3)]
+            for row in range(3)
+        ]
+
+    def entry_for(name: str, payload: dict[str, Any], transform: Sequence[float]) -> dict[str, Any]:
+        scope = (payload.get("reference") or {}).get("scope") or "part_document"
+        com = [float(value) for value in payload["com"]]
+        inertia = [[float(value) for value in row] for row in payload["inertia"]]
+        if scope == "assembly_component_group":
+            return {"mass": float(payload["mass"]), "com": com, "inertia": inertia}
+        return {
+            "mass": float(payload["mass"]),
+            "com": placed(transform, com),
+            "inertia": rotated(transform, inertia),
+        }
+
+    by_name: dict[str, tuple[Any, dict[str, Any]]] = {}
+    for entry in components:
+        if isinstance(entry, dict):
+            by_name[str(entry["name"])] = (entry.get("transform") or _identity(), entry["mass"])
+        else:
+            mass = getattr(entry, "mass", None)
+            if mass is None and masses is not None:
+                mass = masses[str(entry.name)]
+            by_name[str(entry.name)] = (getattr(entry, "transform", None) or _identity(), mass)
+    links: dict[str, dict[str, Any]] = {}
+    for body, names in selections.items():
+        entries = []
+        claimed: set[str] = set()
+        for name in names:
+            parts = str(name).split("/")
+            ancestors = ["/".join(parts[:index]) for index in range(1, len(parts) + 1)]
+            provider = next((ancestor for ancestor in ancestors if ancestor in effective), None)
+            if provider is not None:
+                if provider in claimed:
+                    continue
+                claimed.add(provider)
+                payload = dict(effective[provider], mass_source="cad")
+                transform = by_name.get(provider, (_identity(), None))[0]
+                entries.append(entry_for(provider, payload, transform))
+            else:
+                transform, mass = by_name[str(name)]
+                entries.append(entry_for(str(name), mass, _matrix16(transform)))
+        combined = combine_mass_properties(entries)
+        read = {
+            "mass_kg": float(combined["mass"]),
+            "volume_m3": None,
+            "density_kg_m3": None,
+            "com_m": [float(value) for value in combined["com"]],
+            "inertia_tensor_about_com": [[float(value) for value in row] for row in combined["inertia"]],
+            "inertia_values_about_origin_api": {"error": "fixture"},
+            "overrides": {
+                "OverrideMass": False,
+                "OverrideCenterOfMass": False,
+                "OverrideMomentsOfInertia": False,
+            },
+        }
+        links[str(body)] = {
+            "selection": [str(name) for name in names],
+            "reads": [read, copy.deepcopy(read)],
+            "reproducibility": {"mass_delta_kg": 0.0, "com_delta_norm_m": 0.0, "tensor_delta_max_abs": 0.0},
+        }
+    return links
 
 
 class FixtureCadBackend(CadBackend):
@@ -427,6 +525,19 @@ class FixtureCadBackend(CadBackend):
                 "triangles": triangles,
             }
         return entries
+
+    def link_group_mass_properties(self, path, selections):
+        """Direct link reads for the fixture: the assembly-frame recombination."""
+
+        return {
+            "assembly": str(self.scene_document_override or path),
+            "configuration": str(getattr(self, "configuration_name", "Default")),
+            "used_api": "IMassProperty2 (SelectedItems = component set)",
+            "selection_rule": "top_most_providers+uncovered_leaves",
+            "links": compose_fixture_link_reads(
+                self.components, getattr(self, "effective_readings", None) or {}, selections
+            ),
+        }
 
     def verify_sources_unchanged(self) -> dict[str, Any]:
         files = [self.document, *self._dependencies]

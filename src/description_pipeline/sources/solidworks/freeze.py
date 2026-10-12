@@ -1793,6 +1793,256 @@ def _export_geometry(
     return exported
 
 
+LINK_GROUP_SCHEMA = "solidworks-to-urdf.link-group-mass-properties/v1"
+LINK_GROUP_USED_API = "IMassProperty2 (SelectedItems = component set)"
+LINK_GROUP_SELECTION_RULE = "top_most_providers+uncovered_leaves"
+
+
+def _link_group_selections(cfg: dict[str, Any], scene: Any, effective: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Compose each rigid body's direct-read selection (top-most providers + uncovered leaves).
+
+    Mirrors the verifier's independent recomputation: providers are effective
+    instances (any override flag or a flagless instance measurement) whose whole
+    leaf subtree lies inside one body; a nested provider collapses into the
+    top-most one; every remaining body leaf is selected individually.  Unknown
+    members, duplicated membership, providers that span or only partially cover
+    bodies, and empty selections fail the capture closed.
+    """
+
+    leaves = [str(component.name) for component in (scene.components or [])]
+    if len(set(leaves)) != len(leaves):
+        raise BridgeError("link_group_occurrence_duplicate", "the captured scene repeats an occurrence", exit_code=3)
+    leaf_set = set(leaves)
+    bodies = list(cfg.get("bodies") or [])
+    if not bodies:
+        raise BridgeError("link_group_body_missing", "native discovery defines no rigid bodies", exit_code=3)
+    body_of: dict[str, str] = {}
+    for body in bodies:
+        body_name = str(body.get("name") or body.get("id") or "")
+        if not body_name:
+            raise BridgeError("link_group_body_unnamed", "every body needs a name", exit_code=3)
+        for member in body.get("components") or []:
+            member = str(member)
+            if member not in leaf_set:
+                raise BridgeError(
+                    "link_group_member_unknown",
+                    "a body references an unknown occurrence",
+                    {"body": body_name, "component": member},
+                    exit_code=3,
+                )
+            if member in body_of:
+                raise BridgeError(
+                    "link_group_member_duplicate",
+                    "an occurrence belongs to two bodies",
+                    {"component": member, "bodies": [body_of[member], body_name]},
+                    exit_code=3,
+                )
+            body_of[member] = body_name
+    provider_names = {str(name) for name in effective}
+    provider_names |= {
+        str(name)
+        for name, row in (getattr(scene, "mass_properties", None) or {}).items()
+        if isinstance(row, dict) and row.get("mode") == "effective_instance"
+    }
+    providers: dict[str, set[str]] = {}
+    for provider in sorted(provider_names):
+        subtree = {leaf for leaf in leaves if leaf == provider or leaf.startswith(provider + "/")}
+        if not subtree:
+            raise BridgeError(
+                "link_group_provider_unknown",
+                "an effective instance is not a captured occurrence",
+                {"provider": provider},
+                exit_code=3,
+            )
+        owners = {body_of.get(leaf) for leaf in subtree}
+        named = {owner for owner in owners if owner}
+        if len(named) > 1:
+            raise BridgeError(
+                "link_group_provider_spans_bodies",
+                "an effective instance spans several bodies",
+                {"provider": provider, "bodies": sorted(named), "descendants": sorted(subtree)[:50]},
+                exit_code=3,
+            )
+        if named and len(owners) != 1:
+            raise BridgeError(
+                "link_group_provider_partial",
+                "an effective instance is only partially assigned to a body",
+                {"provider": provider, "body": sorted(named)[0], "descendants": sorted(subtree)[:50]},
+                exit_code=3,
+            )
+        if not named:
+            # Entirely unassigned subtree: it cannot be a provider for any body;
+            # the closure record already accounts for the unassigned mass.
+            continue
+        providers[provider] = subtree
+    selections: dict[str, dict[str, Any]] = {}
+    for body in bodies:
+        body_name = str(body.get("name") or body.get("id") or "")
+        members = {str(item) for item in body.get("components") or []}
+        inner = [provider for provider, subtree in providers.items() if subtree <= members]
+        top_most = [
+            provider
+            for provider in inner
+            if not any(other != provider and provider.startswith(other + "/") for other in inner)
+        ]
+        covered: set[str] = set()
+        for provider in top_most:
+            covered |= providers[provider]
+        uncovered = sorted(members - covered)
+        selection = sorted(top_most) + uncovered
+        if not selection:
+            raise BridgeError(
+                "link_group_empty_selection",
+                "a body has no selectable occurrence",
+                {"body": body_name, "members": sorted(members)},
+                exit_code=3,
+            )
+        selections[body_name] = {"selection": selection, "providers": sorted(top_most), "uncovered_leaves": uncovered}
+    return selections
+
+
+def _link_group_record(
+    backend: Any,
+    cfg: dict[str, Any],
+    scene: Any,
+    effective: dict[str, Any],
+    document: str | None,
+) -> dict[str, Any]:
+    """Read and validate the direct link group mass properties for every body."""
+
+    selections = _link_group_selections(cfg, scene, effective)
+    reader = getattr(backend, "link_group_mass_properties", None)
+    if not callable(reader):
+        raise BridgeError(
+            "cad_link_group_reader_missing",
+            "the backend cannot read direct link group mass properties",
+            exit_code=3,
+        )
+    payload = reader(str(document or cfg["assembly"]), {name: entry["selection"] for name, entry in selections.items()})
+    if (
+        not isinstance(payload, dict)
+        or payload.get("used_api") != LINK_GROUP_USED_API
+        or payload.get("selection_rule") != LINK_GROUP_SELECTION_RULE
+    ):
+        raise BridgeError(
+            "cad_link_group_payload_invalid",
+            "the backend returned an unexpected link group payload",
+            exit_code=3,
+        )
+    links = payload.get("links")
+    if not isinstance(links, dict) or set(links) != set(selections):
+        raise BridgeError(
+            "cad_link_group_payload_invalid",
+            "the link group payload does not cover the composed bodies",
+            {"expected": sorted(selections), "received": sorted(links or [])},
+            exit_code=3,
+        )
+    for name, entry in selections.items():
+        row = links[name]
+        reads = row.get("reads") if isinstance(row, dict) else None
+        if not isinstance(row, dict) or row.get("selection") != entry["selection"]:
+            raise BridgeError(
+                "cad_link_group_payload_invalid",
+                "the link group payload echoes another selection",
+                {"body": name},
+                exit_code=3,
+            )
+        if not isinstance(reads, list) or len(reads) != 2:
+            raise BridgeError(
+                "cad_link_group_payload_invalid",
+                "the link group payload must carry two reads",
+                {"body": name},
+                exit_code=3,
+            )
+        for index, read in enumerate(reads):
+            _link_group_read_valid(name, index, read)
+        reproducibility = row.get("reproducibility")
+        if not isinstance(reproducibility, dict) or set(reproducibility) != {
+            "mass_delta_kg",
+            "com_delta_norm_m",
+            "tensor_delta_max_abs",
+        }:
+            raise BridgeError(
+                "cad_link_group_payload_invalid",
+                "the link group payload carries no reproducibility record",
+                {"body": name},
+                exit_code=3,
+            )
+        for key, value in reproducibility.items():
+            if type(value) not in (int, float) or not math.isfinite(float(value)) or float(value) < 0.0:
+                raise BridgeError(
+                    "cad_link_group_payload_invalid",
+                    "the reproducibility record is malformed",
+                    {"body": name, "field": key},
+                    exit_code=3,
+                )
+    assembly = str(payload.get("assembly") or "")
+    if document and not _same_document(assembly, str(document)):
+        raise BridgeError(
+            "capture_source_mismatch",
+            "the link group read names another document",
+            {"requested": str(document), "reported": assembly},
+            exit_code=3,
+        )
+    return {
+        "schema_version": LINK_GROUP_SCHEMA,
+        "assembly": assembly,
+        "configuration": str(payload.get("configuration") or ""),
+        "used_api": LINK_GROUP_USED_API,
+        "selection_rule": LINK_GROUP_SELECTION_RULE,
+        "links": {
+            name: {
+                "selection": list(links[name]["selection"]),
+                "reads": links[name]["reads"],
+                "reproducibility": links[name]["reproducibility"],
+            }
+            for name in selections
+        },
+    }
+
+
+def _link_group_read_valid(body: str, index: int, read: Any) -> None:
+    def invalid(field: str) -> None:
+        raise BridgeError(
+            "cad_link_group_payload_invalid",
+            "a link group read is malformed",
+            {"body": body, "read": index, "field": field},
+            exit_code=3,
+        )
+
+    if not isinstance(read, dict):
+        invalid("read")
+    mass = read.get("mass_kg")
+    if type(mass) not in (int, float) or not math.isfinite(float(mass)) or float(mass) <= 0.0:
+        invalid("mass_kg")
+    com = read.get("com_m")
+    if (
+        not isinstance(com, list)
+        or len(com) != 3
+        or any(type(value) not in (int, float) or not math.isfinite(float(value)) for value in com)
+    ):
+        invalid("com_m")
+    tensor = read.get("inertia_tensor_about_com")
+    if (
+        not isinstance(tensor, list)
+        or len(tensor) != 3
+        or any(
+            not isinstance(row, list)
+            or len(row) != 3
+            or any(type(value) not in (int, float) or not math.isfinite(float(value)) for value in row)
+            for row in tensor
+        )
+    ):
+        invalid("inertia_tensor_about_com")
+    overrides = read.get("overrides")
+    if (
+        not isinstance(overrides, dict)
+        or set(overrides) != {"OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia"}
+        or any(type(value) is not bool for value in overrides.values())
+    ):
+        invalid("overrides")
+
+
 def _freeze_local(
     config: dict[str, Any],
     destination: Path,
@@ -1900,6 +2150,15 @@ def _freeze_local(
         write_json(
             staging / "raw" / "effective_instances.json",
             _effective_instance_record(scene, cfg, backend_readings, cache_error),
+        )
+        # Direct one-shot link reads: the producer composes each body's
+        # selection (top-most providers + uncovered leaves) and the backend
+        # measures it twice in the same session.  This record is required by
+        # scene generation; an absent or malformed record fails closed there.
+        stage = "link_groups"
+        write_json(
+            staging / "raw" / "link_group_mass_properties.json",
+            _link_group_record(backend, cfg, scene, backend_readings, getattr(scene, "document", None)),
         )
         # Declared author decisions are recorded as declared input, never as CAD
         # readings: freeze keeps the snapshot raw and load_scene applies them.

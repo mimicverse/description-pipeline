@@ -27,6 +27,12 @@ def derive_scene(root: Path, manifest: dict) -> dict:
     datums = read_data(confined(root, "raw/coordinate_systems.json"))
     if raw.get("mass_properties") != masses or raw.get("coordinate_systems") != datums:
         raise PipelineError("Captured scene readings differ from their dedicated raw records")
+    if "raw/link_group_mass_properties.json" not in manifest["files"]:
+        raise PipelineError(
+            "The capture carries no direct link group mass properties record; "
+            "this workflow requires a capture made by the direct-link-readout pipeline"
+        )
+    link_groups = read_data(confined(root, "raw/link_group_mass_properties.json"))
     components = raw.get("components")
     if not isinstance(components, list) or not all(isinstance(row, dict) for row in components):
         raise PipelineError("Captured component readings must be objects")
@@ -41,5 +47,6 @@ def derive_scene(root: Path, manifest: dict) -> dict:
         mass_properties=masses,
         notes=raw.get("notes", {}),
         document=raw.get("document"),
+        link_group_mass_properties=link_groups,
     )
     return build_scene(config, readings, geometry)
