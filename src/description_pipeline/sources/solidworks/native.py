@@ -35,6 +35,10 @@ ICONFIGURATION_IID = "{83A33D98-27C5-11CE-BFD4-00400513BB57}"
 IMODELDOCEXTENSION_IID = "{99F4D4AF-F268-4EE1-8C55-041F7BECF879}"
 #: Published ITessellation dual-interface identity, checked against sldworks.tlb.
 ITESSELLATION_IID = "{699C7492-DB56-4CC2-B7A2-9FFD56698434}"
+#: IConcentricMateFeatureData (dual interface, same offline typelib owners
+#: dump line 87); its documented LockRotation property is the native evidence
+#: for "Lock rotation" on a concentric mate.
+ICONCENTRICMATEFEATUREDATA_IID = "{D9E1EBDD-2E8B-424F-9401-0A3C8ED7FAAD}"
 IMASSPROPERTY2_IID = "{5E4EAE4A-65E6-4CF0-AD72-55EDEF5EB96A}"
 IMASSPROPERTYOVERRIDEOPTIONS_IID = "{82E1635E-B650-4C8B-84C8-D5FFBF660E49}"
 ICUSTOMPROPERTYMANAGER_IID = "{F1938D94-0D1F-4E88-9874-164B1E6568F1}"
@@ -5046,18 +5050,44 @@ class SolidWorksBackend(CadBackend):
                             "mate solve state could not be read; the constraint cannot be trusted",
                             {"mate": name, "error": str(error)},
                         ) from error
-                    mates.append(
-                        {
-                            "name": name,
-                            "type": mate_type,
-                            "suppressed": suppressed,
-                            "limits": limits,
-                            "entities": entities,
-                            "error_code": error_code,
-                            "scope": prefix or "",
-                            "configuration": referenced_configuration,
-                        }
-                    )
+                    mate_record = {
+                        "name": name,
+                        "type": mate_type,
+                        "suppressed": suppressed,
+                        "limits": limits,
+                        "entities": entities,
+                        "error_code": error_code,
+                        "scope": prefix or "",
+                        "configuration": referenced_configuration,
+                    }
+                    if mate_type == "concentric":
+                        # Documented native rotation lock (IConcentricMateFeatureData
+                        # .LockRotation, SW2019+; typelib IID {D9E1EBDD-...}): a
+                        # concentric mate with rotation locked is rigid, without it
+                        # the mate keeps its revolute spin.  The value is read from
+                        # CAD through the same GetDefinition path the earlier manual
+                        # native scripts used; it is never inferred from any
+                        # reference output.
+                        lock_rotation = None
+                        try:
+                            definition = _method(feature, "GetDefinition")
+                            if definition is not None:
+                                bound = _interface(definition, ICONCENTRICMATEFEATUREDATA_IID)
+                                raw_lock = _member(bound, "LockRotation")
+                                if isinstance(raw_lock, bool):
+                                    lock_rotation = raw_lock
+                                else:
+                                    notes.append(
+                                        f"mate_lock_rotation:{name}:unreadable:{repr(raw_lock)[:60]}"
+                                    )
+                            else:
+                                notes.append(f"mate_lock_rotation:{name}:no_definition")
+                        except Exception as error:  # noqa: BLE001 - recorded, never guessed
+                            notes.append(
+                                f"mate_lock_rotation:{name}:{type(error).__name__}: {str(error)[:160]}"
+                            )
+                        mate_record["lock_rotation"] = lock_rotation
+                    mates.append(mate_record)
                     mates_done += 1
                 # The next assembly selection may invalidate this entire borrowed
                 # tree. Pending assemblies and occurrence records contain paths

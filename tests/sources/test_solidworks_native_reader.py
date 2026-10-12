@@ -571,9 +571,13 @@ def _read(root: Path, app: _App, settings=None) -> dict:
         return backend.discover_native(root, resolved)
 
 
-def _mate(name, mate_type, entities, *, lower=0.0, upper=0.0, count=None, suppressed=False, error_code=0):
+def _mate(
+    name, mate_type, entities, *, lower=0.0, upper=0.0, count=None, suppressed=False, error_code=0, definition=None
+):
     specific = _MateSpecific(mate_type, entities, lower=lower, upper=upper, count=count)
-    return _Feature(name, f"Mate{mate_type}", specific=specific, suppressed=suppressed, error_code=error_code)
+    return _Feature(
+        name, f"Mate{mate_type}", specific=specific, suppressed=suppressed, error_code=error_code, definition=definition
+    )
 
 
 def _single_mate_scene(root: Path, make_feature):
@@ -639,6 +643,44 @@ class MateRecordTests(unittest.TestCase):
             self.assertIs(mates["locked_seat"]["suppressed"], True)
             self.assertEqual(mates["broken_solve"]["type"], "coincident")
             self.assertEqual(mates["broken_solve"]["error_code"], 3)
+
+    def test_concentric_mate_records_the_native_lock_rotation_flag(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            cylinder_entity = _MateEntity(
+                component, "Cylinder1", _Cylinder((0.0, 0.0, 0.0), (0.0, 0.0, 2.0), 0.02)
+            )
+            locked = _mate(
+                "locked_spin", 1, [cylinder_entity], definition=types.SimpleNamespace(LockRotation=True)
+            )
+            free = _mate(
+                "free_spin", 1, [cylinder_entity], definition=types.SimpleNamespace(LockRotation=False)
+            )
+            no_definition = _mate("no_definition", 1, [cylinder_entity])
+            unrelated = _mate(
+                "seat", 0, [cylinder_entity], definition=types.SimpleNamespace(LockRotation=True)
+            )
+            locked._next_sub = free
+            free._next_sub = no_definition
+            no_definition._next_sub = unrelated
+            group = _Feature("MateGroup", "MateGroup", first_sub=locked)
+            assembly = _write(root, "robot.SLDASM")
+            doc = _Doc(assembly, first_feature=group, children=[component])
+
+            record = _read(root, _App({assembly: doc}))
+
+            mates = {mate["name"]: mate for mate in record["mates"]}
+            self.assertEqual(mates["locked_spin"]["type"], "concentric")
+            self.assertIs(mates["locked_spin"]["lock_rotation"], True)
+            self.assertIs(mates["free_spin"]["lock_rotation"], False)
+            self.assertIsNone(mates["no_definition"]["lock_rotation"])
+            self.assertNotIn("lock_rotation", mates["seat"])
+            self.assertTrue(
+                any(str(note).startswith("mate_lock_rotation:no_definition") for note in record["notes"]),
+                record["notes"],
+            )
 
     def test_two_level_occurrence_context_scopes_nested_mate(self) -> None:
         with TemporaryDirectory() as tmp:
