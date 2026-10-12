@@ -798,10 +798,6 @@ class StructuralReportTests(unittest.TestCase):
             self.assertIn("report.cad_unassigned_passive_joint_invalid", codes)
             self.assertNotIn("discovery.cad_unassigned_passive_joint", codes)
 
-
-if __name__ == "__main__":
-    unittest.main()
-
     def test_passive_completion_validator_refusals(self):
         def finding(**overrides):
             base = self._passive_finding()
@@ -842,3 +838,6 @@ if __name__ == "__main__":
         }
         self.assertFalse(_valid_passive_completion(unsorted_detail))
 
+
+if __name__ == "__main__":
+    unittest.main()
