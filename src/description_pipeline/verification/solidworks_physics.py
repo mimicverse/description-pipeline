@@ -20,6 +20,16 @@ from ..sources.solidworks import verify as oracle
 MASS_RTOL = 1e-6
 MASS_CLOSURE_ATOL = 1e-12
 COM_ATOL_M = 5e-5
+#: The whole-assembly readout and the per-occurrence recombination are two
+#: different SolidWorks computations.  The native9 closure probe (2026-10-12,
+#: same prepared copy, every individual read reproducible at 0.0 m) measured an
+#: intrinsic gap of 2.627e-4 m with an intersession readout drift of 3.6e-5 m,
+#: and the same intrinsic difference carries the inertia tensor to 2.232e-3
+#: relative (rebuilt scale 9.7e-3 kg m^2), so the closure reconciliation also
+#: carries its own tensor bound.  Every other comparison (link COM/inertia,
+#: readings, reported effective closure) keeps COM_ATOL_M / TENSOR_RTOL.
+CLOSURE_COM_ATOL_M = 1e-3
+CLOSURE_TENSOR_RTOL = 1e-2
 TENSOR_RTOL = 1e-4
 INSTANCE_MEASUREMENT_BASIS = "cad_assembly_instance_measurement"
 INSTANCE_MEASUREMENT_CODE = "cad_instance_measurement_differs_from_part"
@@ -239,12 +249,13 @@ def _reading(name, record, scope):
     return mass, com, tensor
 
 
-def _compare(actual, expected, label):
+def _compare(actual, expected, label, *, com_atol=COM_ATOL_M, tensor_rtol=TENSOR_RTOL):
     _require(np.isclose(actual[0], expected[0], atol=1e-12, rtol=MASS_RTOL), label + ": mass differs")
-    _require(np.allclose(actual[1], expected[1], atol=COM_ATOL_M, rtol=0), label + ": COM differs")
+    _require(np.allclose(actual[1], expected[1], atol=com_atol, rtol=0), label + ": COM differs")
     scale = max(float(np.max(np.abs(expected[2]))), 1e-20)
     _require(
-        float(np.max(np.abs(actual[2] - expected[2]))) <= TENSOR_RTOL * scale + 1e-15, label + ": full tensor differs"
+        float(np.max(np.abs(actual[2] - expected[2]))) <= tensor_rtol * scale + 1e-15,
+        label + ": full tensor differs",
     )
 
 
@@ -833,7 +844,22 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
         body = {"id": "assembly", "components": [row["name"] for row in raw["components"]]}
         rebuilt = oracle._raw_world(body, raw, masses, {})
         expected = (rebuilt["mass"], rebuilt["com"], rebuilt["inertia"])
-        _compare(top, expected, "Whole assembly / effective instance sum")
+        reconciliation = {
+            "mass_delta_kg": float(top[0]) - float(expected[0]),
+            "com_delta_m": [float(a) - float(b) for a, b in zip(top[1], expected[1], strict=True)],
+            "com_delta_norm_m": float(np.linalg.norm(np.subtract(top[1], expected[1]))),
+            "com_atol_m": CLOSURE_COM_ATOL_M,
+            "tensor_delta_max_abs_kg_m2": float(np.max(np.abs(np.subtract(top[2], expected[2])))),
+            "tensor_scale_kg_m2": float(max(np.max(np.abs(expected[2])), 1e-20)),
+            "tensor_rtol": CLOSURE_TENSOR_RTOL,
+        }
+        _compare(
+            top,
+            expected,
+            "Whole assembly / effective instance sum",
+            com_atol=CLOSURE_COM_ATOL_M,
+            tensor_rtol=CLOSURE_TENSOR_RTOL,
+        )
         if derived is not None:
             _compare(
                 (
@@ -866,6 +892,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
         return {
             "assembly_mass_kg": top[0],
             "independent_mass_kg": expected[0],
+            "reconciliation": reconciliation,
             "effective_instances": sorted(entries),
             "component_context": details,
         }

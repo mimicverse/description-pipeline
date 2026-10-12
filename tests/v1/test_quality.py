@@ -309,6 +309,57 @@ class PhysicsTests(unittest.TestCase):
         self._record_clean_provenance()
         self.assertEqual([], self.failures())
 
+    def test_closure_com_uses_the_evidence_bound_and_records_the_deltas(self):
+        self._record_clean_provenance()
+        self.assertEqual([], self.failures())
+        # top_level and leaf_total share their nested lists in this fixture; isolate
+        # the reconciliation value before mutating it.
+        self.closure["top_level"] = copy.deepcopy(self.closure["top_level"])
+        base_com = copy.deepcopy(self.closure["top_level"]["com"])
+
+        self.closure["top_level"]["com"] = [base_com[0] + 5e-4, base_com[1], base_com[2]]
+        self.assertEqual([], self.failures())
+        checks = {check["id"]: check for check in verify_physics(self.root, self.source, self.model)}
+        record = checks["physics.closure"]["details"]["reconciliation"]
+        self.assertEqual(record["com_atol_m"], 1e-3)
+        self.assertEqual(record["tensor_rtol"], 1e-2)
+        self.assertAlmostEqual(record["com_delta_m"][0], 5e-4, places=12)
+        self.assertAlmostEqual(record["com_delta_m"][1], 0.0, places=15)
+        self.assertAlmostEqual(record["com_delta_norm_m"], 5e-4, places=12)
+        self.assertAlmostEqual(record["mass_delta_kg"], 0.0, places=15)
+        self.assertGreater(record["tensor_scale_kg_m2"], 0.0)
+        self.assertAlmostEqual(record["tensor_delta_max_abs_kg_m2"], 0.0, places=15)
+
+        self.closure["top_level"]["com"] = [base_com[0] + 2e-3, base_com[1], base_com[2]]
+        self.assertIn("physics.closure", self.failures())
+
+        self.closure["top_level"]["com"] = base_com
+        self.closure["top_level"]["inertia"][0][0] *= 1.005
+        self.assertEqual([], self.failures())
+        self.closure["top_level"]["inertia"][0][0] *= 1.05
+        self.assertIn("physics.closure", self.failures())
+
+    def test_closure_bound_keeps_mass_strict_and_does_not_widen_other_com_checks(self):
+        self._record_clean_provenance()
+        self.assertEqual([], self.failures())
+        base_mass = self.closure["top_level"]["mass"]
+
+        self.closure["top_level"]["mass"] = base_mass + 1e-4
+        self.write()
+        checks = {check["id"]: check for check in verify_physics(self.root, self.source, self.model)}
+        self.assertFalse(checks["physics.closure"]["passed"])
+        self.assertIn("mass differs", checks["physics.closure"]["details"]["error"])
+        self.closure["top_level"]["mass"] = base_mass
+
+        link = next(item for item in self.model["links"] if item["name"] == "base_link")
+        original = copy.deepcopy(link["inertial"]["xyz"])
+        link["inertial"]["xyz"] = [original[0] + 1e-4, original[1], original[2]]
+        failed = self.failures()
+        self.assertIn("physics.link.base_link", failed)
+        self.assertNotIn("physics.closure", failed)
+        link["inertial"]["xyz"] = original
+        self.assertEqual([], self.failures())
+
     def test_translation_mutation_is_rejected_after_resealing_all_raw_copies(self):
         self.raw["components"][1]["transform"][3] += 0.01
         self.assertIn("physics.link.base_link", self.failures())
