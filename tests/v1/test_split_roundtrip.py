@@ -58,6 +58,16 @@ def capture_record() -> dict:
 class AxisFixtureBackend(support.FixtureCadBackend):
     """Fixture backend that can resolve the authored joint axis selector."""
 
+    def assembly_mass_properties(self, path):
+        from description_pipeline.sources.solidworks.errors import CadError
+
+        raise CadError("cad_mass_property_unavailable", "Control fixture has no native whole-assembly reading")
+
+    def assembly_component_mass_properties(self, path):
+        from description_pipeline.sources.solidworks.errors import CadError
+
+        raise CadError("cad_component_context_unavailable", "Control fixture has no native instance context")
+
     def capture_axis_reference(self, reference):
         record = {
             "component": str(reference.get("component") or ""),
