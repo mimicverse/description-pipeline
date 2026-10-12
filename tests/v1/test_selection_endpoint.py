@@ -228,8 +228,21 @@ class SelectionEndpointTests(unittest.TestCase):
             time.sleep(0.02)
 
     def await_report(self, jobs: Jobs, identifier: str, snapshot: dict, *, timeout: float = 5.0) -> dict:
-        """A terminal snapshot must already carry its sealed failure diagnostics."""
-        self.assertIsNotNone(snapshot.get("failure_diagnostics"))
+        """A terminal run must finish sealing its failure diagnostics.
+
+        The worker records the terminal status first and seals afterwards (the
+        sealed receipt must include the final failure event and completion
+        timestamp), so a snapshot taken between the two is transient by design:
+        poll until the seal is visible instead of asserting on the first sight
+        of ``failed``.
+        """
+
+        deadline = time.monotonic() + timeout
+        while snapshot.get("failure_diagnostics") is None:
+            if time.monotonic() >= deadline:
+                self.assertIsNotNone(snapshot.get("failure_diagnostics"))
+            time.sleep(0.02)
+            snapshot = jobs.snapshot(identifier)
         return snapshot
 
     def observe_events(self) -> list:
