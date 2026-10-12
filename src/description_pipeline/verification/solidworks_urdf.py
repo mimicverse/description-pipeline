@@ -147,6 +147,7 @@ def required_checks(definition=None):
         "urdf.syntax_names",
         "urdf.topology",
         "geometry.coverage",
+        "geometry.native_tessellation",
         "geometry.assets",
         "consumer.urdf",
     }
@@ -979,6 +980,9 @@ def evaluate_bundle(root: Path) -> dict:
         gates.add("source.dependencies", lambda: _dependencies(root, definition))
     if definition is not None and model is not None and raw is not None:
         source = definition["source"]
+        from .native_mesh_observations import verify_native_mesh_observations
+
+        gates.add("geometry.native_tessellation", lambda: verify_native_mesh_observations(root))
         gates.add("source.coverage", lambda: _entities(source, raw, model))
         gates.add(
             "verification.complete",
