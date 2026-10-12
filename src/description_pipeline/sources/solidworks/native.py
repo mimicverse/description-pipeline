@@ -2046,6 +2046,10 @@ class _ActivityEmitter:
 #: SolidWorks COM mid-export transient: DISP_E_EXCEPTION ("服务器出现意外情况").
 TRANSIENT_COM_RETRY_ATTEMPTS = 3
 TRANSIENT_COM_RETRY_DELAYS = (0.2, 0.5)
+# Unloading a full read-write capture session (61 documents) can lag; the
+# settle window is bounded and only decides when a document is truly stuck.
+CLOSE_ALL_SETTLE_ATTEMPTS = 30
+CLOSE_ALL_SETTLE_DELAY_S = 0.5
 # A facetless sheet face whose ITessellation probe exhausts the transient COM
 # retries is still accountable when the face itself proves degeneracy: zero
 # native triangle count, an empty display array, and a finite area at or below
@@ -2489,28 +2493,57 @@ class SolidWorksBackend(CadBackend):
 
         Used by the pristine readout window: after this returns no document is
         open, so the reopened capture copy starts from a never-touched in-memory
-        state.  Probe v5 (CloseAllDocuments(False) + reopen) closed and reopened
-        all 61 documents and restored the opened-state reads bit-identically.
+        state.  The real capture opens the collected copy read-write and rebuilds
+        and recalculates it, so its documents carry in-memory modifications;
+        ``CloseAllDocuments(False)`` silently leaves such dirty documents open in
+        a non-interactive session (native16 leftovers: 61 documents), while
+        ``CloseAllDocuments(True)`` closes without saving - the collected copy is
+        disposable, nothing after the window saves, and freeze re-hashes the
+        post-window copy to prove no writes.  Probe v5's read-only session was
+        clean, which is why False sufficed there.  Leftovers get a bounded settle
+        window (unloading can lag), then ONE force-close attempt per remaining
+        document via CloseDoc, and only then the capture fails closed.
         """
 
         app = self._app_obj()
         try:
-            _member(app, "CloseAllDocuments", False)
+            _member(app, "CloseAllDocuments", True)
         except Exception as error:  # noqa: BLE001 - a refused close is a capture failure
             raise CadError(
                 "cad_close_failed", "CloseAllDocuments failed", {"error": " ".join(str(error).split())[:200]}
             ) from error
-        remaining = []
-        for raw in list(_member(app, "GetDocuments") or []):
-            document = _dynamic(raw)
-            remaining.append(str(_member(document, "GetPathName") or _member(document, "GetTitle") or "?"))
+        remaining = self._settled_open_documents(app)
+        if remaining:
+            for title, path in remaining:
+                try:
+                    _member(app, "CloseDoc", title or path)
+                except Exception:  # noqa: BLE001 - attempted once; a stuck document is reported below
+                    continue
+            remaining = self._settled_open_documents(app)
         if remaining:
             raise CadError(
                 "cad_close_failed",
                 "documents remain open after CloseAllDocuments",
-                {"open": remaining[:20], "count": len(remaining)},
+                {"open": [path for _title, path in remaining][:20], "count": len(remaining)},
             )
         return {"closed": True}
+
+    def _settled_open_documents(self, app):
+        """Open documents as (title, path), polled until empty or the settle window expires."""
+
+        remaining: list[tuple[str, str]] = []
+        for attempt in range(CLOSE_ALL_SETTLE_ATTEMPTS):
+            remaining = []
+            for raw in list(_member(app, "GetDocuments") or []):
+                document = _dynamic(raw)
+                title = str(_member(document, "GetTitle") or "")
+                path = str(_member(document, "GetPathName") or "")
+                remaining.append((title, path or title or "?"))
+            if not remaining:
+                return []
+            if attempt < CLOSE_ALL_SETTLE_ATTEMPTS - 1:
+                time.sleep(CLOSE_ALL_SETTLE_DELAY_S)
+        return remaining
 
     def _placement(self, component):
         transform = _member(component, "GetTotalTransform", False)

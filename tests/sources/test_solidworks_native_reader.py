@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from itertools import pairwise
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from description_pipeline.geometry.stl import read as read_stl
 from description_pipeline.sources.solidworks.errors import CadError
@@ -4029,17 +4029,91 @@ class CloseAllDocumentsTests(unittest.TestCase):
     def _backend(self, app):
         return SolidWorksBackend(session_factory=lambda: _Session(app))
 
-    def test_close_all_documents_verifies_no_document_remains(self):
+    def _fast_settle(self):
+        return (
+            patch("description_pipeline.sources.solidworks.native.CLOSE_ALL_SETTLE_ATTEMPTS", 2),
+            patch("description_pipeline.sources.solidworks.native.CLOSE_ALL_SETTLE_DELAY_S", 0.0),
+        )
+
+    def test_close_all_documents_closes_without_saving_dirty_documents(self):
+        calls = []
+        app = _App({})
+
+        def close(confirm):
+            calls.append(confirm)
+            return True
+
+        def documents():
+            # The real capture's read-write copy only releases with the
+            # close-without-save flag; a False call leaves it open.
+            if calls and calls[-1] is True:
+                return []
+            return [types.SimpleNamespace(GetTitle=lambda: "dirty", GetPathName=lambda: "C:/dirty.SLDASM")]
+
+        app.CloseAllDocuments = close
+        app.GetDocuments = documents
+        attempts, delay = self._fast_settle()
+        with _com_stubs(), attempts, delay:
+            self.assertEqual(self._backend(app).close_all_documents(), {"closed": True})
+        self.assertEqual(calls, [True])
+
+    def test_close_all_documents_settles_before_concluding_leftovers(self):
+        state = {"enumerations": 0}
+        app = _App({})
+        app.CloseAllDocuments = lambda confirm: True
+
+        def documents():
+            state["enumerations"] += 1
+            if state["enumerations"] == 1:
+                return [types.SimpleNamespace(GetTitle=lambda: "slow", GetPathName=lambda: "C:/slow.SLDASM")]
+            return []
+
+        app.GetDocuments = documents
+        attempts, delay = self._fast_settle()
+        with _com_stubs(), attempts, delay:
+            self.assertEqual(self._backend(app).close_all_documents(), {"closed": True})
+        self.assertEqual(state["enumerations"], 2)
+
+    def test_close_all_documents_force_closes_remaining_documents_once(self):
+        closed = []
+        state = {"settled": False}
+        app = _App({})
+        app.CloseAllDocuments = lambda confirm: True
+
+        def documents():
+            if state["settled"]:
+                return []
+            return [types.SimpleNamespace(GetTitle=lambda: "stuck", GetPathName=lambda: "C:/stuck.SLDASM")]
+
+        def close_doc(name):
+            closed.append(name)
+            state["settled"] = True
+            return 1
+
+        app.GetDocuments = documents
+        app.CloseDoc = close_doc
+        attempts, delay = self._fast_settle()
+        with _com_stubs(), attempts, delay:
+            self.assertEqual(self._backend(app).close_all_documents(), {"closed": True})
+        self.assertEqual(closed, ["stuck"])
+
+    def test_close_all_documents_persistent_leftover_fails_closed(self):
+        closed = []
         calls = []
         app = _App({})
         app.CloseAllDocuments = lambda confirm: calls.append(confirm) or True
-        app.GetDocuments = lambda: [types.SimpleNamespace(GetPathName=lambda: "C:/left.SLDASM")]
-        with _com_stubs(), self.assertRaises(CadError) as caught:
+        app.GetDocuments = lambda: [
+            types.SimpleNamespace(GetTitle=lambda: "left", GetPathName=lambda: "C:/left.SLDASM")
+        ]
+        app.CloseDoc = lambda name: closed.append(name) or 0
+        attempts, delay = self._fast_settle()
+        with _com_stubs(), attempts, delay, self.assertRaises(CadError) as caught:
             self._backend(app).close_all_documents()
         self.assertEqual(caught.exception.code, "cad_close_failed")
         self.assertEqual(caught.exception.detail["open"], ["C:/left.SLDASM"])
         self.assertEqual(caught.exception.detail["count"], 1)
-        self.assertEqual(calls, [False])
+        self.assertEqual(calls, [True])
+        self.assertEqual(closed, ["left"])
 
     def test_close_all_documents_reports_success(self):
         app = _App({})

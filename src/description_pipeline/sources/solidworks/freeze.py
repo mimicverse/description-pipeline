@@ -2070,11 +2070,16 @@ def _pristine_readout_window(
 
     Probe v4: any component-instance mass read contaminates the later direct
     group reads and the whole-assembly read of the same session.  Probe v5:
-    ``CloseAllDocuments`` + reopening the same captured copy restores the
-    opened state bit-identically (deltas exactly zero, 61/61 documents).
-    This runs after every other CAD-facing step; inside the window only the two
-    readers run, in the v5-proven order (link groups first, whole assembly
-    second), and nothing else touches the reopened document.
+    closing the read-only probe session and reopening the same captured copy
+    restores the opened state bit-identically (deltas exactly zero, 61/61
+    documents).  Closing the real capture needs ``CloseAllDocuments(True)``:
+    the collected copy was opened read-write and rebuilt/recalculated, so the
+    dirty documents only release with close-without-save (native16 left 61
+    documents open with False); nothing after this window saves and freeze
+    re-hashes the post-window copy to prove no writes.  This runs after every
+    other CAD-facing step; inside the window only the two readers run, in the
+    v5-proven order (link groups first, whole assembly second), and nothing
+    else touches the reopened document.
     """
 
     document = str((closure or {}).get("top_level") or cfg["assembly"])
