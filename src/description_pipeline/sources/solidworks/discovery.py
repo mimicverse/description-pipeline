@@ -4319,6 +4319,7 @@ def _robot_document(
             "axis_reference": joint["axis_reference"],
         }
         if joint.get("passive") is True:
+            entry.pop("axis")
             entry["passive"] = True
             source["joints"].append(entry)
             continue

@@ -560,7 +560,7 @@ def build_scene(
             links[-1]["provenance"]["instance_measurements"] = "raw/effective_instances.json"
             links[-1]["provenance"]["combination"] = "parallel_axis_from_cad_part_and_instance_readings"
 
-    joint_entries = _build_joints(cfg, {link["name"] for link in links}, link_frames)
+    joint_entries = _build_joints(cfg, {link["name"] for link in links}, link_frames, mate_frames)
     frames = _build_frames(cfg, {link["name"] for link in links}, raw_scene, link_frames)
     # The root link's frame is where the model's world coordinates start.  The
     # world-frame oracle needs it to evaluate the q=0 chain, so it is written
@@ -610,6 +610,7 @@ def _build_joints(
     cfg: dict[str, Any],
     link_names: Iterable[str],
     link_frames: dict[str, tuple[Matrix3, Vector3, str | None]] | None = None,
+    mate_frames: dict | None = None,
 ) -> list[dict[str, Any]]:
     """Derive joint origins from captured parent and child CAD datums."""
 
@@ -652,6 +653,12 @@ def _build_joints(
         geometry_detail = {"parent_frame": parent_datum, "child_frame": child_datum}
         movable = joint_type != "fixed"
         axis = joint.get("axis")
+        if joint.get("passive") is True:
+            selector = joint.get("axis_reference") or {}
+            native = (mate_frames or {}).get(selector.get("component"))
+            if not isinstance(native, dict) or native.get("selector") != selector or axis is not None:
+                raise ConfigError("passive rotation requires only its bound native axis", {"joint": joint_id})
+            axis = native["local_axis"]
         if movable and (not isinstance(axis, (list, tuple)) or len(axis) != 3):
             raise ConfigError("movable joints need an explicit axis", {"joint": joint_id})
         entry: dict[str, Any] = {
