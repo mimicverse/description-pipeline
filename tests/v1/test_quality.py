@@ -670,13 +670,19 @@ class PhysicsTests(unittest.TestCase):
         """Seal the current a-row state as the canonical effective instance record."""
 
         reference = self.masses["a"]["reference"]
+        # The ratified producer contract keeps `measurement_basis` on the
+        # sheet-only mass ROW and re-states it in the sealed reading's reference.
+        sealed_reference = {
+            **copy.deepcopy(reference),
+            "measurement_basis": self.masses["a"].get("measurement_basis") or reference.get("measurement_basis"),
+        }
         reading = {
             "role": "leaf",
             "document_type": "part",
             "mass": self.masses["a"]["mass"],
             "com": copy.deepcopy(self.masses["a"]["com"]),
             "inertia": copy.deepcopy(self.masses["a"]["inertia"]),
-            "reference": copy.deepcopy(reference),
+            "reference": sealed_reference,
         }
         context = self.closure["component_context"]
         row = next(entry for entry in context["instances"] if entry["name"] == "a")
@@ -738,7 +744,7 @@ class PhysicsTests(unittest.TestCase):
                 "overrides": copy.deepcopy(reference["overrides"]),
                 "qualification": qualification,
                 "measurement": {**copy.deepcopy(measurement), "state": self.masses["a"]["state"],
-                               "measurement_basis": reference["measurement_basis"]},
+                               "measurement_basis": sealed_reference["measurement_basis"]},
             },
         ]
         write_json(
@@ -776,7 +782,6 @@ class PhysicsTests(unittest.TestCase):
                 "reference_point": "center_of_mass",
                 "use_system_units": True,
                 "effective_instance": True,
-                "measurement_basis": "cad_authored_effective_instance",
                 "selected_components": ["a"],
                 "assembly_document": self.raw["document"],
                 "assembly_configuration": self.source["configuration"],
@@ -795,6 +800,7 @@ class PhysicsTests(unittest.TestCase):
         )
         self.masses["a"]["mode"] = "effective_instance"
         self.masses["a"]["state"] = "sheet_only"
+        self.masses["a"]["measurement_basis"] = "cad_authored_effective_instance"
         self.raw.setdefault("notes", {})["bodies:a"] = {"solid": 0, "sheet": 2350}
         self._record_clean_provenance()
         self._write_effective()
@@ -804,6 +810,23 @@ class PhysicsTests(unittest.TestCase):
         checks = {check["id"]: check for check in verify_physics(self.root, self.source, self.model)}
         self.assertTrue(checks["physics.effective_instances"]["passed"], checks["physics.effective_instances"])
         self.assertTrue(checks["physics.reading.a"]["passed"], checks["physics.reading.a"])
+        self.assertEqual([], self.failures())
+
+    def test_sheet_only_basis_must_be_the_ratified_row_level_literal(self):
+        self._mark_effective_instance()
+        self.assertEqual([], self.failures())
+
+        ratified = self.masses["a"].pop("measurement_basis")
+        self.assertTrue({"physics.reading.a", "physics.effective_instances"} <= set(self.failures()))
+
+        self.masses["a"]["measurement_basis"] = "cad_assembly_instance_measurement"
+        self.assertTrue({"physics.reading.a", "physics.effective_instances"} <= set(self.failures()))
+
+        self.masses["a"]["measurement_basis"] = ratified
+        self.masses["a"]["reference"]["measurement_basis"] = "cad_authored_effective_instance_guess"
+        self.assertTrue({"physics.reading.a", "physics.effective_instances"} <= set(self.failures()))
+
+        self.masses["a"]["reference"]["measurement_basis"] = "cad_authored_effective_instance"
         self.assertEqual([], self.failures())
 
     def test_effective_instance_evidence_is_required_and_bound(self):

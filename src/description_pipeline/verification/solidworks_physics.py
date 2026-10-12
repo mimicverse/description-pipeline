@@ -626,6 +626,11 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
                 row_reference = row.get("reference")
                 _require(isinstance(row_reference, dict), name + ": effective row has no reference block")
                 for field in core_reference_fields:
+                    if field == "measurement_basis":
+                        # The ratified sheet-only row carries the basis at the ROW
+                        # level (native.py `_sheet_only_instance_fallback`); the
+                        # explicit check below binds it to the sealed reading.
+                        continue
                     _require(
                         row_reference.get(field) == reference.get(field),
                         name + ": captured row " + field + " differs from the sealed reading",
@@ -671,9 +676,9 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
                     name + ": warning state differs from the captured row",
                 )
                 _require(
-                    measurement.get("measurement_basis")
-                    == row_reference.get("measurement_basis")
-                    == "cad_authored_effective_instance",
+                    row.get("measurement_basis") == "cad_authored_effective_instance"
+                    and row_reference.get("measurement_basis") in (None, "cad_authored_effective_instance")
+                    and measurement.get("measurement_basis") == "cad_authored_effective_instance",
                     name + ": effective measurement basis changed",
                 )
             else:
@@ -884,7 +889,8 @@ def _effective_reading_summary(name, record):
     _require(bool(reference.get("selection_api")), f"{name}: effective selection API is unrecorded")
     _require(bool(reference.get("override_api")), f"{name}: effective override API is unrecorded")
     _require(
-        reference.get("measurement_basis") == "cad_authored_effective_instance",
+        record.get("measurement_basis") == "cad_authored_effective_instance"
+        and reference.get("measurement_basis") in (None, "cad_authored_effective_instance"),
         f"{name}: effective measurement basis changed",
     )
     _require(record.get("mode") == "effective_instance", f"{name}: effective mode changed")
@@ -917,7 +923,8 @@ def _effective_reading_summary(name, record):
         "inertia_kg_m2": oracle._tensor6(tensor),
         "api": reference["used_api"],
         "scope": reference["scope"],
-        "measurement_basis": reference["measurement_basis"],
+        # Ratified producer shape: the sheet-only row carries the basis itself.
+        "measurement_basis": record.get("measurement_basis"),
     }
 
 
