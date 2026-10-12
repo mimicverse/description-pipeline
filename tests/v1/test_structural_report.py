@@ -715,3 +715,36 @@ if __name__ == "__main__":
         del no_convention["part_measurement"]["product_convention"]
         self.assertIsNone(_canonical_effective_warnings(record_with(no_convention)))
 
+    def test_partial_failure_bundle_renders_recovered_warnings(self):
+        import shutil
+
+        from description_pipeline.structural_report import diagnostic_file_sources
+
+        with TemporaryDirectory() as directory:
+            tree = Path(directory) / "failed-tree"
+            (tree / "evidence.failed-001/partial/raw").mkdir(parents=True)
+            write_json(
+                tree / "evidence.failed-001/partial/raw/material_provenance.json",
+                self._provenance([self._provenance_entry()]),
+            )
+            write_json(
+                tree / "evidence.failed-001/partial/raw/effective_instances.json",
+                self._effective_record([self._effective_warning("cad_surface_only_effective_instance", "pcb-1")]),
+            )
+            write_json(tree / "evidence.failed-001/partial/raw/mass_closure.json", {"status": "recorded"})
+            sources = diagnostic_file_sources(tree, failure_roots=("evidence.failed-001",))
+            bundle = Path(directory) / "bundle"
+            for name, relative in sources.items():
+                target = bundle / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(tree / relative, target)
+            pins = write_structural_report(
+                Path(directory) / "run",
+                {"run_id": "m3", "state": "failed", "error": "boom"},
+                evidence_root=bundle,
+            )
+            report = json.loads((Path(directory) / "run" / pins["json"]["path"]).read_text())
+            codes = [item["code"] for item in report["findings"]]
+            self.assertIn("native.material_provenance_missing", codes)
+            self.assertIn("cad_surface_only_effective_instance", codes)
+
