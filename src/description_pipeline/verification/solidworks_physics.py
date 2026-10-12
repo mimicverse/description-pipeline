@@ -31,6 +31,20 @@ COM_ATOL_M = 5e-5
 CLOSURE_COM_ATOL_M = 1e-3
 CLOSURE_TENSOR_RTOL = 1e-2
 TENSOR_RTOL = 1e-4
+#: The direct link group readout (native one-shot IMassProperty2 per body) is the
+#: authoritative link mass source; the model is generated from it by an exact
+#: assembly->link transform, and the recorded two-read pair must repeat (probe v2
+#: measured bit-identical repeats; the repeat bounds below stand until native12
+#: measures otherwise).
+LINK_DIRECT_SCHEMA = "solidworks-to-urdf.link-group-mass-properties/v1"
+LINK_DIRECT_USED_API = "IMassProperty2 (SelectedItems = component set)"
+LINK_DIRECT_SELECTION_RULE = "top_most_providers+uncovered_leaves"
+LINK_DIRECT_MASS_RTOL = 1e-12
+LINK_DIRECT_COM_ATOL_M = 1e-9
+LINK_DIRECT_TENSOR_RTOL = 1e-9
+LINK_REPEAT_MASS_ATOL_KG = 1e-9
+LINK_REPEAT_COM_ATOL_M = 5e-7
+LINK_REPEAT_TENSOR_RTOL = 1e-6
 INSTANCE_MEASUREMENT_BASIS = "cad_assembly_instance_measurement"
 INSTANCE_MEASUREMENT_CODE = "cad_instance_measurement_differs_from_part"
 INSTANCE_MEASUREMENT_QUALIFICATION = (
@@ -124,6 +138,73 @@ def _unassigned_mass_rows(evidence_root: Path, source: dict) -> list[dict]:
         )
         rows.append({"component": name, "document": row.get("document"), "mass_kg": float(value)})
     return rows
+
+
+def _link_direct_record(evidence_root: Path) -> dict:
+    """The sealed direct link group readout record (one supported schema)."""
+
+    try:
+        payload = read_data(confined(evidence_root, "raw/link_group_mass_properties.json"))
+    except (OSError, PipelineError) as error:
+        raise PipelineError(f"The link group mass record is unreadable: {error}") from error
+    _require(
+        isinstance(payload, dict) and payload.get("schema_version") == LINK_DIRECT_SCHEMA,
+        "The link group mass record schema changed",
+    )
+    _require(payload.get("used_api") == LINK_DIRECT_USED_API, "The link group mass record API changed")
+    _require(
+        payload.get("selection_rule") == LINK_DIRECT_SELECTION_RULE,
+        "The link group mass record selection rule changed",
+    )
+    links = payload.get("links")
+    _require(isinstance(links, dict) and bool(links), "The link group mass record carries no links")
+    for name, entry in links.items():
+        _require(isinstance(entry, dict), f"{name}: link group entry is not an object")
+        selection = entry.get("selection")
+        _require(
+            isinstance(selection, list)
+            and bool(selection)
+            and all(isinstance(path, str) and bool(path) for path in selection),
+            f"{name}: link group selection is malformed",
+        )
+        reads = entry.get("reads")
+        _require(
+            isinstance(reads, list) and len(reads) == 2 and all(isinstance(read, dict) for read in reads),
+            f"{name}: link group reads must be exactly two objects",
+        )
+        _require(
+            isinstance(entry.get("reproducibility"), dict),
+            f"{name}: link group entry carries no reproducibility block",
+        )
+    return payload
+
+
+def _direct_link_sum(record: dict, source: dict) -> tuple[float, np.ndarray, np.ndarray]:
+    """Parallel-axis sum of the authoritative direct link reads in assembly axes."""
+
+    entries = []
+    for body in source.get("bodies") or []:
+        name = str(body.get("name"))
+        entry = (record.get("links") or {}).get(name)
+        _require(isinstance(entry, dict), name + ": the link group mass record carries no entry")
+        read = entry["reads"][0]
+        mass = oracle._finite_positive(read.get("mass_kg"), name + " link group mass")
+        com = np.array(oracle._finite_vector(read.get("com_m"), name + " link group COM"), dtype=float)
+        tensor = oracle._raw_tensor(
+            name,
+            {"inertia": read.get("inertia_tensor_about_com"),
+             "reference": {"product_convention": "solidworks_standard"}},
+        )
+        _require(np.isfinite(tensor).all(), name + ": nonfinite link group tensor")
+        entries.append((mass, com, tensor))
+    _require(bool(entries), "The direct link sum carries no bodies")
+    total = float(sum(mass for mass, _com, _tensor in entries))
+    center = sum((mass * com for mass, com, _tensor in entries), np.zeros(3)) / total
+    inertia = np.zeros((3, 3))
+    for mass, com, tensor in entries:
+        offset = com - center
+        inertia += tensor + mass * (float(offset @ offset) * np.eye(3) - np.outer(offset, offset))
+    return total, center, inertia
 
 
 def verify_urdf_mass_equality(bundle_root: Path, source: dict | None = None) -> dict:
@@ -764,22 +845,131 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
 
     gate("physics.effective_instances", effective_instances)
     links = {row["name"]: row for row in model.get("links", [])}
+    effective = oracle.effective_math_map(masses, raw)
+    direct: dict = {"record": None}
+
+    def direct_record():
+        direct["record"] = _link_direct_record(root)
+        bodies = {str(body["name"]) for body in source["bodies"]}
+        _require(
+            set(direct["record"]["links"]) == bodies,
+            "The link group mass record does not cover the selected bodies exactly",
+        )
+        return {"bodies": len(direct["record"]["links"])}
+
+    gate("physics.link_direct_record", direct_record)
+    partition_audit: dict[str, dict] = {}
     for body in source["bodies"]:
 
         def reconstruct(body=body):
             name = body["name"]
-            world = oracle._raw_world(body, raw, masses, declared)
+            entry = ((direct["record"] or {}).get("links") or {}).get(name)
+            _require(isinstance(entry, dict), name + ": the link group mass record carries no entry")
+            contributions = oracle._resolved_contributions(body, raw, masses, declared, effective)
+            expected_selection = sorted(str(note["component"]) for *_rest, note in contributions)
+            _require(
+                entry.get("selection") == expected_selection,
+                name + ": the recorded selection differs from the independently recomputed set",
+            )
+            reads = entry.get("reads")
+            _require(
+                isinstance(reads, list) and len(reads) == 2 and all(isinstance(read, dict) for read in reads),
+                name + ": the link group mass record needs exactly two reads",
+            )
+            flag_keys = {"OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia"}
+            tensors = []
+            for read in reads:
+                oracle._finite_positive(read.get("mass_kg"), name + " link group mass")
+                oracle._finite_vector(read.get("com_m"), name + " link group COM")
+                tensor = oracle._raw_tensor(
+                    name,
+                    {"inertia": read.get("inertia_tensor_about_com"),
+                     "reference": {"product_convention": "solidworks_standard"}},
+                )
+                _require(np.isfinite(tensor).all(), name + ": nonfinite link group tensor")
+                overrides = read.get("overrides")
+                _require(
+                    isinstance(overrides, dict)
+                    and set(overrides) == flag_keys
+                    and all(value is False for value in overrides.values()),
+                    name + ": a link group read carries object-level overrides",
+                )
+                tensors.append(tensor)
+            first, second = reads
+            mass_delta = abs(float(first["mass_kg"]) - float(second["mass_kg"]))
+            com_delta_norm = float(np.linalg.norm(np.subtract(first["com_m"], second["com_m"])))
+            tensor_delta = float(np.max(np.abs(tensors[0] - tensors[1])))
+            repeat_scale = max(float(np.max(np.abs(tensors[0]))), 1e-20)
+            _require(
+                mass_delta <= LINK_REPEAT_MASS_ATOL_KG
+                and com_delta_norm <= LINK_REPEAT_COM_ATOL_M
+                and tensor_delta <= LINK_REPEAT_TENSOR_RTOL * repeat_scale,
+                name + ": the recorded link group reads do not repeat within the evidence bound",
+            )
+            recorded_repeat = entry.get("reproducibility")
+            _require(
+                isinstance(recorded_repeat, dict),
+                name + ": the link group record carries no reproducibility block",
+            )
+            for key, measured in (
+                ("mass_delta_kg", mass_delta),
+                ("com_delta_norm_m", com_delta_norm),
+                ("tensor_delta_max_abs", tensor_delta),
+            ):
+                value = recorded_repeat.get(key)
+                _require(
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and abs(float(value) - measured) <= 1e-12 + 1e-9 * abs(measured),
+                    name + ": recorded reproducibility " + key + " differs from the recomputed pair",
+                )
             rotation, origin = oracle._transform(datums[body["frame"]["coordinate_system"]])
-            expected = (world["mass"], rotation.T @ (world["com"] - origin), rotation.T @ world["inertia"] @ rotation)
-            actual = oracle._canonical_in_link_frame(links[name])
-            _compare(actual, expected, name)
+            expected_mass = float(first["mass_kg"])
+            expected_com = rotation.T @ (np.array(first["com_m"], dtype=float) - origin)
+            expected_tensor = rotation.T @ tensors[0] @ rotation
+            actual_mass, actual_com, actual_tensor = oracle._canonical_in_link_frame(links[name])
+            _require(
+                np.isclose(actual_mass, expected_mass, rtol=LINK_DIRECT_MASS_RTOL, atol=1e-15),
+                name + ": model mass differs from the direct link group read",
+            )
+            _require(
+                np.allclose(actual_com, expected_com, atol=LINK_DIRECT_COM_ATOL_M, rtol=0),
+                name + ": model COM differs from the direct link group read",
+            )
+            _require(
+                np.allclose(actual_tensor, expected_tensor, rtol=LINK_DIRECT_TENSOR_RTOL, atol=1e-15),
+                name + ": model inertia differs from the direct link group read",
+            )
+            world = oracle._raw_world(body, raw, masses, declared)
+            recombination_com = rotation.T @ (world["com"] - origin)
+            recombination_tensor = rotation.T @ world["inertia"] @ rotation
+            recombination_delta = float(np.max(np.abs(expected_tensor - recombination_tensor)))
+            partition_audit[name] = {
+                "mass_delta_kg": expected_mass - float(world["mass"]),
+                "com_delta_m": [
+                    float(a) - float(b) for a, b in zip(expected_com, recombination_com, strict=True)
+                ],
+                "com_delta_norm_m": float(np.linalg.norm(np.subtract(expected_com, recombination_com))),
+                "tensor_delta_max_abs": recombination_delta,
+                "tensor_rel": recombination_delta
+                / max(float(np.max(np.abs(recombination_tensor))), 1e-20),
+            }
             return {
-                "mass_kg": expected[0],
-                "com_m": expected[1].tolist(),
-                "inertia_kg_m2": oracle._tensor6(expected[2]),
+                "mass_kg": expected_mass,
+                "selection": expected_selection,
+                "com_m": expected_com.tolist(),
+                "inertia_kg_m2": oracle._tensor6(expected_tensor),
             }
 
         gate("physics.link." + body["name"], reconstruct)
+
+    gate(
+        "physics.link_partition_audit",
+        lambda: {
+            "note": "non-blocking: direct link group read vs the per-instance recombination",
+            "links": partition_audit,
+        },
+    )
 
     def closure():
         payload = read_data(confined(root, "raw/mass_closure.json"))
@@ -842,21 +1032,48 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
             _require(not derived.get("blockers"), "Effective substitution blockers were recorded")
         _require(not mine["blockers"], "Effective substitution spans bodies")
         body = {"id": "assembly", "components": [row["name"] for row in raw["components"]]}
-        rebuilt = oracle._raw_world(body, raw, masses, {})
-        expected = (rebuilt["mass"], rebuilt["com"], rebuilt["inertia"])
+        recombination = oracle._raw_world(body, raw, masses, {})
+        expected_recombination = (recombination["mass"], recombination["com"], recombination["inertia"])
+        _require(
+            isinstance(direct["record"], dict),
+            "The link group mass record is required for the closure ledger",
+        )
+        direct_sum = _direct_link_sum(direct["record"], source)
+        unassigned = _unassigned_mass_rows(root, source)
+        unassigned_mass = math.fsum(item["mass_kg"] for item in unassigned)
+        accounted_mass = float(direct_sum[0]) + unassigned_mass
+        _require(
+            abs(accounted_mass - float(top[0])) <= 1e-12,
+            "Whole assembly / direct link sum: mass differs",
+        )
         reconciliation = {
-            "mass_delta_kg": float(top[0]) - float(expected[0]),
-            "com_delta_m": [float(a) - float(b) for a, b in zip(top[1], expected[1], strict=True)],
-            "com_delta_norm_m": float(np.linalg.norm(np.subtract(top[1], expected[1]))),
+            "recombination": {
+                "mass_delta_kg": float(top[0]) - float(expected_recombination[0]),
+                "com_delta_m": [
+                    float(a) - float(b) for a, b in zip(top[1], expected_recombination[1], strict=True)
+                ],
+                "com_delta_norm_m": float(np.linalg.norm(np.subtract(top[1], expected_recombination[1]))),
+                "tensor_delta_max_abs_kg_m2": float(
+                    np.max(np.abs(np.subtract(top[2], expected_recombination[2])))
+                ),
+                "tensor_scale_kg_m2": float(max(np.max(np.abs(expected_recombination[2])), 1e-20)),
+            },
+            "direct_sum": {
+                "unassigned_mass_kg": unassigned_mass,
+                "accounted_mass_kg": accounted_mass,
+                "mass_delta_kg": float(top[0]) - accounted_mass,
+                "com_delta_m": [float(a) - float(b) for a, b in zip(top[1], direct_sum[1], strict=True)],
+                "com_delta_norm_m": float(np.linalg.norm(np.subtract(top[1], direct_sum[1]))),
+                "tensor_delta_max_abs_kg_m2": float(np.max(np.abs(np.subtract(top[2], direct_sum[2])))),
+                "tensor_scale_kg_m2": float(max(np.max(np.abs(direct_sum[2])), 1e-20)),
+            },
             "com_atol_m": CLOSURE_COM_ATOL_M,
-            "tensor_delta_max_abs_kg_m2": float(np.max(np.abs(np.subtract(top[2], expected[2])))),
-            "tensor_scale_kg_m2": float(max(np.max(np.abs(expected[2])), 1e-20)),
             "tensor_rtol": CLOSURE_TENSOR_RTOL,
         }
         _compare(
             top,
-            expected,
-            "Whole assembly / effective instance sum",
+            (accounted_mass, direct_sum[1], direct_sum[2]),
+            "Whole assembly / direct link sum",
             com_atol=CLOSURE_COM_ATOL_M,
             tensor_rtol=CLOSURE_TENSOR_RTOL,
         )
@@ -867,7 +1084,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
                     np.asarray(derived["effective_total"]["com"]),
                     np.asarray(derived["effective_total"]["inertia"]),
                 ),
-                expected,
+                expected_recombination,
                 "Reported effective closure",
             )
         enriched_rows = []
@@ -891,7 +1108,8 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
         _require(error is None, "Component context: " + str(error))
         return {
             "assembly_mass_kg": top[0],
-            "independent_mass_kg": expected[0],
+            "independent_mass_kg": expected_recombination[0],
+            "direct_sum_mass_kg": direct_sum[0],
             "reconciliation": reconciliation,
             # JSON model types only: the report schema is a document, and tuple
             # keys would not survive the saved-report round trip.

@@ -21,6 +21,7 @@ import numpy as np
 
 from description_pipeline.sources.snapshot import write_manifest
 from description_pipeline.verification.solidworks_physics import verify_physics
+from tests.sources import support
 
 # The package re-exports ``freeze`` as a function; bind the modules explicitly.
 freeze_module = importlib.import_module("description_pipeline.sources.solidworks.freeze")
@@ -397,6 +398,7 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
     def _verify(self):
         loaded = scene_module.load_scene(self.evidence)
         model = {"links": [{"name": link["name"], "inertial": link["inertial"]} for link in loaded["links"]]}
+        support.write_link_group_mass_record(self.bundle, model, self.source)
         checks = verify_physics(self.evidence, self.source, model)
         return loaded, model, {check["id"]: check for check in checks}
 
@@ -695,6 +697,7 @@ class InstanceMeasurementIntegrationTests(unittest.TestCase):
     def _verify(self):
         loaded = scene_module.load_scene(self.evidence)
         model = {"links": [{"name": link["name"], "inertial": link["inertial"]} for link in loaded["links"]]}
+        support.write_link_group_mass_record(self.bundle, model, self.source)
         checks = verify_physics(self.evidence, self.source, model)
         return loaded, {check["id"]: check for check in checks}
 

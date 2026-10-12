@@ -453,6 +453,74 @@ def cleanup(path: Path) -> None:
     shutil.rmtree(path, ignore_errors=True)
 
 
+def write_link_group_mass_record(bundle: Path, model: dict, source: dict) -> None:
+    """Synthesize the direct link group record the producer will emit (fixture stand-in).
+
+    The record is derived from the bundle's sealed raw scene plus the model the
+    fixtures just built, so the verifier's direct-readout binding can run before
+    the native producer method lands.
+    """
+
+    import json as _json
+
+    import numpy as _np
+
+    from description_pipeline.sources.solidworks import verify as oracle
+
+    bundle = Path(bundle)
+    evidence = bundle / "evidence"
+    raw = _json.loads((evidence / "raw/scene_raw.json").read_text())
+    masses = _json.loads((evidence / "raw/mass_properties.json").read_text())
+    datums = _json.loads((evidence / "raw/coordinate_systems.json").read_text())
+    declared_path = evidence / "raw/declared_masses.json"
+    declared = (_json.loads(declared_path.read_text()).get("items") or {}) if declared_path.is_file() else {}
+    effective = oracle.effective_math_map(masses, raw)
+    links = {str(link["name"]): link for link in model.get("links", [])}
+    payload = {
+        "schema_version": "solidworks-to-urdf.link-group-mass-properties/v1",
+        "assembly": raw.get("source_document") or raw.get("document"),
+        "configuration": str(source.get("configuration") or "Default"),
+        "used_api": "IMassProperty2 (SelectedItems = component set)",
+        "selection_rule": "top_most_providers+uncovered_leaves",
+        "links": {},
+    }
+    for body in source.get("bodies") or []:
+        name = str(body.get("name"))
+        selection = sorted(
+            str(note["component"])
+            for *_rest, note in oracle._resolved_contributions(body, raw, masses, declared, effective)
+        )
+        mass, com_link, tensor_link = oracle._canonical_in_link_frame(links[name])
+        datum = _np.array(datums[body["frame"]["coordinate_system"]], dtype=float).reshape(4, 4)
+        com_assembly = datum[:3, :3] @ com_link + datum[:3, 3]
+        tensor_assembly = datum[:3, :3] @ tensor_link @ datum[:3, :3].T
+        read = {
+            "mass_kg": float(mass),
+            "volume_m3": 0.001,
+            "density_kg_m3": 1000.0,
+            "com_m": com_assembly.tolist(),
+            "inertia_tensor_about_com": tensor_assembly.tolist(),
+            "inertia_values_about_origin_api": {"error": "fixture"},
+            "overrides": {
+                "OverrideMass": False,
+                "OverrideCenterOfMass": False,
+                "OverrideMomentsOfInertia": False,
+            },
+        }
+        payload["links"][name] = {
+            "selection": selection,
+            "reads": [_json.loads(_json.dumps(read)), _json.loads(_json.dumps(read))],
+            "reproducibility": {
+                "mass_delta_kg": 0.0,
+                "com_delta_norm_m": 0.0,
+                "tensor_delta_max_abs": 0.0,
+            },
+        }
+    (evidence / "raw/link_group_mass_properties.json").write_text(
+        _json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+
+
 def read_scene(snapshot: Path) -> dict:
     """Read the raw scene a snapshot carries (shared loader when available)."""
 

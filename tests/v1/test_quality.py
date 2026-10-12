@@ -155,13 +155,69 @@ class PhysicsTests(unittest.TestCase):
             "leaf_total": world,
             "component_context": context,
         }
+        self.link_direct = self._link_direct_payload()
         self.write()
+
+    def _link_direct_payload(self) -> dict:
+        """The producer-shaped direct link group record this fixture's model stands for."""
+
+        datum = np.array(self.raw["coordinate_systems"]["base_datum"], dtype=float).reshape(4, 4)
+        link = next(item for item in self.model["links"] if item["name"] == "base_link")
+        inertial = link["inertial"]
+        tensor_link = np.array(
+            [
+                [inertial["inertia"][0], inertial["inertia"][1], inertial["inertia"][2]],
+                [inertial["inertia"][1], inertial["inertia"][3], inertial["inertia"][4]],
+                [inertial["inertia"][2], inertial["inertia"][4], inertial["inertia"][5]],
+            ]
+        )
+        com_assembly = datum[:3, :3] @ np.array(inertial["xyz"], dtype=float) + datum[:3, 3]
+        tensor_assembly = datum[:3, :3] @ tensor_link @ datum[:3, :3].T
+        effective = oracle.effective_math_map(self.masses, self.raw)
+        selection = sorted(
+            str(note["component"])
+            for *_rest, note in oracle._resolved_contributions(
+                self.source["bodies"][0], self.raw, self.masses, {}, effective
+            )
+        )
+        read = {
+            "mass_kg": inertial["mass"],
+            "volume_m3": 0.001,
+            "density_kg_m3": 1000.0,
+            "com_m": com_assembly.tolist(),
+            "inertia_tensor_about_com": tensor_assembly.tolist(),
+            "inertia_values_about_origin_api": {"error": "fixture"},
+            "overrides": {
+                "OverrideMass": False,
+                "OverrideCenterOfMass": False,
+                "OverrideMomentsOfInertia": False,
+            },
+        }
+        return {
+            "schema_version": "solidworks-to-urdf.link-group-mass-properties/v1",
+            "assembly": self.captured_identity["assembly"],
+            "configuration": self.source["configuration"],
+            "used_api": "IMassProperty2 (SelectedItems = component set)",
+            "selection_rule": "top_most_providers+uncovered_leaves",
+            "links": {
+                "base_link": {
+                    "selection": selection,
+                    "reads": [copy.deepcopy(read), copy.deepcopy(read)],
+                    "reproducibility": {
+                        "mass_delta_kg": 0.0,
+                        "com_delta_norm_m": 0.0,
+                        "tensor_delta_max_abs": 0.0,
+                    },
+                }
+            },
+        }
 
     def write(self):
         self.raw["mass_properties"] = copy.deepcopy(self.masses)
         write_json(self.root / "raw/scene_raw.json", self.raw)
         write_json(self.root / "raw/mass_properties.json", self.masses)
         write_json(self.root / "raw/coordinate_systems.json", self.raw["coordinate_systems"])
+        write_json(self.root / "raw/link_group_mass_properties.json", self.link_direct)
         write_json(self.root / "raw/declared_masses.json", {"items": {}, "evidence": None})
         native = self._native_closure()
         write_json(self.root / "raw/mass_closure.json", native)
@@ -320,9 +376,10 @@ class PhysicsTests(unittest.TestCase):
         self.closure["top_level"]["com"] = [base_com[0] + 5e-4, base_com[1], base_com[2]]
         self.assertEqual([], self.failures())
         checks = {check["id"]: check for check in verify_physics(self.root, self.source, self.model)}
-        record = checks["physics.closure"]["details"]["reconciliation"]
-        self.assertEqual(record["com_atol_m"], 1e-3)
-        self.assertEqual(record["tensor_rtol"], 1e-2)
+        reconciliation = checks["physics.closure"]["details"]["reconciliation"]
+        self.assertEqual(reconciliation["com_atol_m"], 1e-3)
+        self.assertEqual(reconciliation["tensor_rtol"], 1e-2)
+        record = reconciliation["direct_sum"]
         self.assertAlmostEqual(record["com_delta_m"][0], 5e-4, places=12)
         self.assertAlmostEqual(record["com_delta_m"][1], 0.0, places=15)
         self.assertAlmostEqual(record["com_delta_norm_m"], 5e-4, places=12)
@@ -360,10 +417,58 @@ class PhysicsTests(unittest.TestCase):
         link["inertial"]["xyz"] = original
         self.assertEqual([], self.failures())
 
-    def test_translation_mutation_is_rejected_after_resealing_all_raw_copies(self):
-        self.raw["components"][1]["transform"][3] += 0.01
+    def test_link_direct_record_selection_and_repeatability_are_gated(self):
+        self._record_clean_provenance()
+        self.assertEqual([], self.failures())
+        entry = self.link_direct["links"]["base_link"]
+
+        selection = copy.deepcopy(entry["selection"])
+        entry["selection"] = selection[:-1]
         self.assertIn("physics.link.base_link", self.failures())
-        self.assertIn("physics.closure", self.failures())
+        entry["selection"] = selection
+        self.assertEqual([], self.failures())
+
+        reproducibility = copy.deepcopy(entry["reproducibility"])
+        entry["reproducibility"] = {**reproducibility, "com_delta_norm_m": 0.1}
+        self.assertIn("physics.link.base_link", self.failures())
+        entry["reproducibility"] = reproducibility
+
+        second = copy.deepcopy(entry["reads"][1])
+        second["com_m"] = [second["com_m"][0] + 1e-3, second["com_m"][1], second["com_m"][2]]
+        original_reads = entry["reads"]
+        entry["reads"] = [entry["reads"][0], second]
+        self.assertIn("physics.link.base_link", self.failures())
+        entry["reads"] = original_reads
+        self.assertEqual([], self.failures())
+
+    def test_link_direct_record_is_required_and_schema_bound(self):
+        self._record_clean_provenance()
+        path = self.root / "raw/link_group_mass_properties.json"
+        original = copy.deepcopy(self.link_direct)
+        path.unlink()
+        checks = {check["id"]: check for check in verify_physics(self.root, self.source, self.model)}
+        self.assertFalse(checks["physics.link_direct_record"]["passed"])
+        self.assertFalse(checks["physics.link.base_link"]["passed"])
+        self.assertFalse(checks["physics.closure"]["passed"])
+        self.link_direct["schema_version"] = "solidworks-to-urdf.link-group-mass-properties/v2"
+        self.write()
+        self.assertIn("physics.link_direct_record", self.failures())
+        self.link_direct = original
+        self.write()
+        self.assertEqual([], self.failures())
+
+    def test_component_transform_tamper_keeps_the_direct_binding_and_fails_the_derived_ledger(self):
+        # The direct link read is authoritative: a tampered component placement no
+        # longer moves link inertials.  It stays visible in the non-blocking
+        # partition audit and keeps failing the derived-closure binding.
+        self._record_clean_provenance()
+        self.raw["components"][1]["transform"][3] += 0.01
+        failed = self.failures()
+        self.assertNotIn("physics.link.base_link", failed)
+        self.assertIn("physics.closure", failed)
+        checks = {check["id"]: check for check in verify_physics(self.root, self.source, self.model)}
+        audit = checks["physics.link_partition_audit"]["details"]["links"]["base_link"]
+        self.assertGreater(audit["com_delta_norm_m"], 1e-3)
 
     def test_unknown_or_absent_convention_is_rejected(self):
         self.masses["a"]["reference"].pop("product_convention")
@@ -1086,6 +1191,7 @@ class PhysicsTests(unittest.TestCase):
                 link_tensor[2, 2],
             ],
         }
+        self.link_direct = self._link_direct_payload()
         self._record_clean_provenance()
         record_path = self.root / "raw/effective_instances.json"
         payload = json.loads(record_path.read_text())

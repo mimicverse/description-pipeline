@@ -84,8 +84,8 @@ Implementation paths below are relative to `src/description_pipeline/`.
 | Names and topology | Unique snake_case names; exactly one `base_link`; connected acyclic tree; input/model/XML entity agreement | `verification/solidworks_urdf.py` |
 | Joint semantics | Exact type, parent/child, signed axis and limits; evidence bound to archived inputs | `verification/solidworks_urdf.py` |
 | Physical authority | Native numerical consistency for the recorded CAD values; missing explicit material coverage is warning-level with the measured values preserved and no verified-material claim — real material, density and mass boundaries remain external engineering confirmation; no implicit density or unknown convention is ever evidence | `verification/solidworks_physics.py` |
-| Mass, COM and tensor | Independently rotate/translate raw part readings, apply the parallel-axis theorem and convert to each CAD link datum | `verification/solidworks_physics.py` |
-| Assembly closure | Independent part sum agrees with full whole-assembly mass/COM/tensor and complete component-context readings | `verification/solidworks_physics.py` |
+| Mass, COM and tensor | The native one-shot `IMassProperty2` read over each body's full selected component set is the authoritative link mass source: the verifier recomputes the selection independently and requires it to equal the sealed record, the recorded two-read pair must repeat (≤1e-9 kg, ≤5e-7 m, ≤1e-6 relative), and the model binds to read 1 by the exact assembly→link transform (mass 1e-12 relative, COM 1e-9 m, tensor 1e-9 relative) | `verification/solidworks_physics.py` |
+| Assembly closure | The sum of the direct link reads plus the independently measured unassigned mass is checked against the full whole-assembly mass (exactly, 1e-12 kg) while the COM/tensor gaps to the whole reading are recorded within the evidence-bounded 1e-3 m / 1e-2 relative; the complete component-context readings stay bound and the per-instance recombination remains a non-blocking partition audit | `verification/solidworks_physics.py` |
 | Native mass accounting | Delivered URDF mass plus independently measured, explicitly unassigned CAD mass equals the bound whole-assembly reading; missing evidence or unexplained gaps fail; incomplete whole coverage remains a warning and masses are never normalized | `verification/solidworks_physics.py` |
 | Inertia validity | Finite positive mass; positive principal inertia; triangle inequality; XML full tensor agrees with raw-verified model | `verification/solidworks_urdf.py` |
 | Geometry | Native mesh coverage, SI scale, finite nonempty triangles and CAD placement of actual vertices. Meshes above 199999 triangles use ordered lossless parts; the verifier checks every original triangle record, header, count, pose and scale | `verification/solidworks_urdf.py`, `geometry/stl.py` |
@@ -132,6 +132,14 @@ A flagless leaf instance whose assembly-context measurement differs from its
 part-document measurement is reported the same way, with both measurements kept
 verbatim and the difference recorded as basis `cad_assembly_instance_measurement`
 with an unproven cause — never rescaled, substituted or silently qualified.
+Each body additionally carries the native one-shot direct read over its full
+selected component set (`evidence/raw/link_group_mass_properties.json`): the
+verifier recomputes that selection set independently (top-most override
+providers plus uncovered leaves), the recorded repeat pair is reproducibility
+evidence, and the delivered link inertial is generated from read 1. The
+per-instance recombination is retained as a recorded, non-blocking partition
+gap so the intrinsic difference between CAD's one selection and partitioned
+reads stays visible instead of being hidden by the switch.
 The derived selection accounting is projected as warnings: every unassigned
 occurrence is reported with its native recorded mass, and the native
 whole-vs-selected mass gap is reported as a gap with its qualification withheld
