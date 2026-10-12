@@ -1316,6 +1316,28 @@ class StructuralQualityTests(unittest.TestCase):
             self.assertEqual(report["subject_status"], "unavailable")
             self.assertNotIn(str(root).encode(), canonical(report))
 
+    def test_recomputed_tuple_values_bind_through_the_json_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = {"schema_version": "probe", "checks": [], "passed": True, "value": ("a", 1)}
+            write_json(root / "reports/quality.json", json.loads(json.dumps(report)))
+            with mock.patch.object(quality, "evaluate_bundle", return_value=report):
+                result = quality.check_bundle(root)
+            self.assertNotIn("report.binding", [check["id"] for check in result["checks"]])
+
+    def test_altered_saved_report_still_fails_with_the_same_message(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = {"schema_version": "probe", "checks": [], "passed": True, "value": ("a", 1)}
+            write_json(root / "reports/quality.json", {"schema_version": "probe", "checks": [], "passed": True,
+                                                       "value": ["a", 2]})
+            with mock.patch.object(quality, "evaluate_bundle", return_value=report):
+                result = quality.check_bundle(root)
+            binding = [check for check in result["checks"] if check["id"] == "report.binding"]
+            self.assertEqual(len(binding), 1)
+            self.assertIn("Saved quality report differs from recomputation", binding[0]["details"]["error"])
+            self.assertFalse(result["passed"])
+
 
 class UrdfMassEqualityTests(unittest.TestCase):
     """The delivered URDF must equal the bound whole-CAD mass exactly (atol 1e-12, rtol 0)."""

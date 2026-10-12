@@ -893,7 +893,9 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
             "assembly_mass_kg": top[0],
             "independent_mass_kg": expected[0],
             "reconciliation": reconciliation,
-            "effective_instances": sorted(entries),
+            # JSON model types only: the report schema is a document, and tuple
+            # keys would not survive the saved-report round trip.
+            "effective_instances": [[name, code] for name, code in sorted(entries)],
             "component_context": details,
         }
 

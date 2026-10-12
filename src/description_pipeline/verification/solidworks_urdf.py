@@ -1313,7 +1313,9 @@ def check_bundle(root: Path) -> dict:
     report = evaluate_bundle(root)
     try:
         saved = read_data(confined(Path(root), "reports/quality.json"))
-        _require(saved == report, "Saved quality report differs from recomputation")
+        # The quality report is a JSON document: bind in the JSON data model so a
+        # recomputed tuple cannot make every saved report differ from itself.
+        _require(saved == json.loads(json.dumps(report)), "Saved quality report differs from recomputation")
     except (OSError, ValueError) as error:
         report["checks"].append(
             {"id": "report.binding", "state": "failed", "passed": False, "details": {"error": str(error)}}
