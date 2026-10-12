@@ -29,6 +29,7 @@ REPORT_EVIDENCE_FILES = (
     "evidence/raw/material_provenance.json",
     "evidence/raw/effective_instances.json",
     "evidence/raw/mass_closure.json",
+    "evidence/raw/geometry.json",
     "reports/mass-closure.json",
 )
 
@@ -245,6 +246,84 @@ def _canonical_effective_warnings(value) -> list | None:
     return warnings
 
 
+def _canonical_untessellated_faces(value) -> list | None:
+    """The canonical ``no_facets_faces`` rows of ``raw/geometry.json``, or ``None``.
+
+    The file is a list of per-component entries; each row is returned with its
+    component attached so the warning can name it.  Any schema deviation fails
+    closed, and no area epsilon is applied anywhere.
+    """
+
+    import math
+
+    if not isinstance(value, list):
+        return None
+    pinned_api = "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets"
+    out: list[dict] = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            return None
+        if any(key not in entry for key in ("component", "bodies", "tessellation")):
+            return None
+        component = entry.get("component")
+        bodies = entry.get("bodies")
+        tessellation = entry.get("tessellation")
+        if not isinstance(component, str) or not component.strip():
+            return None
+        if not isinstance(bodies, dict) or not isinstance(tessellation, dict):
+            return None
+        for key in ("solid", "sheet"):
+            count = bodies.get(key)
+            if type(count) is not int or count < 0:
+                return None
+        faces = tessellation.get("faces")
+        if type(faces) is not int or faces < 0:
+            return None
+        rows = tessellation.get("no_facets_faces")
+        if not isinstance(rows, list):
+            return None
+        if faces <= len(rows):
+            return None
+        seen = set()
+        for row in rows:
+            required = {
+                "body_type",
+                "body_index",
+                "face_index",
+                "triangle_count",
+                "facet_count",
+                "area_m2",
+                "tessellate_result",
+                "used_api",
+            }
+            if not isinstance(row, dict) or set(row) != required:
+                return None
+            if row.get("body_type") != 1:
+                return None
+            for key in ("body_index", "face_index"):
+                if type(row.get(key)) is not int or row[key] < 0:
+                    return None
+            if row["body_index"] >= bodies["sheet"]:
+                return None
+            if type(row.get("triangle_count")) is not int or row["triangle_count"] != 0:
+                return None
+            if type(row.get("facet_count")) is not int or row["facet_count"] != 0:
+                return None
+            area = row.get("area_m2")
+            if isinstance(area, bool) or not isinstance(area, (int, float)) or not math.isfinite(area) or area < 0:
+                return None
+            if not isinstance(row.get("tessellate_result"), bool):
+                return None
+            if row.get("used_api") != pinned_api:
+                return None
+            key = (row["body_type"], row["body_index"], row["face_index"])
+            if key in seen:
+                return None
+            seen.add(key)
+            out.append({"component": component, **row})
+    return out
+
+
 def _findings(value, source, *, severity=None):
     if isinstance(value, list):
         for index, entry in enumerate(value):
@@ -324,7 +403,7 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
             }
         )
     for source, value in sources.items():
-        if source in {material_source, effective_source}:
+        if source in {material_source, effective_source, "evidence/raw/geometry.json"}:
             # Projected explicitly below: the raw warning entries carry their own
             # code/message and must not be double-reported by the generic walk.
             continue
@@ -371,6 +450,7 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
             )
     material_required = False
     effective_required = False
+    geometry_required = False
     if evidence_root is not None:
         snapshot_manifest = Path(evidence_root) / "evidence/manifest.json"
         if snapshot_manifest.is_file():
@@ -381,6 +461,7 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
             if isinstance(snapshot, dict) and isinstance(snapshot.get("files"), dict):
                 material_required = "raw/material_provenance.json" in snapshot["files"]
                 effective_required = "raw/effective_instances.json" in snapshot["files"]
+                geometry_required = "raw/geometry.json" in snapshot["files"]
     effective_instances = sources.get(effective_source)
     if isinstance(effective_instances, dict) and effective_instances.get("errors"):
         entries.extend(_findings(effective_instances, effective_source))
@@ -476,6 +557,184 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                         "message": message,
                         "source": "evidence/raw/effective_instances.json/warnings",
                         "evidence": item,
+                    }
+                )
+    geometry_source = "evidence/raw/geometry.json"
+    geometry = sources.get(geometry_source)
+    if isinstance(geometry, dict) and geometry.get("errors"):
+        entries.extend(_findings(geometry, geometry_source))
+        entries.append(
+            {
+                "severity": "blocker",
+                "code": "report.geometry_metadata_invalid",
+                "object": receipt.get("main_assembly"),
+                "message": (
+                    "几何元数据不可读：证据无效，必须由独立检查判为失败。"
+                    "本报告不做面积容差或替代解释。"
+                ),
+                "source": geometry_source,
+                "evidence": {"unreadable": True},
+            }
+        )
+    elif geometry is None:
+        if geometry_required:
+            entries.append(
+                {
+                    "severity": "blocker",
+                    "code": "report.geometry_metadata_missing",
+                    "object": receipt.get("main_assembly"),
+                    "message": (
+                        "快照清单要求几何记录（evidence/raw/geometry.json），但该证据缺失："
+                        "证据无效，必须由独立检查判为失败。本报告不采用默认值或替代解释。"
+                    ),
+                    "source": geometry_source,
+                    "evidence": {"required_by_manifest": True},
+                }
+            )
+    else:
+        untessellated = _canonical_untessellated_faces(geometry)
+        if untessellated is None:
+            entries.append(
+                {
+                    "severity": "blocker",
+                    "code": "report.geometry_metadata_invalid",
+                    "object": receipt.get("main_assembly"),
+                    "message": (
+                        "几何元数据不符合已批准 schema：证据无效，必须由独立检查判为失败。"
+                        "本报告不做面积容差、不做替代解释。"
+                    ),
+                    "source": geometry_source,
+                    "evidence": {
+                        "type": type(geometry).__name__,
+                        "keys": sorted(geometry) if isinstance(geometry, dict) else None,
+                    },
+                }
+            )
+        else:
+            for row in untessellated:
+                entries.append(
+                    {
+                        "severity": "warning",
+                        "code": "cad_sheet_face_untessellated",
+                        "object": f"{row['component']} sheet body {row['body_index']} face {row['face_index']}",
+                        "message": (
+                            f"该曲面（component {row['component']}；body_type 1；body_index {row['body_index']}，"
+                            f"face_index {row['face_index']}）在原生三角剖分中返回 0 个三角形与 0 个面元，"
+                            f"原生面积量测为 {row['area_m2']!r} m²：CAD 未提供该曲面的可导出三角剖分；"
+                            "本报告保留原始事实、不断言零面积；曲面几何的完整性与可用性未经独立确认。"
+                        ),
+                        "source": "evidence/raw/geometry.json/tessellation/no_facets_faces",
+                        "evidence": row,
+                    }
+                )
+    selection_source = "reports/mass-closure.json"
+    selection_report = sources.get(selection_source)
+    selection = None
+    if isinstance(selection_report, dict):
+        derived = selection_report.get("derived")
+        if isinstance(derived, dict):
+            selection = derived.get("selection")
+    if selection is not None:
+        import math as _math
+
+        valid = isinstance(selection, dict) and all(
+            key in selection
+            for key in (
+                "native_mass_kg",
+                "selected_mass_kg",
+                "unassigned_mass_kg",
+                "unassigned",
+                "accounting_delta_kg",
+                "whole_mass_qualified",
+            )
+        )
+        unassigned = selection.get("unassigned") if valid else None
+        if not isinstance(unassigned, list) or not isinstance(selection.get("whole_mass_qualified"), bool):
+            valid = False
+        if valid:
+            for key in ("native_mass_kg", "selected_mass_kg", "unassigned_mass_kg", "accounting_delta_kg"):
+                value = selection.get(key)
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not _math.isfinite(value):
+                    valid = False
+                    break
+        if valid:
+            for row in unassigned:
+                if (
+                    not isinstance(row, dict)
+                    or set(row) != {"component", "document", "configuration", "parent", "mass_kg"}
+                    or not isinstance(row.get("component"), str)
+                    or not row["component"].strip()
+                    or not isinstance(row.get("document"), str)
+                    or not isinstance(row.get("configuration"), str)
+                    or (row.get("parent") is not None and not isinstance(row.get("parent"), str))
+                ):
+                    valid = False
+                    break
+                mass = row.get("mass_kg")
+                if (isinstance(mass, bool) or not isinstance(mass, (int, float))
+                        or not _math.isfinite(mass) or mass <= 0):
+                    valid = False
+                    break
+        if not valid:
+            entries.append(
+                {
+                    "severity": "blocker",
+                    "code": "report.selection_accounting_invalid",
+                    "object": receipt.get("main_assembly"),
+                    "message": (
+                        "选择核算记录不符合已批准 schema：证据无效，必须由独立检查判为失败。"
+                        "本报告不采用默认值、不做替代解释。"
+                    ),
+                    "source": f"{selection_source}/derived/selection",
+                    "evidence": selection,
+                }
+            )
+        else:
+            if abs(selection["accounting_delta_kg"]) > 1e-12:
+                entries.append(
+                    {
+                        "severity": "blocker",
+                        "code": "report.selection_accounting_invalid",
+                        "object": receipt.get("main_assembly"),
+                        "message": (
+                            f"选择核算残留为 {selection['accounting_delta_kg']!r} kg（容差 1e-12 kg）："
+                            "证据无效，必须由独立检查判为失败。"
+                        ),
+                        "source": f"{selection_source}/derived/selection",
+                        "evidence": selection,
+                    }
+                )
+            for row in unassigned:
+                entries.append(
+                    {
+                        "severity": "warning",
+                        "code": "cad_unassigned_occurrence_mass",
+                        "object": row["component"],
+                        "message": (
+                            f"该 CAD 实例未进入所选交付（component {row['component']}；parent {row['parent']}；"
+                            f"document {row['document']}；configuration {row['configuration']}）："
+                            f"质量为原生记录读数 {row['mass_kg']!r} kg；质量归属的工程资格暂未确认"
+                            "（qualification withheld）；本报告不据此声称输入缺失或流水线失败。"
+                        ),
+                        "source": f"{selection_source}/derived/selection/unassigned",
+                        "evidence": row,
+                    }
+                )
+            if unassigned:
+                entries.append(
+                    {
+                        "severity": "warning",
+                        "code": "cad_native_mass_gap_unqualified",
+                        "object": receipt.get("main_assembly"),
+                        "message": (
+                            "原生整体质量与所选交付质量之差为 "
+                            f"{selection['native_mass_kg'] - selection['selected_mass_kg']!r} kg"
+                            f"（native {selection['native_mass_kg']!r} − selected {selection['selected_mass_kg']!r}；"
+                            f"未分配合计 {selection['unassigned_mass_kg']!r} kg，未作归一化）；"
+                            "只要存在未分配实例，整体质量资格即不予确认（qualification withheld）。"
+                        ),
+                        "source": f"{selection_source}/derived/selection",
+                        "evidence": selection,
                     }
                 )
     material_provenance = sources.get(material_source)

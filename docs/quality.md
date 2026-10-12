@@ -132,6 +132,19 @@ A flagless leaf instance whose assembly-context measurement differs from its
 part-document measurement is reported the same way, with both measurements kept
 verbatim and the difference recorded as basis `cad_assembly_instance_measurement`
 with an unproven cause — never rescaled, substituted or silently qualified.
+The derived selection accounting is projected as warnings: every unassigned
+occurrence is reported with its native recorded mass, and the native
+whole-vs-selected mass gap is reported as a gap with its qualification withheld
+— never as missing input bytes or a pipeline failure. An accounting residual
+outside the 1e-12 kg equality tolerance, or an invalid selection record, fails closed.
+A sheet face that the native tessellation returns with zero triangles and zero
+facets while the native record still measures a positive area is reported as the
+non-blocking warning `cad_sheet_face_untessellated` (per component entry,
+naming the component and face), stating the native area measurement as recorded
+and the absence of facets; the report never calls it zero-area, and the
+completeness and usability of the surface geometry remain independently
+unqualified. All other native triangles are retained unchanged; malformed
+geometry metadata fails closed.
 
 Native capture rebuilds the collected read-only assembly in its owned session
 before measurements. This refreshes assembly caches, including mass properties;
