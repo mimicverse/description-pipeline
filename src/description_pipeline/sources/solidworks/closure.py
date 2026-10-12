@@ -171,6 +171,12 @@ def _derive(native: dict, scene_raw: dict, config: dict) -> dict:
         if leaf in covered_effective:
             continue
         payload = mass_properties.get(leaf)
+        contextual = effective_readings.get(leaf)
+        if (
+            isinstance(contextual, dict)
+            and (contextual.get("reference") or {}).get("measurement_basis") == "cad_assembly_instance_measurement"
+        ):
+            payload = contextual
         if not isinstance(payload, dict) or "mass" not in payload:
             continue
         transform = transforms.get(leaf)

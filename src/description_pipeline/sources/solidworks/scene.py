@@ -441,6 +441,12 @@ def build_scene(
                 )
             # This initial scene holds what CAD read. Declared masses are applied later,
             # by load_scene, and only there do they become "used" values.
+            contextual = ((getattr(raw_scene, "notes", None) or {}).get("effective_instances") or {}).get(component)
+            if (
+                isinstance(contextual, dict)
+                and (contextual.get("reference") or {}).get("measurement_basis") == "cad_assembly_instance_measurement"
+            ):
+                payload = contextual
             payload = dict(payload, mass_source="cad")
             readings.append(_PartReading(component, placements[component], payload, link_rotation, link_translation))
         captured_effective = (getattr(raw_scene, "notes", None) or {}).get("effective_instances") or {}
@@ -531,10 +537,16 @@ def build_scene(
                 },
             }
         )
-        if top_most:
-            links[-1]["provenance"]["effective_instances"] = sorted(
-                instance for instance, _local, _reading in top_most
-            )
+        used_context = {
+            component for component in components if component not in covered
+            and ((effective_instances.get(component) or {}).get("reference") or {}).get("measurement_basis")
+            == "cad_assembly_instance_measurement"
+        }
+        effective_names = {instance for instance, _local, _reading in top_most} | used_context
+        if effective_names:
+            links[-1]["provenance"]["effective_instances"] = sorted(effective_names)
+            links[-1]["provenance"]["instance_measurements"] = "raw/effective_instances.json"
+            links[-1]["provenance"]["combination"] = "parallel_axis_from_cad_part_and_instance_readings"
 
     joint_entries = _build_joints(cfg, {link["name"] for link in links}, link_frames)
     frames = _build_frames(cfg, {link["name"] for link in links}, raw_scene, link_frames)

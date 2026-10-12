@@ -338,6 +338,34 @@ class ConfigurationPrimitiveTests(unittest.TestCase):
             _ = document.GetPathName
         self.assertEqual(document.late, ["GetPathName"])
 
+    def test_flagless_instance_difference_retains_both_native_measurements(self):
+        backend, _document, _configuration_view = self._backend()
+        part = {
+            "mass": 1.0, "com": [0.1, 0.2, 0.3],
+            "inertia": [[0.001, 0, 0], [0, 0.001, 0], [0, 0, 0.001]],
+            "reference": {"scope": "part_document", "used_api": "IMassProperty2.GetMomentOfInertia(0)",
+                          "product_convention": "solidworks_standard"},
+        }
+        backend._part_mass_properties = {"arm-1": part}
+        result = backend.assembly_component_mass_properties("C:/captures/robot.SLDASM")
+        self.assertEqual(result["errors"], [])
+        reading = result["instances"][0]["effective"]
+        self.assertEqual(reading["mass"], 1.5)
+        self.assertEqual(reading["part_measurement"]["mass_kg"], 1.0)
+        self.assertEqual(reading["reference"]["measurement_basis"], "cad_assembly_instance_measurement")
+        self.assertFalse(any(reading["reference"]["overrides"].values()))
+        self.assertEqual(backend.effective_instance_readings()["arm-1"], reading)
+        self.assertEqual(part["mass"], 1.0)
+
+    def test_equal_flagless_instance_does_not_create_a_difference_record(self):
+        backend, _document, _configuration_view = self._backend()
+        backend._part_mass_properties = {
+            "arm-1": {"mass": 1.5, "reference": {"scope": "part_document"}}
+        }
+        result = backend.assembly_component_mass_properties("C:/captures/robot.SLDASM")
+        self.assertEqual(result["errors"], [])
+        self.assertNotIn("effective", result["instances"][0])
+
     def test_part_mass_reader_uses_captured_primitives_after_recalculation(self):
         body = object()
         inner = types.SimpleNamespace(

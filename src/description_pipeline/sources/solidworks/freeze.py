@@ -1577,13 +1577,20 @@ def _effective_instance_record(
     for name, reading in sorted(readings_payload.items()):
         reference = dict(reading.get("reference") or {})
         flags = dict(reference.get("overrides") or {})
-        if not any(bool(value) for value in flags.values()):
+        instance_difference = reference.get("measurement_basis") == "cad_assembly_instance_measurement"
+        if not any(bool(value) for value in flags.values()) and not instance_difference:
             continue
         warnings.append(
             {
-                "code": "cad_instance_override_effective",
+                "code": (
+                    "cad_instance_measurement_differs_from_part"
+                    if instance_difference else "cad_instance_override_effective"
+                ),
                 "blocking": False,
                 "message": (
+                    "the native assembly-instance measurement differs from the part-document measurement; "
+                    "the cause is unproven and both are retained"
+                    if instance_difference else
                     "the instance carries CAD-authored mass-property overrides; these are effective CAD values, "
                     "not geometry qualification"
                 ),
@@ -1597,8 +1604,12 @@ def _effective_instance_record(
                 "selected_components": reference.get("selected_components"),
                 "overrides": flags,
                 "qualification": (
+                    "cad_assembly_instance_measurement; cause_of_part_difference_unproven; "
+                    "not geometry-derived, not independently physically qualified"
+                    if instance_difference else
                     "cad_authored_effective_instance; not geometry-derived, not independently physically qualified"
                 ),
+                **({"part_measurement": reading.get("part_measurement")} if instance_difference else {}),
                 "measurement": {
                     "scope": reference.get("scope"),
                     "axes": reference.get("axes"),

@@ -2300,6 +2300,8 @@ class SolidWorksBackend(CadBackend):
         self._source_components.clear()
         self._source_documents.clear()
         self._scene_document_key = None
+        self._part_mass_properties = {}
+        self._effective_instance_readings = {}
         self.save_flags.clear()
         with self._sessions_lock:
             sessions = list(self._sessions.values())
@@ -2617,6 +2619,7 @@ class SolidWorksBackend(CadBackend):
 
         entries: list[dict] = []
         errors: list[dict] = []
+        overridden_ancestors: set[str] = set()
         stack: list[tuple[object, str | None, int]] = [
             (component, None, 0) for component in reversed(list(_method(root, "GetChildren") or ()))
         ]
@@ -2675,7 +2678,19 @@ class SolidWorksBackend(CadBackend):
                     "context_volume_m3": volume if math.isfinite(volume) else None,
                     "overrides": flags,
                 }
-                if any(flags.values()):
+                has_override = any(flags.values())
+                if has_override:
+                    overridden_ancestors.add(name)
+                part_reading = (getattr(self, "_part_mass_properties", None) or {}).get(name)
+                differs_from_part = (
+                    not has_override
+                    and document_type == "part"
+                    and isinstance(part_reading, dict)
+                    and (part_reading.get("reference") or {}).get("scope") == "part_document"
+                    and not any(name.startswith(ancestor + "/") for ancestor in overridden_ancestors)
+                    and not math.isclose(mass, float(part_reading["mass"]), rel_tol=1e-9, abs_tol=1e-12)
+                )
+                if has_override or differs_from_part:
                     # Approved override support: one positively identified
                     # instance, full singleton tensor read from the SAME
                     # selection (no second traversal), cached for the
@@ -2692,6 +2707,11 @@ class SolidWorksBackend(CadBackend):
                         referenced_configuration,
                         flags,
                         document_type,
+                        measurement_basis=(
+                            "cad_assembly_instance_measurement"
+                            if differs_from_part else "cad_authored_effective_instance"
+                        ),
+                        part_reading=part_reading if differs_from_part else None,
                     )
                     entry["effective"] = effective
                     if effective is None:
@@ -3014,6 +3034,9 @@ class SolidWorksBackend(CadBackend):
         referenced,
         flags,
         document_type,
+        *,
+        measurement_basis="cad_authored_effective_instance",
+        part_reading=None,
     ):
         """Full singleton tensor for one already-selected overridden instance.
 
@@ -3048,7 +3071,7 @@ class SolidWorksBackend(CadBackend):
             "assembly_configuration": assembly_configuration,
             "selected_components": [name],
             "effective_instance": True,
-            "measurement_basis": "cad_authored_effective_instance",
+            "measurement_basis": measurement_basis,
             "overrides": dict(flags),
         }
         for key, member in (("volume_m3", "Volume"), ("density_kg_m3", "Density")):
@@ -3058,7 +3081,7 @@ class SolidWorksBackend(CadBackend):
                 continue
             if math.isfinite(value):
                 reference[key] = value
-        return {
+        reading = {
             "role": "parent" if document_type == "assembly" else "leaf",
             "document_type": document_type,
             "mass": float(mass),
@@ -3066,6 +3089,21 @@ class SolidWorksBackend(CadBackend):
             "inertia": [list(map(float, row)) for row in inertia],
             "reference": reference,
         }
+        if part_reading is not None:
+            part_reference = part_reading.get("reference") or {}
+            diagnostic = {
+                "mass_kg": part_reading["mass"],
+                "center_of_mass_m": list(part_reading["com"]),
+                "inertia_kg_m2": [list(row) for row in part_reading["inertia"]],
+                "scope": part_reference.get("scope"),
+                "used_api": part_reference.get("used_api"),
+                "product_convention": part_reference.get("product_convention"),
+            }
+            for key in ("volume_m3", "density_kg_m3"):
+                if key in part_reference:
+                    diagnostic[key] = part_reference[key]
+            reading["part_measurement"] = diagnostic
+        return reading
 
     def effective_instance_readings(self):
         """Cached singleton readings for overridden instances (assembly context)."""
@@ -3359,6 +3397,7 @@ class SolidWorksBackend(CadBackend):
             )
         if progress:
             progress(f"read {len(components)} leaf components; saved CAD sources hashed")
+        self._part_mass_properties = dict(properties)
         return RawScene(doc_path, components, transforms, properties, dict(self.notes))
 
     def _coordinate_system_transform(self, doc, name):
