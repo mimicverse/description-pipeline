@@ -1796,8 +1796,8 @@ class SurfaceOnlyGeometryExemptionTests(unittest.TestCase):
         payload = b"".join(struct.pack("<12fH", 0.0, 0.0, 1.0, *a, *b, *c, 0) for a, b, c in triangles)
         return header + struct.pack("<I", len(triangles)) + payload
 
-    def _geometry_fixture(self, root, *, qualified, collinear):
-        payload = self._stl_bytes(collinear=collinear)
+    def _geometry_fixture(self, root, *, qualified, collinear, raw_payload=None):
+        payload = raw_payload or self._stl_bytes(collinear=collinear)
         (root / "evidence/geometry").mkdir(parents=True, exist_ok=True)
         (root / "meshes/visual").mkdir(parents=True, exist_ok=True)
         (root / "evidence/geometry/0001_mesh.stl").write_bytes(payload)
@@ -1827,7 +1827,7 @@ class SurfaceOnlyGeometryExemptionTests(unittest.TestCase):
             occurrence: {
                 "path": "geometry/0001_mesh.stl",
                 "sha256": digest,
-                "triangles": 2,
+                "triangles": struct.unpack("<I", payload[80:84])[0],
                 "scale": [1, 1, 1],
                 "xyz": [0, 0, 0],
                 "rpy": [0, 0, 0],
@@ -1836,9 +1836,9 @@ class SurfaceOnlyGeometryExemptionTests(unittest.TestCase):
         components = {occurrence: np.identity(4)}
         return node, body, model_link, geometry, components
 
-    def _run_geometry(self, root, *, qualified, collinear):
+    def _run_geometry(self, root, *, qualified, collinear, raw_payload=None):
         node, body, model_link, geometry, components = self._geometry_fixture(
-            root, qualified=qualified, collinear=collinear
+            root, qualified=qualified, collinear=collinear, raw_payload=raw_payload
         )
         return quality._geometry(
             root, body, node, model_link, geometry, components, np.identity(4), np.identity(4), set()
@@ -1853,6 +1853,64 @@ class SurfaceOnlyGeometryExemptionTests(unittest.TestCase):
             with self.assertRaises(PipelineError) as caught:
                 self._run_geometry(Path(tmp), qualified=False, collinear=False)
             self.assertIn("Zero-volume", str(caught.exception))
+
+    def _binary_mesh(self, triangles):
+        header = b"gate mesh".ljust(80, b" ")
+        payload = b"".join(struct.pack("<12fH", 0.0, 0.0, 1.0, *a, *b, *c, 0) for a, b, c in triangles)
+        return header + struct.pack("<I", len(triangles)) + payload
+
+    def _sliver(self, x, y):
+        return ((x, y, 0.0), (x + 1e-7, y, 0.0), (x, y + 1e-7, 0.0))
+
+    def _tetra(self, offset):
+        v0 = (offset, 0.0, 0.0)
+        v1 = (offset + 0.001, 0.0, 0.0)
+        v2 = (offset, 0.001, 0.0)
+        v3 = (offset, 0.0, 0.001)
+        return [(v0, v2, v1), (v0, v1, v3), (v1, v2, v3), (v2, v0, v3)]
+
+    def test_area_based_gate_fails_a_mostly_degenerate_mesh(self):
+        triangles = self._tetra(0.0) + [self._sliver(0.01 + index * 1e-6, 0.02) for index in range(1200)]
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(PipelineError) as caught:
+            self._run_geometry(
+                Path(tmp), qualified=False, collinear=False, raw_payload=self._binary_mesh(triangles)
+            )
+        message = str(caught.exception)
+        self.assertIn("area ratio", message)
+        self.assertIn("count ratio", message)
+        self.assertIn("1.0e-06", message)
+        self.assertIn("1.0e-02", message)
+
+    def test_area_based_gate_passes_many_tiny_slivers_on_a_large_mesh(self):
+        triangles = [face for index in range(750) for face in self._tetra(index * 0.002)]
+        triangles += [self._sliver(2.0 + index * 1e-6, 3.0) for index in range(30)]
+        with tempfile.TemporaryDirectory() as tmp:
+            self._run_geometry(
+                Path(tmp), qualified=False, collinear=False, raw_payload=self._binary_mesh(triangles)
+            )
+
+    def test_stl_degenerate_area_is_accumulated_for_binary_and_ascii(self):
+        from description_pipeline.geometry import stl
+
+        triangles = [
+            ((0.0, 0.0, 0.0), (0.001, 0.0, 0.0), (0.0, 0.001, 0.0)),
+            self._sliver(0.01, 0.01),
+            self._sliver(0.02, 0.02),
+        ]
+        sliver = struct.unpack("<f", struct.pack("<f", 1e-7))[0]
+        valid = struct.unpack("<f", struct.pack("<f", 1e-3))[0]
+        binary = stl.read_bytes(self._binary_mesh(triangles))
+        text = "solid gate\n" + "".join(
+            "facet normal 0 0 1\n" + "".join(f"vertex {v[0]} {v[1]} {v[2]}\n" for v in triangle) + "endfacet\n"
+            for triangle in triangles
+        ) + "endsolid gate\n"
+        ascii_stats = stl.read_bytes(text.encode("ascii"))
+        self.assertEqual(binary.degenerate, 2)
+        self.assertAlmostEqual(binary.degenerate_area, sliver * sliver, places=12)
+        self.assertAlmostEqual(binary.area, 0.5 * valid * valid + sliver * sliver, places=12)
+        self.assertEqual(ascii_stats.degenerate, 2)
+        self.assertAlmostEqual(ascii_stats.degenerate_area, 1e-14, places=12)
+        self.assertAlmostEqual(ascii_stats.area, 5e-7 + 1e-14, places=12)
 
     def test_degenerate_plane_is_still_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

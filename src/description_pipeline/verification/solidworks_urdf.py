@@ -957,7 +957,12 @@ def _geometry(root, body, node, model_link, geometry, components, body_pose, urd
             "Geometry receipt differs from the captured source mesh",
         )
         _require(stats.area > 0, "Empty mesh")
-        _require(stats.degenerate / stats.triangles <= 0.001, "More than 0.1% degenerate triangles")
+        _require(
+            stats.degenerate_area / stats.area <= 1e-6 and stats.degenerate / stats.triangles <= 1e-2,
+            "degenerate triangles exceed the area or count bound "
+            f"(area ratio {stats.degenerate_area / stats.area:.3e}, bound 1.0e-06; "
+            f"count ratio {stats.degenerate / stats.triangles:.3e}, bound 1.0e-02)",
+        )
         chunks = _mesh_chunk_count(stats.triangles)
         group = visuals[cursor : cursor + chunks]
         cursor += chunks

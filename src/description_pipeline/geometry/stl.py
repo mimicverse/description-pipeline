@@ -29,6 +29,7 @@ class MeshStats:
     signed_volume: float  # m³，带符号（负值说明法线整体朝内）
     area: float  # m²
     degenerate: int
+    degenerate_area: float  # m²，退化三角面的面积合计
     binary: bool
     com: tuple[float, float, float]  # 均匀密度质心（网格坐标系）
     second_moment: tuple[float, ...]  # ∫ x xᵀ dV，单位密度，9 个分量
@@ -107,6 +108,7 @@ def _read_binary(data: bytes) -> MeshStats:
     volume = 0.0
     area = 0.0
     degenerate = 0
+    degenerate_area = 0.0
     moment = [0.0] * 9
     centroid = [0.0] * 3
     edges: dict[tuple, int] = {}
@@ -126,7 +128,8 @@ def _read_binary(data: bytes) -> MeshStats:
         _accumulate(corners, signed, moment, centroid, edges)
         if triangle_area <= DEGENERATE_AREA:
             degenerate += 1
-    return _finish(count, low, high, volume, area, degenerate, True, moment, centroid, edges)
+            degenerate_area += triangle_area
+    return _finish(count, low, high, volume, area, degenerate, degenerate_area, True, moment, centroid, edges)
 
 
 def _read_ascii(data: bytes) -> MeshStats:
@@ -138,6 +141,7 @@ def _read_ascii(data: bytes) -> MeshStats:
     volume = 0.0
     area = 0.0
     degenerate = 0
+    degenerate_area = 0.0
     count = 0
     moment = [0.0] * 9
     centroid = [0.0] * 3
@@ -166,10 +170,11 @@ def _read_ascii(data: bytes) -> MeshStats:
                 _accumulate(corners, signed, moment, centroid, edges)
                 if triangle_area <= DEGENERATE_AREA:
                     degenerate += 1
+                    degenerate_area += triangle_area
                 corners = []
     if count == 0 or corners:
         raise StlError("ASCII STL 的顶点数不是 3 的倍数或没有三角面")
-    return _finish(count, low, high, volume, area, degenerate, False, moment, centroid, edges)
+    return _finish(count, low, high, volume, area, degenerate, degenerate_area, False, moment, centroid, edges)
 
 
 def _accumulate(corners, signed: float, moment: list, centroid: list, edges: dict) -> None:
@@ -196,7 +201,7 @@ def _rounded(point):
     return tuple(round(value, 6) for value in point)
 
 
-def _finish(count, low, high, volume, area, degenerate, binary, moment, centroid, edges) -> MeshStats:
+def _finish(count, low, high, volume, area, degenerate, degenerate_area, binary, moment, centroid, edges) -> MeshStats:
     sign = 1.0 if volume >= 0 else -1.0
     magnitude = abs(volume)
     if magnitude > 1.0e-15:
@@ -213,6 +218,7 @@ def _finish(count, low, high, volume, area, degenerate, binary, moment, centroid
         signed_volume=volume,
         area=area,
         degenerate=degenerate,
+        degenerate_area=degenerate_area,
         binary=binary,
         com=com,
         second_moment=tuple(moment),
