@@ -369,7 +369,12 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
         # exact Chinese wording and an exact-shape check, never the raw code text.
         entries = [entry for entry in entries if entry.get("code") != passive_code]
         for entry in passive:
-            detail = entry.get("evidence")
+            record = entry.get("evidence")
+            detail = (
+                record.get("detail")
+                if isinstance(record, dict) and isinstance(record.get("detail"), dict)
+                else record
+            )
             if _valid_passive_completion(detail):
                 entries.append(
                     {
