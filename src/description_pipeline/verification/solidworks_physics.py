@@ -21,6 +21,12 @@ MASS_RTOL = 1e-6
 MASS_CLOSURE_ATOL = 1e-12
 COM_ATOL_M = 5e-5
 TENSOR_RTOL = 1e-4
+INSTANCE_MEASUREMENT_BASIS = "cad_assembly_instance_measurement"
+INSTANCE_MEASUREMENT_CODE = "cad_instance_measurement_differs_from_part"
+INSTANCE_MEASUREMENT_QUALIFICATION = (
+    "cad_assembly_instance_measurement; cause_of_part_difference_unproven; "
+    "not geometry-derived, not independently physically qualified"
+)
 
 
 def _require(passed, message):
@@ -400,13 +406,17 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
             if isinstance(row, dict) and row.get("mode") == "effective_instance"
         }
         overridden = {name for name, row in instances.items() if any((row.get("overrides") or {}).values())}
-        expected = set(leaf_rows) | overridden
-        _require(set(readings) == expected, "Effective readings do not cover exactly the native effective instances")
-        for name in sorted(overridden):
-            row = instances[name]
+        divergent = _instance_measurement_required(masses, instances)
+        expected = set(leaf_rows) | overridden | divergent
+        _require(
+            set(readings) == expected,
+            "Effective instance readings do not cover the native effective instances exactly",
+        )
+        for name in sorted(overridden | divergent):
+            row = instances.get(name) or {}
             _require(
                 isinstance(row.get("effective"), dict) and not row.get("effective_error"),
-                name + ": native overrides carry no usable effective measurement",
+                name + ": native instances carry no usable effective measurement",
             )
             _require(
                 row["effective"] == readings.get(name),
@@ -421,6 +431,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
         expected_pairs = sorted(
             [(name, oracle.EFFECTIVE_CODE_SHEET_ONLY) for name in leaf_rows]
             + [(name, oracle.EFFECTIVE_CODE_INSTANCE) for name in overridden]
+            + [(name, INSTANCE_MEASUREMENT_CODE) for name in divergent]
         )
         core_reference_fields = (
             "scope",
@@ -448,11 +459,22 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
             )
             _require((name, code) not in entries, "Effective instance warning is repeated")
             _require(
-                code in (oracle.EFFECTIVE_CODE_SHEET_ONLY, oracle.EFFECTIVE_CODE_INSTANCE),
+                code
+                in (
+                    oracle.EFFECTIVE_CODE_SHEET_ONLY,
+                    oracle.EFFECTIVE_CODE_INSTANCE,
+                    INSTANCE_MEASUREMENT_CODE,
+                ),
                 name + ": effective warning carries another code",
             )
             _require(entry.get("blocking") is False, name + ": effective warning must be explicitly non-blocking")
-            _require(entry.get("qualification") == qualification, name + ": effective qualification statement changed")
+            expected_qualification = (
+                INSTANCE_MEASUREMENT_QUALIFICATION if code == INSTANCE_MEASUREMENT_CODE else qualification
+            )
+            _require(
+                entry.get("qualification") == expected_qualification,
+                name + ": effective qualification statement changed",
+            )
             reading = readings.get(name)
             _require(isinstance(reading, dict), name + ": effective warning has no sealed reading")
             reference = reading.get("reference")
@@ -464,15 +486,28 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
                 and all(isinstance(value, bool) for value in flags.values()),
                 name + ": effective override flags are malformed",
             )
-            _require(any(flags.values()), name + ": effective reading without an active override")
+            _require(
+                any(flags.values()) or code == INSTANCE_MEASUREMENT_CODE,
+                name + ": effective reading without an active override",
+            )
+            if code == INSTANCE_MEASUREMENT_CODE:
+                _require(
+                    not any(flags.values()),
+                    name + ": instance measurement must carry all-false overrides",
+                )
             _require(
                 flags == (instances.get(name) or {}).get("overrides"),
                 name + ": effective flags differ from the native context",
             )
             _require(entry.get("overrides") == flags, name + ": warning flags differ from the sealed reading")
+            expected_basis = (
+                INSTANCE_MEASUREMENT_BASIS
+                if code == INSTANCE_MEASUREMENT_CODE
+                else "cad_authored_effective_instance"
+            )
             _require(
                 reference.get("effective_instance") is True
-                and reference.get("measurement_basis") == "cad_authored_effective_instance",
+                and reference.get("measurement_basis") == expected_basis,
                 name + ": effective basis marker changed",
             )
             _require(
@@ -519,7 +554,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
                     and entry.get("part_document") == reference.get("part_document"),
                     name + ": override warning part identity differs from the sealed reading",
                 )
-            else:
+            elif code == oracle.EFFECTIVE_CODE_SHEET_ONLY:
                 row = leaf_rows.get(name)
                 _require(isinstance(row, dict), name + ": surface warning has no captured reading row")
                 row_reference = row.get("reference")
@@ -574,6 +609,65 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
                     == row_reference.get("measurement_basis")
                     == "cad_authored_effective_instance",
                     name + ": effective measurement basis changed",
+                )
+            else:
+                _require(name in divergent, name + ": instance measurement outside the divergent set")
+                row = masses.get(name)
+                _require(isinstance(row, dict), name + ": instance measurement has no captured part row")
+                row_reference = row.get("reference")
+                _require(isinstance(row_reference, dict), name + ": part row has no reference block")
+                _require(
+                    reading.get("role") == "leaf" and reading.get("document_type") == "part",
+                    name + ": instance measurement must be a leaf part",
+                )
+                _require(
+                    reference.get("part_document") == row_reference.get("part_document")
+                    and reference.get("configuration") == row_reference.get("configuration"),
+                    name + ": instance measurement part identity differs from the captured row",
+                )
+                oracle._finite_positive(reading.get("mass"), name + " instance mass")
+                oracle._finite_vector(reading.get("com"), name + " instance COM")
+                tensor_value = oracle._raw_tensor(name, reading)
+                eigenvalues = np.linalg.eigvalsh(tensor_value)
+                _require(
+                    np.isfinite(tensor_value).all()
+                    and eigenvalues[0] > 0
+                    and eigenvalues[-1] <= sum(eigenvalues[:2]) + 1e-10 * eigenvalues[-1],
+                    name + ": nonphysical instance tensor",
+                )
+                part = reading.get("part_measurement")
+                _require(isinstance(part, dict), name + ": instance measurement carries no part diagnostic")
+                _require(
+                    part.get("mass_kg") == row.get("mass")
+                    and part.get("center_of_mass_m") == row.get("com")
+                    and part.get("inertia_kg_m2") == row.get("inertia"),
+                    name + ": part diagnostic differs from the captured part row",
+                )
+                _require(
+                    part.get("scope") == "part_document"
+                    and part.get("used_api") == row_reference.get("used_api")
+                    and part.get("product_convention") == "solidworks_standard",
+                    name + ": part diagnostic basis changed",
+                )
+                for field in ("volume_m3", "density_kg_m3"):
+                    if field in part:
+                        _require(
+                            part.get(field) == row_reference.get(field),
+                            name + ": part diagnostic " + field + " differs from the captured row",
+                        )
+                _require(
+                    entry.get("part_measurement") == part,
+                    name + ": warning part diagnostic differs from the sealed reading",
+                )
+                _require(
+                    entry.get("role") == reading.get("role")
+                    and entry.get("document_type") == reading.get("document_type"),
+                    name + ": instance warning role differs from the sealed reading",
+                )
+                _require(
+                    entry.get("configuration") == reference.get("configuration")
+                    and entry.get("part_document") == reference.get("part_document"),
+                    name + ": instance warning part identity differs from the sealed reading",
                 )
             entries[(name, code)] = entry
         _require(
@@ -637,14 +731,25 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
             for row in context["instances"]
             if any((row.get("overrides") or {}).values())
         }
+        instances_by_name = {
+            str(row["name"]): row for row in context["instances"] if isinstance(row, dict)
+        }
+        divergent = sorted(_instance_measurement_required(masses, instances_by_name))
         _require(
-            entry_names == sorted(overridden),
-            "Effective instance record does not cover the native overrides exactly",
+            entry_names == sorted(set(overridden) | set(divergent)),
+            "Effective instance record does not cover the native effective instances exactly",
         )
         for name, row in overridden.items():
             _require(
                 entries[(name, oracle.EFFECTIVE_CODE_INSTANCE)].get("overrides") == row["overrides"],
                 name + ": effective flags differ from the native context",
+            )
+        for name in divergent:
+            _require(
+                entries[(name, INSTANCE_MEASUREMENT_CODE)].get("overrides")
+                == (instances_by_name.get(name) or {}).get("overrides")
+                == {"OverrideMass": False, "OverrideCenterOfMass": False, "OverrideMomentsOfInertia": False},
+                name + ": instance measurement flags differ from the native context",
             )
         derived = report.get("derived") if isinstance(report, dict) else None
         if report is not None:
@@ -783,6 +888,31 @@ def _closure_delta(top_level: dict, leaf_total: dict) -> dict:
     }
 
 
+def _instance_measurement_required(masses: dict, instances: dict) -> set[str]:
+    """Flagless leaf instances whose native singleton mass differs from the part row.
+
+    These are the only occurrences allowed (and required) to carry the
+    cad_assembly_instance_measurement basis; descendants of overridden
+    instances stay diagnostic because the substitution replaces them.
+    """
+
+    overridden = {name for name, row in instances.items() if any((row.get("overrides") or {}).values())}
+    required = set()
+    for name, row in masses.items():
+        if not isinstance(row, dict) or name in overridden or row.get("mode") == "effective_instance":
+            continue
+        if any(name == ancestor or name.startswith(ancestor + "/") for ancestor in overridden):
+            continue
+        context_row = instances.get(name)
+        if not isinstance(context_row, dict) or any((context_row.get("overrides") or {}).values()):
+            continue
+        context_mass = float(context_row.get("context_mass_kg") or 0.0)
+        part_mass = float(row.get("mass") or 0.0)
+        if abs(context_mass - part_mass) > max(1e-12, 1e-9 * max(abs(context_mass), abs(part_mass))):
+            required.add(name)
+    return required
+
+
 def _derive_closure(native: dict, raw_scene: dict, masses: dict, source: dict) -> dict:
     """Rebuild every derived closure finding from the sealed raw facts alone.
 
@@ -804,7 +934,10 @@ def _derive_closure(native: dict, raw_scene: dict, masses: dict, source: dict) -
     effective_total = oracle._raw_world(body, raw_scene, masses, {})
     effective = oracle.effective_math_map(masses, raw_scene)
     parents = sorted(
-        name for name in effective if any(leaf == name or leaf.startswith(name + "/") for leaf in leaves)
+        name
+        for name, value in oracle._notes_effective(raw_scene).items()
+        if str(value.get("document_type") or value.get("role") or "") == "assembly"
+        and any(leaf == name or leaf.startswith(name + "/") for leaf in leaves)
     )
     top_most = [
         name

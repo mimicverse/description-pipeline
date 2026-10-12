@@ -651,7 +651,9 @@ class PhysicsTests(unittest.TestCase):
         self.closure["effective_total"] = {
             key: copy.deepcopy(self.closure["top_level"][key]) for key in ("mass", "com", "inertia")
         }
-        self.closure["effective_total"]["substituted"] = ["a"]
+        # Only assembly-type parents are substitution entries; a leaf effective
+        # row is simply its own authoritative reading.
+        self.closure["effective_total"]["substituted"] = []
         self.write()
         qualification = (
             "cad_authored_effective_instance; not geometry-derived, not independently physically qualified"
@@ -887,6 +889,188 @@ class PhysicsTests(unittest.TestCase):
         self.assertTrue(np.allclose(world["com"], expected_com, atol=1e-12))
         with self.assertRaises(ValueError):
             oracle._raw_world({"id": "x", "components": ["p/a"]}, raw, masses, {})
+
+    def _mark_instance_measurement(self) -> None:
+        """a's part row stays the diagnostic; the assembly singleton is authoritative."""
+
+        grid = np.array(next(r for r in self.raw["components"] if r["name"] == "a")["transform"]).reshape(4, 4)
+        rotation, translation = grid[:3, :3], grid[:3, 3]
+        local_tensor = np.array(self.masses["a"]["inertia"], dtype=float)
+        singleton = {
+            "role": "leaf",
+            "document_type": "part",
+            "mass": 1.5,
+            "com": translation.tolist(),
+            "inertia": (rotation @ local_tensor @ rotation.T).tolist(),
+            "reference": {
+                "used_api": "IMassProperty2.GetMomentOfInertia(0)",
+                "selection_api": "IMassProperty2 (SelectedItems = component instance)",
+                "override_api": "IMassProperty2.GetOverrideOptions (same selection)",
+                "scope": "assembly_component_group",
+                "axes": "assembly_document_axes",
+                "reference_point": "center_of_mass",
+                "product_convention": "solidworks_standard",
+                "use_system_units": True,
+                "effective_instance": True,
+                "measurement_basis": "cad_assembly_instance_measurement",
+                "selected_components": ["a"],
+                "configuration": self.masses["a"]["reference"]["configuration"],
+                "part_document": self.masses["a"]["reference"]["part_document"],
+                "assembly_document": self.raw["document"],
+                "assembly_configuration": "Default",
+                "overrides": {
+                    "OverrideMass": False,
+                    "OverrideCenterOfMass": False,
+                    "OverrideMomentsOfInertia": False,
+                },
+            },
+            "part_measurement": {
+                "mass_kg": self.masses["a"]["mass"],
+                "center_of_mass_m": copy.deepcopy(self.masses["a"]["com"]),
+                "inertia_kg_m2": copy.deepcopy(self.masses["a"]["inertia"]),
+                "scope": "part_document",
+                "used_api": self.masses["a"]["reference"]["used_api"],
+                "product_convention": "solidworks_standard",
+            },
+        }
+        context = self.closure["component_context"]
+        row = next(entry for entry in context["instances"] if entry["name"] == "a")
+        row["context_mass_kg"] = 1.5
+        row["overrides"] = dict(singleton["reference"]["overrides"])
+        row["effective"] = copy.deepcopy(singleton)
+        self.raw.setdefault("notes", {})["effective_instances"] = {"a": copy.deepcopy(singleton)}
+
+        def place(name: str, payload: dict):
+            frame = np.array(next(r for r in self.raw["components"] if r["name"] == name)["transform"]).reshape(4, 4)
+            com = frame[:3, :3] @ np.array(payload["com"], dtype=float) + frame[:3, 3]
+            tensor = frame[:3, :3] @ np.array(payload["inertia"], dtype=float) @ frame[:3, :3].T
+            return float(payload["mass"]), com, tensor
+
+        a_part = (1.5, np.array(singleton["com"], dtype=float), np.array(singleton["inertia"], dtype=float))
+        b_part = place("b", self.masses["b"])
+        total = a_part[0] + b_part[0]
+        com = (a_part[0] * a_part[1] + b_part[0] * b_part[1]) / total
+        inertia = np.zeros((3, 3))
+        for mass, part_com, part_tensor in (a_part, b_part):
+            delta = part_com - com
+            inertia += part_tensor + mass * (float(delta @ delta) * np.eye(3) - np.outer(delta, delta))
+        world = {"mass": total, "com": com.tolist(), "inertia": inertia.tolist()}
+        context["assembly_mass_kg"] = total
+        self.closure["top_level"] = {
+            **copy.deepcopy(world),
+            "reference": copy.deepcopy(self.closure["top_level"]["reference"]),
+        }
+        self.closure["effective_total"] = {**copy.deepcopy(world), "substituted": []}
+        datum = np.array(self.raw["coordinate_systems"]["base_datum"], dtype=float).reshape(4, 4)
+        link_com = datum[:3, :3].T @ (np.array(world["com"]) - datum[:3, 3])
+        link_tensor = datum[:3, :3].T @ np.array(world["inertia"]) @ datum[:3, :3]
+        self.model["links"][0]["inertial"] = {
+            "mass": world["mass"],
+            "xyz": link_com.tolist(),
+            "rpy": [0.0, 0.0, 0.0],
+            "inertia": [
+                link_tensor[0, 0],
+                link_tensor[0, 1],
+                link_tensor[0, 2],
+                link_tensor[1, 1],
+                link_tensor[1, 2],
+                link_tensor[2, 2],
+            ],
+        }
+        self._record_clean_provenance()
+        record_path = self.root / "raw/effective_instances.json"
+        payload = json.loads(record_path.read_text())
+        payload["readings"]["a"] = copy.deepcopy(singleton)
+        payload["warnings"] = [
+            {
+                "code": "cad_instance_measurement_differs_from_part",
+                "blocking": False,
+                "component": "a",
+                "role": "leaf",
+                "document_type": "part",
+                "configuration": singleton["reference"]["configuration"],
+                "part_document": singleton["reference"]["part_document"],
+                "assembly_document": singleton["reference"]["assembly_document"],
+                "assembly_configuration": singleton["reference"]["assembly_configuration"],
+                "selected_components": ["a"],
+                "overrides": dict(singleton["reference"]["overrides"]),
+                "qualification": (
+                    "cad_assembly_instance_measurement; cause_of_part_difference_unproven; "
+                    "not geometry-derived, not independently physically qualified"
+                ),
+                "measurement": {
+                    "scope": singleton["reference"]["scope"],
+                    "axes": singleton["reference"]["axes"],
+                    "used_api": singleton["reference"]["used_api"],
+                    "selection_api": singleton["reference"]["selection_api"],
+                    "override_api": singleton["reference"]["override_api"],
+                    "mass_kg": singleton["mass"],
+                    "center_of_mass_m": copy.deepcopy(singleton["com"]),
+                    "inertia_kg_m2": copy.deepcopy(singleton["inertia"]),
+                    "volume_m3": None,
+                    "density_kg_m3": None,
+                },
+                "part_measurement": copy.deepcopy(singleton["part_measurement"]),
+            }
+        ]
+        write_json(record_path, payload)
+        self.write()
+
+    def test_instance_measurement_is_accepted_and_bound(self):
+        self._mark_instance_measurement()
+        checks = {check["id"]: check for check in verify_physics(self.root, self.source, self.model)}
+        self.assertTrue(checks["physics.effective_instances"]["passed"], checks["physics.effective_instances"])
+        self.assertEqual([], self.failures())
+
+    def test_instance_measurement_evidence_is_required_and_bound(self):
+        def load() -> dict:
+            return json.loads((self.root / "raw/effective_instances.json").read_text())
+
+        def store(payload: dict) -> None:
+            write_json(self.root / "raw/effective_instances.json", payload)
+
+        def removed_entry() -> None:
+            payload = load()
+            payload["readings"].pop("a")
+            payload["warnings"] = []
+            store(payload)
+            self.raw["notes"]["effective_instances"] = {}
+            self.write()
+
+        def active_flag() -> None:
+            payload = load()
+            payload["readings"]["a"]["reference"]["overrides"]["OverrideMass"] = True
+            payload["warnings"][0]["overrides"]["OverrideMass"] = True
+            store(payload)
+
+        def wrong_basis() -> None:
+            payload = load()
+            payload["readings"]["a"]["reference"]["measurement_basis"] = "cad_authored_effective_instance"
+            store(payload)
+
+        def changed_part_diagnostic() -> None:
+            payload = load()
+            payload["readings"]["a"]["part_measurement"]["mass_kg"] = 1.2
+            store(payload)
+
+        def negative_tensor() -> None:
+            payload = load()
+            payload["readings"]["a"]["inertia"][0][0] = -0.002
+            payload["warnings"][0]["measurement"]["inertia_kg_m2"][0][0] = -0.002
+            store(payload)
+
+        for label, mutate in (
+            ("removed_entry", removed_entry),
+            ("active_flag", active_flag),
+            ("wrong_basis", wrong_basis),
+            ("changed_part_diagnostic", changed_part_diagnostic),
+            ("negative_tensor", negative_tensor),
+        ):
+            with self.subTest(case=label):
+                self.setUp()
+                self._mark_instance_measurement()
+                mutate()
+                self.assertIn("physics.effective_instances", self.failures())
 
     def test_unknown_unverified_reasons_are_not_warnable(self):
         def unknown_reason() -> None:
