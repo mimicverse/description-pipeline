@@ -12,6 +12,8 @@ from __future__ import annotations
 import types
 import unittest
 
+import numpy as np
+
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
 from description_pipeline.sources.solidworks.freeze import _effective_instance_record  # noqa: E402
@@ -23,6 +25,10 @@ from description_pipeline.sources.solidworks.scene import (  # noqa: E402
 
 IDENTITY = identity_matrix()
 DATUM_ROW = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+# A rotated, translated link datum (row-major placement): R = [[0,0,1],[-1,0,0],[0,-1,0]].
+DATUM_TILTED = [0.0, 0.0, 1.0, 0.5, -1.0, 0.0, 0.0, -0.25, 0.0, -1.0, 0.0, 0.1, 0.0, 0.0, 0.0, 1.0]
+TILTED_ROTATION = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]])
+TILTED_ORIGIN = np.array([0.5, -0.25, 0.1])
 DEV = "board-1/Dev_Board-1"
 EASYEDA = "board-1/EasyEDA PCB Model~Nz70-1"
 
@@ -136,6 +142,82 @@ class EffectiveInstanceSceneTests(unittest.TestCase):
         # Every child stays in the evidence (visuals) even when its mass is
         # replaced wholesale by the parent reading.
         self.assertEqual(sorted(link["provenance"]["source_entities"]), sorted([DEV, EASYEDA]))
+
+    def test_parent_substitution_is_mapped_into_a_rotated_link_frame(self):
+        parent = _effective_reading(
+            0.0632, (0.031, -0.209, 0.044), role="parent", document_type="assembly", name="board-1"
+        )
+        cfg = self._cfg()
+        cfg["bodies"][0]["frame"]["coordinate_system"] = "tilted_datum"
+        scene_raw = self._scene({"effective_instances": {"board-1": parent}})
+        scene_raw.coordinate_systems["tilted_datum"] = DATUM_TILTED
+        link = build_scene(cfg, scene_raw, [])["links"][0]
+        expected_com = TILTED_ROTATION.T @ (np.array([0.031, -0.209, 0.044]) - TILTED_ORIGIN)
+        expected_tensor = TILTED_ROTATION.T @ np.array(
+            [[2e-6, 1e-8, 0.0], [1e-8, 2.5e-6, 0.0], [0.0, 0.0, 4e-6]]
+        ) @ TILTED_ROTATION
+        self.assertAlmostEqual(link["inertial"]["mass"], 0.0632, places=12)
+        for actual, want in zip(link["inertial"]["xyz"], expected_com):
+            self.assertAlmostEqual(actual, want, places=12)
+        inertia = link["inertial"]["inertia"]
+        actual_tensor = np.array(
+            [
+                [inertia[0], inertia[1], inertia[2]],
+                [inertia[1], inertia[3], inertia[4]],
+                [inertia[2], inertia[4], inertia[5]],
+            ]
+        )
+        self.assertTrue(np.allclose(actual_tensor, expected_tensor, rtol=0, atol=1e-15), actual_tensor)
+
+    def test_parent_substitution_combines_with_a_remaining_leaf_in_link_frame(self):
+        spare = "spare-1"
+        parent = _effective_reading(
+            0.0632, (0.031, -0.209, 0.044), role="parent", document_type="assembly", name="board-1"
+        )
+        dev_payload = _part_payload(0.035, (0.001, 0.0, 0.0))
+        easyeda_payload = _effective_reading(0.026, (0.002, 0.0, 0.0), role="leaf", document_type="part", name=EASYEDA)
+        spare_payload = _part_payload(0.02, (0.05, 0.0, 0.0))
+        scene_raw = types.SimpleNamespace(
+            components=[
+                _leaf(DEV, _placement((0.0, 0.0, 0.0)), dev_payload),
+                _leaf(EASYEDA, _placement((0.0, 0.01, 0.0)), easyeda_payload),
+                _leaf(spare, _placement((0.2, 0.0, 0.0)), spare_payload),
+            ],
+            coordinate_systems={"tilted_datum": DATUM_TILTED},
+            mass_properties={DEV: dev_payload, EASYEDA: easyeda_payload, spare: spare_payload},
+            notes={"effective_instances": {"board-1": parent}},
+        )
+        cfg = {
+            "bodies": [
+                {
+                    "id": "base",
+                    "name": "base_link",
+                    "components": [DEV, EASYEDA, spare],
+                    "frame": {"coordinate_system": "tilted_datum"},
+                }
+            ],
+            "joints": [],
+        }
+        link = build_scene(cfg, scene_raw, [])["links"][0]
+        parent_com = TILTED_ROTATION.T @ (np.array([0.031, -0.209, 0.044]) - TILTED_ORIGIN)
+        spare_com = TILTED_ROTATION.T @ (np.array([0.05, 0.0, 0.0]) + np.array([0.2, 0.0, 0.0]) - TILTED_ORIGIN)
+        expected = (0.0632 * parent_com + 0.02 * spare_com) / (0.0632 + 0.02)
+        self.assertAlmostEqual(link["inertial"]["mass"], 0.0832, places=12)
+        for actual, want in zip(link["inertial"]["xyz"], expected):
+            self.assertAlmostEqual(actual, want, places=12)
+
+    def test_no_substitution_keeps_the_leaf_frame_pipeline_unchanged(self):
+        cfg = self._cfg()
+        cfg["bodies"][0]["frame"]["coordinate_system"] = "tilted_datum"
+        scene_raw = self._scene({})
+        scene_raw.coordinate_systems["tilted_datum"] = DATUM_TILTED
+        link = build_scene(cfg, scene_raw, [])["links"][0]
+        dev_link = TILTED_ROTATION.T @ (np.array([0.001, 0.0, 0.0]) - TILTED_ORIGIN)
+        easyeda_link = TILTED_ROTATION.T @ (np.array([0.002, 0.0, 0.0]) - TILTED_ORIGIN)
+        expected = (0.035 * dev_link + 0.026 * easyeda_link) / 0.061
+        self.assertAlmostEqual(link["inertial"]["mass"], 0.061, places=12)
+        for actual, want in zip(link["inertial"]["xyz"], expected):
+            self.assertAlmostEqual(actual, want, places=12)
 
     def test_build_scene_without_notes_combines_the_leaf_readings(self):
         scene = build_scene(self._cfg(), self._scene({}), [])

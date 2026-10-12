@@ -42,6 +42,15 @@ def identity_matrix() -> Matrix3:
     return ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
 
 
+#: Row-major identity placement for readings already expressed in assembly axes.
+IDENTITY_PLACEMENT = (
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0,
+    0.0, 0.0, 0.0, 1.0,
+)
+
+
 def _transpose(matrix: Matrix3) -> Matrix3:
     return tuple(tuple(matrix[j][i] for j in range(3)) for i in range(3))  # type: ignore[return-value]
 
@@ -481,15 +490,17 @@ def build_scene(
         ]
         covered: set[str] = set()
         entries = []
-        for _instance, local, reading in top_most:
+        for instance, local, reading in top_most:
             covered |= local
-            entries.append(
-                {
-                    "mass": float(reading["mass"]),
-                    "com": [float(value) for value in reading["com"]],
-                    "inertia": [[float(value) for value in row] for row in reading["inertia"]],
-                }
+            # The shallowest overridden ancestor is recorded in assembly document
+            # axes (scope assembly_component_group), so it must enter the link
+            # frame exactly like a leaf reading: with an identity placement. Using
+            # the component's own transform here would map assembly coordinates a
+            # second time and displace the delivered COM of every rotating link.
+            substituted = _PartReading(
+                str(instance), IDENTITY_PLACEMENT, reading, link_rotation, link_translation
             )
+            entries.append(substituted.mass_entry())
         entries.extend(reading.mass_entry() for reading in readings if reading.name not in covered)
         combined = combine_mass_properties(entries)
         visuals = []
