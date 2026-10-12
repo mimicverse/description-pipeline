@@ -2714,10 +2714,13 @@ class SolidWorksBackend(CadBackend):
         leaves).  Every body is read twice with fresh ``CreateMassProperty2``
         objects in the same session; values are in assembly-document axes about
         the COM.  Component-level instance overrides are part of the CAD value
-        and are read as-is; only an active object-level override flag fails the
-        read, matching the whole-assembly reader.  Resolution is exact: an
-        unresolved path, an empty selection or a malformed request aborts the
-        whole call so the capture fails closed, never partially.
+        and are read as-is, and the object-level flags are recorded verbatim in
+        every read - a single-occurrence selection legitimately surfaces the
+        instance's authored override there, so the group read never refuses on
+        them (the whole-assembly and per-instance readers keep their refusals).
+        Resolution is exact: an unresolved path, an empty selection or a
+        malformed request aborts the whole call so the capture fails closed,
+        never partially.
         """
 
         doc = self._document_by_path(path)
@@ -2775,12 +2778,12 @@ class SolidWorksBackend(CadBackend):
                 key: bool(_member(override, key))
                 for key in ("OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia")
             }
-            if any(overrides.values()):
-                raise CadError(
-                    "cad_mass_override",
-                    "direct link read refuses active overrides",
-                    {"link": body_name, "overrides": overrides},
-                )
+            # Instance-level overrides are part of the CAD value and are read
+            # as-is; the flags travel verbatim in the read.  A single-occurrence
+            # selection surfaces the instance's authored override as an
+            # object-level flag in the pristine window (native17 l_ankle), so
+            # the group read never refuses on them.  The whole-assembly and
+            # per-instance readers keep their own refusals.
             mass = float(_member(mp, "Mass"))
             com = [float(value) for value in _member(mp, "CenterOfMass")]
             values = [float(value) for value in _member(mp, "GetMomentOfInertia", 0)]

@@ -441,6 +441,34 @@ class PhysicsTests(unittest.TestCase):
         entry["reads"] = original_reads
         self.assertEqual([], self.failures())
 
+    def test_link_direct_record_records_active_object_overrides_instead_of_refusing(self):
+        self._record_clean_provenance()
+        self.assertEqual([], self.failures())
+        entry = self.link_direct["links"]["base_link"]
+
+        # A single-occurrence selection surfaces the instance's authored override
+        # as an object-level flag in the pristine reopened window; the verifier
+        # records it beside the passing link check instead of refusing the read.
+        active = {"OverrideMass": True, "OverrideCenterOfMass": False, "OverrideMomentsOfInertia": False}
+        for read in entry["reads"]:
+            read["overrides"] = dict(active)
+        self.write()
+        checks = {check["id"]: check for check in verify_physics(self.root, self.source, self.model)}
+        self.assertTrue(checks["physics.link_direct_record"]["passed"])
+        self.assertTrue(checks["physics.link.base_link"]["passed"])
+        details = checks["physics.link.base_link"]["details"]
+        self.assertEqual(
+            details["object_overrides"],
+            [{"read": 0, "active": ["OverrideMass"]}, {"read": 1, "active": ["OverrideMass"]}],
+        )
+        self.assertIn("recorded verbatim", details["object_overrides_note"])
+        self.assertEqual([], self.failures())
+
+        # The evidence stays fail-closed on malformed flags: a non-boolean value
+        # is not tolerated, even though active booleans now are.
+        entry["reads"][0]["overrides"]["OverrideMass"] = "true"
+        self.assertIn("physics.link.base_link", self.failures())
+
     def test_link_direct_record_is_required_and_schema_bound(self):
         self._record_clean_provenance()
         path = self.root / "raw/link_group_mass_properties.json"

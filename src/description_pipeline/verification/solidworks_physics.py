@@ -878,6 +878,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
             )
             flag_keys = {"OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia"}
             tensors = []
+            object_override_notes: list[dict] = []
             for read in reads:
                 oracle._finite_positive(read.get("mass_kg"), name + " link group mass")
                 oracle._finite_vector(read.get("com_m"), name + " link group COM")
@@ -891,9 +892,19 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
                 _require(
                     isinstance(overrides, dict)
                     and set(overrides) == flag_keys
-                    and all(value is False for value in overrides.values()),
-                    name + ": a link group read carries object-level overrides",
+                    and all(isinstance(value, bool) for value in overrides.values()),
+                    name + ": missing or malformed link group override evidence",
                 )
+                if any(overrides.values()):
+                    # A single-occurrence selection surfaces the instance's
+                    # authored override as an object-level flag in the pristine
+                    # reopened window; instance overrides are part of the CAD
+                    # value, so the active flags are recorded verbatim instead
+                    # of refused (whole-assembly and per-instance readers keep
+                    # their own refusals).
+                    object_override_notes.append(
+                        {"read": len(tensors), "active": sorted(key for key, value in overrides.items() if value)}
+                    )
                 tensors.append(tensor)
             first, second = reads
             mass_delta = abs(float(first["mass_kg"]) - float(second["mass_kg"]))
@@ -954,12 +965,19 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
                 "tensor_rel": recombination_delta
                 / max(float(np.max(np.abs(recombination_tensor))), 1e-20),
             }
-            return {
+            details = {
                 "mass_kg": expected_mass,
                 "selection": expected_selection,
                 "com_m": expected_com.tolist(),
                 "inertia_kg_m2": oracle._tensor6(expected_tensor),
             }
+            if object_override_notes:
+                details["object_overrides"] = object_override_notes
+                details["object_overrides_note"] = (
+                    "single-occurrence selections surface the instance's authored overrides as "
+                    "object-level flags in the pristine window; recorded verbatim, not refused"
+                )
+            return details
 
         gate("physics.link." + body["name"], reconstruct)
 

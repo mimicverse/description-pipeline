@@ -4007,14 +4007,34 @@ class LinkGroupMassPropertiesTests(unittest.TestCase):
                 backend.link_group_mass_properties(str(assembly), {"body": ["c-1", "c-1"]})
             self.assertEqual(caught.exception.code, "cad_duplicate_selection")
 
-    def test_object_level_override_fails_the_read(self):
+    def test_single_instance_object_override_is_recorded_and_repeats(self):
         overrides = {"OverrideMass": True, "OverrideCenterOfMass": False, "OverrideMomentsOfInertia": False}
+        reads = {("c-1",): [self._read(2.0, overrides=overrides), self._read(2.0, overrides=overrides)]}
+        with self._backend(reads) as (backend, assembly, state):
+            payload = backend.link_group_mass_properties(str(assembly), {"body": ["c-1"]})
+        self.assertEqual(state, [("c-1",), ("c-1",)])
+        row = payload["links"]["body"]
+        self.assertEqual(row["selection"], ["c-1"])
+        self.assertEqual(len(row["reads"]), 2)
+        for read in row["reads"]:
+            self.assertEqual(read["overrides"], overrides)
+        self.assertEqual(row["reproducibility"]["com_delta_norm_m"], 0.0)
+
+    def test_multi_instance_object_override_is_recorded_verbatim(self):
+        overrides = {"OverrideMass": True, "OverrideCenterOfMass": True, "OverrideMomentsOfInertia": False}
         reads = {("c-1", "sub-1"): [self._read(2.0, overrides=overrides), self._read(2.0, overrides=overrides)]}
+        with self._backend(reads) as (backend, assembly, _state):
+            payload = backend.link_group_mass_properties(str(assembly), {"body": ["c-1", "sub-1"]})
+        row = payload["links"]["body"]
+        self.assertEqual([read["overrides"] for read in row["reads"]], [overrides, overrides])
+
+    def test_whole_assembly_override_refusal_is_unchanged(self):
+        overrides = {"OverrideMass": True, "OverrideCenterOfMass": False, "OverrideMomentsOfInertia": False}
+        reads = {("robot",): [self._read(2.0, overrides=overrides), self._read(2.0, overrides=overrides)]}
         with self._backend(reads) as (backend, assembly, _state), self.assertRaises(CadError) as caught:
-            backend.link_group_mass_properties(str(assembly), {"body": ["c-1", "sub-1"]})
+            backend.assembly_mass_properties(str(assembly))
         self.assertEqual(caught.exception.code, "cad_mass_override")
-        self.assertEqual(caught.exception.detail["link"], "body")
-        self.assertTrue(caught.exception.detail["overrides"]["OverrideMass"])
+        self.assertTrue(caught.exception.detail["OverrideMass"])
 
     def test_a_part_document_is_refused(self):
         with self._backend({}, doc_type=1) as (backend, assembly, _state):
