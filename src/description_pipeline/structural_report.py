@@ -10,7 +10,7 @@ import json
 import re
 from pathlib import Path
 
-from .io import file_digest, read_data, write_json
+from .io import PipelineError, file_digest, read_data, write_json
 
 REPORT_SCHEMA = "solidworks-to-urdf.structural-report/v1"
 MARKDOWN_PATH = "reports/structural-team.md"
@@ -47,18 +47,17 @@ def sealable_diagnostic_files(evidence_root: Path | None) -> list[str]:
     return sorted(diagnostic_file_sources(evidence_root))
 
 
-#: A partial capture keeps its copies under this prefix, preserving either the
-#: full delivery-relative name or the name without the leading ``evidence/``.
-PARTIAL_PREFIX = "partial"
-
-
-def diagnostic_file_sources(evidence_root: Path | None) -> dict[str, str]:
+def diagnostic_file_sources(evidence_root: Path | None, *, failure_roots: tuple[str, ...] = ()) -> dict[str, str]:
     """Canonical sealed-diagnostic names mapped to existing sources, delivery-relative.
 
+    Candidates are the canonical delivery name and, for a retained partial
+    failure, ``<gated failure root>/partial/<name without the evidence/ prefix>``
+    where the failure roots come from the owned failure receipt path.  Nothing is
+    discovered recursively; a top-level ``partial/`` copy is never guessed at.
     The bundle layout, allowlist and hashes always use the canonical names, so a
-    file recovered from ``partial/`` renders exactly like a complete one; which
-    sources came from partial storage stays visible in the manifest instead of
-    being presented as a complete capture.
+    file recovered from a partial tree renders exactly like a complete one, and
+    the manifest keeps the partial provenance visible.  If more than one gated
+    root offers the same file the read fails instead of choosing arbitrarily.
     """
 
     if evidence_root is None:
@@ -66,13 +65,19 @@ def diagnostic_file_sources(evidence_root: Path | None) -> dict[str, str]:
     root = Path(evidence_root)
     sources: dict[str, str] = {}
     for name in SEALED_DIAGNOSTIC_FILES:
-        short = name[len("evidence/") :] if name.startswith("evidence/") else None
-        candidates = [name]
-        candidates.extend(f"{PARTIAL_PREFIX}/{candidate}" for candidate in (name, short) if candidate)
-        for candidate in candidates:
-            if (root / candidate).is_file():
-                sources[name] = candidate
-                break
+        if (root / name).is_file():
+            sources[name] = name
+            continue
+        short = name[len("evidence/") :] if name.startswith("evidence/") else name
+        matches = [
+            f"{failure_root}/partial/{short}"
+            for failure_root in failure_roots
+            if (root / failure_root / "partial" / short).is_file()
+        ]
+        if len(matches) > 1:
+            raise PipelineError(f"Conflicting partial evidence for {name!r}: {matches}")
+        if matches:
+            sources[name] = matches[0]
     urdf = root / "urdf"
     if urdf.is_dir():
         for path in sorted(urdf.rglob("*.urdf")):

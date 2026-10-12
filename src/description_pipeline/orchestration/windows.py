@@ -305,9 +305,18 @@ class Jobs:
         staged.pop("failure_diagnostics", None)
         write_json(receipt, staged)
         evidence = self._delivery_dir(job)
+        partial_roots: tuple[str, ...] = ()
+        if evidence is not None:
+            # Gated to the immediate owned failure receipt directories; no
+            # recursive discovery, so an unexpected layout can never be guessed at.
+            partial_roots = tuple(
+                child.name
+                for child in sorted(Path(evidence).iterdir())
+                if child.is_dir() and re.fullmatch(r"evidence\.failed-\d{3}", child.name)
+            )
         files: dict[str, str] = {}
         partial_names: list[str] = []
-        for name, relative in diagnostic_file_sources(evidence).items():
+        for name, relative in diagnostic_file_sources(evidence, failure_roots=partial_roots).items():
             source = confined(Path(evidence), relative)
             if relative != name:
                 partial_names.append(name)
