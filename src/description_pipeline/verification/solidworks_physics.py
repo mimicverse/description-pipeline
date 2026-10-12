@@ -401,6 +401,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
         }
         overridden = {name for name, row in instances.items() if any((row.get("overrides") or {}).values())}
         expected = set(leaf_rows) | overridden
+        _require(set(readings) == expected, "Effective readings do not cover exactly the native effective instances")
         for name in sorted(overridden):
             row = instances[name]
             _require(
@@ -928,7 +929,7 @@ def _compare_derived(recorded, mine, label: str, _require) -> None:
         elif right and all(isinstance(item, dict) and "name" in item for item in right):
             left = sorted(left, key=lambda item: item.get("name"))
             right = sorted(right, key=lambda item: item.get("name"))
-        for index, (recorded_item, mine_item) in enumerate(zip(left, right)):
+        for index, (recorded_item, mine_item) in enumerate(zip(left, right, strict=True)):
             _compare_derived(recorded_item, mine_item, f"{label}[{index}]", _require)
         return
     if isinstance(mine, bool) or mine is None or isinstance(mine, str):

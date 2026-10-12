@@ -224,7 +224,9 @@ class DeriveMassClosureTests(unittest.TestCase):
                                     0.0632, (0.0015, 0.0, 0.0), role="parent", document_type="assembly", name="board-1"
                                 ),
                             ),
-                            _instance(DEV, depth=1, parent="board-1", document_type="part", mass=0.035, overrides=_flags()),
+                            _instance(
+                                DEV, depth=1, parent="board-1", document_type="part", mass=0.035, overrides=_flags()
+                            ),
                             _instance(
                                 EASYEDA, depth=1, parent="board-1", document_type="part", mass=0.026,
                                 overrides=_flags(OverrideMass=True),

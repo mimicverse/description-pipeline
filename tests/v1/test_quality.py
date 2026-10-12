@@ -821,6 +821,12 @@ class PhysicsTests(unittest.TestCase):
             self.masses["a"]["reference"]["assembly_document"] = "C:\\elsewhere.SLDASM"
             self._write_effective()
 
+        def unrelated_effective_reading() -> None:
+            payload = load()
+            payload["readings"]["unrelated"] = copy.deepcopy(payload["readings"]["a"])
+            self.raw["notes"]["effective_instances"] = copy.deepcopy(payload["readings"])
+            store(payload)
+
         for label, mutate in (
             ("removed_record", removed_record),
             ("changed_flags", changed_flags),
@@ -830,6 +836,7 @@ class PhysicsTests(unittest.TestCase):
             ("inactive_overrides", inactive_overrides),
             ("duplicated_selection", duplicated_selection),
             ("changed_assembly_identity", changed_assembly_identity),
+            ("unrelated_effective_reading", unrelated_effective_reading),
         ):
             with self.subTest(case=label):
                 self.setUp()
@@ -845,7 +852,6 @@ class PhysicsTests(unittest.TestCase):
             return matrix.ravel().tolist()
 
         parent_rotation = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
-        parent = transform(parent_rotation, [-1.025, -1.066, -0.988])
         child_a = transform(parent_rotation, [-0.925, -1.166, -0.888])
         child_b = transform(parent_rotation, [-1.125, -0.966, -1.088])
         leaf_q = transform(np.eye(3), [0.5, -0.25, 0.75])

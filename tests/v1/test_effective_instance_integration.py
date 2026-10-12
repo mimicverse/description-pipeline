@@ -428,7 +428,7 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
         failed = [name for name, check in checks.items() if not check["passed"]]
         self.assertEqual(failed, [], checks)
         link = next(link for link in loaded["links"] if link["name"] == "base_link")
-        mass, com, inertia = self._expected_total()
+        mass, com, _inertia = self._expected_total()
         self.assertAlmostEqual(link["inertial"]["mass"], mass, places=12)
         self.assertAlmostEqual(self.report["derived"]["effective_total"]["mass"], mass, places=12)
         self.assertTrue(np.allclose(link["inertial"]["xyz"], com, atol=1e-12))

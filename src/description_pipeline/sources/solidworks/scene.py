@@ -443,9 +443,10 @@ def build_scene(
             # by load_scene, and only there do they become "used" values.
             payload = dict(payload, mass_source="cad")
             readings.append(_PartReading(component, placements[component], payload, link_rotation, link_translation))
+        captured_effective = (getattr(raw_scene, "notes", None) or {}).get("effective_instances") or {}
         effective_instances = {
             str(instance): dict(reading)
-            for instance, reading in ((getattr(raw_scene, "notes", None) or {}).get("effective_instances") or {}).items()
+            for instance, reading in captured_effective.items()
             if isinstance(reading, dict)
         }
         all_leaves = {str(component.name) for component in (raw_scene.components or [])}
@@ -474,7 +475,7 @@ def build_scene(
         ]
         covered: set[str] = set()
         entries = []
-        for instance, local, reading in top_most:
+        for _instance, local, reading in top_most:
             covered |= local
             entries.append(
                 {

@@ -158,7 +158,7 @@ def _derive(native: dict, scene_raw: dict, config: dict) -> dict:
     ]
     effective_entries: list[dict] = []
     covered_effective: set[str] = set()
-    for name, descendants, value in top_most:
+    for _name, descendants, value in top_most:
         covered_effective |= descendants
         effective_entries.append(
             {
