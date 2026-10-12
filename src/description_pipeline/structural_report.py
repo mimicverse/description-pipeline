@@ -158,9 +158,25 @@ def _canonical_material_warnings(value) -> list | None:
 #: every capture under ``evidence/raw/effective_instances.json``, bound by the manifest.
 _EFFECTIVE_SCHEMA = "solidworks-to-urdf.effective-instances/v1"
 _EFFECTIVE_TOP_KEYS = ("schema_version", "assembly", "configuration", "readings", "warnings")
-_EFFECTIVE_CODES = ("cad_instance_override_effective", "cad_surface_only_effective_instance")
+_EFFECTIVE_CODES = (
+    "cad_instance_override_effective",
+    "cad_surface_only_effective_instance",
+    "cad_instance_measurement_differs_from_part",
+)
 _EFFECTIVE_QUALIFICATION = (
     "cad_authored_effective_instance; not geometry-derived, not independently physically qualified"
+)
+_INSTANCE_DIFFERENCE_QUALIFICATION = (
+    "cad_assembly_instance_measurement; cause_of_part_difference_unproven; "
+    "not geometry-derived, not independently physically qualified"
+)
+_PART_MEASUREMENT_KEYS = (
+    "mass_kg",
+    "center_of_mass_m",
+    "inertia_kg_m2",
+    "scope",
+    "used_api",
+    "product_convention",
 )
 
 
@@ -187,12 +203,26 @@ def _canonical_effective_warnings(value) -> list | None:
             return None
         if not isinstance(item.get("component"), str) or not item["component"].strip():
             return None
-        if item.get("qualification") != _EFFECTIVE_QUALIFICATION:
-            return None
         if not isinstance(item.get("measurement"), dict):
             return None
         overrides = item.get("overrides")
         if not isinstance(overrides, dict) or any(not isinstance(flag, bool) for flag in overrides.values()):
+            return None
+        if code == "cad_instance_measurement_differs_from_part":
+            # Flagless leaf instance whose assembly-context measurement differs from
+            # its part measurement: the cause is unproven, so the exact literal is
+            # required and every override flag must be false.
+            if item.get("qualification") != _INSTANCE_DIFFERENCE_QUALIFICATION:
+                return None
+            if item.get("role") != "leaf":
+                return None
+            if not overrides or any(flag is not False for flag in overrides.values()):
+                return None
+            part = item.get("part_measurement")
+            if not isinstance(part, dict) or any(key not in part for key in _PART_MEASUREMENT_KEYS):
+                return None
+            continue
+        if item.get("qualification") != _EFFECTIVE_QUALIFICATION:
             return None
         required = (
             ("document", "part_document_read", "solid_bodies", "sheet_bodies")
@@ -414,14 +444,25 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                 "（assembly_component_group 范围，使用装配文档坐标轴）：质量、质心与惯量来自 CAD 编写的有效值，"
                 "未经几何推导与独立物理校核，本报告不据此声称物理准确性，也不做分摊或替代。"
             )
+            difference_message = (
+                "该叶实例在装配组件组范围内的测量与其零件文档测量不同"
+                "（basis：cad_assembly_instance_measurement）：差异原因尚未证实；"
+                "本报告保留实例测量与零件测量双方的原始数值供工程确认，不做缩放或替代；"
+                "该值为 CAD 实例上下文记录，未经几何推导与独立物理校核，不据此声称物理准确性。"
+            )
             for item in effective_warnings:
-                surface_only = item["code"] == "cad_surface_only_effective_instance"
+                if item["code"] == "cad_surface_only_effective_instance":
+                    message = surface_message
+                elif item["code"] == "cad_instance_measurement_differs_from_part":
+                    message = difference_message
+                else:
+                    message = override_message
                 entries.append(
                     {
                         "severity": "warning",
                         "code": item["code"],
                         "object": item.get("component") or item.get("document") or item.get("part_document"),
-                        "message": surface_message if surface_only else override_message,
+                        "message": message,
                         "source": "evidence/raw/effective_instances.json/warnings",
                         "evidence": item,
                     }

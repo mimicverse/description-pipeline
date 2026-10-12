@@ -617,3 +617,83 @@ if __name__ == "__main__":
             self.assertEqual(sources["evidence/raw/mass_closure.json"], "evidence/raw/mass_closure.json")
             self.assertNotIn("evidence/raw/dependency_closure.json", sources)
 
+    def _instance_difference_warning(self, component="shim-1"):
+        return {
+            "code": "cad_instance_measurement_differs_from_part",
+            "blocking": False,
+            "component": component,
+            "role": "leaf",
+            "overrides": {"mass": False, "center_of_mass": False, "inertia": False},
+            "qualification": (
+                "cad_assembly_instance_measurement; cause_of_part_difference_unproven; "
+                "not geometry-derived, not independently physically qualified"
+            ),
+            "measurement": {
+                "scope": "assembly_component_group",
+                "mass_kg": 0.0042,
+                "center_of_mass_m": [0.0, 0.0, 0.01],
+                "inertia_kg_m2": [[1e-6, 0.0, 0.0], [0.0, 1e-6, 0.0], [0.0, 0.0, 2e-6]],
+            },
+            "part_measurement": {
+                "mass_kg": 0.0040,
+                "center_of_mass_m": [0.0, 0.0, 0.011],
+                "inertia_kg_m2": [[1.1e-6, 0.0, 0.0], [0.0, 1.1e-6, 0.0], [0.0, 0.0, 2.1e-6]],
+                "scope": "part_document",
+                "used_api": "IMassProperty2",
+                "product_convention": "solidworks-default",
+                "volume_m3": 5.3e-7,
+            },
+        }
+
+    def test_instance_measurement_difference_renders_with_exact_literal(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._effective_record(
+                [self._instance_difference_warning()],
+                readings={"shim-1": {"role": "leaf", "mass": 0.0042}},
+            )
+            write_json(root / "evidence/raw/effective_instances.json", record)
+            pins = write_structural_report(root, {"run_id": "m3", "state": "verified"}, evidence_root=root)
+            report = json.loads((root / pins["json"]["path"]).read_text())
+            finding = next(
+                item
+                for item in report["findings"]
+                if item["code"] == "cad_instance_measurement_differs_from_part"
+            )
+            self.assertEqual(finding["severity"], "warning")
+            self.assertEqual(finding["object"], "shim-1")
+            self.assertIn("差异原因尚未证实", finding["message"])
+            self.assertIn("未经几何推导与独立物理校核", finding["message"])
+            self.assertEqual(
+                finding["evidence"]["qualification"],
+                "cad_assembly_instance_measurement; cause_of_part_difference_unproven; "
+                "not geometry-derived, not independently physically qualified",
+            )
+            self.assertEqual(finding["evidence"]["part_measurement"]["product_convention"], "solidworks-default")
+            self.assertEqual(report["summary"], {"warnings": 1, "blockers": 0})
+
+    def test_instance_measurement_difference_refusals(self):
+        from description_pipeline.structural_report import _canonical_effective_warnings
+
+        def record_with(item):
+            return self._effective_record([item], readings={"shim-1": {"role": "leaf"}})
+
+        self.assertIsNotNone(_canonical_effective_warnings(record_with(self._instance_difference_warning())))
+        wrong_literal = self._instance_difference_warning()
+        wrong_literal["qualification"] = (
+            "cad_authored_effective_instance; not geometry-derived, not independently physically qualified"
+        )
+        self.assertIsNone(_canonical_effective_warnings(record_with(wrong_literal)))
+        flagged = self._instance_difference_warning()
+        flagged["overrides"]["mass"] = True
+        self.assertIsNone(_canonical_effective_warnings(record_with(flagged)))
+        parent_role = self._instance_difference_warning()
+        parent_role["role"] = "parent"
+        self.assertIsNone(_canonical_effective_warnings(record_with(parent_role)))
+        no_part = self._instance_difference_warning()
+        del no_part["part_measurement"]
+        self.assertIsNone(_canonical_effective_warnings(record_with(no_part)))
+        no_convention = self._instance_difference_warning()
+        del no_convention["part_measurement"]["product_convention"]
+        self.assertIsNone(_canonical_effective_warnings(record_with(no_convention)))
+

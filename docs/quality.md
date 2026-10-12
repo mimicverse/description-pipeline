@@ -128,6 +128,10 @@ parent override replaces its subtree only within one rigid body and is never
 distributed to moving links, the whole mass/COM/inertia closure must still hold
 exactly, and the report states plainly that the value is CAD-authored, not
 geometry-derived and not independently physically qualified.
+A flagless leaf instance whose assembly-context measurement differs from its
+part-document measurement is reported the same way, with both measurements kept
+verbatim and the difference recorded as basis `cad_assembly_instance_measurement`
+with an unproven cause — never rescaled, substituted or silently qualified.
 
 Native capture rebuilds the collected read-only assembly in its owned session
 before measurements. This refreshes assembly caches, including mass properties;
