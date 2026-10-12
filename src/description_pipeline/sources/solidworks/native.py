@@ -33,6 +33,10 @@ IASSEMBLYDOC_IID = "{83A33D35-27C5-11CE-BFD4-00400513BB57}"
 ICONFIGURATIONMANAGER_IID = "{8DB64337-F36E-47CC-BBBC-B4B979D31505}"
 ICONFIGURATION_IID = "{83A33D98-27C5-11CE-BFD4-00400513BB57}"
 IMODELDOCEXTENSION_IID = "{99F4D4AF-F268-4EE1-8C55-041F7BECF879}"
+#: ITessellation, verified dual interface in the installed sldworks.tlb
+#: (dump reviews/operator-resume-20261008/windows/907f759-tlb-owners-dump-v1.log
+#: line 489; offline member dump required no CAD session).
+ITESSELLATION_IID = "{699C7492-DB56-4CC2-B7A2-9FFD56698434}"
 IMASSPROPERTY2_IID = "{5E4EAE4A-65E6-4CF0-AD72-55EDEF5EB96A}"
 IMASSPROPERTYOVERRIDEOPTIONS_IID = "{82E1635E-B650-4C8B-84C8-D5FFBF660E49}"
 ICUSTOMPROPERTYMANAGER_IID = "{F1938D94-0D1F-4E88-9874-164B1E6568F1}"
@@ -3423,12 +3427,61 @@ class SolidWorksBackend(CadBackend):
     def _body_count(self, holder, body_type, component):
         return len(self._body_list(holder, body_type, component))
 
+    def _face_facetless_evidence(self, body, face):
+        """Diagnostic-only native evidence for a facetless face.
+
+        Typelib-grounded (sldworks.tlb sha256 6c24fd00..., ITessellation IID
+        {699C7492-DB56-4CC2-B7A2-9FFD56698434}): the bare
+        ``IBody2.GetTessellation()`` form returns the tessellation object; it is
+        bound to its published dual interface, told ``NeedFaceFacetMap = True``
+        (property put) and asked to ``Tessellate()`` (whose boolean result is
+        preserved - False is the engine's own refusal, not an exception), then
+        ``GetFaceFacets`` reports the face's facets.  No triangles are
+        reconstructed here: reconstruction semantics are not validated for this
+        release, so the caller refuses positive facet counts and only accounts
+        zero-facet sheet faces as explicit warnings.
+        """
+
+        raw = _member(body, "GetTessellation")
+        if raw is None:
+            raise CadError(
+                "cad_mesh_export_failed",
+                "IBody2.GetTessellation returned no tessellation object",
+                {"used_api": "IBody2.GetTessellation"},
+            )
+        tessellation = _interface(_dynamic(raw), ITESSELLATION_IID)
+        tessellation.NeedFaceFacetMap = True
+        tessellate_result = _method(tessellation, "Tessellate")
+        if not isinstance(tessellate_result, bool):
+            raise CadError(
+                "cad_mesh_export_failed",
+                "ITessellation.Tessellate did not return a boolean",
+                {"used_api": "ITessellation.Tessellate", "returned": repr(tessellate_result)[:60]},
+            )
+        facet_ids = [int(item) for item in (_as_list(_member(tessellation, "GetFaceFacets", face)) or ())]
+        return {
+            "facets": len(facet_ids),
+            "tessellate_result": tessellate_result,
+            "used_api": "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets",
+        }
+
     def _body_face_triangles(self, bodies, body_type, component):
-        """Component-local display triangles of every face of every requested body."""
+        """Component-local display triangles plus their facetless accounting.
+
+        Returns ``(values, evidence)``.  An empty ``IFace2.GetTessTriangles``
+        array is only accounted when the documented ITessellation diagnostic
+        proves a facetless SHEET face with complete native evidence (native
+        count 0, finite nonnegative area, boolean Tessellate result, zero
+        facets); everything else - solid faces, positive facet counts,
+        malformed non-empty arrays, missing evidence - stays fatal.  No
+        triangles are reconstructed and no area epsilon is applied.
+        """
 
         values: list[float] = []
+        evidence = {"faces": 0, "no_facets_faces": []}
         completed_faces = 0
-        for index, body in enumerate(bodies):
+        for index, raw_body in enumerate(bodies):
+            body = _dynamic(raw_body)
             body_values: list[float] = []
             context = {
                 "component": component,
@@ -3445,7 +3498,9 @@ class SolidWorksBackend(CadBackend):
                     "the occurrence body's faces could not be read",
                     {**context, "api": "IBody2.GetFaces", "error": str(error)},
                 ) from error
-            for face_index, face in enumerate(faces):
+            for face_index, raw_face in enumerate(faces):
+                face = _dynamic(raw_face)
+                evidence["faces"] += 1
                 try:
                     face_values = list(map(float, _member(face, "GetTessTriangles", True) or ()))
                 except Exception as error:
@@ -3461,26 +3516,86 @@ class SolidWorksBackend(CadBackend):
                         },
                     ) from error
                 if not face_values or len(face_values) % 9 or not all(map(math.isfinite, face_values)):
+                    classification = (
+                        "empty"
+                        if not face_values
+                        else ("length_not_multiple_of_9" if len(face_values) % 9 else "nonfinite")
+                    )
+                    native_count: object = None
+                    area: object = None
+                    facetless: dict = {}
+                    facetless_error: str | None = None
+                    if classification == "empty":
+                        try:
+                            native_count = int(_member(face, "GetTessTriangleCount"))
+                        except Exception:  # noqa: BLE001 - missing evidence must not warn-pass
+                            native_count = None
+                        try:
+                            area = float(_member(face, "GetArea"))
+                        except Exception:  # noqa: BLE001 - missing evidence must not warn-pass
+                            area = None
+                        try:
+                            facetless = self._face_facetless_evidence(body, face)
+                        except Exception as error:  # noqa: BLE001 - the failure becomes explicit evidence
+                            facetless_error = f"{type(error).__name__}: {error}"[:200]
+                    if (
+                        classification == "empty"
+                        and facetless_error is None
+                        and body_type == 1
+                        and facetless.get("facets") == 0
+                        and isinstance(facetless.get("tessellate_result"), bool)
+                        and native_count == 0
+                        and isinstance(area, float)
+                        and math.isfinite(area)
+                        and area >= 0.0
+                    ):
+                        # Untessellatable SHEET face with complete native evidence:
+                        # accounted as an explicit warning row; no triangles are
+                        # invented and no zero-area claim is made.
+                        evidence["no_facets_faces"].append(
+                            {
+                                "body_type": body_type,
+                                "body_index": index,
+                                "face_index": face_index,
+                                "triangle_count": 0,
+                                "facet_count": 0,
+                                "area_m2": area,
+                                "tessellate_result": facetless["tessellate_result"],
+                                "used_api": facetless["used_api"],
+                            }
+                        )
+                        completed_faces += 1
+                        continue
                     raise CadError(
                         "cad_mesh_export_failed",
                         "invalid face tessellation",
                         {
-                            "component": component,
-                            "body_type": body_type,
-                            "body_index": index,
+                            **context,
                             "face_index": face_index,
+                            "classification": classification,
+                            "raw_length": len(face_values),
+                            "triangle_count": native_count,
+                            "area_m2": area,
+                            "facetless_facets": facetless.get("facets"),
+                            "tessellate_result": facetless.get("tessellate_result"),
+                            "facetless_error": facetless_error,
                         },
                     )
                 body_values.extend(face_values)
                 completed_faces += 1
             if not body_values:
-                raise CadError(
-                    "cad_mesh_export_failed",
-                    "a body carries no display tessellation",
-                    {"component": component, "body_type": body_type, "body_index": index},
+                explained = any(
+                    entry["body_type"] == body_type and entry["body_index"] == index
+                    for entry in evidence["no_facets_faces"]
                 )
+                if not explained:
+                    raise CadError(
+                        "cad_mesh_export_failed",
+                        "a body carries no display tessellation",
+                        {"component": component, "body_type": body_type, "body_index": index},
+                    )
             values.extend(body_values)
-        return values
+        return values, evidence
 
     def export_component_meshes(self, destinations, progress=None):
         """Keep one live assembly traversal through the entire geometry batch.
@@ -3510,6 +3625,7 @@ class SolidWorksBackend(CadBackend):
         sources: list[str] = []
         values: list[float] = []
         body_counts = {"solid": 0, "sheet": 0}
+        tessellation = {"faces": 0, "no_facets_faces": []}
         for body_type, kind, source in (
             (0, "solid", "solid_body_faces"),
             (1, "sheet", "sheet_body_faces"),
@@ -3517,8 +3633,11 @@ class SolidWorksBackend(CadBackend):
             bodies = self._body_list(holder, body_type, component)
             body_counts[kind] = len(bodies)
             if bodies:
-                values.extend(self._body_face_triangles(bodies, body_type, component))
+                body_values, body_evidence = self._body_face_triangles(bodies, body_type, component)
+                values.extend(body_values)
                 sources.append(source)
+                tessellation["faces"] += body_evidence["faces"]
+                tessellation["no_facets_faces"].extend(body_evidence["no_facets_faces"])
         if not values:
             raise CadError(
                 "cad_mesh_export_failed",
@@ -3529,6 +3648,11 @@ class SolidWorksBackend(CadBackend):
                     "sheet_bodies": body_counts["sheet"],
                 },
             )
+        if tessellation["no_facets_faces"]:
+            self.notes["mesh_tessellation:" + component] = {
+                "faces": tessellation["faces"],
+                "no_facets_faces": tessellation["no_facets_faces"][:20],
+            }
         # Native display tessellation, in metres, independent of global STL
         # preferences. No claim of machining-grade surface approximation.
         with open(dest_path, "xb") as handle:
@@ -3564,6 +3688,10 @@ class SolidWorksBackend(CadBackend):
             "representation": "CAD_display_tessellation",
             "tessellation_sources": sources,
             "bodies": body_counts,
+            "tessellation": {
+                "faces": tessellation["faces"],
+                "no_facets_faces": tessellation["no_facets_faces"][:50],
+            },
         }
 
     def _record_source_document(self, path, configuration):

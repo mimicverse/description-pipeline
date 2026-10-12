@@ -1789,6 +1789,8 @@ def _export_geometry(
                 "path": target.relative_to(geometry_dir.parent).as_posix(),
                 "triangles": triangles,
                 "used_api": info.get("used_api"),
+                "bodies": info.get("bodies"),
+                "tessellation": info.get("tessellation") or {"faces": 0, "no_facets_faces": []},
                 "sha256": sha256_file(target),
             }
         )

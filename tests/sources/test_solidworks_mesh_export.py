@@ -19,11 +19,13 @@ TRIANGLE = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
 
 
 class FakeFace:
-    def __init__(self, triangles, surface=None, feature="shaft"):
+    def __init__(self, triangles, surface=None, feature="shaft", triangle_count=None, area=0.0):
         self._triangles = triangles
         self._surface = surface
         self.Name = "Face3"
         self._feature = feature
+        self._triangle_count = int(triangle_count) if triangle_count is not None else len(list(triangles)) // 9
+        self._area = float(area)
 
     def GetTessTriangles(self, flag):  # noqa: N802 - SolidWorks API name
         return list(self._triangles)
@@ -33,6 +35,12 @@ class FakeFace:
 
     def GetFeature(self):  # noqa: N802 - SolidWorks API name
         return SimpleNamespace(Name=self._feature)
+
+    def GetTessTriangleCount(self):  # noqa: N802 - SolidWorks API name
+        return self._triangle_count
+
+    def GetArea(self):  # noqa: N802 - SolidWorks API name
+        return self._area
 
 
 class FakeSurface:
@@ -46,6 +54,34 @@ class FakeBody:
 
     def GetFaces(self):  # noqa: N802 - SolidWorks API name
         return list(self._faces)
+
+
+class FakeTessellation:
+    """ITessellation twin: NeedFaceFacetMap put, boolean Tessellate, facet count."""
+
+    def __init__(self, facets=0, tessellate_result=True, raises=False):
+        self._facets = int(facets)
+        self.tessellate_result = tessellate_result
+        self.raises = raises
+        self.tessellated = False
+
+    def Tessellate(self):  # noqa: N802 - SolidWorks API name
+        if self.raises:
+            raise RuntimeError("tessellation engine unavailable")
+        self.tessellated = True
+        return self.tessellate_result
+
+    def GetFaceFacets(self, _face):  # noqa: N802 - SolidWorks API name
+        return list(range(self._facets))
+
+
+class FakeTessellationBody(FakeBody):
+    def __init__(self, faces, tessellation):
+        super().__init__(faces)
+        self._tessellation = tessellation
+
+    def GetTessellation(self):  # noqa: N802 - SolidWorks API name
+        return self._tessellation
 
 
 class FakeDocument:
@@ -196,6 +232,125 @@ class ComponentMeshExportTests(unittest.TestCase):
         with self.assertRaises(CadError) as caught:
             _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
         self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
+        self.assertFalse(self.dest.exists())
+
+    def _sheet_facetless_backend(self, face, tessellation):
+        return _backend(
+            FakeComponent(
+                FakeDocument([]),
+                {
+                    0: [FakeBody([FakeFace(TRIANGLE)])],
+                    1: [FakeTessellationBody([face], tessellation)],
+                },
+            )
+        )
+
+    def test_sheet_empty_face_with_native_facetless_evidence_is_recorded(self):
+        tessellation = FakeTessellation(facets=0, tessellate_result=True)
+        backend = self._sheet_facetless_backend(
+            FakeFace([], triangle_count=0, area=1.871564249915375e-13), tessellation
+        )
+        entry = backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        self.assertEqual(entry["triangles"], 1)
+        self.assertEqual(read_stl(self.dest).triangles, 1)
+        self.assertTrue(tessellation.tessellated)
+        self.assertIs(getattr(tessellation, "NeedFaceFacetMap", None), True)
+        self.assertEqual(entry["bodies"], {"solid": 1, "sheet": 1})
+        tessellation_entry = entry["tessellation"]
+        self.assertEqual(tessellation_entry["faces"], 2)
+        self.assertEqual(
+            tessellation_entry["no_facets_faces"],
+            [
+                {
+                    "body_type": 1,
+                    "body_index": 0,
+                    "face_index": 0,
+                    "triangle_count": 0,
+                    "facet_count": 0,
+                    "area_m2": 1.871564249915375e-13,
+                    "tessellate_result": True,
+                    "used_api": "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets",
+                }
+            ],
+        )
+        self.assertIn("mesh_tessellation:pcb-1", backend.notes)
+
+    def test_sheet_empty_face_with_tessellate_refusal_is_recorded_not_failed(self):
+        tessellation = FakeTessellation(facets=0, tessellate_result=False)
+        backend = self._sheet_facetless_backend(
+            FakeFace([], triangle_count=0, area=7.486257000421631e-13), tessellation
+        )
+        entry = backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        row = entry["tessellation"]["no_facets_faces"][0]
+        self.assertIs(row["tessellate_result"], False)
+        self.assertEqual(row["area_m2"], 7.486257000421631e-13)
+
+    def test_sheet_empty_face_with_positive_facets_fails_until_reconstruction_is_validated(self):
+        tessellation = FakeTessellation(facets=1, tessellate_result=True)
+        backend = self._sheet_facetless_backend(FakeFace([], triangle_count=0, area=1e-12), tessellation)
+        with self.assertRaises(CadError) as caught:
+            backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
+        self.assertEqual(caught.exception.detail["facetless_facets"], 1)
+        self.assertFalse(self.dest.exists())
+
+    def test_solid_empty_face_stays_fatal_without_sheet_qualification(self):
+        tessellation = FakeTessellation(facets=0, tessellate_result=True)
+        component = FakeComponent(
+            FakeDocument([]),
+            {
+                0: [FakeBody([FakeFace([], triangle_count=0, area=1e-12)])],
+                1: [FakeTessellationBody([FakeFace(TRIANGLE)], tessellation)],
+            },
+        )
+        with self.assertRaises(CadError) as caught:
+            _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
+        self.assertEqual(caught.exception.detail["body_type"], 0)
+        self.assertFalse(self.dest.exists())
+
+    def test_sheet_empty_face_with_nonzero_native_count_fails(self):
+        tessellation = FakeTessellation(facets=0, tessellate_result=True)
+        backend = self._sheet_facetless_backend(FakeFace([], triangle_count=2, area=1e-12), tessellation)
+        with self.assertRaises(CadError) as caught:
+            backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        self.assertEqual(caught.exception.detail["triangle_count"], 2)
+
+    def test_sheet_empty_face_with_nonfinite_area_fails(self):
+        tessellation = FakeTessellation(facets=0, tessellate_result=True)
+        backend = self._sheet_facetless_backend(FakeFace([], triangle_count=0, area=float("nan")), tessellation)
+        with self.assertRaises(CadError) as caught:
+            backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
+
+    def test_sheet_empty_face_with_unavailable_tessellation_fails(self):
+        tessellation = FakeTessellation(facets=0, tessellate_result=True, raises=True)
+        backend = self._sheet_facetless_backend(FakeFace([], triangle_count=0, area=1e-12), tessellation)
+        with self.assertRaises(CadError) as caught:
+            backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        self.assertTrue(caught.exception.detail["facetless_error"])
+
+    def test_sheet_empty_face_with_non_boolean_tessellate_result_fails(self):
+        tessellation = FakeTessellation(facets=0, tessellate_result=None)
+        backend = self._sheet_facetless_backend(FakeFace([], triangle_count=0, area=1e-12), tessellation)
+        with self.assertRaises(CadError) as caught:
+            backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        self.assertTrue(caught.exception.detail["facetless_error"])
+
+    def test_malformed_face_fails_with_classification_and_no_facetless_call(self):
+        tessellation = FakeTessellation(facets=0, tessellate_result=True)
+        component = FakeComponent(
+            FakeDocument([]),
+            {
+                0: [FakeBody([FakeFace(TRIANGLE)])],
+                1: [FakeTessellationBody([FakeFace([0.0] * 6)], tessellation)],
+            },
+        )
+        with self.assertRaises(CadError) as caught:
+            _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        self.assertEqual(caught.exception.detail["classification"], "length_not_multiple_of_9")
+        self.assertEqual(caught.exception.detail["raw_length"], 6)
+        self.assertFalse(tessellation.tessellated)
         self.assertFalse(self.dest.exists())
 
     def test_empty_part_fails(self):
