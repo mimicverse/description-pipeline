@@ -44,14 +44,41 @@ def sealable_diagnostic_files(evidence_root: Path | None) -> list[str]:
     same bytes, so no report ever depends on where it was rendered.
     """
 
+    return sorted(diagnostic_file_sources(evidence_root))
+
+
+#: A partial capture keeps its copies under this prefix, preserving either the
+#: full delivery-relative name or the name without the leading ``evidence/``.
+PARTIAL_PREFIX = "partial"
+
+
+def diagnostic_file_sources(evidence_root: Path | None) -> dict[str, str]:
+    """Canonical sealed-diagnostic names mapped to existing sources, delivery-relative.
+
+    The bundle layout, allowlist and hashes always use the canonical names, so a
+    file recovered from ``partial/`` renders exactly like a complete one; which
+    sources came from partial storage stays visible in the manifest instead of
+    being presented as a complete capture.
+    """
+
     if evidence_root is None:
-        return []
+        return {}
     root = Path(evidence_root)
-    names = [name for name in SEALED_DIAGNOSTIC_FILES if (root / name).is_file()]
+    sources: dict[str, str] = {}
+    for name in SEALED_DIAGNOSTIC_FILES:
+        short = name[len("evidence/") :] if name.startswith("evidence/") else None
+        candidates = [name]
+        candidates.extend(f"{PARTIAL_PREFIX}/{candidate}" for candidate in (name, short) if candidate)
+        for candidate in candidates:
+            if (root / candidate).is_file():
+                sources[name] = candidate
+                break
     urdf = root / "urdf"
     if urdf.is_dir():
-        names.extend(sorted(path.relative_to(root).as_posix() for path in urdf.rglob("*.urdf")))
-    return names
+        for path in sorted(urdf.rglob("*.urdf")):
+            relative = path.relative_to(root).as_posix()
+            sources[relative] = relative
+    return sources
 
 
 def is_sealed_diagnostic_member(relative: str) -> bool:

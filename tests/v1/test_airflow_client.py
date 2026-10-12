@@ -960,6 +960,8 @@ class ClientTests(unittest.TestCase):
                 "run_id": RUN_ID,
                 "receipt": {"path": "receipt.json", "sha256": hashlib.sha256(receipt).hexdigest()},
                 "files": {"input/discovery/findings.json": hashlib.sha256(evidence).hexdigest()},
+                "partial": True,
+                "partial_files": ["evidence/raw/material_provenance.json"],
             }
         ).encode()
         with MockEndpoint() as server:

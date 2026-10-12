@@ -293,7 +293,7 @@ class Jobs:
     def _seal_failure_diagnostics(self, job):
         """Seal the raw failure diagnostics; the Linux side renders the report from these bytes."""
 
-        from ..structural_report import DIAGNOSTIC_SCHEMA, sealable_diagnostic_files
+        from ..structural_report import DIAGNOSTIC_SCHEMA, diagnostic_file_sources
 
         run_id = job["run_id"]
         root = self.config["state_root"] / "diagnostics" / run_id
@@ -306,8 +306,11 @@ class Jobs:
         write_json(receipt, staged)
         evidence = self._delivery_dir(job)
         files: dict[str, str] = {}
-        for name in sealable_diagnostic_files(evidence):
-            source = confined(Path(evidence), name)
+        partial_names: list[str] = []
+        for name, relative in diagnostic_file_sources(evidence).items():
+            source = confined(Path(evidence), relative)
+            if relative != name:
+                partial_names.append(name)
             target = confined(root / "evidence", name, exists=False)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
@@ -321,6 +324,11 @@ class Jobs:
             "receipt": {"path": "receipt.json", "sha256": receipt_digest},
             "files": files,
         }
+        if partial_names:
+            # Honest provenance: some members were recovered from the partial tree,
+            # so this bundle is explicitly marked as not a complete capture.
+            manifest["partial"] = True
+            manifest["partial_files"] = sorted(partial_names)
         write_json(root / "diagnostic.json", manifest)
         with (root / "diagnostic.json").open("rb") as stream:
             digest = hashlib.file_digest(stream, "sha256").hexdigest()

@@ -600,3 +600,20 @@ if __name__ == "__main__":
             self.assertEqual(blocker["severity"], "blocker")
             self.assertEqual(blocker["object"], "board-1")
 
+    def test_partial_evidence_resolves_to_canonical_sealed_names(self):
+        from description_pipeline.structural_report import diagnostic_file_sources
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_json(root / "partial/raw/material_provenance.json", {"schema_version": "x"})
+            write_json(root / "partial/evidence/raw/effective_instances.json", {"schema_version": "y"})
+            write_json(root / "evidence/raw/mass_closure.json", {"status": "recorded"})
+            sources = diagnostic_file_sources(root)
+            self.assertEqual(sources["evidence/raw/material_provenance.json"], "partial/raw/material_provenance.json")
+            self.assertEqual(
+                sources["evidence/raw/effective_instances.json"],
+                "partial/evidence/raw/effective_instances.json",
+            )
+            self.assertEqual(sources["evidence/raw/mass_closure.json"], "evidence/raw/mass_closure.json")
+            self.assertNotIn("evidence/raw/dependency_closure.json", sources)
+
