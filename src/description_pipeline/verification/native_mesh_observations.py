@@ -35,11 +35,13 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
                  component + ": invalid body counts")
         _require(sum(bodies.values()) > 0, component + ": no native bodies recorded")
         seen = set()
+        base = {"body_type", "body_index", "face_index", "triangle_count", "area_m2", "used_api"}
         for face in omitted:
-            _require(isinstance(face, dict) and set(face) == {
-                "body_type", "body_index", "face_index", "triangle_count", "facet_count",
-                "area_m2", "tessellate_result", "used_api",
-            }, component + ": malformed untessellated-face observation")
+            keys = set(face) if isinstance(face, dict) else None
+            _require(
+                keys in (base | {"facet_count", "tessellate_result"}, base | {"tessellate_probe_error"}),
+                component + ": malformed untessellated-face observation",
+            )
             _require(type(face["body_type"]) is int and face["body_type"] == 1,
                      component + ": only native sheet faces may lack tessellation")
             _require(type(face["body_index"]) is int and 0 <= face["body_index"] < bodies["sheet"],
@@ -49,13 +51,34 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
             key = (face["body_type"], face["body_index"], face["face_index"])
             _require(key not in seen, component + ": duplicate untessellated face")
             seen.add(key)
-            _require(type(face["triangle_count"]) is int and face["triangle_count"] == 0
-                     and type(face["facet_count"]) is int and face["facet_count"] == 0,
-                     component + ": native triangles or facets cannot be omitted")
+            _require(
+                type(face["triangle_count"]) is int and face["triangle_count"] == 0,
+                component + ": native triangles cannot be omitted",
+            )
             _require(type(face["area_m2"]) in (int, float) and math.isfinite(face["area_m2"])
                      and face["area_m2"] >= 0, component + ": invalid untessellated native area")
-            _require(type(face["tessellate_result"]) is bool,
-                     component + ": native tessellation result is unreadable")
+            if "tessellate_result" in face:
+                _require(
+                    type(face["facet_count"]) is int and face["facet_count"] == 0,
+                    component + ": native facets cannot be omitted",
+                )
+                _require(type(face["tessellate_result"]) is bool,
+                         component + ": native tessellation result is unreadable")
+            else:
+                # A persistent DISP_E_EXCEPTION on geometrically degenerate faces is
+                # recorded as a probe error instead of a result: both facet_count and
+                # tessellate_result are products of the probe that failed, so the
+                # variant carries neither; it is admissible only for numerically zero
+                # area and never loosens any other check.
+                probe_error = face["tessellate_probe_error"]
+                _require(
+                    isinstance(probe_error, str) and probe_error.startswith("com_error"),
+                    component + ": native tessellation probe error is unreadable",
+                )
+                _require(
+                    face["area_m2"] <= 1e-12,
+                    component + ": a degenerate-face probe error is only admissible at zero native area",
+                )
             _require(face["used_api"] == "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets",
                      component + ": unsupported untessellated-face evidence API")
             warnings.append({

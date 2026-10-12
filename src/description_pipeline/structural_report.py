@@ -251,7 +251,11 @@ def _canonical_untessellated_faces(value) -> list | None:
 
     The file is a list of per-component entries; each row is returned with its
     component attached so the warning can name it.  Any schema deviation fails
-    closed, and no area epsilon is applied anywhere.
+    closed.  Exactly two row shapes pass, mirroring the verification gate: the
+    proven-probe row (boolean ``tessellate_result`` with ``facet_count`` 0) and
+    the degenerate fallback row (no ``facet_count`` and no ``tessellate_result``;
+    a persistent ``com_error`` probe record) admitted only up to the same
+    numerically-zero area bound (1e-12 m2).  No area claim is derived anywhere.
     """
 
     import math
@@ -285,18 +289,18 @@ def _canonical_untessellated_faces(value) -> list | None:
         if faces <= len(rows):
             return None
         seen = set()
+        base = {
+            "body_type",
+            "body_index",
+            "face_index",
+            "triangle_count",
+            "area_m2",
+            "used_api",
+        }
         for row in rows:
-            required = {
-                "body_type",
-                "body_index",
-                "face_index",
-                "triangle_count",
-                "facet_count",
-                "area_m2",
-                "tessellate_result",
-                "used_api",
-            }
-            if not isinstance(row, dict) or set(row) != required:
+            if not isinstance(row, dict):
+                return None
+            if set(row) not in (base | {"facet_count", "tessellate_result"}, base | {"tessellate_probe_error"}):
                 return None
             if row.get("body_type") != 1:
                 return None
@@ -307,13 +311,25 @@ def _canonical_untessellated_faces(value) -> list | None:
                 return None
             if type(row.get("triangle_count")) is not int or row["triangle_count"] != 0:
                 return None
-            if type(row.get("facet_count")) is not int or row["facet_count"] != 0:
-                return None
             area = row.get("area_m2")
             if isinstance(area, bool) or not isinstance(area, (int, float)) or not math.isfinite(area) or area < 0:
                 return None
-            if not isinstance(row.get("tessellate_result"), bool):
-                return None
+            if "tessellate_result" in row:
+                if type(row.get("facet_count")) is not int or row["facet_count"] != 0:
+                    return None
+                if not isinstance(row.get("tessellate_result"), bool):
+                    return None
+            else:
+                # A persistent DISP_E_EXCEPTION on a geometrically degenerate face
+                # is recorded as a probe error instead of a result: both facet_count
+                # and tessellate_result are products of the probe that failed, so
+                # this variant carries neither.  It is admissible only at
+                # numerically zero area, exactly as in the verification gate.
+                probe_error = row.get("tessellate_probe_error")
+                if not isinstance(probe_error, str) or not probe_error.startswith("com_error"):
+                    return None
+                if area > 1e-12:
+                    return None
             if row.get("used_api") != pinned_api:
                 return None
             key = (row["body_type"], row["body_index"], row["face_index"])
@@ -612,6 +628,13 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
             )
         else:
             for row in untessellated:
+                if "tessellate_probe_error" in row:
+                    facets = (
+                        "在原生三角剖分中返回 0 个三角形，面元探针在几何退化面上重试后仍失败"
+                        f"（{row['tessellate_probe_error']}）"
+                    )
+                else:
+                    facets = "在原生三角剖分中返回 0 个三角形与 0 个面元"
                 entries.append(
                     {
                         "severity": "warning",
@@ -619,7 +642,7 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                         "object": f"{row['component']} sheet body {row['body_index']} face {row['face_index']}",
                         "message": (
                             f"该曲面（component {row['component']}；body_type 1；body_index {row['body_index']}，"
-                            f"face_index {row['face_index']}）在原生三角剖分中返回 0 个三角形与 0 个面元，"
+                            f"face_index {row['face_index']}）{facets}，"
                             f"原生面积量测为 {row['area_m2']!r} m²：CAD 未提供该曲面的可导出三角剖分；"
                             "本报告保留原始事实、不断言零面积；曲面几何的完整性与可用性未经独立确认。"
                         ),

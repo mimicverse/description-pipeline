@@ -796,12 +796,47 @@ class StructuralReportTests(unittest.TestCase):
             self.assertIs(findings[2]["evidence"]["tessellate_result"], True)
             self.assertEqual(report["summary"]["blockers"], 0)
 
+    def test_degenerate_probe_error_row_is_admitted_at_zero_area(self):
+        row = self._untessellated_row(area_m2=1.8716e-13)
+        row.pop("facet_count")
+        row.pop("tessellate_result")
+        row["tessellate_probe_error"] = "com_error: DISP_E_EXCEPTION during Tessellate"
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_json(root / "evidence/raw/geometry.json", self._geometry_list([row]))
+            pins = write_structural_report(root, {"run_id": "m3", "state": "verified"}, evidence_root=root)
+            report = json.loads((root / pins["json"]["path"]).read_text())
+            findings = [item for item in report["findings"] if item["code"] == "cad_sheet_face_untessellated"]
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0]["object"], "board-1 sheet body 5 face 0")
+            self.assertEqual(
+                findings[0]["evidence"]["tessellate_probe_error"],
+                "com_error: DISP_E_EXCEPTION during Tessellate",
+            )
+            self.assertNotIn("tessellate_result", findings[0]["evidence"])
+            self.assertNotIn("facet_count", findings[0]["evidence"])
+            self.assertNotIn("0 个面元", findings[0]["message"])
+            self.assertIn("原生面积量测为 1.8716e-13", findings[0]["message"])
+            self.assertIn("不断言零面积", findings[0]["message"])
+            self.assertEqual(report["summary"]["blockers"], 0)
+
     def test_untessellated_sheet_metadata_fails_closed_outside_schema(self):
+        probe = self._untessellated_row(area_m2=1.8716e-13)
+        probe.pop("facet_count")
+        probe.pop("tessellate_result")
+        probe["tessellate_probe_error"] = "com_error: DISP_E_EXCEPTION"
+        no_result = self._untessellated_row()
+        no_result.pop("tessellate_result")
         cases = [
             [self._untessellated_row(triangle_count=1)],
             [self._untessellated_row(), self._untessellated_row()],
             [self._untessellated_row(body_index=9)],
             [self._untessellated_row(used_api="other")],
+            [{**probe, "area_m2": 1e-11}],
+            [{**probe, "tessellate_result": False}],
+            [{**probe, "facet_count": 0}],
+            [{**probe, "tessellate_probe_error": "DISP_E_EXCEPTION"}],
+            [no_result],
         ]
         for rows in cases:
             with TemporaryDirectory() as directory:

@@ -48,6 +48,58 @@ class NativeMeshObservationTests(unittest.TestCase):
         self.row["tessellation"]["no_facets_faces"][0]["tessellate_result"] = True
         self.assertEqual(len(self.verify()["warnings"]), 1)
 
+    def test_degenerate_probe_error_shape_is_accepted_for_zero_area(self):
+        face = self.row["tessellation"]["no_facets_faces"][0]
+        face.pop("tessellate_result")
+        face.pop("facet_count")
+        face["tessellate_probe_error"] = "com_error: DISP_E_EXCEPTION during Tessellate"
+        face["area_m2"] = 1.8716e-13
+        result = self.verify()
+        warning, = result["warnings"]
+        self.assertEqual(warning["code"], "cad_sheet_face_untessellated")
+        self.assertEqual(warning["tessellate_probe_error"], "com_error: DISP_E_EXCEPTION during Tessellate")
+        self.assertNotIn("tessellate_result", warning)
+        self.assertNotIn("facet_count", warning)
+        self.assertEqual(result["untessellated_native_area_m2"], 1.8716e-13)
+        self.assertIn("unqualified", warning["qualification"])
+
+        self.row = copy.deepcopy(self.row)
+        self.row["tessellation"]["no_facets_faces"][0]["area_m2"] = 1e-12
+        self.assertEqual(len(self.verify()["warnings"]), 1)
+
+    def test_probe_error_shape_is_rejected_above_numerically_zero_area(self):
+        face = self.row["tessellation"]["no_facets_faces"][0]
+        face.pop("tessellate_result")
+        face.pop("facet_count")
+        face["tessellate_probe_error"] = "com_error: DISP_E_EXCEPTION"
+        face["area_m2"] = 1e-11
+        with self.assertRaisesRegex(PipelineError, "zero native area"):
+            self.verify()
+
+    def test_probe_error_and_tessellate_result_together_are_rejected(self):
+        face = self.row["tessellation"]["no_facets_faces"][0]
+        face["tessellate_probe_error"] = "com_error: DISP_E_EXCEPTION"
+        with self.assertRaisesRegex(PipelineError, "malformed untessellated-face observation"):
+            self.verify()
+
+    def test_facet_count_without_a_result_or_probe_error_is_rejected(self):
+        face = self.row["tessellation"]["no_facets_faces"][0]
+        face.pop("tessellate_result")
+        with self.assertRaisesRegex(PipelineError, "malformed untessellated-face observation"):
+            self.verify()
+
+    def test_probe_error_field_must_be_a_com_error_string(self):
+        base = self.row["tessellation"]["no_facets_faces"][0]
+        for value in (None, 7, "DISP_E_EXCEPTION", "", False):
+            with self.subTest(value=value):
+                face = copy.deepcopy(base)
+                face.pop("tessellate_result")
+                face.pop("facet_count")
+                face["tessellate_probe_error"] = value
+                self.row["tessellation"]["no_facets_faces"] = [face]
+                with self.assertRaises(PipelineError):
+                    self.verify()
+
     def test_invalid_and_nonempty_native_geometry_cannot_be_waived(self):
         valid = copy.deepcopy(self.row)
         for key, value in (
