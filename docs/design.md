@@ -71,7 +71,7 @@ declaration. The complete Airflow run
 combines both receipts, while maintenance commands cover only the stages they execute
 ([operations](operations.md#6-independent-review-and-recovery)); unexecuted
 native stages are reported as out of scope, never as qualified.
-[Quality](quality.md) defines the independent gates and tolerances.
+[Quality](quality.md) defines the independent gates and tolerances. Exact selected-set accounting — native-selected plus independently measured unassigned mass closing to the whole within 1e-12 kg — is distinct from full-assembly coverage qualification: the authoritative declared model governs coverage and may leave an explicit unassigned occurrence warning.
 [The mechanical specification](mechanical-handoff-spec.md#111-自动检查与工程师确认)
 defines the remaining external engineering facts. Passed automatic checks are
 accepted without repeated manual review. After verification, the page shows only

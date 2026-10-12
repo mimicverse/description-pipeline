@@ -1,7 +1,7 @@
 # Quality specification
 
 Report: `solidworks-to-urdf.quality/v1`. Pipeline ID: `solidworks-to-urdf`.
-All required gates must pass before automatic publication. Missing required evidence is
+All required integrity and selected-model consistency gates must pass before automatic publication. Missing required evidence is
 a failure. There is no public bypass or waiver switch.
 
 Native SolidWorks engineering is the input. Generated YAML is an internal
@@ -86,7 +86,7 @@ Implementation paths below are relative to `src/description_pipeline/`.
 | Physical authority | Native numerical consistency for the recorded CAD values; missing explicit material coverage is warning-level with the measured values preserved and no verified-material claim — real material, density and mass boundaries remain external engineering confirmation; no implicit density or unknown convention is ever evidence | `verification/solidworks_physics.py` |
 | Mass, COM and tensor | Independently rotate/translate raw part readings, apply the parallel-axis theorem and convert to each CAD link datum | `verification/solidworks_physics.py` |
 | Assembly closure | Independent part sum agrees with full whole-assembly mass/COM/tensor and complete component-context readings | `verification/solidworks_physics.py` |
-| Whole-CAD mass equality | Delivered URDF XML inertial mass sum equals the bound full whole-assembly reading; missing or invalid whole evidence fails; masses are never normalized | `verification/solidworks_physics.py` |
+| Native mass accounting | Delivered URDF mass plus independently measured, explicitly unassigned CAD mass equals the bound whole-assembly reading; missing evidence or unexplained gaps fail; incomplete whole coverage remains a warning and masses are never normalized | `verification/solidworks_physics.py` |
 | Inertia validity | Finite positive mass; positive principal inertia; triangle inequality; XML full tensor agrees with raw-verified model | `verification/solidworks_urdf.py` |
 | Geometry | Native mesh coverage, exact file hashes, SI scale, finite nonempty triangles, CAD placement of actual vertices | `verification/solidworks_urdf.py`, `geometry/stl.py` |
 | Physical plausibility | COM within body bounds; inertia within geometry radius bound; total mass and largest whole-robot extent within declared intervals when a design budget is supplied; a missing budget applies no acceptance intervals and is never manufactured from measured values, while an invalid supplied record fails | `verification/solidworks_urdf.py` |
@@ -135,8 +135,16 @@ with an unproven cause — never rescaled, substituted or silently qualified.
 The derived selection accounting is projected as warnings: every unassigned
 occurrence is reported with its native recorded mass, and the native
 whole-vs-selected mass gap is reported as a gap with its qualification withheld
-— never as missing input bytes or a pipeline failure. An accounting residual
-outside the 1e-12 kg equality tolerance, or an invalid selection record, fails closed.
+— never as missing input bytes or a pipeline failure. Exact selected-set
+accounting is distinct from full-assembly coverage qualification: the generated
+URDF's native-selected mass plus the independently measured unassigned mass must
+close to the whole assembly within 1e-12 kg (no exact-zero comparison, no
+scaling and no invented attachment), while the authoritative declared model
+governs coverage and may legitimately leave an explicit unassigned occurrence
+warning. A residual beyond that tolerance, an unexplained gap, an unreadable
+record, or a selection record outside the schema still fails closed. Reference exports may be used for comparison only. Their meshes, physical
+values and naming aliases are never pipeline inputs; the saved CAD remains the
+source of generated facts.
 A sheet face that the native tessellation returns with zero triangles and zero
 facets while the native record still measures a positive area is reported as the
 non-blocking warning `cad_sheet_face_untessellated` (per component entry,
@@ -144,7 +152,8 @@ naming the component and face), stating the native area measurement as recorded
 and the absence of facets; the report never calls it zero-area, and the
 completeness and usability of the surface geometry remain independently
 unqualified. All other native triangles are retained unchanged; malformed
-geometry metadata fails closed.
+geometry metadata and solid geometry errors fail closed, while a sheet face
+without facets is reported as the precise facts above.
 
 Native capture rebuilds the collected read-only assembly in its owned session
 before measurements. This refreshes assembly caches, including mass properties;
