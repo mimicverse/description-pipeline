@@ -2070,9 +2070,17 @@ FACETLESS_DEGENERATE_AREA_M2 = 1e-12
 FACETLESS_EVIDENCE_API = "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets"
 
 
+#: SolidWorks COM mid-session transients that are retried, matched textually
+#: because pywin32 surfaces both through ``com_error``: DISP_E_EXCEPTION
+#: 0x80010105 ("服务器出现意外情况") and RPC_S_SERVER_UNAVAILABLE 0x800706BA
+#: ("RPC 服务器不可用", the r8 face-51 read that failed the capture while the
+#: predicate matched only the first code).
+TRANSIENT_COM_ERROR_CODES = ("-2147417851", "-2147023174")
+
+
 def _is_transient_com_error(error: BaseException) -> bool:
     text = f"{type(error).__name__}: {error}"
-    return "com_error" in text and "-2147417851" in text
+    return "com_error" in text and any(code in text for code in TRANSIENT_COM_ERROR_CODES)
 
 
 def _retry_transient_com(

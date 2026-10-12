@@ -134,6 +134,13 @@ class TransientComError(RuntimeError):
         return "com_error: (-2147417851, '\u670d\u52a1\u5668\u51fa\u73b0\u610f\u5916\u60c5\u51b5\u3002', None, None)"
 
 
+class ServerUnavailableComError(RuntimeError):
+    """The observed RPC_S_SERVER_UNAVAILABLE face read (native18/r8 face 51)."""
+
+    def __str__(self):
+        return "com_error: (-2147023174, 'RPC \u670d\u52a1\u5668\u4e0d\u53ef\u7528\u3002', None, None)"
+
+
 class FlakyTessellation(FakeTessellation):
     def __init__(self, *, failures, facets=0, tessellate_result=True):
         super().__init__(facets=facets, tessellate_result=tessellate_result)
@@ -536,6 +543,29 @@ class ComponentMeshExportTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             _retry_transient_com(permanent)
         self.assertEqual(calls["n"], 1)
+
+    def test_rpc_server_unavailable_is_transient_and_retried(self):
+        from description_pipeline.sources.solidworks.native import (
+            TRANSIENT_COM_ERROR_CODES,
+            _is_transient_com_error,
+            _retry_transient_com,
+        )
+
+        self.assertIn("-2147023174", TRANSIENT_COM_ERROR_CODES)
+        self.assertTrue(_is_transient_com_error(ServerUnavailableComError()))
+        calls = {"n": 0}
+        slept = []
+
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ServerUnavailableComError()
+            return "face-values"
+
+        result = _retry_transient_com(flaky, sleep=slept.append)
+        self.assertEqual(result, "face-values")
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(slept, [0.2])
 
     def test_face_read_budget_retries_transient_to_exhaustion_then_raises(self):
         from description_pipeline.sources.solidworks.native import (
