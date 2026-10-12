@@ -2046,6 +2046,16 @@ class _ActivityEmitter:
 #: SolidWorks COM mid-export transient: DISP_E_EXCEPTION ("服务器出现意外情况").
 TRANSIENT_COM_RETRY_ATTEMPTS = 3
 TRANSIENT_COM_RETRY_DELAYS = (0.2, 0.5)
+# A facetless sheet face whose ITessellation probe exhausts the transient COM
+# retries is still accountable when the face itself proves degeneracy: zero
+# native triangle count, an empty display array, and a finite area at or below
+# this bound.  The bound sits one order of magnitude above the largest
+# degenerate face measured on the M3 PCB (1.871564249915375e-13 m2) and six
+# orders of magnitude below 1 mm2, so no displayable face of this assembly can
+# be mistaken for degenerate; the proof stays the zero count, the empty array
+# and the measured area, never the failed probe.
+FACETLESS_DEGENERATE_AREA_M2 = 1e-12
+FACETLESS_EVIDENCE_API = "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets"
 
 
 def _is_transient_com_error(error: BaseException) -> bool:
@@ -3634,7 +3644,7 @@ class SolidWorksBackend(CadBackend):
         return {
             "facets": len(facet_ids),
             "tessellate_result": tessellate_result,
-            "used_api": "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets",
+            "used_api": FACETLESS_EVIDENCE_API,
         }
 
     def _body_face_triangles(self, bodies, body_type, component):
@@ -3644,9 +3654,13 @@ class SolidWorksBackend(CadBackend):
         array is only accounted when the documented ITessellation diagnostic
         proves a facetless SHEET face with complete native evidence (native
         count 0, finite nonnegative area, boolean Tessellate result, zero
-        facets); everything else - solid faces, positive facet counts,
-        malformed non-empty arrays, missing evidence - stays fatal.  No
-        triangles are reconstructed and no area epsilon is applied.
+        facets) - or, when the probe itself exhausts the transient COM retries,
+        when the face is geometrically proven degenerate (native count 0, empty
+        array, finite area at or below ``FACETLESS_DEGENERATE_AREA_M2``).
+        Everything else - solid faces, positive facet counts, malformed
+        non-empty arrays, probe failures with weak degeneracy, missing
+        evidence - stays fatal.  No triangles are reconstructed and no area
+        epsilon is applied.
         """
 
         values: list[float] = []
@@ -3706,6 +3720,7 @@ class SolidWorksBackend(CadBackend):
                     area: object = None
                     facetless: dict = {}
                     facetless_error: str | None = None
+                    probe_error_transient = False
                     if classification == "empty" and body_type == 1:
                         try:
                             native_count = _member(face, "GetTessTriangleCount")
@@ -3726,7 +3741,8 @@ class SolidWorksBackend(CadBackend):
                             facetless = _retry_transient_com(_probe_facetless)
                         except Exception as error:  # noqa: BLE001 - the failure becomes explicit evidence
                             facetless_error = f"{type(error).__name__}: {error}"[:200]
-                    if (
+                            probe_error_transient = _is_transient_com_error(error)
+                    facetless_proved = (
                         classification == "empty"
                         and facetless_error is None
                         and body_type == 1
@@ -3736,12 +3752,31 @@ class SolidWorksBackend(CadBackend):
                         and type(area) in (int, float)
                         and math.isfinite(area)
                         and area >= 0.0
-                    ):
-                        # Untessellatable SHEET face with complete native evidence:
-                        # accounted as an explicit warning row; no triangles are
+                    )
+                    # The probe is intrinsically unreliable on proven-degenerate
+                    # faces (the same call raises a persistent RPC_E_SERVERFAULT
+                    # inside one CAD session).  After the bounded retries the
+                    # face is still accountable when the native count and the
+                    # empty array prove degeneracy and the measured area is at
+                    # or below the bound; the failed probe is recorded verbatim
+                    # and no boolean or facet count is fabricated.
+                    degenerate_probe_failure = (
+                        classification == "empty"
+                        and facetless_error is not None
+                        and probe_error_transient
+                        and body_type == 1
+                        and type(native_count) is int
+                        and native_count == 0
+                        and type(area) in (int, float)
+                        and math.isfinite(area)
+                        and 0.0 <= area <= FACETLESS_DEGENERATE_AREA_M2
+                    )
+                    if facetless_proved or degenerate_probe_failure:
+                        # Untessellatable SHEET face with explicit native
+                        # evidence: accounted as a warning row; no triangles are
                         # invented and no zero-area claim is made.
-                        evidence["no_facets_faces"].append(
-                            {
+                        if facetless_proved:
+                            row = {
                                 "body_type": body_type,
                                 "body_index": index,
                                 "face_index": face_index,
@@ -3749,9 +3784,19 @@ class SolidWorksBackend(CadBackend):
                                 "facet_count": 0,
                                 "area_m2": float(area),
                                 "tessellate_result": facetless["tessellate_result"],
-                                "used_api": facetless["used_api"],
+                                "used_api": FACETLESS_EVIDENCE_API,
                             }
-                        )
+                        else:
+                            row = {
+                                "body_type": body_type,
+                                "body_index": index,
+                                "face_index": face_index,
+                                "triangle_count": 0,
+                                "area_m2": float(area),
+                                "tessellate_probe_error": facetless_error,
+                                "used_api": FACETLESS_EVIDENCE_API,
+                            }
+                        evidence["no_facets_faces"].append(row)
                         completed_faces += 1
                         continue
                     raise CadError(

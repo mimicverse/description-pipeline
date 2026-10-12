@@ -454,15 +454,59 @@ class ComponentMeshExportTests(unittest.TestCase):
         self.assertEqual(row["area_m2"], 1.871564249915375e-13)
         self.assertEqual(tessellation.calls, 2)
 
-    def test_persistent_transient_facetless_probe_fails_after_bounded_attempts(self):
+    def test_persistent_transient_probe_on_degenerate_face_records_the_probe_error(self):
+        for area in (1.871564249915375e-13, 1e-12):
+            with self.subTest(area=area):
+                dest = self.tmp / f"mesh-{area}.stl"
+                tessellation = FlakyTessellation(failures=99, facets=0, tessellate_result=True)
+                backend = self._sheet_facetless_backend(FakeFace([], triangle_count=0, area=area), tessellation)
+                entry = backend.export_component_meshes({"pcb-1": dest})["pcb-1"]
+                row = entry["tessellation"]["no_facets_faces"][0]
+                self.assertEqual(
+                    set(row),
+                    {
+                        "body_type",
+                        "body_index",
+                        "face_index",
+                        "triangle_count",
+                        "area_m2",
+                        "tessellate_probe_error",
+                        "used_api",
+                    },
+                )
+                self.assertEqual(row["triangle_count"], 0)
+                self.assertEqual(row["area_m2"], area)
+                self.assertIn("com_error", row["tessellate_probe_error"])
+                self.assertIn("-2147417851", row["tessellate_probe_error"])
+                self.assertEqual(row["used_api"], "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets")
+                self.assertEqual(tessellation.calls, 3)
+                self.assertEqual(entry["triangles"], 1)
+                self.assertTrue(dest.exists())
+
+    def test_persistent_transient_probe_on_non_degenerate_face_stays_fatal(self):
         tessellation = FlakyTessellation(failures=99, facets=0, tessellate_result=True)
-        backend = self._sheet_facetless_backend(FakeFace([], triangle_count=0, area=1e-12), tessellation)
+        backend = self._sheet_facetless_backend(FakeFace([], triangle_count=0, area=1e-6), tessellation)
         with self.assertRaises(CadError) as caught:
             backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
         self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
         self.assertIn("com_error", caught.exception.detail["facetless_error"])
         self.assertEqual(tessellation.calls, 3)
         self.assertFalse(self.dest.exists())
+
+    def test_transient_probe_error_with_weak_degeneracy_evidence_stays_fatal(self):
+        cases = {
+            "boolean-count": FakeFace([], triangle_count=True, area=1e-13),
+            "boolean-area": FakeFace([], triangle_count=0, area=True),
+        }
+        for label, face in cases.items():
+            with self.subTest(label=label):
+                tessellation = FlakyTessellation(failures=99, facets=0, tessellate_result=True)
+                backend = self._sheet_facetless_backend(face, tessellation)
+                with self.assertRaises(CadError) as caught:
+                    backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+                self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
+                self.assertIn("com_error", caught.exception.detail["facetless_error"])
+                self.assertFalse(self.dest.exists())
 
     def test_retry_helper_retries_only_the_transient_signature(self):
         from description_pipeline.sources.solidworks.native import (
