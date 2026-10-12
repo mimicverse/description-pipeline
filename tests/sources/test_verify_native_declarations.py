@@ -177,17 +177,108 @@ class NativeDeclarationsTests(unittest.TestCase):
         for patch in [{"error_code": 1}, {"type": "unread"}, {"type": "coincident"}]:
             candidate = copy.deepcopy(raw)
             candidate["mates"][0].update(patch)
-            self.assertIn("v14.coverage", self.errors(candidate))
+            report = verify_declarations(candidate)
+            self.assertTrue(report["passed"], report["errors"])
+            self.assertEqual(report["completion"], {})
+            warnings = [item for item in report["diagnostics"] if item["code"] == "v14.unassigned_native"]
+            self.assertEqual([item["detail"]["component"] for item in warnings], ["cover"])
+            self.assertNotIn("cover", report["members"]["base"])
 
     def test_rigidity_to_two_declared_links_never_merges_or_selects_owner(self):
         raw = fixture()
         raw["components"].append(component("cover"))
         raw["mates"] = [lock("cover", "base_part"), lock("cover", "module-1/tool_part")]
         report = verify_declarations(raw)
-        self.assertIn("v14.coverage", {item["code"] for item in report["errors"]})
+        self.assertTrue(report["passed"], report["errors"])
         self.assertEqual(report["completion"], {})
         self.assertNotIn("cover", report["members"]["base"])
         self.assertNotIn("cover", report["members"]["tool"])
+        warnings = [item for item in report["diagnostics"] if item["code"] == "v14.unassigned_native"]
+        self.assertEqual([item["detail"]["component"] for item in warnings], ["cover"])
+        self.assertFalse(warnings[0]["blocking"])
+
+    def test_concentric_rotation_lock_rigidity_binds_true_and_the_documented_api(self):
+        api = "IConcentricMateFeatureData.LockRotation"
+
+        def coaxial(lock, witness):
+            mate = {
+                "name": "coaxial_washer",
+                "type": "concentric",
+                "suppressed": False,
+                "error_code": 0,
+                "scope": "",
+                "limits": None,
+                "entities": [
+                    {
+                        "component": "washer",
+                        "feature": "Edge1",
+                        "circle": {"center": [0, 0, 0], "normal": [0, 0, 1], "radius": 0.004},
+                    },
+                    {
+                        "component": "base_part",
+                        "feature": "Edge2",
+                        "circle": {"center": [0, 0, 0], "normal": [0, 0, 1], "radius": 0.006},
+                    },
+                ],
+            }
+            if lock is not None:
+                mate["lock_rotation"] = lock
+            if witness is not None:
+                mate["lock_rotation_api"] = witness
+            return mate
+
+        def seated():
+            return {
+                "name": "seated_washer",
+                "type": "coincident",
+                "suppressed": False,
+                "error_code": 0,
+                "scope": "",
+                "limits": None,
+                "entities": [
+                    {"component": "washer", "feature": "Face1", "plane": {"point": [0, 0, 0], "normal": [0, 0, 1]}},
+                    {
+                        "component": "base_part",
+                        "feature": "Face2",
+                        "plane": {"point": [0, 0, 0], "normal": [0, 0, -1]},
+                    },
+                ],
+            }
+
+        def build(lock, witness):
+            raw = fixture()
+            raw["components"].append(component("washer"))
+            raw["mates"] = [coaxial(lock, witness), seated()]
+            return raw
+
+        report = verify_declarations(build(True, api))
+        self.assertTrue(report["passed"], report["errors"])
+        self.assertEqual(report["completion"], {"washer": "base"})
+        for label, raw in (
+            ("free_spin", build(False, api)),
+            ("unread_lock", build(None, api)),
+            ("boolean_int", build(1, api)),
+            ("string_true", build("true", api)),
+            ("missing_witness", build(True, None)),
+            ("guessed_witness", build(True, api + "-guess")),
+        ):
+            with self.subTest(case=label):
+                report = verify_declarations(raw)
+                self.assertTrue(report["passed"], report["errors"])
+                self.assertEqual(report["completion"], {})
+                warnings = [item for item in report["diagnostics"] if item["code"] == "v14.unassigned_native"]
+                self.assertEqual([item["detail"]["component"] for item in warnings], ["washer"])
+
+    def test_source_claims_cannot_absorb_or_omit_native_membership(self):
+        raw = fixture()
+        raw["components"].append(component("washer"))
+        raw["mates"] = []
+        absorbed = source_claims()
+        absorbed["bodies"][0]["components"].append("washer")
+        self.assertIn("v14.claims", self.errors(raw, absorbed))
+        omitted = source_claims()
+        omitted["bodies"][1]["components"] = ["module-1/tool_part"]
+        self.assertIn("v14.claims", self.errors(fixture(), omitted))
 
     def test_zero_parameters_are_preserved_and_warn_as_motion_unqualified(self):
         def limit_items(root):

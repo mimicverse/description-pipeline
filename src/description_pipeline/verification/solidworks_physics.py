@@ -77,15 +77,58 @@ def _require_measured_reading(measured: dict, row: dict, reference: dict, name: 
     )
 
 
-def verify_urdf_mass_equality(bundle_root: Path) -> dict:
+def _unassigned_mass_rows(evidence_root: Path, source: dict) -> list[dict]:
+    """The measured masses of native leaves that no selected body claims."""
+
+    scene = read_data(confined(evidence_root, "raw/scene_raw.json"))
+    rows_scene = scene.get("components") if isinstance(scene, dict) else None
+    _require(isinstance(rows_scene, list), "The raw scene carries no component inventory")
+    _require(
+        all(isinstance(row, dict) and isinstance(row.get("name"), str) for row in rows_scene),
+        "The raw scene component inventory is malformed",
+    )
+    leaves = [str(row["name"]) for row in rows_scene]
+    _require(len(set(leaves)) == len(leaves), "The raw scene component inventory carries duplicate names")
+    payload = read_data(confined(evidence_root, "raw/mass_closure.json"))
+    context = payload.get("component_context") if isinstance(payload, dict) else None
+    instances = context.get("instances") if isinstance(context, dict) else None
+    _require(isinstance(instances, list), "Unassigned accounting awaits the recorded component context")
+    _require(
+        all(isinstance(row, dict) and isinstance(row.get("name"), str) for row in instances),
+        "The component context instance rows are malformed",
+    )
+    named = [(str(row["name"]), row) for row in instances]
+    _require(len({name for name, _row in named}) == len(named), "The component context carries duplicate instances")
+    by_name = dict(named)
+    selected = {
+        str(component) for body in source.get("bodies") or [] for component in body.get("components") or []
+    }
+    rows = []
+    for name in sorted(set(leaves) - selected):
+        row = by_name.get(name)
+        _require(isinstance(row, dict), f"Unassigned native component {name!r} has no assembly-context reading")
+        value = row.get("context_mass_kg")
+        _require(
+            type(value) in (int, float) and math.isfinite(value) and value > 0,
+            f"Unassigned native component {name!r} has no valid measured mass",
+        )
+        rows.append({"component": name, "document": row.get("document"), "mass_kg": float(value)})
+    return rows
+
+
+def verify_urdf_mass_equality(bundle_root: Path, source: dict | None = None) -> dict:
     """Mandatory whole-CAD equality for the delivered URDF.
 
-    The actual delivered URDF XML inertial mass sum must equal the bound
-    ``evidence/raw/mass_closure.json`` whole-assembly mass with an absolute
-    tolerance of 1e-12 kg and no relative tolerance. Missing, malformed or
-    non-recorded whole evidence fails; masses are never normalized or adjusted.
-    This gate is independent of the broader per-link mass/COM/tensor accuracy
-    checks, which keep their own relative tolerances.
+    The actual delivered URDF XML inertial mass sum, plus the independently
+    measured mass of every native occurrence that no selected body claims,
+    must equal the bound ``evidence/raw/mass_closure.json`` whole-assembly
+    mass with an absolute tolerance of 1e-12 kg and no relative tolerance.
+    Accounting unassigned occurrences this way records ``whole_mass_qualified``
+    false together with an exact per-component warning; the readings
+    themselves are never normalized, redistributed or adjusted. Missing,
+    malformed or non-recorded evidence fails, and an unexplained gap always
+    fails. This gate is independent of the broader per-link mass/COM/tensor
+    accuracy checks, which keep their own relative tolerances.
     """
 
     root = Path(bundle_root)
@@ -130,19 +173,42 @@ def verify_urdf_mass_equality(bundle_root: Path) -> dict:
         values.append(value)
     _require(values, "Delivered URDF carries no inertial masses")
     total = math.fsum(values)
-    delta = total - whole
+    unassigned = _unassigned_mass_rows(root / "evidence", source) if source is not None else []
+    allowance = math.fsum(item["mass_kg"] for item in unassigned)
+    accounted = total + allowance
+    delta = accounted - whole
     _require(
         abs(delta) <= MASS_CLOSURE_ATOL,
-        f"URDF mass sum {total!r} differs from the whole-CAD reading {whole!r} (delta {delta!r} kg)",
+        f"URDF mass sum {total!r} plus measured unassigned native mass {allowance!r} kg differs "
+        f"from the whole-CAD reading {whole!r} (delta {delta!r} kg)",
     )
-    return {
+    details = {
         "urdf_mass_kg": total,
+        "unassigned_mass_kg": allowance,
+        "accounted_mass_kg": accounted,
         "whole_cad_mass_kg": whole,
         "delta_kg": delta,
         "atol_kg": MASS_CLOSURE_ATOL,
         "rtol": 0.0,
         "inertials": len(values),
+        "unassigned": unassigned,
+        "whole_mass_qualified": not unassigned,
     }
+    if unassigned:
+        details["warnings"] = [
+            {
+                "code": "urdf.unassigned_native_mass",
+                "component": item["component"],
+                "mass_kg": item["mass_kg"],
+                "message": (
+                    f"native component {item['component']!r} is not selected into any body; its measured "
+                    f"{item['mass_kg']!r} kg is excluded from the delivered URDF and accounted explicitly, "
+                    "so whole-assembly mass qualification is withheld"
+                ),
+            }
+            for item in unassigned
+        ]
+    return details
 
 
 def _reading(name, record, scope):
@@ -932,7 +998,6 @@ def _derive_closure(native: dict, raw_scene: dict, masses: dict, source: dict) -
     except ValueError:
         leaf_total = None
     effective_total = oracle._raw_world(body, raw_scene, masses, {})
-    effective = oracle.effective_math_map(masses, raw_scene)
     parents = sorted(
         name
         for name, value in oracle._notes_effective(raw_scene).items()
@@ -969,6 +1034,8 @@ def _derive_closure(native: dict, raw_scene: dict, masses: dict, source: dict) -
         if not isinstance(row, dict) or not isinstance(row.get("name"), str):
             raise ValueError("the native component context carries a malformed instance row")
         parsed.append((row["name"], row))
+    if len({name for name, _entry in parsed}) != len(parsed):
+        raise ValueError("the native component context carries duplicate instance rows")
     masses_by_name = {
         name: float((payload or {}).get("mass") or 0.0)
         for name, payload in masses.items()
@@ -1016,6 +1083,38 @@ def _derive_closure(native: dict, raw_scene: dict, masses: dict, source: dict) -
     )
     top_level = native.get("top_level")
     delta = _closure_delta(top_level, leaf_total) if isinstance(top_level, dict) and leaf_total else None
+    by_instance = dict(parsed)
+    unassigned = []
+    for name in sorted(set(leaves) - set(body_members)):
+        row = by_instance.get(name)
+        if not isinstance(row, dict):
+            raise ValueError("unassigned occurrence has no native assembly-context mass: " + name)
+        value = row.get("context_mass_kg")
+        if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+            raise ValueError("unassigned occurrence has an invalid native mass: " + name)
+        reference = (masses.get(name) or {}).get("reference") or {}
+        unassigned.append(
+            {
+                "component": name,
+                "document": row.get("document"),
+                "configuration": reference.get("configuration"),
+                "parent": row.get("parent"),
+                "mass_kg": float(value),
+            }
+        )
+    unassigned_mass = math.fsum(entry["mass_kg"] for entry in unassigned)
+    native_mass = float(top_level["mass"]) if isinstance(top_level, dict) and "mass" in top_level else None
+    full_mass = float(effective_total["mass"])
+    selection = {
+        "native_mass_kg": native_mass,
+        "selected_mass_kg": full_mass - unassigned_mass,
+        "unassigned_mass_kg": unassigned_mass,
+        "unassigned": unassigned,
+        "accounting_delta_kg": None if native_mass is None else native_mass - full_mass,
+        "whole_mass_qualified": (
+            not unassigned and native_mass is not None and abs(native_mass - full_mass) <= 1e-12
+        ),
+    }
     return {
         "leaf_total": leaf_payload,
         "effective_total": {
@@ -1042,6 +1141,7 @@ def _derive_closure(native: dict, raw_scene: dict, masses: dict, source: dict) -
         "instances": {
             name: {"name": name, **instances[name]} for name, _row in parsed
         },
+        "selection": selection,
     }
 
 

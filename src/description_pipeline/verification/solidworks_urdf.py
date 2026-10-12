@@ -13,6 +13,7 @@ import json
 import math
 import ntpath
 import re
+import struct
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -31,6 +32,8 @@ from .consumer import load as load_consumer
 QUALITY_SCHEMA = "solidworks-to-urdf.quality/v1"
 POSITION_TOL_M = 5e-5
 ROTATION_TOL_RAD = math.radians(0.05)
+#: Deterministic MuJoCo-oriented partition limit for one delivered mesh visual.
+CHUNK_TRIANGLES_MAX = 199_999
 _NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
@@ -586,15 +589,29 @@ def _entities(source, raw, model):
     authored = [name for body in source["bodies"] for name in body["components"]]
     _require(bool(components) and len(components) == len(set(components)), "Empty/duplicate native occurrences")
     _require(
-        len(authored) == len(set(authored)) and set(authored) == set(components),
-        "Every native occurrence must belong to exactly one body",
+        len(authored) == len(set(authored)) and set(authored) <= set(components),
+        "Every selected occurrence must be one unique captured native component",
     )
     links = {row["name"]: row for row in model["links"]}
     _require(set(links) == {body["name"] for body in source["bodies"]}, "Canonical body set differs")
     for body in source["bodies"]:
         _require(links[body["name"]]["id"] == body["id"], "Body identity changed")
         _require(links[body["name"]]["provenance"]["source_entities"] == body["components"], "Body occurrences changed")
-    return {"occurrences": len(components), "bodies": len(links)}
+    provenance = model.get("provenance")
+    _require(isinstance(provenance, dict), "The sealed scene carries no entity provenance")
+    unassigned = sorted(set(components) - set(authored))
+    _require(
+        provenance.get("expected_entities") == sorted(authored)
+        and provenance.get("native_entities") == sorted(components)
+        and provenance.get("unassigned_entities") == unassigned,
+        "Scene entity partitions differ from the selected bodies and the native capture",
+    )
+    return {
+        "occurrences": len(components),
+        "bodies": len(links),
+        "selected": len(authored),
+        "unassigned": len(unassigned),
+    }
 
 
 def _tool(root):
@@ -892,55 +909,111 @@ def _qualified_surface_only(root, occurrence: str) -> bool:
     return type(solids) is int and solids == 0 and type(sheets) is int and sheets > 0
 
 
+def _mesh_chunk_count(triangles: int) -> int:
+    """The deterministic delivered-chunk count of one canonical mesh visual."""
+
+    _require(triangles > 0, "Empty mesh")
+    return (triangles + CHUNK_TRIANGLES_MAX - 1) // CHUNK_TRIANGLES_MAX
+
+
+def _check_mesh_part(data: bytes, source_bytes: bytes, start: int, count: int) -> None:
+    """One delivered mesh part: copied header, its own count, contiguous source records."""
+
+    _require(len(data) == 84 + 50 * count, "A mesh part does not match its declared triangle count")
+    _require(data[:80] == source_bytes[:80], "A mesh part header was not copied from the captured source mesh")
+    _require(struct.unpack("<I", data[80:84])[0] == count, "A mesh part header count differs from its records")
+    _require(
+        data[84:] == source_bytes[84 + 50 * start : 84 + 50 * (start + count)],
+        "Mesh parts do not reproduce the captured source triangle records in order",
+    )
+
+
 def _geometry(root, body, node, model_link, geometry, components, body_pose, urdf_pose, exclusions):
     visuals = node.findall("visual")
     canonical = model_link["visuals"]
-    _require(
-        len(visuals) == len(canonical) == len(body["components"]), "Visual geometry does not cover every occurrence"
-    )
+    _require(len(canonical) == len(body["components"]), "Canonical visuals differ from the selected occurrences")
+    expected = 0
+    for occurrence in body["components"]:
+        row = geometry[occurrence]
+        _require(
+            type(row.get("triangles")) is int and row["triangles"] > 0,
+            "Geometry receipt carries no triangle count",
+        )
+        expected += _mesh_chunk_count(row["triangles"])
+    _require(len(visuals) == expected, "Visual geometry does not cover every occurrence")
     _require(not node.findall("collision") and not model_link["collisions"], "Unspecified collision conversion")
     all_points, used = [], []
-    for occurrence, visual, shape in zip(body["components"], visuals, canonical, strict=True):
+    cursor = 0
+    for index, (occurrence, shape) in enumerate(zip(body["components"], canonical, strict=True)):
         row = geometry[occurrence]
         original = confined(root / "evidence", row["path"])
         _require(
             file_digest(original) == row["sha256"] and shape["filename"] == row["path"], "Source mesh identity differs"
         )
-        mesh = _one(_one(visual, "geometry"), "mesh")
-        uri = mesh.attrib["filename"]
+        source_bytes = original.read_bytes()
+        stats = stl.read_bytes(source_bytes)
         _require(
-            uri.startswith("../meshes/") and "\\" not in uri and ":" not in uri,
-            "Mesh URI must reference delivered meshes",
+            stats.binary and stats.triangles == row["triangles"],
+            "Geometry receipt differs from the captured source mesh",
         )
-        delivery_name = "meshes/" + uri[len("../meshes/") :]
-        delivered = confined(root, delivery_name)
-        _require(file_digest(delivered) == row["sha256"], "Delivered mesh bytes differ from captured geometry")
-        used.append(delivery_name)
-        _require(
-            np.array_equal(_numbers(mesh, "scale", 3), [1, 1, 1]) and shape["scale"] == [1, 1, 1],
-            "Meshes must use native SI units without rescaling",
-        )
-        native_pose = np.linalg.inv(body_pose) @ components[occurrence]
-        _same_pose(_xml_pose(visual), native_pose)
-        _same_pose(_pose(shape["xyz"], shape["rpy"]), native_pose)
-        stats = stl.read(delivered)
-        _require(stats.triangles > 0 and stats.area > 0, "Empty mesh")
+        _require(stats.area > 0, "Empty mesh")
         _require(stats.degenerate / stats.triangles <= 0.001, "More than 0.1% degenerate triangles")
-        _require(row["triangles"] == stats.triangles, "Geometry receipt differs from actual mesh")
+        chunks = _mesh_chunk_count(stats.triangles)
+        group = visuals[cursor : cursor + chunks]
+        cursor += chunks
+        materials, origins = set(), []
+        for part, visual in enumerate(group):
+            mesh = _one(_one(visual, "geometry"), "mesh")
+            uri = mesh.attrib["filename"]
+            _require(
+                uri.startswith("../meshes/") and "\\" not in uri and ":" not in uri,
+                "Mesh URI must reference delivered meshes",
+            )
+            delivery_name = "meshes/" + uri[len("../meshes/") :]
+            expected_name = f"meshes/visual/{node.attrib['name']}_{index}" + (
+                f"_part_{part}.stl" if chunks > 1 else ".stl"
+            )
+            _require(
+                delivery_name == expected_name,
+                "Delivered mesh naming differs from the canonical mesh contract",
+            )
+            delivered = confined(root, delivery_name)
+            if chunks == 1:
+                _require(file_digest(delivered) == row["sha256"], "Delivered mesh bytes differ from captured geometry")
+            else:
+                _check_mesh_part(
+                    delivered.read_bytes(),
+                    source_bytes,
+                    CHUNK_TRIANGLES_MAX * part,
+                    min(CHUNK_TRIANGLES_MAX, stats.triangles - CHUNK_TRIANGLES_MAX * part),
+                )
+            used.append(delivery_name)
+            _require(
+                np.array_equal(_numbers(mesh, "scale", 3), [1, 1, 1]) and shape["scale"] == [1, 1, 1],
+                "Meshes must use native SI units without rescaling",
+            )
+            material = visual.find("material")
+            materials.add(ET.tostring(material, encoding="unicode") if material is not None else "")
+            origins.append(_xml_pose(visual))
+        _require(len(materials) == 1, "Mesh parts carry different visual materials")
+        native_pose = np.linalg.inv(body_pose) @ components[occurrence]
+        for origin in origins:
+            _same_pose(origin, native_pose)
+        _same_pose(_pose(shape["xyz"], shape["rpy"]), native_pose)
         _require(
             stats.volume > 1e-15
             or occurrence in exclusions
             or _qualified_surface_only(root, occurrence),
             "Zero-volume geometry needs a documented exclusion",
         )
-        points = stl.vertices(delivered)
-        world = urdf_pose @ _xml_pose(visual)
+        points = stl.vertices(original)
+        world = urdf_pose @ origins[0]
         native = components[occurrence]
         # Compare placement using actual vertices, not bounds written by generation.
         actual = points @ world[:3, :3].T + world[:3, 3]
-        expected = points @ native[:3, :3].T + native[:3, 3]
+        desired = points @ native[:3, :3].T + native[:3, 3]
         _require(
-            np.max(np.linalg.norm(actual - expected, axis=1)) <= POSITION_TOL_M,
+            np.max(np.linalg.norm(actual - desired, axis=1)) <= POSITION_TOL_M,
             "Mesh vertices are displaced from native CAD",
         )
         all_points.append(points @ native_pose[:3, :3].T + native_pose[:3, 3])
@@ -975,7 +1048,7 @@ def evaluate_bundle(root: Path) -> dict:
         gates.add("source.native", lambda: _native(root, manifest))
     model = gates.add("model.schema", lambda: _model(root))
     raw = gates.add("source.raw", lambda: read_data(confined(root / "evidence", "raw/scene_raw.json")))
-    gates.add("physics.mass_closure_equality", lambda: _mass_closure_equality(root))
+    gates.add("physics.mass_closure_equality", lambda: _mass_closure_equality(root, definition))
     if definition is not None:
         gates.add("source.dependencies", lambda: _dependencies(root, definition))
     if definition is not None and model is not None and raw is not None:
@@ -1046,10 +1119,10 @@ def _model(root):
     return Robot.from_dict(read_data(confined(root, "model/robot.json"))).to_dict()
 
 
-def _mass_closure_equality(root):
+def _mass_closure_equality(root, definition=None):
     from .solidworks_physics import verify_urdf_mass_equality
 
-    return verify_urdf_mass_equality(root)
+    return verify_urdf_mass_equality(root, (definition or {}).get("source"))
 
 
 def _verify_model(root, gates, definition, model, raw, diagnostics):

@@ -45,6 +45,8 @@ SUPPORTED_MATES = {
 
 AXIS_OFFSET_TOL_M = 5e-5
 TOL = 1e-6
+#: The documented native property that may carry a concentric rotation lock.
+LOCK_ROTATION_API = "IConcentricMateFeatureData.LockRotation"
 #: Conflict tolerances of the delivery contract: 0.05 mm and 0.05 degrees.
 _CONFLICT_POS_TOL_M = 5e-5
 _CONFLICT_ANGLE_EPS = 1.0 - math.cos(math.radians(0.05))
@@ -1115,6 +1117,11 @@ def _rows_for(mate: dict, frames) -> dict | None:
         rows = [_translation_row(direction, left_point) for direction in plane] + [
             _rotation_row(direction) for direction in plane
         ]
+        # The documented concentric rotation lock removes the spin only: one axial
+        # rotation row, and only from an exact native boolean true.  A missing,
+        # false or non-boolean value leaves the revolute freedom intact.
+        if mate.get("lock_rotation") is True and mate.get("lock_rotation_api") == LOCK_ROTATION_API:
+            rows.append(_rotation_row(left_axis))
         # Circle axes reconstruct the constraint but never evidence the shaft: the
         # independent interface gate must keep requiring a real cylindrical entity.
         shaft = None

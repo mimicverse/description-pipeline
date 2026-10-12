@@ -223,6 +223,39 @@ class PhysicsTests(unittest.TestCase):
         if effective is None:
             effective = {**copy.deepcopy(self.closure["leaf_total"]), "substituted": []}
         effective.setdefault("substituted", [])
+        body_members = {
+            str(component)
+            for body in self.source.get("bodies") or []
+            for component in body.get("components") or []
+        }
+        by_instance = {
+            str(row.get("name")): row
+            for row in ((self.closure.get("component_context") or {}).get("instances") or [])
+            if isinstance(row, dict)
+        }
+        unassigned = []
+        for name in sorted(set(leaves) - body_members):
+            row = by_instance[name]
+            unassigned.append(
+                {
+                    "component": name,
+                    "document": row.get("document"),
+                    "configuration": ((self.masses.get(name) or {}).get("reference") or {}).get("configuration"),
+                    "parent": row.get("parent"),
+                    "mass_kg": float(row["context_mass_kg"]),
+                }
+            )
+        unassigned_mass = float(sum(item["mass_kg"] for item in unassigned))
+        whole_mass = float(self.closure["top_level"]["mass"])
+        effective_mass = float(effective["mass"])
+        selection = {
+            "native_mass_kg": whole_mass,
+            "selected_mass_kg": effective_mass - unassigned_mass,
+            "unassigned_mass_kg": unassigned_mass,
+            "unassigned": unassigned,
+            "accounting_delta_kg": whole_mass - effective_mass,
+            "whole_mass_qualified": not unassigned and abs(whole_mass - effective_mass) <= 1e-12,
+        }
         return {
             "leaf_total": copy.deepcopy(self.closure["leaf_total"]),
             "effective_total": effective,
@@ -263,6 +296,7 @@ class PhysicsTests(unittest.TestCase):
                 }
                 for row in rows
             },
+            "selection": selection,
         }
 
     def failures(self):
@@ -1294,6 +1328,87 @@ class UrdfMassEqualityTests(unittest.TestCase):
                     verify_urdf_mass_equality(self.root)
 
 
+class DerivedSelectionAccountingTests(unittest.TestCase):
+    """The independent recomputation binds each native instance and its own measurements."""
+
+    def test_unassigned_rows_keep_each_instance_identity_and_never_redistribute(self):
+        from description_pipeline.verification.solidworks_physics import _derive_closure
+
+        placement = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+        masses = {
+            "a": {
+                "mass": 1.0,
+                "com": [0.0, 0.0, 0.0],
+                "inertia": [[1e-3, 0.0, 0.0], [0.0, 1e-3, 0.0], [0.0, 0.0, 1e-3]],
+                "reference": {"product_convention": "solidworks_standard", "configuration": "Default"},
+            },
+            "b": {
+                "mass": 2.0,
+                "com": [0.0, 0.0, 0.0],
+                "inertia": [[2e-3, 0.0, 0.0], [0.0, 2e-3, 0.0], [0.0, 0.0, 2e-3]],
+                "reference": {"product_convention": "solidworks_standard", "configuration": "Other"},
+            },
+        }
+        native = {
+            "top_level": {
+                "mass": 3.0,
+                "com": [0.0, 0.0, 0.0],
+                "inertia": [[3e-3, 0.0, 0.0], [0.0, 3e-3, 0.0], [0.0, 0.0, 3e-3]],
+            },
+            "component_context": {
+                "status": "recorded",
+                "assembly_mass_kg": 3.0,
+                "instances": [
+                    {
+                        "name": "a",
+                        "parent": None,
+                        "depth": 0,
+                        "document": "a.SLDPRT",
+                        "document_type": "part",
+                        "context_mass_kg": 1.0,
+                        "context_volume_m3": None,
+                        "overrides": {},
+                        "effective": None,
+                        "effective_error": None,
+                    },
+                    {
+                        "name": "b",
+                        "parent": "frame-9",
+                        "depth": 1,
+                        "document": "b.SLDPRT",
+                        "document_type": "part",
+                        "context_mass_kg": 2.0,
+                        "context_volume_m3": None,
+                        "overrides": {},
+                        "effective": None,
+                        "effective_error": None,
+                    },
+                ],
+                "errors": [],
+            },
+        }
+        scene = {
+            "components": [{"name": "a", "transform": placement}, {"name": "b", "transform": placement}],
+            "mass_properties": copy.deepcopy(masses),
+            "notes": {},
+        }
+        source = {"bodies": [{"name": "base", "components": ["a"]}]}
+        derived = _derive_closure(native, scene, scene["mass_properties"], source)
+        selection = derived["selection"]
+        self.assertAlmostEqual(selection["native_mass_kg"], 3.0, places=12)
+        self.assertAlmostEqual(selection["unassigned_mass_kg"], 2.0, places=12)
+        self.assertAlmostEqual(selection["selected_mass_kg"], 1.0, places=12)
+        self.assertAlmostEqual(selection["accounting_delta_kg"], 0.0, places=12)
+        self.assertFalse(selection["whole_mass_qualified"])
+        self.assertEqual(len(selection["unassigned"]), 1)
+        row = selection["unassigned"][0]
+        self.assertEqual(row["component"], "b")
+        self.assertEqual(row["document"], "b.SLDPRT")
+        self.assertEqual(row["configuration"], "Other")
+        self.assertEqual(row["parent"], "frame-9")
+        self.assertAlmostEqual(row["mass_kg"], 2.0, places=12)
+
+
 class OptionalDesignExpectationTests(unittest.TestCase):
     def test_absent_expectations_do_not_execute_or_require_a_passing_placeholder(self):
         definition = {"checks": {}}
@@ -1431,16 +1546,16 @@ class SurfaceOnlyGeometryExemptionTests(unittest.TestCase):
     def _geometry_fixture(self, root, *, qualified, collinear):
         payload = self._stl_bytes(collinear=collinear)
         (root / "evidence/geometry").mkdir(parents=True, exist_ok=True)
-        (root / "meshes").mkdir(parents=True, exist_ok=True)
+        (root / "meshes/visual").mkdir(parents=True, exist_ok=True)
         (root / "evidence/geometry/0001_mesh.stl").write_bytes(payload)
-        (root / "meshes/0001_mesh.stl").write_bytes(payload)
+        (root / "meshes/visual/board_0.stl").write_bytes(payload)
         digest = hashlib.sha256(payload).hexdigest()
         occurrence = "pcb-1"
         if qualified:
             self._delivery(root)
         node = ET.fromstring(
             '<link name="board"><visual><origin xyz="0 0 0" rpy="0 0 0"/>'
-            '<geometry><mesh filename="../meshes/0001_mesh.stl" scale="1 1 1"/></geometry></visual></link>'
+            '<geometry><mesh filename="../meshes/visual/board_0.stl" scale="1 1 1"/></geometry></visual></link>'
         )
         body = {"components": [occurrence]}
         model_link = {

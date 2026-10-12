@@ -453,6 +453,24 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
             )
         added, proofs, conflicts = _complete_membership(raw, components, members, leaves)
         uncovered = sorted(leaves - set().union(*members.values()))
+        for name in uncovered:
+            component = components[name]
+            diagnostics.append(
+                {
+                    "code": "v14.unassigned_native",
+                    "blocking": False,
+                    "message": (
+                        "native material leaf is not attached by any declared link or proven "
+                        "rigid attachment; it stays outside the selected model and its measured "
+                        "mass must be accounted explicitly"
+                    ),
+                    "detail": {
+                        "component": name,
+                        "document": component.get("document"),
+                        "configuration": component.get("configuration"),
+                    },
+                }
+            )
         state.update(
             components=components,
             members=members,
@@ -469,7 +487,6 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
             "rigid_completion": added,
             "rigid_proofs": proofs,
         }
-        _require(not uncovered, "v14.coverage", "native material leaves remain unassigned", **details)
         return details
 
     def frame(name):
