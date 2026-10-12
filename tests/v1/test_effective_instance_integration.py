@@ -15,6 +15,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from typing import ClassVar
 
 import numpy as np
 
@@ -45,11 +46,7 @@ def combine(mass_a, com_a, tensor_a, mass_b, com_b, tensor_b):
     total = mass_a + mass_b
     com = (mass_a * com_a + mass_b * com_b) / total
     delta = com_a - com
-    inertia = (
-        tensor_a
-        + mass_a * (float(delta @ delta) * np.eye(3) - np.outer(delta, delta))
-        + tensor_b
-    )
+    inertia = tensor_a + mass_a * (float(delta @ delta) * np.eye(3) - np.outer(delta, delta)) + tensor_b
     delta = com_b - com
     inertia = inertia + mass_b * (float(delta @ delta) * np.eye(3) - np.outer(delta, delta))
     return total, com, inertia
@@ -369,12 +366,8 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
         (raw / "mass_properties.json").write_text(json.dumps(self.masses), encoding="utf-8")
         (raw / "mass_closure.json").write_text(json.dumps(native), encoding="utf-8")
         (raw / "effective_instances.json").write_text(json.dumps(record), encoding="utf-8")
-        (raw / "declared_masses.json").write_text(
-            json.dumps({"items": {}, "evidence": None}), encoding="utf-8"
-        )
-        (raw / "coordinate_systems.json").write_text(
-            json.dumps(self.raw_scene["coordinate_systems"]), encoding="utf-8"
-        )
+        (raw / "declared_masses.json").write_text(json.dumps({"items": {}, "evidence": None}), encoding="utf-8")
+        (raw / "coordinate_systems.json").write_text(json.dumps(self.raw_scene["coordinate_systems"]), encoding="utf-8")
         (raw / "source_config.json").write_text(json.dumps(self.source), encoding="utf-8")
         (raw / "material_provenance.json").write_text(
             json.dumps(
@@ -487,8 +480,8 @@ class StubInstanceBackend:
 class InstanceMeasurementIntegrationTests(unittest.TestCase):
     """Flagless divergence: producer tuple primary, part row diagnostic."""
 
-    TENSOR = [[0.002, 0.0, 0.0], [0.0, 0.003, 0.0], [0.0, 0.0, 0.004]]
-    FLAGS_OFF = {
+    TENSOR: ClassVar = [[0.002, 0.0, 0.0], [0.0, 0.003, 0.0], [0.0, 0.0, 0.004]]
+    FLAGS_OFF: ClassVar = {
         "OverrideMass": False,
         "OverrideCenterOfMass": False,
         "OverrideMomentsOfInertia": False,
@@ -613,14 +606,33 @@ class InstanceMeasurementIntegrationTests(unittest.TestCase):
                         (),
                         {
                             "name": self.PART,
-                            "transform": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                            "transform": [
+                                1.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                1.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                1.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                1.0,
+                            ],
                             "path": "C:\\captured\\copy\\np-f550.step.SLDPRT",
                             "is_fixed": False,
                             "document_type": "part",
                         },
                     )()
                 ],
-                "coordinate_systems": {"base_datum": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]},
+                "coordinate_systems": {
+                    "base_datum": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+                },
                 "mass_properties": {self.PART: copy.deepcopy(self.part_row)},
                 "notes": {},
             },
@@ -639,7 +651,9 @@ class InstanceMeasurementIntegrationTests(unittest.TestCase):
                     "document_type": "part",
                 }
             ],
-            "coordinate_systems": {"base_datum": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]},
+            "coordinate_systems": {
+                "base_datum": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+            },
             "mass_properties": {self.PART: copy.deepcopy(self.part_row)},
             "notes": {
                 "bodies:" + self.PART: {"solid": 8, "sheet": 0},
