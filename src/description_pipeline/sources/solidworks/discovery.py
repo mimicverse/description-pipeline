@@ -924,7 +924,8 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
         rows += [_rotation_row(direction) for direction in basis]
         # The documented concentric rotation lock removes the spin only.
         # Axial translation remains free until another native mate constrains it.
-        if mate.get("lock_rotation") is True:
+        if (mate.get("lock_rotation") is True
+                and mate.get("lock_rotation_api") == "IConcentricMateFeatureData.LockRotation"):
             rows.append(_rotation_row(axis))
         # Rows may be reconstructed from a circular edge, but shaft evidence is
         # only ever an actual cylindrical face: a circle normal can be flipped

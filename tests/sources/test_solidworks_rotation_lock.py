@@ -17,6 +17,7 @@ class ConcentricRotationLockTests(unittest.TestCase):
                 {"component": name, "circle": {"center": [0., 0., 0.], "normal": [0., 0., 1.], "radius": .01}}
                 for name in self.frames
             ],
+            "lock_rotation_api": "IConcentricMateFeatureData.LockRotation",
         }
 
     def rows(self, mate):
@@ -42,3 +43,8 @@ class ConcentricRotationLockTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.mate["lock_rotation"] = value
                 self.assertEqual(_rank(self.rows(self.mate)), 4)
+
+    def test_unbound_rotation_lock_cannot_complete_rigidity(self):
+        self.mate["lock_rotation"] = True
+        self.mate.pop("lock_rotation_api")
+        self.assertEqual(_rank(self.rows(self.mate)), 4)
