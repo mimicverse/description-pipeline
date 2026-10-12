@@ -399,7 +399,15 @@ def _component_context_findings(
                 "a documented mass only rescales the CAD tensor at an unchanged center of mass — or "
                 "remove the overrides in CAD"
             )
-        mismatches = [row for row in equivalence if str(row.get("name")) not in covered_names]
+        def _explained_by_cover(name: str) -> bool:
+            """An overridden/effective instance at, inside or above the node explains its divergence."""
+
+            return any(
+                covered == name or name.startswith(covered + "/") or covered.startswith(name + "/")
+                for covered in covered_names
+            )
+
+        mismatches = [row for row in equivalence if not _explained_by_cover(str(row.get("name")))]
         if isinstance(coverage, dict) and mismatches:
             examples = mismatches[:3]
             return details, (
