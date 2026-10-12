@@ -779,7 +779,11 @@ class StructuralReportTests(unittest.TestCase):
                 if item["code"] == "discovery.cad_unassigned_passive_joint"
             )
             self.assertEqual(finding["severity"], "warning")
-            self.assertEqual(finding["object"], "headM3.0-1/垫片2-2")
+            self.assertEqual(finding["object"], finding["evidence"]["joint"])
+            self.assertIn(finding["evidence"]["body"], finding["message"])
+            self.assertIn(finding["evidence"]["joint"], finding["message"])
+            self.assertIn("垫片2-2", finding["message"])
+            self.assertIn("headM3.0-1", finding["message"])
             self.assertIn("作者意图与驱动尚未取得工程确认", finding["message"])
             self.assertEqual(finding["evidence"]["rank"], 5)
             self.assertEqual(report["summary"]["blockers"], 0)

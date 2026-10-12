@@ -386,11 +386,12 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                     {
                         "severity": "warning",
                         "code": passive_code,
-                        "object": detail.get("component"),
+                        "object": detail.get("joint") or detail.get("component"),
                         "message": (
-                            "该 CAD 叶件未获得显式导出刚性归属：按 CAD 保存的装配自由度以被动连续关节补齐"
-                            "（rank 5：保留原始自由旋转，不推断刚性、驱动或限位）；作者意图与驱动尚未取得工程确认，"
-                            "是否通过以独立校验为准。"
+                            "该 CAD 叶件未获得显式导出刚性归属：已按 CAD 保存的装配自由度生成被动连续关节 "
+                            f"{detail['joint']}（刚体 {detail['body']}，rank 5：保留原始自由旋转，不推断刚性、驱动或限位）。"
+                            f"源 CAD 叶件 {detail['component']}（父装配 {detail['parent']}）；"
+                            "作者意图与驱动尚未取得工程确认，是否通过以独立校验为准。"
                         ),
                         "source": entry.get("source"),
                         "evidence": detail,
