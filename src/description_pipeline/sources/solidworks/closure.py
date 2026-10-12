@@ -14,6 +14,7 @@ reads files: the snapshot bytes are never modified.
 from __future__ import annotations
 
 import types
+import math
 from pathlib import Path
 
 from .jsonio import read_json
@@ -194,6 +195,34 @@ def _derive(native: dict, scene_raw: dict, config: dict) -> dict:
             "substituted": sorted(name for name, _descendants, _value in top_most),
         }
 
+    by_instance = {str(entry.get("name")): entry for entry in native_instances}
+    unassigned = []
+    for name in sorted(leaf_names - set(body_members)):
+        entry = by_instance.get(name)
+        if not isinstance(entry, dict):
+            raise ConfigError("unassigned occurrence has no native assembly-context mass", {"component": name})
+        value = entry.get("context_mass_kg")
+        if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+            raise ConfigError("unassigned occurrence has an invalid native mass", {"component": name})
+        reference = (mass_properties.get(name) or {}).get("reference") or {}
+        unassigned.append({
+            "component": name, "document": entry.get("document"),
+            "configuration": reference.get("configuration"), "parent": entry.get("parent"),
+            "mass_kg": float(value),
+        })
+    unassigned_mass = math.fsum(entry["mass_kg"] for entry in unassigned)
+    native_mass = float(top_level["mass"]) if isinstance(top_level, dict) and "mass" in top_level else None
+    full_mass = effective_total["mass"] if effective_total is not None else None
+    selection = {
+        "native_mass_kg": native_mass,
+        "selected_mass_kg": None if full_mass is None else full_mass - unassigned_mass,
+        "unassigned_mass_kg": unassigned_mass,
+        "unassigned": unassigned,
+        "accounting_delta_kg": None if native_mass is None or full_mass is None else native_mass - full_mass,
+        "whole_mass_qualified": not unassigned and native_mass is not None and full_mass is not None
+        and abs(native_mass - full_mass) <= 1e-12,
+    }
+
     return {
         "leaf_total": leaf_total,
         "effective_total": effective_total,
@@ -225,4 +254,5 @@ def _derive(native: dict, scene_raw: dict, config: dict) -> dict:
             "leaf_documents_uncovered": sorted(leaf_names - covered)[:50],
         },
         "instances": {entry["name"]: entry for entry in derived_instances},
+        "selection": selection,
     }

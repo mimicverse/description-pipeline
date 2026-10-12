@@ -260,7 +260,8 @@ class DeriveMassClosureTests(unittest.TestCase):
         derived = report["derived"]
         self.assertEqual(
             set(derived),
-            {"leaf_total", "effective_total", "blockers", "delta", "totals", "overridden", "coverage", "instances"},
+            {"leaf_total", "effective_total", "blockers", "delta", "totals", "overridden", "coverage", "instances",
+             "selection"},
         )
         self.assertEqual(
             set(derived["instances"]),
@@ -282,6 +283,24 @@ class DeriveMassClosureTests(unittest.TestCase):
             derived["coverage"],
             {"leaf_documents": 2, "leaf_documents_covered": 2, "leaf_documents_uncovered": []},
         )
+        self.assertEqual(_hashes(self.tmp), before)
+
+    def test_selection_gap_is_exact_native_unassigned_mass_without_redistribution(self):
+        self._write_evidence([{"name": "base_link", "components": [DEV]}])
+        path = self.tmp / "raw/mass_closure.json"
+        raw = json.loads(path.read_text())
+        raw["top_level"]["mass"] = .061
+        parent = raw["component_context"]["instances"][0]
+        parent["overrides"] = _flags()
+        parent["effective"] = None
+        path.write_text(json.dumps(raw))
+        before = _hashes(self.tmp)
+        selection = derive_mass_closure(self.tmp)["derived"]["selection"]
+        self.assertAlmostEqual(selection["selected_mass_kg"], .035, places=12)
+        self.assertAlmostEqual(selection["unassigned_mass_kg"], .026, places=12)
+        self.assertAlmostEqual(selection["accounting_delta_kg"], 0, places=12)
+        self.assertEqual(selection["unassigned"][0]["component"], EASYEDA)
+        self.assertFalse(selection["whole_mass_qualified"])
         self.assertEqual(_hashes(self.tmp), before)
 
     def test_derive_records_an_explicit_blocker_when_the_subtree_spans_bodies(self):

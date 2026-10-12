@@ -5063,8 +5063,9 @@ class SolidWorksBackend(CadBackend):
                     if mate_type == "concentric":
                         # Documented native rotation lock (IConcentricMateFeatureData
                         # .LockRotation, SW2019+; typelib IID {D9E1EBDD-...}): a
-                        # concentric mate with rotation locked is rigid, without it
-                        # the mate keeps its revolute spin.  The value is read from
+                        # concentric mate with rotation locked removes its spin;
+                        # axial translation still requires another constraint.
+                        # The value is read from
                         # CAD through the same GetDefinition path the earlier manual
                         # native scripts used; it is never inferred from any
                         # reference output.

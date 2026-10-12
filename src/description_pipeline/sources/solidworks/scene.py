@@ -573,7 +573,9 @@ def build_scene(
         "coordinate_systems_read": sorted((raw_scene.coordinate_systems or {}).keys()),
         # every native entity that a consumer must account for; the common
         # layer checks that the links below cover exactly this set
-        "expected_entities": sorted(placements),
+        "expected_entities": sorted(included),
+        "native_entities": sorted(placements),
+        "unassigned_entities": sorted(set(placements) - included),
         "world_from_root": world_from_root,
     }
     if unverified_material:
