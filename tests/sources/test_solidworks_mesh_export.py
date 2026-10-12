@@ -281,3 +281,54 @@ class AxisReferenceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class NoFullScanExportTests(unittest.TestCase):
+    """The native boundary writes and receipts meshes without a full STL scan."""
+
+    def _planar_stl(self):
+        import struct
+
+        header = b"planar fixture".ljust(80, b" ")
+        triangles = [
+            ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+            ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0)),
+        ]
+        payload = b"".join(struct.pack("<12fH", 0.0, 0.0, 1.0, *a, *b, *c, 0) for a, b, c in triangles)
+        return header + struct.pack("<I", len(triangles)) + payload
+
+    def test_export_records_identity_and_header_count_without_reader(self):
+        import hashlib
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        from importlib import import_module
+
+        freeze_module = import_module("description_pipeline.sources.solidworks.freeze")
+        native_module = import_module("description_pipeline.sources.solidworks.native")
+
+        self.assertFalse(hasattr(freeze_module, "read_stl"))
+        self.assertFalse(hasattr(native_module, "read_stl"))
+
+        payload = self._planar_stl()
+
+        class Backend:
+            def export_component_meshes(self, destinations):
+                entries = {}
+                for component, destination in destinations.items():
+                    Path(destination).write_bytes(payload)
+                    entries[component] = {"component": component, "written": destination, "used_api": "fixture"}
+                return entries
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch("description_pipeline.geometry.stl.read", side_effect=AssertionError("full scan")):
+                exported = freeze_module._export_geometry(
+                    Backend(), {"assembly": "robot.SLDASM"}, root / "evidence" / "geometry", ["pcb-1"]
+                )
+        self.assertEqual(len(exported), 1)
+        row = exported[0]
+        self.assertEqual(set(row), {"component", "path", "triangles", "used_api", "sha256"})
+        self.assertEqual(row["triangles"], 2)
+        self.assertEqual(row["sha256"], hashlib.sha256(payload).hexdigest())
+

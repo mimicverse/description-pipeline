@@ -48,11 +48,10 @@ their dependency records identify their different execution roles.
 
 The sealed native bytes are the captured inputs: readings, configuration and
 meshes travel as captured (`raw/scene_raw.json`, `raw/source_config.json`,
-evidence and mesh files), and the canonical scene snapshot and the
-structural-team reports are derived on Linux — the Windows worker renders no
-report and stores no derived scene. The native host still records its own
-derived capture diagnostics (mass-closure and component-context comparisons)
-and validates the exported meshes; the scene and report scope moved, nothing else.
+evidence and mesh files). Scene construction, closure comparison math, mesh
+analysis and the structural-team report all run on Linux; the Windows worker
+only performs the native reads and geometry export plus identity, serialization
+and transfer — it renders no report and stores no derived scene.
 
 When present, the saved exporter declaration payload and its PID resolution rows
 travel with the sealed bundle. The declared structure is derived from the raw
