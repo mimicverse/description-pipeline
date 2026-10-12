@@ -3639,6 +3639,39 @@ class ComponentSuppressionStateTests(unittest.TestCase):
             self.assertEqual(triple("arm-1"), (2, False, False))
             self.assertEqual(triple("arm-2"), (1, False, True))
 
+    def test_unreadable_child_transform_blocks_descent_without_fabrication(self):
+        """An unreadable occurrence transform must not become an empty parent frame.
+
+        Regression for the empty-parent-transform defect: the occurrence keeps its
+        empty transform (a blocking finding downstream) and its recorded note, the
+        subtree is skipped instead of composing against an empty matrix, and
+        siblings still record their own placements.
+        """
+
+        class UnreadableTransformComponent(_Component):
+            def GetTotalTransform(self, _presentation):
+                return None
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            leaf = _Component("leaf-1", _write(root, "leaf.SLDPRT"))
+            sub_path = _write(root, "sub.SLDASM")
+            sub_doc = _Doc(sub_path, doc_type=2, children=[leaf])
+            broken = UnreadableTransformComponent("sub-1", sub_path, children=[leaf], doc=sub_doc)
+            sibling = _Component("arm-1", _write(root, "arm.SLDPRT"))
+            assembly = _write(root, "robot.SLDASM")
+            record = _read(root, _App({assembly: _Doc(assembly, doc_type=2, children=[broken, sibling])}))
+            by_name = {item["name2"]: item for item in record["components"]}
+            self.assertEqual(by_name["sub-1"]["transform"], [])
+            self.assertNotIn("sub-1/leaf-1", by_name)
+            self.assertEqual(len(by_name["arm-1"]["transform"]), 16)
+            notes = record["notes"]
+            self.assertTrue(
+                any(note.startswith("transform:sub-1:") and "GetTotalTransform(False)" in note for note in notes),
+                notes,
+            )
+            self.assertIn("transform:sub-1:subtree_skipped_unreadable_parent", notes)
+
 
 class ComponentSourceDocumentTests(unittest.TestCase):
     """Raw import readings for the discovery walk (no selection carrier)."""

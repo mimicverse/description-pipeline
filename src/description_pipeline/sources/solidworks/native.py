@@ -4735,7 +4735,15 @@ class SolidWorksBackend(CadBackend):
                         notes.append(f"mass:{path_name}:{error}")
                     children = list(_method(component, "GetChildren") or [])
                     if children:
-                        part = _method(component, "GetModelDoc2")
+                        if not transform:
+                            # An unreadable occurrence transform leaves no frame
+                            # for its descendants: composing with an empty parent
+                            # would fabricate placement.  The subtree is skipped,
+                            # the skip is recorded, and the occurrence's own
+                            # empty transform stays a blocking native finding
+                            # downstream.
+                            notes.append(f"transform:{path_name}:subtree_skipped_unreadable_parent")
+                        part = _method(component, "GetModelDoc2") if transform else None
                         if part is not None:
                             referenced = str(_member(component, "ReferencedConfiguration") or "")
                             # A containment chain that repeats a document (an assembly
