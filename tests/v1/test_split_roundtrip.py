@@ -85,6 +85,22 @@ class AxisFixtureBackend(support.FixtureCadBackend):
             record["face_index"] = reference["face_index"]
         return record
 
+    def export_component_meshes(self, destinations, progress=None):
+        """Mirror the native exporter response: body counts plus tessellation accounting.
+
+        The real native reader reports, per component, the native body counts and
+        the display-tessellation accounting (total faces and any facetless sheet
+        faces) beside the exported mesh identity.  The control fixture reports
+        the canonical cube stand-in: one solid body whose six faces all
+        tessellate, with no omitted faces.
+        """
+
+        entries = super().export_component_meshes(destinations, progress=progress)
+        for info in entries.values():
+            info["bodies"] = {"solid": 1, "sheet": 0}
+            info["tessellation"] = {"faces": 6, "no_facets_faces": []}
+        return entries
+
 
 class SplitRoundtripTests(unittest.TestCase):
     def setUp(self) -> None:
