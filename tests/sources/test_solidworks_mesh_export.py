@@ -483,7 +483,9 @@ class NoFullScanExportTests(unittest.TestCase):
                 )
         self.assertEqual(len(exported), 1)
         row = exported[0]
-        self.assertEqual(set(row), {"component", "path", "triangles", "used_api", "sha256"})
+        self.assertEqual(set(row), {
+            "component", "path", "triangles", "used_api", "sha256", "bodies", "tessellation",
+        })
         self.assertEqual(row["triangles"], 2)
         self.assertEqual(row["sha256"], hashlib.sha256(payload).hexdigest())
 

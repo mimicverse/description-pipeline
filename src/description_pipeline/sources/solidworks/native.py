@@ -33,9 +33,7 @@ IASSEMBLYDOC_IID = "{83A33D35-27C5-11CE-BFD4-00400513BB57}"
 ICONFIGURATIONMANAGER_IID = "{8DB64337-F36E-47CC-BBBC-B4B979D31505}"
 ICONFIGURATION_IID = "{83A33D98-27C5-11CE-BFD4-00400513BB57}"
 IMODELDOCEXTENSION_IID = "{99F4D4AF-F268-4EE1-8C55-041F7BECF879}"
-#: ITessellation, verified dual interface in the installed sldworks.tlb
-#: (dump reviews/operator-resume-20261008/windows/907f759-tlb-owners-dump-v1.log
-#: line 489; offline member dump required no CAD session).
+#: Published ITessellation dual-interface identity, checked against sldworks.tlb.
 ITESSELLATION_IID = "{699C7492-DB56-4CC2-B7A2-9FFD56698434}"
 IMASSPROPERTY2_IID = "{5E4EAE4A-65E6-4CF0-AD72-55EDEF5EB96A}"
 IMASSPROPERTYOVERRIDEOPTIONS_IID = "{82E1635E-B650-4C8B-84C8-D5FFBF660E49}"
@@ -3525,13 +3523,13 @@ class SolidWorksBackend(CadBackend):
                     area: object = None
                     facetless: dict = {}
                     facetless_error: str | None = None
-                    if classification == "empty":
+                    if classification == "empty" and body_type == 1:
                         try:
-                            native_count = int(_member(face, "GetTessTriangleCount"))
+                            native_count = _member(face, "GetTessTriangleCount")
                         except Exception:  # noqa: BLE001 - missing evidence must not warn-pass
                             native_count = None
                         try:
-                            area = float(_member(face, "GetArea"))
+                            area = _member(face, "GetArea")
                         except Exception:  # noqa: BLE001 - missing evidence must not warn-pass
                             area = None
                         try:
@@ -3544,8 +3542,8 @@ class SolidWorksBackend(CadBackend):
                         and body_type == 1
                         and facetless.get("facets") == 0
                         and isinstance(facetless.get("tessellate_result"), bool)
-                        and native_count == 0
-                        and isinstance(area, float)
+                        and type(native_count) is int and native_count == 0
+                        and type(area) in (int, float)
                         and math.isfinite(area)
                         and area >= 0.0
                     ):
@@ -3559,7 +3557,7 @@ class SolidWorksBackend(CadBackend):
                                 "face_index": face_index,
                                 "triangle_count": 0,
                                 "facet_count": 0,
-                                "area_m2": area,
+                                "area_m2": float(area),
                                 "tessellate_result": facetless["tessellate_result"],
                                 "used_api": facetless["used_api"],
                             }
@@ -3690,7 +3688,7 @@ class SolidWorksBackend(CadBackend):
             "bodies": body_counts,
             "tessellation": {
                 "faces": tessellation["faces"],
-                "no_facets_faces": tessellation["no_facets_faces"][:50],
+                "no_facets_faces": tessellation["no_facets_faces"],
             },
         }
 
