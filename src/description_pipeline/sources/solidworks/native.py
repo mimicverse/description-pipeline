@@ -2043,6 +2043,35 @@ class _ActivityEmitter:
         self._last_action = (phase, action)
 
 
+#: SolidWorks COM mid-export transient: DISP_E_EXCEPTION ("服务器出现意外情况").
+TRANSIENT_COM_RETRY_ATTEMPTS = 3
+TRANSIENT_COM_RETRY_DELAYS = (0.2, 0.5)
+
+
+def _is_transient_com_error(error: BaseException) -> bool:
+    text = f"{type(error).__name__}: {error}"
+    return "com_error" in text and "-2147417851" in text
+
+
+def _retry_transient_com(operation, *, attempts: int = TRANSIENT_COM_RETRY_ATTEMPTS):
+    """Bounded retries for the transient COM server exception only.
+
+    Each attempt re-runs ``operation``, whose callers re-dereference the face or
+    body first, so a stale COM proxy is never reused.  Any other exception, or
+    the final attempt, propagates unchanged; the strict decision tree downstream
+    is untouched.
+    """
+
+    for attempt in range(attempts):
+        try:
+            return operation()
+        except Exception as error:  # noqa: BLE001 - only the transient signature is retried
+            if attempt == attempts - 1 or not _is_transient_com_error(error):
+                raise
+            time.sleep(TRANSIENT_COM_RETRY_DELAYS[min(attempt, len(TRANSIENT_COM_RETRY_DELAYS) - 1)])
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
 class SolidWorksBackend(CadBackend):
     name = "solidworks"
 
@@ -3503,8 +3532,17 @@ class SolidWorksBackend(CadBackend):
             for face_index, raw_face in enumerate(faces):
                 face = _dynamic(raw_face)
                 evidence["faces"] += 1
+                read_state = {"face": face}
+
+                def _read_face_values(body=body, face_index=face_index, read_state=read_state) -> list[float]:
+                    fresh_faces = _as_list(_member(body, "GetFaces"))
+                    if len(fresh_faces) > face_index:
+                        read_state["face"] = _dynamic(fresh_faces[face_index])
+                    return list(map(float, _member(read_state["face"], "GetTessTriangles", True) or ()))
+
                 try:
-                    face_values = list(map(float, _member(face, "GetTessTriangles", True) or ()))
+                    face_values = _retry_transient_com(_read_face_values)
+                    face = read_state["face"]
                 except Exception as error:
                     raise CadError(
                         "cad_face_tessellation_unreadable",
@@ -3536,8 +3574,15 @@ class SolidWorksBackend(CadBackend):
                             area = _member(face, "GetArea")
                         except Exception:  # noqa: BLE001 - missing evidence must not warn-pass
                             area = None
+                        def _probe_facetless(body=body, face_index=face_index, face=face) -> dict:
+                            fresh_faces = _as_list(_member(body, "GetFaces"))
+                            face_ref = (
+                                _dynamic(fresh_faces[face_index]) if len(fresh_faces) > face_index else face
+                            )
+                            return self._face_facetless_evidence(body, face_ref)
+
                         try:
-                            facetless = self._face_facetless_evidence(body, face)
+                            facetless = _retry_transient_com(_probe_facetless)
                         except Exception as error:  # noqa: BLE001 - the failure becomes explicit evidence
                             facetless_error = f"{type(error).__name__}: {error}"[:200]
                     if (

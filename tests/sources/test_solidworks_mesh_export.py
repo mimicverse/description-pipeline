@@ -123,6 +123,39 @@ class FakeComponent:
         return []
 
 
+class TransientComError(RuntimeError):
+    """The observed SolidWorks mid-export transient (DISP_E_EXCEPTION)."""
+
+    def __str__(self):
+        return "com_error: (-2147417851, '\u670d\u52a1\u5668\u51fa\u73b0\u610f\u5916\u60c5\u51b5\u3002', None, None)"
+
+
+class FlakyTessellation(FakeTessellation):
+    def __init__(self, *, failures, facets=0, tessellate_result=True):
+        super().__init__(facets=facets, tessellate_result=tessellate_result)
+        self.failures = failures
+        self.calls = 0
+
+    def Tessellate(self):  # noqa: N802 - SolidWorks API name
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise TransientComError()
+        return super().Tessellate()
+
+
+class FlakyFace(FakeFace):
+    def __init__(self, values, *, failures, **kwargs):
+        super().__init__(values, **kwargs)
+        self.failures = failures
+        self.calls = 0
+
+    def GetTessTriangles(self, flag):  # noqa: N802 - SolidWorks API name
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise TransientComError()
+        return super().GetTessTriangles(flag)
+
+
 def _backend(component, name="pcb-1") -> SolidWorksBackend:
     backend = SolidWorksBackend()
     component.Name2 = name
@@ -404,6 +437,52 @@ class ComponentMeshExportTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "cad_missing_component")
 
 
+    def test_transient_face_read_is_retried_before_failure(self):
+        face = FlakyFace(TRIANGLE, failures=1)
+        component = FakeComponent(FakeDocument([]), {0: [FakeBody([face])], 1: []})
+        entry = _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        self.assertEqual(entry["triangles"], 1)
+        self.assertEqual(face.calls, 2)
+
+    def test_transient_facetless_probe_is_retried_and_warning_recorded(self):
+        tessellation = FlakyTessellation(failures=1, facets=0, tessellate_result=True)
+        face = FakeFace([], triangle_count=0, area=1.871564249915375e-13)
+        backend = self._sheet_facetless_backend(face, tessellation)
+        entry = backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        row = entry["tessellation"]["no_facets_faces"][0]
+        self.assertEqual(row["tessellate_result"], True)
+        self.assertEqual(row["area_m2"], 1.871564249915375e-13)
+        self.assertEqual(tessellation.calls, 2)
+
+    def test_persistent_transient_facetless_probe_fails_after_bounded_attempts(self):
+        tessellation = FlakyTessellation(failures=99, facets=0, tessellate_result=True)
+        backend = self._sheet_facetless_backend(FakeFace([], triangle_count=0, area=1e-12), tessellation)
+        with self.assertRaises(CadError) as caught:
+            backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
+        self.assertIn("com_error", caught.exception.detail["facetless_error"])
+        self.assertEqual(tessellation.calls, 3)
+        self.assertFalse(self.dest.exists())
+
+    def test_retry_helper_retries_only_the_transient_signature(self):
+        from description_pipeline.sources.solidworks.native import (
+            _is_transient_com_error,
+            _retry_transient_com,
+        )
+
+        self.assertTrue(_is_transient_com_error(TransientComError()))
+        self.assertFalse(_is_transient_com_error(RuntimeError("permanent")))
+        calls = {"n": 0}
+
+        def permanent() -> None:
+            calls["n"] += 1
+            raise RuntimeError("permanent")
+
+        with self.assertRaises(RuntimeError):
+            _retry_transient_com(permanent)
+        self.assertEqual(calls["n"], 1)
+
+
 class AxisReferenceTests(unittest.TestCase):
     def _component_with(self, face):
         return FakeComponent(FakeDocument([]), {0: [FakeBody([face])], 1: []})
@@ -470,6 +549,7 @@ class AxisReferenceTests(unittest.TestCase):
         self.assertEqual(record["radius_m"], 0.006)
         self.assertIn("IComponent2.GetBodies2(type)", backend.notes["bodies_api:arm-1:0"])
         self.assertEqual(component.body_calls, [(0,)])
+
 
 
 if __name__ == "__main__":
