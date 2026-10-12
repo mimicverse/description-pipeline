@@ -2639,6 +2639,12 @@ class SolidWorksBackend(CadBackend):
     def link_group_mass_properties(self, path, selections):
         """One-shot direct group readings for the rigid-body link selections.
 
+        The capture calls this on the OPENED collected copy, before its
+        pre-measurement ``ForceRebuild3`` (see ``link_group_membership``): the
+        opened state is the state the reference method measures, and rebuild
+        shifts these COM/inertia reads.  Recorded per-instance evidence and the
+        closure ledger intentionally keep their post-rebuild values.
+
         ``selections`` maps each rigid body to the exact occurrence paths the
         producer composer chose (top-most effective providers plus uncovered
         leaves).  Every body is read twice with fresh ``CreateMassProperty2``
@@ -2775,6 +2781,42 @@ class SolidWorksBackend(CadBackend):
             "used_api": "IMassProperty2 (SelectedItems = component set)",
             "selection_rule": "top_most_providers+uncovered_leaves",
             "links": links,
+        }
+
+    def link_group_membership(self, path, *, require_material: bool = True) -> dict:
+        """Leaf occurrences and effective providers on the OPENED capture copy.
+
+        Runs before the capture's pre-measurement ``ForceRebuild3`` so freeze can
+        compose and take the direct link group reads on the opened state, which
+        is the state the reference method measures.  The membership criteria are
+        rebuild-invariant (measured mass deltas across the rebuild are exactly
+        zero; override flags and body counts are document data), and freeze
+        fails closed when the post-rebuild evidence map disagrees.  Every value
+        measured here is discarded except the names; no recorded evidence is
+        produced.
+        """
+
+        doc = self._document_by_path(path)
+        if _member(doc, "GetType") != 2:
+            raise CadError("cad_not_assembly", "link group membership requires a saved SLDASM")
+        _manager, _configuration, configuration_name = _configuration_context(doc)
+        opened = self.collect_scene(path, (), require_material=require_material, rebuild=False)
+        self.assembly_component_mass_properties(path)
+        providers = set(self.effective_instance_readings())
+        providers |= {
+            str(key).split(":", 1)[1]
+            for key in opened.notes
+            if str(key).startswith("effective_instance:")
+        }
+        # The early context walk cached opened-state singleton readings; clear
+        # them so the post-rebuild evidence walk repopulates every entry with
+        # rebuilt-state values and no stale opened-state value can survive.
+        self._effective_instance_readings = {}
+        return {
+            "assembly": str(_member(doc, "GetPathName")),
+            "configuration": configuration_name,
+            "components": [component.name for component in opened.components],
+            "providers": sorted(providers),
         }
 
     def assembly_component_mass_properties(self, path):
@@ -3436,11 +3478,23 @@ class SolidWorksBackend(CadBackend):
             detail.update(extra)
         return CadError(error.code, error.message, detail)
 
-    def collect_scene(self, doc_path, coordinate_systems, progress=None, require_material=True):
+    def collect_scene(self, doc_path, coordinate_systems, progress=None, require_material=True, rebuild=True):
         doc = self._document_by_path(doc_path)
         if _member(doc, "GetType") != 2:
             raise CadError("cad_not_assembly", "export requires a saved SLDASM")
-        doc, preparation = self._rebuild_capture_copy(doc, doc_path)
+        if rebuild:
+            doc, preparation = self._rebuild_capture_copy(doc, doc_path)
+        else:
+            # Opened-state probe: no ForceRebuild3.  "link_group_membership"
+            # uses this so the direct link group reads can run on the opened
+            # state before the capture's pre-measurement rebuild.
+            preparation = {
+                "used_api": None,
+                "scope": "collected_copy_opened_state",
+                "document": str(_member(doc, "GetPathName") or ""),
+                "configuration": _active_configuration(doc),
+                "saved_to_disk": False,
+            }
         self._record_save_flag(doc, doc_path)
         self._components = set()
         self._source_components = {}

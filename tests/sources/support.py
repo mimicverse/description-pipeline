@@ -491,7 +491,12 @@ class FixtureCadBackend(CadBackend):
         coordinate_systems: Sequence[str],
         progress=None,
         require_material: bool = True,
+        rebuild: bool = True,
     ) -> RawScene:
+        order = getattr(self, "order", None)
+        if order is None:
+            order = self.order = []
+        order.append("collect_scene" if rebuild else "collect_scene_opened")
         self.collected_scene_calls.append(str(doc_path))
         if self.originals_change_during_capture:
             Path(self.document).write_bytes(b"fixture assembly edited during capture")
@@ -529,14 +534,63 @@ class FixtureCadBackend(CadBackend):
     def link_group_mass_properties(self, path, selections):
         """Direct link reads for the fixture: the assembly-frame recombination."""
 
+        order = getattr(self, "order", None)
+        if order is None:
+            order = self.order = []
+        order.append("link_group_read")
+        if getattr(self, "membership_providers", None) is not None:
+            # Generic echo for the rebuild-mismatch gate test: the early
+            # membership deliberately names providers the late evidence map
+            # does not carry, so the selection comparison must fail closed.
+            reads = {
+                "mass_kg": 1.0,
+                "volume_m3": None,
+                "density_kg_m3": None,
+                "com_m": [0.0, 0.0, 0.0],
+                "inertia_tensor_about_com": [[1e-6, 0.0, 0.0], [0.0, 1e-6, 0.0], [0.0, 0.0, 1e-6]],
+                "inertia_values_about_origin_api": {"error": "fixture"},
+                "overrides": {
+                    "OverrideMass": False,
+                    "OverrideCenterOfMass": False,
+                    "OverrideMomentsOfInertia": False,
+                },
+            }
+            links = {
+                str(body): {
+                    "selection": [str(name) for name in paths],
+                    "reads": [copy.deepcopy(reads), copy.deepcopy(reads)],
+                    "reproducibility": {"mass_delta_kg": 0.0, "com_delta_norm_m": 0.0, "tensor_delta_max_abs": 0.0},
+                }
+                for body, paths in selections.items()
+            }
+        else:
+            links = compose_fixture_link_reads(
+                self.components, getattr(self, "effective_readings", None) or {}, selections
+            )
         return {
             "assembly": str(self.scene_document_override or path),
             "configuration": str(getattr(self, "configuration_name", "Default")),
             "used_api": "IMassProperty2 (SelectedItems = component set)",
             "selection_rule": "top_most_providers+uncovered_leaves",
-            "links": compose_fixture_link_reads(
-                self.components, getattr(self, "effective_readings", None) or {}, selections
-            ),
+            "links": links,
+        }
+
+    def link_group_membership(self, path, *, require_material=True):
+        """Opened-state membership probe for the fixture backend."""
+
+        del require_material
+        order = getattr(self, "order", None)
+        if order is None:
+            order = self.order = []
+        order.append("membership")
+        configured = getattr(self, "membership_providers", None)
+        if configured is None:
+            configured = sorted((getattr(self, "effective_readings", None) or {}).keys())
+        return {
+            "assembly": str(self.scene_document_override or path),
+            "configuration": str(getattr(self, "configuration_name", "Default")),
+            "components": [str(entry["name"]) for entry in self.components],
+            "providers": [str(name) for name in configured],
         }
 
     def verify_sources_unchanged(self) -> dict[str, Any]:

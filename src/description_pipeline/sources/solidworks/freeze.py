@@ -18,7 +18,7 @@ import shutil
 import contextlib
 from pathlib import Path
 from typing import Any
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 from .errors import BridgeError, ConfigError
 from .native import session_materialization_path
@@ -1799,6 +1799,26 @@ LINK_GROUP_SELECTION_RULE = "top_most_providers+uncovered_leaves"
 
 
 def _link_group_selections(cfg: dict[str, Any], scene: Any, effective: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Compose each body's selection from the captured scene's per-instance evidence.
+
+    Provider names come from the recorded evidence exactly as the verifier
+    recomputes them (notes effective instances and effective-instance rows);
+    the shared core validates and collapses them.
+    """
+
+    leaves = [str(component.name) for component in (scene.components or [])]
+    provider_names = {str(name) for name in effective}
+    provider_names |= {
+        str(name)
+        for name, row in (getattr(scene, "mass_properties", None) or {}).items()
+        if isinstance(row, dict) and row.get("mode") == "effective_instance"
+    }
+    return _compose_link_selections(cfg, leaves, provider_names)
+
+
+def _compose_link_selections(
+    cfg: dict[str, Any], leaves: Sequence[str], provider_names: set[str]
+) -> dict[str, dict[str, Any]]:
     """Compose each rigid body's direct-read selection (top-most providers + uncovered leaves).
 
     Mirrors the verifier's independent recomputation: providers are effective
@@ -1809,7 +1829,7 @@ def _link_group_selections(cfg: dict[str, Any], scene: Any, effective: dict[str,
     bodies, and empty selections fail the capture closed.
     """
 
-    leaves = [str(component.name) for component in (scene.components or [])]
+    leaves = [str(name) for name in leaves]
     if len(set(leaves)) != len(leaves):
         raise BridgeError("link_group_occurrence_duplicate", "the captured scene repeats an occurrence", exit_code=3)
     leaf_set = set(leaves)
@@ -1838,12 +1858,6 @@ def _link_group_selections(cfg: dict[str, Any], scene: Any, effective: dict[str,
                     exit_code=3,
                 )
             body_of[member] = body_name
-    provider_names = {str(name) for name in effective}
-    provider_names |= {
-        str(name)
-        for name, row in (getattr(scene, "mass_properties", None) or {}).items()
-        if isinstance(row, dict) and row.get("mode") == "effective_instance"
-    }
     providers: dict[str, set[str]] = {}
     for provider in sorted(provider_names):
         subtree = {leaf for leaf in leaves if leaf == provider or leaf.startswith(provider + "/")}
@@ -1908,7 +1922,7 @@ def _link_group_record(
     effective: dict[str, Any],
     document: str | None,
 ) -> dict[str, Any]:
-    """Read and validate the direct link group mass properties for every body."""
+    """Compose, read and validate the direct link group mass properties (late helper)."""
 
     selections = _link_group_selections(cfg, scene, effective)
     reader = getattr(backend, "link_group_mass_properties", None)
@@ -1919,6 +1933,14 @@ def _link_group_record(
             exit_code=3,
         )
     payload = reader(str(document or cfg["assembly"]), {name: entry["selection"] for name, entry in selections.items()})
+    return _link_group_record_from_payload(payload, selections, document)
+
+
+def _link_group_record_from_payload(
+    payload: Any, selections: dict[str, dict[str, Any]], document: str | None
+) -> dict[str, Any]:
+    """Validate one native link group payload against the composed selections."""
+
     if (
         not isinstance(payload, dict)
         or payload.get("used_api") != LINK_GROUP_USED_API
@@ -2043,6 +2065,53 @@ def _link_group_read_valid(body: str, index: int, read: Any) -> None:
         invalid("overrides")
 
 
+def _opened_link_group_read(
+    backend: Any, cfg: dict[str, Any], closure: dict[str, Any], *, require_material: bool
+) -> dict[str, Any]:
+    """Read the direct link group mass properties on the OPENED capture copy.
+
+    Runs before the capture's pre-measurement rebuild so the direct reads use
+    the opened state (the reference method's state).  The membership probe and
+    the two group reads are native; the composition is the shared core.  Every
+    value measured here is pre-rebuild; recorded per-instance evidence is
+    unaffected.
+    """
+
+    document = str((closure or {}).get("top_level") or cfg["assembly"])
+    membership_reader = getattr(backend, "link_group_membership", None)
+    reader = getattr(backend, "link_group_mass_properties", None)
+    if not callable(membership_reader) or not callable(reader):
+        raise BridgeError(
+            "cad_link_group_reader_missing",
+            "the backend cannot read direct link group mass properties",
+            exit_code=3,
+        )
+    membership = membership_reader(document, require_material=require_material)
+    if not isinstance(membership, dict):
+        raise BridgeError(
+            "cad_link_group_payload_invalid",
+            "the backend returned no link group membership",
+            exit_code=3,
+        )
+    components = membership.get("components")
+    providers = membership.get("providers")
+    if (
+        not isinstance(components, list)
+        or not all(isinstance(name, str) and name for name in components)
+        or not isinstance(providers, list)
+        or not all(isinstance(name, str) and name for name in providers)
+    ):
+        raise BridgeError(
+            "cad_link_group_payload_invalid",
+            "the link group membership is malformed",
+            exit_code=3,
+        )
+    selections = _compose_link_selections(cfg, components, {str(name) for name in providers})
+    payload = reader(document, {name: entry["selection"] for name, entry in selections.items()})
+    record = _link_group_record_from_payload(payload, selections, document)
+    return {"selections": selections, "record": record}
+
+
 def _freeze_local(
     config: dict[str, Any],
     destination: Path,
@@ -2110,6 +2179,18 @@ def _freeze_local(
         stage = "environment"
         environment = capture_environment(backend, worker_version)
         write_json(staging / "evidence" / "environment.json", environment)
+        # Direct one-shot link reads run on the OPENED capture copy, before the
+        # pre-measurement rebuild that collect_scene performs for the recorded
+        # evidence.  The opened state is the reference method's state: the
+        # measured mass deltas across ForceRebuild3(False) are exactly zero, so
+        # the provider membership is rebuild-invariant, while COM/inertia of
+        # the direct group reads are not.  The late stage re-checks that the
+        # composed selections are identical across the rebuild and fails closed
+        # if they are not.
+        stage = "opened_link_groups"
+        opened_link_groups = _opened_link_group_read(
+            backend, cfg, closure, require_material=cfg["material_source"] == "cad"
+        )
         stage = "readings"
         scene, raw = _capture_readings(backend, cfg, closure, staging / "source")
         write_json(staging / "raw" / "scene_raw.json", raw)
@@ -2151,15 +2232,21 @@ def _freeze_local(
             staging / "raw" / "effective_instances.json",
             _effective_instance_record(scene, cfg, backend_readings, cache_error),
         )
-        # Direct one-shot link reads: the producer composes each body's
-        # selection (top-most providers + uncovered leaves) and the backend
-        # measures it twice in the same session.  This record is required by
-        # scene generation; an absent or malformed record fails closed there.
+        # The recorded direct reads are the OPENED-state values (matching the
+        # reference method); per-instance evidence, the closure ledger and the
+        # verifier binding stay exactly as captured after the rebuild.  The
+        # selections composed from that post-rebuild evidence must match the
+        # opened-state composition, or the capture fails closed here.
         stage = "link_groups"
-        write_json(
-            staging / "raw" / "link_group_mass_properties.json",
-            _link_group_record(backend, cfg, scene, backend_readings, getattr(scene, "document", None)),
-        )
+        rebuilt_selections = _link_group_selections(cfg, scene, backend_readings)
+        if rebuilt_selections != opened_link_groups["selections"]:
+            raise BridgeError(
+                "link_group_selection_changed_across_rebuild",
+                "the link group selection composition differs between the opened and rebuilt states",
+                {"opened": opened_link_groups["selections"], "rebuilt": rebuilt_selections},
+                exit_code=3,
+            )
+        write_json(staging / "raw" / "link_group_mass_properties.json", opened_link_groups["record"])
         # Declared author decisions are recorded as declared input, never as CAD
         # readings: freeze keeps the snapshot raw and load_scene applies them.
         write_json(

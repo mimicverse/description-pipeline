@@ -149,6 +149,52 @@ class FreezeTests(unittest.TestCase):
             link["provenance"]["mass_properties"]["direct_vs_recombination"]["mass_delta_kg"], 0.0, places=12
         )
 
+    def test_freeze_reads_link_groups_on_the_opened_state_before_the_rebuild(self) -> None:
+        freeze(self.config, self.destination, backend=self.backend)
+        order = self.backend.order
+        self.assertLess(order.index("membership"), order.index("collect_scene"))
+        self.assertLess(order.index("link_group_read"), order.index("collect_scene"))
+
+    def test_freeze_fails_closed_when_the_opened_selection_changes_across_the_rebuild(self) -> None:
+        assembly = support.make_cad_tree(self.tmp / "cad2")
+        parts = [self.tmp / "cad2" / "base.SLDPRT", self.tmp / "cad2" / "arm.SLDPRT"]
+        backend = support.FixtureCadBackend(
+            assembly,
+            [
+                {
+                    "name": "board/x-1",
+                    "transform": support.placement((0.0, 0.0, 0.0)),
+                    "mass": support.mass_payload(0.5, (0.0, 0.0, 0.0)),
+                },
+                {
+                    "name": "board/x-2",
+                    "transform": support.placement((0.0, 0.0, 0.1)),
+                    "mass": support.mass_payload(0.5, (0.0, 0.0, 0.05)),
+                },
+            ],
+            dependencies=parts,
+        )
+        # The early membership names a provider the post-rebuild evidence map
+        # does not carry: the composed selections differ and the capture must
+        # fail closed instead of recording mismatched reads.
+        backend.membership_providers = ["board"]
+        config = json.loads(json.dumps(self.config))
+        config["assembly"] = str(assembly)
+        config["allowed_roots"] = [str(self.tmp / "cad2")]
+        config["bodies"] = [
+            {
+                "id": "board",
+                "name": "board_link",
+                "components": ["board/x-1", "board/x-2"],
+                "frame": {"coordinate_system": "base_datum"},
+            }
+        ]
+        config["joints"] = []
+        config["frames"] = []
+        with self.assertRaises(BridgeError) as caught:
+            freeze(config, self.destination, backend=backend)
+        self.assertEqual(caught.exception.code, "link_group_selection_changed_across_rebuild")
+
     def test_freeze_records_evidence_covered_stale_stored_references(self) -> None:
         config = json.loads(json.dumps(self.config))
         config["closure"] = {
@@ -1042,7 +1088,9 @@ class FreezeTests(unittest.TestCase):
         self.assertTrue(failure.is_dir())
         record = json.loads((failure / "failure.json").read_text(encoding="utf-8"))
         self.assertEqual(record["code"], "capture_source_mismatch")
-        self.assertEqual(record["stage"], "readings")
+        # The opened-state direct link group read detects the wrong document
+        # before any evidence measurement, so the failure names that stage.
+        self.assertEqual(record["stage"], "opened_link_groups")
         self.assertEqual(record["request"]["assembly"], str(self.assembly))
         self.assertEqual(record["request"]["configuration"], "Default")
         # the material that explains the failure survives: the collector's copy
