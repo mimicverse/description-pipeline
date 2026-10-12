@@ -4102,7 +4102,11 @@ def derive_native_package(
     discovery_path.parent.mkdir(parents=True, exist_ok=True)
     derived = {
         "bodies": [
-            {"name": body["name"], "components": body["components"], "frame": {"coordinate_system": body["datum"]}}
+            {
+                "name": body["name"], "components": body["components"],
+                "frame": ({"mate_axis": body["mate_axis"]} if body.get("source") == "native_passive"
+                          else {"coordinate_system": body["datum"]}),
+            }
             for body in sorted(bodies, key=lambda item: item["name"])
         ],
         "joints": [
@@ -4114,6 +4118,7 @@ def derive_native_package(
                 "child": joint.get("child"),
                 "axis": joint["axis"],
                 "limits": joint["limits"],
+                **({"passive": True, "axis_reference": joint["axis_reference"]} if joint.get("passive") else {}),
             }
             for joint in joints
         ],
