@@ -1796,6 +1796,11 @@ def _export_geometry(
 LINK_GROUP_SCHEMA = "solidworks-to-urdf.link-group-mass-properties/v1"
 LINK_GROUP_USED_API = "IMassProperty2 (SelectedItems = component set)"
 LINK_GROUP_SELECTION_RULE = "top_most_providers+uncovered_leaves"
+#: Marker for the whole-assembly and direct link reads taken in the reopened,
+#: never-touched readout window (probe v5: close+reopen restores the opened
+#: state bit-identically; any earlier instance read in the session shifts the
+#: direct group reads and the whole-assembly read - probe v4).
+PRISTINE_WINDOW = "pristine-reopen"
 
 
 def _link_group_selections(cfg: dict[str, Any], scene: Any, effective: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -1913,27 +1918,6 @@ def _compose_link_selections(
             )
         selections[body_name] = {"selection": selection, "providers": sorted(top_most), "uncovered_leaves": uncovered}
     return selections
-
-
-def _link_group_record(
-    backend: Any,
-    cfg: dict[str, Any],
-    scene: Any,
-    effective: dict[str, Any],
-    document: str | None,
-) -> dict[str, Any]:
-    """Compose, read and validate the direct link group mass properties (late helper)."""
-
-    selections = _link_group_selections(cfg, scene, effective)
-    reader = getattr(backend, "link_group_mass_properties", None)
-    if not callable(reader):
-        raise BridgeError(
-            "cad_link_group_reader_missing",
-            "the backend cannot read direct link group mass properties",
-            exit_code=3,
-        )
-    payload = reader(str(document or cfg["assembly"]), {name: entry["selection"] for name, entry in selections.items()})
-    return _link_group_record_from_payload(payload, selections, document)
 
 
 def _link_group_record_from_payload(
@@ -2065,51 +2049,71 @@ def _link_group_read_valid(body: str, index: int, read: Any) -> None:
         invalid("overrides")
 
 
-def _opened_link_group_read(
-    backend: Any, cfg: dict[str, Any], closure: dict[str, Any], *, require_material: bool
-) -> dict[str, Any]:
-    """Read the direct link group mass properties on the OPENED capture copy.
+def _top_level_record(reading: dict[str, Any]) -> dict[str, Any]:
+    """The mass_closure ``top_level`` projection of one whole-assembly reading."""
 
-    Runs before the capture's pre-measurement rebuild so the direct reads use
-    the opened state (the reference method's state).  The membership probe and
-    the two group reads are native; the composition is the shared core.  Every
-    value measured here is pre-rebuild; recorded per-instance evidence is
-    unaffected.
+    return {
+        "mass": float(reading["mass"]),
+        "com": [float(value) for value in reading["com"]],
+        "inertia": [[float(value) for value in row] for row in reading["inertia"]],
+        "reference": dict(reading.get("reference") or {}),
+    }
+
+
+def _pristine_readout_window(
+    backend: Any,
+    cfg: dict[str, Any],
+    closure: dict[str, Any],
+    selections: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Whole-assembly and direct link reads in the pristine reopen window.
+
+    Probe v4: any component-instance mass read contaminates the later direct
+    group reads and the whole-assembly read of the same session.  Probe v5:
+    ``CloseAllDocuments`` + reopening the same captured copy restores the
+    opened state bit-identically (deltas exactly zero, 61/61 documents).
+    This runs after every other CAD-facing step; inside the window only the two
+    readers run, in the v5-proven order (link groups first, whole assembly
+    second), and nothing else touches the reopened document.
     """
 
     document = str((closure or {}).get("top_level") or cfg["assembly"])
-    membership_reader = getattr(backend, "link_group_membership", None)
+    closer = getattr(backend, "close_all_documents", None)
+    opener = getattr(backend, "open_document", None)
     reader = getattr(backend, "link_group_mass_properties", None)
-    if not callable(membership_reader) or not callable(reader):
+    if not callable(closer) or not callable(opener) or not callable(reader):
         raise BridgeError(
-            "cad_link_group_reader_missing",
-            "the backend cannot read direct link group mass properties",
+            "cad_pristine_readout_unavailable",
+            "the backend cannot reopen a pristine readout window",
             exit_code=3,
         )
-    membership = membership_reader(document, require_material=require_material)
-    if not isinstance(membership, dict):
+    closer()
+    prepare = getattr(backend, "prepare_source", None)
+    if callable(prepare):
+        prepare(document, cfg["configuration"])
+    opened = opener(document)
+    if not isinstance(opened, dict) or not _same_document(str(opened.get("path") or ""), document):
         raise BridgeError(
-            "cad_link_group_payload_invalid",
-            "the backend returned no link group membership",
+            "capture_source_mismatch",
+            "the pristine reopen named another document",
+            {
+                "requested": document,
+                "reported": opened.get("path") if isinstance(opened, dict) else opened,
+            },
             exit_code=3,
         )
-    components = membership.get("components")
-    providers = membership.get("providers")
-    if (
-        not isinstance(components, list)
-        or not all(isinstance(name, str) and name for name in components)
-        or not isinstance(providers, list)
-        or not all(isinstance(name, str) and name for name in providers)
-    ):
-        raise BridgeError(
-            "cad_link_group_payload_invalid",
-            "the link group membership is malformed",
-            exit_code=3,
-        )
-    selections = _compose_link_selections(cfg, components, {str(name) for name in providers})
     payload = reader(document, {name: entry["selection"] for name, entry in selections.items()})
     record = _link_group_record_from_payload(payload, selections, document)
-    return {"selections": selections, "record": record}
+    record["readout_window"] = PRISTINE_WINDOW
+    assembly = getattr(backend, "assembly_mass_properties", None)
+    top_level = None
+    if callable(assembly):
+        try:
+            top_level = assembly(document)
+        except Exception:  # noqa: BLE001 - mirrors _mass_closure's optional whole-assembly reader
+            top_level = None
+    closer()
+    return {"top_level": top_level, "record": record}
 
 
 def _freeze_local(
@@ -2179,18 +2183,6 @@ def _freeze_local(
         stage = "environment"
         environment = capture_environment(backend, worker_version)
         write_json(staging / "evidence" / "environment.json", environment)
-        # Direct one-shot link reads run on the OPENED capture copy, before the
-        # pre-measurement rebuild that collect_scene performs for the recorded
-        # evidence.  The opened state is the reference method's state: the
-        # measured mass deltas across ForceRebuild3(False) are exactly zero, so
-        # the provider membership is rebuild-invariant, while COM/inertia of
-        # the direct group reads are not.  The late stage re-checks that the
-        # composed selections are identical across the rebuild and fails closed
-        # if they are not.
-        stage = "opened_link_groups"
-        opened_link_groups = _opened_link_group_read(
-            backend, cfg, closure, require_material=cfg["material_source"] == "cad"
-        )
         stage = "readings"
         scene, raw = _capture_readings(backend, cfg, closure, staging / "source")
         write_json(staging / "raw" / "scene_raw.json", raw)
@@ -2205,9 +2197,9 @@ def _freeze_local(
         axis_references = _capture_axis_references(backend, cfg)
         if axis_references:
             write_json(staging / "raw" / "axis_references.json", axis_references)
+        # Computed here so `component_context` observes exactly the walked
+        # session; `top_level` is replaced by the pristine window reading below.
         mass_closure = _mass_closure(backend, cfg, getattr(scene, "document", None))
-        if mass_closure is not None:
-            write_json(staging / "raw" / "mass_closure.json", mass_closure)
         # Effective instance readings (overridden instances, sheet-only
         # fallback) come from the SAME component-context traversal; they are
         # injected into the scene notes and the raw scene file is rewritten so
@@ -2232,21 +2224,6 @@ def _freeze_local(
             staging / "raw" / "effective_instances.json",
             _effective_instance_record(scene, cfg, backend_readings, cache_error),
         )
-        # The recorded direct reads are the OPENED-state values (matching the
-        # reference method); per-instance evidence, the closure ledger and the
-        # verifier binding stay exactly as captured after the rebuild.  The
-        # selections composed from that post-rebuild evidence must match the
-        # opened-state composition, or the capture fails closed here.
-        stage = "link_groups"
-        rebuilt_selections = _link_group_selections(cfg, scene, backend_readings)
-        if rebuilt_selections != opened_link_groups["selections"]:
-            raise BridgeError(
-                "link_group_selection_changed_across_rebuild",
-                "the link group selection composition differs between the opened and rebuilt states",
-                {"opened": opened_link_groups["selections"], "rebuilt": rebuilt_selections},
-                exit_code=3,
-            )
-        write_json(staging / "raw" / "link_group_mass_properties.json", opened_link_groups["record"])
         # Declared author decisions are recorded as declared input, never as CAD
         # readings: freeze keeps the snapshot raw and load_scene applies them.
         write_json(
@@ -2282,6 +2259,30 @@ def _freeze_local(
                 {"changed": changed},
                 exit_code=3,
             )
+
+        # Pristine readout window: every CAD-facing step above may have
+        # contaminated the session's direct group reads (probe v4), so close
+        # all documents and reopen the captured copy; the whole-assembly read
+        # and all direct link-group reads then come from a never-touched window
+        # (probe v5: close+reopen restores the opened state bit-identically).
+        # This is the last CAD activity of the capture; only file-level steps
+        # follow.  The record selections are the late composition of the walked
+        # per-instance evidence and the payload echo must match them exactly.
+        stage = "pristine_readout"
+        selections = _link_group_selections(cfg, scene, backend_readings)
+        window = _pristine_readout_window(backend, cfg, closure, selections)
+        if isinstance(mass_closure, dict) and mass_closure.get("status") == "recorded":
+            if not isinstance(window["top_level"], dict):
+                raise BridgeError(
+                    "cad_pristine_readout_unavailable",
+                    "the reopened window produced no whole-assembly reading",
+                    exit_code=3,
+                )
+            mass_closure["top_level"] = _top_level_record(window["top_level"])
+            mass_closure["top_level"]["reference"]["readout_window"] = PRISTINE_WINDOW
+        if mass_closure is not None:
+            write_json(staging / "raw" / "mass_closure.json", mass_closure)
+        write_json(staging / "raw" / "link_group_mass_properties.json", window["record"])
 
         # Scene construction is portable work. Seal its exact inputs here;
         # Linux derives the scene without rewriting this native snapshot.

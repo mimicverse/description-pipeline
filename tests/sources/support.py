@@ -9,6 +9,7 @@ from typing import Any, cast
 from collections.abc import Sequence
 
 from description_pipeline.io import file_digest
+from description_pipeline.sources.solidworks.errors import CadError
 from description_pipeline.sources.solidworks.protocol import CadBackend, Matrix, RawComponent, RawScene
 
 
@@ -285,6 +286,10 @@ class FixtureCadBackend(CadBackend):
         return [str(self.document), *(str(path) for path in self._dependencies)]
 
     def open_document(self, path: str) -> dict[str, Any]:
+        order = getattr(self, "order", None)
+        if order is None:
+            order = self.order = []
+        order.append("open_document")
         self.open_documents.append(str(path))
         return {"opened": Path(path).name, "path": str(path), "read_only": True}
 
@@ -491,12 +496,11 @@ class FixtureCadBackend(CadBackend):
         coordinate_systems: Sequence[str],
         progress=None,
         require_material: bool = True,
-        rebuild: bool = True,
     ) -> RawScene:
         order = getattr(self, "order", None)
         if order is None:
             order = self.order = []
-        order.append("collect_scene" if rebuild else "collect_scene_opened")
+        order.append("collect_scene")
         self.collected_scene_calls.append(str(doc_path))
         if self.originals_change_during_capture:
             Path(self.document).write_bytes(b"fixture assembly edited during capture")
@@ -538,35 +542,13 @@ class FixtureCadBackend(CadBackend):
         if order is None:
             order = self.order = []
         order.append("link_group_read")
-        if getattr(self, "membership_providers", None) is not None:
-            # Generic echo for the rebuild-mismatch gate test: the early
-            # membership deliberately names providers the late evidence map
-            # does not carry, so the selection comparison must fail closed.
-            reads = {
-                "mass_kg": 1.0,
-                "volume_m3": None,
-                "density_kg_m3": None,
-                "com_m": [0.0, 0.0, 0.0],
-                "inertia_tensor_about_com": [[1e-6, 0.0, 0.0], [0.0, 1e-6, 0.0], [0.0, 0.0, 1e-6]],
-                "inertia_values_about_origin_api": {"error": "fixture"},
-                "overrides": {
-                    "OverrideMass": False,
-                    "OverrideCenterOfMass": False,
-                    "OverrideMomentsOfInertia": False,
-                },
-            }
-            links = {
-                str(body): {
-                    "selection": [str(name) for name in paths],
-                    "reads": [copy.deepcopy(reads), copy.deepcopy(reads)],
-                    "reproducibility": {"mass_delta_kg": 0.0, "com_delta_norm_m": 0.0, "tensor_delta_max_abs": 0.0},
-                }
-                for body, paths in selections.items()
-            }
-        else:
-            links = compose_fixture_link_reads(
-                self.components, getattr(self, "effective_readings", None) or {}, selections
-            )
+        links = compose_fixture_link_reads(
+            self.components, getattr(self, "effective_readings", None) or {}, selections
+        )
+        override = getattr(self, "link_group_selection_override", None) or {}
+        for body, names in override.items():
+            if str(body) in links:
+                links[str(body)]["selection"] = [str(name) for name in names]
         return {
             "assembly": str(self.scene_document_override or path),
             "configuration": str(getattr(self, "configuration_name", "Default")),
@@ -575,25 +557,23 @@ class FixtureCadBackend(CadBackend):
             "links": links,
         }
 
-    def link_group_membership(self, path, *, require_material=True):
-        """Opened-state membership probe for the fixture backend."""
+    def close_all_documents(self):
+        """Fixture close-all for the pristine readout window."""
 
-        del require_material
         order = getattr(self, "order", None)
         if order is None:
             order = self.order = []
-        order.append("membership")
-        configured = getattr(self, "membership_providers", None)
-        if configured is None:
-            configured = sorted((getattr(self, "effective_readings", None) or {}).keys())
-        return {
-            "assembly": str(self.scene_document_override or path),
-            "configuration": str(getattr(self, "configuration_name", "Default")),
-            "components": [str(entry["name"]) for entry in self.components],
-            "providers": [str(name) for name in configured],
-        }
+        order.append("close_all_documents")
+        if getattr(self, "close_refuses", False):
+            raise CadError("cad_close_failed", "fixture refuses to close documents")
+        self.open_documents.clear()
+        return {"closed": True}
 
     def verify_sources_unchanged(self) -> dict[str, Any]:
+        order = getattr(self, "order", None)
+        if order is None:
+            order = self.order = []
+        order.append("verify_sources")
         files = [self.document, *self._dependencies]
         return {str(item): {"sha256": file_digest(Path(item))} for item in files if Path(item).is_file()}
 

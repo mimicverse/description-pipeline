@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
-from description_pipeline.sources.solidworks.errors import BridgeError, ConfigError  # noqa: E402
+from description_pipeline.sources.solidworks.errors import BridgeError, CadError, ConfigError  # noqa: E402
 from description_pipeline.sources.solidworks.freeze import (  # noqa: E402
     _relative_document_name,
     _source_inputs,
@@ -133,6 +133,7 @@ class FreezeTests(unittest.TestCase):
         )
         self.assertEqual(record["schema_version"], "solidworks-to-urdf.link-group-mass-properties/v1")
         self.assertEqual(record["selection_rule"], "top_most_providers+uncovered_leaves")
+        self.assertEqual(record["readout_window"], "pristine-reopen")
         self.assertEqual(sorted(record["links"]), ["arm_link", "base_link"])
         base = record["links"]["base_link"]
         self.assertEqual(base["selection"], ["base-1"])
@@ -149,51 +150,73 @@ class FreezeTests(unittest.TestCase):
             link["provenance"]["mass_properties"]["direct_vs_recombination"]["mass_delta_kg"], 0.0, places=12
         )
 
-    def test_freeze_reads_link_groups_on_the_opened_state_before_the_rebuild(self) -> None:
+    def test_freeze_reads_link_groups_in_the_pristine_reopen_window(self) -> None:
         freeze(self.config, self.destination, backend=self.backend)
         order = self.backend.order
-        self.assertLess(order.index("membership"), order.index("collect_scene"))
-        self.assertLess(order.index("link_group_read"), order.index("collect_scene"))
+        window_close = order.index("close_all_documents")
+        reopen = order.index("open_document")
+        read = order.index("link_group_read")
+        self.assertLess(order.index("collect_scene"), window_close)
+        self.assertLess(order.index("verify_sources"), window_close)
+        self.assertLess(window_close, reopen)
+        self.assertLess(reopen, read)
+        # Between the reopen and the direct reads nothing else may run, and
+        # after the reads only the closing close-all follows: no other CAD mass
+        # read can touch the reopened document.
+        self.assertEqual(order[reopen + 1 : read], [])
+        self.assertEqual(order[read + 1 :], ["close_all_documents"])
 
-    def test_freeze_fails_closed_when_the_opened_selection_changes_across_the_rebuild(self) -> None:
-        assembly = support.make_cad_tree(self.tmp / "cad2")
-        parts = [self.tmp / "cad2" / "base.SLDPRT", self.tmp / "cad2" / "arm.SLDPRT"]
-        backend = support.FixtureCadBackend(
-            assembly,
-            [
-                {
-                    "name": "board/x-1",
-                    "transform": support.placement((0.0, 0.0, 0.0)),
-                    "mass": support.mass_payload(0.5, (0.0, 0.0, 0.0)),
-                },
-                {
-                    "name": "board/x-2",
-                    "transform": support.placement((0.0, 0.0, 0.1)),
-                    "mass": support.mass_payload(0.5, (0.0, 0.0, 0.05)),
-                },
-            ],
-            dependencies=parts,
-        )
-        # The early membership names a provider the post-rebuild evidence map
-        # does not carry: the composed selections differ and the capture must
-        # fail closed instead of recording mismatched reads.
-        backend.membership_providers = ["board"]
-        config = json.loads(json.dumps(self.config))
-        config["assembly"] = str(assembly)
-        config["allowed_roots"] = [str(self.tmp / "cad2")]
-        config["bodies"] = [
-            {
-                "id": "board",
-                "name": "board_link",
-                "components": ["board/x-1", "board/x-2"],
-                "frame": {"coordinate_system": "base_datum"},
-            }
-        ]
-        config["joints"] = []
-        config["frames"] = []
+    def test_freeze_fails_closed_when_the_window_payload_echo_differs(self) -> None:
+        self.backend.link_group_selection_override = {"base_link": ["arm-1"]}
         with self.assertRaises(BridgeError) as caught:
-            freeze(config, self.destination, backend=backend)
-        self.assertEqual(caught.exception.code, "link_group_selection_changed_across_rebuild")
+            freeze(self.config, self.destination, backend=self.backend)
+        self.assertEqual(caught.exception.code, "cad_link_group_payload_invalid")
+
+    def test_freeze_fails_closed_when_documents_cannot_close(self) -> None:
+        self.backend.close_refuses = True
+        with self.assertRaises(CadError) as caught:
+            freeze(self.config, self.destination, backend=self.backend)
+        self.assertEqual(caught.exception.code, "cad_close_failed")
+
+    def test_freeze_fails_closed_without_a_window_capable_backend(self) -> None:
+        self.backend.close_all_documents = None
+        with self.assertRaises(BridgeError) as caught:
+            freeze(self.config, self.destination, backend=self.backend)
+        self.assertEqual(caught.exception.code, "cad_pristine_readout_unavailable")
+
+    def test_freeze_binds_the_pristine_top_and_marks_both_records(self) -> None:
+        reading = {
+            "mass": 2.5,
+            "com": [0.001, -0.002, 0.003],
+            "inertia": [[1e-6, 0.0, 0.0], [0.0, 2e-6, 0.0], [0.0, 0.0, 3e-6]],
+            "reference": {
+                "used_api": "IMassProperty2.GetMomentOfInertia(0)",
+                "scope": "assembly_document",
+                "axes": "assembly_document_axes",
+                "reference_point": "center_of_mass",
+                "use_system_units": True,
+                "product_convention": "solidworks_standard",
+                "overrides": {
+                    "OverrideMass": False,
+                    "OverrideCenterOfMass": False,
+                    "OverrideMomentsOfInertia": False,
+                },
+            },
+        }
+        self.backend.assembly_mass_properties = lambda _path: reading
+        freeze(self.config, self.destination, backend=self.backend)
+        closure = json.loads((self.destination / "raw" / "mass_closure.json").read_text(encoding="utf-8"))
+        self.assertEqual(closure["status"], "recorded")
+        self.assertEqual(closure["top_level"]["mass"], 2.5)
+        self.assertEqual(closure["top_level"]["com"], [0.001, -0.002, 0.003])
+        self.assertEqual(closure["top_level"]["reference"]["readout_window"], "pristine-reopen")
+        record = json.loads(
+            (self.destination / "raw" / "link_group_mass_properties.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(record["readout_window"], "pristine-reopen")
+        # The direct reads ran after the reopen, never on the walked session.
+        order = self.backend.order
+        self.assertLess(order.index("open_document"), order.index("link_group_read"))
 
     def test_freeze_records_evidence_covered_stale_stored_references(self) -> None:
         config = json.loads(json.dumps(self.config))
@@ -1088,9 +1111,7 @@ class FreezeTests(unittest.TestCase):
         self.assertTrue(failure.is_dir())
         record = json.loads((failure / "failure.json").read_text(encoding="utf-8"))
         self.assertEqual(record["code"], "capture_source_mismatch")
-        # The opened-state direct link group read detects the wrong document
-        # before any evidence measurement, so the failure names that stage.
-        self.assertEqual(record["stage"], "opened_link_groups")
+        self.assertEqual(record["stage"], "readings")
         self.assertEqual(record["request"]["assembly"], str(self.assembly))
         self.assertEqual(record["request"]["configuration"], "Default")
         # the material that explains the failure survives: the collector's copy

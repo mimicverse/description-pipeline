@@ -4023,60 +4023,41 @@ class LinkGroupMassPropertiesTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "cad_not_assembly")
 
 
-class OpenedStateMembershipTests(unittest.TestCase):
-    """link_group_membership probes the OPENED copy, before ForceRebuild3."""
+class CloseAllDocumentsTests(unittest.TestCase):
+    """The pristine readout window's close-all helper fails closed on leftovers."""
 
-    def test_collect_scene_can_skip_the_rebuild_for_the_opened_probe(self):
-        class SpyBackend(_CaptureBackend):
-            def __init__(self, **kwargs):
-                super().__init__(**kwargs)
-                self.rebuilds = 0
+    def _backend(self, app):
+        return SolidWorksBackend(session_factory=lambda: _Session(app))
 
-            def _rebuild_capture_copy(self, doc, path):
-                self.rebuilds += 1
-                return super()._rebuild_capture_copy(doc, path)
+    def test_close_all_documents_verifies_no_document_remains(self):
+        calls = []
+        app = _App({})
+        app.CloseAllDocuments = lambda confirm: calls.append(confirm) or True
+        app.GetDocuments = lambda: [types.SimpleNamespace(GetPathName=lambda: "C:/left.SLDASM")]
+        with _com_stubs(), self.assertRaises(CadError) as caught:
+            self._backend(app).close_all_documents()
+        self.assertEqual(caught.exception.code, "cad_close_failed")
+        self.assertEqual(caught.exception.detail["open"], ["C:/left.SLDASM"])
+        self.assertEqual(caught.exception.detail["count"], 1)
+        self.assertEqual(calls, [False])
 
-        with TemporaryDirectory() as tmp, _com_stubs():
-            root = Path(tmp)
-            part = _write(root, "base.SLDPRT")
-            component = _Component("base-1", part)
-            assembly = _write(root, "robot.SLDASM")
-            doc = _Doc(assembly, doc_type=2, children=[component])
-            backend = SpyBackend(session_factory=lambda: _Session(_App({assembly: doc})))
-            opened = backend.collect_scene(str(assembly), [], rebuild=False)
-            self.assertEqual(backend.rebuilds, 0)
-            self.assertEqual([entry.name for entry in opened.components], ["base-1"])
-            rebuilt = backend.collect_scene(str(assembly), [])
-            self.assertEqual(backend.rebuilds, 1)
-            self.assertEqual([entry.name for entry in rebuilt.components], ["base-1"])
+    def test_close_all_documents_reports_success(self):
+        app = _App({})
+        app.CloseAllDocuments = lambda confirm: True
+        app.GetDocuments = list
+        with _com_stubs():
+            self.assertEqual(self._backend(app).close_all_documents(), {"closed": True})
 
-    def test_membership_unions_the_effective_names_and_clears_the_early_cache(self):
-        class StubBackend(_CaptureBackend):
-            def __init__(self, **kwargs):
-                super().__init__(**kwargs)
-                self.scene_calls = []
+    def test_close_all_documents_failure_is_fail_closed(self):
+        def refuse(_confirm):
+            raise RuntimeError("server busy")
 
-            def collect_scene(self, path, coordinate_systems, progress=None, require_material=True, rebuild=True):
-                self.scene_calls.append(rebuild)
-                return types.SimpleNamespace(
-                    components=[types.SimpleNamespace(name="a-1")],
-                    notes={"effective_instance:sheet-1": "cad_authored_effective_instance"},
-                )
-
-            def assembly_component_mass_properties(self, path):
-                self._effective_instance_readings = {"a-1": {"mass": 1.0}}
-                return {"instances": []}
-
-        with TemporaryDirectory() as tmp, _com_stubs():
-            root = Path(tmp)
-            assembly = _write(root, "robot.SLDASM")
-            doc = _Doc(assembly, doc_type=2, children=[])
-            backend = StubBackend(session_factory=lambda: _Session(_App({assembly: doc})))
-            membership = backend.link_group_membership(str(assembly), require_material=False)
-            self.assertEqual(backend.scene_calls, [False])
-            self.assertEqual(membership["components"], ["a-1"])
-            self.assertEqual(membership["providers"], ["a-1", "sheet-1"])
-            self.assertEqual(backend.effective_instance_readings(), {})
+        app = _App({})
+        app.CloseAllDocuments = refuse
+        app.GetDocuments = list
+        with _com_stubs(), self.assertRaises(CadError) as caught:
+            self._backend(app).close_all_documents()
+        self.assertEqual(caught.exception.code, "cad_close_failed")
 
 
 if __name__ == "__main__":

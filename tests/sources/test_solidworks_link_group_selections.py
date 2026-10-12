@@ -15,7 +15,7 @@ from . import _paths  # noqa: F401  (import side effect: sys.path)
 
 from description_pipeline.sources.solidworks.errors import BridgeError  # noqa: E402
 from description_pipeline.sources.solidworks.freeze import (  # noqa: E402
-    _link_group_record,
+    _link_group_record_from_payload,
     _link_group_selections,
 )
 
@@ -47,31 +47,6 @@ def _read(mass=1.0):
         "inertia_values_about_origin_api": {"error": "fixture"},
         "overrides": {"OverrideMass": False, "OverrideCenterOfMass": False, "OverrideMomentsOfInertia": False},
     }
-
-
-class _Backend:
-    def __init__(self, links=None):
-        self.links = links
-        self.calls = []
-
-    def link_group_mass_properties(self, path, selections):
-        self.calls.append((path, selections))
-        return {
-            "assembly": path,
-            "configuration": "Default",
-            "used_api": "IMassProperty2 (SelectedItems = component set)",
-            "selection_rule": "top_most_providers+uncovered_leaves",
-            "links": self.links
-            if self.links is not None
-            else {
-                name: {
-                    "selection": list(paths),
-                    "reads": [_read(), _read()],
-                    "reproducibility": {"mass_delta_kg": 0.0, "com_delta_norm_m": 0.0, "tensor_delta_max_abs": 0.0},
-                }
-                for name, paths in selections.items()
-            },
-        }
 
 
 class LinkGroupSelectionTests(unittest.TestCase):
@@ -143,15 +118,28 @@ class LinkGroupSelectionTests(unittest.TestCase):
 
 
 class LinkGroupRecordTests(unittest.TestCase):
-    def _scene(self):
-        return _scene(["a-1", "a-2", "sub-1/b-1", "sub-1/b-2"])
+    SELECTION: ClassVar[list[str]] = ["a-1", "a-2", "sub-1/b-1", "sub-1/b-2"]
 
-    def _cfg(self):
-        return _cfg(("body", ["a-1", "a-2", "sub-1/b-1", "sub-1/b-2"]))
+    def _selections(self):
+        return {"body": {"selection": list(self.SELECTION), "providers": [], "uncovered_leaves": list(self.SELECTION)}}
+
+    def _payload(self, *, selection=None, reads=None, assembly="C:/copy/robot.SLDASM"):
+        return {
+            "assembly": assembly,
+            "configuration": "Default",
+            "used_api": "IMassProperty2 (SelectedItems = component set)",
+            "selection_rule": "top_most_providers+uncovered_leaves",
+            "links": {
+                "body": {
+                    "selection": list(selection if selection is not None else self.SELECTION),
+                    "reads": reads if reads is not None else [_read(), _read()],
+                    "reproducibility": {"mass_delta_kg": 0.0, "com_delta_norm_m": 0.0, "tensor_delta_max_abs": 0.0},
+                }
+            },
+        }
 
     def test_record_wraps_the_native_payload_with_the_schema(self):
-        backend = _Backend()
-        record = _link_group_record(backend, self._cfg(), self._scene(), {}, "C:/copy/robot.SLDASM")
+        record = _link_group_record_from_payload(self._payload(), self._selections(), "C:/copy/robot.SLDASM")
         self.assertEqual(record["schema_version"], "solidworks-to-urdf.link-group-mass-properties/v1")
         self.assertEqual(record["assembly"], "C:/copy/robot.SLDASM")
         self.assertEqual(record["configuration"], "Default")
@@ -159,63 +147,54 @@ class LinkGroupRecordTests(unittest.TestCase):
         self.assertEqual(record["selection_rule"], "top_most_providers+uncovered_leaves")
         self.assertEqual(sorted(record["links"]), ["body"])
         row = record["links"]["body"]
-        self.assertEqual(row["selection"], ["a-1", "a-2", "sub-1/b-1", "sub-1/b-2"])
+        self.assertEqual(row["selection"], self.SELECTION)
         self.assertEqual(len(row["reads"]), 2)
         self.assertEqual(
-            record["links"]["body"]["reproducibility"],
+            row["reproducibility"],
             {"mass_delta_kg": 0.0, "com_delta_norm_m": 0.0, "tensor_delta_max_abs": 0.0},
         )
-        self.assertEqual(backend.calls, [("C:/copy/robot.SLDASM", {"body": row["selection"]})])
 
-    def test_missing_backend_reader_fails_closed(self):
+    def test_bad_schema_fields_and_link_coverage_fail_closed(self):
+        bad = self._payload()
+        bad["used_api"] = "other"
         with self.assertRaises(BridgeError) as caught:
-            _link_group_record(object(), self._cfg(), self._scene(), {}, "C:/copy/robot.SLDASM")
-        self.assertEqual(caught.exception.code, "cad_link_group_reader_missing")
-
-    def test_payload_mismatches_fail_closed(self):
-        backend = _Backend(links={})
-        with self.assertRaises(BridgeError) as caught:
-            _link_group_record(backend, self._cfg(), self._scene(), {}, "C:/copy/robot.SLDASM")
+            _link_group_record_from_payload(bad, self._selections(), "C:/copy/robot.SLDASM")
         self.assertEqual(caught.exception.code, "cad_link_group_payload_invalid")
-        backend = _Backend(
-            links={
-                "body": {
-                    "selection": ["a-1"],
-                    "reads": [_read(), _read()],
-                    "reproducibility": {"mass_delta_kg": 0.0, "com_delta_norm_m": 0.0, "tensor_delta_max_abs": 0.0},
-                }
-            }
-        )
+        bad = self._payload()
+        bad["selection_rule"] = "other"
         with self.assertRaises(BridgeError) as caught:
-            _link_group_record(backend, self._cfg(), self._scene(), {}, "C:/copy/robot.SLDASM")
+            _link_group_record_from_payload(bad, self._selections(), "C:/copy/robot.SLDASM")
+        self.assertEqual(caught.exception.code, "cad_link_group_payload_invalid")
+        bad = self._payload()
+        bad["links"] = {}
+        with self.assertRaises(BridgeError) as caught:
+            _link_group_record_from_payload(bad, self._selections(), "C:/copy/robot.SLDASM")
+        self.assertEqual(caught.exception.code, "cad_link_group_payload_invalid")
+
+    def test_selection_echo_mismatch_fails_closed(self):
+        bad = self._payload(selection=["a-1"])
+        with self.assertRaises(BridgeError) as caught:
+            _link_group_record_from_payload(bad, self._selections(), "C:/copy/robot.SLDASM")
         self.assertEqual(caught.exception.code, "cad_link_group_payload_invalid")
 
     def test_single_read_and_bad_read_fields_fail_closed(self):
-        links = {
-            "body": {
-                "selection": ["a-1", "a-2", "sub-1/b-1", "sub-1/b-2"],
-                "reads": [_read()],
-                "reproducibility": {"mass_delta_kg": 0.0, "com_delta_norm_m": 0.0, "tensor_delta_max_abs": 0.0},
-            }
-        }
         with self.assertRaises(BridgeError) as caught:
-            _link_group_record(_Backend(links=links), self._cfg(), self._scene(), {}, "C:/copy/robot.SLDASM")
+            _link_group_record_from_payload(
+                self._payload(reads=[_read()]), self._selections(), "C:/copy/robot.SLDASM"
+            )
         self.assertEqual(caught.exception.code, "cad_link_group_payload_invalid")
-        bad = _read()
-        bad["mass_kg"] = -1.0
-        links["body"]["reads"] = [bad, _read()]
+        bad_read = _read()
+        bad_read["mass_kg"] = -1.0
         with self.assertRaises(BridgeError) as caught:
-            _link_group_record(_Backend(links=links), self._cfg(), self._scene(), {}, "C:/copy/robot.SLDASM")
+            _link_group_record_from_payload(
+                self._payload(reads=[bad_read, _read()]), self._selections(), "C:/copy/robot.SLDASM"
+            )
         self.assertEqual(caught.exception.code, "cad_link_group_payload_invalid")
 
     def test_other_document_read_fails_closed(self):
-        backend = _Backend()
-        backend.link_group_mass_properties = lambda path, selections: {
-            **_Backend().link_group_mass_properties(path, selections),
-            "assembly": "C:/elsewhere/robot.SLDASM",
-        }
+        payload = self._payload(assembly="C:/elsewhere/robot.SLDASM")
         with self.assertRaises(BridgeError) as caught:
-            _link_group_record(backend, self._cfg(), self._scene(), {}, "C:/copy/robot.SLDASM")
+            _link_group_record_from_payload(payload, self._selections(), "C:/copy/robot.SLDASM")
         self.assertEqual(caught.exception.code, "capture_source_mismatch")
 
 
