@@ -460,5 +460,270 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
         self.assertFalse(checks["physics.closure"]["passed"])
 
 
+class StubInstanceBackend:
+    """CAD-API double that also exposes the cached singleton readings."""
+
+    def __init__(self, top, rows, readings):
+        self._top = top
+        self._rows = rows
+        self._readings = readings
+
+    def assembly_mass_properties(self, path):
+        return copy.deepcopy(self._top)
+
+    def assembly_component_mass_properties(self, path):
+        return {
+            "assembly": path,
+            "configuration": "Default",
+            "instances": copy.deepcopy(self._rows),
+            "errors": [],
+            "reference": {"method": "IMassProperty2 (SelectedItems = component instance)"},
+        }
+
+    def effective_instance_readings(self):
+        return copy.deepcopy(self._readings)
+
+
+class InstanceMeasurementIntegrationTests(unittest.TestCase):
+    """Flagless divergence: producer tuple primary, part row diagnostic."""
+
+    TENSOR = [[0.002, 0.0, 0.0], [0.0, 0.003, 0.0], [0.0, 0.0, 0.004]]
+    FLAGS_OFF = {
+        "OverrideMass": False,
+        "OverrideCenterOfMass": False,
+        "OverrideMomentsOfInertia": False,
+    }
+    PART = "NP-F550.step-1"
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.bundle = Path(directory.name)
+        self.evidence = self.bundle / "evidence"
+        (self.evidence / "raw").mkdir(parents=True)
+        self.part_row = {
+            "mass": 1.0,
+            "com": [0.0, 0.0, 0.0],
+            "inertia": [list(row) for row in self.TENSOR],
+            "reference": {
+                "used_api": "IMassProperty2.GetMomentOfInertia(0)",
+                "product_convention": "solidworks_standard",
+                "reference_point": "center_of_mass",
+                "use_system_units": True,
+                "scope": "part_document",
+                "axes": "part_document_axes",
+                "overrides": dict(self.FLAGS_OFF),
+                "part_document": "C:\\captured\\copy\\np-f550.step.SLDPRT",
+                "configuration": "Default",
+                "material_assignment": {
+                    "part": {"name": "Steel", "database": "unit-test"},
+                    "bodies": [{"material": {}, "effective_source": "part"}],
+                },
+            },
+        }
+        self.singleton = {
+            "role": "leaf",
+            "document_type": "part",
+            "mass": 1.5,
+            "com": [0.0, 0.0, 0.0],
+            "inertia": [list(row) for row in self.TENSOR],
+            "reference": {
+                "used_api": "IMassProperty2.GetMomentOfInertia(0)",
+                "selection_api": "IMassProperty2 (SelectedItems = component instance)",
+                "override_api": "IMassProperty2.GetOverrideOptions (same selection)",
+                "scope": "assembly_component_group",
+                "convention_basis": "analytic_fixture_v2_20261006",
+                "product_convention": "solidworks_standard",
+                "reference_point": "center_of_mass",
+                "axes": "assembly_document_axes",
+                "use_system_units": True,
+                "configuration": "Default",
+                "part_document": "C:\\captured\\copy\\np-f550.step.SLDPRT",
+                "assembly_document": COLLECTED,
+                "assembly_configuration": "Default",
+                "selected_components": [self.PART],
+                "effective_instance": True,
+                "measurement_basis": "cad_assembly_instance_measurement",
+                "overrides": dict(self.FLAGS_OFF),
+            },
+            "part_measurement": {
+                "mass_kg": 1.0,
+                "center_of_mass_m": [0.0, 0.0, 0.0],
+                "inertia_kg_m2": [list(row) for row in self.TENSOR],
+                "scope": "part_document",
+                "used_api": "IMassProperty2.GetMomentOfInertia(0)",
+                "product_convention": "solidworks_standard",
+            },
+        }
+        self.top = {
+            "mass": 1.5,
+            "com": [0.0, 0.0, 0.0],
+            "inertia": [list(row) for row in self.TENSOR],
+            "reference": {
+                "used_api": "IMassProperty2.GetMomentOfInertia(0)",
+                "product_convention": "solidworks_standard",
+                "reference_point": "center_of_mass",
+                "use_system_units": True,
+                "scope": "assembly_document",
+                "axes": "assembly_document_axes",
+                "overrides": dict(self.FLAGS_OFF),
+            },
+        }
+        self.rows = [
+            {
+                "name": self.PART,
+                "parent": None,
+                "depth": 0,
+                "document": "C:\\captured\\copy\\np-f550.step.SLDPRT",
+                "document_type": "part",
+                "context_mass_kg": 1.5,
+                "context_volume_m3": 1e-6,
+                "overrides": dict(self.FLAGS_OFF),
+                "effective": copy.deepcopy(self.singleton),
+                "effective_error": None,
+            }
+        ]
+        self.source = {
+            "provider": "solidworks",
+            "assembly": ORIGINAL,
+            "configuration": "Default",
+            "material_source": "cad",
+            "bodies": [
+                {
+                    "id": "base",
+                    "name": "base_link",
+                    "components": [self.PART],
+                    "frame": {"coordinate_system": "base_datum"},
+                }
+            ],
+            "joints": [],
+        }
+
+    def _build(self):
+        backend = StubInstanceBackend(self.top, self.rows, {self.PART: self.singleton})
+        native = freeze_module._mass_closure(backend, self.source, COLLECTED)
+        readings = backend.effective_instance_readings()
+        scene_obj = type(
+            "Scene",
+            (),
+            {
+                "components": [
+                    type(
+                        "Component",
+                        (),
+                        {
+                            "name": self.PART,
+                            "transform": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                            "path": "C:\\captured\\copy\\np-f550.step.SLDPRT",
+                            "is_fixed": False,
+                            "document_type": "part",
+                        },
+                    )()
+                ],
+                "coordinate_systems": {"base_datum": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]},
+                "mass_properties": {self.PART: copy.deepcopy(self.part_row)},
+                "notes": {},
+            },
+        )()
+        record = freeze_module._effective_instance_record(scene_obj, self.source, readings)
+        scene_payload = {
+            "document": COLLECTED,
+            "source_document": ORIGINAL,
+            "source_root": "C:\\captured\\copy",
+            "components": [
+                {
+                    "name": self.PART,
+                    "path": "C:\\captured\\copy\\np-f550.step.SLDPRT",
+                    "transform": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                    "is_fixed": False,
+                    "document_type": "part",
+                }
+            ],
+            "coordinate_systems": {"base_datum": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]},
+            "mass_properties": {self.PART: copy.deepcopy(self.part_row)},
+            "notes": {
+                "bodies:" + self.PART: {"solid": 8, "sheet": 0},
+                "effective_instances": copy.deepcopy(readings),
+            },
+        }
+        raw = self.evidence / "raw"
+        (raw / "scene_raw.json").write_text(json.dumps(scene_payload), encoding="utf-8")
+        (raw / "mass_properties.json").write_text(json.dumps(scene_payload["mass_properties"]), encoding="utf-8")
+        (raw / "mass_closure.json").write_text(json.dumps(native), encoding="utf-8")
+        (raw / "effective_instances.json").write_text(json.dumps(record), encoding="utf-8")
+        (raw / "declared_masses.json").write_text(json.dumps({"items": {}, "evidence": None}), encoding="utf-8")
+        (raw / "coordinate_systems.json").write_text(json.dumps(scene_payload["coordinate_systems"]), encoding="utf-8")
+        (raw / "source_config.json").write_text(json.dumps(self.source), encoding="utf-8")
+        (raw / "material_provenance.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "solidworks-to-urdf.material-provenance/v1",
+                    "assembly": ORIGINAL,
+                    "configuration": "Default",
+                    "material_source": "cad",
+                    "measured_source": "cad_api",
+                    "warnings": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        write_manifest(
+            self.evidence,
+            kind="solidworks",
+            identity={"assembly": ORIGINAL, "configuration": "Default", "provider": "solidworks"},
+            evidence_class="cad",
+        )
+        report = closure_module.derive_mass_closure(self.evidence)
+        (self.bundle / "reports").mkdir(parents=True, exist_ok=True)
+        (self.bundle / "reports/mass-closure.json").write_text(json.dumps(report), encoding="utf-8")
+        return record, report
+
+    def _verify(self):
+        loaded = scene_module.load_scene(self.evidence)
+        model = {"links": [{"name": link["name"], "inertial": link["inertial"]} for link in loaded["links"]]}
+        checks = verify_physics(self.evidence, self.source, model)
+        return loaded, {check["id"]: check for check in checks}
+
+    def test_flagless_instance_measurement_is_primary_and_bound(self):
+        record, report = self._build()
+        warning = record["warnings"][0]
+        self.assertEqual(warning["code"], "cad_instance_measurement_differs_from_part")
+        self.assertEqual(
+            warning["qualification"],
+            "cad_assembly_instance_measurement; cause_of_part_difference_unproven; "
+            "not geometry-derived, not independently physically qualified",
+        )
+        self.assertEqual(warning["part_measurement"]["mass_kg"], 1.0)
+        self.assertEqual(report["derived"]["leaf_total"]["mass"], 1.0)
+        self.assertAlmostEqual(report["derived"]["effective_total"]["mass"], 1.5, places=12)
+        loaded, checks = self._verify()
+        failed = [name for name, check in checks.items() if not check["passed"]]
+        self.assertEqual(failed, [], checks)
+        link = loaded["links"][0]
+        self.assertAlmostEqual(link["inertial"]["mass"], 1.5, places=12)
+        raw_row = json.loads((self.evidence / "raw/mass_properties.json").read_text())[self.PART]
+        self.assertEqual(raw_row["mass"], 1.0)
+
+    def test_altered_part_diagnostic_is_rejected(self):
+        self._build()
+        record_path = self.evidence / "raw/effective_instances.json"
+        record = json.loads(record_path.read_text())
+        record["readings"][self.PART]["part_measurement"]["mass_kg"] = 1.2
+        record["warnings"][0]["part_measurement"]["mass_kg"] = 1.2
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        scene_path = self.evidence / "raw/scene_raw.json"
+        scene = json.loads(scene_path.read_text())
+        scene["notes"]["effective_instances"] = json.loads(json.dumps(record["readings"]))
+        scene_path.write_text(json.dumps(scene), encoding="utf-8")
+        write_manifest(
+            self.evidence,
+            kind="solidworks",
+            identity={"assembly": ORIGINAL, "configuration": "Default", "provider": "solidworks"},
+            evidence_class="cad",
+        )
+        _loaded, checks = self._verify()
+        self.assertFalse(checks["physics.effective_instances"]["passed"])
+
+
 if __name__ == "__main__":
     unittest.main()
