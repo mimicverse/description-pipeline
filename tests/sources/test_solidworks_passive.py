@@ -7,6 +7,7 @@ from . import _paths  # noqa: F401
 
 from description_pipeline.sources.solidworks.passive import complete_passive_leaves, resolve_mate_frame
 from description_pipeline.sources.solidworks.scene import _link_frame
+from description_pipeline.sources.solidworks.freeze import _capture_axis_references
 
 
 def native_record():
@@ -74,7 +75,10 @@ class PassiveCompletionTests(unittest.TestCase):
         self.assertEqual(len(self.complete()), 1)
 
     def test_unreadable_solver_and_authored_limits_prevent_completion(self):
-        for key, value in (("error_code", None), ("error_code", 1), ("limits", {"lower": 0., "upper": 1.})):
+        for key, value in (
+            ("error_code", None), ("error_code", 1), ("error_code", False), ("suppressed", None),
+            ("limits", {"lower": 0., "upper": 1.}),
+        ):
             with self.subTest(key=key, value=value):
                 self.raw = native_record()
                 self.raw["mates"][0][key] = value
@@ -119,4 +123,14 @@ class PassiveCompletionTests(unittest.TestCase):
         self.raw["mates"].pop(0)
         with self.assertRaisesRegex(Exception, "uniquely"):
             resolve_mate_frame(self.raw, selector)
+
+    def test_passive_capture_does_not_repeat_native_axis_reads(self):
+        class NoNativeRead:
+            def capture_axis_reference(self, reference):
+                raise AssertionError("sealed mate geometry must be resolved on Linux")
+
+        result, = self.complete()
+        self.assertEqual(_capture_axis_references(NoNativeRead(), {
+            "joints": [{"name": result["joint"], "axis_reference": result["axis_reference"]}],
+        }), [])
 
