@@ -250,13 +250,27 @@ def _valid_passive_completion(detail) -> bool:
 
     import hashlib
 
+    import re
+
     if not isinstance(detail, dict):
+        return False
+    if set(detail) != {
+        "component",
+        "parent",
+        "body",
+        "joint",
+        "axis_reference",
+        "rank",
+        "qualification",
+    }:
         return False
     component = detail.get("component")
     if not isinstance(component, str) or not component.strip():
         return False
-    required = ("parent", "body", "joint", "axis_reference", "rank", "qualification")
-    if any(key not in detail for key in required):
+    parent = detail.get("parent")
+    # The parent must be a declared URDF link name (snake_case, never an
+    # occurrence-style context such as the selected parent assembly).
+    if not isinstance(parent, str) or re.fullmatch(r"[a-z][a-z0-9_]*", parent) is None:
         return False
     if detail.get("rank") != 5:
         return False
@@ -266,7 +280,7 @@ def _valid_passive_completion(detail) -> bool:
     if detail.get("body") != f"passive_{tag}" or detail.get("joint") != f"passive_joint_{tag}":
         return False
     selector = detail.get("axis_reference")
-    if not isinstance(selector, dict):
+    if not isinstance(selector, dict) or set(selector) != {"kind", "component", "mates"}:
         return False
     if selector.get("kind") != "mate_axis" or selector.get("component") != component:
         return False
@@ -275,14 +289,12 @@ def _valid_passive_completion(detail) -> bool:
         return False
     normalized = []
     for mate in mates:
-        if (
-            not isinstance(mate, dict)
-            or not isinstance(mate.get("scope"), str)
-            or not isinstance(mate.get("name"), str)
-        ):
+        if not isinstance(mate, dict) or set(mate) != {"scope", "name"}:
+            return False
+        if not isinstance(mate.get("scope"), str) or not isinstance(mate.get("name"), str):
             return False
         normalized.append((mate["scope"], mate["name"]))
-    return normalized == sorted(normalized)
+    return len(set(normalized)) == len(normalized) and normalized == sorted(normalized)
 
 def _findings(value, source, *, severity=None):
     if isinstance(value, list):
@@ -389,7 +401,8 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                         "object": detail.get("joint") or detail.get("component"),
                         "message": (
                             "该 CAD 叶件未获得显式导出刚性归属：已按 CAD 保存的装配自由度生成被动连续关节 "
-                            f"{detail['joint']}（刚体 {detail['body']}，rank 5：保留原始自由旋转，不推断刚性、驱动或限位）。"
+                            f"{detail['joint']}（刚体 {detail['body']}，rank 5：保留原始自由旋转，"
+                            "不推断刚性、驱动或限位）。"
                             f"源 CAD 叶件 {detail['component']}（父装配 {detail['parent']}）；"
                             "作者意图与驱动尚未取得工程确认，是否通过以独立校验为准。"
                         ),

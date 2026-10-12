@@ -753,7 +753,7 @@ class StructuralReportTests(unittest.TestCase):
         tag = hashlib.sha256(component.encode("utf-8")).hexdigest()[:12]
         detail = {
             "component": component,
-            "parent": "headM3.0-1",
+            "parent": "base_link",
             "body": f"passive_{tag}",
             "joint": f"passive_joint_{tag}",
             "axis_reference": {
@@ -783,7 +783,7 @@ class StructuralReportTests(unittest.TestCase):
             self.assertIn(finding["evidence"]["body"], finding["message"])
             self.assertIn(finding["evidence"]["joint"], finding["message"])
             self.assertIn("垫片2-2", finding["message"])
-            self.assertIn("headM3.0-1", finding["message"])
+            self.assertIn("base_link", finding["message"])
             self.assertIn("作者意图与驱动尚未取得工程确认", finding["message"])
             self.assertEqual(finding["evidence"]["rank"], 5)
             self.assertEqual(report["summary"]["blockers"], 0)
@@ -801,3 +801,49 @@ class StructuralReportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_passive_completion_validator_refusals(self):
+        def finding(**overrides):
+            base = self._passive_finding()
+            base["detail"].update(overrides)
+            return base
+
+        self.assertIsNotNone(None)  # placeholder to keep formatting stable
+        self.assertTrue(
+            __import__("description_pipeline.structural_report", fromlist=["_valid_passive_completion"])
+            ._valid_passive_completion(self._passive_finding()["detail"])
+        )
+        from description_pipeline.structural_report import _valid_passive_completion
+
+        self.assertTrue(_valid_passive_completion(self._passive_finding()["detail"]))
+        self.assertFalse(_valid_passive_completion(finding(parent="headM3.0-1")["detail"]))
+        extras = self._passive_finding()["detail"].copy()
+        extras["extra"] = True
+        self.assertFalse(_valid_passive_completion(extras))
+        selector_extra = self._passive_finding()["detail"].copy()
+        selector_extra["axis_reference"] = {
+            **selector_extra["axis_reference"],
+            "extra": 1,
+        }
+        self.assertFalse(_valid_passive_completion(selector_extra))
+        duplicate = self._passive_finding()["detail"].copy()
+        duplicate["axis_reference"] = {
+            "kind": "mate_axis",
+            "component": duplicate["component"],
+            "mates": [
+                {"scope": "headM3.0-1", "name": "同心27"},
+                {"scope": "headM3.0-1", "name": "同心27"},
+            ],
+        }
+        self.assertFalse(_valid_passive_completion(duplicate))
+        unsorted_detail = self._passive_finding()["detail"].copy()
+        unsorted_detail["axis_reference"] = {
+            "kind": "mate_axis",
+            "component": unsorted_detail["component"],
+            "mates": [
+                {"scope": "z-scope", "name": "b"},
+                {"scope": "a-scope", "name": "a"},
+            ],
+        }
+        self.assertFalse(_valid_passive_completion(unsorted_detail))
+
