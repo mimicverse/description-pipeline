@@ -808,11 +808,6 @@ if __name__ == "__main__":
             base["detail"].update(overrides)
             return base
 
-        self.assertIsNotNone(None)  # placeholder to keep formatting stable
-        self.assertTrue(
-            __import__("description_pipeline.structural_report", fromlist=["_valid_passive_completion"])
-            ._valid_passive_completion(self._passive_finding()["detail"])
-        )
         from description_pipeline.structural_report import _valid_passive_completion
 
         self.assertTrue(_valid_passive_completion(self._passive_finding()["detail"]))
