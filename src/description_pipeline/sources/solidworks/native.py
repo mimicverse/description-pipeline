@@ -4785,8 +4785,13 @@ class SolidWorksBackend(CadBackend):
                     state = _component_state(component)
                     document_path = _method(component, "GetPathName")
                     source_document = _component_source_document(component, source_root)
-                    materialized = bool(source_document.get("materialization_path")) and session_materialization_path(
-                        source_document["materialization_path"]
+                    # The native materialization identity is recorded inside
+                    # source_provenance. Reading it from the outer record would
+                    # make cached descendants lose their defining anchor.
+                    source_provenance = source_document.get("source_provenance") or {}
+                    materialization_path = source_provenance.get("materialization_path")
+                    materialized = bool(materialization_path) and session_materialization_path(
+                        materialization_path
                     )
                     anchor_for_children = path_name if materialized else anchor
                     # Ultimate native owner: the nearest ancestor delivered

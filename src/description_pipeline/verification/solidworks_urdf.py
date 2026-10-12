@@ -1182,7 +1182,11 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
     geometry = {row["component"]: row for row in geometry_rows}
     gates.add("geometry.coverage", lambda: _geometry_coverage(geometry_rows, components))
     points, used = [], []
-    exclusions = {row["component"] for row in definition["checks"].get("documented_exclusions", [])}
+    # ``checks`` is optional; omission means no documented exclusions.
+    exclusions = {
+        row["component"]
+        for row in (definition.get("checks") or {}).get("documented_exclusions", [])
+    }
     for body in source["bodies"]:
         name = body["name"]
         gates.add("inertia." + name, lambda n=name: _link_physics(links[n], model_links[n]))
