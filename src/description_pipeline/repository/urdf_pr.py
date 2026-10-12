@@ -43,12 +43,16 @@ GIT_ATTRIBUTES = (
     )
 ).encode("ascii")
 #: Immutable native provenance reports travel with the delivery whenever present.
+#: ``mass-closure.json`` is bound by ``delivery.subject_inventory`` whenever it
+#: exists, so it must travel too; dropping it here changed the staged subject
+#: and failed publish reverification (native19, 1.3.12).
 REPORTS_FILES = (
     "input.json",
     "tool.json",
     "quality.json",
     "native-tool.json",
     "native-stages.json",
+    "mass-closure.json",
     "structural-team.md",
     "structural-team.json",
 )
