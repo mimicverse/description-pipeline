@@ -245,57 +245,6 @@ def _canonical_effective_warnings(value) -> list | None:
     return warnings
 
 
-def _valid_passive_completion(detail) -> bool:
-    """Exact ratified shape of one passive-completion finding, or ``False``."""
-
-    import hashlib
-
-    import re
-
-    if not isinstance(detail, dict):
-        return False
-    if set(detail) != {
-        "component",
-        "parent",
-        "body",
-        "joint",
-        "axis_reference",
-        "rank",
-        "qualification",
-    }:
-        return False
-    component = detail.get("component")
-    if not isinstance(component, str) or not component.strip():
-        return False
-    parent = detail.get("parent")
-    # The parent must be a declared URDF link name (snake_case, never an
-    # occurrence-style context such as the selected parent assembly).
-    if not isinstance(parent, str) or re.fullmatch(r"[a-z][a-z0-9_]*", parent) is None:
-        return False
-    if detail.get("rank") != 5:
-        return False
-    if detail.get("qualification") != "cad_derived_passive_dof; author_intent_and_drive_unqualified":
-        return False
-    tag = hashlib.sha256(component.encode("utf-8")).hexdigest()[:12]
-    if detail.get("body") != f"passive_{tag}" or detail.get("joint") != f"passive_joint_{tag}":
-        return False
-    selector = detail.get("axis_reference")
-    if not isinstance(selector, dict) or set(selector) != {"kind", "component", "mates"}:
-        return False
-    if selector.get("kind") != "mate_axis" or selector.get("component") != component:
-        return False
-    mates = selector.get("mates")
-    if not isinstance(mates, list) or not mates:
-        return False
-    normalized = []
-    for mate in mates:
-        if not isinstance(mate, dict) or set(mate) != {"scope", "name"}:
-            return False
-        if not isinstance(mate.get("scope"), str) or not isinstance(mate.get("name"), str):
-            return False
-        normalized.append((mate["scope"], mate["name"]))
-    return len(set(normalized)) == len(normalized) and normalized == sorted(normalized)
-
 def _findings(value, source, *, severity=None):
     if isinstance(value, list):
         for index, entry in enumerate(value):
@@ -380,50 +329,6 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
             # code/message and must not be double-reported by the generic walk.
             continue
         entries.extend(_findings(value, source))
-    passive_code = "discovery.cad_unassigned_passive_joint"
-    passive = [entry for entry in entries if entry.get("code") == passive_code]
-    if passive:
-        # Projected explicitly: the ratified passive-completion record needs the
-        # exact Chinese wording and an exact-shape check, never the raw code text.
-        entries = [entry for entry in entries if entry.get("code") != passive_code]
-        for entry in passive:
-            record = entry.get("evidence")
-            detail = (
-                record.get("detail")
-                if isinstance(record, dict) and isinstance(record.get("detail"), dict)
-                else record
-            )
-            if _valid_passive_completion(detail):
-                entries.append(
-                    {
-                        "severity": "warning",
-                        "code": passive_code,
-                        "object": detail.get("joint") or detail.get("component"),
-                        "message": (
-                            "该 CAD 叶件未获得显式导出刚性归属：已按 CAD 保存的装配自由度生成被动连续关节 "
-                            f"{detail['joint']}（刚体 {detail['body']}，rank 5：保留原始自由旋转，"
-                            "不推断刚性、驱动或限位）。"
-                            f"源 CAD 叶件 {detail['component']}（父装配 {detail['parent']}）；"
-                            "作者意图与驱动尚未取得工程确认，是否通过以独立校验为准。"
-                        ),
-                        "source": entry.get("source"),
-                        "evidence": detail,
-                    }
-                )
-            else:
-                entries.append(
-                    {
-                        "severity": "blocker",
-                        "code": "report.cad_unassigned_passive_joint_invalid",
-                        "object": receipt.get("main_assembly"),
-                        "message": (
-                            "被动补齐记录不符合已批准的 schema：证据无效，必须由独立检查判为失败。"
-                            "本报告不采用默认值、不做替代解释。"
-                        ),
-                        "source": entry.get("source"),
-                        "evidence": detail,
-                    }
-                )
     closure = ((receipt.get("selection") or {}).get("manifest") or {}).get("closure") or {}
     opened = closure.get("open_status") or {}
     if opened.get("warnings"):

@@ -746,97 +746,9 @@ class StructuralReportTests(unittest.TestCase):
             self.assertIn("native.material_provenance_missing", codes)
             self.assertIn("cad_surface_only_effective_instance", codes)
 
-    def _passive_finding(self, **overrides):
-        import hashlib
 
-        component = "headM3.0-1/垫片2-2"
-        tag = hashlib.sha256(component.encode("utf-8")).hexdigest()[:12]
-        detail = {
-            "component": component,
-            "parent": "base_link",
-            "body": f"passive_{tag}",
-            "joint": f"passive_joint_{tag}",
-            "axis_reference": {
-                "kind": "mate_axis",
-                "component": component,
-                "mates": [{"scope": "headM3.0-1", "name": "同心27"}],
-            },
-            "rank": 5,
-            "qualification": "cad_derived_passive_dof; author_intent_and_drive_unqualified",
-        }
-        detail.update(overrides)
-        return {"code": "discovery.cad_unassigned_passive_joint", "blocking": False, "detail": detail}
 
-    def test_passive_completion_renders_chinese_warning(self):
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            write_json(root / "input/discovery/findings.json", {"findings": [self._passive_finding()]})
-            pins = write_structural_report(root, {"run_id": "m3", "state": "verified"}, evidence_root=root)
-            report = json.loads((root / pins["json"]["path"]).read_text())
-            finding = next(
-                item
-                for item in report["findings"]
-                if item["code"] == "discovery.cad_unassigned_passive_joint"
-            )
-            self.assertEqual(finding["severity"], "warning")
-            self.assertEqual(finding["object"], finding["evidence"]["joint"])
-            self.assertIn(finding["evidence"]["body"], finding["message"])
-            self.assertIn(finding["evidence"]["joint"], finding["message"])
-            self.assertIn("垫片2-2", finding["message"])
-            self.assertIn("base_link", finding["message"])
-            self.assertIn("作者意图与驱动尚未取得工程确认", finding["message"])
-            self.assertEqual(finding["evidence"]["rank"], 5)
-            self.assertEqual(report["summary"]["blockers"], 0)
 
-    def test_passive_completion_outside_the_schema_fails_closed(self):
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            write_json(root / "input/discovery/findings.json", {"findings": [self._passive_finding(rank=4)]})
-            pins = write_structural_report(root, {"run_id": "m3", "state": "verified"}, evidence_root=root)
-            report = json.loads((root / pins["json"]["path"]).read_text())
-            codes = [item["code"] for item in report["findings"]]
-            self.assertIn("report.cad_unassigned_passive_joint_invalid", codes)
-            self.assertNotIn("discovery.cad_unassigned_passive_joint", codes)
-
-    def test_passive_completion_validator_refusals(self):
-        def finding(**overrides):
-            base = self._passive_finding()
-            base["detail"].update(overrides)
-            return base
-
-        from description_pipeline.structural_report import _valid_passive_completion
-
-        self.assertTrue(_valid_passive_completion(self._passive_finding()["detail"]))
-        self.assertFalse(_valid_passive_completion(finding(parent="headM3.0-1")["detail"]))
-        extras = self._passive_finding()["detail"].copy()
-        extras["extra"] = True
-        self.assertFalse(_valid_passive_completion(extras))
-        selector_extra = self._passive_finding()["detail"].copy()
-        selector_extra["axis_reference"] = {
-            **selector_extra["axis_reference"],
-            "extra": 1,
-        }
-        self.assertFalse(_valid_passive_completion(selector_extra))
-        duplicate = self._passive_finding()["detail"].copy()
-        duplicate["axis_reference"] = {
-            "kind": "mate_axis",
-            "component": duplicate["component"],
-            "mates": [
-                {"scope": "headM3.0-1", "name": "同心27"},
-                {"scope": "headM3.0-1", "name": "同心27"},
-            ],
-        }
-        self.assertFalse(_valid_passive_completion(duplicate))
-        unsorted_detail = self._passive_finding()["detail"].copy()
-        unsorted_detail["axis_reference"] = {
-            "kind": "mate_axis",
-            "component": unsorted_detail["component"],
-            "mates": [
-                {"scope": "z-scope", "name": "b"},
-                {"scope": "a-scope", "name": "a"},
-            ],
-        }
-        self.assertFalse(_valid_passive_completion(unsorted_detail))
 
 
 if __name__ == "__main__":

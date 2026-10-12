@@ -132,12 +132,6 @@ A flagless leaf instance whose assembly-context measurement differs from its
 part-document measurement is reported the same way, with both measurements kept
 verbatim and the difference recorded as basis `cad_assembly_instance_measurement`
 with an unproven cause — never rescaled, substituted or silently qualified.
-An unassigned CAD leaf completed by a passive continuous joint (CAD-saved free
-spin preserved, rank 5, no inferred rigidity, drive or limits) is reported as a
-warning under exactly that ratified schema, naming the derived body and joint
-IDs with the source CAD component and parent as context; author intent and drive
-remain unqualified, and a record that does not match the schema fails closed
-instead of being reinterpreted.
 
 Native capture rebuilds the collected read-only assembly in its owned session
 before measurements. This refreshes assembly caches, including mass properties;

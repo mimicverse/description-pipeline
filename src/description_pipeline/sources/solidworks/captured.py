@@ -30,22 +30,6 @@ def derive_scene(root: Path, manifest: dict) -> dict:
     components = raw.get("components")
     if not isinstance(components, list) or not all(isinstance(row, dict) for row in components):
         raise PipelineError("Captured component readings must be objects")
-    mate_frames = {}
-    selectors = [body.get("frame", {}).get("mate_axis") for body in config.get("bodies", [])]
-    selectors = [selector for selector in selectors if isinstance(selector, dict)]
-    if selectors:
-        from .passive import resolve_mate_frame
-
-        native = read_data(confined(root, "raw/native_discovery.json"))["raw"]
-        observed = {row["name"]: row["transform"] for row in components}
-        for selector in selectors:
-            component = selector["component"]
-            original = next(row["transform"] for row in native["components"] if row.get("name2") == component)
-            if component not in observed or any(
-                abs(a - b) > 1e-8 for a, b in zip(original, observed[component], strict=True)
-            ):
-                raise PipelineError("Passive mate placement differs between discovery and capture")
-            mate_frames[component] = {"selector": selector, **resolve_mate_frame(native, selector)}
     geometry = (
         read_data(confined(root, "raw/geometry.json"))
         if "raw/geometry.json" in manifest["files"]
@@ -57,6 +41,5 @@ def derive_scene(root: Path, manifest: dict) -> dict:
         mass_properties=masses,
         notes=raw.get("notes", {}),
         document=raw.get("document"),
-        native_mate_frames=mate_frames,
     )
     return build_scene(config, readings, geometry)
