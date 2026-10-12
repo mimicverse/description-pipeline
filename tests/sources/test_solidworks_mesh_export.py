@@ -8,12 +8,16 @@ import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
 from description_pipeline.geometry.stl import read as read_stl  # noqa: E402
 from description_pipeline.sources.solidworks.errors import CadError  # noqa: E402
-from description_pipeline.sources.solidworks.native import SolidWorksBackend  # noqa: E402
+from description_pipeline.sources.solidworks.native import (  # noqa: E402
+    FACE_READ_RETRY_ATTEMPTS,
+    SolidWorksBackend,
+)
 
 TRIANGLE = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
 
@@ -154,6 +158,12 @@ class FlakyFace(FakeFace):
         if self.calls <= self.failures:
             raise TransientComError()
         return super().GetTessTriangles(flag)
+
+
+def _silence_retry_sleep():
+    """The face-read budget is pinned by attempt counts, not wall time."""
+
+    return patch("description_pipeline.sources.solidworks.native.time.sleep", lambda _seconds: None)
 
 
 def _backend(component, name="pcb-1") -> SolidWorksBackend:
@@ -460,7 +470,8 @@ class ComponentMeshExportTests(unittest.TestCase):
                 dest = self.tmp / f"mesh-{area}.stl"
                 tessellation = FlakyTessellation(failures=99, facets=0, tessellate_result=True)
                 backend = self._sheet_facetless_backend(FakeFace([], triangle_count=0, area=area), tessellation)
-                entry = backend.export_component_meshes({"pcb-1": dest})["pcb-1"]
+                with _silence_retry_sleep():
+                    entry = backend.export_component_meshes({"pcb-1": dest})["pcb-1"]
                 row = entry["tessellation"]["no_facets_faces"][0]
                 self.assertEqual(
                     set(row),
@@ -479,18 +490,18 @@ class ComponentMeshExportTests(unittest.TestCase):
                 self.assertIn("com_error", row["tessellate_probe_error"])
                 self.assertIn("-2147417851", row["tessellate_probe_error"])
                 self.assertEqual(row["used_api"], "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets")
-                self.assertEqual(tessellation.calls, 3)
+                self.assertEqual(tessellation.calls, FACE_READ_RETRY_ATTEMPTS)
                 self.assertEqual(entry["triangles"], 1)
                 self.assertTrue(dest.exists())
 
     def test_persistent_transient_probe_on_non_degenerate_face_stays_fatal(self):
         tessellation = FlakyTessellation(failures=99, facets=0, tessellate_result=True)
         backend = self._sheet_facetless_backend(FakeFace([], triangle_count=0, area=1e-6), tessellation)
-        with self.assertRaises(CadError) as caught:
+        with _silence_retry_sleep(), self.assertRaises(CadError) as caught:
             backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
         self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
         self.assertIn("com_error", caught.exception.detail["facetless_error"])
-        self.assertEqual(tessellation.calls, 3)
+        self.assertEqual(tessellation.calls, FACE_READ_RETRY_ATTEMPTS)
         self.assertFalse(self.dest.exists())
 
     def test_transient_probe_error_with_weak_degeneracy_evidence_stays_fatal(self):
@@ -502,7 +513,7 @@ class ComponentMeshExportTests(unittest.TestCase):
             with self.subTest(label=label):
                 tessellation = FlakyTessellation(failures=99, facets=0, tessellate_result=True)
                 backend = self._sheet_facetless_backend(face, tessellation)
-                with self.assertRaises(CadError) as caught:
+                with _silence_retry_sleep(), self.assertRaises(CadError) as caught:
                     backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
                 self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
                 self.assertIn("com_error", caught.exception.detail["facetless_error"])
@@ -525,6 +536,105 @@ class ComponentMeshExportTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             _retry_transient_com(permanent)
         self.assertEqual(calls["n"], 1)
+
+    def test_face_read_budget_retries_transient_to_exhaustion_then_raises(self):
+        from description_pipeline.sources.solidworks.native import (
+            FACE_READ_RETRY_ATTEMPTS,
+            FACE_READ_RETRY_DELAYS,
+            _retry_transient_com,
+        )
+
+        calls = {"n": 0}
+        slept = []
+
+        def transient() -> None:
+            calls["n"] += 1
+            raise TransientComError()
+
+        with self.assertRaises(TransientComError):
+            _retry_transient_com(
+                transient,
+                attempts=FACE_READ_RETRY_ATTEMPTS,
+                delays=FACE_READ_RETRY_DELAYS,
+                sleep=slept.append,
+            )
+        self.assertEqual(calls["n"], FACE_READ_RETRY_ATTEMPTS)
+        self.assertEqual(slept, list(FACE_READ_RETRY_DELAYS))
+        self.assertGreaterEqual(FACE_READ_RETRY_ATTEMPTS, 6)
+        self.assertLessEqual(FACE_READ_RETRY_ATTEMPTS, 8)
+        self.assertLessEqual(max(FACE_READ_RETRY_DELAYS), 4.0)
+        self.assertLessEqual(sum(FACE_READ_RETRY_DELAYS), 20.0)
+
+    def test_face_read_budget_succeeds_on_the_fourth_attempt(self):
+        from description_pipeline.sources.solidworks.native import (
+            FACE_READ_RETRY_ATTEMPTS,
+            FACE_READ_RETRY_DELAYS,
+            _retry_transient_com,
+        )
+
+        calls = {"n": 0}
+        slept = []
+
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] <= 3:
+                raise TransientComError()
+            return "face-values"
+
+        result = _retry_transient_com(
+            flaky,
+            attempts=FACE_READ_RETRY_ATTEMPTS,
+            delays=FACE_READ_RETRY_DELAYS,
+            sleep=slept.append,
+        )
+        self.assertEqual(result, "face-values")
+        self.assertEqual(calls["n"], 4)
+        self.assertEqual(slept, list(FACE_READ_RETRY_DELAYS[:3]))
+
+    def test_face_read_budget_does_not_retry_non_transient_errors(self):
+        from description_pipeline.sources.solidworks.native import (
+            FACE_READ_RETRY_ATTEMPTS,
+            FACE_READ_RETRY_DELAYS,
+            _retry_transient_com,
+        )
+
+        calls = {"n": 0}
+        slept = []
+
+        def permanent() -> None:
+            calls["n"] += 1
+            raise RuntimeError("permanent")
+
+        with self.assertRaises(RuntimeError):
+            _retry_transient_com(
+                permanent,
+                attempts=FACE_READ_RETRY_ATTEMPTS,
+                delays=FACE_READ_RETRY_DELAYS,
+                sleep=slept.append,
+            )
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(slept, [])
+
+    def test_default_retry_budget_stays_at_three_attempts(self):
+        from description_pipeline.sources.solidworks.native import (
+            TRANSIENT_COM_RETRY_ATTEMPTS,
+            TRANSIENT_COM_RETRY_DELAYS,
+            _retry_transient_com,
+        )
+
+        calls = {"n": 0}
+        slept = []
+
+        def transient() -> None:
+            calls["n"] += 1
+            raise TransientComError()
+
+        self.assertEqual(TRANSIENT_COM_RETRY_ATTEMPTS, 3)
+        self.assertEqual(TRANSIENT_COM_RETRY_DELAYS, (0.2, 0.5))
+        with self.assertRaises(TransientComError):
+            _retry_transient_com(transient, sleep=slept.append)
+        self.assertEqual(calls["n"], 3)
+        self.assertEqual(slept, [0.2, 0.5])
 
 
 class AxisReferenceTests(unittest.TestCase):

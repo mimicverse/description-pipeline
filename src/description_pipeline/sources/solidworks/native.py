@@ -2046,6 +2046,14 @@ class _ActivityEmitter:
 #: SolidWorks COM mid-export transient: DISP_E_EXCEPTION ("服务器出现意外情况").
 TRANSIENT_COM_RETRY_ATTEMPTS = 3
 TRANSIENT_COM_RETRY_DELAYS = (0.2, 0.5)
+#: Geometry-export face reads (display triangles and the facetless probe) run
+#: against a CAD server that can stay unavailable under load for longer than
+#: the default budget: native18 failed a whole read-write capture on a single
+#: face read.  These two reads carry the deeper budget - 8 attempts with
+#: delays escalating to 4 s (at most 18.5 s of waiting); every other call site
+#: keeps the 3/0.2/0.5 default.
+FACE_READ_RETRY_ATTEMPTS = 8
+FACE_READ_RETRY_DELAYS = (0.5, 1.0, 2.0, 3.0, 4.0, 4.0, 4.0)
 # Unloading a full read-write capture session (61 documents) can lag; the
 # settle window is bounded and only decides when a document is truly stuck.
 CLOSE_ALL_SETTLE_ATTEMPTS = 30
@@ -2067,22 +2075,32 @@ def _is_transient_com_error(error: BaseException) -> bool:
     return "com_error" in text and "-2147417851" in text
 
 
-def _retry_transient_com(operation, *, attempts: int = TRANSIENT_COM_RETRY_ATTEMPTS):
+def _retry_transient_com(
+    operation,
+    *,
+    attempts: int = TRANSIENT_COM_RETRY_ATTEMPTS,
+    delays: tuple[float, ...] = TRANSIENT_COM_RETRY_DELAYS,
+    sleep=None,
+):
     """Bounded retries for the transient COM server exception only.
 
     Each attempt re-runs ``operation``, whose callers re-dereference the face or
     body first, so a stale COM proxy is never reused.  Any other exception, or
     the final attempt, propagates unchanged; the strict decision tree downstream
-    is untouched.
+    is untouched.  ``attempts``, ``delays`` and ``sleep`` let a call site widen
+    the budget (the geometry face reads do) without changing the shared default;
+    ``sleep`` resolves to ``time.sleep`` at call time when not given.
     """
 
+    if sleep is None:
+        sleep = time.sleep
     for attempt in range(attempts):
         try:
             return operation()
         except Exception as error:  # noqa: BLE001 - only the transient signature is retried
             if attempt == attempts - 1 or not _is_transient_com_error(error):
                 raise
-            time.sleep(TRANSIENT_COM_RETRY_DELAYS[min(attempt, len(TRANSIENT_COM_RETRY_DELAYS) - 1)])
+            sleep(delays[min(attempt, len(delays) - 1)])
     raise AssertionError("unreachable")  # pragma: no cover
 
 
@@ -3769,7 +3787,11 @@ class SolidWorksBackend(CadBackend):
                     return list(map(float, _member(read_state["face"], "GetTessTriangles", True) or ()))
 
                 try:
-                    face_values = _retry_transient_com(_read_face_values)
+                    face_values = _retry_transient_com(
+                        _read_face_values,
+                        attempts=FACE_READ_RETRY_ATTEMPTS,
+                        delays=FACE_READ_RETRY_DELAYS,
+                    )
                     face = read_state["face"]
                 except Exception as error:
                     raise CadError(
@@ -3811,7 +3833,11 @@ class SolidWorksBackend(CadBackend):
                             return self._face_facetless_evidence(body, face_ref)
 
                         try:
-                            facetless = _retry_transient_com(_probe_facetless)
+                            facetless = _retry_transient_com(
+                                _probe_facetless,
+                                attempts=FACE_READ_RETRY_ATTEMPTS,
+                                delays=FACE_READ_RETRY_DELAYS,
+                            )
                         except Exception as error:  # noqa: BLE001 - the failure becomes explicit evidence
                             facetless_error = f"{type(error).__name__}: {error}"[:200]
                             probe_error_transient = _is_transient_com_error(error)
