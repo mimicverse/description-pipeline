@@ -58,6 +58,21 @@ from ..sources.solidworks.handoff import MAX_HANDOFF_BYTES
 
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _HARDWARE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
+# A publication base may be any well-formed git branch name (the release pins
+# `main`; feature branches stay valid).  The pattern keeps the documented
+# check-ref-format shape and the extra checks below reject `..`, trailing dots
+# and `.lock` components, which the pattern alone would let through.
+_BASE_BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*")
+
+
+def _valid_base_branch(value: object) -> bool:
+    if not isinstance(value, str) or value != value.strip() or not value:
+        return False
+    if _BASE_BRANCH.fullmatch(value) is None or ".." in value or value.endswith("."):
+        return False
+    return all(not part.lower().endswith(".lock") for part in value.split("/"))
+
+
 JOB_SCHEMA = "solidworks-to-urdf.job/v1"
 CONFIG_SCHEMA = "solidworks-to-urdf.endpoint/v1"
 
@@ -193,8 +208,8 @@ def read_config(path):
             "Target repository slug must be owner/name",
         )
         _require(
-            isinstance(target["base"], str) and target["base"].startswith("feature/"),
-            "Model PR base must be feature/<hardware>",
+            _valid_base_branch(target["base"]),
+            "Model PR base must be a well-formed git branch name",
         )
     for index, first in enumerate(roots):
         for second in roots[index + 1 :]:

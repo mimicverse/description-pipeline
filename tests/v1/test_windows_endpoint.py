@@ -269,6 +269,31 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
                 with self.assertRaises(PipelineError):
                     read_config(self.path)
 
+    def test_publication_target_accepts_well_formed_branch_names(self):
+        for base in ("main", "feature/m3.0", "release/m2.1-rc1", "work/solidworks/m3.0"):
+            with self.subTest(base=base):
+                write_json(
+                    self.path,
+                    {
+                        **self.config_data,
+                        "targets": {"m3_0": {"repository_slug": "mimicverse/description", "base": base}},
+                    },
+                )
+                self.assertEqual(read_config(self.path)["targets"]["m3_0"]["base"], base)
+
+    def test_publication_target_rejects_malformed_branch_names(self):
+        for base in ("", " ", "/main", "main/", "main..x", "main.", ".hidden", "main.lock", "feat//x", "a b"):
+            with self.subTest(base=base):
+                write_json(
+                    self.path,
+                    {
+                        **self.config_data,
+                        "targets": {"m3_0": {"repository_slug": "mimicverse/description", "base": base}},
+                    },
+                )
+                with self.assertRaises(PipelineError):
+                    read_config(self.path)
+
 
 if __name__ == "__main__":
     unittest.main()
