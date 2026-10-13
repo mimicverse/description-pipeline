@@ -1,4 +1,4 @@
--- Read models for the operator: exactly two views, six columns (A v3.3 frozen).
+-- Read models for the operator: exactly two views, six columns.
 -- Run through apply.sh, which supplies :airflow_schema (default: airflow).
 --
 -- lifecycle_projection:

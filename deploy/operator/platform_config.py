@@ -309,7 +309,7 @@ def validate_platform(document) -> dict:
 
 
 #: The minimal same-source contract closure inside the release wheel.  ``io.py`` is the single
-#: owner of the canonical bytes (R17); the deployment keeps NO mirror - the snapshot bytes and
+#: owner of the canonical bytes; the deployment keeps NO mirror - the snapshot bytes and
 #: every digest consume exactly these files from the digest-bound artifact.
 CLOSURE_MEMBERS = (
     "__init__.py",

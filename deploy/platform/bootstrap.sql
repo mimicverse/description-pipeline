@@ -49,22 +49,5 @@ ALTER ROLE airflow_runtime IN DATABASE :"platform_database" SET search_path = :"
 REVOKE ALL ON SCHEMA public FROM PUBLIC;
 REVOKE CREATE ON DATABASE :"platform_database" FROM PUBLIC;
 
--- Ownership is normalized inside the airflow schema only (reinstalls across the identity
--- transition); the platform schema is owned by platform_migrate directly.
-DO $$
-DECLARE item record;
-BEGIN
-    FOR item IN
-        SELECT c.relkind, c.relname FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'airflow' AND pg_get_userbyid(c.relowner) <> 'airflow_migrate'
-    LOOP
-        EXECUTE format('ALTER %s airflow.%I OWNER TO airflow_migrate',
-            CASE item.relkind
-                WHEN 'S' THEN 'SEQUENCE'
-                WHEN 'v' THEN 'VIEW'
-                WHEN 'm' THEN 'MATERIALIZED VIEW'
-                ELSE 'TABLE'
-            END, item.relname);
-    END LOOP;
-END $$;
+-- No ownership rewriting: every object is created by the identity that owns its schema, and a
+-- foreign-owned object makes that identity's migration fail loudly instead of being absorbed.

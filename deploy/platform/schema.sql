@@ -1,12 +1,11 @@
 -- Platform schema: the admission gate, the business rows and their controlled fields.
--- Frozen structure: A v3.3 (reviews/target-architecture-20261013/platform-admission-and-projection-A-final.md).
 -- The schema itself is created by bootstrap.sql (cluster identity); this file is applied by
 -- the platform migration identity (platform_migrate) via apply.sh; idempotent.  The read
 -- models live in views.sql, the consumer grants in roles.sql.  Scheduling facts are not stored here:
 -- the lifecycle view reads the real Airflow metadata in the same consistent snapshot
 -- (no cache, no TTL, no third view).
 --
--- Per-object state vocabularies (frozen; these CHECKs consume them):
+-- Per-object state vocabularies (these CHECKs consume them):
 --   run        queued / running / succeeded / failed / cancelled / unresolved
 --   stage      pending / running / completed / failed / cancelled / unresolved / blocked
 --   operation  queued / running / succeeded / failed / cancelled / unresolved
@@ -85,13 +84,13 @@ CREATE TABLE IF NOT EXISTS platform.operation (
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 
--- The single admission row starts open; the store API owns every later transition.
--- U0: installation initializes the gate CLOSED; the start verb opens it through the store.
+-- Installation initializes the single admission row CLOSED; the start verb opens it through
+-- the store API, which owns every later transition.
 INSERT INTO platform.admission (id, state, reason, actor)
 VALUES (1, 'closed', 'install', 'apply')
 ON CONFLICT (id) DO NOTHING;
 
--- Append-only run event log (U2): events are registered in the same transaction as the state
+-- Append-only run event log: events are registered in the same transaction as the state
 -- change they describe.  ``seq`` is assigned by the application inside the run-locked
 -- transaction; the primary key serializes duplicates.  The role boundary keeps this table
 -- append-only (INSERT/SELECT only - no UPDATE/DELETE grants, no triggers).

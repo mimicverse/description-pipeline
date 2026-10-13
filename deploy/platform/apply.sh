@@ -9,9 +9,9 @@
 #   apply.sh [--bootstrap] --psql PATH --database DB [--airflow-schema NAME]
 #            [--socket DIR | --host HOST] [--port PORT] [--user USER]
 #
-# The caller is the maintenance role that may create the platform schema, the roles and the
-# grants (and that can read the Airflow metadata schema).  Every file is applied with
-# ON_ERROR_STOP so a failed statement aborts the run.
+# Default mode runs as platform_migrate, which owns only the platform schema; --bootstrap is
+# the only step that runs with the installation identity and creates roles and schemas.  Every
+# file is applied with ON_ERROR_STOP so a failed statement aborts the run.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
