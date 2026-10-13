@@ -1,342 +1,109 @@
-# Quality specification
+# 质量规范
 
-Report: `solidworks-to-urdf.quality/v1`. Pipeline ID: `solidworks-to-urdf`.
-All required integrity and selected-model consistency gates must pass before automatic publication. Missing required evidence is
-a failure. There is no public bypass or waiver switch.
+独立验证针对完整、不可变的交付主体建立结论。发布要求所有必需且适用的检查通过；缺失证据、未执行必需检查、无效不适用声明或主体改变均阻断。系统没有质量绕过开关。
 
-Native SolidWorks engineering is the input. Generated YAML is an internal
-artifact and must be verified against original native observations.
+## 验证原则
 
-## Step and result contract
+验证器只读取封存输入、原始观察和实际产物，独立重建成员、拓扑、基准、轴线、限位与物理预期，再检查规范化模型、XML、网格及独立进程中的 MuJoCo 加载。生成方的采集计划、模型和报告是待核对的声明，不能成为预期答案。
 
-The [six-step architecture](design.md#2-how-the-system-works) owns the execution
-boundaries. Each step records input QC and output QC; generation-input inspection
-belongs to capture. Independent verification repeats the engineering checks against
-frozen evidence and actual files rather than trusting earlier success flags.
+验证不会重新打开 CAD，也不是第二次物理实验。它证明封存观察与交付的规定一致性；CAD 的实物真实性与规格适用性由[机械规范](mechanical-handoff-spec.md#review)中的工程责任确定。
 
-| Result | States and meaning |
+检查策略定义固定门与按对象展开的门，以及适用条件、容差和证据要求。报告保存策略摘要、完整预期检查集合、实际结果、测量值、单位、阈值和证据引用。预期集合由策略固定门与原始证据的按对象展开形成；报告检查集合必须与其完全相等，缺失、重复和额外未知检查均失败，不能由生成器或调用者删减。
+
+<a id="gates"></a>
+## 必需检查
+
+| 检查域 | 独立证据与通过条件 |
 |---|---|
-| Step | `not_run`, `running`, `completed`, `failed`, `blocked`; completed requires every boundary check to pass |
-| Automatic check | `passed`, `failed`, `not_run`; missing prerequisites leave a required check unexecuted and prevent qualification |
-| Unsupported check | `unsupported`, with its scope and responsible stage stated; it is never an automatic pass |
-| Stage warning | `warning`: a nonblocking observation with its affected objects and qualification impact. It never substitutes for a required check. An unspecified optional budget needs no manual confirmation. |
-| Engineering review | `not_ready` before automatic verification completes, then `external_review`: only facts outside automatic coverage; the portal does not read or infer approval status from the matching PR or controlled records |
+| 身份与完整性 | 文件清单闭合、摘要正确、schema 有效；工程、配置、采集计划、原生运行和同版工具绑定一致 |
+| 原生来源 | 原生 API/build 与环境已资格化；每个依赖及物化导入件绑定封存原件、所有者和实例；无包外或未知来源 |
+| 机械解释 | 独立判定声明存在性；有声明时独立解码，确证无声明时独立重建完整配合集合；模式、成员和结构一致 |
+| 对象与拓扑 | 每个纳入实例恰属一个刚体，其余显式未分配；名称唯一且合规；唯一 `base_link`、连通无环树，模型/XML 集合一致 |
+| 配置与状态 | 正确引用配置、活动实例和抑制状态；原生重建成功；读取及恢复有效；原件和采集副本的字节保持不变 |
+| 坐标与零姿态 | 有限 SI 齐次变换、正交右手基准；独立从原生根基准计算零姿态 FK，实际产物的放置一致 |
+| 关节与轴线 | 类型、两端、完整原点、正向、限位一致；轴线绑定正确实例中的独立重读原生参考轴或圆柱面 |
+| 物理来源 | 每次读数明确选择范围、配置、单位、坐标轴、质心参考点、张量约定及覆盖标志；未知约定不能采用 |
+| 刚体惯性 | 独立重算完整选择集合，核对原生两次直接读数及到刚体基准的变换；质量、COM 和完整惯量与模型一致 |
+| 整机核算 | 原生所选刚体与独立测量的未分配部分完整划分整机；质量精确闭合，COM/张量在规定容差内，无重复或未解释缺口 |
+| 数值与物理合理性 | 质量正、主惯量正、三角不等式成立；COM 与几何边界合理，惯量不超出几何半径界限 |
+| 网格 | 原生覆盖记录完整；实际三角形有限、非空、尺度与位姿一致；无损分片保持顺序、原始记录、header 和数量 |
+| 可选独立预算 | 已提供预算必须可解析、有效且适用，整机质量与最大外形尺寸在区间内；未提供时有据标记不适用 |
+| 消费者加载 | 新的隔离进程加载实际 URDF 与网格，使用锁定 MuJoCo；保留预期刚体和可动关节，输入前后摘要不变 |
+| 报告绑定 | 根据同一主体与策略重算完整确定性报告，保存报告与重算结果完全一致 |
 
-`quality.json` records the required gate inventory and every executed or unexecuted
-gate. `stages.json` records boundary results, inputs/outputs, file hashes and
-responsibility references. Airflow task logs retain detailed terminal results,
-including failures; XCom retains the compact stage summary. Automatic publication
-creates a candidate PR and cannot set an engineering-approved release state.
-Passed automatic checks do not require manual repetition. Failed checks require
-correction, not human override. Applicable approvals of unchanged engineering
-facts can be reused; changed facts and their effects need review.
-Each receipt declares its `execution_scope`: Windows covers the native portions
-of freeze, discover and capture, including reading and sealing the saved
-exporter declaration; Linux derives the prepared definition during discovery
-and performs generation, verification and publication, including an independent
-re-decode of the sealed declaration. Windows runs no structure derivation,
-URDF generation, MuJoCo verification or Git operations. A complete
-Airflow run binds both; maintenance runs cover only the stages they execute ([operations](operations.md#6-independent-review-and-recovery));
-unexecuted native stages are shown as out of scope rather than qualified.
+原生读取以每个实例的实际引用配置为准，不借用共享零件文档的当前配置。网格从当前装配实例的实体和曲面取得，保持相关 COM 父接口存活；完整批次前后核对实例路径、配置和抑制状态。临时选择与配置恢复须有可核验结果。不可读活动基准、未知抑制状态或读取失败不能被静默省略，失败保留环境、会话和部分观察。
 
-## Capture transfer
+声明存在性是封存原生观察中的 `present / absent / unreadable / unknown`。`absent` 只在交付配置中成功完成原生声明存储查询并证明不存在时成立，必须保留查询对象、接口、返回状态及结果；缺少记录、读取失败或空的损坏载荷不是不存在。`present` 必须支持格式版本、可完整解码、适用于交付配置，全部持久组件/基准/轴引用可解析，且与原生几何和可比较工作限位一致；否则失败。推导和验证分别执行语义核对，只有存在性契约共享。
 
-The Windows worker seals archived inputs, native evidence, the input report,
-native tool identity and native stage receipt. Linux admits this bundle only
-when its closed inventory, every file hash, run ID, handoff digest and selected
-assembly agree with the request. Both hosts must use the same tool source release;
-their dependency records identify their different execution roles.
+发布对有效载荷及 Git/PR 的验收由[发布契约](contracts.md#publication)定义，不能以生成成功、原生完成或报告绿标代替上述验证。
 
-The sealed native bytes are the captured inputs: readings, configuration and
-meshes travel as captured (`raw/scene_raw.json`, `raw/source_config.json`,
-evidence and mesh files). Scene construction, closure comparison math, mesh
-analysis and the structural-team report all run on Linux; the Windows worker
-only performs the native reads and geometry export plus identity, serialization
-and transfer — it renders no report and stores no derived scene.
+<a id="physics"></a>
+## 物理权威与覆盖
 
-When present, the saved exporter declaration payload and its PID resolution rows
-travel with the sealed bundle. The declared structure is derived from the raw
-native record during Linux derivation; Linux verification re-decodes the sealed
-bytes independently and checks the declared topology and native geometry. Saved-pose mate restrictions
-remain diagnostics; conflicting authored operating limits still fail. Authored limits are preserved verbatim: a
-zero-width range or a zero effort/velocity is a stage warning that is kept for
-capture and generation and never qualifies motion. Stored meshes, inertias and
-non-customized origins are regenerated from native CAD and are never adopted.
+每个刚体的质量、COM 和惯量权威是 SolidWorks 对其完整选择集合的一次直接读取，采集保留连续两次读取作为重复性证据。验证器自行重算选择集合，逐项核对；模型采用第一读数及严格的坐标变换。逐实例组合保留为独立分区审计，不得替换权威读数或用于调整总量。
 
-`reports/native-stages.json` preserves the native receipt. The final
-`reports/stages.json` records the full run. Native completion does not grant
-model qualification. Linux still independently reconstructs engineering facts,
-checks the delivered bytes and loads the URDF with MuJoCo before publication.
+选择集合由有效父级覆盖提供者与未被覆盖的叶实例组成。父级覆盖只在一个刚体内整体替代子树，不能分摊到运动链。实例有效值保留原生范围、坐标和覆盖标志；无覆盖标志但装配上下文与零件文档读数不同，保留两者和未证实的原因，不推定覆盖来源。
 
-## Verification gates
+所有有效实例被划分为模型选中集合与显式未分配集合，二者不重叠且覆盖整机。未分配集合由原生独立测量，不能从整机减去模型计算后充当证据。原生刚体直接质量之和加未分配质量，与整机直接读取在规定绝对容差内闭合。完整张量和 COM 在共同坐标系下核算，包含未分配部分；缺少所需物理读数仍失败。
 
-Implementation paths below are relative to `src/description_pipeline/`.
+物理数值始终保留非对角项。原生张量声明 `IMassProperty2.GetMomentOfInertia(0)` 的已验收标准带符号约定、关于质心的参考点及表达轴。验证按正确旋转和平行轴定理换算，不采用未知 fallback 数组或参考导出的惯量。
 
-| Gate | Independent evidence and acceptance | Implementation |
+CAD 值、规格值与实测值须明确来源和适用性。材料缺失、有效覆盖或装配上下文差异不能建立物理真实性；数学闭合通过也不能授予该资格。
+
+<a id="numerics"></a>
+## 数值判据
+
+容差用于以下特定比较，不能互换或因单个工程失败而放宽。整机闭合是额外的严格守恒门，使用同一采集配置与会话中的第一组权威读数、完整分区和稳定求和；重复性或一般独立比较通过不意味着闭合通过。守恒残差超限仍失败，不以较宽的读取容差豁免。模型与 XML 保留[规定的数值精度](contracts.md#delivery)。张量误差以最大元素绝对差计算，张量尺度取参考张量最大元素绝对值与 `1e-20 kg·m²` 的较大者；一般 `absolute + relative × scale` 是允许误差。
+
+| 比较 | 允许误差 |
+|---|---|
+| 关节/基准位置、轴线径向偏差 | `5e-5 m` |
+| 基准旋转、轴线夹角 | `0.05°` |
+| 有向 XML/声明轴分量 | 绝对 `1e-12` |
+| 单位轴范数 | `1e-9` |
+| 一般独立质量 | 绝对 `1e-12 kg` + 相对 `1e-6` |
+| 一般独立 COM 分量 | `5e-5 m` |
+| 一般独立完整张量 | 绝对 `1e-15 kg·m²` + 相对 `1e-4` |
+| 原生刚体重复读取：质量 / COM / 张量 | `1e-9 kg` / `5e-7 m` / 相对 `1e-6` |
+| 直接读数到模型：质量 / COM / 张量 | 相对 `1e-12` / `1e-9 m` / 相对 `1e-9` |
+| XML 到规范化模型完整张量 | 绝对 `1e-15 kg·m²` + 相对 `1e-10` |
+| 整机质量闭合 | 绝对 `1e-12 kg`，无相对容差 |
+| 整机 COM / 完整张量闭合 | `1e-3 m` / 相对 `1e-2` |
+| COM 超出刚体几何边界 | `1e-4 m` 的三角剖分余量 |
+| 惯量/几何半径界限 | `1%` 的三角剖分余量 |
+| 退化三角形 | 面积 `≤1e-14 m²` 定义为退化；逐原生网格及其对应完整交付分片集检查：退化数/总三角形数 `≤1%` 且退化面积/总面积 `≤1e-6`，两者同时通过，禁止跨对象摊平；零分母失败 |
+| 交付网格分片 | 每片不超过 `199999` 个三角形，保持全部原始三角形记录 |
+
+有效变换必须具有齐次末行、单位正交旋转与正行列式；schema 和检查策略规定这些数值合法性门。非有限值、零/负质量、非正主惯量和不满足惯量三角不等式始终失败。
+
+近零体积网格须有绑定具体实例的异常几何依据。原生曲面片记录正面积却返回零三角形和零 facets 时，可保留精确警告，包含实例、面及原生面积；其曲面几何完整性不获得资格。实体无网格、三角数据损坏、非空曲面缺失必要事实均失败。
+
+<a id="qualification"></a>
+## 警告与资格
+
+报告将检查结果与资格结论分开。`passed` 只表示必需检查集合已通过；资格项在质量报告中以策略定义的 `fact_id`、范围及原生 `object_id` 唯一定位，使用 `established / unqualified / out_of_scope`，引用建立或未建立结论的证据；页面和 PR 使用同一身份，不以显示文本作机器键。外部实物真实性或批准不能由自动项标记为已建立。阶段、检查和复用状态遵循[状态契约](contracts.md#recovery)。
+
+| 保留事实 | 可继续的条件 | 未建立的资格 |
 |---|---|---|
-| Derived-input contract | Reinspect generated YAML, native provenance, controlled records, inventories and generated revision | `sources/solidworks/input.py`, `revision.py` |
-| Native definition | Independently reconstruct membership, adjacency, motion, names, frames and limits from native observations; required gate `source.native_discovery` | `verification/native_discovery.py` |
-| Declared native facts | Exporter declaration ingested at discovery and independently re-decoded at verification; declared membership, topology, frames, axes and limits reconciled with native observations and with the generated source (`discovery.declarations`); contradictions fail closed | `sources/solidworks/exporter.py`, `verification/v14_declarations.py`, `verification/native_declarations.py` |
-| Native source | Native SolidWorks evidence, qualified API/build, matching collection identity and environment | `verification/solidworks_urdf.py` |
-| Dependency closure | No unresolved reference: closure is admitted only from the engine's resolved bindings inside the staged root ([design](design.md#2-how-the-system-works)); original CAD belongs to the sealed selection; collected-copy hashes and configuration agree | `verification/solidworks_urdf.py` |
-| Occurrence coverage | Every selected native occurrence belongs to exactly one body, matching the native declarations and independently proven rigid attachments; unassigned occurrences remain explicit warnings with their measured mass accounted separately. Missing explicit material assignments retain the measured CAD mass/centre-of-mass/inertia without claiming verified material; identity survives normalization | `verification/solidworks_urdf.py` |
-| Coordinates | Finite SI homogeneous transforms, orthonormal right-handed bases, CAD-derived body/joint/reference frames | `verification/solidworks_urdf.py` |
-| Shaft alignment | Numeric shaft line from the independently re-read reference axis or cylindrical interface, stable native identity, origin on shaft and axis collinearity | `verification/solidworks_urdf.py` |
-| Names and topology | Unique snake_case names; exactly one `base_link`; connected acyclic tree; input/model/XML entity agreement | `verification/solidworks_urdf.py` |
-| Joint semantics | Exact type, parent/child, signed axis and limits; evidence bound to archived inputs | `verification/solidworks_urdf.py` |
-| Physical authority | Native numerical consistency for the recorded CAD values; missing explicit material coverage is warning-level with the measured values preserved and no verified-material claim — real material, density and mass boundaries remain external engineering confirmation; no implicit density or unknown convention is ever evidence | `verification/solidworks_physics.py` |
-| Mass, COM and tensor | The native one-shot `IMassProperty2` read over each body's full selected component set is the authoritative link mass source: the verifier recomputes the selection independently and requires it to equal the sealed record, the recorded two-read pair must repeat (≤1e-9 kg, ≤5e-7 m, ≤1e-6 relative), and the model binds to read 1 by the exact assembly→link transform (mass 1e-12 relative, COM 1e-9 m, tensor 1e-9 relative) | `verification/solidworks_physics.py` |
-| Assembly closure | The sum of the direct link reads plus the independently measured unassigned mass is checked against the full whole-assembly mass (exactly, 1e-12 kg) while the COM/tensor gaps to the whole reading are recorded within the evidence-bounded 1e-3 m / 1e-2 relative; the complete component-context readings stay bound and the per-instance recombination remains a non-blocking partition audit | `verification/solidworks_physics.py` |
-| Native mass accounting | Delivered URDF mass plus independently measured, explicitly unassigned CAD mass equals the bound whole-assembly reading; missing evidence or unexplained gaps fail; incomplete whole coverage remains a warning and masses are never normalized | `verification/solidworks_physics.py` |
-| Inertia validity | Finite positive mass; positive principal inertia; triangle inequality; XML full tensor agrees with raw-verified model | `verification/solidworks_urdf.py` |
-| Geometry | Native mesh coverage, SI scale, finite nonempty triangles and CAD placement of actual vertices. Meshes above 199999 triangles use ordered lossless parts; the verifier checks every original triangle record, header, count, pose and scale | `verification/solidworks_urdf.py`, `geometry/stl.py` |
-| Physical plausibility | COM within body bounds; inertia within geometry radius bound; total mass and largest whole-robot extent within declared intervals when a design budget is supplied; a missing budget applies no acceptance intervals and is never manufactured from measured values, while an invalid supplied record fails | `verification/solidworks_urdf.py` |
-| Consumer loading | MuJoCo loads delivered URDF and meshes and retains expected bodies and movable joints | `verification/solidworks_urdf.py` |
-| Report binding | Recomputed deterministic report equals the saved report and bound file subject | `delivery.py`, `verification/solidworks_urdf.py` |
-| Publication | Reverify copied output and actual Git blob bytes; revision succession; fast-forward push; exact PR head/base | `repository/urdf_pr.py` |
+| 显式未分配实例 | 完整划分、独立读数及整机核算通过 | 整机 URDF 覆盖 |
+| 显式材料赋值缺失 | 原生物理数值可读、合法且一致 | 材料与密度真实性 |
+| 原生覆盖或有效实例差异 | 范围、坐标、来源标志与闭包有效 | 几何推导的物理真实性 |
+| 声明的零范围、零 effort/velocity | 值有限、非负、顺序及可比较来源一致 | 可用运动或驱动能力 |
+| 原生曲面片无 facets | 精确原生面积及对象事实完整，其余几何门通过 | 该曲面片的几何完整性 |
 
-## Numerical contract
+零值必须是明确读取的作者值，缺失不是零。不能填默认值、归一化质量、编造刚体附着或丢弃对象以获得通过。负值、缺失必需读数、工作限位冲突及未知范围仍失败。
 
-| Quantity | Acceptance tolerance |
-|---|---|
-| Joint/frame position and radial shaft offset | 0.05 mm |
-| Frame rotation and shaft line angle | 0.05 degrees |
-| Signed XML/declared axis | Absolute component difference ≤ 1e-12 |
-| Unit joint axis | Norm error ≤ 1e-9 |
-| Independent mass | Relative 1e-6, absolute 1e-12 kg |
-| Whole-CAD mass equality | Absolute 1e-12 kg, relative 0 |
-| Independent COM | Absolute 0.05 mm per component |
-| Independent full tensor | Max-entry error ≤ 1e-4 of tensor scale + 1e-15 kg·m² |
-| XML/canonical full tensor | Relative 1e-10, absolute 1e-15 kg·m² |
-| COM/body bounds | 0.1 mm allowance for tessellation |
-| Inertia/radius bound | 1% allowance for tessellation |
-| Degenerate triangles | Count ratio ≤ 1% and degenerate-area / total-area ratio ≤ 1e-6; both bounds must pass |
-| Near-zero mesh volume | Requires a documented exceptional-geometry occurrence |
+可选预算未提供属于不适用，不生成预算、警告或人工确认任务。平台列出实际不在自动覆盖范围内的工程事实，既不代签批准，也不把未读取的既有审批推断为未完成。
 
-Raw part tensors must declare the measured standard signed convention for
-`IMassProperty2.GetMomentOfInertia(0)`. Cross terms are retained. Unqualified
-fallback arrays are rejected. A native analytic fixture verifies nonzero cross
-terms, component rotation and assembly aggregation; diagonal-only examples do
-not establish the convention.
+<a id="report"></a>
+## 报告、预览与复核
 
-Each reading declares its scope, axes, COM reference, SI-unit setting and
-override flags. Per-part readings use part-document axes; whole-assembly
-readings use assembly-document axes. Missing declarations block publication. A
-CAD-authored effective instance — an overridden instance, or a surface-only
-component whose part document cannot answer mass questions — is admitted as a
-non-blocking warning that keeps its exact scope, axes and override flags: a
-parent override replaces its subtree only within one rigid body and is never
-distributed to moving links, the whole mass/COM/inertia closure must still hold
-exactly, and the report states plainly that the value is CAD-authored, not
-geometry-derived and not independently physically qualified.
-A flagless leaf instance whose assembly-context measurement differs from its
-part-document measurement is reported the same way, with both measurements kept
-verbatim and the difference recorded as basis `cad_assembly_instance_measurement`
-with an unproven cause — never rescaled, substituted or silently qualified.
-Each body additionally carries the native one-shot direct read over its full
-selected component set (`evidence/raw/link_group_mass_properties.json`): the
-verifier recomputes that selection set independently (top-most override
-providers plus uncovered leaves), the recorded repeat pair is reproducibility
-evidence, and the delivered link inertial is generated from read 1. The
-per-instance recombination is retained as a recorded, non-blocking partition
-gap so the intrinsic difference between CAD's one selection and partitioned
-reads stays visible instead of being hidden by the switch.
-The derived selection accounting is projected as warnings: every unassigned
-occurrence is reported with its native recorded mass, and the native
-whole-vs-selected mass gap is reported as a gap with its qualification withheld
-— never as missing input bytes or a pipeline failure. Exact selected-set
-accounting is distinct from full-assembly coverage qualification: the generated
-URDF's native-selected mass plus the independently measured unassigned mass must
-close to the whole assembly within 1e-12 kg (no exact-zero comparison, no
-scaling and no invented attachment), while the authoritative declared model
-governs coverage and may legitimately leave an explicit unassigned occurrence
-warning. A residual beyond that tolerance, an unexplained gap, an unreadable
-record, or a selection record outside the schema still fails closed. Reference exports may be used for comparison only. Their meshes, physical
-values and naming aliases are never pipeline inputs; the saved CAD remains the
-source of generated facts.
-A sheet face that the native tessellation returns with zero triangles and zero
-facets while the native record still measures a positive area is reported as the
-non-blocking warning `cad_sheet_face_untessellated` (per component entry,
-naming the component and face), stating the native area measurement as recorded
-and the absence of facets; the report never calls it zero-area, and the
-completeness and usability of the surface geometry remain independently
-unqualified. All other native triangles are retained unchanged; malformed
-geometry metadata and solid geometry errors fail closed, while a sheet face
-without facets is reported as the precise facts above.
+质量报告的确定性部分包含主体、工具、策略、检查、测量与资格，禁止加入本次检查时间、运行 UUID、主机临时路径或随机排序。执行时间、活动和运行身份进入独立收据。相同主体与策略重算得到相同报告字节。
 
-Native capture rebuilds the collected read-only assembly in its owned session
-before measurements. This refreshes assembly caches, including mass properties;
-it never saves over CAD. The snapshot records the rebuild and verifies both
-original and collected file hashes after capture. A failed rebuild blocks export.
-Original configuration and save-state observations are initial evidence;
-the retired source is not reread. Live configuration, occurrence and geometry
-guards apply to the collected copy that supplies all measurements.
+验证在只读交付上执行。解析器拒绝外部实体、路径逃逸和远程网格；消费者在新进程中执行，使用明确超时，不继承生成器状态或可影响模型的配置。验证和消费者读取前后均检查主体。
 
-Datums and mass are read in each occurrence's exact referenced configuration.
-Temporary document selections are restored and verified. Meshes use the
-occurrence's solid and surface bodies in component coordinates, without switching
-the shared part document's configuration. Mesh and shaft reads acquire current
-occurrences from the recorded assembly and verify their full names, paths and
-referenced configurations. One assembly traversal owns the complete mesh batch;
-its parent interfaces remain alive through all body and face reads. Mesh destinations
-are unique and ordered by full occurrence identity. An unreadable body, invalid face
-triangles or a body with no display mesh blocks capture. Final checks verify
-the document state through each recorded path in the owned session, and compare
-a fresh assembly traversal with the captured active occurrences. Changed
-names, paths, references or suppression block capture. Unreadable state retains
-the affected document and occurrence in diagnostics.
-Environment and owned-session identities are saved before native readings, so
-reading and geometry failures retain those facts with the partial capture.
-Suppressed datums are excluded. Unreadable suppression state or an unreadable
-active datum blocks discovery and capture; active frames cannot disappear
-silently. An unreadable selection or failed restoration blocks capture.
+通过的预览加载绑定主体的实际 URDF 与网格，显示报告与资格。验证失败后仅允许显著标注“未验证”的诊断预览，附失败检查；缺乏可安全解析的模型时只展示诊断。预览控件不能产生验证结论。
 
-Captured transforms use the native adapter protocol: SI, row-major 4×4
-homogeneous matrices with column-vector multiplication. The adapter converts
-SolidWorks' vendor MathTransform layout at the COM boundary. Verification reads
-the captured protocol directly and derives zero-pose FK from the native root
-datum, independently of model provenance.
+`description check` 只读重算并核对完整报告；额外报告写到交付目录之外。源、工具、策略或文件变化均需重新执行规定阶段与验证。通过结果不能脱离其主体迁移。
 
-Assembly reference geometry is recorded as a frame, never a physical part.
-Top-assembly datums may belong to the base body only when all assembly-frame
-mates resolve to one rigid cluster, their combined constraints have rank six,
-and that cluster owns `CS_base_link`. The generator and verifier derive this
-attachment separately from the raw observations. Partial, ambiguous and nested
-assembly-frame attachments block derivation with the affected mate and scope;
-no world joint, mass or rigid membership is inferred from an `IsFixed` flag.
-
-## Report identity
-
-The subject digest binds every file under `input/`, `evidence/`, `model/`,
-`urdf/`, `meshes/`, plus `README.md`, `reports/input.json` and
-`reports/tool.json`. Transferred captures also bind `reports/native-tool.json`,
-`reports/native-stages.json` and `transfer-manifest.json`; a partial set fails.
-Independent verification rechecks the manifest and native provenance from the
-delivered files. The quality report refers to that subject and cannot hash itself. Local run/PR receipts are also outside the subject and are not published
-as model evidence. `reports/stages.json` is also a run receipt: it records
-the subject and contract hashes, and its own file hash is retained in
-`reports/run.json`. It stays outside the subject to avoid circular hashes and
-post-publication changes to model evidence.
-
-`description check` recomputes every gate and compares the entire deterministic
-report. A stale green flag, incomplete check set or changed file cannot qualify.
-Publication repeats this after copying and against the actual committed Git
-blobs. The publisher generates `.gitattributes` to preserve delivery bytes through
-Git storage and checkout, and records its hash in the publication receipt.
-Effective newline, filter or encoding overrides block publication; the native
-subject remains unchanged.
-
-A retained failed-verification checkpoint may be served as an explicitly
-unverified diagnostic preview carrying its failing checks and warnings; it never
-asserts verification and is forbidden from publication. Generation success alone
-is not verification.
-
-## Scope of acceptance
-
-A pass establishes the listed consistency, physical arithmetic, geometry and
-URDF-loading checks for its exact files. It does not prove actual CAD rigidity
-or degrees of freedom, physical zero or positive motion, real mechanical limits,
-drive capability, material correctness or full-range clearance. Those facts
-require engineering confirmation. Simulation, training and control require
-their own acceptance evidence.
-
-Unassigned rigid ownership, explicit zero parameters and missing explicit
-material assignments are stage warnings so generation can continue; material
-warnings retain the measured CAD mass/centre-of-mass/inertia and never claim
-verified material. Exact native mass accounting and numerical validity and
-consistency remain required. Zero ranges or drives retain their unqualified
-status even when consistency passes; conflicting comparable authored operating
-limits still fail.
-
-Publication identity follows the
-[mechanical identity contract](mechanical-handoff-spec.md#12-工程身份).
-Missing administrative metadata does not block measurement; the raw CAD record
-keeps its absence. CAD-authored values take precedence over authenticated
-submission metadata, whose provenance is retained separately. A submitter-derived
-owner is a submission identity, and a generated revision identifies a frozen
-handoff; neither establishes mechanical responsibility, a PDM revision or
-engineering approval. Remaining publication-readiness gaps still block a PR.
-
-Stage warnings never substitute for acceptance: they stay visible with their
-objects, and the warned facts (material coverage, usable ranges or drives) are
-not qualified by a consistency pass; usable motion, drive capability and material
-truth require their applicable engineering evidence. A material
-warning must never be reported as verified material, and numeric evidence that
-is unreadable, non-positive or non-physical still fails closed. Missing
-required evidence remains a failure.
-
-Source integrity is required before evidence can be used. Every imported CAD
-occurrence must bind to a file in the frozen handoff — or, for an
-engine-materialized import, to the sealed closure's owner/occurrence evidence
-matched to that staged source by native identity. A temporary document or
-visible cached geometry without that sealed binding, and any external source,
-remain errors, with the affected occurrences and reference paths retained in
-diagnostics.
-
-Mechanical review owns input meaning and measured authority. v1 exports visual
-meshes and physical properties; collision simplification, contact behavior,
-actuator/control interfaces and dynamic validation require separate acceptance.
-The [mechanical specification](mechanical-handoff-spec.md) assigns each handoff
-check to its automatic coverage and required engineering confirmation.
-Unit tests with mocked CAD cannot grant native qualification. The release review
-must include actual Windows capture and a complete passing delivery.
-
-Acceptance on the neutral analytic fixture qualifies the tool behaviors it
-exercises. It does not qualify a specific hardware model; each model needs
-its own reviewed inputs, passing delivery and evidence for its intended use.
-
-## Native definition verification
-
-The [mechanical specification](mechanical-handoff-spec.md) owns the handoff
-requirements, naming and engineering confirmations. Definitions, manifests and
-reports are generated; every derived mechanical fact keeps its source.
-
-Native admission reconstructs supported coincident, concentric, distance,
-parallel, perpendicular, angle and lock constraints, including position limits.
-Their combined six-dimensional constraint space must establish rigid membership
-or one supported relative motion. Temporary fixed flags and mate names cannot
-establish motion. Unresolved entities, unsupported constraints, ambiguous motion
-and non-tree topology block derivation.
-
-Constraint reconstruction accepts concentric circular edges and cylindrical
-faces when their recorded axes are coaxial in the assembly frame. A circular
-edge coincident with a plane must lie in that plane, with aligned normals.
-Both entities require usable geometry; a missing entity cannot supply a
-constraint. Supporting an edge for mate reconstruction does not qualify it as
-the independently reread cylindrical interface required for a joint axis.
-
-Capture requires a rereadable native axis reference for each motion axis: a
-named reference axis bound by the saved declaration's axis name, or a rereadable
-cylindrical interface on the reconstruction path. Serialized axis numbers alone
-never qualify. Explicit declarations retain their exact named frames and signed
-axes. On the inferred path, owned `CS_<link>` datums
-identify body frames and `CS_base_link` the root; an optional JCS must match its
-child body frame and owner. Native `axis_sign` supplies the confirmed positive
-direction. Installation, TCP and sensor datums retain their interface names and
-owners.
-
-Independent verification reconstructs membership, joint adjacency/type, signed
-axes, zero configuration, datum placement and limits from native observations
-and engineering annotations. Comparing generated YAML with a model does not
-establish these facts. Controlled physical and drive records must be fixed,
-retrievable and applicable to the engineering revision.
-
-Effective native mass, COM and inertia overrides are carried as qualified
-warnings, not rejections: their scope, axes and override flags are recorded, a
-parent override replaces its subtree only within one rigid body without
-distribution to moving links, and the whole mass/COM/inertia closure is checked
-strictly. No physical accuracy is claimed; complete physical source records
-remain subject to independent checks. The
-[per-item responsibility table](mechanical-handoff-spec.md#111-自动检查与工程师确认)
-separates automatic coverage from engineer-confirmed physical meaning.
-
-Both discovery regimes are supported by design and selected by the same shared
-predicate in the producer and the verifier
-([design](design.md#2-how-the-system-works)): when the sealed record carries the
-saved exporter declaration (the `exporter` block exists and its state is not a
-proven `absent`), verification re-decodes that declaration and reconciles it with
-the native observations; when the declaration is proven absent, verification runs
-the mate-inference suite instead. Tool releases must retain actual native
-acceptance evidence for each supported regime; a capture using a saved exporter
-declaration cannot qualify the mate-inference path. The
-[release procedure](../RELEASING.md#acceptance) owns that evidence requirement.
+模型的工程批准、全行程安全、制造公差、接触/碰撞、仿真、训练和实机控制在各自验收中建立。中性原生夹具资格化其实际覆盖的工具行为，不资格化具体硬件。

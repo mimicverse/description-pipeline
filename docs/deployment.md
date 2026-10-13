@@ -1,481 +1,147 @@
-# Deployment
+# 部署指南
 
-One Linux server hosts the HTTPS operator page, Airflow and PostgreSQL, and
-executes generation, independent MuJoCo verification and PR publication. One
-logged-in Windows computer with licensed SolidWorks serializes the native
-raw-record read and the native capture for each sealed selection. Operators use **Feishu login → engineering folder → Start → checks,
-URDF preview and review PR**.
+部署由一台 Linux 平台主机和一个串行 Windows 原生执行端组成。用户仅访问一个 HTTPS 操作台；Airflow、数据库、内部 API 和原生端点不直接向用户开放。
 
-Use the same source-bound tool release on both hosts. This guide owns installation
-and maintenance; [operations](operations.md) owns the engineering workflow.
+Linux 承担全部平台与可移植工作。Windows 只安装原生运行依赖和已资格化的 SolidWorks，运行在专用登录用户的交互式桌面中；不配置规格库、模型仓库、发布目标、Git 凭据、报告或 MuJoCo。
 
-## Prerequisites
+## 主机准备
 
-| Host or service | Required preparation |
+| 主机 | 必需条件 |
 |---|---|
-| Linux | Ubuntu 22.04 x86_64, user-level systemd, Git, GitHub CLI, network access to the Windows worker, GitHub and Feishu |
-| Windows | Dedicated native execution host with SolidWorks 2026 (major 34; other versions require acceptance first), Python 3.12 x86_64, OpenSSH Server and an interactive desktop session; no independent CAD work during pipeline execution |
-| Model repository | Private repository, an existing configured base such as `feature/<hardware>` or `main`, and a dedicated clean Linux clone |
-| Feishu | Enterprise app, approved tenant keys, registered OAuth callback and access to basic user identity/profile |
-| Storage | Dedicated CAD intake directories; separate frozen inputs, outputs, state, secrets and model clones |
+| Linux | 发行清单支持的 x86_64 Linux、CPython、PostgreSQL、反向代理、Git/GitHub CLI、用户级 systemd；可访问 Windows SSH、飞书与模型仓库 |
+| Windows | 发行清单支持的 Windows、CPython x86_64、licensed SolidWorks 与原生 API；OpenSSH Server、专用登录桌面和独立工程暂存目录 |
+| 外部服务 | 可信 TLS、飞书企业应用及批准租户、私有模型仓库与存在的集成 base |
 
-Choose one operator address through `OPERATOR_HOST` and the HTTPS port, for
-example `https://operator.example.com:8443/`. Register that address followed by
-`/auth/feishu/callback` as the app callback.
-The browser must trust the server certificate and be able to reach this address.
-Use the same origin for the app homepage, login and callback. Feishu's redirect
-URL list permits callbacks; its order does not select the address. The platform
-derives the callback from `OPERATOR_HOST` and the HTTPS port. Avoid environment
-overrides that point it elsewhere. The proxy redirects login and callback
-requests with a different hostname to the configured origin before authentication.
+发行物的 `release.json` 是支持矩阵与依赖身份的权威：两端源码发行身份一致，角色依赖分别锁定。Linux 消费者验证无渲染，不要求桌面、GPU 或图形驱动。Windows 服务不能运行在 Session 0，不能复用工程师的交互 CAD 会话。
 
-Operators use their existing enterprise Feishu accounts; the platform has no
-account-registration step. Create a dedicated enterprise custom app, enable
-the **Web app** feature and set its desktop homepage to the operator address.
-Register the exact callback under **Security Settings → Redirect URLs**.
-Publish a version with the intended users in its availability scope; new
-configuration takes effect after publication. A creator-only release is
-sufficient for commissioning that user's sign-in.
+## 配置权威
 
-SolidWorks is required for the native record read and the native capture. Verification and
-rebuild of a complete frozen delivery run on Linux without opening CAD. Both hosts require Python 3.12 x86_64 and the pinned runtime wheels.
-Consumer checks load models without rendering; they require no display, GPU or
-graphics-driver setup. `description doctor` checks the host role: SolidWorks registration and COM
-prerequisites on Windows, pinned dependencies and an isolated consumer load on
-Linux. Windows capture requires neither MuJoCo nor GitHub access. A native
-readiness pass is a prerequisite; the capture session still checks actual CAD
-access and document readiness.
-Windows jobs must run as the logged-in execution user, outside Session 0.
+Linux 使用一份私有 `platform.json`。schema 拒绝未知键、不安全路径、不完整目标和冲突端口；秘密只按文件引用。安装将其渲染为不可变的配置快照，记录摘要；操作台、Airflow 和维护命令读取同一快照。Airflow Connection 只引用该配置身份，不能再维护一份路由或凭据副本。
 
-## 1. Install the Windows worker
+最小配置如下，路径与标识在安装前替换为实际值：
 
-Download the Windows offline runtime archive and verify its SHA-256 against the
-release manifest. Extract it, then run from the extracted directory:
-
-```powershell
-py -3.12 -m venv C:\description-runtime
-C:\description-runtime\Scripts\python.exe -m pip install --no-index --require-hashes --find-links wheels -r requirements.lock
-C:\description-runtime\Scripts\description.exe doctor
+```json
+{
+  "schema_version": "solidworks-to-urdf.platform/v1",
+  "operator": {
+    "origin": "https://operator.example.com:8443",
+    "certificate_file": "/srv/description/secrets/tls.crt",
+    "private_key_file": "/srv/description/secrets/tls.key"
+  },
+  "storage": {
+    "state_root": "/srv/description/state",
+    "handoff_root": "/srv/description/handoffs",
+    "artifact_root": "/srv/description/artifacts",
+    "workspace_root": "/srv/description/workspaces",
+    "release_root": "/srv/description/releases"
+  },
+  "database": {"dsn_file": "/srv/description/secrets/postgres.dsn"},
+  "windows": {
+    "ssh_host": "solidworks-worker",
+    "endpoint_port": 8765,
+    "token_file": "/srv/description/secrets/endpoint.token"
+  },
+  "auth": {
+    "feishu_secret_file": "/srv/description/secrets/feishu.json",
+    "tenant_keys": ["<approved-tenant-key>"],
+    "admin_open_ids": []
+  },
+  "targets": {
+    "arm": {"repository_slug": "<owner>/<model-repository>", "base": "main"}
+  },
+  "specifications": {"record_roots": ["/srv/description/specifications"]}
+}
 ```
 
-Create the directories below. The worker holds no operator source roots and no
-controlled-record library; it collects immutable copies of each run's staged
-engineering into `C:\description-packages` and keeps managed deliveries,
-state and secrets separate.
+配置、状态、上传、交付、临时工作区、发行安装和规格库使用专用目录，禁止使用主目录/操作系统根、目录重叠、符号链接或 junction。Linux 私有配置和秘密文件权限为 `0600`，私有目录为 `0700`；Windows 使用仅执行用户可读写的 ACL。日志只展示标识、摘要和路径，不展示秘密值。
+
+产品目标、仓库与 base 仅在 Linux 维护。Git 凭据属于 Linux 服务账户；模型仓库来源必须与目标一致，发布使用受管理的干净工作区。规格库只解析 CAD 明确引用的不可变版本，不能被上传内容覆盖。仓库规则须允许服务主体向受管理候选分支追加提交和创建 PR，禁止非 fast-forward；凭据权限限定于配置目标，工程集成 base 保持独立评审。PostgreSQL 的平台与 Airflow 角色只能迁移各自 schema，连接预算及恢复目标在部署验收中固定并验证。
+
+## 安装 Windows 执行端
+
+校验 Windows 离线运行档案与发行清单摘要，提取到独立发行目录并安装其 hash-locked 依赖：
 
 ```powershell
-New-Item -ItemType Directory -Force C:\description-packages, C:\description-deliveries, C:\description-state, C:\description-secrets | Out-Null
-$account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-icacls C:\description-secrets /inheritance:r /grant:r "${account}:(OI)(CI)F"
-C:\description-runtime\Scripts\python.exe -c "import secrets; from pathlib import Path; Path('C:/description-secrets/endpoint.token').write_text(secrets.token_hex(32), encoding='ascii')"
+py -3.12 -m venv C:\description\runtime
+C:\description\runtime\Scripts\python.exe -m pip install --no-index --require-hashes --find-links wheels -r requirements.lock
+C:\description\runtime\Scripts\description.exe doctor
 ```
 
-Keep the token private. Transfer it securely to the Linux host for the tunnel's
-Airflow Connection and portal; do not put its value in source code or logs.
-Save `C:\description-state\endpoint.json`:
+`doctor` 验证安装身份、最小角色依赖及 SolidWorks/COM 就绪；实际作业仍须检查文件和会话。为端点生成独立随机令牌，以受控方式在 Linux 保存副本。原生端点只绑定 loopback：
 
 ```json
 {
   "schema_version": "solidworks-to-urdf.endpoint/v1",
-  "package_root": "C:/description-packages",
-  "output_root": "C:/description-deliveries",
-  "state_root": "C:/description-state",
-  "token_file": "C:/description-secrets/endpoint.token",
+  "package_root": "C:/description/packages",
+  "output_root": "C:/description/results",
+  "state_root": "C:/description/state",
+  "token_file": "C:/description/secrets/endpoint.token",
   "host": "127.0.0.1",
-  "port": 8765,
-  "targets": {
-    "arm": {
-      "repository_slug": "<owner>/<model-repository>",
-      "base": "feature/arm"
-    }
-  }
+  "port": 8765
 }
 ```
 
-Replace `arm` with the hardware identity used by CAD or the configured publication
-target, and set its model base.
-Publication requires a configured hardware target; extraction and inspection
-can proceed while routing is absent. The endpoint keeps no discovery settings:
-controlled records and approved interface names are Linux-side derivation
-settings (section 2). The endpoint stages the complete uploaded folder it is
-given, resolves the main assembly's references inside that staging, reads the
-raw native record and captures the sealed engineering.
-
-Start the endpoint in the logged-in desktop:
+在专用登录桌面启动：
 
 ```powershell
-C:\description-runtime\Scripts\description.exe serve --config C:\description-state\endpoint.json
+C:\description\runtime\Scripts\description.exe serve --config C:\description\endpoint.json
 ```
 
-Keep Windows awake during processing. After foreground acceptance, an
-interactive Scheduled Task may start this same command at login under the same
-user. Do not create a second worker or run concurrent native CAD jobs.
+验收后以同一账户的登录 Scheduled Task 启动同一命令，保持桌面登录和主机唤醒。此主机只有一个配置 state root，执行期间无独立 CAD 活动；就绪检查发现外部会话时显示不可执行原因，不能关闭该会话。保持时钟同步、桌面有效和磁盘容量充足，系统更新/重启使用同一排空流程。所有启动与清理入口共用资源域，遵守[CAD 所有权契约](contracts.md#resources)。
 
-## 2. Configure Linux and Feishu
+## 安装 Linux 平台
 
+配置服务账户的 Git 身份及 GitHub 认证，确认目标仓库与 base 可读写。配置专用 SSH key 和已核验 Windows host key；传输使用 SSH 隧道和端点令牌，内侧均为 loopback。拒绝跨主机重定向和未认证端点。
 
-Configure Git identity and GitHub authentication for the Linux service user.
-Create a dedicated clean model checkout; the publication stage verifies that its
-origin matches the Windows hardware routing's repository slug:
+校验同版 Linux 离线运行档案、部署档案与全部摘要。在提取的部署目录执行唯一生命周期入口：
 
 ```sh
-gh auth login
-gh auth setup-git
-git clone https://github.com/<owner>/<model-repository> /srv/description/models/arm
+bash deploy/operator/operatorctl.sh validate --config /srv/description/platform.json
+bash deploy/operator/operatorctl.sh install --config /srv/description/platform.json
+bash deploy/operator/operatorctl.sh start --config /srv/description/platform.json
+bash deploy/operator/operatorctl.sh health --config /srv/description/platform.json
 ```
 
-Extract the deployment archive matching the worker release. Keep deployment
-configuration and secrets outside the checkout. Copy
-[`operator.env.example`](../deploy/operator/operator.env.example) to a private
-file, then set its actual paths and host:
+`validate` 只检查静态配置和发行身份。`install` 在关闭准入的状态下安装锁定运行环境、渲染服务、初始化数据库并校验 DAG；不能改变正在运行的安装。`start` 先验证两端身份、服务及配置，再开启任务准入。数据库、内部服务和隧道不对用户暴露端口。
 
-```sh
-description_base="$HOME/description"
-description_env="$description_base/operator.env"
-mkdir -p "$description_base/secrets"
-chmod 700 "$description_base" "$description_base/secrets"
-cp deploy/operator/operator.env.example "$description_env"
-chmod 600 "$description_env"
-```
+安装记录明确管理的全部服务与路径，不依赖工作目录或个人工具位置。配置变化先渲染并验证新快照，再按受控切换流程应用；运行中的请求继续使用其固定配置身份。`status/health` 及提交准入核验安装记录、发行文件、配置快照、实际服务、Airflow 配置引用和 Windows 发行/契约/端口身份，端点认证同时证明令牌一致；漂移关闭新准入，健康查询不打开 CAD。
 
-Replace the example `/srv/description` paths with your chosen service directory.
-Complete these configuration groups once:
+## 飞书与权限
 
-| Settings | Purpose |
-|---|---|
-| `OPERATOR_HOST`, `OPERATOR_HTTPS_PORT`, `OPERATOR_TLS_CERT`, `OPERATOR_TLS_KEY` | One operator address and its trusted HTTPS identity |
-| `OPERATOR_STATE`, `AIRFLOW_VENV`, `AIRFLOW_HOME`, `POSTGRES_ROOT` | Separate runtime, database and managed state |
-| `PIPELINE_WHEEL`, `AIRFLOW_DB_URL` | Matching release wheel and dedicated PostgreSQL connection |
-| `SOLIDWORKS_SSH_HOST`, `SOLIDWORKS_ENDPOINT_PORT` | Key-authenticated SSH alias to Windows and its loopback endpoint |
-| `ENDPOINT_TOKEN_FILE` | Private copy of the Windows endpoint token, mode `0600` |
-| `SOLIDWORKS_HANDOFF_ROOT` | Dedicated Linux intake, such as `/srv/description/cad-handoffs`, outside runtime and state |
-| `PIPELINE_STORE_ROOT` | Linux stage checkpoints, model deliveries and diagnostics; defaults to `OPERATOR_STATE/runs` |
-| `MODEL_REPOSITORIES_FILE` | Mode-`0600` JSON mapping repository slugs to dedicated Linux model checkouts |
-| `MODEL_TARGETS_FILE` | Mode-`0600` JSON mapping hardware identities to `{repository_slug, base}`; configure it to offer publication targets and match the endpoint's routing |
-| `DISCOVERY_SETTINGS_FILE` | Optional mode-`0600` JSON with Linux `record_roots` and `frozen_names_file` |
-| `FEISHU_APP_SECRET_FILE`, `FEISHU_TENANT_KEYS` | App credentials and mandatory tenant allowlist |
-| `FEISHU_ADMIN_OPEN_IDS` | Explicit administrator identities; optional, no automatic administrator |
+企业应用启用 Web app，主页使用配置的唯一 HTTPS origin，回调为 `<origin>/auth/feishu/callback`。应用版本向批准用户发布；浏览器须信任证书。配置精确租户 allowlist，管理员使用同一应用的显式 `open_id`，空列表不授予管理员权限。
 
-Create the repository mapping before accepting runs, for example:
+应用凭据文件包含 `app_id` 和 `app_secret`。登录使用 OAuth state、PKCE S256、服务端 code exchange 和基本用户身份 API；租户与 app/tenant/open_id 共同校验。会话使用安全 cookie、CSRF 防护及明确过期；不申请离线授权或保留 refresh token。代理只信任本机入口并执行固定 origin。
 
-```json
-{"<owner>/<model-repository>": "/srv/description/models/arm"}
-```
+租户成员可提交与查看共享结果；只有发起人和管理员可变更运行、重跑或管理显示记录。工程批准另有责任边界，登录不赋予该批准。[操作指南](operations.md)规定用户行为。
 
-Set `MODEL_REPOSITORIES_FILE` to its absolute path and restrict it to mode `0600`.
-The slug must match the Windows target's `repository_slug`; its Git origin must
-match that slug. Keep checkouts separate from CAD intake, runtime and run storage.
-Installation renders the same store and routing into the portal and Airflow
-Connection. Health refuses an empty mapping. Reinstall after changing routing.
+## 部署验收
 
-Create the publication-target mapping before accepting submissions, for example:
+开放服务前，在已安装发行上验证完整流程：
 
-```json
-{"m3.0": {"repository_slug": "<owner>/<model-repository>", "base": "main"}}
-```
+1. 两端安装身份及 `doctor` 通过，配置一致、TLS 可信、真实飞书登录成功；未批准租户和越权运行管理被拒绝。
+2. 上传原生文件夹，选择主装配与产品目标，执行全部六阶段；请求、证据、报告、预览和 PR 绑定一致。
+3. Linux 推导、生成、验证、报告与发布不调用 Windows；验证/发布重跑不创建 CAD 操作，Windows 安装不包含可移植运行依赖。
+4. 同时提交、重复请求、断连与重启保持幂等；原生作业串行，未知 CAD 会话被拒绝且不被访问或终止。
+5. 缺失/包外来源、错误配置、坏证据及验证失败阻断下游；诊断与未验证预览的身份清晰。发布失败保留验证结果，未知外部结果通过对账恢复。
+6. 阶段重跑正确复用完整上游，保留原时间和生产身份；删除/恢复显示记录不移除证据。服务重启后请求、历史、准入和发布状态可恢复。
 
-Set `MODEL_TARGETS_FILE` to its absolute path and restrict it to mode `0600`; every
-target must name a configured `MODEL_REPOSITORIES_FILE` key. The portal offers these
-targets in the upload window and derives the publication identity when the CAD records
-do not carry `dp.hardware_id`. The Windows endpoint exposes its own target list on
-`/health`, and the operator health check fails when the endpoint's targets differ from
-the portal (and the Airflow connection rendered from the same file) configuration.
-Back up the run store with platform state; it owns portable checkpoints and
-published model receipts.
+保留真实原生、身份、授权、失败和恢复证据。mock、健康绿标或能打开页面不能替代完整验收。
 
-Set `DISCOVERY_SETTINGS_FILE` to the absolute path of a private JSON file, for example
-`{"record_roots":["/srv/description/cad-records"],"frozen_names_file":"/srv/description/interface-names.json"}`.
-Omit unused keys. Installation carries this object through `pipeline.discovery`
-to the Airflow connection's `discovery` settings; reinstall after changing it.
+<a id="lifecycle"></a>
+## 维护、升级与恢复
 
-Controlled-record roots and the optional approved-interface-name file are Linux
-derivation settings set by the platform maintainer with the platform's Linux
-configuration; they are never operator inputs and never live on the endpoint.
-Populate the controlled library with approved records before admitting runs.
-CAD references include the approved record version, such as
-`arm/r2/budget.json#robot`, resolved as `/srv/description/cad-records/arm/r2/budget.json`.
-Keep versions immutable and available together; do not replace a shared file
-between runs. Use real directories and files, without symbolic links or
-junctions. Each reference must match one file across the configured roots;
-duplicate matches refuse the derivation even when their bytes agree. Files
-uploaded with an operator's folder are archived evidence and do not supply this
-authority.
+生命周期命令为 `validate / install / start / drain / stop / status / health / reconcile / stage / promote / rollback`，统一读取同一配置及安装记录。`drain` 关闭新提交和 DAG 准入，保留在途执行；返回全部活动、未确认与发布中操作。`stop` 仅在已排空且状态已知时停止全部管理服务，禁止通过杀进程代替排空。
 
-Use comma-separated tenant and administrator lists without spaces.
-The configuration example defines the remaining service and transport defaults.
+平台编排在启动与有界退避重试时对账，维护人员也可调用 `reconcile`。对账查询调度意图、阶段收据、Windows 操作及远端 Git/PR，确认已发生结果后登记或安全继续；不能重复未知副作用。未决状态未消除时，排空不算完成。
 
-Set `OPERATOR_TLS_CERT` and `OPERATOR_TLS_KEY` to the absolute paths of the
-approved certificate chain and its private key. The certificate must cover
-`OPERATOR_HOST`; the service user must be able to read both files, and the key
-must have mode `0600`. Reinstall and restart the services after replacing either
-file. Leaving both settings empty generates a self-signed certificate for a LAN
-rehearsal; shared use requires browser trust in the approved certificate.
+`stage` 负责两端候选：从校验档案建立独立 Linux/Windows 安装目录和配置，核验身份、角色依赖、DAG、存储 schema 与原生就绪，不改变活动指针或启动第二个 CAD 资源域。
 
-Store the app credentials in the mode-`0600` JSON file named by
-`FEISHU_APP_SECRET_FILE`:
+`promote` 依次记录：关闭准入并排空、建立可恢复备份、停止两端执行服务、执行平台和 Airflow 各自的已验证 schema 迁移、切换两端安装/配置指针、启动并核验身份、完成健康和验收、开放准入。每步固定前置条件与实际结果；任一主机或步骤失败，准入保持关闭，不能将部分切换报告为成功。
 
-```json
-{"app_id": "<enterprise-app-id>", "app_secret": "<enterprise-app-secret>"}
-```
+升级意图和每个切换步骤持久登记。失败记录已完成与未确认步骤，`rollback` 使用该记录恢复两端明确的上一发行和配置，再检查身份与状态；不能猜测目录或最新备份。代码回滚必须兼容当前持久状态，不能回退数据库而丢失已产生的运行、证据或发布记录。涉及存储 schema 的变化须提供备份、迁移验证及明确可恢复方案，准入在完成前保持关闭。
 
-Obtain the company identifier with the app's **Tenant token** permission
-`tenant:tenant:readonly` (**Obtain tenant information**). Exchange the app
-credentials for a tenant access token, then call
-[Obtain company information](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/tenant-v2/tenant/query).
-Set `FEISHU_TENANT_KEYS` from `data.tenant.tenant_key` after confirming the
-company name. The company name and `display_id` are not tenant keys.
+备份前关闭准入、排空并确认无未决副作用，取得平台与 Airflow schema 的同一数据库快照，再按该快照引用复制冻结原件、交付/诊断、安装记录、配置与密钥并核验清单。备份加密、访问受控，按部署恢复目标保留；升级前须有已验证的恢复演练。恢复在关闭准入状态下核验清单和引用，查询两端作业与远端发布结果后重建投影，先证明完整再开启服务。
 
-Feishu API authentication is required for the workflow. The server reads the
-authenticated user's Feishu username and keeps credentials server-side.
-The enterprise app is used for sign-in only. The
-[current authorization API](https://open.feishu.cn/document/common-capabilities/sso/api/obtain-oauth-code)
-uses an S256 challenge; the server exchanges the code at the
-[OAuth token API](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/authentication-management/access-token/get-user-access-token)
-with a JSON request containing the PKCE verifier.
-The [basic profile API](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/authen-v1/user_info/get)
-requires no additional contact-directory, email, phone or employment permissions.
-The workflow does not request offline access or retain Feishu refresh tokens.
+端点令牌轮换在排空后更新两端受控副本，验证认证与配置身份再开启准入；飞书和 Git 凭据轮换同样使用受控配置切换与实测登录/访问。秘密值不进入日志、命令行或发行档案。
 
-After an approved administrator signs in, obtain that person's app-scoped
-`open_id` from `/auth/feishu/profile` and add it to `FEISHU_ADMIN_OPEN_IDS`.
-Keep the list empty until an administrator is explicitly selected. User IDs
-from another app cannot be reused. Apply configuration through the supported
-installation and restart steps below.
-
-Membership in an approved tenant grants access to start runs and view shared
-results; administrators must also appear in the explicit admin list. Only the
-initiator and platform administrators may change a run. **从此步骤重新运行** creates
-a linked attempt from an eligible retained checkpoint and executes that step and
-its successors. Generation, verification and publication reruns stay on Linux;
-they do not reopen CAD. Changed source files require a new upload.
-**继续原作业** recovers an interrupted transport connection within the same run;
-it does not repeat engineering work. The owner check ships with the platform package; no
-separate credential or install-time flag is required, and operator run changes
-are refused when that guard is absent. Each run's history and details show the
-original submitter's Feishu username from the authenticated API response.
-The app, tenant and `open_id` remain the internal audit identity; users do not
-supply the submitter name. Feishu does not supply CAD, drive specifications or
-engineering approval merely through login.
-
-Configure the SSH alias on Linux using a dedicated execution key and verified
-Windows host key. Confirm it works without a password prompt:
-
-```sh
-ssh -o BatchMode=yes solidworks-worker whoami
-```
-
-The endpoint binds only to Windows loopback. The managed SSH tunnel exposes it
-on Linux loopback port `18765`; operators never configure transport or tokens.
-
-## 3. Install and start Linux services
-
-From the deployment archive:
-
-```sh
-bash deploy/operator/operatorctl.sh install --env-file "$description_env"
-bash deploy/operator/operatorctl.sh start --env-file "$description_env"
-bash deploy/operator/operatorctl.sh health --env-file "$description_env"
-```
-
-Installation provisions the pinned Python toolchain, PostgreSQL 14, Airflow
-3.3.2, the matching tool wheel with its verification runtime, proxy and service
-configuration. The Linux runtime check must pass before database migration. It starts the
-managed database before migration; `start` launches the remaining services.
-Installation creates the sole `solidworks_windows` Connection with the endpoint
-token, Linux source allowlist, run store and model routing. Operators need no
-Connection or DAG setup.
-
-`install` writes configuration, secrets and service units while preserving the
-DAG's admission state. `start` opens and verifies DAG admission before starting
-the operator page and HTTPS proxy; `stop` closes ingress and pauses the DAG before
-stopping the core services. Start and health check installed configuration for
-drift. Reinstall after a configuration change;
-existing signing and encryption keys are preserved. For services to survive a
-Linux user logout, the host administrator runs the following command with the
-actual service account:
-
-```sh
-sudo loginctl enable-linger <service-user>
-```
-
-Before Feishu configuration, health exits with failure for missing SSO
-credentials and unavailable SSO commissioning (`HTTP 503`). These identify an
-incomplete installation. Any additional failure requires investigation. A
-self-signed rehearsal certificate also requires browser trust before use;
-service liveness does not establish that trust. Commissioning requires zero
-health failures, trusted HTTPS and a successful live Feishu sign-in.
-
-## Acceptance
-
-Commission the complete workflow with actual native CAD and live Feishu:
-
-1. Run `description doctor` in each installed runtime and require all checks to
-   pass. Confirm HTTPS trust, all services, authenticated Windows endpoint health
-   and the installed Airflow Connection.
-2. Sign in with Feishu. Verify the displayed Feishu username, approved tenant,
-   explicit admin assignment and denied unauthorized users. Confirm an approved
-   operator can start new pipeline runs and view shared results from other
-   operators.
-3. Verify that the initiator and administrators can start a linked attempt from
-   every eligible engineering step, including a completed step. Earlier work is
-   reused only after its checkpoint checks pass. A verification rerun must not
-   reopen CAD or regenerate the model; a publication rerun must independently
-   recheck the retained delivery before submitting. Other operators may view
-   results but cannot initiate these changes. Separately exercise **继续原作业**
-   for a recoverable transport failure and confirm it retains the same run.
-4. In the operator page, choose the complete engineering folder once (Chrome or
-   Edge); the browser uploads its files to the platform's Linux intake and
-   `Start` creates the run. Confirm the suggested configured publication target
-   or select another configured target; verify CAD identity takes precedence and
-   a hardware conflict refuses publication. No server path, YAML, free-form
-   repository/branch or credential is supplied; selections containing SolidWorks lock
-   transients (`~$…`) are rejected before anything runs.
-5. Verify the UUID, frozen inventory and all six engineering steps. Inspect
-   input/input QC/output/output QC in the page, the DAG contract table,
-   terminal task logs and `engineering_stages` XCom. Confirm failed, blocked,
-   not-run states and external engineering review scope, and the hashed `reports/stages.json`.
-   Failed and delivered runs likewise retain `reports/structural-team.md` and
-   `reports/structural-team.json` (re-created on Linux from the sealed receipt);
-   verify their hashes from the run evidence.
-   Verify the native record read, the sealed closure selection binding and every
-   independent quality result.
-   Confirm history and details show the original submitter's Feishu username
-   after reload and when viewed by another authorized operator.
-6. Inspect the delivered URDF and actual meshes in the page. Exercise individual
-   joint controls and limits; confirm preview binds to the passing file subject.
-7. Check the resulting private-model PR's exact base, head, structural revision
-   and verified commit. Candidate submission does not grant engineering approval.
-8. Exercise a transport-recovery Retry together with automatic polling, plus
-   changed inputs, quality failure, service restart and PR failure. Retain
-   diagnostics; a PR-service failure preserves verified preview.
-9. After the complete service restart described below, select a completed run
-   and choose **从此步骤重新运行** from verification or publication. Require a
-   new linked run with the selected starting step recorded in its request.
-   These Linux stages must not submit a new Windows job. Upstream results must show **复用已验证结果**, retain their original
-   timestamps and producing-run identity, and trigger no new CAD capture.
-   Confirm that only the selected step and its downstream steps execute again,
-   and that the original run and evidence remain unchanged. Verify access for
-   the initiator and administrators, refusal for other operators, and an
-   actionable refusal when upstream evidence or tool identity is invalid.
-
-Mocks, server liveness and an unconfigured OAuth callback do not establish this
-acceptance. Retain reports for the exact tool and native source revision.
-
-## Maintenance
-
-The upload root also holds `.run-metadata.json`, the portal's durable display
-names and deleted-record state. Back it up with platform state and preserve it
-across upgrades. Moving a run to **已删除** does not reclaim CAD or artifact storage.
-Unreadable history metadata blocks run history and its management; repair or restore the
-metadata instead of discarding it and losing the recorded names and deletions.
-
-In a new shell, set `description_env` to the installed configuration file:
-
-```sh
-description_env="$HOME/description/operator.env"
-bash deploy/operator/operatorctl.sh status --env-file "$description_env"
-bash deploy/operator/operatorctl.sh health --env-file "$description_env"
-bash deploy/operator/operatorctl.sh stop --env-file "$description_env"
-```
-
-Service logs use `journalctl --user -u <service>`. Maintainers read Airflow task
-logs under the configured `AIRFLOW_HOME/logs` on Linux; no separate Airflow UI
-is exposed to operators. Task logs, endpoint state and bound job diagnostics
-identify failed operations. Transport retries reconnect
-to the existing native job. A terminal native failure requires a new run; an
-endpoint restart during capture marks that job failed. Preserve its partial
-evidence for diagnosis. Recover a publication failure from the complete verified
-delivery using [the operations procedure](operations.md#6-independent-review-and-recovery).
-Engineering corrections require a new source revision and run.
-
-After code or deployment changes, run the
-[development checks](../CONTRIBUTING.md#verification), validate shell syntax and
-repeat affected native and deployed acceptance. For an upgrade, let the current
-native job finish and stop new submissions. Retain the previous release archives,
-runtime directories and private configuration, including `operator.env`, its
-`PIPELINE_WHEEL` path and the Windows endpoint configuration. Stop the endpoint
-and Linux services, install the same new release on both hosts, then restart the
-endpoint and Linux services and run health. `install` updates files; it does not
-restart an already running process.
-
-If acceptance fails, drain native work and stop both hosts' services. Restore the
-previous tool installations and private configuration, run `install` from the
-previous deployment archive, then start the endpoint and Linux services. Verify
-both installed source identities and run health before reopening submissions.
-Preserve every frozen input, delivery, diagnostic, signing key, job and ledger
-row created during the upgrade. Do not restore an older database or state snapshot;
-code rollback requires compatible persisted schemas. Published tags and assets
-remain immutable.
-
-## Release staging and rehearsal
-
-Every deployment archive stages its own release machinery: the staged tree carries
-`deploy/operator/rehearsal/{prepare-venv,stage-and-validate,switch,quiesce-admission}.sh`,
-`deploy/operator/inspect-release.py`, `deploy/windows/{endpoint-launcher.py,endpoint.example.json}`
-and `deploy/windows/candidate/` (the Windows candidate harness). Run them from the staged release
-tree. They retain staged evidence and refuse unverifiable preconditions; the live
-rollback runtime is an explicit parameter. Some failures leave admission paused
-or a promoted runtime unhealthy, so inspect the phase and restore admission or
-roll back before accepting more work.
-
-| variable | meaning | default |
-|---|---|---|
-| `OPERATOR_ROOT` | operator state root (venvs, releases, state) | `/home/andy/operator` |
-| `LIVE_TAG` | live/rollback venv tag; required by prepare-venv, stage-and-validate and switch | — |
-| `LIVE_RELEASE` | live/rollback release directory name; required by switch | — |
-| `REHEARSAL_DIR` | rehearsal working directory | `$OPERATOR_ROOT/split-$TAG-rehearsal` |
-| `EXPECTED_DAG_TASKS` | pinned DAG task count checked while staging | `8` |
-| `OPERATOR_URL` | operator URL used by the health checks | installed `state/resolved.env`; set explicitly if unavailable |
-| `OPERATOR_TLS_CA` | CA bundle used by the health checks | `$OPERATOR_ROOT/state/tls/operator-tls-fullchain.crt` |
-| `POSTGRES_ROOT`, `POSTGRES_MAJOR` | portable PostgreSQL used for the drain gate | `$OPERATOR_ROOT/airflow-pg`, `14` |
-| `POSTGRES_PORT` | installed socket-cluster port; must agree with `AIRFLOW_DB_URL` | required in `operator.env` or exported for `switch.sh` |
-| `UV_PYTHON` | base CPython used to build candidate venvs | host-specific uv path; set explicitly on another host |
-
-Before staging an upgrade, compare the installed private `operator.env` with the
-current example by key, preserving actual paths, secrets and database settings.
-Older configurations may lack `MODEL_TARGETS_FILE` and `POSTGRES_PORT`; configure
-the former to match endpoint routing and copy the actual installed database port
-into the latter. Health checks target agreement; a source-only upgrade does not
-repair these missing settings.
-
-Use explicit paths from the staged release. In particular, `switch.sh` invokes
-its helpers through `REHEARSAL_DIR`, and `quiesce-admission.sh` needs
-`INSPECT_RELEASE_PY` to name the shipped inspector rather than a workstation path:
-
-```sh
-export OPERATOR_ROOT="$HOME/description"
-export OPERATOR_STATE="$OPERATOR_ROOT/state"
-export REHEARSAL_DIR=/path/to/staged-release/deploy/operator/rehearsal
-export INSPECT_RELEASE_PY=/path/to/staged-release/deploy/operator/inspect-release.py
-export UV_PYTHON=/path/to/python3.12
-export LIVE_TAG="<previous-runtime-tag>"
-export LIVE_RELEASE="<previous-release-directory>"
-```
-
-Replace the placeholders with installed values before execution. Set
-`POSTGRES_PORT` to the installed port if it is not in `operator.env`; the switch
-drain gate currently cannot obtain it from `resolved.env` alone. Preserve candidate
-configuration and logs under a distinct tag. If active configuration changes after
-staging, the existing candidate environment refuses drift: retain it for diagnosis
-and stage a fresh tag rather than bypassing the comparison.
-
-`switch.sh stage <tag> …` installs the inactive runtime and imports the DAG without live change;
-`switch.sh switch <tag> …` re-stages, requires zero active Airflow rows, backs up `operator.env`,
-promotes, starts and health-checks; `switch.sh rollback <tag>` restores the newest
-`operator.env.bak-pre-<tag>-*` and the live rollback runtime. `quiesce-admission.sh` stops ingress,
-pauses the DAG and runs the read-only `inspect-release.py` drain check. An inspector
-failure leaves ingress closed and the DAG paused. After resolving the failure and
-confirming the intended runtime, use its `operatorctl.sh start --env-file <file>`
-followed by `health` to restore and verify admission. A post-promotion health failure
-requires correction or the recorded `switch.sh rollback <tag>`; it is not a
-successful upgrade.
-
-The Windows candidate harness runs from `deploy/windows/candidate/` with a mandatory `-Tag`
-(plus `-Root`, `-Stamp`, and `-TemplateTask` for registration); `endpoint.example.json` mirrors the
-endpoint configuration schema with placeholder paths and no secret values (the bearer token stays
-in the host's mode-`0600` token file), and `endpoint-launcher.py` takes the endpoint root from
-`DESCRIPTION_ENDPOINT_ROOT`. `tools/acceptance/m3_acceptance.py <run-dir> [<bundle-dir>]` runs the
-read-only M3-specific acceptance from the repository. That check complements the
-generic gates and does not qualify other hardware or an unexercised discovery
-regime. The candidate scripts currently expect endpoint loopback port `8765`;
-verify their host parameters before using them on a different installation.
+显示记录删除不回收存储。Linux 封存证据默认不自动删除，显式保留策略只作用于无引用证据；Windows 已确认导入缓存的释放遵循[交换契约](contracts.md#exchange)。已被运行、发布或工程批准引用的文件不得自动清除。日志提供稳定错误码、操作身份、对象与证据位置；日志轮换不删除封存证据。
