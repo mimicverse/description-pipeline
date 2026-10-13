@@ -432,13 +432,13 @@ def generate_model(staging: Path, definition: dict, input_report: dict, *, on_ev
     write_json(staging / "model/robot.json", robot.to_dict())
     generate_urdf(robot, staging / "evidence", staging, name=name)
     from .delivery import write_delivery_manifest
-    from .interface_records import RESOURCE_POLICY_V1, resource_policy_v1_digest
+    from .interface_records import CHECK_POLICY_SCHEMA, check_policy_digest
     from .stages import CONTRACT, CONTRACT_SHA256
 
     write_delivery_manifest(
         staging,
         contract={"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
-        policy={"schema_version": RESOURCE_POLICY_V1["schema_version"], "digest": resource_policy_v1_digest()},
+        policy={"schema_version": CHECK_POLICY_SCHEMA, "digest": check_policy_digest()},
     )
 
     def generated():
