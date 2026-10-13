@@ -655,8 +655,17 @@ class LifecycleTests(unittest.TestCase):
             "  *\"-Verb status\"*)\n"
             '    if [ "${FIXTURE_STATUS:-switched}" = "before" ]; then\n'
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
-            "{\"execute\":\"C:/description-e2e/runtime/Scripts/description.exe\","
-            "\"arguments\":\"serve --config C:/description-e2e/state/endpoint.json\",\"state\":\"Running\"},"
+            "{\"execute\":\"C:/description-e2e/state/instance-promotions/previous-0001/runtime/Scripts/description.exe\","
+            "\"arguments\":\"serve --config C:/description-e2e/state/instance-promotions/previous-0001/endpoint.json\","
+            "\"state\":\"Running\"},"
+            "\"pending\":{\"intent\":true,\"verb\":\"promote\","
+            "\"generation\":\"C:/description-e2e/state/lifecycle/gen-2/generation\","
+            "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\"},"
+            "\"last_promotion\":null}'\n"
+            '    elif [ "${FIXTURE_STATUS:-switched}" = "foreign" ]; then\n'
+            "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
+            "{\"execute\":\"C:/foreign/not-description.exe\","
+            "\"arguments\":\"foreign-service --option x\",\"state\":\"Running\"},"
             "\"pending\":null,\"last_promotion\":null}'\n"
             "    else\n"
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
@@ -1526,8 +1535,17 @@ class InstallOrderingTests(unittest.TestCase):
             "  *\"-Verb status\"*)\n"
             '    if [ "${FIXTURE_STATUS:-switched}" = "before" ]; then\n'
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
-            "{\"execute\":\"C:/description-e2e/runtime/Scripts/description.exe\","
-            "\"arguments\":\"serve --config C:/description-e2e/state/endpoint.json\",\"state\":\"Running\"},"
+            "{\"execute\":\"C:/description-e2e/state/instance-promotions/previous-0001/runtime/Scripts/description.exe\","
+            "\"arguments\":\"serve --config C:/description-e2e/state/instance-promotions/previous-0001/endpoint.json\","
+            "\"state\":\"Running\"},"
+            "\"pending\":{\"intent\":true,\"verb\":\"promote\","
+            "\"generation\":\"C:/description-e2e/state/lifecycle/gen-2/generation\","
+            "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\"},"
+            "\"last_promotion\":null}'\n"
+            '    elif [ "${FIXTURE_STATUS:-switched}" = "foreign" ]; then\n'
+            "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
+            "{\"execute\":\"C:/foreign/not-description.exe\","
+            "\"arguments\":\"foreign-service --option x\",\"state\":\"Running\"},"
             "\"pending\":null,\"last_promotion\":null}'\n"
             "    else\n"
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
@@ -1775,7 +1793,7 @@ class InstallOrderingTests(unittest.TestCase):
             )
             self.assertIn("platform.pgc", backup_manifest["files"])
             self.assertIn("state/resolved.env", backup_manifest["files"])
-            self.assertTrue((state / "promotions" / "gen-2" / "backup" / "closure.json").is_file())
+            self.assertFalse((state / "promotions" / "gen-2" / "backup").exists())
             rolled = self._maintenance(release, control_env, "rollback")
             self.assertEqual(rolled.returncode, 0, rolled.stdout + rolled.stderr)
             restored = json.loads((state / "install-record.json").read_text(encoding="utf-8"))
@@ -1800,15 +1818,32 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertEqual(manifest["encrypted"]["sha256"], hashlib.sha256(sealed.read_bytes()).hexdigest())
             key = state / "secrets" / "backup.key"
             self.assertEqual(stat.S_IMODE(key.stat().st_mode), 0o600)
+            self.assertFalse((state / "promotions" / "gen-2" / "backup").exists(), "staging must be cleaned")
+            manifest_path = state / "promotions" / "gen-2" / "evidence" / "backup-manifest.json"
             scratch = Path(tmp) / "restore"
             opened = run(
                 [
                     "python3", str(release / "operator" / "backup.py"), "open",
-                    "--archive", str(sealed), "--key", str(key), "--dest", str(scratch),
+                    "--archive", str(sealed), "--key", str(key), "--manifest", str(manifest_path),
+                    "--dest", str(scratch),
                 ],
                 {},
             )
             self.assertEqual(opened.returncode, 0, opened.stderr)
+            tampered = Path(tmp) / "tampered.enc"
+            forged = bytearray(sealed.read_bytes())
+            forged[-1] ^= 1
+            tampered.write_bytes(bytes(forged))
+            refused = run(
+                [
+                    "python3", str(release / "operator" / "backup.py"), "open",
+                    "--archive", str(tampered), "--key", str(key), "--manifest", str(manifest_path),
+                    "--dest", str(Path(tmp) / "tampered-out"),
+                ],
+                {},
+            )
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("does not match the manifest", refused.stderr)
             (state / "install-record.json").write_bytes(
                 (scratch / "state" / "install-record.json").read_bytes()
             )
@@ -1924,6 +1959,33 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertEqual(
                 len([line for line in lines if line.startswith("ssh ") and "-Verb status" in line]), 1
             )
+
+    def test_foreign_live_launcher_stays_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, _ = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            self.assertEqual(self._install(release, control_env).returncode, 0)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            self._health_double(release, control_env)
+            self.assertEqual(self._maintenance(release, control_env, "stage", "gen-2").returncode, 0)
+            self._clone_generation_stubs(state)
+            lost = self._maintenance(release, dict(control_env, FIXTURE_ACK_LOSS="1"), "promote", "gen-2")
+            self.assertEqual(lost.returncode, 1)
+            # The endpoint runs a foreign launcher: neither the target nor the bound source.
+            foreign = run(
+                [
+                    "bash", str(release / "operator" / "operatorctl.sh"), "rollback",
+                    "--config", str(release.parent / "platform.json"), "--install-id", "gen-2",
+                ],
+                dict(control_env, FIXTURE_STATUS="foreign"),
+            )
+            self.assertEqual(foreign.returncode, 1)
+            self.assertIn("not provably recoverable", foreign.stderr)
+            receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
+            steps = {row["step"]: row["status"] for row in receipt["steps"] if row["verb"] == "rollback"}
+            self.assertEqual(steps.get("rollback-windows"), "unknown")
+            lines = Path(tmp, "order.log").read_text(encoding="utf-8").splitlines()
+            self.assertFalse([line for line in lines if line.startswith("ssh ") and "-Verb rollback" in line])
 
     def test_config_upgrade_flows_through_stage_and_promote(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -63,9 +64,19 @@ def seal(source: Path, key: Path, out: Path) -> str:
     return hashlib.sha256(out.read_bytes()).hexdigest()
 
 
-def open_archive(archive: Path, key: Path, dest: Path) -> None:
+def open_archive(archive: Path, key: Path, manifest_path: Path, dest: Path) -> None:
     require(archive.is_file(), f"backup archive is missing: {archive}")
     require(key.is_file(), f"backup key is missing: {key}")
+    try:
+        manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        die(f"cannot read the backup manifest: {error}")
+    sealed = manifest.get("encrypted") if isinstance(manifest, dict) else None
+    expected = sealed.get("sha256") if isinstance(sealed, dict) else None
+    require(
+        isinstance(expected, str) and hashlib.sha256(archive.read_bytes()).hexdigest() == expected,
+        "the sealed archive digest does not match the manifest",
+    )
     require(not dest.exists(), f"refuse to overwrite the restore destination: {dest}")
     dest.mkdir(parents=True)
     with tempfile.NamedTemporaryFile(dir=dest.parent, delete=False) as handle:
@@ -78,6 +89,20 @@ def open_archive(archive: Path, key: Path, dest: Path) -> None:
             tar.extractall(dest, filter="data")
     finally:
         plain.unlink(missing_ok=True)
+    files = manifest.get("files") if isinstance(manifest.get("files"), dict) else {}
+    require(files, "the backup manifest carries no member digests")
+    for name, checksum in files.items():
+        restored = dest / name
+        require(
+            restored.is_file() and hashlib.sha256(restored.read_bytes()).hexdigest() == checksum,
+            f"restored member differs from the manifest: {name}",
+        )
+    extras = sorted(
+        path.relative_to(dest).as_posix()
+        for path in dest.rglob("*")
+        if path.is_file() and path.relative_to(dest).as_posix() not in files
+    )
+    require(not extras, f"the archive carries members outside the manifest: {extras[:3]}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -92,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
     open_parser = subparsers.add_parser("open")
     open_parser.add_argument("--archive", type=Path, required=True)
     open_parser.add_argument("--key", type=Path, required=True)
+    open_parser.add_argument("--manifest", type=Path, required=True)
     open_parser.add_argument("--dest", type=Path, required=True)
     args = parser.parse_args(argv)
     if args.action == "key":
@@ -104,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"sha256={digest}")
         return 0
     if args.action == "open":
-        open_archive(args.archive, args.key, args.dest)
+        open_archive(args.archive, args.key, args.manifest, args.dest)
         print(f"opened={args.dest}")
         return 0
     return 2

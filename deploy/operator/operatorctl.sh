@@ -740,6 +740,7 @@ PY
     RUNNING_SNAPSHOT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["snapshot"]["path"])' "$STATE_ROOT/install-record.json")"
     python3 - "$RUNNING_SNAPSHOT" "$BACKUP_DIR" <<'PY'
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -747,6 +748,7 @@ from pathlib import Path
 snapshot = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 backup = Path(sys.argv[2])
 storage = snapshot["resolved"]["storage"]
+resolved = snapshot["resolved"]
 copied = {}
 for name, target in (("handoff_root", "handoff"), ("artifact_root", "artifacts")):
     source = Path(storage[name])
@@ -756,10 +758,27 @@ for name, target in (("handoff_root", "handoff"), ("artifact_root", "artifacts")
             shutil.rmtree(destination)
         shutil.copytree(source, destination, symlinks=False)
         copied[name] = str(destination)
+captured_secrets = {}
+secrets_dir = backup / "secrets"
+for key, value in (
+    ("certificate", resolved["operator"]["certificate_file"]),
+    ("private_key", resolved["operator"]["private_key_file"]),
+    ("database_dsn", resolved["database"]["dsn_file"]),
+    ("feishu_secret", resolved["auth"]["feishu_secret_file"]),
+    ("endpoint_token", resolved["windows"]["token_file"]),
+):
+    source = Path(value)
+    if source.is_file():
+        secrets_dir.mkdir(parents=True, exist_ok=True)
+        destination = secrets_dir / key
+        shutil.copyfile(source, destination)
+        os.chmod(destination, 0o600)
+        captured_secrets[key] = str(destination)
 (backup / "closure.json").write_text(
     json.dumps(
         {
             "captured_roots": copied,
+            "captured_secrets": sorted(captured_secrets),
             "not_captured": {
                 "workspace_root": "scratch working copies are rebuilt on demand",
                 "store_root": "model store roots are reconstructible from the release archives",
@@ -818,6 +837,9 @@ out.write_text(
 )
 PY
     promotion_step "$CANDIDATE_ID" promote backup completed "$EVIDENCE_DIR/backup-manifest.json"
+    # The sealed archive replaces the plaintext staging: the encrypted artifact plus the
+    # manifest are the only restore inputs that remain.
+    rm -rf "$BACKUP_DIR"
     # 4. both ends' execution services stop before the pointers move
     if ! {
       airflow_lifecycle stop \
@@ -981,29 +1003,51 @@ except Exception:
       fi
       RECONCILIATION="$(python3 - "$RECEIPT_DIR/windows-binding.json" "$WINDOWS_STATUS" <<'PY'
 import json
+import re
 import sys
+
 
 def normalize(value):
     return str(value or "").replace("\\", "/").rstrip("/")
 
+
+def parse_config(arguments):
+    matches = re.findall(r"--config\s+\"?([^\"]+?)\"?(?:\s|$)", str(arguments or ""))
+    return normalize(matches[-1]) if matches else ""
+
+
 binding = json.load(open(sys.argv[1], encoding="utf-8"))
 status = json.load(open(sys.argv[2], encoding="utf-8"))
-expected = normalize(binding.get("dir")) + "/generation"
+target = normalize(binding.get("dir")) + "/generation"
 live = status.get("live_task") if isinstance(status, dict) else None
-if not isinstance(live, dict) or not normalize(live.get("arguments")):
+if not isinstance(live, dict):
     print("unknown")
     raise SystemExit(0)
-arguments = normalize(live.get("arguments"))
+execute = normalize(live.get("execute")).lower()
+config = parse_config(live.get("arguments")).lower()
+if not execute or not config:
+    print("unknown")
+    raise SystemExit(0)
 records = [row for row in (status.get("pending"), status.get("last_promotion")) if isinstance(row, dict)]
-record = next((row for row in records if normalize(row.get("generation")) == expected), None)
-if expected not in arguments:
-    # The live task provably does not run this generation: nothing was switched.
+record = next((row for row in records if normalize(row.get("generation")) == target), None)
+source = normalize(record.get("previous")) if record else ""
+
+
+def runs(generation):
+    # The single launch convention the endpoint script uses (Runtime-Launcher + Config-Path).
+    return (
+        execute == (generation + "/runtime/scripts/description.exe").lower()
+        and config == (generation + "/endpoint.json").lower()
+    )
+
+
+if runs(target):
+    print(source if source else "unknown")
+elif source and runs(source):
+    # Positively the bound source generation of THIS maintenance: nothing was switched.
     print("before")
-elif record is not None and normalize(record.get("previous")):
-    print(record["previous"])
 else:
-    # The task runs this generation but no bound previous generation is on record: the state is
-    # not provably recoverable.
+    # A foreign, unparseable or unbound launcher is never claimed as an unswitched source.
     print("unknown")
 PY
 )"

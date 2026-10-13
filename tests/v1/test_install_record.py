@@ -610,6 +610,39 @@ class InstallRecordTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE((state_root / "install-record.json").stat().st_mode), 0o600)
         self.assertFalse((state_root / "install-record.json.repoint.tmp").exists())
 
+    def test_verify_running_is_the_full_reader_without_the_config_term(self):
+        record = build_record(self.root)
+        state_root = self.root / "state"
+        owner = contract_owner(self.root)
+        install_record.write_install_record(record, state_root, owner)
+        self.assertEqual(install_record.verify_running_generation(state_root)["install_id"], "gen-1")
+
+        # A consistent but non-JSON snapshot (record digest updated to match) is still refused.
+        junk = b"not-json"
+        (state_root / "snapshots" / "gen-1.json").write_bytes(junk)
+        stored = json.loads((state_root / "install-record.json").read_text(encoding="utf-8"))
+        stored["snapshot"]["digest"] = hashlib.sha256(junk).hexdigest()
+        (state_root / "install-record.json").write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(SystemExit):
+            install_record.verify_running_generation(state_root)
+
+        # A snapshot belonging to another state root is refused as well.
+        resolved = platform_config.validate_platform(platform_document(self.root))
+        snapshot = platform_config.build_snapshot(
+            resolved,
+            platform_json_sha256="e" * 64,
+            install_id="gen-1",
+            generated_at=TIMESTAMP,
+        )
+        snapshot["resolved"]["storage"]["state_root"] = "/elsewhere/state"
+        payload = json.dumps(snapshot).encode("utf-8")
+        (state_root / "snapshots" / "gen-1.json").write_bytes(payload)
+        stored = json.loads((state_root / "install-record.json").read_text(encoding="utf-8"))
+        stored["snapshot"]["digest"] = hashlib.sha256(payload).hexdigest()
+        (state_root / "install-record.json").write_text(json.dumps(stored), encoding="utf-8")
+        with self.assertRaises(SystemExit):
+            install_record.verify_running_generation(state_root)
+
     def test_verify_active_consumes_the_canonical_validator(self):
         with tempfile.TemporaryDirectory(prefix="verify-active-") as temporary:
             root = Path(temporary)

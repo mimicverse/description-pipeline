@@ -199,37 +199,18 @@ def _canonical_records():
     return interface_records
 
 
-def verify_running_generation(state_root: Path) -> dict:
-    """The running record and its immutable snapshot, without binding the current platform.json.
+def _verify_generation(config_path: Path | None, state_root: Path) -> dict:
+    """The one running reader: complete record + immutable snapshot identity.
 
-    A candidate configuration is the subject of stage/promote, not drift of the running
-    generation; this check proves the running record is internally consistent and its snapshot
-    matches the recorded digest.
+    ``config_path`` adds exactly one term - the current platform.json equals the snapshot's
+    recorded source - which steady-state verbs require and the maintenance window must not
+    (a candidate configuration is the subject of a switch, not drift of the running record).
     """
 
     state_root = Path(state_root)
-    record_path = state_root / "install-record.json"
-    require(record_path.is_file(), f"not installed: install record missing at {record_path} (run install first)")
-    interface_records = _canonical_records()
-    try:
-        record = interface_records.validate_install_record(json.loads(record_path.read_text(encoding="utf-8")))
-    except Exception as error:
-        die(f"install record invalid: {error}")
-    snapshot_path = Path(record["snapshot"]["path"])
-    require(snapshot_path.is_file(), f"snapshot missing: {snapshot_path}")
-    actual = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
-    require(
-        actual == record["snapshot"]["digest"],
-        f"snapshot digest mismatch (tampered or replaced): {snapshot_path}",
-    )
-    return record
-
-
-def verify_active_generation(config_path: Path, state_root: Path) -> dict:
-    """Operational gate: complete record + snapshot digest + current-config binding."""
-
-    config_path, state_root = Path(config_path), Path(state_root)
-    require(config_path.is_file(), f"config file not found: {config_path}")
+    if config_path is not None:
+        config_path = Path(config_path)
+        require(config_path.is_file(), f"config file not found: {config_path}")
     record_path = state_root / "install-record.json"
     require(record_path.is_file(), f"not installed: install record missing at {record_path} (run install first)")
     interface_records = _canonical_records()
@@ -262,12 +243,25 @@ def verify_active_generation(config_path: Path, state_root: Path) -> dict:
         storage["state_root"] == str(state_root),
         f"install record belongs to another state root: {storage['state_root']}",
     )
-    current = hashlib.sha256(config_path.read_bytes()).hexdigest()
-    require(
-        current == document["sources"]["platform_json_sha256"],
-        "the current platform.json does not match the active snapshot; re-run install or promote",
-    )
+    if config_path is not None:
+        current = hashlib.sha256(config_path.read_bytes()).hexdigest()
+        require(
+            current == document["sources"]["platform_json_sha256"],
+            "the current platform.json does not match the active snapshot; re-run install or promote",
+        )
     return record
+
+
+def verify_active_generation(config_path: Path, state_root: Path) -> dict:
+    """Steady-state gate: the running reader plus the current platform.json binding."""
+
+    return _verify_generation(Path(config_path), Path(state_root))
+
+
+def verify_running_generation(state_root: Path) -> dict:
+    """Maintenance-window gate: the same running reader, without the current-config binding."""
+
+    return _verify_generation(None, Path(state_root))
 
 
 def wheel_binding(release: dict, *, wheel: Path | None, tree_root: Path | None = None) -> Path:
