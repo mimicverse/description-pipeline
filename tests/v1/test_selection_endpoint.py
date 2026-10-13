@@ -23,8 +23,9 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from description_pipeline.io import digest, file_digest, write_json
-from description_pipeline.orchestration.windows import Jobs, RequestError, handler, read_config
+from description_pipeline import interface_records as ir
+from description_pipeline.io import digest, file_digest, read_data, write_json
+from description_pipeline.orchestration.windows import Jobs, RequestError, handler, provision_install_id, read_config
 from description_pipeline.sources.solidworks.selection import SelectionError
 from tests.sources.selection_support import closure_evidence
 
@@ -122,6 +123,7 @@ class SelectionEndpointTests(unittest.TestCase):
                 "targets": {"arm": {"repository_slug": "a/b", "base": "feature/arm"}},
             },
         )
+        self.config_path = config_path
         self.config = read_config(config_path)
         identity = patch(
             "description_pipeline.orchestration.windows._native_tool_record",
@@ -521,6 +523,27 @@ class SelectionEndpointTests(unittest.TestCase):
         except HTTPError as error:
             return error.code, json.loads(error.read().decode("utf-8"))
 
+    def test_the_install_id_is_written_once_and_survives_restarts(self) -> None:
+        first = provision_install_id(self.root / "state")
+        self.assertTrue(first.startswith("win-"))
+        self.assertEqual(provision_install_id(self.root / "state"), first)
+
+    def test_the_documented_minimal_config_needs_no_targets(self) -> None:
+        minimal = self.root / "minimal-endpoint.json"
+        write_json(
+            minimal,
+            {
+                "schema_version": "solidworks-to-urdf.endpoint/v1",
+                "package_root": str(self.packages),
+                "output_root": str(self.root / "outputs"),
+                "state_root": str(self.root / "state"),
+                "token_file": str(self.root / "token"),
+            },
+        )
+        config = read_config(minimal)
+        self.assertEqual(config["targets"], {})
+        self.assertEqual(config["config_digest"], digest(read_data(minimal)))
+
     def test_default_selection_reader_shares_the_endpoint_cad_ledger(self) -> None:
         jobs = self.jobs
         probe = {"native_tool": {"source_sha256": "0" * 64}}
@@ -546,7 +569,15 @@ class SelectionEndpointTests(unittest.TestCase):
 
         status, body = self.http_call(base, "GET", "/health", headers=auth)
         self.assertEqual(status, 200)
-        self.assertTrue(body["ready"])
+        self.assertEqual(set(body), set(ir.HEALTH_KEYS))
+        self.assertNotIn("targets", body)
+        self.assertEqual(body["schema_version"], ir.HEALTH_SCHEMA)
+        self.assertFalse(body["native_platform"])
+        self.assertFalse(body["ready"])
+        self.assertTrue(body["readiness"]["reason_code"])
+        self.assertEqual(body["install"]["install_id"], self.jobs.install_id)
+        self.assertEqual(body["install"]["config_digest"], digest(read_data(self.config_path)))
+        self.assertEqual(body["endpoint"]["port"], self.jobs.config["port"])
 
         anonymous = json.dumps(self.request(str(uuid.uuid4()))).encode()
         status, _body = self.http_call(base, "POST", "/v1/jobs", anonymous, {"Content-Type": "application/json"})

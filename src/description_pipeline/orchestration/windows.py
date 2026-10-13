@@ -50,7 +50,16 @@ from ..sources.snapshot import verify_snapshot
 from ..sources.solidworks.revision import package_inventory
 from ..sources.solidworks.selection import SelectionError
 from ..runtime import tool_record
-from ..stages import ACTIVITY_HISTORY_LIMIT, STAGE_IDS, merge_activity, normalize_activity, stage_view
+from ..interface_records import HEALTH_SCHEMA, RESOURCE_POLICY_SCHEMA, resource_policy_v1_digest
+from ..stages import (
+    ACTIVITY_HISTORY_LIMIT,
+    CONTRACT,
+    CONTRACT_SHA256,
+    STAGE_IDS,
+    merge_activity,
+    normalize_activity,
+    stage_view,
+)
 from .stage_transfer import CAPTURE_MANIFEST as CAPTURE_MANIFEST_NAME
 from .selection_transport import StagedSelection
 from ..sources.solidworks.selection import validate_file_index, verify_selection
@@ -193,11 +202,17 @@ def read_config(path):
         },
         "Unknown endpoint configuration key",
     )
+    #: The install identity digests the document itself, before any derived key:
+    #: the lifecycle stage step computes the same value with the same owner.
+    config_digest = digest(config)
     for key in ("package_root", "output_root", "state_root"):
         config[key] = _root(config[key])
     _require(config["package_root"].is_dir(), "Package root does not exist")
-    targets = config["targets"]
-    _require(isinstance(targets, dict) and bool(targets), "Configure at least one model repository target")
+    #: Model-repository routing belongs to the Linux side; the endpoint accepts
+    #: the documented minimal configuration without targets and never requires
+    #: one to exist.
+    targets = config.get("targets") or {}
+    _require(isinstance(targets, dict), "Endpoint targets must be a mapping")
     roots = [config[key] for key in ("package_root", "output_root", "state_root")]
     for hardware, target in targets.items():
         _require(
@@ -232,6 +247,8 @@ def read_config(path):
     )
     config["token"] = token
     config.pop("token_file")
+    config["targets"] = targets
+    config["config_digest"] = config_digest
     config.setdefault("host", "127.0.0.1")
     config.setdefault("port", SOLIDWORKS_ENDPOINT_PORT)
     _require(
@@ -251,6 +268,125 @@ def _owner_lock(path):
         return acquire_process_lock(path)
     except OSError as error:
         raise PipelineError("Another endpoint owns the state root or its ownership lock is unavailable") from error
+
+
+def provision_install_id(state_root: Path) -> str:
+    """The endpoint's own install identity: written once, stable across restarts.
+
+    The operator derives install records from the running endpoint's ``/health``,
+    so the endpoint itself must mint and keep its identity; a write-once marker
+    in the instance state root survives config switches and crash restarts.
+    """
+
+    marker = Path(state_root) / "install-id"
+    try:
+        existing = marker.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        existing = ""
+    if existing:
+        return existing
+    fresh = "win-" + uuid.uuid4().hex
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        handle = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return marker.read_text(encoding="utf-8").strip()
+    with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        stream.write(fresh + "\n")
+    return fresh
+
+
+#: Endpoint job states, partitioned for the health identity: anything outside the
+#: known sets is unresolved (a fail-closed bucket, never silently healthy).
+_HEALTH_ACTIVE_JOB_STATES = frozenset({"running", "selecting", "awaiting_definition"})
+_HEALTH_QUEUED_JOB_STATES = frozenset({"queued"})
+_HEALTH_TERMINAL_JOB_STATES = frozenset({"passed", "failed", "native_complete"})
+
+
+def _cad_health(jobs) -> tuple[dict, list[str]]:
+    """Process-fact CAD ownership for the health identity; the probe never opens CAD."""
+
+    if sys.platform != "win32":
+        return {"external_session_detected": False, "owned_sessions": 0, "lease_held": False}, ["unsupported_platform"]
+    try:
+        from ..sources.solidworks import isolation
+
+        records = isolation.OwnershipStore(jobs.cad_ownership_file).load()
+        external = [
+            pid
+            for pid in isolation._matching_process_ids(
+                isolation.registered_executable(), isolation._windows_process_table()
+            )
+            if pid not in records
+        ]
+        return (
+            {"external_session_detected": bool(external), "owned_sessions": len(records), "lease_held": bool(records)},
+            [],
+        )
+    except Exception:  # noqa: BLE001 - an unprovable CAD state is a readiness problem, never a pass
+        return {"external_session_detected": False, "owned_sessions": 0, "lease_held": False}, ["cad_state_unavailable"]
+
+
+def health_payload(jobs) -> dict:
+    """The IF-09 endpoint identity from its own install record, config snapshot and live state."""
+
+    config = jobs.config
+    record = tool_record()
+    embedded = record.get("release") if isinstance(record.get("release"), dict) else None
+    release = {
+        "version": str(record.get("version") or ""),
+        "source_commit": str((embedded or {}).get("source_commit") or ""),
+        "source_sha256": str(record.get("source_sha256") or ""),
+        "role": "native",
+    }
+    problems: list[str] = []
+    native_ok = sys.platform == "win32"
+    if not native_ok:
+        problems.append("unsupported_platform")
+    if embedded is None:
+        problems.append("release_identity_missing")
+    for key in ("package_root", "output_root"):
+        if not Path(config[key]).is_dir():
+            problems.append(f"missing_{key}")
+    with jobs.mutex:
+        states = [str(job.get("status") or "") for job in jobs.jobs.values()]
+    active = sum(1 for state in states if state in _HEALTH_ACTIVE_JOB_STATES)
+    queued = sum(1 for state in states if state in _HEALTH_QUEUED_JOB_STATES)
+    unresolved = sum(
+        1
+        for state in states
+        if state not in (_HEALTH_ACTIVE_JOB_STATES | _HEALTH_QUEUED_JOB_STATES | _HEALTH_TERMINAL_JOB_STATES)
+    )
+    cad, cad_problems = _cad_health(jobs)
+    problems.extend(cad_problems)
+    ready = native_ok and not problems and not cad["external_session_detected"] and unresolved == 0
+    if ready:
+        reason_code = None
+    elif problems:
+        reason_code = problems[0]
+    elif cad["external_session_detected"]:
+        reason_code = "external_cad_session"
+    else:
+        reason_code = "unresolved_operations"
+    usage = shutil.disk_usage(Path(config["output_root"]))
+    return {
+        "schema_version": HEALTH_SCHEMA,
+        "pipeline_id": PIPELINE_ID,
+        "native_platform": native_ok,
+        "ready": ready,
+        "release": release,
+        "contract": {"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
+        "resource_policy": {"schema_version": RESOURCE_POLICY_SCHEMA, "digest": resource_policy_v1_digest()},
+        "install": {"config_digest": config["config_digest"], "install_id": jobs.install_id},
+        "endpoint": {"port": config["port"]},
+        "cad": cad,
+        "jobs": {"active": active, "queued": queued, "unresolved": unresolved},
+        "capacity": {"free_bytes": int(usage.free), "reserved_bytes": 0},
+        "readiness": {
+            "reason_code": reason_code,
+            "native": {"ok": native_ok and not problems, "problems": problems},
+        },
+    }
 
 
 def _default_runner(*args, **kwargs):
@@ -289,6 +425,7 @@ class Jobs:
         inventory(self.directory)
         self.lock_path = config["state_root"] / ".endpoint.lock"
         self.handle = _owner_lock(self.lock_path)
+        self.install_id = provision_install_id(config["state_root"])
         self._closed = False
         self.mutex = threading.RLock()
         self.condition = threading.Condition(self.mutex)
@@ -1463,15 +1600,7 @@ def handler(jobs, token):
                 return
             try:
                 if self.path == "/health":
-                    self._reply(
-                        200,
-                        {
-                            "pipeline_id": PIPELINE_ID,
-                            "ready": jobs.thread.is_alive(),
-                            "native_platform": sys.platform == "win32",
-                            "targets": sorted(jobs.config["targets"]),
-                        },
-                    )
+                    self._reply(200, health_payload(jobs))
                 elif self.path.startswith("/v1/jobs/"):
                     suffix = self.path[len("/v1/jobs/") :]
                     if "/artifacts/" in suffix:
