@@ -66,6 +66,11 @@ _HARDWARE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
 _BASE_BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*")
 
 
+#: Distinguishes "the runner already returned" from "the runner has not run yet"
+#: when a terminal publication is deferred to the one atomic critical section.
+_UNSET = object()
+
+
 def _valid_base_branch(value: object) -> bool:
     if not isinstance(value, str) or value != value.strip() or not value:
         return False
@@ -287,6 +292,12 @@ class Jobs:
                 )
                 self.jobs[identifier] = job
                 if job["status"] in {"running", "selecting", "awaiting_definition"}:
+                    # Restart repair publishes this terminal record inside one
+                    # single-threaded construction block (flip -> clear -> seal
+                    # -> save) and deliberately carries no completed_at: the job
+                    # never ran to completion, and the interrupted-record shape
+                    # is pinned by
+                    # test_process_exit_releases_ownership_and_fails_interrupted_job.
                     job.update(
                         status="failed",
                         error="Endpoint restarted during native execution; inspect diagnostics and use a new run_id",
@@ -1040,6 +1051,9 @@ class Jobs:
                 return self.snapshot(identifier)
             if job["status"] != "awaiting_definition":
                 raise RequestError("Only a pending Linux derivation can be aborted", 409)
+            # Already atomic (one condition block: flip -> clear -> seal -> save);
+            # deliberately no completed_at - the derivation aborted before any
+            # native completion (definition-endpoint tests pin this shape).
             job.update(copy.deepcopy(request), status="failed", client_failure=copy.deepcopy(request))
             discovery = request["detail"].get("discovery")
             if isinstance(discovery, dict) and discovery.get("passed") is False:
@@ -1192,6 +1206,9 @@ class Jobs:
                 return
             job = self.jobs[identifier]
             spec = None
+            result = _UNSET
+            terminal = None
+            terminal_guarded = False
             try:
                 spec = _resume_spec(job["request"])
                 if spec is not None and spec["from_stage"] not in NATIVE_STAGES:
@@ -1308,44 +1325,59 @@ class Jobs:
                     handoff_sha256=job["handoff_sha256"],
                     **resume_kwargs,
                 )
-                with self.mutex:
-                    job["result"] = result
-                    archive = result.get("capture_archive") if isinstance(result.get("capture_archive"), dict) else None
-                    if result.get("native_complete") is True and result.get("passed") is False and archive:
-                        verified = self._verified_capture_archive(identifier, archive)
-                        job.update(status="native_complete", error=None, capture_archive=verified)
-                        self._clear_activity(job)
-                    elif result.get("native_complete") is True or result.get("passed") is True:
-                        job.update(
-                            status="failed",
-                            error="Native result shape is not a sealed capture transfer; the run cannot be qualified",
-                        )
-                        self._clear_activity(job)
-                        if result.get("error_code"):
-                            job["error_code"] = str(result["error_code"])
-                    else:
-                        # A genuinely failed native run keeps its own diagnostics.
-                        job.update(status="failed", error=result.get("error") or "Native capture failed")
-                        self._clear_activity(job)
-                        if result.get("error_code"):
-                            job["error_code"] = str(result["error_code"])
-                        for key in ("detail", "diagnostic_path"):
-                            if result.get(key) is not None:
-                                job[key] = result[key]
+                archive = result.get("capture_archive") if isinstance(result.get("capture_archive"), dict) else None
+                if result.get("native_complete") is True and result.get("passed") is False and archive:
+                    verified = self._verified_capture_archive(identifier, archive)
+                    terminal = {
+                        "result": result,
+                        "status": "native_complete",
+                        "error": None,
+                        "capture_archive": verified,
+                    }
+                elif result.get("native_complete") is True or result.get("passed") is True:
+                    terminal = {
+                        "result": result,
+                        "status": "failed",
+                        "error": "Native result shape is not a sealed capture transfer; the run cannot be qualified",
+                    }
+                    if result.get("error_code"):
+                        terminal["error_code"] = str(result["error_code"])
+                else:
+                    # A genuinely failed native run keeps its own diagnostics.
+                    terminal = {
+                        "result": result,
+                        "status": "failed",
+                        "error": result.get("error") or "Native capture failed",
+                    }
+                    if result.get("error_code"):
+                        terminal["error_code"] = str(result["error_code"])
+                    for key in ("detail", "diagnostic_path"):
+                        if result.get(key) is not None:
+                            terminal[key] = result[key]
             except Exception as error:
-                with self.mutex:
-                    if job["status"] != "failed":
-                        job.update(status="failed", error=f"{type(error).__name__}: {error}")
-                        self._clear_activity(job)
-                        code = getattr(error, "code", None)
-                        if code:
-                            job["error_code"] = str(code)
-                        if getattr(error, "detail", None) is not None:
-                            job["detail"] = error.detail
-                        elif isinstance(getattr(error, "details", None), dict):
-                            job["detail"] = error.details
+                # Record the failure without publishing it: the terminal record
+                # (status, error, completion timestamp, terminal event, sealed
+                # diagnostics, journal save) is published in ONE critical
+                # section below, so a snapshot can never observe a terminal
+                # status that is missing its completion record.
+                terminal = {"status": "failed", "error": f"{type(error).__name__}: {error}"}
+                if result is not _UNSET:
+                    terminal["result"] = result
+                code = getattr(error, "code", None)
+                if code:
+                    terminal["error_code"] = str(code)
+                if getattr(error, "detail", None) is not None:
+                    terminal["detail"] = error.detail
+                elif isinstance(getattr(error, "details", None), dict):
+                    terminal["detail"] = error.details
+                terminal_guarded = True
             finally:
                 with self.mutex:
+                    # The terminal publication is atomic for observers: flip,
+                    # clear, event, timestamp, seal and save under one lock.
+                    if terminal is not None and (not terminal_guarded or job["status"] != "failed"):
+                        job.update(terminal)
+                        self._clear_activity(job)
                     if job["status"] == "failed" and (not job["events"] or job["events"][-1]["state"] != "failed"):
                         phase = (job["events"][-1] if job["events"] else {}).get("stage", "freeze")
                         self._event(identifier, {"stage": phase, "state": "failed", "error": job.get("error")})
