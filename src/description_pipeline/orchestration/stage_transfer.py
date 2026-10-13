@@ -101,6 +101,9 @@ def _validate_native_tool(native_tool) -> None:
         canonicalize_name("mujoco") not in pins,
         "Native tool record must not include the MuJoCo consumer closure",
     )
+    # Source/PYTHONPATH checkouts embed no tool-release.json, so this local
+    # cross-release comparison is skipped for them; publication refuses without
+    # the embedded identity (steps.publish_model, ORC-04).
     release = Path(__file__).resolve().parent.parent / "tool-release.json"
     if release.is_file():
         identity = read_data(release)

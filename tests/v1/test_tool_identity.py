@@ -8,9 +8,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from description_pipeline import __version__, runtime
+from description_pipeline import __version__, runtime, steps
 from description_pipeline.delivery import PIPELINE_ID
-from description_pipeline.io import PipelineError, digest, inventory, write_json
+from description_pipeline.io import PipelineError, digest, inventory, read_data, write_json
+from description_pipeline.sources.solidworks.revision import seal_revision
 
 
 class ToolIdentityTests(unittest.TestCase):
@@ -75,3 +76,61 @@ class ToolIdentityTests(unittest.TestCase):
             (root / "Foo" / "nested").mkdir()
             (root / "Foo" / "nested" / "c.txt").write_text("c\n", encoding="utf-8")
             self.assertEqual(len(inventory(root)), 2)
+
+    @staticmethod
+    def _publishable_bundle(root: Path) -> Path:
+        """A minimal delivery whose inputs pass before the publication identity gate."""
+
+        bundle = root / "bundle"
+        inputs = bundle / "input"
+        inputs.mkdir(parents=True)
+        (inputs / "arm.SLDASM").write_bytes(b"release-identity fixture\n")
+        (inputs / "robot.yaml").write_text('{"hardware_id": "arm"}\n', encoding="utf-8")
+        seal_revision(
+            inputs,
+            hardware_id="arm",
+            revision="arm-1",
+            owner="t",
+            system="handoff",
+            reference="local-handoff",
+            summary="release identity fixture",
+        )
+        return bundle
+
+    def test_publication_refuses_without_the_embedded_release_identity(self):
+        """A source/PYTHONPATH install must refuse publication instead of degrading the gate (ORC-04)."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._publishable_bundle(root)
+            calls: list = []
+            with (
+                patch.object(steps, "tool_record", return_value={"release": None}),
+                patch(
+                    "description_pipeline.repository.urdf_pr.submit_bundle",
+                    side_effect=lambda *args, **kwargs: calls.append(args),
+                ),
+                self.assertRaisesRegex(PipelineError, "embedded release identity"),
+            ):
+                steps.publish_model(bundle, root / "repository")
+            self.assertEqual(calls, [])
+            self.assertFalse((bundle / "reports" / "pr.json").exists())
+
+    def test_publication_proceeds_with_the_embedded_release_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._publishable_bundle(root)
+            release = {"schema_version": "solidworks-to-urdf.release/v1", "version": __version__}
+            submission = {"state": "published", "url": "https://github.com/example/arm/pull/1", "subject": "a" * 64}
+            with (
+                patch.object(steps, "tool_record", return_value={"release": release}),
+                patch(
+                    "description_pipeline.repository.urdf_pr.submit_bundle",
+                    return_value=submission,
+                ) as publish,
+            ):
+                result = steps.publish_model(bundle, root / "repository")
+            publish.assert_called_once()
+            self.assertTrue(result["passed"])
+            self.assertEqual(result["subject_sha256"], "a" * 64)
+            self.assertEqual(read_data(bundle / "reports/pr.json")["url"], submission["url"])

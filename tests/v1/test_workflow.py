@@ -122,6 +122,9 @@ class WorkflowTests(unittest.TestCase):
         bundle.mkdir()
         shutil.copytree(self.package, bundle / "input")
         with (
+            patch.object(
+                steps, "tool_record", return_value={"release": {"schema_version": "solidworks-to-urdf.release/v1"}}
+            ),
             patch("description_pipeline.repository.urdf_pr.submit_bundle") as publish,
             self.assertRaisesRegex(PipelineError, "authored CAD hardware"),
         ):
