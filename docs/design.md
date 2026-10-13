@@ -122,10 +122,9 @@ assembly, run identity and native tool identity before use. Native completion is
 an intermediate state, not a verified model: an extracted declaration is
 evidence to reconcile, extraction warnings (uncovered occurrences, unusable
 ranges or drives) stay visible. Saved-pose mate restrictions do not override the
-declared kinematics. Administrative metadata (hardware ID, revision, owner,
-control record) is a publication-readiness requirement: when it is absent,
-measurement and inspection continue, the raw record keeps the absence, and no
-value and no neutral technical name is promoted to authored identity.
+declared kinematics. Administrative metadata absence is publication-readiness
+only ([quality](quality.md#scope-of-acceptance)); measurement and the raw record
+continue unchanged.
 
 The whole uploaded native folder is staged provisionally, then the native
 engine itself resolves the main assembly's references; the pipeline seals the
@@ -148,12 +147,11 @@ retained failed-verification checkpoint is served only as an explicitly
 unverified diagnostic preview that never asserts verification and never
 authorizes publication.
 
-When a folder contains more than one saved `.SLDASM`, the page always lists their
-relative paths and requires the operator to choose the main assembly before the run
-starts (a single assembly is selected automatically). The choice travels with the
-frozen handoff and its evidence, is reused by retries and reruns, and resolves only
-which assembly is the entry — every identity, dependency and physical check still
-applies to the native data.
+Multi-assembly selection is an operator step
+([operations](operations.md#2-collect-and-save-a-controlled-version)): a single
+assembly is selected automatically; otherwise the choice is frozen with the
+handoff, reused by retries and reruns, and fixes only the entry point — every
+identity, dependency and physical check still applies to the native data.
 
 ## 3. How engineering is organized
 

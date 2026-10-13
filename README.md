@@ -22,24 +22,21 @@ The page is **SolidWorks2URDF 交付操作台**.
 2. Sign in with Feishu, choose the complete project folder on your computer
    (Chrome or Edge) and start the run. The browser uploads the folder's files to
    the platform before anything is frozen; no server path is entered by hand.
-   When the folder holds several saved `.SLDASM` assemblies the page lists their
-   relative paths and you must choose the main assembly before starting; a single
-   assembly is selected automatically. The choice is recorded with the run and its
-   evidence, is kept by retries and reruns, and only fixes the entry point —
-   identity and physical checks still run on the native data.
-   The complete uploaded folder is staged to the Windows worker; the native
-   engine resolves the main assembly's references inside that staging and the
-   sealed closure admits only bindings that lie inside the staged root and match
-   the upload index — an engine-materialized import only through the sealed
-   owner/occurrence evidence matched by native identity, never by its temporary
-   path or file name. The worker reads the raw native record and later captures
-   that staging, while the robot definition is derived on Linux and returns to
-   the worker only as generated text. The full folder is never re-imported on
-   Windows.
+   When the folder holds several saved `.SLDASM` assemblies you must choose the
+   main assembly before starting
+   ([operations](docs/operations.md#2-collect-and-save-a-controlled-version));
+   a single assembly is selected automatically.
+   The complete uploaded folder is staged to the Windows worker; dependency
+   closure is admitted only from the engine's resolved bindings inside that
+   staging ([design](docs/design.md#2-how-the-system-works)). The worker reads
+   the raw native record and later captures that staging, while the robot
+   definition is derived on Linux and returns to the worker only as generated
+   text. The full folder is never re-imported on Windows.
 3. Review each step's actual check results, warnings and failure diagnoses.
-   Automatic passes need no manual
-   repetition; warnings never count as passes, and external engineering scope
-   remains explicit. Inspect the verified URDF and joint limits, and open the PR
+   Automatic passes need no manual repetition; warnings never count as passes
+   ([quality](docs/quality.md#step-and-result-contract)), and external
+   engineering scope remains explicit. Inspect the verified URDF and joint
+   limits, and open the PR
    for engineering approval. A retained delivery after a failed independent
    verification stays viewable only as an explicitly unverified diagnostic
    preview: generation success alone is not verification, and such artifacts are
@@ -57,9 +54,9 @@ declared link/joint evidence; zero or placeholder operating values are retained
 and flagged as warnings, never filled with defaults.
 
 Missing administrative metadata (hardware ID, revision, owner, control record)
-is a publication-readiness issue: measurement and inspection continue, the raw
-record keeps the absence, and no revision, owner, hardware ID or neutral
-technical name is treated as authored identity.
+is a publication-readiness issue only: it never blocks measurement, the raw
+record keeps the absence, and no value is invented
+([quality](docs/quality.md#scope-of-acceptance)).
 
 Run history and details show the original submitter's Feishu username, obtained
 automatically through Feishu's authentication API.
