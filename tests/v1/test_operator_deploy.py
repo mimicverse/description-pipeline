@@ -616,6 +616,9 @@ class LifecycleTests(unittest.TestCase):
                 derived_env[key] = value
         bindir = tmp / "bin"
         bindir.mkdir()
+        pgbin = state / "airflow-pg" / "root" / "usr" / "lib" / "postgresql" / "14" / "bin"
+        pgbin.mkdir(parents=True, exist_ok=True)
+        write_stub(pgbin / "pg_isready", '#!/bin/bash\necho "pg_isready" >> "$ORDER_LOG"\nexit 0\n')
         write_stub(
             bindir / "systemctl",
             '#!/bin/bash\necho "systemctl $*" >> "$ORDER_LOG"\n'
@@ -708,6 +711,12 @@ class LifecycleTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(admission.read_text().strip(), "false")
                 lines = order.read_text().splitlines()
+                # Cold start: the managed database comes up first, then the actual close.
+                self.assertLess(
+                    lines.index("systemctl --user start description-postgres.service"),
+                    lines.index("platform close_admission"),
+                )
+                self.assertLess(lines.index("pg_isready"), lines.index("platform close_admission"))
                 ingress = lines.index(
                     "systemctl --user enable --now description-portal.service description-operator-proxy.service"
                 )

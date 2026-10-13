@@ -109,6 +109,23 @@ load_active_env() {
   [ -f "$ENV_FILE" ] || die "derived environment missing for generation $ACTIVE_ID; run install"
 }
 
+# The gates read the platform authority from the managed database, so the start window must
+# begin by bringing that database up and confirming its socket.  The cluster identity never
+# runs here; this is the same managed unit the installation created.
+ensure_postgres_ready() {
+  PG_BIN="$POSTGRES_ROOT/root/usr/lib/postgresql/${POSTGRES_MAJOR:-14}/bin"
+  export LD_LIBRARY_PATH="$POSTGRES_ROOT/root/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+  systemctl --user daemon-reload
+  systemctl --user start description-postgres.service \
+    || die "description-postgres.service failed to start"
+  local ready=0
+  for _ in $(seq 1 20); do
+    if "$PG_BIN/pg_isready" -q -h "$POSTGRES_ROOT/socket" -p "$POSTGRES_PORT"; then ready=1; break; fi
+    sleep 0.5
+  done
+  [ "$ready" = "1" ] || die "PostgreSQL did not become ready on $POSTGRES_ROOT/socket"
+}
+
 airflow_render() {
   AIRFLOW_VENV="$AIRFLOW_VENV" AIRFLOW_HOME="$AIRFLOW_HOME" \
   POSTGRES_ROOT="${POSTGRES_ROOT:-}" POSTGRES_MAJOR="${POSTGRES_MAJOR:-14}" \
@@ -262,15 +279,17 @@ case "$ACTION" in
   install)
     install_from_config ;;
   start)
-    # Start-window precondition: close the gate through the controlled entry BEFORE any
-    # verification, so an identity or configuration failure during this start attempt cannot
-    # leave a leftover open gate; already-admitted runs continue.
+    # Cold-start order inside the single entry: bring the managed database up and confirm its
+    # socket, then actually close the platform admission through the controlled entry (BEFORE
+    # any identity/drift verification, so a failed start attempt cannot leave a leftover open
+    # gate), then run the preconditions; the gate reopens only after everything is ready.
     START_STATE_ROOT="$(python3 "$HERE/platform_config.py" resolve --config "$CONFIG_FILE" | \
       python3 -c 'import json,sys; print(json.load(sys.stdin)["storage"]["state_root"])')" || exit $?
     [ -f "$START_STATE_ROOT/resolved.env" ] \
       || die "not installed: $START_STATE_ROOT/resolved.env is missing (run install first)"
     # shellcheck disable=SC1090
     source "$START_STATE_ROOT/resolved.env"
+    ensure_postgres_ready
     platform_close_admission "start-window" "operatorctl start"
     load_active_env ;;
   drain|stop|status|health)
@@ -304,17 +323,7 @@ case "$ACTION" in
       # One path for a fresh install and a stopped reinstall: the managed unit owns the server
       # `airflow db migrate` needs, and install waits for its socket before migration. No other
       # service is started here.
-      systemctl --user daemon-reload
-      systemctl --user start description-postgres.service \
-        || die "description-postgres.service failed to start"
-      PG_BIN="$POSTGRES_ROOT/root/usr/lib/postgresql/${POSTGRES_MAJOR:-14}/bin"
-      export LD_LIBRARY_PATH="$POSTGRES_ROOT/root/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
-      ready=0
-      for _ in $(seq 1 20); do
-        if "$PG_BIN/pg_isready" -q -h "$POSTGRES_ROOT/socket" -p "$POSTGRES_PORT"; then ready=1; break; fi
-        sleep 0.5
-      done
-      [ "$ready" = "1" ] || die "PostgreSQL did not become ready on $POSTGRES_ROOT/socket"
+      ensure_postgres_ready
       db_state="$("$PG_BIN/psql" -h "$POSTGRES_ROOT/socket" -p "$POSTGRES_PORT" -U solidworks -d postgres \
         -tAc "select 1 from pg_database where datname='airflow_meta'")" \
         || die "could not query pg_database for airflow_meta"
