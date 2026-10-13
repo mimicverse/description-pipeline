@@ -77,8 +77,13 @@ install_from_config() {
   if [ -z "$INSTALL_ID" ]; then
     INSTALL_ID="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
   fi
-  SNAPSHOT_PATH="$(python3 "$HERE/platform_config.py" render --config "$CONFIG_FILE" \
-    --install-id "$INSTALL_ID" | sed -n 's/^snapshot=//p')" || exit $?
+  if [ -n "$WHEEL_FILE" ]; then
+    SNAPSHOT_PATH="$(python3 "$HERE/platform_config.py" render --config "$CONFIG_FILE" \
+      --install-id "$INSTALL_ID" --wheel "$WHEEL_FILE" | sed -n 's/^snapshot=//p')" || exit $?
+  else
+    SNAPSHOT_PATH="$(python3 "$HERE/platform_config.py" render --config "$CONFIG_FILE" \
+      --install-id "$INSTALL_ID" --tree "$HERE/../.." | sed -n 's/^snapshot=//p')" || exit $?
+  fi
   [ -f "$SNAPSHOT_PATH" ] || die "config snapshot was not written"
   if [ -n "$WHEEL_FILE" ]; then
     DERIVED_ENV="$(python3 "$HERE/platform_env.py" emit --snapshot "$SNAPSHOT_PATH" \
@@ -395,10 +400,19 @@ SQL
     # it is written only after the installation legs are ready.
     STATE_ROOT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["resolved"]["storage"]["state_root"])' "$SNAPSHOT_PATH")"
     SERVICES_CSV="$(IFS=,; printf '%s' "${UNITS[*]}")"
-    python3 "$HERE/install_record.py" build --state-root "$STATE_ROOT" --install-id "$INSTALL_ID" \
-      --snapshot "$SNAPSHOT_PATH" --release-file "$RELEASE_FILE" \
-      --endpoint-identity "$ENDPOINT_IDENTITY" --services "$SERVICES_CSV" \
-      --dag "$AIRFLOW_HERE/dags/solidworks_to_urdf.py"
+    # The record's canonical bytes and its digest come from the same contract closure the
+    # snapshot legs consumed: the installed wheel or the single wheel in the deployment tree.
+    if [ -n "$WHEEL_FILE" ]; then
+      python3 "$HERE/install_record.py" build --state-root "$STATE_ROOT" --install-id "$INSTALL_ID" \
+        --snapshot "$SNAPSHOT_PATH" --release-file "$RELEASE_FILE" \
+        --endpoint-identity "$ENDPOINT_IDENTITY" --services "$SERVICES_CSV" \
+        --dag "$AIRFLOW_HERE/dags/solidworks_to_urdf.py" --wheel "$WHEEL_FILE"
+    else
+      python3 "$HERE/install_record.py" build --state-root "$STATE_ROOT" --install-id "$INSTALL_ID" \
+        --snapshot "$SNAPSHOT_PATH" --release-file "$RELEASE_FILE" \
+        --endpoint-identity "$ENDPOINT_IDENTITY" --services "$SERVICES_CSV" \
+        --dag "$AIRFLOW_HERE/dags/solidworks_to_urdf.py" --tree "$HERE/../.."
+    fi
     echo "install complete: ${OPERATOR_URL:-unknown}"
     ;;
   start)

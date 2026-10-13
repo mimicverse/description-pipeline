@@ -106,13 +106,14 @@ class PlatformEnvTests(unittest.TestCase):
             install_id="gen-1",
             generated_at="2026-10-13T00:00:00Z",
         )
-        self.snapshot_path = platform_config.write_snapshot(snapshot, self.root / "state" / "snapshots")
-        self.snapshot = snapshot
         self.tree = self.root / "deployment"
         self.tree.mkdir()
         self.wheel = self.tree / "mimicverse_description-1.4.0-py3-none-any.whl"
         write_contract_wheel(self.wheel)
         self.release = write_release(self.root, self.wheel)
+        owner = platform_config.load_contract_owner(platform_config.extract_contract_closure(self.wheel))
+        self.snapshot_path = platform_config.write_snapshot(snapshot, self.root / "state" / "snapshots", owner)
+        self.snapshot = snapshot
 
     def derive(self, snapshot, *, install_id, tree_root=None, wheel=None):
         return platform_env.derive(

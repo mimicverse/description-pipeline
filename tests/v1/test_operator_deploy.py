@@ -170,6 +170,8 @@ def platform_fixture(
             str(config_path),
             "--install-id",
             install_id,
+            "--wheel",
+            str(wheel),
         ],
         {},
     )
@@ -240,6 +242,8 @@ def platform_fixture(
             "description-postgres,description-airflow-scheduler,description-operator-proxy",
             "--dag",
             str(dag_path),
+            "--wheel",
+            str(wheel),
         ],
         {},
     )
@@ -1154,7 +1158,7 @@ class InstallOrderingTests(unittest.TestCase):
         for unit in (OPERATOR / "systemd").glob("*.service"):
             (release / "operator" / "systemd" / unit.name).write_bytes(unit.read_bytes())
         (release / "platform").mkdir()
-        for artifact in ("apply.sh", "schema.sql", "views.sql", "roles.sql"):
+        for artifact in ("apply.sh", "bootstrap.sql", "schema.sql", "views.sql", "roles.sql"):
             (release / "platform" / artifact).write_bytes((OPERATOR.parent / "platform" / artifact).read_bytes())
         write_stub(
             release / "operator" / "scripts" / "install_toolchain.sh",

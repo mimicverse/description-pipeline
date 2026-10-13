@@ -24,15 +24,20 @@ Exit codes: 0 success; 1 configuration error (message on stderr); 2 usage error.
 from __future__ import annotations
 
 import argparse
+import atexit
 import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import sys
+import tempfile
 import uuid
+import zipfile
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -302,16 +307,111 @@ def validate_platform(document) -> dict:
     }
 
 
-def canonical(data) -> bytes:
-    """The IF-05 canonical serialization; byte-identical to ``description_pipeline.io.canonical``."""
 
-    return (json.dumps(data, sort_keys=True, ensure_ascii=False, allow_nan=False, indent=2) + "\n").encode()
+#: The minimal same-source contract closure inside the release wheel.  ``io.py`` is the single
+#: owner of the canonical bytes (R17); the deployment keeps NO mirror - the snapshot bytes and
+#: every digest consume exactly these files from the digest-bound artifact.
+CLOSURE_MEMBERS = (
+    "__init__.py",
+    "schemas.py",
+    "io.py",
+    "delivery.py",
+    "stages.py",
+    "stage-contract.json",
+    "interface_records.py",
+)
 
 
-def snapshot_digest(snapshot: dict) -> str:
-    """Canonical digest of the snapshot bytes (the snapshot stores no self-digest)."""
+def extract_contract_closure(wheel: Path) -> Path:
+    """Extract the bound wheel's minimal contract closure into a private directory.
 
-    return hashlib.sha256(canonical(snapshot)).hexdigest()
+    The directory lives under the system temporary root (never inside the deployment tree) and
+    is removed at process exit; a wheel missing any closure member is refused.
+    """
+
+    directory = Path(tempfile.mkdtemp(prefix="description-contract-"))
+    atexit.register(shutil.rmtree, directory, ignore_errors=True)
+    package = directory / "description_pipeline"
+    package.mkdir()
+    with zipfile.ZipFile(wheel) as archive:
+        names = set(archive.namelist())
+        for member in CLOSURE_MEMBERS:
+            name = f"description_pipeline/{member}"
+            require(name in names, f"the release artifact {wheel.name} misses the contract closure member {name}")
+            (package / member).write_bytes(archive.read(name))
+    return directory
+
+
+def load_contract_owner(closure_dir: Path):
+    """Import the canonical encoding owner from the extracted closure (ambient-proof).
+
+    Snapshot bytes and their digests come from exactly this source; the authoritative
+    validation boundary stays the isolated ``-I -S`` subprocess in ``platform_env``.  The
+    import must resolve to the closure even when the interpreter already carries an ambient
+    ``description_pipeline`` (a site hook or a stray tree on ``PYTHONPATH``): the previous
+    modules are set aside for the import, the loaded modules must live inside the closure,
+    and the previous state is restored - only the digest-bound artifact can decide.
+    """
+
+    closure_dir = Path(closure_dir).resolve()
+    package_dir = closure_dir / "description_pipeline"
+    saved = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "description_pipeline" or name.startswith("description_pipeline.")
+    }
+    for name in saved:
+        del sys.modules[name]
+    sys.path.insert(0, str(closure_dir))
+    try:
+        from description_pipeline import interface_records, io  # noqa: PLC0415
+
+        for module in (interface_records, io):
+            source = Path(module.__file__).resolve()
+            require(
+                source.is_relative_to(package_dir),
+                f"the contract closure did not decide the {module.__name__} import: {source}",
+            )
+        owner = SimpleNamespace(
+            canonical=io.canonical, config_snapshot_digest=interface_records.config_snapshot_digest
+        )
+    finally:
+        sys.path.remove(str(closure_dir))
+        for name in [
+            name
+            for name in sys.modules
+            if name == "description_pipeline" or name.startswith("description_pipeline.")
+        ]:
+            del sys.modules[name]
+        sys.modules.update(saved)
+    return owner
+
+
+def resolve_release_wheel(*, wheel: Path | None, tree_root: Path | None) -> Path:
+    """Select the release wheel whose closure carries the canonical owner (no release binding).
+
+    The release-bound selection remains ``install_record.wheel_binding``; deploy helpers that
+    only need the contract bytes accept the same explicit-wheel-or-single-tree-wheel rule.
+    """
+
+    if wheel is not None:
+        candidate = Path(wheel)
+    else:
+        require(tree_root is not None, "either --wheel or --tree is required to select the release wheel")
+        candidates = sorted(path for path in Path(tree_root).glob("*.whl") if path.is_file())
+        require(
+            len(candidates) == 1,
+            f"expected exactly one *.whl under {tree_root} (found {len(candidates)}); pass --wheel",
+        )
+        candidate = candidates[0]
+    require(candidate.is_file(), f"wheel not found: {candidate}")
+    return candidate
+
+
+def snapshot_digest(snapshot: dict, owner) -> str:
+    """Canonical digest of the snapshot bytes via the single owner (no deploy-side rule)."""
+
+    return owner.config_snapshot_digest(snapshot)
 
 
 def build_snapshot(resolved: dict, *, platform_json_sha256: str, install_id: str, generated_at: str) -> dict:
@@ -368,10 +468,10 @@ def atomic_write_once(path: Path, payload: bytes) -> Path:
     return path
 
 
-def write_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
-    """Write the generation snapshot atomically (0600); a generation is never rewritten."""
+def write_snapshot(snapshot: dict, snapshots_dir: Path, owner) -> Path:
+    """Write the generation snapshot atomically (0600) with the canonical owner's bytes."""
 
-    return atomic_write_once(snapshots_dir / f"{snapshot['install_id']}.json", canonical(snapshot))
+    return atomic_write_once(snapshots_dir / f"{snapshot['install_id']}.json", owner.canonical(snapshot))
 
 
 def load_document(path: Path) -> tuple[bytes, object]:
@@ -396,6 +496,8 @@ def main(argv: list[str] | None = None) -> int:
         if action == "render":
             subparser.add_argument("--install-id", default=None, help="installation generation id (default: generated)")
             subparser.add_argument("--generated-at", default=None, help="RFC3339 UTC timestamp (default: now)")
+            subparser.add_argument("--wheel", type=Path, default=None, help="release wheel carrying the contract owner")
+            subparser.add_argument("--tree", type=Path, default=None, help="deployment tree for wheel discovery")
     args = parser.parse_args(argv)
 
     raw, document = load_document(args.config)
@@ -409,14 +511,15 @@ def main(argv: list[str] | None = None) -> int:
 
     install_id = args.install_id or uuid.uuid4().hex
     generated_at = args.generated_at or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    owner = load_contract_owner(extract_contract_closure(resolve_release_wheel(wheel=args.wheel, tree_root=args.tree)))
     snapshot = build_snapshot(
         resolved,
         platform_json_sha256=hashlib.sha256(raw).hexdigest(),
         install_id=install_id,
         generated_at=generated_at,
     )
-    snapshot_path = write_snapshot(snapshot, Path(resolved["storage"]["state_root"]) / "snapshots")
-    print(f"config_digest={snapshot_digest(snapshot)}")
+    snapshot_path = write_snapshot(snapshot, Path(resolved["storage"]["state_root"]) / "snapshots", owner)
+    print(f"config_digest={snapshot_digest(snapshot, owner)}")
     print(f"snapshot={snapshot_path}")
     return 0
 

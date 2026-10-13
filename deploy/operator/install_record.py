@@ -33,7 +33,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from platform_config import SNAPSHOT_SCHEMA, atomic_write_once, canonical  # noqa: E402  (shared helpers)
+from platform_config import (  # noqa: E402  (single owners)
+    SNAPSHOT_SCHEMA,
+    atomic_write_once,
+    extract_contract_closure,
+    load_contract_owner,
+)
 
 INSTALL_RECORD_SCHEMA = "solidworks-to-urdf.install-record/v1"
 RELEASE_SCHEMA = "solidworks-to-urdf.release/v1"
@@ -353,10 +358,10 @@ def build_install_record(
     }
 
 
-def write_install_record(record: dict, state_root: Path) -> tuple[Path, Path]:
+def write_install_record(record: dict, state_root: Path, owner) -> tuple[Path, Path]:
     """Persist one generation (write-once) and update the active record pointer atomically."""
 
-    payload = canonical(record)
+    payload = owner.canonical(record)
     generation = atomic_write_once(state_root / "install-records" / f"{record['install_id']}.json", payload)
     active = state_root / "install-record.json"
     active.parent.mkdir(parents=True, exist_ok=True)
@@ -386,6 +391,8 @@ def main(argv: list[str] | None = None) -> int:
     build.add_argument("--endpoint-identity", type=Path, required=True)
     build.add_argument("--services", required=True, help="comma-separated managed unit names")
     build.add_argument("--dag", type=Path, required=True)
+    build.add_argument("--wheel", type=Path, default=None, help="the installed wheel (contract owner source)")
+    build.add_argument("--tree", type=Path, default=None, help="deployment tree for wheel discovery")
     check = subparsers.add_parser("check")
     check.add_argument("--release-file", type=Path, required=True)
     check.add_argument("--endpoint-identity", type=Path, required=True)
@@ -425,10 +432,12 @@ def main(argv: list[str] | None = None) -> int:
         services=services,
         dag_file=args.dag,
     )
-    generation, active = write_install_record(record, args.state_root)
+    bound_wheel = wheel_binding(release, wheel=args.wheel, tree_root=args.tree)
+    contract = load_contract_owner(extract_contract_closure(bound_wheel))
+    generation, active = write_install_record(record, args.state_root, contract)
     print(f"generation={generation}")
     print(f"active={active}")
-    print(f"record_digest={hashlib.sha256(canonical(record)).hexdigest()}")
+    print(f"record_digest={hashlib.sha256(contract.canonical(record)).hexdigest()}")
     print(f"verified_artifacts={verified}")
     return 0
 

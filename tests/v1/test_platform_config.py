@@ -18,6 +18,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from description_pipeline import interface_records as ir
+from description_pipeline import io as io_module
+
+from .contract_wheel import write_contract_wheel
+
 ROOT = Path(__file__).resolve().parents[2]
 OPERATOR = ROOT / "deploy" / "operator"
 PLATFORM_CONFIG = OPERATOR / "platform_config.py"
@@ -32,6 +37,16 @@ def _load_from_path(name: str, path: Path):
 
 
 platform_config = _load_from_path("deploy_platform_config", PLATFORM_CONFIG)
+
+WHEEL_NAME = "mimicverse_description-1.4.0-py3-none-any.whl"
+
+
+def contract_owner(root: Path):
+    """The canonical owner as the deployment consumes it: from the wheel's contract closure."""
+
+    wheel = root / WHEEL_NAME
+    write_contract_wheel(wheel)
+    return platform_config.load_contract_owner(platform_config.extract_contract_closure(wheel))
 
 
 def platform_document(root: Path) -> dict:
@@ -257,13 +272,12 @@ class ValidationTests(unittest.TestCase):
 
 class RenderTests(unittest.TestCase):
     def test_render_cli_writes_generation_snapshot_and_matches_package_validators(self):
-        from description_pipeline import interface_records as ir
-        from description_pipeline.io import canonical as io_canonical
-
         with tempfile.TemporaryDirectory(prefix="platform-config-") as temporary:
             root = Path(temporary)
             config_path = root / "platform.json"
             config_path.write_text(json.dumps(platform_document(root)), encoding="utf-8")
+            wheel = root / WHEEL_NAME
+            write_contract_wheel(wheel)
 
             result = run_cli(
                 "render",
@@ -273,6 +287,8 @@ class RenderTests(unittest.TestCase):
                 "gen-1",
                 "--generated-at",
                 "2026-10-13T00:00:00Z",
+                "--wheel",
+                str(wheel),
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             summary = dict(line.split("=", 1) for line in result.stdout.strip().splitlines())
@@ -284,10 +300,19 @@ class RenderTests(unittest.TestCase):
 
             snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
             ir.validate_config_snapshot(snapshot)
-            self.assertEqual(platform_config.snapshot_digest(snapshot), ir.config_snapshot_digest(snapshot))
+            # R17: the deployment keeps no canonical mirror - the written bytes and the printed
+            # digest come from the single owner (io/interface_records) carried by the release
+            # wheel's contract closure.
+            owner = contract_owner(root)
+            self.assertEqual(platform_config.snapshot_digest(snapshot, owner), ir.config_snapshot_digest(snapshot))
             self.assertEqual(summary["config_digest"], ir.config_snapshot_digest(snapshot))
-            self.assertEqual(platform_config.canonical(snapshot), io_canonical(snapshot))
+            self.assertEqual(snapshot_path.read_bytes(), io_module.canonical(snapshot))
+            self.assertFalse(hasattr(platform_config, "canonical"), "the deploy side keeps no second rule")
             self.assertEqual(snapshot["resolved"]["windows"]["instance"]["task_name"], "description-e2e-endpoint")
+
+            missing_binding = run_cli("render", "--config", str(config_path), "--install-id", "gen-2")
+            self.assertEqual(missing_binding.returncode, 1)
+            self.assertIn("either --wheel or --tree", missing_binding.stderr)
 
             validate_result = run_cli("validate", "--config", str(config_path))
             self.assertEqual(validate_result.returncode, 0)
@@ -302,14 +327,16 @@ class RenderTests(unittest.TestCase):
             generated_at="2026-10-13T00:00:00Z",
         )
         with tempfile.TemporaryDirectory(prefix="platform-config-write-") as temporary:
-            snapshots = Path(temporary) / "state" / "snapshots"
-            first = platform_config.write_snapshot(snapshot, snapshots)
-            second = platform_config.write_snapshot(snapshot, snapshots)
+            root = Path(temporary)
+            owner = contract_owner(root)
+            snapshots = root / "state" / "snapshots"
+            first = platform_config.write_snapshot(snapshot, snapshots, owner)
+            second = platform_config.write_snapshot(snapshot, snapshots, owner)
             self.assertEqual(first, second)
             tampered = copy.deepcopy(snapshot)
             tampered["generated_at"] = "2026-10-13T00:00:01Z"
             with self.assertRaises(SystemExit):
-                platform_config.write_snapshot(tampered, snapshots)
+                platform_config.write_snapshot(tampered, snapshots, owner)
 
     @unittest.skipUnless(hasattr(os, "fork"), "requires a POSIX fork")
     def test_concurrent_different_payloads_for_one_generation_never_overwrite(self):
@@ -327,7 +354,9 @@ class RenderTests(unittest.TestCase):
             generated_at="2026-10-13T00:00:00Z",
         )
         with tempfile.TemporaryDirectory(prefix="platform-config-race-") as temporary:
-            snapshots = Path(temporary) / "snapshots"
+            root = Path(temporary)
+            owner = contract_owner(root)
+            snapshots = root / "snapshots"
             go_ahead, wait_for_write = os.pipe()
             pid = os.fork()
             if pid == 0:  # child: the second writer, released together with the first
@@ -335,7 +364,7 @@ class RenderTests(unittest.TestCase):
                 try:
                     os.close(wait_for_write)
                     os.read(go_ahead, 1)
-                    platform_config.write_snapshot(second, snapshots)
+                    platform_config.write_snapshot(second, snapshots, owner)
                     child_code = 0
                 except SystemExit:
                     child_code = 1
@@ -347,7 +376,7 @@ class RenderTests(unittest.TestCase):
             parent_ok = True
             try:
                 os.write(wait_for_write, b"x")
-                platform_config.write_snapshot(first, snapshots)
+                platform_config.write_snapshot(first, snapshots, owner)
             except SystemExit:
                 parent_ok = False
             finally:

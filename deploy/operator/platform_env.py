@@ -34,35 +34,18 @@ Exit codes: 0 success; 1 error (message on stderr); 2 usage error.
 from __future__ import annotations
 
 import argparse
-import atexit
 import json
 import os
-import shutil
 import subprocess
 import sys
-import tempfile
-import zipfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from platform_config import atomic_write_once, canonical  # noqa: E402  (shared helpers)
+from platform_config import atomic_write_once, extract_contract_closure, load_contract_owner  # noqa: E402  (single owners)
 from install_record import release_identity, wheel_binding  # noqa: E402  (single release/asset binding)
 from render_operator import PORT_DEFAULTS  # noqa: E402  (single deploy-layer port source, DEP-01)
-
-#: The minimal same-source contract closure inside the release wheel: the schema owner modules
-#: plus the stage contract they read.  These files are the frozen interface validators the
-#: bootstrap runs itself; the rest of the package is not needed before a venv exists.
-CLOSURE_MEMBERS = (
-    "__init__.py",
-    "schemas.py",
-    "io.py",
-    "delivery.py",
-    "stages.py",
-    "stage-contract.json",
-    "interface_records.py",
-)
 
 
 def die(message: str) -> None:
@@ -104,40 +87,18 @@ print(json.dumps({"verdict": "accept"}))
 """
 
 
-def extract_contract_closure(wheel: Path) -> Path:
-    """Extract the bound wheel's minimal contract closure into a private directory.
-
-    The directory lives under the system temporary root (never inside the deployment tree)
-    and is removed at process exit.  A wheel missing any closure member is refused - the
-    gate never falls back to weaker local checks.
-    """
-    directory = Path(tempfile.mkdtemp(prefix="description-contract-"))
-    atexit.register(shutil.rmtree, directory, ignore_errors=True)
-    package = directory / "description_pipeline"
-    package.mkdir()
-    with zipfile.ZipFile(wheel) as archive:
-        names = set(archive.namelist())
-        for member in CLOSURE_MEMBERS:
-            name = f"description_pipeline/{member}"
-            require(name in names, f"the release artifact {wheel.name} misses the contract closure member {name}")
-            (package / member).write_bytes(archive.read(name))
-    return directory
-
-
-def validate_snapshot_via_closure(wheel: Path, snapshot_bytes: bytes) -> None:
+def validate_snapshot_via_closure(closure_dir: Path, snapshot_bytes: bytes) -> None:
     """Run the canonical snapshot validation in a true ``-I -S`` child process.
 
     The child starts with a cleared environment and no site initialization, and imports the
-    validators only from the closure extracted out of the digest-bound wheel: the caller's
-    sys.modules, sys.path and ambient site hooks cannot shadow them.  It receives the
-    snapshot's exact bytes on stdin - nothing is re-serialized.  An un-runnable child, a
-    non-zero exit without a machine-readable verdict or a missing verdict refuses the gate
-    (fail closed).
+    validators only from the extracted closure directory: the caller's sys.modules, sys.path
+    and ambient site hooks cannot shadow them.  It receives the snapshot's exact bytes on
+    stdin - nothing is re-serialized.  An un-runnable child, a non-zero exit without a
+    machine-readable verdict or a missing verdict refuses the gate (fail closed).
     """
-    directory = extract_contract_closure(wheel)
     try:
         completed = subprocess.run(
-            [sys.executable, "-I", "-S", "-B", "-c", ISOLATED_VALIDATION, str(directory)],
+            [sys.executable, "-I", "-S", "-B", "-c", ISOLATED_VALIDATION, str(closure_dir)],
             input=snapshot_bytes,
             capture_output=True,
             env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
@@ -211,8 +172,11 @@ def derive(
     # The canonical IF-16 validation runs before the emit's first write, enforced by a true
     # -I -S -B child process over the closure extracted from the digest-bound wheel: the
     # caller's environment, sys.path and sys.modules cannot substitute the validators, and an
-    # un-runnable or unverifiable child fails the gate closed.
-    validate_snapshot_via_closure(wheel_path, snapshot_bytes)
+    # un-runnable or unverifiable child fails the gate closed.  The same closure supplies the
+    # canonical bytes for the derived artifacts (io is the single owner).
+    closure_dir = extract_contract_closure(wheel_path)
+    validate_snapshot_via_closure(closure_dir, snapshot_bytes)
+    contract = load_contract_owner(closure_dir)
     declared = snapshot["install_id"]
     require(
         declared == install_id,
@@ -309,9 +273,9 @@ def derive(
         "DISCOVERY_SETTINGS_FILE": str(discovery_file),
     }
     lines = [f"{key}={value}" for key, value in sorted(env.items())]
-    atomic_write_once(repositories_file, canonical(repositories))
-    atomic_write_once(targets_file, canonical(targets))
-    atomic_write_once(discovery_file, canonical(discovery))
+    atomic_write_once(repositories_file, contract.canonical(repositories))
+    atomic_write_once(targets_file, contract.canonical(targets))
+    atomic_write_once(discovery_file, contract.canonical(discovery))
     atomic_write_once(env_path, ("\n".join(lines) + "\n").encode("utf-8"))
     return {"env": env, "env_path": env_path, "derived_dir": derived_dir, "wheel": wheel_path}
 

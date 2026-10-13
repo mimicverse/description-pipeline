@@ -19,6 +19,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from description_pipeline import io as pipeline_io
+
+from .contract_wheel import write_contract_wheel
+
 ROOT = Path(__file__).resolve().parents[2]
 OPERATOR = ROOT / "deploy" / "operator"
 
@@ -77,6 +81,16 @@ def platform_document(root: Path) -> dict:
     }
 
 
+def contract_owner(root: Path):
+    """The canonical owner exactly as the deployment consumes it: the wheel's closure."""
+
+    wheel = root / "distribution" / WHEEL_NAME
+    if not wheel.is_file():
+        wheel.parent.mkdir(parents=True, exist_ok=True)
+        write_contract_wheel(wheel)
+    return platform_config.load_contract_owner(platform_config.extract_contract_closure(wheel))
+
+
 def make_snapshot(root: Path) -> Path:
     resolved = platform_config.validate_platform(platform_document(root))
     snapshot = platform_config.build_snapshot(
@@ -85,14 +99,14 @@ def make_snapshot(root: Path) -> Path:
         install_id="gen-1",
         generated_at=TIMESTAMP,
     )
-    return platform_config.write_snapshot(snapshot, root / "state" / "snapshots")
+    return platform_config.write_snapshot(snapshot, root / "state" / "snapshots", contract_owner(root))
 
 
 def make_release(root: Path) -> Path:
     distribution = root / "distribution"
     distribution.mkdir(parents=True, exist_ok=True)
     wheel = distribution / WHEEL_NAME
-    wheel.write_bytes(b"wheel-bytes")
+    write_contract_wheel(wheel)
     document = {
         "schema_version": install_record.RELEASE_SCHEMA,
         "pipeline_id": "solidworks-to-urdf",
@@ -178,8 +192,9 @@ class InstallRecordTests(unittest.TestCase):
     def test_record_generations_are_write_once_and_the_active_pointer_replaces(self):
         record = build_record(self.root)
         state_root = self.root / "state"
-        generation, active = install_record.write_install_record(record, state_root)
-        again, _ = install_record.write_install_record(record, state_root)
+        owner = contract_owner(self.root)
+        generation, active = install_record.write_install_record(record, state_root, owner)
+        again, _ = install_record.write_install_record(record, state_root, owner)
         self.assertEqual(generation, again)
         self.assertEqual(stat.S_IMODE(generation.stat().st_mode), 0o600)
         self.assertEqual(json.loads(active.read_text(encoding="utf-8")), record)
@@ -187,13 +202,13 @@ class InstallRecordTests(unittest.TestCase):
         tampered = copy.deepcopy(record)
         tampered["timestamp"] = "2026-10-13T00:00:01Z"
         with self.assertRaises(SystemExit):
-            install_record.write_install_record(tampered, state_root)
+            install_record.write_install_record(tampered, state_root, owner)
 
         second = copy.deepcopy(record)
         second["install_id"] = "gen-2"
         second["snapshot"]["install_id"] = "gen-2"
         second["ends"]["linux"]["install_id"] = "gen-2"
-        second_generation, active = install_record.write_install_record(second, state_root)
+        second_generation, active = install_record.write_install_record(second, state_root, owner)
         self.assertEqual(second_generation.name, "gen-2.json")
         self.assertTrue(generation.is_file(), "older generations must be retained")
         self.assertEqual(json.loads(active.read_text(encoding="utf-8"))["install_id"], "gen-2")
@@ -220,6 +235,8 @@ class InstallRecordTests(unittest.TestCase):
                 ",".join(SERVICES),
                 "--dag",
                 str(self.root / "solidworks_to_urdf.py"),
+                "--wheel",
+                str(self.root / "distribution" / WHEEL_NAME),
             ],
             capture_output=True,
             text=True,
@@ -233,7 +250,7 @@ class InstallRecordTests(unittest.TestCase):
         record = json.loads(active.read_text(encoding="utf-8"))
         self.assertEqual(record, json.loads(generation.read_text(encoding="utf-8")))
         self.assertEqual(summary["verified_artifacts"], "1")
-        expected_digest = hashlib.sha256(install_record.canonical(record)).hexdigest()
+        expected_digest = hashlib.sha256(pipeline_io.canonical(record)).hexdigest()
         self.assertEqual(summary["record_digest"], expected_digest)
 
     def assert_rejected(self, mutate, needle: str) -> None:
@@ -378,6 +395,8 @@ class InstallRecordTests(unittest.TestCase):
                     ",".join(SERVICES),
                     "--dag",
                     str(root / "solidworks_to_urdf.py"),
+                    "--wheel",
+                    str(root / "distribution" / WHEEL_NAME),
                 ],
                 capture_output=True,
                 text=True,
@@ -557,7 +576,8 @@ class InstallRecordTests(unittest.TestCase):
                 install_id="gen-1",
                 generated_at=TIMESTAMP,
             )
-            snapshot_path = platform_config.write_snapshot(snapshot, root / "state" / "snapshots")
+            owner = contract_owner(root)
+            snapshot_path = platform_config.write_snapshot(snapshot, root / "state" / "snapshots", owner)
             make_release(root)
             make_endpoint_identity(root)
             dag = make_dag(root)
@@ -576,7 +596,7 @@ class InstallRecordTests(unittest.TestCase):
                 services=list(SERVICES),
                 dag_file=dag,
             )
-            install_record.write_install_record(record, root / "state")
+            install_record.write_install_record(record, root / "state", owner)
             verified = install_record.verify_active_generation(config_path, root / "state")
             self.assertEqual(verified["install_id"], "gen-1")
 
