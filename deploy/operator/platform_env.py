@@ -21,8 +21,10 @@ the lifecycle, never an external interface.
 
 Every emit runs the canonical IF-16 contract validation from the contract closure carried
 inside the digest-bound release wheel and refuses an invalid or tampered snapshot before the
-first write - the bootstrap enforces the same rules as the installed pipeline, with no local
-mirror and no venv/service/checkout dependency.
+first write.  The validator executes in an isolated ``-I -S -B`` child process with a cleared
+environment, so ambient site hooks, sys.path shadowing or a cached import in the caller can
+never substitute the validators; there is no local mirror and no venv/service/checkout
+dependency.
 
 Exit codes: 0 success; 1 error (message on stderr); 2 usage error.
 """
@@ -30,8 +32,14 @@ Exit codes: 0 success; 1 error (message on stderr); 2 usage error.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
+import os
+import shutil
+import subprocess
 import sys
+import tempfile
+import zipfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -64,19 +72,40 @@ def require(condition: bool, message: str) -> None:
         die(message)
 
 
-def load_contract_closure(wheel: Path):
-    """Import the canonical contract validators from the release wheel itself.
+#: The validator script executed by the isolated child interpreter.  It holds no rules of its
+#: own: it imports the same-source canonical ``interface_records`` from the extracted closure
+#: directory and runs the frozen validator over the snapshot's exact bytes arriving on stdin.
+#: It reports a machine-readable verdict on stdout plus an exit code - 0 accept, 2 reject;
+#: anything else is an infrastructure failure and fails the gate closed.
+ISOLATED_VALIDATION = """\
+import json
+import pathlib
+import sys
 
-    Bootstrap runs before any venv, service or checkout exists, so the same-source minimal
-    closure is extracted from the digest-bound release artifact into a private directory
-    and imported there with the plain interpreter.  A wheel missing any closure member is
-    refused - the gate never falls back to weaker local checks.
+(closure,) = sys.argv[1:]
+sys.path.insert(0, closure)
+from description_pipeline import interface_records
+
+source = pathlib.Path(interface_records.__file__).resolve()
+if not source.is_relative_to(pathlib.Path(closure).resolve()):
+    print(f"the contract closure identity check failed: {source}", file=sys.stderr)
+    sys.exit(1)
+try:
+    interface_records.validate_config_snapshot(json.loads(sys.stdin.buffer.read()))
+except interface_records.InterfaceRecordError as error:
+    print(json.dumps({"verdict": "reject", "error": str(error)}))
+    sys.exit(2)
+print(json.dumps({"verdict": "accept"}))
+"""
+
+
+def extract_contract_closure(wheel: Path) -> Path:
+    """Extract the bound wheel's minimal contract closure into a private directory.
+
+    The directory lives under the system temporary root (never inside the deployment tree)
+    and is removed at process exit.  A wheel missing any closure member is refused - the
+    gate never falls back to weaker local checks.
     """
-    import atexit  # noqa: PLC0415
-    import shutil  # noqa: PLC0415
-    import tempfile  # noqa: PLC0415
-    import zipfile  # noqa: PLC0415
-
     directory = Path(tempfile.mkdtemp(prefix="description-contract-"))
     atexit.register(shutil.rmtree, directory, ignore_errors=True)
     package = directory / "description_pipeline"
@@ -87,10 +116,43 @@ def load_contract_closure(wheel: Path):
             name = f"description_pipeline/{member}"
             require(name in names, f"the release artifact {wheel.name} misses the contract closure member {name}")
             (package / member).write_bytes(archive.read(name))
-    sys.path.insert(0, str(directory))
-    from description_pipeline import interface_records  # noqa: PLC0415  (from the extracted closure)
+    return directory
 
-    return interface_records
+
+def validate_snapshot_via_closure(wheel: Path, snapshot_bytes: bytes) -> None:
+    """Run the canonical snapshot validation in a true ``-I -S`` child process.
+
+    The child starts with a cleared environment and no site initialization, and imports the
+    validators only from the closure extracted out of the digest-bound wheel: the caller's
+    sys.modules, sys.path and ambient site hooks cannot shadow them.  It receives the
+    snapshot's exact bytes on stdin - nothing is re-serialized.  An un-runnable child, a
+    non-zero exit without a machine-readable verdict or a missing verdict refuses the gate
+    (fail closed).
+    """
+    directory = extract_contract_closure(wheel)
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-I", "-S", "-B", "-c", ISOLATED_VALIDATION, str(directory)],
+            input=snapshot_bytes,
+            capture_output=True,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        die(f"the isolated contract validation could not run: {error}")
+    verdict = None
+    if completed.returncode in (0, 2):
+        try:
+            verdict = json.loads(completed.stdout.decode("utf-8").strip().splitlines()[-1])
+        except (IndexError, ValueError):
+            verdict = None
+    if completed.returncode == 0 and isinstance(verdict, dict) and verdict.get("verdict") == "accept":
+        return
+    if completed.returncode == 2 and isinstance(verdict, dict) and verdict.get("verdict") == "reject":
+        die(f"snapshot invalid: {verdict.get('error') or 'config_snapshot_invalid'}")
+    stderr = completed.stderr.decode("utf-8", "replace").strip()
+    tail = stderr.splitlines()[-1] if stderr else f"exit code {completed.returncode}"
+    die(f"the isolated contract validation failed ({completed.returncode}): {tail}")
 
 
 def _text(value, where: str) -> str:
@@ -117,29 +179,35 @@ def _origin_parts(origin: str, where: str) -> tuple[str, int]:
 
 
 def derive(
-    snapshot: dict,
+    snapshot_bytes: bytes,
     *,
     install_id: str,
     tree_root: Path,
     release: dict,
     wheel: Path | None = None,
 ) -> dict:
-    """Return ``{env, env_path, derived_dir, wheel}`` for one install generation."""
+    """Return ``{env, env_path, derived_dir, wheel}`` for one install generation.
 
+    ``snapshot_bytes`` are the exact bytes of the config snapshot document - the same bytes
+    the isolated validator consumes, so nothing is re-serialized between the parse here and
+    the canonical gate.
+    """
+
+    try:
+        snapshot = json.loads(snapshot_bytes)
+    except ValueError as error:
+        die(f"snapshot is not a valid JSON document: {error}")
     require(bool(install_id) and all(character not in install_id for character in "\n\r/"), "install_id is malformed")
     require(
         isinstance(release, dict) and "artifacts" in release,
         "the release identity is required to bind the consumed wheel",
     )
     wheel_path = wheel_binding(release, wheel=wheel, tree_root=tree_root)
-    # The canonical IF-16 validation runs before the emit's first write.  The closure travels
-    # inside the digest-bound release wheel, so the bootstrap enforces exactly the rules of the
-    # installed pipeline - no local mirror, no venv, no checkout dependency.
-    interface_records = load_contract_closure(wheel_path)
-    try:
-        interface_records.validate_config_snapshot(snapshot)
-    except interface_records.InterfaceRecordError as error:
-        die(f"snapshot invalid: {error}")
+    # The canonical IF-16 validation runs before the emit's first write, enforced by a true
+    # -I -S -B child process over the closure extracted from the digest-bound wheel: the
+    # caller's environment, sys.path and sys.modules cannot substitute the validators, and an
+    # un-runnable or unverifiable child fails the gate closed.
+    validate_snapshot_via_closure(wheel_path, snapshot_bytes)
     declared = snapshot["install_id"]
     require(
         declared == install_id,
@@ -247,9 +315,9 @@ def main(argv: list[str] | None = None) -> int:
 
     require(args.snapshot.is_file(), f"snapshot not found: {args.snapshot}")
     try:
-        snapshot = json.loads(args.snapshot.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as error:
-        die(f"cannot parse snapshot {args.snapshot}: {error}")
+        snapshot = args.snapshot.read_bytes()
+    except OSError as error:
+        die(f"cannot read snapshot {args.snapshot}: {error}")
     require(args.release_file.is_file(), f"release file not found: {args.release_file}")
     try:
         release = release_identity(json.loads(args.release_file.read_text(encoding="utf-8")))

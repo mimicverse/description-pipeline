@@ -114,11 +114,32 @@ class PlatformEnvTests(unittest.TestCase):
 
     def derive(self, snapshot, *, install_id, tree_root=None, wheel=None):
         return platform_env.derive(
-            snapshot,
+            json.dumps(snapshot).encode("utf-8"),
             install_id=install_id,
             tree_root=tree_root or self.tree,
             release=self.release,
             wheel=wheel,
+        )
+
+    def _emit(self, snapshot: Path, *, env: dict | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [
+                sys.executable,
+                str(OPERATOR / "platform_env.py"),
+                "emit",
+                "--snapshot",
+                str(snapshot),
+                "--install-id",
+                "gen-1",
+                "--tree",
+                str(self.tree),
+                "--release-file",
+                str(self.root / "release.json"),
+            ],
+            capture_output=True,
+            text=True,
+            cwd="/tmp",
+            env=env if env is not None else {"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
         )
 
     def tearDown(self) -> None:
@@ -302,6 +323,11 @@ class PlatformEnvTests(unittest.TestCase):
                     self.derive(snapshot, install_id=install_id, tree_root=self.tree)
                 self.assertEqual(tree_digest(state), before, "a refused snapshot must not write state")
                 self.assertFalse((state / "derived").exists(), "no derived files may be written")
+        before = tree_digest(state)
+        with self.assertRaises(SystemExit):
+            platform_env.derive(b"{not json", install_id="gen-1", tree_root=self.tree, release=self.release)
+        self.assertEqual(tree_digest(state), before, "an unparseable snapshot must not write state")
+        self.assertFalse((state / "derived").exists())
 
     def test_a_valid_derivation_shows_detectable_writes(self):
         state = self.root / "state"
@@ -334,7 +360,7 @@ class PlatformEnvTests(unittest.TestCase):
         self.assertEqual(tree_digest(state), before, "a wheel without the closure must not write state")
         self.assertFalse((state / "derived").exists())
 
-    def test_contract_closure_loads_in_an_isolated_interpreter(self):
+    def test_contract_closure_extracts_and_ignores_pyyaml_under_isolation(self):
         script = f"""
 import pathlib
 import sys
@@ -342,8 +368,11 @@ import sys
 sys.path.insert(0, {str(OPERATOR)!r})
 import platform_env
 
-records = platform_env.load_contract_closure(pathlib.Path(sys.argv[1]))
-print(records.CONFIG_SNAPSHOT_SCHEMA)
+directory = platform_env.extract_contract_closure(pathlib.Path(sys.argv[1]))
+sys.path.insert(0, str(directory))
+from description_pipeline import interface_records
+
+print(interface_records.CONFIG_SNAPSHOT_SCHEMA)
 print("yaml" in sys.modules)
 from description_pipeline import io
 
@@ -368,6 +397,79 @@ except io.PipelineError as error:
             "the YAML parser (PyYAML) is required to read this input",
             yaml_required,
             "the YAML read path still requires PyYAML, reported as a PipelineError",
+        )
+
+    def test_emit_ignores_ambient_validator_forks_before_any_write(self):
+        def ambient_home(name: str, validator: str) -> dict:
+            home = self.root / name
+            package = home / "description_pipeline"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            (package / "interface_records.py").write_text(validator, encoding="utf-8")
+            (home / "sitecustomize.py").write_text(
+                "import description_pipeline.interface_records\n", encoding="utf-8"
+            )
+            return dict(os.environ, PYTHONPATH=str(home))
+
+        weak = ambient_home(
+            "ambient-weak",
+            "class InterfaceRecordError(ValueError):\n    pass\n\n\ndef validate_config_snapshot(snapshot):\n"
+            "    return None\n",
+        )
+        strict = ambient_home(
+            "ambient-strict",
+            "class InterfaceRecordError(ValueError):\n    pass\n\n\ndef validate_config_snapshot(snapshot):\n"
+            "    raise InterfaceRecordError('the ambient fork must not decide')\n",
+        )
+        probe = subprocess.run(
+            [sys.executable, "-c", "import description_pipeline.interface_records as module; print(module.__file__)"],
+            capture_output=True,
+            text=True,
+            cwd=str(ROOT),
+            env=weak,
+        )
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        self.assertIn("ambient-weak", probe.stdout, "the ambient hook must be able to shadow a plain interpreter")
+
+        state = self.root / "state"
+        relaxed_snapshot = json.loads(json.dumps(self.snapshot))
+        relaxed_snapshot["review_unknown"] = 1
+        unknown = self.root / "ambient-unknown.json"
+        unknown.write_text(json.dumps(relaxed_snapshot), encoding="utf-8")
+        before = tree_digest(state)
+        relaxed = self._emit(unknown, env=weak)
+        self.assertNotEqual(relaxed.returncode, 0, relaxed.stdout + relaxed.stderr)
+        self.assertEqual(tree_digest(state), before, "an ambient fork must not let an invalid snapshot write state")
+        self.assertFalse((state / "derived").exists())
+
+        before = tree_digest(state)
+        tightened = self._emit(self.snapshot_path, env=strict)
+        self.assertEqual(tightened.returncode, 0, tightened.stdout + tightened.stderr)
+        written = {path.relative_to(state).as_posix() for path in state.rglob("*") if path.is_file()}
+        self.assertTrue(
+            {
+                "derived/gen-1/operator.env",
+                "derived/gen-1/repositories.json",
+                "derived/gen-1/targets.json",
+                "derived/gen-1/discovery.json",
+            }
+            <= written
+        )
+        self.assertNotEqual(tree_digest(state), before)
+
+    def test_emit_runs_outside_the_checkout_with_a_scrubbed_environment(self):
+        state = self.root / "state"
+        completed = self._emit(self.snapshot_path)
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        written = {path.relative_to(state).as_posix() for path in state.rglob("*") if path.is_file()}
+        self.assertTrue(
+            {
+                "derived/gen-1/operator.env",
+                "derived/gen-1/repositories.json",
+                "derived/gen-1/targets.json",
+                "derived/gen-1/discovery.json",
+            }
+            <= written
         )
 
 
