@@ -11,6 +11,22 @@ Only three facts are taken from the package as *claims*: ``robot.yaml``, a suppl
 ``cad-revision.json`` seal and the discovery payload itself.  The payload is
 bound by digest to the package's provenance block; every derived value is
 recomputed here before it is accepted.
+
+Two verification regimes are supported by design, selected by the same shared
+predicate as the producer (``sources/solidworks/discovery.py`` ``exporter_mode``):
+an exporter-declaration capture keeps the declaration suite, while a capture whose
+exporter state is a proven ``absent`` runs the mate-inference suite.  Gate ownership
+(VER-01):
+  * both regimes: ``discovery.binding``, ``suppression_state``, ``selection``,
+    ``files``, ``imported_sources``, ``identity``, ``revision``, ``budgets``,
+    ``masses``;
+  * mate-inference only: ``graph``, ``frame_attachment``, ``bodies``, ``names``,
+    ``joints``, ``tree``, ``frames``;
+  * exporter-declaration only: ``discovery.declarations``
+    (``native_declarations.py``, ``v14_declarations.py``);
+  * conditional: budgets drop when no evidence is supplied, the revision
+    not-sealed note stays a nonblocking diagnostic, and a binding failure stubs
+    its dependents as ``not_run``.
 """
 
 from __future__ import annotations
@@ -24,9 +40,10 @@ from pathlib import Path, PurePosixPath
 
 import yaml
 
+from ..schemas import CAD_REVISION_SCHEMA, INPUT_SCHEMA
+
 VERIFICATION_SCHEMA = "solidworks-to-urdf.native-discovery-verification/v1"
 DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v1"
-INPUT_SCHEMA = "solidworks-to-urdf.input/v1"
 ROBOT_FILE = "robot.yaml"
 REVISION_FILE = "cad-revision.json"
 DISCOVERY_FILE = "discovery/native-discovery.json"
@@ -2052,7 +2069,7 @@ def verify_discovery(package: Path) -> dict:
         _require(
             isinstance(revision, dict)
             and not set(revision) - fields
-            and revision.get("schema_version") == "solidworks-to-urdf.cad-revision/v1",
+            and revision.get("schema_version") == CAD_REVISION_SCHEMA,
             "discovery.revision",
             "the supplied revision manifest is malformed",
         )

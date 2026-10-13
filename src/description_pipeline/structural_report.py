@@ -11,6 +11,7 @@ import re
 from pathlib import Path
 
 from .io import PipelineError, file_digest, read_data, write_json
+from .schemas import EFFECTIVE_INSTANCES_SCHEMA
 
 REPORT_SCHEMA = "solidworks-to-urdf.structural-report/v1"
 MARKDOWN_PATH = "reports/structural-team.md"
@@ -168,7 +169,7 @@ def _canonical_material_warnings(value) -> list | None:
 
 #: The single canonical effective-instance record (producer: the native freeze): written for
 #: every capture under ``evidence/raw/effective_instances.json``, bound by the manifest.
-_EFFECTIVE_SCHEMA = "solidworks-to-urdf.effective-instances/v1"
+_EFFECTIVE_SCHEMA = EFFECTIVE_INSTANCES_SCHEMA
 _EFFECTIVE_TOP_KEYS = ("schema_version", "assembly", "configuration", "readings", "warnings")
 _EFFECTIVE_CODES = (
     "cad_instance_override_effective",

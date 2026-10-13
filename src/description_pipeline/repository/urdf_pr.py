@@ -25,7 +25,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from ..delivery import subject_digest
+from ..delivery import MASS_CLOSURE_REPORT, SUBJECT_FILES, subject_digest
 from ..io import PipelineError, acquire_process_lock, confined, file_digest, read_data
 from ..sources.solidworks import revision as cad_revision
 from ..stages import record_check
@@ -47,13 +47,14 @@ GIT_ATTRIBUTES = (
 #: ``mass-closure.json`` is bound by ``delivery.subject_inventory`` whenever it
 #: exists, so it must travel too; dropping it here changed the staged subject
 #: and failed publish reverification (native19, 1.3.12).
+#: Reports copied into a publication branch.  Subject-bound report files derive
+#: from ``delivery`` so the two lists cannot drift (VER-11, native19 incident).
 REPORTS_FILES = (
-    "input.json",
-    "tool.json",
+    *(Path(name).name for name in SUBJECT_FILES if name.startswith("reports/")),
     "quality.json",
     "native-tool.json",
     "native-stages.json",
-    "mass-closure.json",
+    Path(MASS_CLOSURE_REPORT).name,
     "structural-team.md",
     "structural-team.json",
 )

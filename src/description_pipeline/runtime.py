@@ -11,6 +11,7 @@ from pathlib import Path
 from . import __version__
 from .delivery import PIPELINE_ID
 from .io import PipelineError, digest, file_digest, read_data
+from .schemas import TOOL_SCHEMA
 
 RUNTIME_PACKAGES = ("numpy", "PyYAML", "jsonschema", "packaging", "python-multipart")
 RUNTIME_VERSIONS = {
@@ -75,7 +76,7 @@ def tool_record(role: str | None = None) -> dict:
     ):
         raise PipelineError("Installed release files differ from the embedded source identity; reinstall the release")
     return {
-        "schema_version": "solidworks-to-urdf.tool/v1",
+        "schema_version": TOOL_SCHEMA,
         "pipeline_id": PIPELINE_ID,
         "version": __version__,
         "source_sha256": source_hash,

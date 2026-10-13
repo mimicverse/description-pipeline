@@ -8,8 +8,8 @@ import re
 from pathlib import Path
 
 from ...io import PipelineError, digest, inventory, read_data
+from ...schemas import CAD_REVISION_SCHEMA as SCHEMA
 
-SCHEMA = "solidworks-to-urdf.cad-revision/v1"
 FILENAME = "cad-revision.json"
 NATIVE_SUFFIXES = {".sldasm", ".sldprt"}
 _ID = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")

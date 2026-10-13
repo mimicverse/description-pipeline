@@ -15,6 +15,7 @@ from xml.etree import ElementTree as ET
 import numpy as np
 
 from ..io import PipelineError, confined, read_data
+from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, LINK_GROUP_MASS_SCHEMA, MASS_CLOSURE_REPORT_SCHEMA
 from ..sources.solidworks import verify as oracle
 
 MASS_RTOL = 1e-6
@@ -36,7 +37,7 @@ TENSOR_RTOL = 1e-4
 #: assembly->link transform, and the recorded two-read pair must repeat (probe v2
 #: measured bit-identical repeats; the repeat bounds below stand until native12
 #: measures otherwise).
-LINK_DIRECT_SCHEMA = "solidworks-to-urdf.link-group-mass-properties/v1"
+LINK_DIRECT_SCHEMA = LINK_GROUP_MASS_SCHEMA
 LINK_DIRECT_USED_API = "IMassProperty2 (SelectedItems = component set)"
 LINK_DIRECT_SELECTION_RULE = "top_most_providers+uncovered_leaves"
 LINK_DIRECT_MASS_RTOL = 1e-12
@@ -536,7 +537,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
         )
         _require(
             isinstance(record, dict)
-            and record.get("schema_version") == "solidworks-to-urdf.effective-instances/v1",
+            and record.get("schema_version") == EFFECTIVE_INSTANCES_SCHEMA,
             "Effective instance schema changed",
         )
         _require(
@@ -997,7 +998,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
             report = read_data(report_path)
             _require(
                 isinstance(report, dict)
-                and report.get("schema_version") == "solidworks-to-urdf.mass-closure-report/v1",
+                and report.get("schema_version") == MASS_CLOSURE_REPORT_SCHEMA,
                 "Mass closure report schema changed",
             )
             _require(

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from pathlib import PureWindowsPath
 
-from ..stages import stage_view
+from ..stages import FIXED_REQUIRED_CHECKS, stage_view
 
 REPORT_SCHEMA = "solidworks-to-urdf.report/v1"
 
@@ -138,6 +138,7 @@ _INDEPENDENT_LABELS_ZH = {
     "urdf.topology": "URDF 拓扑",
     "geometry.coverage": "几何网格覆盖",
     "geometry.assets": "几何网格资产",
+    "geometry.native_tessellation": "几何原生三角剖分",
     "geometry.expected_extent": "外形尺寸期望范围",
     "physics.expected_mass": "质量期望范围",
     "consumer.urdf": "消费端 URDF 可加载性",
@@ -148,6 +149,10 @@ _INDEPENDENT_LABELS_ZH = {
     "physics.raw_inputs": "物理原始输入",
     "physics.reading": "物理读数",
 }
+
+#: VER-02 guard: the label table must cover the verifier's fixed inventory; the
+#: regression suite asserts this stays empty.
+_UNLABELLED_REQUIRED_CHECKS = tuple(sorted(FIXED_REQUIRED_CHECKS - set(_INDEPENDENT_LABELS_ZH)))
 
 _INDEPENDENT_FAMILIES = (
     ("inertia.", "惯量：{name}"),

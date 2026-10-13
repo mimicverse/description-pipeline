@@ -16,11 +16,11 @@ from collections.abc import Iterable, Sequence
 
 from .errors import ConfigError
 from .jsonio import read_json
+from ...schemas import LINK_GROUP_MASS_SCHEMA as LINK_GROUP_SCHEMA
 
 SCENE_SCHEMA = "solidworks-to-urdf.scene/v1"
 #: Sealed derivations may still carry the retired id; reads accept both (XC-01).
 LEGACY_SCENE_SCHEMAS = ("description.scene/v1",)
-LINK_GROUP_SCHEMA = "solidworks-to-urdf.link-group-mass-properties/v1"
 
 
 def scene_schema_supported(value: object) -> bool:

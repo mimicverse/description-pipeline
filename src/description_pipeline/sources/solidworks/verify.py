@@ -19,6 +19,7 @@ import numpy as np
 
 from .jsonio import read_json
 from ...io import PipelineError, confined, file_digest
+from ...schemas import EFFECTIVE_INSTANCES_SCHEMA as EFFECTIVE_SCHEMA
 
 INERTIA_ORDER = ("ixx", "ixy", "ixz", "iyy", "iyz", "izz")
 # Same API, selection scopes measured on the analytic native fixture
@@ -30,7 +31,6 @@ _SCOPE_CONVENTIONS = {
     "assembly_component_group": "solidworks_standard",
     "assembly_document": "solidworks_standard",
 }
-EFFECTIVE_SCHEMA = "solidworks-to-urdf.effective-instances/v1"
 EFFECTIVE_CODE_SHEET_ONLY = "cad_surface_only_effective_instance"
 EFFECTIVE_CODE_INSTANCE = "cad_instance_override_effective"
 MASS_ATOL = 1e-12
