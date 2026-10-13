@@ -16,7 +16,7 @@ from pathlib import Path
 import yaml
 
 from description_pipeline.sources.solidworks.discovery import DiscoverySettings, prepare_native_package
-from description_pipeline.verification.native_discovery import _Failure, rebuild_rigid_bodies
+from description_pipeline.verification.native_discovery import _Failure, rebuild_joint_facts, rebuild_rigid_bodies
 
 from . import test_solidworks_discovery_oracle as oracle_fixtures
 
@@ -25,14 +25,16 @@ class RebuildCarrierTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="rebuild-carrier-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.serial = 0
 
-    def _prepared(self, record: dict) -> tuple[dict, dict]:
-        source = self.tmp / "native"
+    def _prepared(self, record: dict) -> tuple[dict, dict, Path]:
+        self.serial += 1
+        source = self.tmp / f"native{self.serial}"
         for name in ("cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT"):
             path = source / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(f"placeholder {name}\n".encode())
-        records = self.tmp / "records"
+        records = self.tmp / f"records{self.serial}"
         (records / "joints").mkdir(parents=True, exist_ok=True)
         (records / "joints" / "arm.json").write_text(
             json.dumps({"limits": {"lower": -1.5, "upper": 1.5}, "drive": {"effort": 6.0, "velocity": 2.0}}),
@@ -42,7 +44,7 @@ class RebuildCarrierTests(unittest.TestCase):
             json.dumps({"robot": {"expected_mass_kg": [0.28, 0.32], "expected_extent_m": [0.35, 0.5]}}),
             encoding="utf-8",
         )
-        output = self.tmp / "prepared"
+        output = self.tmp / f"prepared{self.serial}"
         result = prepare_native_package(
             source,
             output,
@@ -53,7 +55,7 @@ class RebuildCarrierTests(unittest.TestCase):
         self.assertTrue(result.passed, result.findings)
         payload = json.loads((output / "discovery/native-discovery.json").read_text(encoding="utf-8"))
         robot = yaml.safe_load((output / "robot.yaml").read_text(encoding="utf-8"))
-        return payload["raw"], robot["source"]
+        return payload, robot["source"], output
 
     @staticmethod
     def _normalized(bodies: list[dict]) -> list[dict]:
@@ -71,15 +73,29 @@ class RebuildCarrierTests(unittest.TestCase):
         )
 
     def test_oracle_fixture_rebuild_matches_the_saved_carrier(self) -> None:
-        raw, source = self._prepared(oracle_fixtures.native_record())
-        self.assertEqual(self._normalized(source["bodies"]), self._normalized(rebuild_rigid_bodies(raw)))
+        payload, source, _output = self._prepared(oracle_fixtures.native_record())
+        self.assertEqual(self._normalized(source["bodies"]), self._normalized(rebuild_rigid_bodies(payload["raw"])))
 
     def test_lock_fixture_rebuild_matches_the_saved_carrier(self) -> None:
-        raw, source = self._prepared(oracle_fixtures.OracleSemanticsTests._lock_record(with_point=True))
-        self.assertEqual(self._normalized(source["bodies"]), self._normalized(rebuild_rigid_bodies(raw)))
+        payload, source, _output = self._prepared(oracle_fixtures.OracleSemanticsTests._lock_record(with_point=True))
+        self.assertEqual(self._normalized(source["bodies"]), self._normalized(rebuild_rigid_bodies(payload["raw"])))
+
+    def test_joint_rebuild_matches_the_saved_carrier(self) -> None:
+        cases = (
+            ("oracle", oracle_fixtures.native_record()),
+            ("lock", oracle_fixtures.OracleSemanticsTests._lock_record(with_point=True)),
+        )
+        for label, record in cases:
+            with self.subTest(case=label):
+                payload, source, output = self._prepared(record)
+                rebuilt = rebuild_joint_facts(payload, output)
+                expected = sorted(source["joints"], key=lambda joint: joint["name"])
+                actual = sorted(rebuilt, key=lambda joint: joint["name"])
+                self.assertEqual(expected, actual)
 
     def test_missing_or_ambiguous_frame_datum_fails_closed(self) -> None:
-        raw, _source = self._prepared(oracle_fixtures.native_record())
+        payload, _source, _output = self._prepared(oracle_fixtures.native_record())
+        raw = payload["raw"]
         missing = copy.deepcopy(raw)
         missing["datums"] = [datum for datum in missing["datums"] if datum.get("name") != "CS_arm_link"]
         with self.assertRaises(_Failure):

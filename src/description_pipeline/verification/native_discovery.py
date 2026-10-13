@@ -1652,6 +1652,330 @@ def rebuild_rigid_bodies(record: dict) -> list[dict]:
     return bodies
 
 
+def rebuild_joint_facts(record: dict, package: Path) -> list[dict]:
+    """Rebuild the movable-joint carrier from the raw capture alone (IF-17, in memory).
+
+    ``record`` is the discovery payload (its ``raw`` block, ``frozen_names``,
+    ``namespace`` and controlled-record entries); ``package`` resolves the
+    embedded record bytes.  The reconstruction mirrors the documented rules on
+    the verification side: the raw mate rank/twist proves the freedom and type,
+    the recorded shaft and axis sign give the native direction, the child body
+    frame gives the local axis, and the controlled records give the position
+    and drive ranges.  Every missing or conflicting witness raises a classified
+    failure - the saved derived definition is never read.
+    """
+
+    payload = record if isinstance(record.get("raw"), dict) else {"raw": record}
+    raw = payload["raw"]
+    namespace = str(payload.get("namespace") or "dp")
+    frozen = payload.get("frozen_names") or {}
+    bodies = rebuild_rigid_bodies(raw)
+    by_name = {str(body["name"]): body for body in bodies}
+    _require("base_link" in by_name, "discovery.joint_rebuild", "no base_link body in the rebuilt carrier")
+    by_component = {
+        str(component): str(body["name"]) for body in bodies for component in body["components"]
+    }
+    attached = _frame_attached_members(raw)
+    raw_mates = raw.get("mates") or []
+    _members, pairs = _independent_clusters(raw)
+    facts: list[dict] = []
+    for key, group in sorted(pairs.items()):
+        left, right = sorted(key)
+        if group.get("unresolved") or group["rank"] == 6:
+            continue
+        left_body, right_body = by_component.get(left), by_component.get(right)
+        _require(
+            left_body is not None and right_body is not None and left_body != right_body,
+            "discovery.joint_rebuild",
+            "a movable mate pair must connect two distinct rigid bodies",
+            {"components": [left, right]},
+        )
+        mates = [raw_mates[index] for index in group["mates"] if 0 <= index < len(raw_mates)]
+        _require(bool(mates), "discovery.joint_rebuild", "a movable pair carries no raw mates", {"pair": sorted(key)})
+        properties, conflicts = _joint_properties(raw, mates)
+        _require(
+            not conflicts,
+            "discovery.joint_rebuild",
+            "two native sources declare the same joint scalar differently",
+            {"conflicts": conflicts},
+        )
+        nullity = 6 - group["rank"]
+        _require(
+            nullity == 1,
+            "discovery.joint_rebuild",
+            "the mate pair does not leave exactly one motion",
+            {"rank": group["rank"], "components": [left, right]},
+        )
+        twist = _null_space(group["rows"], 6)[0]
+        velocity, omega = twist[:3], twist[3:]
+        w = math.sqrt(_dot(omega, omega))
+        v = math.sqrt(_dot(velocity, velocity))
+        hint = str(properties.get(f"{namespace}.joint.type") or "").strip().lower()
+        if w <= 1e-9:
+            joint_type = "prismatic"
+            _require(
+                v > 1e-9,
+                "discovery.joint_rebuild",
+                "the reconstructed motion has no axis",
+                {"pair": [left, right]},
+            )
+            direction = [value / v for value in velocity]
+            axis_point = None
+        else:
+            _require(
+                not (v > 1e-9 and abs(_dot(velocity, omega)) > 1e-6 * max(v, w) ** 2),
+                "discovery.joint_rebuild",
+                "the reconstructed motion is a screw, not a supported joint",
+                {"pair": [left, right]},
+            )
+            joint_type = "continuous" if hint == "continuous" else "revolute"
+            direction = [value / w for value in omega]
+            axis_point = [value / (w * w) for value in _cross(omega, velocity)]
+        _require(
+            hint in {"", joint_type},
+            "discovery.joint_rebuild",
+            "the joint type annotation contradicts the reconstructed freedom",
+            {"annotation": hint, "derived": joint_type},
+        )
+        shaft = group["axis"]
+        _require(
+            shaft is not None,
+            "discovery.joint_rebuild",
+            "no cylindrical mate entity carries the joint shaft",
+            {"pair": [left, right]},
+        )
+        _require(
+            abs(abs(_dot(shaft, direction)) - 1.0) <= 1e-4,
+            "discovery.joint_rebuild",
+            "the recorded shaft does not follow the reconstructed freedom",
+            {"pair": [left, right]},
+        )
+        if axis_point is not None and group.get("point") is not None:
+            _require(
+                _offset(group["point"], axis_point, direction) <= AXIS_OFFSET_TOL_M,
+                "discovery.joint_rebuild",
+                "the recorded shaft misses the reconstructed axis",
+                {"pair": [left, right]},
+            )
+        sign_value = properties.get(f"{namespace}.joint.axis_sign")
+        sign = None
+        if type(sign_value) is int and sign_value in (1, -1):
+            sign = sign_value
+        elif type(sign_value) is str and sign_value in ("+1", "1", "-1"):
+            sign = 1 if sign_value in ("+1", "1") else -1
+        _require(
+            sign is not None,
+            "discovery.joint_rebuild",
+            "dp.joint.axis_sign must be exactly +1 or -1",
+            {"pair": [left, right], "value": sign_value},
+        )
+        native_direction = [float(value) for value in shaft]
+        if sign == -1:
+            native_direction = [-value for value in native_direction]
+        cylinder = next(
+            (
+                item
+                for mate in mates
+                for item in _entities(mate)
+                if isinstance(item.get("cylinder"), dict)
+                and isinstance(item.get("component"), str)
+                and item.get("component")
+                and (
+                    (isinstance(item.get("feature"), str) and item.get("feature"))
+                    or isinstance(item.get("face_index"), int)
+                )
+            ),
+            None,
+        )
+        _require(
+            cylinder is not None,
+            "discovery.joint_rebuild",
+            "the cylindrical mate entity carries no feature name or face index",
+            {"pair": [left, right]},
+        )
+        axis_reference = {"component": str(cylinder["component"]), "body_type": "solid"}
+        if isinstance(cylinder.get("feature"), str) and cylinder.get("feature"):
+            axis_reference["feature_name"] = str(cylinder["feature"])
+        else:
+            axis_reference["face_index"] = int(cylinder["face_index"])
+        heads: list[str] = []
+        mate_names = [str(mate.get("name") or "") for mate in mates]
+        for mate_name in mate_names:
+            head, separator, role = mate_name.partition("__")
+            if not separator or not role or _SNAKE.fullmatch(head) is None:
+                heads = []
+                break
+            heads.append(head)
+        _require(
+            bool(heads) and len(set(heads)) == 1,
+            "discovery.joint_rebuild",
+            "mate names must share one snake_case <joint>__<role> group name",
+            {"mates": mate_names},
+        )
+        name = heads[0]
+        identity = mate_names[0]
+        if identity in frozen:
+            name = str(frozen[identity])
+        _require(_SNAKE.fullmatch(name) is not None, "discovery.joint_rebuild", "joint name is not snake_case")
+        limits: dict | None = None
+        limit_evidence = None
+        native_limits = group["limits"]
+        limits_reference = properties.get(f"{namespace}.joint.limits_record")
+        if joint_type == "continuous":
+            _require(
+                not isinstance(native_limits, dict),
+                "discovery.joint_rebuild",
+                "a continuous joint carries native position limits",
+                {"pair": [left, right]},
+            )
+        elif isinstance(native_limits, dict):
+            expected_unit = "m" if joint_type == "prismatic" else "rad"
+            _require(
+                native_limits.get("unit") == expected_unit,
+                "discovery.joint_rebuild",
+                "native limits are not in SI units",
+                {"pair": [left, right], "unit": native_limits.get("unit")},
+            )
+            limits = {"lower": float(native_limits["lower"]), "upper": float(native_limits["upper"])}
+            if isinstance(limits_reference, str) and limits_reference.strip():
+                entry = _find_record_entry(payload, limits_reference)
+                value = _record_value(package, entry["entry"], entry["key"])
+                _require(
+                    _close([limits["lower"], limits["upper"]], [value.get("lower"), value.get("upper")], 1e-12),
+                    "discovery.joint_rebuild",
+                    "native mate limits and the controlled record disagree",
+                    {"pair": [left, right]},
+                )
+                limit_evidence = {
+                    "file": entry["entry"].get("package_file"),
+                    "sha256": entry["entry"].get("sha256"),
+                    "anchor": entry["entry"].get("anchor"),
+                }
+        else:
+            _require(
+                isinstance(limits_reference, str) and limits_reference.strip(),
+                "discovery.joint_rebuild",
+                "the joint has no native or controlled position range",
+                {"pair": [left, right]},
+            )
+            entry = _find_record_entry(payload, limits_reference)
+            value = _record_value(package, entry["entry"], entry["key"])
+            limits = {"lower": float(value["lower"]), "upper": float(value["upper"])}
+            limit_evidence = {
+                "file": entry["entry"].get("package_file"),
+                "sha256": entry["entry"].get("sha256"),
+                "anchor": entry["entry"].get("anchor"),
+            }
+        drive_reference = properties.get(f"{namespace}.joint.drive_record")
+        _require(
+            isinstance(drive_reference, str) and drive_reference.strip(),
+            "discovery.joint_rebuild",
+            "the joint has no controlled drive record",
+            {"pair": [left, right]},
+        )
+        entry = _find_record_entry(payload, drive_reference)
+        drive = _record_value(package, entry["entry"], entry["key"])
+        effort = float(drive["effort"])
+        velocity_limit = float(drive["velocity"])
+        _require(
+            math.isfinite(effort) and math.isfinite(velocity_limit) and effort > 0.0 and velocity_limit > 0.0,
+            "discovery.joint_rebuild",
+            "drive record effort/velocity must be finite and positive",
+            {"pair": [left, right]},
+        )
+        limits = dict(limits or {})
+        limits["effort"] = effort
+        limits["velocity"] = velocity_limit
+        facts.append(
+            {
+                "nodes": (left_body, right_body),
+                "components": [left, right],
+                "native_direction": native_direction,
+                "entry": {
+                    "id": name,
+                    "name": name,
+                    "type": joint_type,
+                    "axis_reference": axis_reference,
+                    "limits": limits,
+                    "limit_evidence": limit_evidence,
+                },
+            }
+        )
+    # Orient away from the base body (breadth-first over the body graph).
+    adjacency: dict[str, list[tuple[str, int]]] = {}
+    for index, fact in enumerate(facts):
+        first, second = fact["nodes"]
+        adjacency.setdefault(first, []).append((second, index))
+        adjacency.setdefault(second, []).append((first, index))
+    order = {"base_link": 0}
+    queue = ["base_link"]
+    consumed: set[int] = set()
+    edges: set[frozenset[str]] = set()
+    for fact in facts:
+        fact["entry"]["parent"] = None
+        fact["entry"]["child"] = None
+        fact["entry"]["axis"] = None
+    while queue:
+        current = queue.pop(0)
+        for neighbour, index in sorted(adjacency.get(current, []), key=lambda item: item[1]):
+            if index in consumed:
+                continue
+            edge = frozenset((current, neighbour))
+            _require(
+                edge not in edges,
+                "discovery.joint_rebuild",
+                "two movable mates connect the same pair of bodies; one reduction is ambiguous",
+                {"components": facts[index]["components"]},
+            )
+            consumed.add(index)
+            edges.add(edge)
+            fact = facts[index]
+            fact["entry"]["parent"] = current
+            fact["entry"]["child"] = neighbour
+            child = by_name[neighbour]
+            datum = _owned_datum(
+                raw,
+                child["frame"]["coordinate_system"],
+                _datum_owners(frozenset(child["components"]), attached),
+            )
+            _require(
+                datum is not None,
+                "discovery.joint_rebuild",
+                "the child body frame names no datum owned uniquely by that body",
+                {"body": neighbour},
+            )
+            frame = _frame(datum.get("array"))
+            _require(frame is not None, "discovery.joint_rebuild", "the child body frame datum is unreadable")
+            local = _local_axis(frame, fact["native_direction"])
+            _require(
+                math.sqrt(_dot(local, local)) > 0.0,
+                "discovery.joint_rebuild",
+                "the child frame collapses the joint axis",
+                {"body": neighbour},
+            )
+            norm = math.sqrt(_dot(local, local))
+            fact["entry"]["axis"] = [value / norm for value in local]
+            if neighbour not in order:
+                order[neighbour] = order[current] + 1
+                queue.append(neighbour)
+    _require(
+        len(consumed) == len(facts),
+        "discovery.joint_rebuild",
+        "the movable mates do not form a tree reachable from base_link",
+        {"joints": len(facts), "reached": len(consumed)},
+    )
+    entries = [fact["entry"] for fact in facts]
+    entries.sort(key=lambda entry: entry["name"])
+    names = [entry["name"] for entry in entries]
+    _require(
+        len(set(names)) == len(names),
+        "discovery.joint_rebuild",
+        "two joints resolve to the same name",
+        {"names": names},
+    )
+    return entries
+
+
 def _frame(values) -> list[list[float]] | None:
     try:
         raw = list(values or ())
