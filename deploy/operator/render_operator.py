@@ -42,6 +42,20 @@ BROAD_ROOTS = {
     Path.home(),
 }
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+#: The single source of deployment port defaults (DEP-01).  The operator env
+#: file may override every value; each rendered file and every downstream
+#: deploy script consumes the values from resolved.env, so no template, unit
+#: or script repeats a literal.  SOLIDWORKS_ENDPOINT_PORT must equal
+#: description_pipeline.ports.SOLIDWORKS_ENDPOINT_PORT
+#: (tests/v1/test_port_defaults.py).
+PORT_DEFAULTS = {
+    "OPERATOR_HTTPS_PORT": 8443,
+    "OPERATOR_UPSTREAM_PORT": 8788,
+    "AIRFLOW_API_PORT": 8791,
+    "TUNNEL_LOOPBACK_PORT": 18765,
+    "POSTGRES_PORT": 5433,
+    "SOLIDWORKS_ENDPOINT_PORT": 8765,
+}
 # Keys that must not appear in the operator env: removed auth modes and credential values that
 # belong in the 0600 secret file. Refusing them keeps a stale/hand-edited file from silently
 # reintroducing a second login or a duplicated credential.
@@ -202,6 +216,7 @@ def ensure_portal_config(state: Path, resolved: dict[str, str]) -> Path:
     rendered = PORTAL_TEMPLATE.read_text(encoding="utf-8")
     for token, value in (
         ("@AIRFLOW_BASE_URL@", resolved["AIRFLOW_BASE_URL"]),
+        ("@TUNNEL_LOOPBACK_PORT@", resolved["TUNNEL_LOOPBACK_PORT"]),
         ("@OPERATOR_UPSTREAM_HOST@", resolved["PORTAL_HOST"]),
         ("@OPERATOR_UPSTREAM_PORT@", resolved["PORTAL_PORT"]),
         ("@ENDPOINT_TOKEN_FILE@", resolved["ENDPOINT_TOKEN_FILE"]),
@@ -260,8 +275,14 @@ def main() -> int:
             ipaddress.ip_address(bind)
         except ValueError:
             die(f"OPERATOR_BIND must be an IP address: {bind!r}")
-    https_port = integer(values, "OPERATOR_HTTPS_PORT", 8443)
-    upstream = require_no_space(values.get("OPERATOR_UPSTREAM", "127.0.0.1:8788"), "OPERATOR_UPSTREAM")
+    https_port = integer(values, "OPERATOR_HTTPS_PORT", PORT_DEFAULTS["OPERATOR_HTTPS_PORT"])
+    upstream = require_no_space(
+        values.get("OPERATOR_UPSTREAM", f"127.0.0.1:{PORT_DEFAULTS['OPERATOR_UPSTREAM_PORT']}"), "OPERATOR_UPSTREAM"
+    )
+    airflow_api_port = integer(values, "AIRFLOW_API_PORT", PORT_DEFAULTS["AIRFLOW_API_PORT"])
+    tunnel_port = integer(values, "TUNNEL_LOOPBACK_PORT", PORT_DEFAULTS["TUNNEL_LOOPBACK_PORT"])
+    postgres_port = integer(values, "POSTGRES_PORT", PORT_DEFAULTS["POSTGRES_PORT"])
+    endpoint_port = integer(values, "SOLIDWORKS_ENDPOINT_PORT", PORT_DEFAULTS["SOLIDWORKS_ENDPOINT_PORT"])
     if ":" not in upstream:
         die("OPERATOR_UPSTREAM must be host:port")
     portal_host, _, portal_port_raw = upstream.rpartition(":")
@@ -406,7 +427,11 @@ def main() -> int:
         OPERATOR_UPSTREAM=upstream,
         PORTAL_HOST=portal_host,
         PORTAL_PORT=str(portal_port),
-        AIRFLOW_BASE_URL="http://127.0.0.1:8791",
+        AIRFLOW_API_PORT=str(airflow_api_port),
+        AIRFLOW_BASE_URL=f"http://127.0.0.1:{airflow_api_port}",
+        TUNNEL_LOOPBACK_PORT=str(tunnel_port),
+        POSTGRES_PORT=str(postgres_port),
+        SOLIDWORKS_ENDPOINT_PORT=str(endpoint_port),
         OPERATOR_URL=f"https://{host}:{https_port}/",
         SOLIDWORKS_HANDOFF_ROOT=str(handoff_root),
         PIPELINE_STORE_ROOT=str(store_root),
@@ -468,6 +493,7 @@ def main() -> int:
         ("@OPERATOR_BIND@", bind),
         ("@OPERATOR_HTTPS_PORT@", str(https_port)),
         ("@OPERATOR_HOST@", host),
+        ("@AIRFLOW_API_PORT@", str(airflow_api_port)),
         ("@OPERATOR_UPSTREAM@", upstream),
         ("@OPERATOR_TLS_CERT@", str(certificate)),
         ("@OPERATOR_TLS_KEY@", str(key)),

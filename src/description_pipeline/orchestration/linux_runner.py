@@ -42,6 +42,9 @@ def _portable_identity_gate(store: LinuxStore, run_id: str) -> dict:
     for key in ("pipeline_id", "version", "source_sha256"):
         if portable.get(key) != native_tool.get(key):
             raise PipelineError(f"The portable runtime differs from the native capture in {key}; refusing to continue")
+    # Source checkouts embed no release on either side and this comparison is
+    # then empty; publication refuses without the embedded identity, so the
+    # degraded pair can never reach a PR (steps.publish_model, ORC-04).
     if portable.get("release") != native_tool.get("release"):
         raise PipelineError("The portable release identity differs from the native capture; refusing to continue")
     packages = {canonicalize_name(str(name)): value for name, value in (runtime.get("packages") or {}).items()}

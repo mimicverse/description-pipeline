@@ -5,6 +5,10 @@
 # preserves the cluster and reapplies its managed configuration.
 set -euo pipefail
 : "${POSTGRES_ROOT:?set POSTGRES_ROOT to the isolated deployment directory}"
+: "${POSTGRES_PORT:?set POSTGRES_PORT to the isolated socket port}"
+case "$POSTGRES_PORT" in
+  *[!0-9]*|"") echo "POSTGRES_PORT must be a TCP port" >&2; exit 1 ;;
+esac
 WORK="$POSTGRES_ROOT"
 export LD_LIBRARY_PATH="$WORK/root/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
 SOCKET="$WORK/socket"
@@ -29,7 +33,7 @@ if [ ! -f "$WORK/data/PG_VERSION" ]; then
     --auth-local=trust --auth-host=reject --encoding=UTF8 >/dev/null
 fi
 
-# Deterministic, managed cluster settings: no TCP listener, private socket, fixed port.
+# Deterministic, managed cluster settings: no TCP listener, private socket, deployment port.
 CONF="$WORK/data/postgresql.conf"
 awk -v s="# >>> description-postgres" -v e="# <<< description-postgres" '
   $0 == s { skip = 1 } $0 == e { skip = 0; next } !skip { print }' "$CONF" > "$CONF.tmp"
@@ -38,7 +42,7 @@ cat >> "$CONF" <<EOF
 # >>> description-postgres
 listen_addresses = ''
 unix_socket_directories = '$SOCKET'
-port = 5433
+port = $POSTGRES_PORT
 # <<< description-postgres
 EOF
 
@@ -58,5 +62,5 @@ chmod 600 "$CONF" "$HBA"
 # Provision only: this script never starts, restarts or stops a server, and it never creates the
 # database. The managed description-postgres unit owns the only long-running server; operatorctl
 # starts that unit, waits for readiness, then creates airflow_meta before Airflow migration.
-echo "AIRFLOW_DB_URL=postgresql+psycopg2://solidworks@/airflow_meta?host=$SOCKET&port=5433"
+echo "AIRFLOW_DB_URL=postgresql+psycopg2://solidworks@/airflow_meta?host=$SOCKET&port=$POSTGRES_PORT"
 echo "POSTGRES_MAJOR=$MAJOR"

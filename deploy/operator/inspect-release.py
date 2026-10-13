@@ -3,7 +3,7 @@
 Environment (defaults encode the supported deployment):
   OPERATOR_ROOT (default /home/andy/operator), OPERATOR_STATE (default $OPERATOR_ROOT/state),
   POSTGRES_ROOT (default $OPERATOR_ROOT/airflow-pg), POSTGRES_MAJOR (default 14),
-  POSTGRES_PORT (default 5433).
+  POSTGRES_PORT (default: the shared deployment default).
 """
 
 from __future__ import annotations
@@ -13,11 +13,13 @@ import os
 import subprocess
 from pathlib import Path
 
+from render_operator import PORT_DEFAULTS
+
 BASE = Path(os.environ.get("OPERATOR_ROOT", "/home/andy/operator"))
 STATE = Path(os.environ.get("OPERATOR_STATE", str(BASE / "state")))
 POSTGRES_ROOT = Path(os.environ.get("POSTGRES_ROOT", str(BASE / "airflow-pg")))
 POSTGRES_MAJOR = os.environ.get("POSTGRES_MAJOR", "14")
-POSTGRES_PORT = os.environ.get("POSTGRES_PORT", "5433")
+POSTGRES_PORT = os.environ.get("POSTGRES_PORT") or str(PORT_DEFAULTS["POSTGRES_PORT"])
 PSQL = POSTGRES_ROOT / "root/usr/lib/postgresql" / POSTGRES_MAJOR / "bin/psql"
 
 config = json.loads((STATE / "portal.json").read_text(encoding="utf-8"))

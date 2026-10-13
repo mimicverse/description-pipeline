@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -323,7 +324,27 @@ def _auth_health(port: int) -> dict:
         return {"status": None, "error": str(error)}
 
 
-def _feishu_env(home: Path) -> dict[str, str]:
+def _deploy_defaults(root: Path) -> dict:
+    """The deployment port defaults live once, in the operator renderer (DEP-01)."""
+
+    spec = importlib.util.spec_from_file_location(
+        "deploy_render_operator", root / "deploy/operator/render_operator.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.PORT_DEFAULTS
+
+
+def _operator_https_port(root: Path) -> int:
+    override = os.environ.get("OPERATOR_HTTPS_PORT", "")
+    if override:
+        if not override.isdigit():
+            raise SystemExit("OPERATOR_HTTPS_PORT must be a TCP port")
+        return int(override)
+    return int(_deploy_defaults(root)["OPERATOR_HTTPS_PORT"])
+
+
+def _feishu_env(home: Path, https_port: int) -> dict[str, str]:
     """One throwaway 0600 enterprise app, so the smoke exercises the real Feishu manager."""
     secret = home / "feishu.json"
     secret.write_text(json.dumps({"app_id": FEISHU_APP_ID, "app_secret": FEISHU_SECRET}), encoding="utf-8")
@@ -331,7 +352,7 @@ def _feishu_env(home: Path) -> dict[str, str]:
     return {
         "FEISHU_APP_SECRET_FILE": str(secret),
         "FEISHU_TENANT_KEYS": FEISHU_TENANT,
-        "FEISHU_REDIRECT_URI": "https://127.0.0.1:8443/auth/feishu/callback",
+        "FEISHU_REDIRECT_URI": f"https://127.0.0.1:{https_port}/auth/feishu/callback",
     }
 
 
@@ -448,7 +469,7 @@ def main() -> int:
         AIRFLOW__CORE__AUTH_MANAGER="description_pipeline.orchestration.feishu_auth.FeishuAuthManager",
         AIRFLOW__CORE__LOAD_EXAMPLES="false",
         AIRFLOW__API_AUTH__JWT_SECRET=JWT_SECRET,
-        **_feishu_env(args.airflow_home),
+        **_feishu_env(args.airflow_home, _operator_https_port(args.root)),
         SOLIDWORKS_SENSOR_MODE="poke",
         SOLIDWORKS_POLL_INTERVAL="1",
         SOLIDWORKS_TIMEOUT="120",
