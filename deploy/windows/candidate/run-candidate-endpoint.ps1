@@ -9,7 +9,9 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$B = "$Root\native-product$Fixture-$Stamp"
+# Operate on exactly the base directory the register action targeted (its -Stage):
+# re-deriving the path here let a non-default -Stamp silently diverge from it.
+$B = $Stage
 $RT = $B + '\runtime\Scripts\python.exe'
 $Prod = 'description-v1-endpoint'
 $Journal = Join-Path $B ('run-journal-' + $Fixture + '.json')

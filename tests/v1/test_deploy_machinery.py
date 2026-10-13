@@ -42,6 +42,15 @@ class DeployMachineryTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8", errors="replace")
             self.assertNotRegex(text, GENERATION, path.name)
 
+    def test_candidate_stage_binding_is_single_sourced(self) -> None:
+        # The register action passes -Stage <base>; the child must operate on exactly that
+        # directory instead of re-deriving it (a non-default -Stamp diverged once and the
+        # first live exercise exited before it could write its journal).
+        register = (CANDIDATE / "register-candidate.ps1").read_text(encoding="utf-8")
+        child = (CANDIDATE / "run-candidate-endpoint.ps1").read_text(encoding="utf-8")
+        self.assertIn('-Stage "', register)
+        self.assertIn("$B = $Stage", child)
+
     def test_endpoint_example_carries_no_secret_material(self) -> None:
         text = (ROOT / "deploy/windows/endpoint.example.json").read_text(encoding="utf-8")
         for marker in ("gho_", "ghp_", "Bearer ", "BEGIN OPENSSH", "app_secret", "password"):
