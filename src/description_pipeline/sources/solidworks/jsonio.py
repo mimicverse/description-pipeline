@@ -27,7 +27,7 @@ _SHARING_ATTEMPTS = 5
 _SHARING_DELAY_SECONDS = 0.05
 
 
-def sha256_file(path: Path, chunk: int = 1 << 20) -> str:
+def sha256_file(path: Path) -> str:
     """The streamed sha256 of one file (``io.file_digest``)."""
 
     return _file_digest(path)

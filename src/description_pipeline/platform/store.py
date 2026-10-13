@@ -16,7 +16,6 @@ closes the connection again; no transaction ever spans an external call.
 
 from __future__ import annotations
 
-import json
 import os
 import uuid
 from collections.abc import Callable, Mapping
@@ -27,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from ..delivery import BUNDLE_SCHEMA, read_delivery_manifest
-from ..io import PipelineError, digest
+from ..io import PipelineError, canonical, digest
 from ..stages import (
     CONFIRMED_STAGE_PASSED,
     CONFIRMED_STAGE_STATES,
@@ -152,16 +151,12 @@ _TERMINAL_KINDS = frozenset({"cancel", "reconcile"})
 
 
 def _json(value: Any) -> str | None:
-    """jsonb parameters travel as canonical JSON text; non-finite numbers are refused.
-
-    The single canonical codec belongs to the shared foundation (R17); until it
-    lands this guard fail-closes instead of emitting NaN/Infinity.
-    """
+    """jsonb parameters travel as the single canonical JSON text (the R17 codec)."""
 
     if value is None:
         return None
     try:
-        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        return canonical(value).decode()
     except ValueError as error:
         raise PlatformStoreError(f"Platform parameters must be finite JSON: {error}") from error
 
