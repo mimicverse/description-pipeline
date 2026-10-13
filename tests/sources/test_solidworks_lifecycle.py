@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import datetime
 import os
+import sys
+import tempfile
 import threading
+import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -483,49 +488,326 @@ class SessionTests(unittest.TestCase):
 
 
 class RemnantSweepTests(unittest.TestCase):
-    """The pre-start sweep kills only same-executable leftovers."""
+    """The pre-start sweep terminates only RECORDED leftovers whose owning
+    process is proven gone; anything unrecorded or unverifiable refuses the
+    launch instead of being killed."""
 
     EXE = "/opt/SLDPRT/SLDWORKS.exe"
+    OTHER = "/opt/other/other.exe"
+    BOOT = 1_700_000_000.0
 
-    def test_same_executable_leftovers_are_terminated_with_one_settle(self):
-        killed = []
-        slept = []
-        table = [(11, self.EXE), (22, "/opt/other/other.exe"), (33, self.EXE)]
-        with patch.object(isolation, "_TRACKED_PIDS", set()):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ledger = Path(self.tmp.name) / "cad-ownership.json"
+
+    def _record(self, pid, *, creation=100, boot=None, owner="earlier-owner", owner_pid=999, owner_creation=555):
+        record = {
+            "pid": pid,
+            "executable": self.EXE,
+            "creation_time": creation,
+            "boot_epoch": self.BOOT if boot is None else boot,
+            "owner": owner,
+            "owner_pid": owner_pid,
+            "recorded_at": 0.0,
+        }
+        if owner_creation is not None:
+            record["owner_creation_time"] = owner_creation
+        isolation.OwnershipStore(self.ledger).add(record)
+
+    def _sweep(self, table, *, tracked=(), exclude=(), creation=None, boot=None, killed=None, slept=None):
+        killed = [] if killed is None else killed
+        slept = [] if slept is None else slept
+
+        def terminate(pid, _creation_time=None):
+            killed.append(pid)
+            return True
+
+        with patch.object(isolation, "_TRACKED_PIDS", set(tracked)):
             result = terminate_remnant_processes(
                 self.EXE,
+                exclude_pids=exclude,
                 process_table=lambda: table,
-                terminate_pid=killed.append,
+                terminate_pid=terminate,
                 sleep=slept.append,
+                ownership_file=self.ledger,
+                creation_time=creation or (lambda pid: 100),
+                boot_epoch=boot or (lambda: self.BOOT),
             )
-        self.assertEqual(result, [11, 33])
-        self.assertEqual(killed, [11, 33])
+        return result, killed, slept
+
+    def test_recorded_leftover_of_an_earlier_owner_is_swept_with_one_settle(self):
+        self._record(11)
+        result, killed, slept = self._sweep([(11, self.EXE), (22, self.OTHER)])
+        self.assertEqual(result, [11])
+        self.assertEqual(killed, [11])
         self.assertEqual(slept, [isolation.REMNANT_SETTLE_SECONDS])
+        self.assertEqual(isolation.OwnershipStore(self.ledger).load(), {})
 
-    def test_tracked_and_excluded_pids_are_never_swept(self):
+    def test_unrecorded_same_executable_refuses_and_is_never_terminated(self):
+        with self.assertRaises(EnvironmentError_) as caught:
+            self._sweep([(4242, self.EXE)])
+        self.assertEqual(caught.exception.code, "cad_external_solidworks")
+        self.assertIn("close it before capturing", str(caught.exception))
+        self.assertEqual(caught.exception.detail["pids"], [4242])
+
+    def test_tracked_and_excluded_pids_are_never_swept_or_refused(self):
+        result, killed, slept = self._sweep([(11, self.EXE), (33, self.EXE)], tracked={11}, exclude={33})
+        self.assertEqual((result, killed, slept), ([], [], []))
+
+    def test_other_executable_is_untouched(self):
+        result, killed, slept = self._sweep([(22, self.OTHER)])
+        self.assertEqual((result, killed, slept), ([], [], []))
+
+    def test_pid_reuse_with_a_different_creation_time_is_never_terminated(self):
+        self._record(11, creation=100)
+        with self.assertRaises(EnvironmentError_) as caught:
+            self._sweep([(11, self.EXE)], creation=lambda pid: 200)
+        self.assertEqual(caught.exception.code, "cad_external_solidworks")
+
+    def test_record_from_another_boot_is_not_trusted(self):
+        self._record(11, boot=self.BOOT - 3600.0)
+        with self.assertRaises(EnvironmentError_) as caught:
+            self._sweep([(11, self.EXE)])
+        self.assertEqual(caught.exception.code, "cad_external_solidworks")
+
+    def test_own_record_is_left_to_the_windows_job(self):
+        self._record(11, owner=isolation._OWNER_TOKEN)
+        result, killed, slept = self._sweep([(11, self.EXE)])
+        self.assertEqual((result, killed, slept), ([], [], []))
+
+    def test_unreadable_recorded_process_refuses_instead_of_launching(self):
+        self._record(11)
         killed = []
-        slept = []
-        table = [(11, self.EXE), (33, self.EXE)]
-        with patch.object(isolation, "_TRACKED_PIDS", {11}):
-            result = terminate_remnant_processes(
-                self.EXE,
-                exclude_pids={33},
-                process_table=lambda: table,
-                terminate_pid=killed.append,
-                sleep=slept.append,
-            )
-        self.assertEqual(result, [])
+        with self.assertRaises(EnvironmentError_) as caught:
+            self._sweep([(11, self.EXE)], creation=lambda pid: None, killed=killed)
+        self.assertEqual(caught.exception.code, "cad_external_solidworks")
+        self.assertIn("cannot be verified", str(caught.exception))
+        self.assertEqual(caught.exception.detail["unverified_pids"], [11])
         self.assertEqual(killed, [])
-        self.assertEqual(slept, [])
+        # the record stays: the process is still enumerated and undecided
+        self.assertIn(11, isolation.OwnershipStore(self.ledger).load())
+
+    def test_record_of_a_gone_owner_pid_is_swept(self):
+        self._record(11, owner_pid=888, owner_creation=555)
+        result, killed, slept = self._sweep(
+            [(11, self.EXE)], creation=lambda pid: None if pid == 888 else 100
+        )
+        self.assertEqual(result, [11])
+        self.assertEqual(killed, [11])
+        self.assertEqual(slept, [isolation.REMNANT_SETTLE_SECONDS])
+        self.assertEqual(isolation.OwnershipStore(self.ledger).load(), {})
+
+    def test_live_owner_record_refuses_and_is_never_terminated(self):
+        self._record(11, owner="other-live-owner", owner_pid=777, owner_creation=100)
+        killed = []
+        with self.assertRaises(EnvironmentError_) as caught:
+            self._sweep([(11, self.EXE)], killed=killed)
+        self.assertEqual(caught.exception.code, "cad_external_solidworks")
+        self.assertIn("another live pipeline process", str(caught.exception))
+        self.assertEqual(caught.exception.detail["live_owner_pids"], [11])
+        self.assertEqual(killed, [])
+        # the live owner's record is retained for its own later cleanup
+        self.assertIn(11, isolation.OwnershipStore(self.ledger).load())
+
+    def test_record_without_owner_evidence_is_never_terminated(self):
+        self._record(11, owner_creation=None)
+        killed = []
+        with self.assertRaises(EnvironmentError_) as caught:
+            self._sweep([(11, self.EXE)], killed=killed)
+        self.assertEqual(caught.exception.detail["unverified_pids"], [11])
+        self.assertEqual(killed, [])
+
+    def test_record_without_a_usable_creation_identity_never_matches(self):
+        self._record(11, creation=None)
+        killed = []
+        with self.assertRaises(EnvironmentError_) as caught:
+            self._sweep([(11, self.EXE)], killed=killed)
+        self.assertEqual(caught.exception.detail["unrecorded_pids"], [11])
+        self.assertEqual(killed, [])
+
+    def test_stale_record_for_a_gone_pid_is_pruned(self):
+        self._record(99)
+        result, _killed, _slept = self._sweep([(22, self.OTHER)])
+        self.assertEqual(result, [])
+        self.assertEqual(isolation.OwnershipStore(self.ledger).load(), {})
 
     def test_no_leftovers_leave_the_settle_untouched(self):
-        slept = []
-        with patch.object(isolation, "_TRACKED_PIDS", set()):
-            result = terminate_remnant_processes(
-                self.EXE,
-                process_table=list,
-                terminate_pid=Mock(),
-                sleep=slept.append,
-            )
-        self.assertEqual(result, [])
-        self.assertEqual(slept, [])
+        result, killed, slept = self._sweep([])
+        self.assertEqual((result, killed, slept), ([], [], []))
+
+    def test_ledger_roundtrip_and_foreign_schema_reads_empty(self):
+        store = isolation.OwnershipStore(self.ledger)
+        store.add({"pid": 7, "executable": self.EXE, "creation_time": 1, "boot_epoch": 0.0, "owner": "x"})
+        self.assertEqual(list(store.load()), [7])
+        store.remove(7, creation_time=1)
+        self.assertEqual(store.load(), {})
+        self.ledger.write_text('{"schema_version": "foreign/v9", "records": []}', encoding="utf-8")
+        self.assertEqual(store.load(), {})
+
+
+class OwnershipLedgerLockTests(unittest.TestCase):
+    """Ledger read-modify-write is serialized in-process and across processes."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ledger = Path(self.tmp.name) / "cad-ownership.json"
+
+    def test_every_ledger_write_takes_the_sidecar_process_lock(self):
+        store = isolation.OwnershipStore(self.ledger)
+        seen: list[Path] = []
+        real = isolation.acquire_process_lock
+
+        def spy(path):
+            seen.append(Path(path))
+            return real(path)
+
+        with patch.object(isolation, "acquire_process_lock", spy):
+            store.add({"pid": 7, "executable": "/x", "creation_time": 1, "boot_epoch": 0.0, "owner": "t"})
+            store.remove(7, creation_time=1)
+        self.assertEqual(seen, [store.lock_path, store.lock_path])
+        self.assertTrue(store.lock_path.is_file())
+        self.assertEqual(store.load(), {})
+
+    def test_concurrent_store_instances_do_not_lose_records(self):
+        stores = (isolation.OwnershipStore(self.ledger), isolation.OwnershipStore(self.ledger))
+        original = isolation.OwnershipStore._save
+        errors: list = []
+
+        def slow_save(self, records):
+            time.sleep(0.002)  # widen the read-modify-write window
+            return original(self, records)
+
+        def writer(store, base):
+            try:
+                for index in range(120):
+                    store.add(
+                        {
+                            "pid": base + index + 1,  # pid 0 is reserved and filtered by load()
+                            "executable": "/x",
+                            "creation_time": 1,
+                            "boot_epoch": 0.0,
+                            "owner": "t",
+                        }
+                    )
+            except Exception as error:  # pragma: no cover - diagnostic only
+                errors.append(error)
+
+        with patch.object(isolation.OwnershipStore, "_save", slow_save):
+            threads = [
+                threading.Thread(target=writer, args=(store, 1000 * index)) for index, store in enumerate(stores)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(len(stores[0].load()), 240)
+
+
+class _PyTime(datetime.datetime):
+    """pywin32's PyTime is a datetime subclass; the parser must accept it."""
+
+
+class OwnershipRemovalTests(unittest.TestCase):
+    """Removal must prove identity: a stale cleanup never deletes a newer record."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ledger = Path(self.tmp.name) / "cad-ownership.json"
+
+    def test_removal_without_an_identity_never_deletes_a_newer_record(self):
+        store = isolation.OwnershipStore(self.ledger)
+        store.add({"pid": 7, "executable": "/x", "creation_time": None, "boot_epoch": 0.0, "owner": "old"})
+        store.add({"pid": 7, "executable": "/x", "creation_time": 200, "boot_epoch": 0.0, "owner": "new"})
+        store.remove(7, creation_time=None)  # stale cleanup that cannot state the identity
+        self.assertIn(7, store.load())
+        store.remove(7, creation_time=100)  # wrong identity
+        self.assertIn(7, store.load())
+        store.remove(7, creation_time=200)  # exact identity
+        self.assertEqual(store.load(), {})
+        store.add({"pid": 8, "executable": "/x", "creation_time": None, "boot_epoch": 0.0, "owner": "old"})
+        store.remove(8, creation_time=None)
+        self.assertIn(8, store.load())  # None is never a removable identity
+
+
+class CreationTicksTests(unittest.TestCase):
+    """pywin32 exposes GetProcessTimes in several shapes; all normalize alike."""
+
+    def test_pywin32_dict_shape_normalizes_to_ticks(self):
+        # epoch + 1 s + 1 us = 10**7 + 10 ticks, a literal independent of the parser
+        moment = _PyTime(1601, 1, 1, 0, 0, 1, 1)
+        snapshot = {"CreationTime": moment, "ExitTime": None, "KernelTime": None, "UserTime": None}
+        self.assertEqual(isolation._creation_ticks(snapshot), 10**7 + 10)
+
+    def test_timezone_aware_pywin32_shape_normalizes_via_utc(self):
+        # The endpoint's own Python returns dict + timezone-aware pywintypes
+        # datetimes; the same instant in any zone must yield the same ticks.
+        utc = _PyTime(2026, 10, 13, 8, 33, 16, 528000, tzinfo=datetime.UTC)
+        aware = _PyTime(2026, 10, 13, 16, 33, 16, 528000, tzinfo=datetime.timezone(datetime.timedelta(hours=8)))
+        named = _PyTime(2026, 10, 13, 9, 33, 16, 528000, tzinfo=datetime.timezone(datetime.timedelta(hours=1)))
+        expected = isolation._creation_ticks({"CreationTime": utc})
+        self.assertEqual(isolation._creation_ticks({"CreationTime": aware}), expected)
+        self.assertEqual(isolation._creation_ticks({"CreationTime": named}), expected)
+        self.assertEqual(isolation._creation_ticks((aware, None, None, None)), expected)
+
+    def test_legacy_tuple_shape_normalizes_to_ticks(self):
+        moment = _PyTime(1601, 1, 1, 0, 0, 2)
+        self.assertEqual(isolation._creation_ticks((moment, None, None, None)), 2 * 10**7)
+
+    def test_filetime_struct_shape_normalizes_to_ticks(self):
+        struct = SimpleNamespace(dwHighDateTime=2, dwLowDateTime=5)
+        self.assertEqual(isolation._creation_ticks(struct), (2 << 32) | 5)
+
+    def test_unusable_shapes_are_never_authority(self):
+        self.assertIsNone(isolation._creation_ticks({}))
+        self.assertIsNone(isolation._creation_ticks((None,)))
+        self.assertIsNone(isolation._creation_ticks(None))
+        self.assertIsNone(isolation._creation_ticks({"CreationTime": "not-a-time"}))
+
+
+class WindowsTerminateTests(unittest.TestCase):
+    """The kill verifies the creation moment on the very handle that may kill."""
+
+    def _modules(self, handle, times, killed, *, fail_read=False):
+        def get_times(_handle):
+            if fail_read:
+                raise OSError("unreadable")
+            return times
+
+        return {
+            "win32api": SimpleNamespace(
+                OpenProcess=lambda access, inherit, pid: handle,
+                TerminateProcess=lambda opened, code: killed.append(opened),
+            ),
+            "win32process": SimpleNamespace(GetProcessTimes=get_times),
+            "win32event": SimpleNamespace(WaitForSingleObject=lambda opened, ms: 0),
+            "win32con": SimpleNamespace(
+                PROCESS_QUERY_INFORMATION=1, PROCESS_TERMINATE=2, SYNCHRONIZE=4
+            ),
+        }
+
+    def test_matching_creation_time_terminates_on_the_same_handle(self):
+        handle = SimpleNamespace()
+        killed: list = []
+        times = {"CreationTime": isolation._CREATION_EPOCH + datetime.timedelta(seconds=1)}
+        with patch.dict(sys.modules, self._modules(handle, times, killed)):
+            self.assertTrue(isolation._windows_terminate_matching(11, 10**7))
+        self.assertEqual(killed, [handle])  # the exact handle opened for verification
+
+    def test_mismatched_creation_time_never_terminates(self):
+        handle = SimpleNamespace()
+        killed: list = []
+        times = {"CreationTime": isolation._CREATION_EPOCH + datetime.timedelta(seconds=9)}
+        with patch.dict(sys.modules, self._modules(handle, times, killed)):
+            self.assertFalse(isolation._windows_terminate_matching(11, 10**7))
+        self.assertEqual(killed, [])
+
+    def test_unreadable_process_times_never_terminate(self):
+        handle = SimpleNamespace()
+        killed: list = []
+        with patch.dict(sys.modules, self._modules(handle, None, killed, fail_read=True)):
+            self.assertFalse(isolation._windows_terminate_matching(11, 10**7))
+        self.assertEqual(killed, [])
