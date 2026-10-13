@@ -57,7 +57,9 @@ CREATE TABLE IF NOT EXISTS platform.stage (
     state text NOT NULL CHECK (state IN ('pending', 'running', 'completed', 'failed', 'cancelled', 'unresolved', 'blocked')),
     -- Sealed receipt / checkpoint reference, registered atomically with a confirmation.
     receipt jsonb,
-    checkpoint jsonb,
+    checkpoint_uri text,
+    reused_from_run text,
+    original_executed_at timestamptz,
     updated_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (run_id, stage)
 );
@@ -66,7 +68,7 @@ CREATE TABLE IF NOT EXISTS platform.operation (
     operation_id text PRIMARY KEY,
     run_id text NOT NULL REFERENCES platform.run (run_id),
     stage text,
-    kind text NOT NULL CHECK (kind IN ('dispatch', 'native', 'publish', 'cancel', 'cache_release')),
+    kind text NOT NULL CHECK (kind IN ('dispatch', 'native', 'publish', 'cancel', 'reconcile', 'cache_release')),
     state text NOT NULL CHECK (state IN ('queued', 'running', 'succeeded', 'failed', 'cancelled', 'unresolved')),
     -- Idempotent registration key: same key + same digest returns the existing record; the
     -- UNIQUE constraint backstops concurrent registrations.
