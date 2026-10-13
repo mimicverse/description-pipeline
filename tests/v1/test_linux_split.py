@@ -13,7 +13,7 @@ from unittest import mock
 
 from packaging.utils import canonicalize_name
 
-from description_pipeline.io import PipelineError, digest, file_digest
+from description_pipeline.io import PipelineError, digest, file_digest, write_json
 from description_pipeline.orchestration import linux_runner
 from description_pipeline.orchestration.linux_store import LinuxStore
 from description_pipeline.orchestration.stage_transfer import seal_capture
@@ -203,29 +203,116 @@ class LinuxSplitTests(unittest.TestCase):
             )
         )
 
+    def _registered_generate_checkpoint(self) -> str:
+        """A real generated-shaped checkpoint recorded through the store (reuse fixture)."""
+
+        from description_pipeline.delivery import subject_inventory, write_delivery_manifest
+        from description_pipeline.interface_records import CHECK_POLICY_SCHEMA, check_policy_digest
+        from description_pipeline.runtime import tool_record
+        from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
+
+        output = self.store.stage_dir(self.run_id, "generate")
+        shutil.copytree(self.store.capture_dir(self.run_id), output)
+        for name in ("model", "urdf", "meshes"):
+            (output / name).mkdir(exist_ok=True)
+        write_json(output / "tool.json", tool_record())
+        write_delivery_manifest(
+            output,
+            contract={"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
+            policy={"schema_version": CHECK_POLICY_SCHEMA, "digest": check_policy_digest()},
+        )
+        subject = digest(subject_inventory(output))
+        self.store.record_stage(
+            self.run_id,
+            "generate",
+            {
+                "schema_version": "solidworks-to-urdf.bundle/v1",
+                "run_id": self.run_id,
+                "stage": "generate",
+                "state": "generated",
+                "passed": False,
+                "subject_sha256": subject,
+                "handoff_sha256": HANDOFF,
+                "events": [],
+            },
+        )
+        return subject
+
     def test_a_registered_checkpoint_is_returned_without_rerunning_the_stage(self) -> None:
         self.admit()
+        subject = self._registered_generate_checkpoint()
+        with (
+            mock.patch.object(linux_runner, "tool_record", return_value=portable_record(self.tool)),
+            mock.patch.object(
+                linux_runner.solidworks, "generate", side_effect=AssertionError("registered checkpoints are immutable")
+            ),
+        ):
+            receipt = linux_runner.run_portable_stage(self.store, self.run_id, "generate")
+        self.assertEqual(receipt["state"], "generated")
+        self.assertEqual(receipt["subject_sha256"], subject)
 
-        def fake_generate(seed_dir, output, **kwargs):
-            Path(output).mkdir(parents=True, exist_ok=True)
-            return {
+    def test_a_forged_receipt_claiming_confirmation_is_refused(self) -> None:
+        self.admit()
+        self.store.record_stage(
+            self.run_id,
+            "verify",
+            {
+                "schema_version": "solidworks-to-urdf.bundle/v1",
+                "run_id": "9b2f4c55-0c3a-4f2b-9d1e-7a6b5c4d3e2f",
+                "stage": "publish",
+                "state": "verified",
+                "passed": True,
+                "subject_sha256": "bad",
+            },
+        )
+        with (
+            mock.patch.object(linux_runner, "tool_record", return_value=portable_record(self.tool)),
+            mock.patch.object(linux_runner.solidworks, "verify", side_effect=AssertionError("must not rerun")),
+            self.assertRaisesRegex(PipelineError, "another run or stage"),
+        ):
+            linux_runner.run_portable_stage(self.store, self.run_id, "verify", expected_subject="a" * 64)
+
+    def test_a_confirmed_receipt_without_sealed_artifacts_is_refused(self) -> None:
+        self.admit()
+        self.store.record_stage(
+            self.run_id,
+            "generate",
+            {
+                "schema_version": "solidworks-to-urdf.bundle/v1",
+                "run_id": self.run_id,
+                "stage": "generate",
                 "state": "generated",
                 "passed": False,
                 "subject_sha256": "a" * 64,
-                "events": [{"stage": "generate", "state": "completed", "at": "2026-10-10T00:00:00+00:00"}],
-            }
-
+            },
+        )
         with (
-            mock.patch.object(linux_runner.solidworks, "generate", side_effect=fake_generate),
+            mock.patch.object(linux_runner.solidworks, "generate", side_effect=AssertionError("must not rerun")),
+            self.assertRaisesRegex(PipelineError, "no sealed delivery"),
+        ):
+            linux_runner.run_portable_stage(self.store, self.run_id, "generate")
+
+    def test_a_tampered_checkpoint_is_refused_instead_of_replayed(self) -> None:
+        self.admit()
+        self._registered_generate_checkpoint()
+        (self.store.stage_dir(self.run_id, "generate") / "model" / "tampered.bin").write_bytes(b"x")
+        with (
             mock.patch.object(linux_runner, "tool_record", return_value=portable_record(self.tool)),
+            mock.patch.object(linux_runner.solidworks, "generate", side_effect=AssertionError("must not rerun")),
+            self.assertRaisesRegex(PipelineError, "manifest"),
         ):
-            first = linux_runner.run_portable_stage(self.store, self.run_id, "generate")
-        with mock.patch.object(
-            linux_runner.solidworks, "generate", side_effect=AssertionError("registered checkpoints are immutable")
+            linux_runner.run_portable_stage(self.store, self.run_id, "generate")
+
+    def test_reuse_still_passes_the_runtime_identity_gate(self) -> None:
+        self.admit()
+        self._registered_generate_checkpoint()
+        drifted = portable_record(self.tool, source_sha256="0" * 64)
+        with (
+            mock.patch.object(linux_runner, "tool_record", return_value=drifted),
+            mock.patch.object(linux_runner.solidworks, "generate", side_effect=AssertionError("must not rerun")),
+            self.assertRaisesRegex(PipelineError, "differs from the native capture"),
         ):
-            again = linux_runner.run_portable_stage(self.store, self.run_id, "generate")
-        self.assertEqual(first["state"], "generated")
-        self.assertEqual(again, first)
+            linux_runner.run_portable_stage(self.store, self.run_id, "generate")
 
     def test_preview_and_artifacts_are_bound_to_the_verified_bytes(self) -> None:
         from description_pipeline.delivery import subject_digest

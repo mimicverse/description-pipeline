@@ -14,9 +14,18 @@ import os
 import tempfile
 from pathlib import Path
 
-from ..delivery import PIPELINE_ID, stamped_output, subject_digest, subject_inventory
+from ..delivery import (
+    BUNDLE_SCHEMA,
+    PIPELINE_ID,
+    read_delivery_manifest,
+    stamped_output,
+    subject_digest,
+    subject_inventory,
+)
+from ..interface_records import check_policy_digest
 from ..io import PipelineError, confined, inventory, read_data, write_json
-from ..stages import PORTABLE_STAGES, STAGE_IDS, stage_view
+from ..runtime import tool_record
+from ..stages import CONFIRMED_STAGE_STATES, CONTRACT_SHA256, PORTABLE_STAGES, STAGE_IDS, stage_view
 from ..verification.solidworks_urdf import check_bundle, require_qualified_report
 from .airflow_client import JOB_SCHEMA, validate_run_id
 from .stage_transfer import CAPTURE_MANIFEST, TRANSFER_SCHEMA, admit_capture
@@ -95,6 +104,50 @@ class LinuxStore:
 
     def checkpoint_receipt(self, run_id: str, stage: str) -> Path:
         return self.receipt_path(self.checkpoint_owner(run_id, stage), stage)
+
+    def confirmed_stage_checkpoint(self, run_id: str, stage: str) -> dict | None:
+        """The attempt's registered stage receipt, fully rebound - or an explicit refusal.
+
+        Reuse only stands through this query: the receipt must name this run and
+        stage with a confirmed state, and the sealed artifacts must still bind
+        - the delivery manifest record-for-record with its contract and check
+        policy digests, the delivery tool identity, the subject recomputed from
+        the checkpoint bytes and the stored handoff.  A receipt that claims
+        confirmation without binding artifacts is a damaged store: it refuses
+        instead of silently re-running, and no caller keeps its own copy of the
+        confirmed-state vocabulary.
+        """
+
+        if stage not in CONFIRMED_STAGE_STATES:
+            raise PipelineError(f"stage must be one of {tuple(CONFIRMED_STAGE_STATES)}: {stage!r}")
+        path = self.receipt_path(run_id, stage)
+        if not path.is_file():
+            return None
+        receipt = read_data(path)
+        if not isinstance(receipt, dict) or receipt.get("schema_version") != BUNDLE_SCHEMA:
+            raise PipelineError("The recorded stage receipt is malformed")
+        if receipt.get("run_id") != run_id or receipt.get("stage") != stage:
+            raise PipelineError("The recorded stage receipt names another run or stage")
+        if receipt.get("state") not in CONFIRMED_STAGE_STATES[stage]:
+            return None
+        directory = self.output_dir(run_id) if stage == "publish" else self.stage_dir(run_id, stage)
+        if not directory.is_dir():
+            raise PipelineError(f"The recorded {stage} checkpoint has no sealed delivery to reuse")
+        manifest = read_delivery_manifest(directory)
+        if manifest.get("contract", {}).get("digest") != CONTRACT_SHA256:
+            raise PipelineError("The recorded checkpoint was produced under another contract")
+        if manifest.get("policy", {}).get("digest") != check_policy_digest():
+            raise PipelineError("The recorded checkpoint was recorded under another check policy")
+        if read_data(directory / "tool.json") != tool_record():
+            raise PipelineError("The recorded checkpoint was produced by another tool release")
+        subject = receipt.get("subject_sha256")
+        if not isinstance(subject, str) or subject_digest(directory) != subject:
+            raise PipelineError("The recorded checkpoint bytes no longer match its receipt")
+        meta = self.meta(run_id) or {}
+        recorded_handoff = receipt.get("handoff_sha256")
+        if recorded_handoff and meta.get("handoff_sha256") and recorded_handoff != meta.get("handoff_sha256"):
+            raise PipelineError("The recorded checkpoint is bound to another handoff")
+        return receipt
 
     def delivery_dir(self, run_id: str) -> Path | None:
         """The newest installed delivery of this attempt (publish, verify or generate)."""

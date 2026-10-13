@@ -48,6 +48,16 @@ PORTABLE_STAGES = tuple(stage for stage, hosts in HOST_BY_STAGE.items() if hosts
 #: boundary receipts stay raw-evidence-only.
 DELIVERY_STAGES = ("generate", "verify", "publish")
 
+#: The stage states whose checkpoint counts as registered and immutable.  This
+#: mapping is the single owner of that fact: reuse paths query the authoritative
+#: store (which rebinds the sealed artifacts) and never re-derive the
+#: vocabulary themselves.
+CONFIRMED_STAGE_STATES = {
+    "generate": frozenset({"generated"}),
+    "verify": frozenset({"verified"}),
+    "publish": frozenset({"published", "updated", "noop"}),
+}
+
 #: Fixed definition-independent required checks every quality report must carry;
 #: ``verification.solidworks_urdf.required_checks`` adds the dynamic per-object gates.
 FIXED_REQUIRED_CHECKS = frozenset(

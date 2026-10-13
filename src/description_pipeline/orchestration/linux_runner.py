@@ -94,30 +94,6 @@ def _failure_receipt(store: LinuxStore, run_id: str, stage: str, error: Exceptio
     return receipt
 
 
-#: Stage states whose checkpoint is registered and immutable: a repeated call
-#: returns the recorded receipt instead of overwriting the checkpoint on disk.
-_REGISTERED_STATES = {
-    "generate": frozenset({"generated"}),
-    "verify": frozenset({"verified"}),
-    "publish": frozenset({"published", "updated", "noop"}),
-}
-
-
-def _registered_checkpoint(store: LinuxStore, run_id: str, stage: str) -> dict | None:
-    """The store's recorded receipt for an already-registered checkpoint, if any."""
-
-    path = store.receipt_path(run_id, stage)
-    if not path.is_file():
-        return None
-    try:
-        receipt = read_data(path)
-    except (PipelineError, OSError, ValueError):
-        return None
-    if isinstance(receipt, dict) and receipt.get("state") in _REGISTERED_STATES[stage]:
-        return receipt
-    return None
-
-
 def run_portable_stage(
     store: LinuxStore,
     run_id: str,
@@ -134,10 +110,13 @@ def run_portable_stage(
     run_id = validate_run_id(run_id)
     if stage not in DELIVERY_STAGES:
         raise PipelineError(f"stage must be one of {DELIVERY_STAGES}: {stage!r}")
-    registered = _registered_checkpoint(store, run_id, stage)
+    registered = store.confirmed_stage_checkpoint(run_id, stage)
     if registered is not None:
-        # A registered checkpoint is immutable; the store returns its receipt
-        # instead of re-running the stage into an existing directory.
+        # A registered checkpoint is reused only after the store rebound its
+        # sealed artifacts; the same environment gates as a normal run apply.
+        capture_owner = store.checkpoint_owner(run_id, "capture")
+        _revalidate_capture(store, capture_owner)
+        _portable_identity_gate(store, capture_owner)
         return registered
     owner = validate_run_id(source_run_id or parent_run) if source_run_id or parent_run else run_id
     outputs = {
