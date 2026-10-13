@@ -563,8 +563,11 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn("--env-file", example)
         for stale in ("install-base", "install-proxy", "rehearse", "--refresh", "c9", "root provides"):
             self.assertNotIn(stale, example)
-        self.assertIn("mimicverse_description-1.0.1-py3-none-any.whl", example)
-        self.assertNotIn("mimicverse_description-1.0.0-py3-none-any.whl", example)
+        self.assertIn("mimicverse_description-<version>-py3-none-any.whl", example)
+        self.assertIsNone(
+            re.search(r"mimicverse_description-\d+\.\d+\.\d+-py3-none-any\.whl", example),
+            "the example must not pin a concrete release wheel",
+        )
         toolchain = (OPERATOR / "scripts" / "install_toolchain.sh").read_text(encoding="utf-8")
         self.assertIn("UV_VERSION=0.12.23", toolchain)
         self.assertIn("PYTHON_VERSION=3.12.14", toolchain)

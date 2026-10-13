@@ -39,6 +39,7 @@ exists. Each new delivery continues that baseline. Reusing a revision requires
 identical revision content.
 
 Choose the complete project folder from your own computer in the operator page.
+The page states the platform's fixed upload limits.
 The browser uploads its files, preserving relative paths, to the platform's
 dedicated Linux intake before anything is frozen; server-side admission applies
 the same naming, case and generated-input rules as the native handoff
@@ -248,3 +249,18 @@ description submit /path/to/verified-delivery --repository /path/to/model-clone 
 Rebuild preserves native evidence and generated definitions. Submission
 reverifies the copied delivery and committed Git blobs before updating its PR.
 These maintenance commands do not create an alternative engineering input path.
+
+### Native endpoint exit codes
+
+The native bridge behind the Windows endpoint reports fatal failures with
+stable process exit codes; Airflow task logs and endpoint diagnostics identify
+the failing operation.
+
+| Code | Meaning |
+|---|---|
+| 0 | success |
+| 1 | usage |
+| 2 | environment |
+| 3 | upstream CAD |
+| 4 | timeout |
+| 5 | internal |
