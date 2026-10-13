@@ -319,15 +319,43 @@ def _dependencies(root, definition):
     _require(bool(original) and bool(closure["mapping"]), "Missing dependency mapping")
     actual = {"source/" + name: checksum for name, checksum in inventory(root / "input/cad").items()}
     _require(actual == closure["copy_files"], "Collected CAD changed")
-    original_hashes = _handoff_native_hashes(root)
-    _require(set(original.values()) <= original_hashes, "Capture used CAD outside the mechanical handoff")
+    # The archived input carries the dependency-closure copies; the frozen
+    # discovery inventory binds those copy bytes.
+    _handoff_native_hashes(root)
+    # Original coverage is a digest-mapping decision: the originals stay in the
+    # platform's frozen upload storage, so their identity is the handoff upload
+    # index (name -> original digest), never an equality with the - possibly
+    # engine-rewritten - copy bytes.
+    handoff = ev.handoff(root)
+    package_files = handoff.get("package_files")
+    _require(isinstance(package_files, dict) and bool(package_files), "The frozen upload index is missing")
+    upload_hashes = {str(checksum) for checksum in package_files.values()}
     top = [row for row in closure["mapping"] if row["instance"] == "top_level"]
     _require(len(top) == 1, "Missing unique top assembly mapping")
-    expected = file_digest(confined(root / "input/cad", definition["source"]["assembly"]))
+    main = str(definition["source"]["assembly"])
+    main_suffix = ntpath.normcase(main.replace("/", "\\"))
+    main_key = next(
+        (
+            name
+            for name in package_files
+            if ntpath.normcase(str(name).replace("/", "\\")).endswith(main_suffix)
+        ),
+        None,
+    )
+    _require(main_key is not None, "The frozen upload index does not name the captured main assembly")
+    expected = str(package_files[main_key])
     _require(top[0]["source_sha256"] == expected, "Captured another top assembly revision")
     for row in closure["mapping"]:
         _require(original.get(row["source"]) == row["source_sha256"], "Source mapping hash differs")
+        _require(
+            str(row["source_sha256"]) in upload_hashes,
+            "A captured original is outside the frozen upload index",
+        )
         _require(actual.get(row["copy"]) == row["copy_sha256"], "Copied mapping hash differs")
+    _require(
+        {str(checksum) for checksum in original.values()} <= upload_hashes,
+        "Capture used CAD outside the frozen upload index",
+    )
     _require(
         {ntpath.normcase(str(row["source"])) for row in closure["mapping"]}
         == {ntpath.normcase(str(path)) for path in original},
