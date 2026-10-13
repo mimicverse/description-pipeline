@@ -23,9 +23,10 @@ from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
-from ..delivery import BUNDLE_SCHEMA
+from ..delivery import BUNDLE_SCHEMA, read_delivery_manifest
 from ..io import PipelineError
 from ..stages import (
     CONFIRMED_STAGE_PASSED,
@@ -107,7 +108,12 @@ _READ_STAGE_ROW = "SELECT state, receipt, checkpoint_uri FROM platform.stage WHE
 _READ_STAGE = "SELECT state, receipt, checkpoint_uri FROM platform.stage WHERE run_id = %s AND stage = %s"
 _LOCK_STAGE = "SELECT state FROM platform.stage WHERE run_id = %s AND stage = %s FOR UPDATE"
 _FIND_RECONCILE = (
-    "SELECT 1 FROM platform.operation WHERE operation_id = %s AND run_id = %s AND kind = 'reconcile' LIMIT 1"
+    "SELECT 1 FROM platform.operation"
+    " WHERE operation_id = %s AND run_id = %s AND kind = 'reconcile' AND stage = %s LIMIT 1"
+)
+_FIND_UNKNOWN_ORIGIN = (
+    "SELECT 1 FROM platform.operation"
+    " WHERE run_id = %s AND stage = %s AND kind <> 'reconcile' AND state = 'unresolved' LIMIT 1"
 )
 _INSERT_STAGE = (
     "INSERT INTO platform.stage (run_id, stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at)"
@@ -162,11 +168,14 @@ def _json(value: Any) -> str | None:
 class PlatformStore:
     """The application-side store API: the single transaction entry for platform state."""
 
-    def __init__(self, connect: Callable[[], Any]):
+    def __init__(self, connect: Callable[[], Any], *, sealed: Callable[[str], Any] | None = None):
         self._connect = connect
+        self._sealed = sealed
 
     @classmethod
-    def from_environment(cls, environ: Mapping[str, str] | None = None) -> PlatformStore:
+    def from_environment(
+        cls, environ: Mapping[str, str] | None = None, *, sealed: Callable[[str], Any] | None = None
+    ) -> PlatformStore:
         """Build the store from the deploy side's derived service DSN.
 
         Install (``platform_env``) exports ``PLATFORM_SERVICE_DSN`` for the
@@ -185,7 +194,7 @@ class PlatformStore:
 
             return psycopg2.connect(dsn)
 
-        return cls(connect)
+        return cls(connect, sealed=sealed)
 
     @contextmanager
     def _transaction(self):
@@ -402,6 +411,9 @@ class PlatformStore:
             raise PlatformStoreError("Reconciliation evidence must be a non-empty record")
         if reconcile is not None and state not in {"completed", "failed", "cancelled"}:
             raise PlatformStoreError("A reconciliation confirms a definite outcome; unresolved is not an outcome")
+        _sealed_receipt(receipt, run_id=run_id, stage=stage, state=state, checkpoint_uri=checkpoint_uri)
+        if state == "completed" and stage in CONFIRMED_STAGE_STATES:
+            self._verify_sealed(checkpoint_uri, receipt)
         with self._transaction() as connection:
             cursor = connection.cursor()
             cursor.execute(_LOCK_RUN, (run_id,))
@@ -427,12 +439,16 @@ class PlatformStore:
                 operation_id = reconcile.get("operation_id")
                 if not isinstance(operation_id, str) or not operation_id:
                     raise PlatformStoreError("Reconciliation must name its registered reconcile operation")
-                cursor.execute(_FIND_RECONCILE, (operation_id, run_id))
+                cursor.execute(_FIND_RECONCILE, (operation_id, run_id, stage))
                 if cursor.fetchone() is None:
                     raise PlatformStoreError(
-                        "The reconciliation names no registered reconcile operation of this run"
+                        "The reconciliation names no registered reconcile operation of this run and stage"
                     )
-            _sealed_receipt(receipt, run_id=run_id, stage=stage, state=state, checkpoint_uri=checkpoint_uri)
+                cursor.execute(_FIND_UNKNOWN_ORIGIN, (run_id, stage))
+                if cursor.fetchone() is None:
+                    raise PlatformStoreError(
+                        "The reconciliation binds no unresolved original operation of this stage"
+                    )
             payload_receipt = {**receipt, "reconciliation": reconcile} if reconcile is not None else receipt
             if current == "unresolved":
                 cursor.execute(
@@ -483,6 +499,30 @@ class PlatformStore:
         row = cursor.fetchone()
         sequence = row[0] if row else 1
         cursor.execute(_INSERT_EVENT, (run_id, sequence, kind, stage, operation_id, _json(payload)))
+
+    def _verify_sealed(self, checkpoint_uri, receipt) -> None:
+        """Rebind the real sealed delivery before any registration.
+
+        The receipt's URI and inventory are self-reported; the bytes are not.
+        The resolver (deploy-side sealed storage) locates the sealed delivery
+        root, ``read_delivery_manifest`` re-binds every subject record and the
+        subject digest, and the receipt's artifact inventory must carry the
+        same file digests - so a syntactic URI or an invented inventory can
+        never mint a completion.
+        """
+
+        if self._sealed is None:
+            raise PlatformStoreError("Sealed storage is not configured; a completion cannot be registered")
+        root = Path(self._sealed(checkpoint_uri))
+        manifest = read_delivery_manifest(root)
+        subject = manifest.get("subject") or {}
+        if subject.get("digest") != receipt.get("subject_sha256"):
+            raise PlatformStoreError("The sealed delivery subject does not match the receipt")
+        artifacts = receipt.get("artifacts") or {}
+        for record in subject.get("files") or []:
+            name = record.get("path") if isinstance(record, dict) else None
+            if name is None or artifacts.get(name) != record.get("sha256"):
+                raise PlatformStoreError("The receipt's artifact inventory does not bind the sealed delivery")
 
     def confirmed_stage(self, run_id: str, stage: str) -> dict | None:
         """The platform-authority reuse query: the sealed receipt of a confirmed stage, or refusal.
