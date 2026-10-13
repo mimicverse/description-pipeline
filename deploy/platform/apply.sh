@@ -40,7 +40,7 @@ run() {
   local file="$1"
   echo "platform apply: $(basename "$file")" >&2
   "$PSQL" "${CONNECTION[@]}" -d "$DATABASE" -v ON_ERROR_STOP=1 \
-    -v airflow_schema="$AIRFLOW_SCHEMA" -f "$file" >&2
+    -v airflow_schema="$AIRFLOW_SCHEMA" -v platform_database="$DATABASE" -f "$file" >&2
 }
 
 run "$HERE/schema.sql"

@@ -22,6 +22,9 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'airflow_runtime') THEN
         CREATE ROLE airflow_runtime LOGIN;
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'airflow_migrate') THEN
+        CREATE ROLE airflow_migrate LOGIN;
+    END IF;
 END $$;
 
 -- Role attributes are enforced idempotently as well: the roles are cluster-scoped and may
@@ -33,6 +36,11 @@ ALTER ROLE operator_ro LOGIN;
 -- schema are applied right after the migration (operatorctl install), because the schema does
 -- not exist yet when this file runs.
 ALTER ROLE airflow_runtime LOGIN;
+ALTER ROLE airflow_migrate LOGIN;
+-- Both Airflow roles resolve unqualified metadata names (including the migration ledger)
+-- inside the airflow schema only.
+ALTER ROLE airflow_runtime IN DATABASE :"platform_database" SET search_path = airflow, pg_catalog;
+ALTER ROLE airflow_migrate IN DATABASE :"platform_database" SET search_path = airflow, pg_catalog;
 
 GRANT USAGE ON SCHEMA :"airflow_schema" TO platform_owner;
 GRANT SELECT ON :"airflow_schema".task_instance TO platform_owner;

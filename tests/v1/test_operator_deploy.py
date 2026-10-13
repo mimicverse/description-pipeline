@@ -720,13 +720,21 @@ class LifecycleTests(unittest.TestCase):
                 self.assertEqual(lines.count("airflow dags unpause solidworks_to_urdf"), register_after + 1)
         with tempfile.TemporaryDirectory() as tmp:
             config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            admission.write_text("false")  # a leftover open gate from an interrupted window
             env["START_INGRESS_RC"] = "7"
             result = run(["bash", str(CONTROL), "start", "--config", str(config_path)], env)
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("platform admission stays closed", result.stderr)
             # The DAG scheduling unpause already happened (a recorded fact); the PLATFORM gate
-            # never opened - that is the boundary under test.
+            # is closed through the controlled start precondition and never reopens.
             order_text = order.read_text()
+            self.assertIn("platform close_admission", order_text)
+            lines = order_text.splitlines()
+            self.assertLess(
+                lines.index("platform close_admission"),
+                lines.index("airflow dags unpause solidworks_to_urdf"),
+                "the start window closes the leftover gate before scheduling changes",
+            )
             self.assertNotIn("is-active", order_text)
             self.assertNotIn("platform open_admission", order_text)
 
@@ -735,7 +743,7 @@ class LifecycleTests(unittest.TestCase):
             config_path, env, admission, order = self._admission_fixture(Path(tmp), unpause_rc=7)
             result = run(["bash", str(CONTROL), "start", "--config", str(config_path)], env)
             self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
-            self.assertEqual(admission.read_text(), "true")
+            self.assertEqual(admission.read_text().strip(), "true")
             self.assertNotIn("description-portal.service", order.read_text())
             self.assertNotIn("description-operator-proxy.service", order.read_text())
 
@@ -1270,8 +1278,8 @@ class InstallOrderingTests(unittest.TestCase):
             + 'case "$*" in\n'
             '  *-f*platform/schema.sql*|*-f*platform/views.sql*|*-f*platform/roles.sql*)\n'
             '    echo "psql_platform_apply" >> "$ORDER_LOG"; exit 0 ;;\n'
-            '  *-c*CREATE\\ SCHEMA*airflow*)\n'
-            '    echo "psql_airflow_schema" >> "$ORDER_LOG"; exit 0 ;;\n'
+            '  *-v*airflow_bootstrap*)\n'
+            '    echo "psql_airflow_bootstrap" >> "$ORDER_LOG"; exit 0 ;;\n'
             '  *-v*ON_ERROR_STOP=1*q*)\n'
             '    echo "psql_airflow_grants" >> "$ORDER_LOG"; exit 0 ;;\n'
             "esac\n"
@@ -1335,8 +1343,8 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertLess(lines.index("pg_isready 2"), lines.index("airflow_install"))
             self.assertLess(lines.index("pg_isready 2"), lines.index("psql_db_query"))
             self.assertLess(lines.index("psql_db_query"), lines.index("createdb"))
-            self.assertLess(lines.index("createdb"), lines.index("psql_airflow_schema"))
-            self.assertLess(lines.index("psql_airflow_schema"), lines.index("airflow_install"))
+            self.assertLess(lines.index("createdb"), lines.index("psql_airflow_bootstrap"))
+            self.assertLess(lines.index("psql_airflow_bootstrap"), lines.index("airflow_install"))
             self.assertLess(lines.index("createdb"), lines.index("airflow_install"))
             self.assertLess(lines.index("airflow_install"), lines.index("psql_platform_apply"))
             self.assertLess(lines.index("psql_platform_apply"), lines.index("psql_airflow_grants"))
@@ -1539,7 +1547,7 @@ class InstallPostgresBehaviorTests(unittest.TestCase):
             conf = (pgroot / "data" / "postgresql.conf").read_text(encoding="utf-8")
             self.assertIn("# >>> description-postgres", conf)
             self.assertIn("reject", (pgroot / "data" / "pg_hba.conf").read_text(encoding="utf-8"))
-            self.assertIn("AIRFLOW_DB_URL=postgresql+psycopg2://solidworks@/airflow_meta", result.stdout)
+            self.assertIn("AIRFLOW_DB_URL=postgresql+psycopg2://airflow_migrate@/airflow_meta", result.stdout)
             self.assertFalse((pgroot / "data" / ".running").exists())
 
     def test_existing_cluster_is_rehardened_without_server_or_database_calls(self) -> None:

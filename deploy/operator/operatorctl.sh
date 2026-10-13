@@ -175,8 +175,10 @@ PY
 # drain are scheduling measures only.  Both transitions go through the single controlled store
 # entry (transaction-serialized with new admissions); the gates never write it directly.
 platform_close_admission() {
+  local reason="${1:-drain}" actor="${2:-operatorctl drain}"
   [ -n "${PLATFORM_SERVICE_DSN:-}" ] || die "PLATFORM_SERVICE_DSN is missing; run install to derive it"
-  "$AIRFLOW_VENV/bin/python" - <<'PY' || die "could not close the platform admission"
+  PLATFORM_CLOSE_REASON="$reason" PLATFORM_CLOSE_ACTOR="$actor" "$AIRFLOW_VENV/bin/python" - <<'PY' \
+    || die "could not close the platform admission"
 # platform-close-admission
 import os
 
@@ -189,7 +191,9 @@ def connect():
     return psycopg2.connect(os.environ["PLATFORM_SERVICE_DSN"])
 
 
-view = PlatformStore(connect).close_admission(reason="drain", actor="operatorctl drain")
+view = PlatformStore(connect).close_admission(
+    reason=os.environ["PLATFORM_CLOSE_REASON"], actor=os.environ["PLATFORM_CLOSE_ACTOR"]
+)
 print(f"admission={view.state} revision={view.revision}")
 PY
 }
@@ -306,11 +310,39 @@ case "$ACTION" in
         "$PG_BIN/createdb" -h "$POSTGRES_ROOT/socket" -p "$POSTGRES_PORT" -U solidworks airflow_meta \
           || die "could not create the airflow_meta database"
       fi
-      # One instance, separate schemas: the deployment initialization owns the airflow schema
-      # (the migration identity creates it); the platform schema comes from apply below.
+      # One instance, separate schemas.  The cluster bootstrap identity only prepares the
+      # migrator role, its schema and the search_path both roles run with; the actual Airflow
+      # migration then runs as the least-privilege migrator (airflow_migrate), which can DDL
+      # inside the airflow schema only - its version ledger resolves into that schema too, so
+      # no public object and no cross-schema DDL are ever needed.
       "$PG_BIN/psql" -h "$POSTGRES_ROOT/socket" -p "$POSTGRES_PORT" -U solidworks -d airflow_meta \
-        -v ON_ERROR_STOP=1 -q -c "CREATE SCHEMA IF NOT EXISTS airflow" \
-        || die "could not initialize the airflow schema"
+        -v ON_ERROR_STOP=1 -q -v airflow_bootstrap=1 <<'SQL' || die "could not bootstrap the airflow schema"
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'airflow_migrate') THEN
+    CREATE ROLE airflow_migrate LOGIN;
+END IF; END $$;
+CREATE SCHEMA IF NOT EXISTS airflow AUTHORIZATION airflow_migrate;
+ALTER SCHEMA airflow OWNER TO airflow_migrate;
+ALTER ROLE airflow_migrate IN DATABASE airflow_meta SET search_path = airflow, pg_catalog;
+-- Normalize object ownership inside the airflow schema only (reinstalls across the identity
+-- transition); nothing outside that schema is touched.
+DO $$
+DECLARE item record;
+BEGIN
+    FOR item IN
+        SELECT c.relkind, c.relname FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'airflow' AND pg_get_userbyid(c.relowner) <> 'airflow_migrate'
+    LOOP
+        EXECUTE format('ALTER %s airflow.%I OWNER TO airflow_migrate',
+            CASE item.relkind
+                WHEN 'S' THEN 'SEQUENCE'
+                WHEN 'v' THEN 'VIEW'
+                WHEN 'm' THEN 'MATERIALIZED VIEW'
+                ELSE 'TABLE'
+            END, item.relname);
+    END LOOP;
+END $$;
+SQL
     fi
     AIRFLOW_VENV="$AIRFLOW_VENV" AIRFLOW_HOME="$AIRFLOW_HOME" AIRFLOW_PYTHON="${AIRFLOW_PYTHON:-}" \
       PIPELINE_WHEEL="${PIPELINE_WHEEL:?PIPELINE_WHEEL is required for install}" \
@@ -334,9 +366,9 @@ GRANT USAGE ON SCHEMA airflow TO airflow_runtime;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA airflow TO airflow_runtime;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA airflow TO airflow_runtime;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA airflow TO airflow_runtime;
-ALTER DEFAULT PRIVILEGES FOR ROLE solidworks IN SCHEMA airflow
+ALTER DEFAULT PRIVILEGES FOR ROLE airflow_migrate IN SCHEMA airflow
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO airflow_runtime;
-ALTER DEFAULT PRIVILEGES FOR ROLE solidworks IN SCHEMA airflow
+ALTER DEFAULT PRIVILEGES FOR ROLE airflow_migrate IN SCHEMA airflow
     GRANT USAGE, SELECT ON SEQUENCES TO airflow_runtime;
 REVOKE ALL ON SCHEMA public FROM airflow_runtime;
 SQL
@@ -371,6 +403,10 @@ SQL
   start)
     load_installed
     drift_check || die "configuration drift detected; run install before start"
+    # Start precondition: the gate is closed for the whole start window (a leftover open gate
+    # from an interrupted window is closed through the same controlled entry), so any failure
+    # below keeps it closed while already-admitted runs continue.
+    platform_close_admission "start-window" "operatorctl start"
     airflow_lifecycle start
     airflow_unpause_dag
     systemctl --user enable --now description-portal.service description-operator-proxy.service \

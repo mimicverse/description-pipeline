@@ -11,7 +11,8 @@ Derivations (all paths under the configured storage roots; converged here as the
   AIRFLOW_VENV   = <release_root>/airflow-venv-<install_id>
   AIRFLOW_HOME   = <state_root>/airflow-home
   POSTGRES_ROOT  = <state_root>/airflow-pg
-  AIRFLOW_DB_URL = postgresql+psycopg2://solidworks@/airflow_meta?host=<POSTGRES_ROOT>/socket&port=<POSTGRES_PORT>
+  AIRFLOW_DB_URL = the Airflow migration identity (airflow_migrate: DDL inside the airflow schema
+  only, DML on the bootstrap-created migration ledger)
   PIPELINE_WHEEL = the installed wheel (explicit ``--wheel`` or the single ``*.whl`` under the
   deployment tree), bound to a release artifact by name+digest before any leg runs
   PLATFORM_SERVICE_DSN / PLATFORM_OPERATOR_DSN = the platform store and read roles over the
@@ -284,7 +285,7 @@ def derive(
         "POSTGRES_MAJOR": "14",
         "POSTGRES_PORT": str(postgres_port),
         "AIRFLOW_DB_URL": (
-            f"postgresql+psycopg2://solidworks@/airflow_meta?host={postgres_root}/socket&port={postgres_port}"
+            f"postgresql+psycopg2://airflow_migrate@/airflow_meta?host={postgres_root}/socket&port={postgres_port}"
         ),
         "AIRFLOW_RUNTIME_DB_URL": (
             f"postgresql+psycopg2://airflow_runtime@/airflow_meta?host={postgres_root}/socket&port={postgres_port}"
