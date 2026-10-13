@@ -1059,6 +1059,32 @@ def require_endpoint_matches_install_record(health, record) -> None:
     )
 
 
+def subject_file_records(files, code: str, where: str = "subject.files") -> tuple[dict[str, str], list[str]]:
+    """Validate one ``{path, bytes, sha256}`` record list; the single inventory owner.
+
+    Every record carries exactly path, byte length and SHA-256; paths are
+    unique relative POSIX paths and the digests are 64-hex.  Returns the
+    path->digest mapping and the paths in their recorded order.  Ordering
+    policy belongs to the caller: the manifest requires sorted paths, the
+    platform receipt accepts any order but must cover the same record set.
+    """
+
+    _require(isinstance(files, list) and files, code, {"where": where})
+    mapping: dict[str, str] = {}
+    paths: list[str] = []
+    for index, record in enumerate(files):
+        position = f"{where}[{index}]"
+        _exact_keys(record, {"path", "bytes", "sha256"}, code, position)
+        name = record["path"]
+        _require(isinstance(name, str), code, {"where": f"{position}.path"})
+        artifact_path_parts(name)
+        _require(name not in mapping, code, {"where": f"{position}.path", "reason": "duplicate subject path"})
+        _non_negative_int(record["bytes"], code, f"{position}.bytes")
+        mapping[name] = _hex64(record["sha256"], code, f"{position}.sha256")
+        paths.append(name)
+    return mapping, paths
+
+
 def validate_delivery_manifest(manifest) -> dict:
     """``manifest.json`` (IF-13): subject inventory, subject digest, identities."""
 
@@ -1067,21 +1093,10 @@ def validate_delivery_manifest(manifest) -> dict:
     _require(manifest["schema_version"] == DELIVERY_MANIFEST_SCHEMA, code, {"where": "schema_version"})
     _exact_keys(manifest["subject"], {"files", "digest"}, code, "subject")
     files = manifest["subject"]["files"]
-    _require(isinstance(files, list) and files, code, {"where": "subject.files"})
     # Each record carries path, byte length and SHA-256 (contracts §交付格式与摘要);
-    # paths are unique, sorted relative POSIX paths and every byte is bound.
-    mapping: dict[str, str] = {}
-    paths: list[str] = []
-    for index, record in enumerate(files):
-        where = f"subject.files[{index}]"
-        _exact_keys(record, {"path", "bytes", "sha256"}, code, where)
-        name = record["path"]
-        _require(isinstance(name, str), code, {"where": f"{where}.path"})
-        artifact_path_parts(name)
-        _require(name not in mapping, code, {"where": f"{where}.path", "reason": "duplicate subject path"})
-        _non_negative_int(record["bytes"], code, f"{where}.bytes")
-        mapping[name] = _hex64(record["sha256"], code, f"{where}.sha256")
-        paths.append(name)
+    # the inventory owner enforces the shape and unique paths, the manifest
+    # additionally requires sorted relative POSIX paths and bound bytes.
+    mapping, paths = subject_file_records(files, code)
     _require(paths == sorted(paths), code, {"where": "subject.files", "reason": "sorted relative POSIX paths"})
     expected = digest(mapping)
     _require(manifest["subject"]["digest"] == expected, "delivery_manifest_subject_mismatch", {"expected": expected})

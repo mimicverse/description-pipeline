@@ -576,6 +576,13 @@ class PlatformStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(PlatformStoreError, "artifact inventory"):
             self._confirm_generate(receipt=self.generate_receipt(artifacts=extra))
         records = [dict(record) for record in self.artifacts]
+        duplicated = [dict(record) for record in records]
+        duplicated[1] = dict(duplicated[0])
+        with self.assertRaisesRegex(PlatformStoreError, "artifact inventory"):
+            self._confirm_generate(receipt=self.generate_receipt(artifacts=duplicated))
+        tripled = [dict(records[0]) for _ in records]
+        with self.assertRaisesRegex(PlatformStoreError, "artifact inventory"):
+            self._confirm_generate(receipt=self.generate_receipt(artifacts=tripled))
         self._confirm_generate(receipt=self.generate_receipt(artifacts=list(reversed(records))))
         self.assertEqual(self.world.stages[("r-1", "generate")][0], "completed")
 

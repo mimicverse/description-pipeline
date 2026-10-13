@@ -650,14 +650,18 @@ class PlatformStore:
             raise PlatformStoreError("The sealed delivery subject does not match the receipt")
         records = subject.get("files") or []
         artifacts = receipt.get("artifacts")
-        if not isinstance(artifacts, list) or not isinstance(records, list) or len(artifacts) != len(records):
+        from ..interface_records import InterfaceRecordError, subject_file_records
+
+        try:
+            subject_file_records(
+                artifacts if isinstance(artifacts, list) else [], "sealed_receipt_invalid", "receipt.artifacts"
+            )
+        except InterfaceRecordError as error:
+            raise PlatformStoreError("The receipt's artifact inventory does not bind the sealed delivery") from error
+        stamped = {record["path"]: (record["bytes"], record["sha256"]) for record in records}
+        received = {record["path"]: (record["bytes"], record["sha256"]) for record in artifacts}
+        if received != stamped:
             raise PlatformStoreError("The receipt's artifact inventory does not bind the sealed delivery")
-        stamped = {record.get("path"): record for record in records if isinstance(record, dict)}
-        if len(stamped) != len(records):
-            raise PlatformStoreError("The sealed delivery does not carry a complete record set")
-        for record in artifacts:
-            if not isinstance(record, dict) or stamped.get(record.get("path")) != record:
-                raise PlatformStoreError("The receipt's artifact inventory does not bind the sealed delivery")
         from ..verification.solidworks_urdf import rebuilt_definition
 
         definition = rebuilt_definition(root)
