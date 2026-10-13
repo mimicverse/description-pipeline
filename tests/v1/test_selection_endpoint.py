@@ -521,6 +521,19 @@ class SelectionEndpointTests(unittest.TestCase):
         except HTTPError as error:
             return error.code, json.loads(error.read().decode("utf-8"))
 
+    def test_default_selection_reader_shares_the_endpoint_cad_ledger(self) -> None:
+        jobs = self.jobs
+        probe = {"native_tool": {"source_sha256": "0" * 64}}
+        jobs.jobs["ledger-probe"] = probe
+        try:
+            reader = jobs._default_selection_reader("ledger-probe")
+        finally:
+            del jobs.jobs["ledger-probe"]
+        backend = reader._walker.__self__
+        self.assertEqual(jobs.cad_ownership_file, jobs.config["state_root"] / "cad-ownership.json")
+        self.assertEqual(backend._cad_ownership_file, jobs.cad_ownership_file)
+        self.assertEqual(reader._reader_sha256, "0" * 64)
+
     def test_http_routes_stage_the_full_folder_once(self) -> None:
         token = self.jobs.config["token"]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler(self.jobs, token))

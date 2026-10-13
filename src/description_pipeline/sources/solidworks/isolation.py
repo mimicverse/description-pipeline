@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import contextlib
+import datetime
 import os
 import threading
 import time
 import uuid
 from pathlib import Path
 
-from ...io import PipelineError, read_data, write_json
+from ...io import PipelineError, acquire_process_lock, read_data, write_json
 from .errors import EnvironmentError_
 
 # Published ISldWorks dual-interface IID in the SolidWorks type library.
@@ -40,6 +41,14 @@ OWNERSHIP_SCHEMA = "solidworks-to-urdf.cad-ownership/v1"
 BOOT_ID_TOLERANCE_SECONDS = 30
 #: This pipeline process; records carrying another token are earlier owners.
 _OWNER_TOKEN = uuid.uuid4().hex
+
+#: Serializes ownership-ledger read-modify-write cycles inside this process;
+#: the ledger's sidecar lock file (``acquire_process_lock``) extends the same
+#: serialization to any other process that shares the file, so concurrent
+#: writers can never silently drop each other's records.
+_LEDGER_LOCK = threading.RLock()
+OWNERSHIP_LOCK_TIMEOUT_SECONDS = 10.0
+OWNERSHIP_LOCK_POLL_SECONDS = 0.05
 
 
 def registered_executable() -> str:
@@ -110,23 +119,51 @@ def _matching_process_ids(executable: str, table) -> list[int]:
     return matched
 
 
-def _windows_terminate_pid(pid: int) -> None:
-    """Terminate one process and wait, bounded, for its exit."""
+#: FILETIME counts 100 ns ticks from 1601-01-01; pywin32 hands process times
+#: back either as FILETIME structs or as PyTime values (a datetime subclass),
+#: so both shapes normalize to this epoch.
+_CREATION_EPOCH = datetime.datetime(1601, 1, 1)
 
-    import win32api
-    import win32con
-    import win32event
 
-    handle = win32api.OpenProcess(win32con.PROCESS_TERMINATE | win32con.SYNCHRONIZE, False, pid)
-    try:
-        win32api.TerminateProcess(handle, 1)
-        win32event.WaitForSingleObject(handle, REMNANT_TERMINATE_WAIT_MS)
-    finally:
-        handle.Close()
+def _creation_ticks(snapshot) -> int | None:
+    """One stable 100 ns tick integer from a pywin32 process-times snapshot.
+
+    Different pywin32 builds expose ``GetProcessTimes`` differently: a dict
+    with a ``CreationTime`` PyTime (current builds), a four-tuple whose first
+    entry is that value (legacy), or FILETIME-shaped objects with
+    ``dwHighDateTime``/``dwLowDateTime``.  All shapes normalize here so a
+    record's identity stays exact regardless of the local pywin32 build; a
+    value that cannot be normalized returns None and is never termination
+    authority.
+    """
+
+    value = snapshot
+    if isinstance(snapshot, dict):
+        value = snapshot.get("CreationTime")
+    elif isinstance(snapshot, (tuple, list)):
+        value = snapshot[0] if snapshot else None
+    if value is None or isinstance(value, bool):
+        return None
+    high = getattr(value, "dwHighDateTime", None)
+    low = getattr(value, "dwLowDateTime", None)
+    if isinstance(high, int) and isinstance(low, int):
+        return (high << 32) | low
+    if isinstance(value, datetime.datetime):
+        moment = value
+        if moment.tzinfo is not None:
+            # The CAD host hands back timezone-aware datetimes (verified on the
+            # endpoint's own Python); normalize through UTC so the identity
+            # survives a DST change between the record write and the sweep.
+            moment = moment.astimezone(datetime.UTC).replace(tzinfo=None)
+        delta = moment - _CREATION_EPOCH
+        return ((delta.days * 86400 + delta.seconds) * 10**7) + delta.microseconds * 10
+    if isinstance(value, int):
+        return value
+    return None
 
 
 def _windows_creation_time(pid: int) -> int | None:
-    """The process creation FILETIME (100 ns ticks), or None when unreadable.
+    """The process creation moment (100 ns ticks), or None when unreadable.
 
     A pid without a readable creation time is never termination authority: it
     either exited between enumeration and this query or cannot be inspected,
@@ -140,10 +177,45 @@ def _windows_creation_time(pid: int) -> int | None:
     handle = None
     try:
         handle = win32api.OpenProcess(win32con.PROCESS_QUERY_INFORMATION, False, pid)
-        created, _exited, _kernel, _user = win32process.GetProcessTimes(handle)
-        return (created.dwHighDateTime << 32) | created.dwLowDateTime
+        return _creation_ticks(win32process.GetProcessTimes(handle))
     except Exception:  # noqa: BLE001 - unreadable processes are never terminated
         return None
+    finally:
+        if handle is not None:
+            with contextlib.suppress(Exception):
+                handle.Close()
+
+
+def _windows_terminate_matching(pid: int, creation_time: int) -> bool:
+    """Terminate ``pid`` only while it is still the recorded process.
+
+    Verification and termination share ONE handle: the creation moment is
+    read on the handle that then carries ``TerminateProcess``, so a pid
+    reused between an earlier classification read and this call can never
+    terminate its replacement.  Any open or read failure returns False
+    without killing, and the caller refuses the launch instead of pressing
+    on into a possible single-instance conflict.
+    """
+
+    import win32api
+    import win32con
+    import win32event
+    import win32process
+
+    handle = None
+    try:
+        handle = win32api.OpenProcess(
+            win32con.PROCESS_QUERY_INFORMATION | win32con.PROCESS_TERMINATE | win32con.SYNCHRONIZE,
+            False,
+            pid,
+        )
+        if _creation_ticks(win32process.GetProcessTimes(handle)) != creation_time:
+            return False
+        win32api.TerminateProcess(handle, 1)
+        win32event.WaitForSingleObject(handle, REMNANT_TERMINATE_WAIT_MS)
+        return True
+    except Exception:  # noqa: BLE001 - an unverifiable process is never terminated
+        return False
     finally:
         if handle is not None:
             with contextlib.suppress(Exception):
@@ -177,11 +249,43 @@ class OwnershipStore:
 
     A malformed or foreign ledger reads as empty: it must never become
     termination authority, and the unrecorded-process refusal covers the rest.
+    Every read-modify-write holds the module lock and the ledger's sidecar
+    lock, so two stores in one process and stores in other processes (an
+    upgraded endpoint generation, a manual capture sharing the ledger) cannot
+    lose each other's records.
     """
 
     def __init__(self, path: Path):
         self.path = Path(path)
-        self._lock = threading.Lock()
+        self.lock_path = self.path.with_name(self.path.name + ".lock")
+
+    @contextlib.contextmanager
+    def _exclusive(self):
+        """One ledger read-modify-write under the in-process and file locks.
+
+        The file lock waits, bounded: a concurrent writer only holds it for
+        one small file rewrite.  Never nest two of these.
+        """
+
+        with _LEDGER_LOCK:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            deadline = time.monotonic() + OWNERSHIP_LOCK_TIMEOUT_SECONDS
+            while True:
+                try:
+                    handle = acquire_process_lock(self.lock_path)
+                    break
+                except OSError as error:
+                    if time.monotonic() >= deadline:
+                        raise EnvironmentError_(
+                            "cad_ownership_locked",
+                            "The CAD ownership ledger is held by another process",
+                            {"path": str(self.lock_path)},
+                        ) from error
+                    time.sleep(OWNERSHIP_LOCK_POLL_SECONDS)
+            try:
+                yield
+            finally:
+                os.close(handle)
 
     def load(self) -> dict[int, dict]:
         if not self.path.is_file():
@@ -202,18 +306,24 @@ class OwnershipStore:
         return loaded
 
     def add(self, record: dict) -> None:
-        with self._lock:
+        with self._exclusive():
             records = self.load()
             records[record["pid"]] = record
             self._save(records)
 
     def remove(self, pid: int, *, creation_time=None) -> None:
-        with self._lock:
+        """Remove the record for ``pid`` only when its identity still matches.
+
+        ``creation_time`` must equal the stored record's creation moment.
+        Deleting by pid alone could remove a NEWER process's record after pid
+        reuse (the degraded-None chain made that reachable on real Windows),
+        so any removal that cannot state the identity is a no-op.
+        """
+
+        with self._exclusive():
             records = self.load()
             record = records.get(pid)
-            if record is None:
-                return
-            if creation_time is not None and record.get("creation_time") != creation_time:
+            if record is None or creation_time is None or record.get("creation_time") != creation_time:
                 return
             del records[pid]
             self._save(records)
@@ -242,14 +352,18 @@ def terminate_remnant_processes(
     crashed capture keeps the LocalServer32 registration, so the next owned
     launch would attach to the corpse and never complete startup (native18).
     Ownership is persisted per owned launch ({pid, executable, creation time,
-    host boot, owner token}); the sweep terminates a same-executable process
-    only when a record matches its image, creation time and host boot and the
-    record carries an earlier owner token.  A same-executable process with no
-    matching record is never touched - the operator is running SolidWorks
-    outside the pipeline, so the launch refuses (fail closed) instead.  PIDs
-    tracked by a live ``WindowsCadProcess`` (plus explicitly excluded ones) are
-    always skipped: they are the live owner, not a remnant.  After a kill the
-    caller settles briefly so the COM registration clears before the launch.
+    host boot, owner token, owner pid and creation time}); the sweep
+    terminates a same-executable process only when a record matches its
+    image, creation time and host boot, the record's owning process is
+    proven gone (its pid absent or reused), and the terminating call
+    re-verifies the creation moment on the very handle that kills.  A
+    same-executable process without a usable matching record is never
+    touched: an external session, an unverifiable record or a record owned
+    by another live pipeline process refuses the launch (fail closed)
+    instead.  PIDs tracked by a live ``WindowsCadProcess`` (plus explicitly
+    excluded ones) are always skipped: they are the live owner, not a
+    remnant.  After a kill the caller settles briefly so the COM
+    registration clears before the launch.
     """
 
     store = OwnershipStore(_ownership_path(ownership_file))
@@ -258,8 +372,33 @@ def terminate_remnant_processes(
     tracked = _tracked_pids() | set(exclude_pids)
     read_creation = creation_time or _windows_creation_time
     current_boot = (boot_epoch or _windows_boot_epoch)()
+    present = {row[0] for row in table}
     killed: list[int] = []
     unrecorded: list[int] = []
+    live_owner: list[int] = []
+    unverified: list[int] = []
+
+    def owner_status(record) -> str:
+        """Whether the recorded owner process is proven gone, live, or unknown.
+
+        A pid whose live creation moment equals the recorded one is that same
+        owner process: another live capture still owns this CAD server, so
+        the record is never sweepable.  A creation mismatch or an absent pid
+        proves the recorded owner gone.  Anything else cannot decide either
+        way and is not termination authority.
+        """
+
+        owner_pid = record.get("owner_pid")
+        owner_created = record.get("owner_creation_time")
+        if type(owner_pid) is not int or owner_pid <= 0 or type(owner_created) is not int:
+            return "unknown"
+        live_created = read_creation(owner_pid)
+        if live_created is None:
+            return "gone" if owner_pid not in present else "unknown"
+        if type(live_created) is not int:
+            return "unknown"
+        return "live" if live_created == owner_created else "gone"
+
     for pid in _matching_process_ids(executable, table):
         if pid in tracked:
             continue
@@ -267,12 +406,23 @@ def terminate_remnant_processes(
         if record is None:
             unrecorded.append(pid)
             continue
+        recorded_creation = record.get("creation_time")
+        if type(recorded_creation) is not int:
+            # A record without a usable identity never matches: a degraded
+            # creation read must never authorize a kill.
+            unrecorded.append(pid)
+            continue
         live_creation = read_creation(pid)
-        if live_creation is None:
-            continue  # exited between enumeration and the query; nothing to judge
+        if live_creation is None or type(live_creation) is not int:
+            # Enumerated but unreadable: it may still be the recorded process,
+            # and launching while its single-instance COM registration
+            # survives would hang the owned launch (native18).  Refuse rather
+            # than launch into a hang.
+            unverified.append(pid)
+            continue
         boot = record.get("boot_epoch")
         matches = (
-            record.get("creation_time") == live_creation
+            recorded_creation == live_creation
             and isinstance(boot, (int, float))
             and abs(float(boot) - float(current_boot)) <= BOOT_ID_TOLERANCE_SECONDS
         )
@@ -281,20 +431,45 @@ def terminate_remnant_processes(
             continue
         if record.get("owner") == _OWNER_TOKEN:
             continue  # this process's own launch; the Windows job owns its cleanup
-        (terminate_pid or _windows_terminate_pid)(pid)
+        status = owner_status(record)
+        if status == "live":
+            live_owner.append(pid)  # a live pipeline process still owns this CAD server
+            continue
+        if status == "unknown":
+            unverified.append(pid)
+            continue
+        if not (terminate_pid or _windows_terminate_matching)(pid, recorded_creation):
+            # The process changed between classification and the kill (or it
+            # could not be re-verified on the killing handle); it was NOT
+            # touched.  Fold it into the unrecorded refusal rather than
+            # launching into a possible single-instance conflict.
+            unrecorded.append(pid)
+            continue
         killed.append(pid)
-        store.remove(pid, creation_time=record.get("creation_time"))
-    present = {row[0] for row in table}
+        store.remove(pid, creation_time=recorded_creation)
     for pid in list(records):
         if pid not in present:
             store.remove(pid, creation_time=records[pid].get("creation_time"))
     if killed:
         sleep(REMNANT_SETTLE_SECONDS)
-    if unrecorded:
+    if live_owner or unverified or unrecorded:
+        detail = {
+            "executable": executable,
+            "pids": sorted(live_owner + unverified + unrecorded),
+            "live_owner_pids": sorted(live_owner),
+            "unverified_pids": sorted(unverified),
+            "unrecorded_pids": sorted(unrecorded),
+        }
+        if live_owner:
+            message = "SolidWorks is owned by another live pipeline process; retry after that capture finishes"
+        elif unverified:
+            message = "A recorded SolidWorks process cannot be verified; refusing to capture"
+        else:
+            message = "SolidWorks is running outside the pipeline; close it before capturing"
         raise EnvironmentError_(
             "cad_external_solidworks",
-            "SolidWorks is running outside the pipeline; close it before capturing",
-            {"pids": sorted(unrecorded), "executable": executable},
+            message,
+            detail,
         )
     return killed
 
@@ -304,9 +479,10 @@ class WindowsCadProcess:
 
     Closing the job kills only this process tree, and the PID is published in
     ``_TRACKED_PIDS`` so the startup remnant sweep never touches it.  Each
-    owned launch is also persisted in the ownership ledger: the sweep may only
-    terminate a process that matches its record, and any other same-executable
-    process refuses the launch instead of being killed.
+    owned launch is also persisted in the ownership ledger: the sweep may
+    only terminate a process that matches its record and whose owning process
+    is proven gone, and any other same-executable process refuses the launch
+    instead of being killed.
     """
 
     def __init__(self, executable: str, *, ownership_file: Path | None = None):
@@ -354,6 +530,7 @@ class WindowsCadProcess:
                         "boot_epoch": _windows_boot_epoch(),
                         "owner": _OWNER_TOKEN,
                         "owner_pid": os.getpid(),
+                        "owner_creation_time": _windows_creation_time(os.getpid()),
                         "recorded_at": time.time(),
                     }
                 )
@@ -374,8 +551,7 @@ class WindowsCadProcess:
         import win32process
 
         try:
-            created, _exited, _kernel, _user = win32process.GetProcessTimes(self._process)
-            return (created.dwHighDateTime << 32) | created.dwLowDateTime
+            return _creation_ticks(win32process.GetProcessTimes(self._process))
         except Exception:  # noqa: BLE001 - the record stays valid, it just cannot be swept
             return None
 

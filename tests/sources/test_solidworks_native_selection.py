@@ -571,6 +571,17 @@ class ClosureAdmissionTests(unittest.TestCase):
             NativeSelectionReader(walker=lambda *_: {}, reader_sha256="short")
         with self.assertRaises(SelectionError):
             NativeSelectionReader(walker="not-callable")
+        with self.assertRaises(SelectionError):
+            NativeSelectionReader(walker=lambda *_: {}, cad_ownership_file=Path("ledger.json"))
+        with self.assertRaises(SelectionError):
+            NativeSelectionReader(backend=object(), cad_ownership_file=Path("ledger.json"))
+
+    def test_default_backend_can_be_bound_to_a_cad_ownership_file(self) -> None:
+        ledger = Path("/state/cad-ownership.json")
+        reader = NativeSelectionReader(cad_ownership_file=ledger)
+        backend = reader._walker.__self__
+        self.assertEqual(backend._cad_ownership_file, ledger)
+        self.assertIsNone(NativeSelectionReader()._walker.__self__._cad_ownership_file)
 
 
 class SearchFolderPinTests(unittest.TestCase):

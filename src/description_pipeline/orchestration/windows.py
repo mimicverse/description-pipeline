@@ -268,6 +268,9 @@ class Jobs:
         self.selection_reader_factory = selection_reader_factory
         self.native_reader = native_reader
         self.backend_factory = backend_factory or self._sealed_backend
+        #: Every endpoint-side owned launch (selection and capture) records
+        #: into this one ledger.
+        self.cad_ownership_file = config["state_root"] / "cad-ownership.json"
         self._plans = {}
         self.directory = config["state_root"] / "jobs"
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -894,15 +897,29 @@ class Jobs:
                     raise PipelineError("Timed out waiting for the bound Linux continuation")
                 self.condition.wait(timeout=min(remaining, 10))
 
+    def _default_selection_reader(self, identifier):
+        """The selection reader shares the sealed backend's ownership ledger.
+
+        Selection (closure admission) and capture both launch SolidWorks on
+        this endpoint, so both must record into one ledger: otherwise a
+        corpse left by one path is unrecorded for the other path's sweep,
+        and the liveness semantics of the two paths diverge.
+        """
+
+        from ..sources.solidworks.native_selection import NativeSelectionReader
+
+        return NativeSelectionReader(
+            reader_sha256=self.jobs[identifier]["native_tool"]["source_sha256"],
+            cad_ownership_file=self.cad_ownership_file,
+        )
+
     def _select_native(self, identifier):
         """Resolve the fully staged folder once, then retain its proven native closure."""
         session = self.selections[identifier]
         factory = self.selection_reader_factory
         if factory is None:
-            from ..sources.solidworks.native_selection import NativeSelectionReader
-
             def factory():
-                return NativeSelectionReader(reader_sha256=self.jobs[identifier]["native_tool"]["source_sha256"])
+                return self._default_selection_reader(identifier)
 
         _require(session.state == "reading", "The complete uploaded folder must be staged before native resolution")
         _require(
@@ -1192,7 +1209,7 @@ class Jobs:
         from ..sources.solidworks.native import SolidWorksBackend
 
         native_readiness()
-        backend = SolidWorksBackend(cad_ownership_file=self.config["state_root"] / "cad-ownership.json")
+        backend = SolidWorksBackend(cad_ownership_file=self.cad_ownership_file)
         backend.configure_staged_search(package)
         backend.seal_documents([confined(package, name) for name in files])
         return backend
