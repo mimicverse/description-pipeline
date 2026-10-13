@@ -17,8 +17,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import yaml
-
 from description_pipeline.sources.solidworks.discovery import (
     CONTRACT,
     DISCOVERY_SCHEMA,
@@ -27,9 +25,10 @@ from description_pipeline.sources.solidworks.discovery import (
 )
 from description_pipeline.verification.native_discovery import verify_discovery
 
+from . import support
 from .selection_support import sealed_selection
 
-RECORD_FILE = "discovery/native-discovery.json"
+RECORD_FILE = "evidence/discovery.json"
 
 IDENTITY = [
     1.0,
@@ -269,7 +268,7 @@ class OracleSemanticsTests(unittest.TestCase):
         self.serial = 0
 
     def baseline(self, record: dict | None = None) -> Path:
-        """One package produced by the generator from the analytic fixture (or a variant)."""
+        """One delivery produced by the generator from the analytic fixture (or a variant)."""
         self.serial += 1
         source = self.tmp / f"native{self.serial}"
         for name in ("cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT"):
@@ -295,11 +294,12 @@ class OracleSemanticsTests(unittest.TestCase):
             settings=DiscoverySettings(record_roots=(records,)),
         )
         self.assertTrue(result.passed, result.findings)
-        return output
+        delivery = self.tmp / f"delivery{self.serial}"
+        return support.native_discovery_delivery(delivery, output)
 
     @staticmethod
     def _native(package: Path, mutate) -> Path:
-        """Mutate the bound record and reseal both digests, keeping the binding check honest."""
+        """Mutate the bound record and reseal the manifest, keeping the binding check honest."""
         record_path = package / RECORD_FILE
         payload = json.loads(record_path.read_text(encoding="utf-8"))
         mutate(payload["raw"], payload)
@@ -313,20 +313,13 @@ class OracleSemanticsTests(unittest.TestCase):
 
     @staticmethod
     def _seal(package: Path, payload: dict | None = None) -> None:
-        """Refresh the two digests the oracle checks after any package edit."""
+        """Write the record (when given) and refresh the delivery manifest binding."""
         record_path = package / RECORD_FILE
-        if payload is None:
-            payload = json.loads(record_path.read_text(encoding="utf-8"))
-        robot_path = package / "robot.yaml"
-        robot = yaml.safe_load(robot_path.read_text(encoding="utf-8"))
-        robot["provenance"]["discovery_sha256"] = hashlib.sha256(record_path.read_bytes()).hexdigest()
-        robot["provenance"]["native_inventory_sha256"] = hashlib.sha256(
-            (
-                json.dumps(payload["native_files"], sort_keys=True, ensure_ascii=False, allow_nan=False, indent=2)
-                + "\n"
-            ).encode()
-        ).hexdigest()
-        robot_path.write_text(yaml.safe_dump(robot, sort_keys=False), encoding="utf-8")
+        if payload is not None:
+            record_path.write_text(
+                json.dumps(payload, sort_keys=True, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            )
+        support.seal_delivery(package)
 
     def check(self, package: Path) -> tuple[bool, list[dict], dict]:
         report = verify_discovery(package)
@@ -724,14 +717,12 @@ class OracleSemanticsTests(unittest.TestCase):
 
         package = self.baseline()
         self._native(package, mutate)
-        # Let robot.yaml agree with the mutated mate graph so only the container rule can fail.
-        robot_path = package / "robot.yaml"
-        robot = yaml.safe_load(robot_path.read_text(encoding="utf-8"))
-        for body in robot["source"]["bodies"]:
+        # Let the derived carrier agree with the mutated mate graph so only the container rule can fail.
+        record = json.loads((package / RECORD_FILE).read_text(encoding="utf-8"))
+        for body in record["derived"]["bodies"]:
             if body["name"] == "base_link":
                 body["components"] = ["base-1", "sub-1"]
-        robot_path.write_text(yaml.safe_dump(robot, sort_keys=False), encoding="utf-8")
-        self._seal(package)
+        self._seal(package, record)
         passed, errors, _checks = self.check(package)
         self.assertFalse(passed, errors)
         self.assertTrue(
@@ -918,8 +909,8 @@ class OracleSemanticsTests(unittest.TestCase):
         self._native(package, strip_point_geometry)
         passed, errors, _checks = self.check(package)
         self.assertTrue(passed, errors)
-        document = yaml.safe_load((package / "robot.yaml").read_text(encoding="utf-8"))
-        bodies = [(body["name"], sorted(body["components"])) for body in document["source"]["bodies"]]
+        record = json.loads((package / RECORD_FILE).read_text(encoding="utf-8"))
+        bodies = [(body["name"], sorted(body["components"])) for body in record["derived"]["bodies"]]
         self.assertEqual(bodies, [("base_link", ["arm-1", "base-1"])])
 
     def test_lock_with_a_missing_occurrence_frame_blocks(self) -> None:
@@ -1232,11 +1223,10 @@ class OracleSemanticsTests(unittest.TestCase):
 
     def test_top_owned_interface_datum_binds_the_proven_base(self) -> None:
         def publish_frame(package: Path, parent: str) -> None:
-            robot_path = package / "robot.yaml"
-            robot = yaml.safe_load(robot_path.read_text(encoding="utf-8"))
-            robot["source"].setdefault("frames", [])
-            robot["source"]["frames"].append({"name": "tool", "parent": parent, "coordinate_system": "TCP_tool"})
-            robot_path.write_text(yaml.safe_dump(robot, sort_keys=False), encoding="utf-8")
+            record = json.loads((package / RECORD_FILE).read_text(encoding="utf-8"))
+            record["derived"].setdefault("frames", [])
+            record["derived"]["frames"].append({"name": "tool", "parent": parent, "coordinate_system": "TCP_tool"})
+            OracleSemanticsTests._seal(package, record)
 
         def add_tool_datum(raw, payload):
             raw["datums"].append({"name": "TCP_tool", "owner": "", "array": copy.deepcopy(IDENTITY)})

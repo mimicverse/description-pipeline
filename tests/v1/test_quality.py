@@ -16,7 +16,6 @@ import numpy as np
 
 from description_pipeline.io import PipelineError, canonical, write_json
 from description_pipeline.sources.solidworks import verify as oracle
-from description_pipeline.sources.solidworks.scene import closure_delta
 from description_pipeline.verification import solidworks_urdf as quality
 from description_pipeline.verification.solidworks_physics import verify_physics, verify_urdf_mass_equality
 from tests.sources import support
@@ -45,10 +44,11 @@ class PhysicsTests(unittest.TestCase):
                 }
             ],
         }
-        # The frozen tree carries one capture identity: the collection block's
-        # identity, bound to the archived source record (package-relative names).
+        # The record quotes the capture session's assembly path (an environment
+        # fact, kept verbatim); the frozen collection identity names the same
+        # document package-relative and binds the record by normalized suffix.
         self.captured_identity = {
-            "assembly": "robot.SLDASM",
+            "assembly": "C:\\endpoint\\prepared\\robot.SLDASM",
             "configuration": "Default",
         }
         material = {
@@ -217,7 +217,7 @@ class PhysicsTests(unittest.TestCase):
         self.raw["mass_properties"] = copy.deepcopy(self.masses)
         native = self._native_closure()
         source = support.default_source_record(
-            main_assembly=self.captured_identity["assembly"],
+            main_assembly="robot.SLDASM",
             configuration=self.captured_identity["configuration"],
             revision=None,
         )
@@ -256,14 +256,6 @@ class PhysicsTests(unittest.TestCase):
             capture=capture,
             source=source,
         )
-        write_json(
-            self.bundle / "reports/mass-closure.json",
-            {
-                "schema_version": "solidworks-to-urdf.mass-closure-report/v1",
-                "native": native,
-                "derived": self._derived_closure(),
-            },
-        )
 
     def block(self, name):
         return support.load_capture_block(self.root, name)
@@ -297,107 +289,6 @@ class PhysicsTests(unittest.TestCase):
         for key in ("leaf_total", "leaf_components", "delta", "effective_total", "blockers"):
             native.pop(key, None)
         return native
-
-    def _derived_closure(self):
-        """The Linux-side derived diagnostics the report must carry."""
-
-        context = self.closure["component_context"]
-        rows = [row for row in context.get("instances") or [] if isinstance(row, dict)]
-        leaves = [row["name"] for row in self.raw["components"]]
-        masses_by_name = {name: float(row["mass"]) for name, row in self.masses.items()}
-        basis = {
-            row["name"]: sum(
-                mass
-                for leaf, mass in masses_by_name.items()
-                if leaf == row["name"] or leaf.startswith(row["name"] + "/")
-            )
-            for row in rows
-        }
-        top_rows = [row for row in rows if row.get("depth") == 0]
-        context_kg = sum(float(row["context_mass_kg"]) for row in top_rows)
-        document_kg = sum(basis[row["name"]] for row in top_rows)
-        assembly_kg = context.get("assembly_mass_kg")
-        part_rows = {row["name"] for row in rows if row.get("document_type") == "part"}
-        covered = {leaf for leaf in leaves if leaf in part_rows}
-        effective = copy.deepcopy(self.closure.get("effective_total"))
-        if effective is None:
-            effective = {**copy.deepcopy(self.closure["leaf_total"]), "substituted": []}
-        effective.setdefault("substituted", [])
-        body_members = {
-            str(component)
-            for body in self.source.get("bodies") or []
-            for component in body.get("components") or []
-        }
-        by_instance = {
-            str(row.get("name")): row
-            for row in ((self.closure.get("component_context") or {}).get("instances") or [])
-            if isinstance(row, dict)
-        }
-        unassigned = []
-        for name in sorted(set(leaves) - body_members):
-            row = by_instance[name]
-            unassigned.append(
-                {
-                    "component": name,
-                    "document": row.get("document"),
-                    "configuration": ((self.masses.get(name) or {}).get("reference") or {}).get("configuration"),
-                    "parent": row.get("parent"),
-                    "mass_kg": float(row["context_mass_kg"]),
-                }
-            )
-        unassigned_mass = float(sum(item["mass_kg"] for item in unassigned))
-        whole_mass = float(self.closure["top_level"]["mass"])
-        effective_mass = float(effective["mass"])
-        selection = {
-            "native_mass_kg": whole_mass,
-            "selected_mass_kg": effective_mass - unassigned_mass,
-            "unassigned_mass_kg": unassigned_mass,
-            "unassigned": unassigned,
-            "accounting_delta_kg": whole_mass - effective_mass,
-            "whole_mass_qualified": not unassigned and abs(whole_mass - effective_mass) <= 1e-12,
-        }
-        return {
-            "leaf_total": copy.deepcopy(self.closure["leaf_total"]),
-            "effective_total": effective,
-            "blockers": copy.deepcopy(self.closure.get("blockers") or []),
-            "delta": closure_delta(self.closure["top_level"], self.closure["leaf_total"]),
-            "totals": {
-                "context_kg": context_kg,
-                "document_kg": document_kg,
-                "assembly_kg": assembly_kg,
-                "context_minus_document_kg": context_kg - document_kg,
-                "context_minus_assembly_kg": None if assembly_kg is None else context_kg - assembly_kg,
-            },
-            "overridden": {
-                "top_level_instances": len(top_rows),
-                "mass": sum(1 for row in rows if (row.get("overrides") or {}).get("OverrideMass")),
-                "com": sum(1 for row in rows if (row.get("overrides") or {}).get("OverrideCenterOfMass")),
-                "inertia": sum(
-                    1 for row in rows if (row.get("overrides") or {}).get("OverrideMomentsOfInertia")
-                ),
-                "any": sum(1 for row in rows if any((row.get("overrides") or {}).values())),
-                "top_level_overridden": sum(
-                    1 for row in top_rows if any((row.get("overrides") or {}).values())
-                ),
-                "examples": [
-                    row["name"] for row in rows if (row.get("overrides") or {}).get("OverrideMass")
-                ][:50],
-            },
-            "coverage": {
-                "leaf_documents": len(leaves),
-                "leaf_documents_covered": len(covered),
-                "leaf_documents_uncovered": sorted(set(leaves) - covered)[:50],
-            },
-            "instances": {
-                row["name"]: {
-                    "name": row["name"],
-                    "document_basis_mass_kg": basis[row["name"]],
-                    "delta_kg": float(row["context_mass_kg"]) - basis[row["name"]],
-                }
-                for row in rows
-            },
-            "selection": selection,
-        }
 
     def failures(self):
         self.write()
@@ -836,9 +727,11 @@ class PhysicsTests(unittest.TestCase):
             store(payload)
 
         def changed_captured_assembly() -> None:
-            self._record_unverified_material()
+            # The record seals the capture-session path it was read under; the
+            # frozen source identity names another document, so the suffix
+            # binding must refuse.
             self.captured_identity["assembly"] = "C:\\endpoint\\prepared\\other.SLDASM"
-            self.write()
+            self._record_unverified_material()
 
         def changed_record_configuration() -> None:
             self._record_unverified_material()

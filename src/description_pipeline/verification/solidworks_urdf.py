@@ -373,10 +373,16 @@ def _dependencies(root, definition):
             any(tail == suffix or tail.endswith("\\" + suffix) for suffix in selected_suffixes),
             f"A seeded required leaf is not a selected source: {path}",
         )
-    collection = read_data(root / "evidence/evidence/collection.json")
-    _require(collection["dependency_closure"] == closure, "Collection dependency record differs")
+    # The frozen tree keeps the dependency closure and the source-stability
+    # record once, as capture blocks (the old evidence collection file no longer
+    # enters the delivery tree).  The closure block is re-read against the
+    # record these checks consumed, and the stability record must cover the
+    # captured input inventory.
+    capture = ev.capture(root)
+    _require(capture.get("dependency_closure") == closure, "Capture dependency record differs")
+    stability = capture.get("originals_unchanged")
     _require(
-        collection["capture"]["originals_unchanged"]["files_checked"] == len(original),
+        isinstance(stability, dict) and stability.get("files_checked") == len(original),
         "Source stability was not verified",
     )
     return {

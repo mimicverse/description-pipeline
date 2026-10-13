@@ -14,8 +14,8 @@ from xml.etree import ElementTree as ET
 
 import numpy as np
 
-from ..io import PipelineError, confined, read_data
-from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, LINK_GROUP_MASS_SCHEMA, MASS_CLOSURE_REPORT_SCHEMA
+from ..io import PipelineError, confined
+from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, LINK_GROUP_MASS_SCHEMA
 from ..sources.solidworks import verify as oracle
 from . import evidence_tree as ev
 
@@ -365,6 +365,23 @@ def _capture_identity(root):
     return identity
 
 
+def _record_assembly_belongs(record_assembly, main_assembly) -> bool:
+    """Whether a record's capture-session assembly path names the frozen main assembly.
+
+    The record quotes the assembly path of the capture session (an environment
+    fact, kept verbatim and never rewritten); the frozen source identity names
+    the same document package-relative.  The binding is a normalized suffix
+    match: POSIX separators plus casefold, then the recorded path must end with
+    ``"/" + main_assembly``.
+    """
+
+    if not isinstance(record_assembly, str) or not isinstance(main_assembly, str) or not main_assembly:
+        return False
+    recorded = record_assembly.replace("\\", "/").casefold()
+    expected = main_assembly.replace("\\", "/").casefold()
+    return recorded.endswith("/" + expected)
+
+
 def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]:
     checks = []
 
@@ -472,7 +489,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
         # bound to the archived source record); the record must belong to it.
         identity = _capture_identity(root)
         _require(
-            record.get("assembly") == identity["main_assembly"],
+            _record_assembly_belongs(record.get("assembly"), identity["main_assembly"]),
             "Material provenance assembly differs from the capture identity",
         )
         _require(
@@ -555,7 +572,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
             "Effective instance schema changed",
         )
         _require(
-            record.get("assembly") == identity["main_assembly"],
+            _record_assembly_belongs(record.get("assembly"), identity["main_assembly"]),
             "Effective instance record belongs to another assembly",
         )
         _require(
@@ -1000,20 +1017,6 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
 
     def closure():
         payload = ev.mass_closure(root)
-        report_path = Path(root).parent / "reports" / "mass-closure.json"
-        report = None
-        if report_path.is_file():
-            report = read_data(report_path)
-            _require(
-                isinstance(report, dict) and report.get("schema_version") == MASS_CLOSURE_REPORT_SCHEMA,
-                "Mass closure report schema changed",
-            )
-            _require(
-                report.get("native") == payload,
-                "Mass closure report native section differs from the captured record",
-            )
-        elif source.get("material_source") == "cad":
-            _require(False, "The Linux mass closure report is missing")
         _require(
             payload["status"] == "recorded" and payload["mode"] == "full",
             "Full whole-assembly physics evidence is required",
@@ -1045,13 +1048,11 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
                 == {"OverrideMass": False, "OverrideCenterOfMass": False, "OverrideMomentsOfInertia": False},
                 name + ": instance measurement flags differ from the native context",
             )
-        derived = report.get("derived") if isinstance(report, dict) else None
-        if report is not None:
-            _require(isinstance(derived, dict), "Mass closure report carries no derived block")
+        # The full closure ledger is recomputed here from the sealed capture
+        # observations (the mass_closure block, the direct link group record and
+        # the per-row readings).  The old CAD-owned mass-closure report is no
+        # longer a delivery artifact and is never consumed.
         mine = _derive_closure(payload, raw, masses, source)
-        if derived is not None:
-            _compare_derived(derived, mine, "derived", _require)
-            _require(not derived.get("blockers"), "Effective substitution blockers were recorded")
         _require(not mine["blockers"], "Effective substitution spans bodies")
         body = {"id": "assembly", "components": [row["name"] for row in raw["components"]]}
         recombination = oracle._raw_world(body, raw, masses, {})
@@ -1095,16 +1096,21 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
             com_atol=CLOSURE_COM_ATOL_M,
             tensor_rtol=CLOSURE_TENSOR_RTOL,
         )
-        if derived is not None:
-            _compare(
-                (
-                    float(derived["effective_total"]["mass"]),
-                    np.asarray(derived["effective_total"]["com"]),
-                    np.asarray(derived["effective_total"]["inertia"]),
-                ),
-                expected_recombination,
-                "Reported effective closure",
-            )
+        # The ledger's effective closure (the per-occurrence recombination) must
+        # close against the sealed whole-assembly reading; this is the same
+        # two-computation comparison the reconciliation bounds are calibrated
+        # for (native9 probe: 2.627e-4 m COM, 2.232e-3 relative tensor gap).
+        _compare(
+            top,
+            (
+                float(mine["effective_total"]["mass"]),
+                np.asarray(mine["effective_total"]["com"]),
+                np.asarray(mine["effective_total"]["inertia"]),
+            ),
+            "Effective closure",
+            com_atol=CLOSURE_COM_ATOL_M,
+            tensor_rtol=CLOSURE_TENSOR_RTOL,
+        )
         enriched_rows = []
         for row in context["instances"]:
             if not isinstance(row, dict):
@@ -1129,6 +1135,13 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
             "independent_mass_kg": expected_recombination[0],
             "direct_sum_mass_kg": direct_sum[0],
             "reconciliation": reconciliation,
+            # The ledger narrative lives in the single quality report (this
+            # check's details), not in a separate closure report.
+            "ledger": {
+                "blockers": mine.get("blockers"),
+                "totals": mine.get("totals"),
+                "coverage": mine.get("coverage"),
+            },
             # JSON model types only: the report schema is a document, and tuple
             # keys would not survive the saved-report round trip.
             "effective_instances": [[name, code] for name, code in sorted(entries)],
@@ -1406,36 +1419,3 @@ def _derive_closure(native: dict, raw_scene: dict, masses: dict, source: dict) -
         "selection": selection,
     }
 
-
-def _compare_derived(recorded, mine, label: str, _require) -> None:
-    """Bind the Linux report's derived block to the verifier's own recomputation."""
-
-    if isinstance(mine, dict):
-        _require(isinstance(recorded, dict) and set(recorded) == set(mine), label + ": derived keys changed")
-        for key in sorted(mine):
-            _compare_derived(recorded[key], mine[key], label + "." + key, _require)
-        return
-    if isinstance(mine, list):
-        _require(isinstance(recorded, list) and len(recorded) == len(mine), label + ": derived list changed")
-        left = list(recorded)
-        right = list(mine)
-        if right and all(isinstance(item, str) for item in right):
-            left, right = sorted(left), sorted(right)
-        elif right and all(isinstance(item, dict) and "name" in item for item in right):
-            left = sorted(left, key=lambda item: item.get("name"))
-            right = sorted(right, key=lambda item: item.get("name"))
-        for index, (recorded_item, mine_item) in enumerate(zip(left, right, strict=True)):
-            _compare_derived(recorded_item, mine_item, f"{label}[{index}]", _require)
-        return
-    if isinstance(mine, bool) or mine is None or isinstance(mine, str):
-        _require(recorded == mine, label + ": derived value changed")
-        return
-    if isinstance(mine, (int, float)):
-        _require(
-            isinstance(recorded, (int, float))
-            and not isinstance(recorded, bool)
-            and abs(float(recorded) - float(mine)) <= max(1e-12, 1e-6 * abs(float(mine))),
-            label + ": derived number changed",
-        )
-        return
-    _require(recorded == mine, label + ": derived value changed")
