@@ -213,6 +213,93 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(result["url"], "https://github.com/example/m3.0/pull/1")
         self.assertEqual(result["commit"], self.fx.remote_head())
 
+    def _advance_base(self) -> None:
+        (self.fx.seed / "README.md").write_text("independent remote base update\n", encoding="utf-8")
+        run("git", "add", "README.md", cwd=self.fx.seed)
+        run("git", "commit", "-m", "review external base advance", cwd=self.fx.seed)
+        run("git", "push", "origin", "feature/m3.0", cwd=self.fx.seed)
+
+    def test_candidate_head_rewind_is_refused_without_overwriting(self):
+        """A rewound candidate head must be a CAS conflict, never an overwrite."""
+
+        first = self.submit()
+        self.assertIn(first["state"], {"published", "updated"})
+        fixed_base = self.fx.remote_head("feature/m3.0")
+        fixed_head = self.fx.remote_head()
+        self.fx.write_bundle("rewind race evidence\n")
+        real_git = urdf_pr._git
+        injected = False
+
+        def git_with_race(repository, *args, **kwargs):
+            nonlocal injected
+            if not injected and args[:1] == ("push",):
+                injected = True
+                run(
+                    "git",
+                    "--git-dir",
+                    str(self.fx.remote),
+                    "update-ref",
+                    f"refs/heads/{BRANCH}",
+                    fixed_base,
+                    fixed_head,
+                )
+            return real_git(repository, *args, **kwargs)
+
+        with mock.patch.object(urdf_pr, "_git", side_effect=git_with_race):
+            result = self.submit()
+        self.assertTrue(injected)
+        self.assertEqual(result["state"], "unresolved")
+        self.assertEqual(result["error"], "candidate_head_changed")
+        self.assertIn("retry", result)
+        # The rewound remote head stays exactly where the race left it.
+        self.assertEqual(self.fx.remote_head(), fixed_base)
+
+    def test_base_advance_after_planning_ends_unresolved_not_updated(self):
+        first = self.submit()
+        self.assertIn(first["state"], {"published", "updated"})
+        self.fx.write_bundle("base race evidence\n")
+        real_git = urdf_pr._git
+        injected = False
+
+        def git_with_race(repository, *args, **kwargs):
+            nonlocal injected
+            if not injected and args[:1] == ("push",):
+                injected = True
+                self._advance_base()
+            return real_git(repository, *args, **kwargs)
+
+        with mock.patch.object(urdf_pr, "_git", side_effect=git_with_race):
+            result = self.submit()
+        self.assertTrue(injected)
+        self.assertEqual(result["state"], "unresolved")
+        self.assertEqual(result["error"], "base_moved_after_push")
+        self.assertIn("retry", result)
+        # The candidate write is retained for reconciliation, never a success.
+        self.assertEqual(result["commit"], self.fx.remote_head())
+
+    def test_base_advance_before_final_confirmation_ends_unresolved(self):
+        first = self.submit()
+        self.assertIn(first["state"], {"published", "updated"})
+        self.fx.write_bundle("final confirmation race evidence\n")
+        real_gh = urdf_pr._gh
+        injected = False
+
+        def gh_with_race(repository, *args):
+            nonlocal injected
+            if not injected and args[:2] == ("pr", "view"):
+                injected = True
+                self._advance_base()
+            return real_gh(repository, *args)
+
+        with mock.patch.object(urdf_pr, "_gh", side_effect=gh_with_race):
+            result = self.submit()
+        self.assertTrue(injected)
+        self.assertEqual(result["state"], "unresolved")
+        self.assertEqual(result["error"], "base_moved_after_push")
+        self.assertIn("retry", result)
+        self.assertEqual(result["url"], "https://github.com/example/m3.0/pull/1")
+        self.assertEqual(result["commit"], self.fx.remote_head())
+
     def submit(self, **kwargs):
         return urdf_pr.submit_bundle(self.fx.bundle, self.fx.repo, base="feature/m3.0", branch=BRANCH, **kwargs)
 

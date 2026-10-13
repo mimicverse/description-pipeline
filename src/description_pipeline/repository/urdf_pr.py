@@ -104,6 +104,36 @@ def _remote_branch(repository: Path, branch: str) -> tuple[str, str]:
     return sha, message
 
 
+def _remote_ref(repository: Path, ref: str) -> str:
+    """One remote ref exactly as the remote currently answers (empty when absent)."""
+
+    listing = _git(repository, "ls-remote", "origin", ref).stdout.strip()
+    return listing.split()[0] if listing else ""
+
+
+def _unresolved(code: str, detail, *, commit: str, branch: str, subject: str, base: str, url: str = "") -> dict:
+    """A side-effect-unknown or baseline-changed receipt that blocks on reconciliation."""
+
+    return {
+        "state": "unresolved",
+        "error": code,
+        "detail": detail,
+        "commit": commit,
+        "branch": branch,
+        "subject": subject,
+        "base": base,
+        "url": url,
+        "retry": {
+            "command": f"git ls-remote origin refs/heads/{base} refs/heads/{branch}",
+            "note": (
+                "re-read both remote refs; nothing was written"
+                if not commit
+                else "reconcile the retained candidate write against the advanced base"
+            ),
+        },
+    }
+
+
 def _serialize(report: dict) -> str:
     return json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
 
@@ -611,16 +641,101 @@ def submit_bundle(
                 },
             )
             phase = "publication.receipt"
+            # IF-12: re-check the baseline immediately before the write.  A base
+            # that moved since planning refuses this stale merge without any
+            # write; the receipt is unresolved for reconciliation.
+            observed_base = _remote_ref(repository, f"refs/heads/{base}")
+            if observed_base != base_sha:
+                observed(
+                    "publication.receipt",
+                    "failed",
+                    {"error": "base_moved_before_write", "planned_base": base_sha, "observed_base": observed_base},
+                )
+                return _unresolved(
+                    "base_moved_before_write",
+                    {"planned_base": base_sha, "observed_base": observed_base},
+                    commit="",
+                    branch=branch,
+                    subject=subject,
+                    base=base,
+                )
             if not noop or commit != head_sha:
-                _git(worktree, "push", "origin", f"HEAD:refs/heads/{branch}")
+                # Conditional write: the candidate branch may only move from the
+                # exact head this plan read (an empty expectation means the
+                # branch must still not exist).  A rewound or re-created head
+                # must never be overwritten.
+                try:
+                    _git(
+                        worktree,
+                        "push",
+                        f"--force-with-lease=refs/heads/{branch}:{head_sha}",
+                        "origin",
+                        f"HEAD:refs/heads/{branch}",
+                    )
+                except subprocess.CalledProcessError:
+                    moved_base = _remote_ref(repository, f"refs/heads/{base}")
+                    if moved_base != base_sha:
+                        observed(
+                            "publication.receipt",
+                            "failed",
+                            {"error": "base_moved_before_write", "planned_base": base_sha, "observed_base": moved_base},
+                        )
+                        return _unresolved(
+                            "base_moved_before_write",
+                            {"planned_base": base_sha, "observed_base": moved_base},
+                            commit="",
+                            branch=branch,
+                            subject=subject,
+                            base=base,
+                        )
+                    observed_head = _remote_ref(repository, f"refs/heads/{branch}")
+                    if observed_head != head_sha:
+                        observed(
+                            "publication.receipt",
+                            "failed",
+                            {
+                                "error": "candidate_head_changed",
+                                "expected_head": head_sha,
+                                "observed_head": observed_head,
+                            },
+                        )
+                        return _unresolved(
+                            "candidate_head_changed",
+                            {"expected_head": head_sha, "observed_head": observed_head},
+                            commit="",
+                            branch=branch,
+                            subject=subject,
+                            base=base,
+                        )
+                    raise
             pushed = commit
         finally:
             _git(repository, "worktree", "remove", "--force", str(worktree), check=False)
             _git(repository, "worktree", "prune", check=False)
             shutil.rmtree(staging, ignore_errors=True)
-        if _git(repository, "ls-remote", "origin", f"refs/heads/{branch}").stdout.split()[:1] != [pushed]:
+        if _remote_ref(repository, f"refs/heads/{branch}") != pushed:
             raise PrError("remote_head_mismatch", {"expected": pushed})
         state, url = _pr(repository, slug, base, branch, subject, pushed, report, message)
+        # Final confirmation: the baseline must still be the one this candidate
+        # was planned and merged against.  When it moved after the candidate
+        # write, the write is retained and the receipt stays unresolved for
+        # reconciliation - never a success.
+        confirmed_base = _remote_ref(repository, f"refs/heads/{base}")
+        if confirmed_base != base_sha:
+            observed(
+                "publication.receipt",
+                "failed",
+                {"error": "base_moved_after_push", "planned_base": base_sha, "observed_base": confirmed_base},
+            )
+            return _unresolved(
+                "base_moved_after_push",
+                {"planned_base": base_sha, "observed_base": confirmed_base, "commit": pushed},
+                commit=pushed,
+                branch=branch,
+                subject=subject,
+                base=base,
+                url=url,
+            )
         content_noop = noop and pushed == head_sha
         result = {
             "state": "noop" if content_noop else state,
