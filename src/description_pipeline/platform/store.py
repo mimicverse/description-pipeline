@@ -46,6 +46,12 @@ class AdmissionClosedError(PlatformStoreError):
     code = "admission_closed"
 
 
+class RunNotAdmittedError(PlatformStoreError):
+    """A display write named a run that has no platform row."""
+
+    code = "run_not_admitted"
+
+
 class OperationConflictError(PlatformStoreError):
     """The same operation key reappeared with a different scope or parameters."""
 
@@ -724,7 +730,7 @@ class PlatformStore:
             cursor.execute(statement, parameters)
             row = cursor.fetchone()
         if row is None:
-            raise PlatformStoreError(f"The run {run_id!r} is not admitted")
+            raise RunNotAdmittedError(f"The run {run_id!r} is not admitted")
         return RunDisplay(*row)
 
     def lifecycle_rows(self) -> list[dict]:

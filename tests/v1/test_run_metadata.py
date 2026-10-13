@@ -356,6 +356,22 @@ class RunMetadataTests(unittest.TestCase):
         status, _, body = client.request("DELETE", f"/api/runs/{run_id}")
         self.assertEqual(status, 503, body)
 
+    def test_runs_without_a_platform_row_refuse_display_writes(self) -> None:
+        run_id = self._seed(self._uuid())
+        self.world.run_display_rows.pop(run_id)
+        for method, path, payload in (
+            ("PATCH", f"/api/runs/{run_id}", {"title": "x"}),
+            ("DELETE", f"/api/runs/{run_id}", None),
+            ("POST", f"/api/runs/{run_id}/restore", None),
+        ):
+            with self.subTest(case=method):
+                status, _, body = self.client.request(method, path, payload)
+                self.assertEqual(status, 404, body)
+                self.assertIn("平台登记", json.loads(body)["error"])
+        status, _, body = self.client.request("GET", f"/api/runs/{run_id}")
+        self.assertEqual(status, 200, body)
+        self.assertFalse(json.loads(body)["deleted"])
+
     def test_unknown_native_status_refuses_and_list_failure_is_503(self) -> None:
         run_id = self._seed(self._uuid())
         from unittest import mock

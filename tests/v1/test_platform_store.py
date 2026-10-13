@@ -23,6 +23,7 @@ from description_pipeline.platform.store import (
     OperationConflictError,
     PlatformStore,
     PlatformStoreError,
+    RunNotAdmittedError,
 )
 from description_pipeline.runtime import tool_record
 from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
@@ -677,11 +678,11 @@ class PlatformStoreTests(unittest.TestCase):
         self.assertNotIn("r-1", self.store.run_displays(), "a run without display data is not listed")
 
     def test_run_display_writes_refuse_a_run_without_a_platform_row(self) -> None:
-        with self.assertRaisesRegex(PlatformStoreError, "is not admitted"):
+        with self.assertRaisesRegex(RunNotAdmittedError, "is not admitted"):
             self.store.set_run_display("r-9", "x")
-        with self.assertRaisesRegex(PlatformStoreError, "is not admitted"):
+        with self.assertRaisesRegex(RunNotAdmittedError, "is not admitted"):
             self.store.hide_run("r-9", actor="崔工")
-        with self.assertRaisesRegex(PlatformStoreError, "is not admitted"):
+        with self.assertRaisesRegex(RunNotAdmittedError, "is not admitted"):
             self.store.restore_run("r-9")
         self.assertIsNone(self.store.run_display("r-9"))
 

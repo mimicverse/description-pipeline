@@ -58,7 +58,7 @@ from .airflow_client import (
     verified_result,
 )
 from ..io import PipelineError, digest
-from ..platform.store import AdmissionClosedError, PlatformStore, PlatformStoreError
+from ..platform.store import AdmissionClosedError, PlatformStore, PlatformStoreError, RunNotAdmittedError
 from ..ports import PORTAL_HTTP_PORT
 from .linux_store import LinuxStore
 from .stage_transfer import TEAM_REPORTS
@@ -1376,6 +1376,8 @@ class PortalApp:
             raise PortalError(HTTPStatus.BAD_REQUEST, str(error)) from error
         try:
             display = self._platform().set_run_display(dag_run_id, title)
+        except RunNotAdmittedError as error:
+            raise PortalError(HTTPStatus.NOT_FOUND, "该运行没有平台登记，无法重命名") from error
         except PlatformStoreError as error:
             log.error("run display rename failed: %s", error)
             raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用，请稍后重试") from error
@@ -1408,6 +1410,8 @@ class PortalApp:
                 )
             try:
                 display = self._platform().hide_run(dag_run_id, actor=self._actor_label(session, dag_run_id, run))
+            except RunNotAdmittedError as error:
+                raise PortalError(HTTPStatus.NOT_FOUND, "该运行没有平台登记，无法删除") from error
             except PlatformStoreError as error:
                 log.error("run display hide failed: %s", error)
                 raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用，请稍后重试") from error
@@ -1459,6 +1463,8 @@ class PortalApp:
             raise PortalError(HTTPStatus.FORBIDDEN, "只有发起人或平台管理员可恢复此运行")
         try:
             overlay = _display_overlay(self._platform().restore_run(dag_run_id))
+        except RunNotAdmittedError as error:
+            raise PortalError(HTTPStatus.NOT_FOUND, "该运行没有平台登记，无法恢复") from error
         except PlatformStoreError as error:
             log.error("run display restore failed: %s", error)
             raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用，请稍后重试") from error
