@@ -592,24 +592,34 @@ def _same_request(job: dict, request: dict) -> None:
     start_date=datetime(2026, 1, 1),
     catchup=False,
     tags=["solidworks", "urdf", "windows"],
+    description="Engineering folder → native capture → verified URDF + review PR",
     default_args={"retries": 2, "retry_delay": timedelta(seconds=15)},
     doc_md=(
-        "# SolidWorks to URDF\n\nLinux admits the sealed engineering folder and stages the complete uploaded "
-        "folder to the Windows endpoint; the native engine resolves the main assembly's references inside "
-        "that staging and the sealed closure fixes what the capture reads. The native host reads the raw "
-        "discovery record and, after Linux derives the prepared package from the sealed selection, captures "
-        "the native evidence. "
-        "Linux then generates the URDF, independently verifies it and publishes the PR. The graph "
-        "coordinates these six engineering stages; transport and polling are orchestration tasks.\n\n"
-        + contract_markdown()
-        + "\n\nRun results: `wait_for_job` logs native stage checks; `run_generate`, `run_verify` and "
-        "`run_publish` log Linux stage results. Their `engineering_stages` XComs retain stage summaries, "
-        "including failures. The operator page shows "
-        "inputs, checks, outputs and evidence per stage; `reports/stages.json` retains the detailed receipt. "
-        "Delivered and failed native runs also retain the structural-team report at "
-        "`reports/structural-team.md` and `reports/structural-team.json`. "
-        "Engineering review scope stays with the bound review records; the platform reports it without "
-        "claiming approvals are pending or complete."
+        "# SolidWorks → URDF\n\n"
+        "One engineering folder becomes a verified URDF delivery and a review PR. Linux admits the sealed "
+        "folder and stages it to the Windows endpoint; the native engine resolves the main assembly's "
+        "references inside that staging and captures the native evidence; Linux then generates the URDF, "
+        "independently verifies it and publishes the PR. Transport and polling are orchestration tasks.\n\n"
+        "## Read a run in the grid\n\n"
+        "| Task | Stage | What it means |\n"
+        "|---|---|---|\n"
+        "| `resolve_handoff` | freeze | Admitted folder, file inventory and handoff digest |\n"
+        "| `start_job`, `wait_for_job` | discover, capture | Windows native half: reference resolution, "
+        "definition exchange and capture; native stage checks appear in these logs |\n"
+        "| `fetch_capture` | capture | Sealed native capture imported into the Linux attempt store |\n"
+        "| `run_generate`, `run_verify`, `run_publish` | generate, verify, publish | Linux URDF generation, "
+        "independent verification and review PR |\n"
+        "| `confirm_job` | — | Final six-stage receipt and the delivery summary (PR, commit, subject) |\n\n"
+        "## Stage contract\n\n" + contract_markdown() + "\n\n## Where results live\n\n"
+        "- Task logs: native stage checks in `wait_for_job`; Linux results "
+        "(`portable stage=... state=... checks=n/m`) in `run_generate` / `run_verify` / `run_publish`; "
+        "the delivery summary in `confirm_job`.\n"
+        "- Per-run XCom `engineering_stages`; detailed receipt at `reports/stages.json`; delivered or "
+        "failed native runs also retain the structural-team report at `reports/structural-team.md` and "
+        "`reports/structural-team.json`.\n"
+        "- The operator page shows inputs, checks, outputs and evidence per stage. Engineering review "
+        "scope stays with the bound review records; the platform reports it without claiming approvals "
+        "are pending or complete.\n"
     ),
     params={
         "handoff_path": Param(
@@ -649,7 +659,11 @@ def _same_request(job: dict, request: dict) -> None:
     },
 )
 def solidworks_to_urdf():
-    @task(doc_md="Collect the admitted native folder and bind its file inventory for the queued engineering job.")
+    @task(
+        doc_md=(
+            "Freeze stage: admit the sealed folder, bind its file inventory and handoff digest for the engineering job."
+        )
+    )
     def resolve_handoff(**context) -> dict:
         linked = _linked_conf(context)
         if linked is not None:
@@ -760,7 +774,9 @@ def solidworks_to_urdf():
         log.info("started run_id=%s status=%s", job["run_id"], job["status"])
         return {**request, "status": job["status"]}
 
-    @task(doc_md="Import the sealed native capture into the Linux attempt store and bind routing.")
+    @task(
+        doc_md=("Capture stage: import the sealed native capture into the Linux store and bind routing for generation.")
+    )
     def fetch_capture(request: dict) -> dict:
         store = _linux_store(request["conn_id"])
         run_id = request["run_id"]
@@ -801,7 +817,7 @@ def solidworks_to_urdf():
         )
         return {"request": request, **binding}
 
-    @task(doc_md="Generate the model on Linux; this checkpoint is intentionally unverified.")
+    @task(doc_md="Generate stage: build the URDF on Linux; this checkpoint is intentionally unverified.")
     def run_generate(binding: dict, **context) -> dict:
         if binding.get("from_stage") in {"verify", "publish"}:
             # The linked attempt resumes past generation: reuse the parent checkpoint.
@@ -813,7 +829,7 @@ def solidworks_to_urdf():
         _portable_report(receipt, stage="generate", context=context)
         return {**binding, "generate": _portable_summary(receipt, stage="generate")}
 
-    @task(doc_md="Independent verification on Linux, including the MuJoCo consumer.")
+    @task(doc_md="Verify stage: independent verification on Linux, including the MuJoCo consumer.")
     def run_verify(generated: dict, **context) -> dict:
         if generated.get("from_stage") == "publish":
             # The linked attempt resumes past verification: reuse the parent checkpoint.
@@ -834,7 +850,11 @@ def solidworks_to_urdf():
         _portable_report(receipt, stage="verify", context=context)
         return {**generated, "verify": _portable_summary(receipt, stage="verify")}
 
-    @task(doc_md="Publish the verified delivery from Linux; no repository work happens on Windows.")
+    @task(
+        doc_md=(
+            "Publish stage: publish the verified delivery as the review PR from Linux; no repository work on Windows."
+        )
+    )
     def run_publish(verified: dict, **context) -> dict:
         subject = (verified.get("verify") or {}).get("subject_sha256")
         if not subject:
@@ -856,7 +876,7 @@ def solidworks_to_urdf():
         _portable_report(receipt, stage="publish", context=context)
         return {**verified, "publish": _portable_summary(receipt, stage="publish")}
 
-    @task(doc_md="Confirm the six-stage receipt and the verified candidate PR from the Linux store.")
+    @task(doc_md="Confirm the six-stage receipt and report the delivery (PR, commit, subject).")
     def confirm_job(published: dict) -> dict:
         request = published["request"]
         run_id = request["run_id"]
@@ -895,11 +915,20 @@ def solidworks_to_urdf():
             expected_slug=routing["repository_slug"],
             expected_base=routing["repository_base"],
         )
+        submission = result.get("submission") or {}
         log.info(
-            "published run_id=%s quality=%s submission=%s",
+            "delivered run_id=%s hardware=%s revision=%s subject=%s state=%s",
             run_id,
-            result.get("quality"),
-            result.get("submission"),
+            routing["hardware_id"],
+            routing["revision"],
+            result["quality"].get("subject_sha256"),
+            submission.get("state"),
+        )
+        log.info(
+            "delivered pr=%s commit=%s base=%s",
+            submission.get("url"),
+            submission.get("commit"),
+            submission.get("base"),
         )
         return {
             "run_id": run_id,
