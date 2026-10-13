@@ -21,14 +21,26 @@ CONTRACT_FILE_SHA256 = file_digest(Path(__file__).with_name("stage-contract.json
 STAGE_IDS = tuple(stage["id"] for stage in CONTRACT["stages"])
 #: Discovery combines Windows observations with Linux derivation. Capture stays
 #: native; generation, verification and publication stay portable.
-HOST_IDS = ("native", "portable", "native+portable")
-HOST_BY_STAGE = {stage["id"]: stage.get("host") for stage in CONTRACT["stages"]}
-if set(HOST_BY_STAGE.values()) - set(HOST_IDS) or any(host is None for host in HOST_BY_STAGE.values()):
+HOST_IDS = ("linux", "windows")
+HOST_BY_STAGE = {stage["id"]: tuple(stage.get("hosts") or ()) for stage in CONTRACT["stages"]}
+if any(
+    not hosts or len(set(hosts)) != len(hosts) or set(hosts) - set(HOST_IDS)
+    for hosts in HOST_BY_STAGE.values()
+):
     raise PipelineError("Every engineering stage must declare its execution hosts")
+if any(
+    not isinstance(stage.get("host_text"), str)
+    or not stage["host_text"]
+    or not isinstance(stage.get("doc"), dict)
+    or not all(isinstance(stage["doc"].get(key), str) and stage["doc"][key] for key in ("input", "output"))
+    for stage in CONTRACT["stages"]
+):
+    raise PipelineError("Every engineering stage must declare its documented contract row")
 VIEW_SCHEMA = "solidworks-to-urdf.stages/v1"
-#: Stages the portable Linux host owns, derived from the contract's host field
-#: so the set never depends on stage order (ORC-02).
-PORTABLE_STAGES = tuple(stage for stage, host in HOST_BY_STAGE.items() if host == "portable")
+#: Stages only the portable Linux host owns, derived from the contract's hosts
+#: field so the set never depends on stage order (ORC-02).  Mixed Windows+Linux
+#: stages (discover, capture) are native-driven and stay out of this set.
+PORTABLE_STAGES = tuple(stage for stage, hosts in HOST_BY_STAGE.items() if hosts == ("linux",))
 
 #: Fixed definition-independent required checks every quality report must carry;
 #: ``verification.solidworks_urdf.required_checks`` adds the dynamic per-object gates.
@@ -311,8 +323,8 @@ def activity_view(job) -> dict:
     return view
 
 
-def stage_host(stage_id: str) -> str:
-    """The declared execution hosts of one engineering stage."""
+def stage_host(stage_id: str) -> tuple[str, ...]:
+    """The declared execution hosts of one engineering stage (frozen role tokens)."""
 
     try:
         return HOST_BY_STAGE[stage_id]
@@ -510,16 +522,20 @@ def require_complete(view):
 
 
 def contract_markdown():
-    """Shared table for Airflow's DAG documentation and the architecture document."""
+    """The six-stage table rendered cell-for-cell from the machine contract.
+
+    The same definition the runtime consumes renders this table, so
+    ``docs/contracts.md`` is compared exactly against this output.
+    """
     rows = [
-        "| # | Stage | Input | Input QC | Output | Output QC |",
-        "|---|---|---|---|---|---|",
+        "| 阶段 | 执行 | 输入与输入检查 | 封存输出与输出检查 |",
+        "|---|---|---|---|",
     ]
-    for number, stage in enumerate(CONTRACT["stages"], 1):
-        cells = [str(number), f"`{stage['id']}` — {stage['name']}"]
-        for field in ("inputs", "input_qc", "outputs", "output_qc"):
-            cells.append("; ".join(item["label"] for item in stage[field]))
-        rows.append("| " + " | ".join(cells) + " |")
+    for stage in CONTRACT["stages"]:
+        rows.append(
+            f"| `{stage['id']}` {stage['name_zh']} | {stage['host_text']} | "
+            f"{stage['doc']['input']} | {stage['doc']['output']} |"
+        )
     return "\n".join(rows)
 
 
@@ -549,7 +565,7 @@ def compact_view(view):
         "stages": [
             {
                 "id": stage["id"],
-                "host": stage["host"],
+                "hosts": list(stage["hosts"]),
                 "state": stage["state"],
                 "checks_passed": stage["checks_passed"],
                 "checks_total": stage["checks_total"],
