@@ -365,25 +365,14 @@ def _dependencies(root, definition):
     _require(len(top) == 1, "Missing unique top assembly mapping")
     main = str(definition["source"]["assembly"])
     normalized_main = ntpath.normcase(main.replace("/", "\\"))
+    # The frozen package-relative main assembly must exist in the upload index
+    # exactly; there is no suffix fallback that could rewrite its path.  (The
+    # native absolute path's rooted original->copy mapping is a separate layer.)
     exact = [
         name for name in package_files if ntpath.normcase(str(name).replace("/", "\\")) == normalized_main
     ]
-    if exact:
-        main_key = exact[0]
-    else:
-        # Path-boundary matching only; a similar basename such as
-        # ``notrobot.SLDASM`` never satisfies the request, and the choice never
-        # depends on index order.
-        boundary = [
-            name
-            for name in package_files
-            if ntpath.normcase(str(name).replace("/", "\\")).endswith("\\" + normalized_main)
-        ]
-        _require(
-            len(boundary) == 1,
-            "The frozen upload index does not name exactly one captured main assembly",
-        )
-        main_key = boundary[0]
+    _require(len(exact) == 1, "The frozen upload index does not name exactly one captured main assembly")
+    main_key = exact[0]
     expected = str(package_files[main_key])
     _require(
         ntpath.normcase(str(top[0].get("source") or "")).endswith("\\" + normalized_main),

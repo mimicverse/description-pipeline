@@ -150,7 +150,7 @@ class CopyCoverageTests(unittest.TestCase):
                 self._root_with_package_files(package_files)
                 _dependencies(self.root, self.definition)
 
-    def test_main_key_binds_by_exact_then_single_path_boundary(self) -> None:
+    def test_main_key_binds_by_the_exact_frozen_relative_path(self) -> None:
         real = {
             "robot.SLDASM": _sha(MAIN),
             "shank.SLDPRT": _sha(SHANK),
@@ -159,16 +159,17 @@ class CopyCoverageTests(unittest.TestCase):
         # The exact request key wins even beside a boundary twin.
         self._root_with_package_files({**real, "sub/robot.SLDASM": _sha(b"TWIN")})
         _dependencies(self.root, self.definition)
-        # A single path-boundary key still resolves the request.
+        # A nested key never substitutes the frozen path, even with the same
+        # bytes (no suffix fallback may rewrite the frozen main-assembly key).
         self._root_with_package_files(
             {"sub/robot.SLDASM": _sha(MAIN), "shank.SLDPRT": _sha(SHANK), "NP-F550.step": _sha(NP)}
         )
-        _dependencies(self.root, self.definition)
-        # Two boundary candidates are ambiguous and must be refused.
+        with self.assertRaises(PipelineError):
+            _dependencies(self.root, self.definition)
+        # A nested key with different bytes is refused as well.
         self._root_with_package_files(
             {
-                "sub/robot.SLDASM": _sha(MAIN),
-                "other/robot.SLDASM": _sha(b"TWIN"),
+                "sub/robot.SLDASM": _sha(b"DECOY"),
                 "shank.SLDPRT": _sha(SHANK),
                 "NP-F550.step": _sha(NP),
             }
