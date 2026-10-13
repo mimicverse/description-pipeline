@@ -95,8 +95,18 @@ def release_identity(document) -> dict:
     return {"version": version, "source_commit": commit, "source_sha256": source_sha, "artifacts": rows}
 
 
+def _is_link(path: Path) -> bool:
+    """A symlink or a Windows junction (reparse point); both are refused on any component."""
+
+    return path.is_symlink() or path.is_junction()
+
+
 def _confined_artifact(root: Path, name) -> Path | None:
-    """A release-index entry must stay a plain relative file under the distribution root."""
+    """A release-index entry must stay a plain relative file under the distribution root.
+
+    The terminal node's link/junction type is checked before it is followed or read: an entry
+    that is itself a symlink is refused even when it targets a real file inside the root.
+    """
 
     require(isinstance(name, str) and bool(name) and "\\" not in name, f"artifact name is malformed: {name!r}")
     require(not name.startswith("/"), f"artifact path escapes the distribution root: {name!r}")
@@ -108,10 +118,11 @@ def _confined_artifact(root: Path, name) -> Path | None:
     candidate = root.joinpath(*parts)
     node = candidate.parent
     while node != root:
-        require(not node.is_symlink(), f"artifact path crosses a link: {name!r}")
+        require(not _is_link(node), f"artifact path crosses a link: {name!r}")
         require(root in node.parents, f"artifact path escapes the distribution root: {name!r}")
         node = node.parent
-    require(not node.is_symlink(), f"artifact path crosses a link: {name!r}")
+    require(not _is_link(node), f"artifact path crosses a link: {name!r}")
+    require(not _is_link(candidate), f"artifact path crosses a link: {name!r}")
     if not candidate.exists():
         return None
     require(candidate.is_file(), f"artifact is not a regular file: {name!r}")

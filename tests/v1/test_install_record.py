@@ -11,6 +11,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
 import stat
 import subprocess
 import sys
@@ -436,6 +437,51 @@ class InstallRecordTests(unittest.TestCase):
             result = run_cli(root, install_id="gen-1", snapshot=snapshot, release=release)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue((root / "state" / "install-record.json").is_file())
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "requires symlink support")
+    def test_terminal_symlink_artifact_rejected_without_writing(self):
+        with tempfile.TemporaryDirectory(prefix="install-record-terminal-link-") as temporary:
+            root = Path(temporary)
+            snapshot = make_snapshot(root)
+            release = make_release(root)
+            make_endpoint_identity(root)
+            make_dag(root)
+            distribution = root / "distribution"
+            alias = distribution / "alias.whl"
+            alias.symlink_to(distribution / WHEEL_NAME)
+            document = json.loads(release.read_text(encoding="utf-8"))
+            document["artifacts"] = {alias.name: hashlib.sha256((distribution / WHEEL_NAME).read_bytes()).hexdigest()}
+            release.write_text(json.dumps(document), encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(OPERATOR / "install_record.py"),
+                    "build",
+                    "--state-root",
+                    str(root / "state"),
+                    "--install-id",
+                    "gen-1",
+                    "--timestamp",
+                    TIMESTAMP,
+                    "--snapshot",
+                    str(snapshot),
+                    "--release-file",
+                    str(release),
+                    "--endpoint-identity",
+                    str(root / "endpoint-identity.json"),
+                    "--services",
+                    ",".join(SERVICES),
+                    "--dag",
+                    str(root / "solidworks_to_urdf.py"),
+                ],
+                capture_output=True,
+                text=True,
+                cwd=str(ROOT),
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("crosses a link", result.stderr)
+            self.assertFalse((root / "state" / "install-record.json").exists())
+            self.assertFalse((root / "state" / "install-records").exists())
 
     def test_no_production_task_or_path_fallback_exists(self):
         source = (OPERATOR / "install_record.py").read_text(encoding="utf-8")
