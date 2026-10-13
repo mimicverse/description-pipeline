@@ -1124,6 +1124,54 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertIn("createdb", lines)
             self.assertNotIn("airflow_install", lines)
 
+    def _digest_tree(self, *roots: Path) -> dict[str, str]:
+        snapshot = {}
+        for root in roots:
+            if root.exists():
+                for path in sorted(root.rglob("*")):
+                    if path.is_file():
+                        snapshot[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+        return snapshot
+
+    def test_preflight_conflicts_write_nothing(self) -> None:
+        for case in ("endpoint_triple", "rogue_wheel"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                release, control_env, order = self._prepare(Path(tmp), fresh=True, ready_after=1)
+                tree = release.parent
+                identity = tree / "endpoint-identity.json"
+                args = [
+                    "bash",
+                    str(release / "operator" / "operatorctl.sh"),
+                    "install",
+                    "--config",
+                    str(tree / "platform.json"),
+                    "--install-id",
+                    "gen-1",
+                    "--endpoint-identity",
+                    str(identity),
+                ]
+                if case == "endpoint_triple":
+                    document = json.loads(identity.read_text(encoding="utf-8"))
+                    document["release"]["source_commit"] = "e" * 40
+                    identity.write_text(json.dumps(document), encoding="utf-8")
+                else:
+                    rogue = Path(tmp) / "unrelated" / "mimicverse_description-1.4.0-py3-none-any.whl"
+                    rogue.parent.mkdir()
+                    rogue.write_bytes(b"UNINDEXED-ROGUE-WHEEL")
+                    args.extend(["--wheel", str(rogue)])
+                state = Path(tmp) / "state"
+                config_home = Path(control_env["XDG_CONFIG_HOME"])
+                before = self._digest_tree(state, config_home)
+                result = run(args, control_env)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(
+                    self._digest_tree(state, config_home),
+                    before,
+                    "a conflicted preflight must not write state or unit files",
+                )
+                self.assertFalse((state / "install-record.json").exists())
+                self.assertFalse(order.exists(), "no installation leg may run")
+
 
 class InstallPostgresBehaviorTests(unittest.TestCase):
     """install_postgres.sh provisions only: no server lifecycle and no database creation."""
