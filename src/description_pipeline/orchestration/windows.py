@@ -253,6 +253,20 @@ def _owner_lock(path):
         raise PipelineError("Another endpoint owns the state root or its ownership lock is unavailable") from error
 
 
+def _default_runner(*args, **kwargs):
+    """The six-stage Linux executor, imported only when a run actually needs it.
+
+    ``orchestration.windows`` must stay inside the Windows capture closure: the
+    endpoint only ever supplies an explicit runner in production wiring or tests
+    that exercise the capture boundary, so the generation/verification domain is
+    never pulled in by importing or constructing the endpoint.
+    """
+
+    from ..solidworks import run
+
+    return run(*args, **kwargs)
+
+
 class Jobs:
     """One persistent queue, one CAD runner, one endpoint process owner."""
 
@@ -261,10 +275,8 @@ class Jobs:
     PLAN_TTL = 30.0
 
     def __init__(self, config, *, runner=None, selection_reader_factory=None, native_reader=None, backend_factory=None):
-        from ..solidworks import run
-
         self.config = config
-        self.runner = runner or run
+        self.runner = runner or _default_runner
         self.selection_reader_factory = selection_reader_factory
         self.native_reader = native_reader
         self.backend_factory = backend_factory or self._sealed_backend
