@@ -151,6 +151,12 @@ def config_snapshot() -> dict:
                 "endpoint_port": 8765,
                 "token_file": "/srv/description/secrets/endpoint.token",
                 "tunnel_loopback_port": 18765,
+                "instance": {
+                    "task_name": "description-e2e-endpoint",
+                    "package_root": "C:/description-e2e/packages",
+                    "output_root": "C:/description-e2e/results",
+                    "state_root": "C:/description-e2e/state",
+                },
             },
             "auth": {
                 "feishu_secret_file": "/srv/description/secrets/feishu.json",
@@ -346,6 +352,26 @@ class B4FixSingleVariableTests(unittest.TestCase):
             (
                 "string endpoint port",
                 lambda c: c["resolved"]["windows"].__setitem__("endpoint_port", "8765"),
+                "config_snapshot_invalid",
+            ),
+            (
+                "missing windows instance",
+                lambda c: c["resolved"]["windows"].pop("instance"),
+                "config_snapshot_invalid",
+            ),
+            (
+                "windows task name with space",
+                lambda c: c["resolved"]["windows"]["instance"].__setitem__("task_name", "e2e endpoint"),
+                "config_snapshot_invalid",
+            ),
+            (
+                "relative windows package root",
+                lambda c: c["resolved"]["windows"]["instance"].__setitem__("package_root", "packages"),
+                "config_snapshot_invalid",
+            ),
+            (
+                "windows state root traversal",
+                lambda c: c["resolved"]["windows"]["instance"].__setitem__("state_root", "C:/e2e/../state"),
                 "config_snapshot_invalid",
             ),
             (

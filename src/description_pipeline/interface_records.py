@@ -676,6 +676,11 @@ _REPOSITORY_SLUG = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0
 _BASE_BRANCH = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
 _SSH_HOST = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 _ORIGIN = re.compile(r"\Ahttps://([A-Za-z0-9][A-Za-z0-9.-]*)(?::([0-9]{1,5}))?\Z")
+#: Isolated Windows target binding (design ruling D3): the task name and instance
+#: directories the Linux lifecycle may address.  No fallback to a production task
+#: or production path exists anywhere in the lifecycle.
+_TASK_NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+_WINDOWS_DRIVE = re.compile(r"\A[A-Za-z]:/")
 
 
 def _absolute_path(value, code: str, where: str) -> PurePosixPath:
@@ -683,6 +688,16 @@ def _absolute_path(value, code: str, where: str) -> PurePosixPath:
     path = PurePosixPath(value)
     _require(path.is_absolute() and ".." not in path.parts, code, {"where": where})
     return path
+
+
+def _windows_path(value, code: str, where: str) -> str:
+    """Drive-absolute Windows directory: forward slashes, no traversal or empty segments."""
+
+    _require(isinstance(value, str) and bool(value) and not _CONTROL.search(value), code, {"where": where})
+    _require(bool(_WINDOWS_DRIVE.match(value)) and "\\" not in value, code, {"where": where})
+    parts = value[3:].split("/")
+    _require(all(part not in {"", ".", ".."} for part in parts), code, {"where": where})
+    return value
 
 
 def _within(child: PurePosixPath, parent: PurePosixPath) -> bool:
@@ -710,7 +725,9 @@ def validate_config_snapshot(snapshot) -> dict:
     paths are absolute without ``..`` (symlink/mode/readability checks belong to
     the consuming host), and configured roots must not overlap.  ``derived``
     carries the IF-11 consumables (store root, repository checkouts, discovery
-    roots).
+    roots).  ``resolved.windows.instance`` binds the isolated Windows target
+    (task name plus instance directories) so no observe/stop/restore path can
+    address anything but the configured instance.
     """
 
     code = "config_snapshot_invalid"
@@ -754,7 +771,12 @@ def validate_config_snapshot(snapshot) -> dict:
     _exact_keys(resolved["database"], {"dsn_file"}, code, "resolved.database")
     _absolute_path(resolved["database"]["dsn_file"], code, "resolved.database.dsn_file")
     windows = resolved["windows"]
-    _exact_keys(windows, {"ssh_host", "endpoint_port", "token_file", "tunnel_loopback_port"}, code, "resolved.windows")
+    _exact_keys(
+        windows,
+        {"ssh_host", "endpoint_port", "token_file", "tunnel_loopback_port", "instance"},
+        code,
+        "resolved.windows",
+    )
     _require(
         isinstance(windows["ssh_host"], str) and bool(_SSH_HOST.match(windows["ssh_host"])),
         code,
@@ -772,6 +794,15 @@ def validate_config_snapshot(snapshot) -> dict:
     )
     _require(origin_port != tunnel_port, code, {"rule": "origin port differs from tunnel_loopback_port"})
     _absolute_path(windows["token_file"], code, "resolved.windows.token_file")
+    instance = windows["instance"]
+    _exact_keys(instance, {"task_name", "package_root", "output_root", "state_root"}, code, "resolved.windows.instance")
+    _require(
+        isinstance(instance["task_name"], str) and bool(_TASK_NAME.match(instance["task_name"])),
+        code,
+        {"where": "resolved.windows.instance.task_name"},
+    )
+    for field in ("package_root", "output_root", "state_root"):
+        _windows_path(instance[field], code, f"resolved.windows.instance.{field}")
     auth = resolved["auth"]
     _exact_keys(auth, {"feishu_secret_file", "tenant_keys", "admin_open_ids"}, code, "resolved.auth")
     _absolute_path(auth["feishu_secret_file"], code, "resolved.auth.feishu_secret_file")
