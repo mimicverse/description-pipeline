@@ -12,8 +12,6 @@ import tempfile
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
-import yaml
-
 
 class PipelineError(ValueError):
     """An explicit invalid input or unmet pipeline requirement."""
@@ -136,13 +134,27 @@ def _unique_mapping(pairs) -> dict:
     return mapping
 
 
-class _UniqueLoader(yaml.SafeLoader):
-    def construct_mapping(self, node, deep=False):
-        self.flatten_mapping(node)
-        return _unique_mapping(
-            (self.construct_object(key, deep=deep), self.construct_object(value, deep=deep))
-            for key, value in node.value
-        )
+def _load_yaml(text: str) -> Any:
+    """Parse YAML with duplicate-key rejection; the only PyYAML-dependent surface.
+
+    The import is deferred so the contract closure (schemas/io/delivery/stages/
+    interface_records) loads in bootstrap interpreters without ambient packages:
+    PyYAML is required only when a capture actually carries a YAML document.
+    """
+    import yaml  # noqa: PLC0415  (deferred on purpose: the bootstrap closure must import without PyYAML)
+
+    class UniqueLoader(yaml.SafeLoader):
+        def construct_mapping(self, node, deep=False):
+            self.flatten_mapping(node)
+            return _unique_mapping(
+                (self.construct_object(key, deep=deep), self.construct_object(value, deep=deep))
+                for key, value in node.value
+            )
+
+    try:
+        return yaml.load(text, Loader=UniqueLoader)
+    except yaml.YAMLError as error:
+        raise PipelineError(str(error)) from error
 
 
 def parse_data(content: bytes, path: Path) -> Any:
@@ -151,9 +163,9 @@ def parse_data(content: bytes, path: Path) -> Any:
         # Windows PowerShell 5.1 writes a BOM for Set-Content -Encoding UTF8.
         text = content.decode("utf-8-sig")
         if path.suffix in {".yaml", ".yml"}:
-            return yaml.load(text, Loader=_UniqueLoader)
+            return _load_yaml(text)
         return json.loads(text, object_pairs_hook=_unique_mapping)
-    except (PipelineError, yaml.YAMLError, json.JSONDecodeError, UnicodeDecodeError) as error:
+    except (PipelineError, json.JSONDecodeError, UnicodeDecodeError) as error:
         raise PipelineError(f"Invalid input {path}: {error}") from error
 
 
