@@ -14,6 +14,8 @@ import unittest
 import zipfile
 from pathlib import Path
 
+from description_pipeline import io as pipeline_io
+
 from .contract_wheel import write_contract_wheel
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -471,6 +473,21 @@ except io.PipelineError as error:
             }
             <= written
         )
+
+    def test_emit_refuses_duplicate_keys_with_the_canonical_parser_before_any_write(self):
+        raw = json.dumps(self.snapshot).encode("utf-8")
+        duplicate = self.root / "duplicate.json"
+        duplicate.write_bytes(b'{"install_id":"bad/id",' + raw[1:])
+        with self.assertRaises(pipeline_io.PipelineError) as canonical:
+            pipeline_io.parse_data(duplicate.read_bytes(), duplicate)
+        self.assertIn("Duplicate input key", str(canonical.exception))
+        state = self.root / "state"
+        before = tree_digest(state)
+        completed = self._emit(duplicate)
+        self.assertNotEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertIn("Duplicate input key", completed.stderr)
+        self.assertEqual(tree_digest(state), before, "a duplicate-key snapshot must not write state")
+        self.assertFalse((state / "derived").exists())
 
 
 if __name__ == "__main__":

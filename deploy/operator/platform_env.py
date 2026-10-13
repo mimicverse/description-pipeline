@@ -73,10 +73,11 @@ def require(condition: bool, message: str) -> None:
 
 
 #: The validator script executed by the isolated child interpreter.  It holds no rules of its
-#: own: it imports the same-source canonical ``interface_records`` from the extracted closure
-#: directory and runs the frozen validator over the snapshot's exact bytes arriving on stdin.
-#: It reports a machine-readable verdict on stdout plus an exit code - 0 accept, 2 reject;
-#: anything else is an infrastructure failure and fails the gate closed.
+#: own: it parses the stdin bytes with the closure's canonical parse entry (``io.parse_data``,
+#: whose duplicate-key and encoding strictness is what the binding source enforces) and runs
+#: the frozen validator over the parsed document.  It reports a machine-readable verdict on
+#: stdout plus an exit code - 0 accept, 2 reject (parse or validation refusal); anything else
+#: is an infrastructure failure and fails the gate closed.
 ISOLATED_VALIDATION = """\
 import json
 import pathlib
@@ -85,14 +86,16 @@ import sys
 (closure,) = sys.argv[1:]
 sys.path.insert(0, closure)
 from description_pipeline import interface_records
+from description_pipeline import io as contract_io
 
 source = pathlib.Path(interface_records.__file__).resolve()
 if not source.is_relative_to(pathlib.Path(closure).resolve()):
     print(f"the contract closure identity check failed: {source}", file=sys.stderr)
     sys.exit(1)
 try:
-    interface_records.validate_config_snapshot(json.loads(sys.stdin.buffer.read()))
-except interface_records.InterfaceRecordError as error:
+    snapshot = contract_io.parse_data(sys.stdin.buffer.read(), pathlib.Path("<config-snapshot>"))
+    interface_records.validate_config_snapshot(snapshot)
+except contract_io.PipelineError as error:
     print(json.dumps({"verdict": "reject", "error": str(error)}))
     sys.exit(2)
 print(json.dumps({"verdict": "accept"}))
