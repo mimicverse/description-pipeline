@@ -295,7 +295,7 @@ class StructuralReportTests(unittest.TestCase):
             write_json(
                 root / "evidence/manifest.json",
                 {
-                    "schema_version": "description.source/v1",
+                    "schema_version": "solidworks-to-urdf.source/v1",
                     "kind": "solidworks",
                     "identity": {"main_assembly": "robot.SLDASM"},
                     "evidence_class": "cad",
@@ -319,7 +319,7 @@ class StructuralReportTests(unittest.TestCase):
             write_json(
                 root / "evidence/manifest.json",
                 {
-                    "schema_version": "description.source/v1",
+                    "schema_version": "solidworks-to-urdf.source/v1",
                     "kind": "solidworks",
                     "identity": {"main_assembly": "robot.SLDASM"},
                     "evidence_class": "cad",

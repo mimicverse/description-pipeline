@@ -45,8 +45,8 @@ The page is **SolidWorks2URDF 交付操作台**.
    preview: generation success alone is not verification, and such artifacts are
    forbidden from publication.
 
-The picker uploads only the chosen folder; the page shows the platform's current
-upload limits (default 2 GB total, 4 096 files, 512 MB per file). Empty
+The picker uploads only the chosen folder; the page shows the platform's fixed
+upload limits (2 GiB total, 4 096 files, 512 MiB per file). Empty
 subfolders are not representable; temporary SolidWorks lock files (`~$…`) must
 be removed first — the platform rejects any selection containing them. Generated platform inputs such as `robot.yaml` and
 `cad-revision.json` must not be included — the platform generates them.

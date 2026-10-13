@@ -122,7 +122,7 @@ class PhysicsTests(unittest.TestCase):
         flags = {"OverrideMass": False, "OverrideCenterOfMass": False, "OverrideMomentsOfInertia": False}
         # The split native record: observations only, as the capture writes them.
         context = {
-            "schema_version": "description-pipeline.solidworks-component-mass-context/v1",
+            "schema_version": "solidworks-to-urdf.component-mass-context/v1",
             "status": "recorded",
             "assembly_mass_kg": 3.0,
             "instances": [
@@ -145,7 +145,7 @@ class PhysicsTests(unittest.TestCase):
         }
         world = {"mass": 3.0, "com": com_world.tolist(), "inertia": tensor_world.tolist()}
         self.closure = {
-            "schema_version": "description-pipeline.solidworks-mass-closure/v1",
+            "schema_version": "solidworks-to-urdf.mass-closure/v1",
             "status": "recorded",
             "mode": "full",
             "top_level": {

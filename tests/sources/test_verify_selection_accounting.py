@@ -66,7 +66,7 @@ def _write_evidence(root: Path, bodies, *, top_mass, clear_parent):
         else _effective_payload(top_mass, (0.0015, 0.0, 0.0), role="parent", document_type="assembly", name="board-1"),
     )
     native = {
-        "schema_version": "description-pipeline.solidworks-mass-closure/v1",
+        "schema_version": "solidworks-to-urdf.mass-closure/v1",
         "status": "recorded",
         "mode": "full",
         "top_level": {
@@ -76,7 +76,7 @@ def _write_evidence(root: Path, bodies, *, top_mass, clear_parent):
             "reference": {},
         },
         "component_context": {
-            "schema_version": "description-pipeline.solidworks-component-mass-context/v1",
+            "schema_version": "solidworks-to-urdf.component-mass-context/v1",
             "status": "recorded",
             "assembly_mass_kg": top_mass,
             "instances": [

@@ -3098,7 +3098,18 @@ def verify_discovery(package: Path) -> dict:
     )
     raw_block = (state.get("payload") or {}).get("raw")
     raw_block = raw_block if isinstance(raw_block, dict) else None
-    if bound["passed"] and raw_block is not None and "exporter" in raw_block:
+    # Shared predicate contract with the producer (``sources/solidworks/discovery.py``
+    # ``exporter_mode``): the native capture writes the exporter block unconditionally,
+    # and only a proven ``absent`` state means the CAD carries no v1.4 declaration. That
+    # capture must run the mate-inference suite below; every other present state keeps
+    # the declarations suite, which fails closed on unreadable declarations.
+    exporter_block = raw_block.get("exporter") if raw_block is not None else None
+    declaration_capture = (
+        raw_block is not None
+        and "exporter" in raw_block
+        and not (isinstance(exporter_block, dict) and exporter_block.get("state") == "absent")
+    )
+    if bound["passed"] and declaration_capture:
         # Explicit native declarations do not require incomplete mate inference to
         # rediscover memberships or impose unrelated CS_/dp.* naming conventions.
         # Capture/file/mass binding remains mandatory. A declaration carries no

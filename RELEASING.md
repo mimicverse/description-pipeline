@@ -2,7 +2,9 @@
 
 A release contains one complete operator workflow, its specifications and
 source-bound distributions. Native robot and CAD history stays in the private
-model repository. Retain local acceptance evidence; GitHub CI is not required.
+model repository. Retain local acceptance evidence; GitHub CI runs the
+deterministic checks on every pull request and does not replace accepted local
+evidence.
 
 ## Acceptance
 

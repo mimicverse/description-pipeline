@@ -1,4 +1,4 @@
-"""Turn raw CAD readings into the shared ``description.scene/v1`` structure.
+"""Turn raw CAD readings into the shared ``solidworks-to-urdf.scene/v1`` structure.
 
 The adapter owns the *source-side* derivation: component placements, per-part
 mass properties and exported geometry are read from CAD, then expressed in the
@@ -17,8 +17,17 @@ from collections.abc import Iterable, Sequence
 from .errors import ConfigError
 from .jsonio import read_json
 
-SCENE_SCHEMA = "description.scene/v1"
+SCENE_SCHEMA = "solidworks-to-urdf.scene/v1"
+#: Sealed derivations may still carry the retired id; reads accept both (XC-01).
+LEGACY_SCENE_SCHEMAS = ("description.scene/v1",)
 LINK_GROUP_SCHEMA = "solidworks-to-urdf.link-group-mass-properties/v1"
+
+
+def scene_schema_supported(value: object) -> bool:
+    """Whether a scene declares the current or a retained schema id."""
+
+    return value in {SCENE_SCHEMA, *LEGACY_SCENE_SCHEMAS}
+
 
 Matrix3 = tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]
 Vector3 = tuple[float, float, float]
@@ -876,7 +885,7 @@ def load_scene(snapshot_root: Path) -> dict[str, Any]:
     from .captured import derive_scene
 
     scene = derive_scene(root, manifest)
-    if not isinstance(scene, dict) or scene.get("schema_version") != SCENE_SCHEMA:
+    if not isinstance(scene, dict) or not scene_schema_supported(scene.get("schema_version")):
         raise ConfigError("unexpected scene schema", {"snapshot": str(root)})
     if scene.get("units") != "SI":
         raise ConfigError("only SI scenes are supported", {"units": scene.get("units")})

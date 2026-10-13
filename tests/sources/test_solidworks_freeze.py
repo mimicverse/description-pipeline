@@ -315,7 +315,7 @@ class FreezeTests(unittest.TestCase):
             freeze(self.config, self.destination, backend=self.backend)
         before = inventory(self.destination)
         scene = load_scene(self.destination)
-        self.assertEqual(scene["schema_version"], "description.scene/v1")
+        self.assertEqual(scene["schema_version"], "solidworks-to-urdf.scene/v1")
         self.assertEqual(inventory(self.destination), before)
         self.assertNotIn("scene.json", before)
 
@@ -376,7 +376,7 @@ class FreezeTests(unittest.TestCase):
     def test_scene_carries_combined_mass_and_geometry(self) -> None:
         freeze(self.config, self.destination, backend=self.backend, worker_version="test-worker")
         scene = load_scene(self.destination)
-        self.assertEqual(scene["schema_version"], "description.scene/v1")
+        self.assertEqual(scene["schema_version"], "solidworks-to-urdf.scene/v1")
         self.assertEqual(scene["units"], "SI")
         links = {link["name"]: link for link in scene["links"]}
         self.assertEqual(sorted(links), ["arm_link", "base_link"])
@@ -1406,7 +1406,7 @@ class SharedModelContractTests(unittest.TestCase):
         robot = self.robot_cls.from_dict(scene)
 
         payload = robot.to_dict()
-        self.assertEqual(payload["schema_version"], "description.scene/v1")
+        self.assertEqual(payload["schema_version"], "solidworks-to-urdf.scene/v1")
         self.assertEqual(payload["units"], "SI")
         self.assertEqual({link["name"] for link in payload["links"]}, {"base_link", "arm_link"})
         self.assertEqual([joint["name"] for joint in payload["joints"]], ["hinge_joint"])
