@@ -73,6 +73,8 @@
 
 无法从主装配唯一识别刚体基准时，可在相应组件文档中用 `dp.body_datum` 引用本实例所属刚体的 `CS_<刚体名>`。重复实例必须仍能按实际装配上下文唯一解析，不能借用共享文档属性将不同安装位置合并为一个刚体。
 
+**发布身份解析顺序（P-02 自动派生）**：管理身份按“CAD 优先、提交补充”解析——`dp.hardware_id`、`dp.revision`、`dp.owner`、`dp.change_summary`、`dp.control` 存在时一律采用 CAD 记录；缺失字段由门户提交补齐（硬件身份来自已配置目标选择，所有者取提交主体，变更说明取提交的一行说明，`control` 记为 `handoff` + 封存交接摘要）。提交的硬件身份与 CAD 冲突时阻止发布；无匹配目标且未选择时保持“待发布”阻断项。自动派生的结构修订号形如 `<hardware>-<yyyymmdd>-<digest8>`（冻结 CAD 清单摘要），并在可读取上一已发布修订时写入 `parent_revision`；身份来源记录在 `input/discovery/identity-resolution.json`。CAD 记录中已存在的身份值不得被提交覆盖。
+
 ## 2. 命名与原生引用
 
 ### 2.1 名称与身份

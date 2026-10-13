@@ -199,7 +199,7 @@ class DeriveMassClosureTests(unittest.TestCase):
             "notes": {},
         }
         native = {
-            "schema_version": "description-pipeline.solidworks-mass-closure/v1",
+            "schema_version": "solidworks-to-urdf.mass-closure/v1",
             "status": status,
         }
         if status == "recorded":
@@ -213,7 +213,7 @@ class DeriveMassClosureTests(unittest.TestCase):
                         "reference": {},
                     },
                     "component_context": {
-                        "schema_version": "description-pipeline.solidworks-component-mass-context/v1",
+                        "schema_version": "solidworks-to-urdf.component-mass-context/v1",
                         "status": "recorded",
                         "assembly_mass_kg": 0.0632,
                         "instances": [

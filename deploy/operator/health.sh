@@ -72,19 +72,26 @@ fi
 
 # Authenticated endpoint probe through the tunnel: a bare HTTP response is not health.
 if [ -f "${ENDPOINT_TOKEN_FILE:-}" ]; then
-  if python3 - "$ENDPOINT_TOKEN_FILE" <<'PY'
+  if python3 - "$ENDPOINT_TOKEN_FILE" "$PORTAL_CONFIG" <<'PY'
 import json, sys, urllib.request
 token = open(sys.argv[1]).read().strip()
 request = urllib.request.Request("http://127.0.0.1:18765/health",
                                  headers={"Authorization": "Bearer " + token})
 with urllib.request.urlopen(request, timeout=15) as response:
     body = json.load(response)
-raise SystemExit(0 if body.get("ready") and body.get("pipeline_id") == "solidworks-to-urdf" else 1)
+configured = json.load(open(sys.argv[2], encoding="utf-8"))["pipeline"].get("targets", {})
+raise SystemExit(
+    0
+    if body.get("ready")
+    and body.get("pipeline_id") == "solidworks-to-urdf"
+    and sorted(body.get("targets") or []) == sorted(configured)
+    else 1
+)
 PY
   then
-    report PASS "endpoint /health authenticated via tunnel + token"
+    report PASS "endpoint /health authenticated via tunnel + token; targets match portal config"
   else
-    report FAIL "endpoint /health rejected the token or is not ready"
+    report FAIL "endpoint /health rejected the token, is not ready, or its targets differ from the portal config"
   fi
 fi
 

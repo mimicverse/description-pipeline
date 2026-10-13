@@ -6,7 +6,10 @@ from pathlib import Path
 
 from ..io import PipelineError, confined, inventory, read_data, write_json
 
-SCHEMA = "description.source/v1"
+SCHEMA = "solidworks-to-urdf.source/v1"
+#: Sealed manifests from earlier releases carry the retired id; reads accept
+#: both spellings (XC-01), writes always use SCHEMA.
+LEGACY_SCHEMAS = ("description.source/v1",)
 
 
 def write_manifest(root: Path, *, kind: str, identity: dict, evidence_class: str) -> dict:
@@ -34,7 +37,8 @@ def write_manifest(root: Path, *, kind: str, identity: dict, evidence_class: str
 
 def verify_snapshot(root: Path) -> dict:
     manifest = read_data(confined(root, "manifest.json"))
-    if not isinstance(manifest, dict) or manifest.get("schema_version") != SCHEMA:
+    accepted = {SCHEMA, *LEGACY_SCHEMAS}
+    if not isinstance(manifest, dict) or manifest.get("schema_version") not in accepted:
         raise PipelineError("Unsupported source manifest schema")
     if manifest.get("evidence_class") not in {"cad", "fixture", "imported"}:
         raise PipelineError("Snapshot evidence class is missing or invalid")

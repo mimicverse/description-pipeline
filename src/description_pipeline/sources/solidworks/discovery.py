@@ -84,12 +84,16 @@ ROBOT_FILE = "robot.yaml"
 REVISION_FILE = "cad-revision.json"
 DISCOVERY_FILE = "discovery/native-discovery.json"
 FINDINGS_FILE = "discovery/findings.json"
+IDENTITY_FILE = "discovery/identity-resolution.json"
+IDENTITY_SCHEMA = "solidworks-to-urdf.identity-resolution/v1"
 RECORD_DIR = "records"
 #: The one native contract: a fixed property namespace and one record version.
 NAMESPACE = "dp"
 CONTRACT = "native-discovery/v1"
 GENERATOR = "native-discovery"
 GENERATOR_VERSION = "1"
+_DATE_ID = re.compile(r"[0-9]{8}\Z")
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
 
 #: The prepared package must satisfy the same joint geometry gate as an
 #: authored package: a movable joint frame has to sit on the native shaft.
@@ -144,6 +148,25 @@ class DiscoverySettings:
     record_roots: tuple[Path, ...] = ()
     frozen_names: Mapping[str, str] = field(default_factory=dict)
     main_assembly: str | None = None
+
+
+@dataclass(frozen=True)
+class SubmissionIdentity:
+    """Administrative identity supplied by the portal submission.
+
+    Used only to fill CAD-absent fields; CAD-carried ``dp.*`` values always win,
+    and a differing submitted hardware identity blocks publication.  ``as_of``
+    is the submission's UTC date (``yyyymmdd``) and ``inventory_digest`` the
+    frozen CAD inventory digest used for the deterministic revision id.
+    """
+
+    hardware_id: str | None = None
+    owner: str | None = None
+    change_summary: str | None = None
+    parent_revision: str | None = None
+    control_reference: str | None = None
+    as_of: str | None = None
+    inventory_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3464,16 +3487,24 @@ def _identity(
     configuration: str | None,
     assembly: str | None,
     native_files: Mapping[str, str],
-) -> dict:
-    """Read authored identity, deferring absent administrative metadata to publication.
+    submission: SubmissionIdentity | None = None,
+    handoff_sha256: str | None = None,
+) -> tuple[dict, dict]:
+    """Read authored identity, filling CAD-absent fields from the portal submission.
 
     Absent hardware, revision, owner, change summary, control or robot name is a
     publication-readiness gap: it is recorded as a nonblocking finding carrying
-    ``detail.publication_blocker``, the raw record keeps the absence and nothing
-    is invented.  Malformed or conflicting supplied values still block.
+    ``detail.publication_blocker`` and the raw record keeps the absence.  When a
+    submission identity is supplied, CAD-absent fields are filled from it (and
+    recorded as ``discovery.identity_derived``); CAD-carried values always win
+    and a differing submitted hardware identity blocks.  Malformed values block.
+    Returns ``(identity, sources)`` where ``sources`` names the origin of every
+    administrative field for the identity-resolution evidence file.
     """
 
     namespace = NAMESPACE
+    sources: dict[str, str] = {}
+    derived: list[str] = []
 
     def deferred(code: str, field: str, message: str, detail: dict | None = None) -> None:
         payload = {"publication_blocker": field}
@@ -3481,15 +3512,42 @@ def _identity(
             payload.update(detail)
         findings.append(_finding(code, "assembly", message, payload, blocking=False))
 
+    def submitted(value) -> str | None:
+        return str(value).strip() if _text(value) else None
+
+    sub_hardware = submitted(submission.hardware_id) if submission is not None else None
+    sub_owner = submitted(submission.owner) if submission is not None else None
+    sub_summary = submitted(submission.change_summary) if submission is not None else None
+    sub_control = submitted(submission.control_reference) if submission is not None else None
+    sub_parent = submitted(submission.parent_revision) if submission is not None else None
+
     hardware = _identity_value(record, namespace, "hardware_id")
     hardware = str(hardware).strip() if _text(hardware) else None
     if hardware is None:
-        deferred(
-            "discovery.identity_missing",
-            "hardware_id",
-            "hardware identity is not recorded in the CAD records; publication readiness requires it",
-        )
-    elif _IDENTITY_ID.fullmatch(hardware) is None:
+        if sub_hardware is not None:
+            hardware = sub_hardware
+            sources["hardware_id"] = "submission"
+            derived.append("hardware_id")
+        else:
+            sources["hardware_id"] = "absent"
+            deferred(
+                "discovery.identity_missing",
+                "hardware_id",
+                "hardware identity is not recorded in the CAD records and the submission selected no "
+                "configured target; publication readiness requires it",
+            )
+    else:
+        sources["hardware_id"] = "cad"
+        if sub_hardware is not None and sub_hardware != hardware:
+            findings.append(
+                _finding(
+                    "discovery.identity_conflict",
+                    "assembly",
+                    "the submitted hardware identity differs from the CAD-carried identity; publication stays blocked",
+                    {"cad": hardware, "submission": sub_hardware},
+                )
+            )
+    if hardware is not None and _IDENTITY_ID.fullmatch(hardware) is None:
         findings.append(
             _finding(
                 "discovery.identity_invalid",
@@ -3500,13 +3558,43 @@ def _identity(
         )
     revision = _identity_value(record, namespace, "revision")
     revision = str(revision).strip() if _text(revision) else None
-    if revision is None:
-        deferred(
-            "discovery.revision_missing",
-            "revision",
-            "structural revision is not recorded in the CAD records; publication readiness requires it",
-        )
-    elif _IDENTITY_ID.fullmatch(revision) is None:
+    if revision is not None:
+        sources["revision"] = "cad"
+    else:
+        derived_revision = None
+        if submission is not None:
+            as_of = submitted(submission.as_of)
+            digest_source = submitted(submission.inventory_digest) or handoff_sha256
+            if as_of is not None and _DATE_ID.fullmatch(as_of) is None:
+                findings.append(
+                    _finding(
+                        "discovery.identity_invalid",
+                        "assembly",
+                        "the submission date is malformed; the structural revision cannot be derived",
+                        {"value": as_of},
+                    )
+                )
+            elif (
+                as_of is not None
+                and isinstance(digest_source, str)
+                and _SHA256_HEX.fullmatch(digest_source) is not None
+                and hardware is not None
+                and _IDENTITY_ID.fullmatch(hardware) is not None
+            ):
+                derived_revision = f"{hardware}-{as_of}-{digest_source[:8]}"
+        if derived_revision is not None:
+            revision = derived_revision
+            sources["revision"] = "derived"
+            derived.append("revision")
+        else:
+            sources["revision"] = "absent"
+            deferred(
+                "discovery.revision_missing",
+                "revision",
+                "structural revision is not recorded in the CAD records and cannot be derived from the "
+                "submission; publication readiness requires it",
+            )
+    if revision is not None and _IDENTITY_ID.fullmatch(revision) is None:
         findings.append(
             _finding(
                 "discovery.revision_invalid",
@@ -3517,13 +3605,21 @@ def _identity(
         )
     owner = _identity_value(record, namespace, "owner")
     owner = str(owner).strip() if _text(owner) else None
-    if owner is None:
+    if owner is not None:
+        sources["owner"] = "cad"
+    elif sub_owner is not None:
+        owner = sub_owner
+        sources["owner"] = "submission"
+        derived.append("owner")
+    else:
+        sources["owner"] = "absent"
         deferred(
             "discovery.owner_missing",
             "owner",
-            "revision owner is not recorded in the CAD records; publication readiness requires it",
+            "revision owner is not recorded in the CAD records and the submission carries none; "
+            "publication readiness requires it",
         )
-    elif not _authored_text(owner):
+    if owner is not None and not _authored_text(owner):
         findings.append(
             _finding(
                 "discovery.owner_invalid",
@@ -3534,13 +3630,21 @@ def _identity(
         )
     summary = _identity_value(record, namespace, "change_summary")
     summary = str(summary).strip() if _text(summary) else None
-    if summary is None:
+    if summary is not None:
+        sources["change_summary"] = "cad"
+    elif sub_summary is not None:
+        summary = sub_summary
+        sources["change_summary"] = "submission"
+        derived.append("change_summary")
+    else:
+        sources["change_summary"] = "absent"
         deferred(
             "discovery.summary_missing",
             "change_summary",
-            "change summary is not recorded in the CAD records; publication readiness requires it",
+            "change summary is not recorded in the CAD records and the submission carries none; "
+            "publication readiness requires it",
         )
-    elif not _authored_text(summary):
+    if summary is not None and not _authored_text(summary):
         findings.append(
             _finding(
                 "discovery.summary_invalid",
@@ -3558,13 +3662,21 @@ def _identity(
     system = str(control["system"]).strip() if _text(control.get("system")) else None
     reference = str(control["reference"]).strip() if _text(control.get("reference")) else None
     if system is None or reference is None:
-        deferred(
-            "discovery.control_missing",
-            "control",
-            "CAD control system/reference are not recorded; publication readiness requires both",
-        )
-        control = None
+        if sub_control is not None:
+            control = {"system": "handoff", "reference": sub_control}
+            sources["control"] = "submission"
+            derived.append("control")
+        else:
+            sources["control"] = "absent"
+            deferred(
+                "discovery.control_missing",
+                "control",
+                "CAD control system/reference are not recorded and the submission carries no handoff "
+                "reference; publication readiness requires both",
+            )
+            control = None
     elif system not in CONTROL_SYSTEMS:
+        sources["control"] = "cad"
         findings.append(
             _finding(
                 "discovery.control_invalid",
@@ -3575,6 +3687,7 @@ def _identity(
         )
         control = None
     elif system == "git" and _GIT_COMMIT.search(reference) is None:
+        sources["control"] = "cad"
         findings.append(
             _finding(
                 "discovery.control_invalid",
@@ -3586,6 +3699,7 @@ def _identity(
         control = None
     else:
         control = {"system": system, "reference": reference}
+        sources["control"] = "cad"
     delivery = (
         configuration
         or _identity_value(record, namespace, "delivery_configuration")
@@ -3632,18 +3746,47 @@ def _identity(
             )
         )
     parent = _identity_value(record, namespace, "parent_revision")
-    return {
-        "hardware_id": hardware,
-        "revision": revision,
-        "parent_revision": str(parent).strip() if _text(parent) else None,
-        "owner": owner,
-        "change_summary": summary,
-        "control": control,
-        "delivery_configuration": delivery,
-        "main_assembly": main,
-        "robot_name": robot_name,
-        "robot_name_technical": technical_name,
-    }
+    if _text(parent):
+        parent_value = str(parent).strip()
+        sources["parent_revision"] = "cad"
+    else:
+        parent_value = None
+        if (
+            sources.get("revision") == "derived"
+            and sub_parent is not None
+            and _IDENTITY_ID.fullmatch(sub_parent) is not None
+        ):
+            parent_value = sub_parent
+            sources["parent_revision"] = "submission"
+            derived.append("parent_revision")
+        else:
+            sources["parent_revision"] = "absent"
+    if derived:
+        findings.append(
+            _finding(
+                "discovery.identity_derived",
+                "assembly",
+                "administrative identity fields were derived from the portal submission; CAD-carried "
+                "values win",
+                {"fields": sorted(derived)},
+                blocking=False,
+            )
+        )
+    return (
+        {
+            "hardware_id": hardware,
+            "revision": revision,
+            "parent_revision": parent_value,
+            "owner": owner,
+            "change_summary": summary,
+            "control": control,
+            "delivery_configuration": delivery,
+            "main_assembly": main,
+            "robot_name": robot_name,
+            "robot_name_technical": technical_name,
+        },
+        sources,
+    )
 
 
 def _anchor_for(text: str, resolved: dict) -> str | None:
@@ -3804,13 +3947,17 @@ def derive_native_package(
     settings: DiscoverySettings | None = None,
     configuration: str | None = None,
     assembly: str | None = None,
+    submission_identity: SubmissionIdentity | None = None,
     on_event=None,
 ) -> PreparedPackage:
     """Derive a prepared package purely from a raw native record.
 
     No backend, COM or session import happens here: the record is validated,
     its file bindings are proven against the frozen bytes, and the robot
-    document, revision and findings follow from that evidence.
+    document, revision and findings follow from that evidence.  A submission
+    identity fills CAD-absent administrative fields (CAD-carried values win and
+    a conflicting hardware identity blocks); its resolution is recorded in
+    ``discovery/identity-resolution.json``.
     """
 
     settings = settings or DiscoverySettings()
@@ -3968,9 +4115,29 @@ def derive_native_package(
                 {"record": record_contract, "expected": CONTRACT},
             )
         )
-    identity = _identity(
-        record, settings, findings, configuration=configuration, assembly=assembly, native_files=native_files
+    identity, identity_sources = _identity(
+        record,
+        settings,
+        findings,
+        configuration=configuration,
+        assembly=assembly,
+        native_files=native_files,
+        submission=submission_identity,
+        handoff_sha256=handoff_sha256,
     )
+    if submission_identity is not None:
+        write_json(
+            output / IDENTITY_FILE,
+            {
+                "schema_version": IDENTITY_SCHEMA,
+                "run_id": run_id,
+                "handoff_sha256": handoff_sha256,
+                "sources": identity_sources,
+                "hardware_id": identity["hardware_id"],
+                "revision": identity["revision"],
+                "parent_revision": identity["parent_revision"],
+            },
+        )
     checks, budget_entry = _budgets(record, settings, findings)
     exporter_block = record.get("exporter")
     exporter_mode = "exporter" in record and not (

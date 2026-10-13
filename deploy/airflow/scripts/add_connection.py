@@ -43,6 +43,7 @@ def main() -> int:
         store_root=pipeline["store_root"],
         repositories=pipeline["repositories"],
         discovery=pipeline.get("discovery", {}),
+        targets=pipeline.get("targets", {}),
     )
     with Session() as session:
         existing = session.query(Connection).filter(Connection.conn_id == args.conn_id).one_or_none()
@@ -59,6 +60,7 @@ def main() -> int:
                 "store_root": str(config.store_root),
                 "repositories": {slug: str(path) for slug, path in config.repositories.items()},
                 "discovery": config.discovery,
+                "targets": config.targets,
             }
         )
         session.commit()
