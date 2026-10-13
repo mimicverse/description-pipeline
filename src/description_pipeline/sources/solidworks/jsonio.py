@@ -7,13 +7,13 @@ Windows sharing-violation retry that the adapter state files need.
 
 from __future__ import annotations
 
-import json
 import time
 from pathlib import Path
 
 from ...io import (
     digest as _canonical_digest,
     file_digest as _file_digest,
+    read_data as _strict_read,
     write_json as _canonical_write,
 )
 
@@ -58,10 +58,11 @@ def write_json(path: Path, payload: object) -> None:
 
 
 def read_json(path: Path) -> JsonValue | None:
+    """The strict foundation parse with the Windows sharing-violation retry."""
+
     for attempt in range(_SHARING_ATTEMPTS):
         try:
-            with open(path, encoding="utf-8") as handle:
-                return json.load(handle)
+            return _strict_read(path)
         except PermissionError:
             if attempt == _SHARING_ATTEMPTS - 1:
                 raise
