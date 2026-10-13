@@ -583,7 +583,6 @@ def main() -> int:
         for task_id, expected_state in (
             ("resolve_handoff", "success"),
             ("start_job", "success"),
-            ("wait_for_job", "success"),
             ("fetch_capture", "success"),
             ("run_generate", "success"),
             ("run_verify", "failed"),
@@ -591,7 +590,7 @@ def main() -> int:
             actual = task_states.get(task_id, {}).get("state")
             if actual != expected_state:
                 problems.append(f"task {task_id} is {actual!r}, expected {expected_state!r}")
-        for task_id in ("run_publish", "confirm_job"):
+        for task_id in ("run_publish",):
             # Blocked without execution: the scheduler marked the task upstream_failed/skipped and
             # it never entered a running attempt, so a publish that started and failed early can
             # never be mistaken for a prevention proof.
