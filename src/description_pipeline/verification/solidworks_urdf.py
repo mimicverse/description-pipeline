@@ -333,17 +333,31 @@ def _dependencies(root, definition):
     top = [row for row in closure["mapping"] if row["instance"] == "top_level"]
     _require(len(top) == 1, "Missing unique top assembly mapping")
     main = str(definition["source"]["assembly"])
-    main_suffix = ntpath.normcase(main.replace("/", "\\"))
-    main_key = next(
-        (
+    normalized_main = ntpath.normcase(main.replace("/", "\\"))
+    exact = [
+        name for name in package_files if ntpath.normcase(str(name).replace("/", "\\")) == normalized_main
+    ]
+    if exact:
+        main_key = exact[0]
+    else:
+        # Path-boundary matching only; a similar basename such as
+        # ``notrobot.SLDASM`` never satisfies the request, and the choice never
+        # depends on index order.
+        boundary = [
             name
             for name in package_files
-            if ntpath.normcase(str(name).replace("/", "\\")).endswith(main_suffix)
-        ),
-        None,
-    )
-    _require(main_key is not None, "The frozen upload index does not name the captured main assembly")
+            if ntpath.normcase(str(name).replace("/", "\\")).endswith("\\" + normalized_main)
+        ]
+        _require(
+            len(boundary) == 1,
+            "The frozen upload index does not name exactly one captured main assembly",
+        )
+        main_key = boundary[0]
     expected = str(package_files[main_key])
+    _require(
+        ntpath.normcase(str(top[0].get("source") or "")).endswith("\\" + normalized_main),
+        "The top mapping does not name the requested main assembly",
+    )
     _require(top[0]["source_sha256"] == expected, "Captured another top assembly revision")
     for row in closure["mapping"]:
         _require(original.get(row["source"]) == row["source_sha256"], "Source mapping hash differs")

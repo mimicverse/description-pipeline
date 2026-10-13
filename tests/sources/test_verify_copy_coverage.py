@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -121,6 +122,63 @@ class CopyCoverageTests(unittest.TestCase):
     def test_full_coverage_passes_with_rewritten_native_bytes(self) -> None:
         self._build()
         _dependencies(self.root, self.definition)
+
+    def _root_with_package_files(self, package_files: dict) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="copy-coverage-main-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self._build()
+        path = self.root / "input/handoff.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["package_files"] = package_files
+        path.write_text(json.dumps(document), encoding="utf-8")
+
+    def test_unreferenced_similar_basename_never_shadows_the_real_main(self) -> None:
+        """notrobot.SLDASM in the upload index must not stand in for robot.SLDASM."""
+
+        decoy = _sha(b"UNREFERENCED-OTHER-ASSEMBLY")
+        real = {
+            "robot.SLDASM": _sha(MAIN),
+            "shank.SLDPRT": _sha(SHANK),
+            "NP-F550.step": _sha(NP),
+        }
+        for label, package_files in (
+            ("before", {"notrobot.SLDASM": decoy, **real}),
+            ("after", {**real, "notrobot.SLDASM": decoy}),
+        ):
+            with self.subTest(position=label):
+                self._root_with_package_files(package_files)
+                _dependencies(self.root, self.definition)
+
+    def test_main_key_binds_by_exact_then_single_path_boundary(self) -> None:
+        real = {
+            "robot.SLDASM": _sha(MAIN),
+            "shank.SLDPRT": _sha(SHANK),
+            "NP-F550.step": _sha(NP),
+        }
+        # The exact request key wins even beside a boundary twin.
+        self._root_with_package_files({**real, "sub/robot.SLDASM": _sha(b"TWIN")})
+        _dependencies(self.root, self.definition)
+        # A single path-boundary key still resolves the request.
+        self._root_with_package_files(
+            {"sub/robot.SLDASM": _sha(MAIN), "shank.SLDPRT": _sha(SHANK), "NP-F550.step": _sha(NP)}
+        )
+        _dependencies(self.root, self.definition)
+        # Two boundary candidates are ambiguous and must be refused.
+        self._root_with_package_files(
+            {
+                "sub/robot.SLDASM": _sha(MAIN),
+                "other/robot.SLDASM": _sha(b"TWIN"),
+                "shank.SLDPRT": _sha(SHANK),
+                "NP-F550.step": _sha(NP),
+            }
+        )
+        with self.assertRaises(PipelineError):
+            _dependencies(self.root, self.definition)
+        # A missing main-assembly entry is refused outright.
+        self._root_with_package_files({"shank.SLDPRT": _sha(SHANK), "NP-F550.step": _sha(NP)})
+        with self.assertRaises(PipelineError):
+            _dependencies(self.root, self.definition)
 
     def test_seeded_leaves_must_be_covered_and_selected(self) -> None:
         def uncovered_seed(root: Path, closure: dict, copies: dict) -> None:
