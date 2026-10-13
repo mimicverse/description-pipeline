@@ -246,7 +246,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         record = json.loads(record_path.read_text())
         record["native_files"]["stray.SLDPRT"] = "0" * 64
         write_json(record_path, record)
-        report_path = source / "reports/input.json"
+        report_path = source / "input/handoff.json"
         report = json.loads(report_path.read_text())
         report["package_files"]["discovery/native-discovery.json"] = file_digest(record_path)
         report["input_receipt"]["inventory"] = [
@@ -376,7 +376,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         """Bind the entire admitted digest map even when the replacement manifest is internally consistent."""
 
         capture = self.store.capture_dir(RUN)
-        report_path = capture / "reports/input.json"
+        report_path = capture / "input/handoff.json"
         target = capture / "input/robot.yaml"
         tampered = b'{"hardware_id": "tampered"}\n'
         target.write_bytes(tampered)
@@ -386,7 +386,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         manifest_path = capture / CAPTURE_MANIFEST
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["files"]["input/robot.yaml"] = hashlib.sha256(tampered).hexdigest()
-        manifest["files"]["reports/input.json"] = hashlib.sha256(report_path.read_bytes()).hexdigest()
+        manifest["files"]["input/handoff.json"] = hashlib.sha256(report_path.read_bytes()).hexdigest()
         manifest["file_count"] = len(manifest["files"])
         manifest["total_bytes"] = sum((capture / name).stat().st_size for name in manifest["files"])
         manifest_path.write_bytes(canonical(manifest))

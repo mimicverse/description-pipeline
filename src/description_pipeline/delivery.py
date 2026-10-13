@@ -32,6 +32,32 @@ TOOL_RECORD = "tool.json"
 TRANSFER_FILES = ("reports/native-tool.json", "reports/native-stages.json", "transfer-manifest.json")
 MASS_CLOSURE_REPORT = "reports/mass-closure.json"
 
+#: Entries a stamped pipeline output root may carry beyond the strict delivery
+#: layout: the rendered reports directory, the sealed transfer sidecar and the
+#: repository checkout attributes/readme.
+STAMPED_EXTRA = ("reports", "transfer-manifest.json", ".gitattributes", "README.md")
+
+
+def stamped_output(path: Path) -> bool:
+    """True when a directory is absent, empty, or shaped like a pipeline output.
+
+    Replacing a directory never clobbers unrelated data: a target with any
+    entry outside the stamped shape (or without its reports directory) is
+    refused.  Ownership itself lives in the platform run store; this predicate
+    is the structural guard only.
+    """
+
+    path = Path(path)
+    if not path.exists():
+        return True
+    if path.is_symlink() or path.is_junction() or not path.is_dir():
+        return False
+    entries = {entry.name for entry in path.iterdir()}
+    if not entries:
+        return True
+    allowed = set(SUBJECT_DIRECTORIES) | set(SUBJECT_FILES) | {"manifest.json"} | set(STAMPED_EXTRA)
+    return "reports" in entries and entries <= allowed and (path / "reports").is_dir()
+
 
 def _reject_root_links(root: Path) -> None:
     """No delivery entry (subject directory, receipt or manifest) may be a link."""

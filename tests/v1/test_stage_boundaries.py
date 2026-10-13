@@ -154,16 +154,15 @@ class StageBoundaryTests(unittest.TestCase):
         self.assertTrue((self.output / "reports/stages.json").is_file())
         native_stages = self.output / "reports" / "native-stages.json"
         self.assertTrue(native_stages.is_file())
-        receipt = json.loads((self.output / "reports/run.json").read_text(encoding="utf-8"))
         native_view = json.loads(native_stages.read_text(encoding="utf-8"))
         rendered = json.loads((self.output / "reports/stages.json").read_text(encoding="utf-8"))
         self.assertEqual({key: value for key, value in native_view.items() if key != "events"}, rendered)
-        self.assertEqual(native_view["events"], receipt["events"])
+        self.assertEqual(native_view["events"], result["events"])
         self.assertTrue(native_view["events"])
         self.assertTrue(all(isinstance(event.get("at"), str) and event["at"] for event in native_view["events"]))
-        self.assertEqual(receipt["state"], "native_complete")
-        self.assertIs(receipt["passed"], False)
-        self.assertEqual(receipt["capture_archive"], info)
+        self.assertEqual(result["state"], "native_complete")
+        self.assertIs(result["passed"], False)
+        self.assertEqual(result["capture_archive"], info)
 
         # Real-sealer roundtrip: seal -> admit, and only the immutable native receipt travels.
         with zipfile.ZipFile(archive) as opened:
@@ -224,9 +223,8 @@ class StageBoundaryTests(unittest.TestCase):
         self.assertTrue((self.output / "input" / "robot.yaml").is_file())
         self.assertTrue((self.output / "reports/stages.json").is_file())
         self.assertFalse((self.output / "reports" / "quality.json").exists())
-        receipt = json.loads((self.output / "reports/run.json").read_text(encoding="utf-8"))
-        self.assertEqual(receipt["state"], "generated")
-        self.assertIs(receipt["passed"], False)
+        self.assertEqual(result["state"], "generated")
+        self.assertIs(result["passed"], False)
 
     def test_verify_reruns_the_checker_on_the_seeded_subject(self) -> None:
         seed = make_seed(self.root)

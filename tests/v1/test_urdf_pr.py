@@ -587,7 +587,7 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(self.fx.remote_head(), "")
 
     def test_local_receipts_are_refused_under_reports(self) -> None:
-        self.fx.write_bundle("one\n", extra={"reports/run.json": '{"run": 1}\n'})
+        self.fx.write_bundle("one\n", extra={"reports/rogue.json": '{"run": 1}\n'})
         result = self.submit()
         self.assertEqual(result["state"], "failed")
         self.assertEqual(result["error"], "bundle_layout")

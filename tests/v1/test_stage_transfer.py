@@ -708,7 +708,7 @@ class StageTransferTests(unittest.TestCase):
         finally:
             support.cleanup(work)
 
-    def test_publisher_copies_the_native_provenance_files(self) -> None:
+    def test_publisher_keeps_native_receipts_out_of_the_model_repo(self) -> None:
         from description_pipeline.repository.urdf_pr import _copy_governed
 
         bundle = self.base / "publish-bundle"
@@ -724,9 +724,10 @@ class StageTransferTests(unittest.TestCase):
 
         worktree = self.base / "publish-worktree"
         _copy_governed(bundle, worktree)
-        self.assertTrue((worktree / "reports/native-tool.json").is_file())
-        self.assertTrue((worktree / "reports/native-stages.json").is_file())
-        self.assertTrue((worktree / transfer.CAPTURE_MANIFEST).is_file())
+        # Receipts live in platform run storage; they never enter the model repo.
+        self.assertFalse((worktree / "reports/native-tool.json").exists())
+        self.assertFalse((worktree / "reports/native-stages.json").exists())
+        self.assertFalse((worktree / transfer.CAPTURE_MANIFEST).exists())
 
         neutral = self.base / "neutral-bundle"
         for name in ("input", "evidence", "model", "urdf", "meshes"):
@@ -896,10 +897,18 @@ class StageTransferTests(unittest.TestCase):
         admit(archive, destination)
         self.assertEqual(transfer.verify_transfer(destination)["main_assembly"], MAIN_ASSEMBLY)
 
-    def test_git_attributes_protect_the_transfer_sidecar(self) -> None:
+    def test_git_attributes_protect_the_delivered_bytes(self) -> None:
         from description_pipeline.repository.urdf_pr import GIT_ATTRIBUTES
 
-        self.assertIn(b"/transfer-manifest.json -text -filter -working-tree-encoding\n", GIT_ATTRIBUTES)
+        for line in (
+            b"/manifest.json -text -filter -working-tree-encoding\n",
+            b"/input/** -text -filter -working-tree-encoding\n",
+            b"/reports/** -text -filter -working-tree-encoding\n",
+            b"/tool.json -text -filter -working-tree-encoding\n",
+        ):
+            self.assertIn(line, GIT_ATTRIBUTES)
+        # Transfer receipts stay in platform run storage; nothing protects them in the repo.
+        self.assertNotIn(b"transfer-manifest", GIT_ATTRIBUTES)
         if shutil.which("git") is None:
             self.skipTest("git is unavailable")
         repo = self.base / "attr-repo"
@@ -907,9 +916,9 @@ class StageTransferTests(unittest.TestCase):
         subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
         subprocess.run(["git", "-C", str(repo), "config", "core.autocrlf", "true"], check=True, capture_output=True)
         (repo / ".gitattributes").write_bytes(GIT_ATTRIBUTES)
-        (repo / "transfer-manifest.json").write_bytes(b"{}\n")
+        (repo / "tool.json").write_bytes(b"{}\n")
         (repo / "reports").mkdir()
-        (repo / "reports/native-tool.json").write_bytes(b"{}\n")
+        (repo / "reports/quality.json").write_bytes(b"{}\n")
         result = subprocess.run(
             [
                 "git",
@@ -920,8 +929,8 @@ class StageTransferTests(unittest.TestCase):
                 "filter",
                 "working-tree-encoding",
                 "--",
-                "transfer-manifest.json",
-                "reports/native-tool.json",
+                "tool.json",
+                "reports/quality.json",
             ],
             check=True,
             capture_output=True,

@@ -14,7 +14,7 @@ from unittest.mock import patch
 from description_pipeline import solidworks, steps
 from description_pipeline.cli import main
 from description_pipeline.delivery import BUNDLE_SCHEMA, PIPELINE_ID
-from description_pipeline.io import PipelineError, digest, file_digest, read_data, write_json
+from description_pipeline.io import PipelineError, digest, file_digest, inventory, read_data, write_json
 from description_pipeline.sources.solidworks.revision import package_inventory, seal_revision
 from description_pipeline.stages import stage_view
 
@@ -178,13 +178,14 @@ class WorkflowTests(unittest.TestCase):
 
     def test_failed_input_does_not_replace_existing_owned_output(self):
         self.output.mkdir()
+        (self.output / "reports").mkdir()
         marker = self.output / "README.md"
         marker.write_text("Existing output bytes")
         solidworks._stamp(self.output, {"schema_version": BUNDLE_SCHEMA, "pipeline_id": PIPELINE_ID})
         result = solidworks.capture(self.package, self.output)
         self.assertFalse(result["passed"])
         self.assertEqual("Existing output bytes", marker.read_text())
-        self.assertTrue(solidworks._owned_output(self.output))
+        self.assertTrue(solidworks.stamped_output(self.output))
 
     def test_native_preflight_failure_blocks_capture_and_retains_diagnostics(self):
         self.seal()
@@ -201,10 +202,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(result["stage"], "capture")
         self.assertEqual(result["error"], "Native readiness failed")
         self.assertEqual(result["detail"], error.details)
-        self.assertTrue((Path(result["diagnostic_path"]) / "reports/run.json").is_file())
         root = Path(result["diagnostic_path"])
-        receipt = read_data(root / "reports/run.json")
-        self.assertEqual(receipt["stage_report"]["sha256"], file_digest(root / "reports/stages.json"))
+        self.assertEqual(result["stage_report"]["sha256"], file_digest(root / "reports/stages.json"))
         view = read_data(root / "reports/stages.json")
         capture = next(stage for stage in view["stages"] if stage["id"] == "capture")
         self.assertEqual(capture["state"], "failed")
@@ -309,10 +308,10 @@ class WorkflowTests(unittest.TestCase):
         self.seal()
         bundle = self.root / "frozen"
         (bundle / "reports").mkdir(parents=True)
-        write_json(bundle / "reports/run.json", {"run_id": "source-run"})
         import shutil
 
         shutil.copytree(self.package, bundle / "input")
+        input_files = inventory(bundle / "input")
         write_json(
             bundle / "input" / "handoff.json",
             {
@@ -320,7 +319,7 @@ class WorkflowTests(unittest.TestCase):
                 "input": None,
                 "cad_revision": {"revision": "r1"},
                 "input_receipt": None,
-                "package_files": {},
+                "package_files": input_files,
             },
         )
         (bundle / "evidence").mkdir()
@@ -346,16 +345,35 @@ class WorkflowTests(unittest.TestCase):
             patch.object(solidworks, "_check", return_value={"passed": True, "subject_sha256": source_subject}),
             patch.object(steps, "generate_model", side_effect=generate),
             patch.object(steps, "verify_delivery", side_effect=verify),
+            patch.object(
+                steps,
+                "inspect_prepared_input",
+                return_value={
+                    "passed": True,
+                    "input": None,
+                    "cad_revision": {"revision": "r1"},
+                    "input_receipt": None,
+                },
+            ),
+            patch(
+                "description_pipeline.sources.solidworks.input.resolve_package",
+                return_value={
+                    "hardware_id": "arm",
+                    "source": {"robot_name": "arm"},
+                    "provenance": {"native_inventory_sha256": "d" * 64},
+                },
+            ),
         ):
             result = solidworks.rebuild(bundle, self.output)
         self.assertTrue(result["passed"], result)
-        self.assertEqual(result["rebuild_from"]["run_id"], "source-run")
         self.assertEqual(result["rebuild_from"]["subject_sha256"], source_subject)
+        self.assertEqual(result["rebuild_from"]["handoff_sha256"], "d" * 64)
+        self.assertEqual(result["handoff_sha256"], "d" * 64)
         view = read_data(self.output / "reports/stages.json")
         self.assertEqual(view["execution_scope"], ["generate", "verify"])
         self.assertEqual([row["id"] for row in view["stages"] if row["state"] == "completed"], ["generate", "verify"])
         self.assertTrue(all(row["state"] == "not_run" for row in view["stages"] if not row["in_scope"]))
-        self.assertTrue(solidworks._owned_output(self.output))
+        self.assertTrue(solidworks.stamped_output(self.output))
 
     def test_rebuild_refuses_a_frozen_delivery_that_changed_after_verification(self):
         bundle = self.root / "frozen"
@@ -376,7 +394,7 @@ class WorkflowTests(unittest.TestCase):
             solidworks.rebuild(bundle, self.output)
         self.assertFalse(self.output.exists())
 
-    def test_rebuild_refuses_frozen_evidence_changed_during_preparation_and_records_handoff(self):
+    def test_rebuild_refuses_frozen_evidence_changed_during_preparation(self):
         import shutil
 
         from description_pipeline.delivery import subject_digest
@@ -384,7 +402,6 @@ class WorkflowTests(unittest.TestCase):
         self.seal()
         bundle = self.root / "frozen"
         (bundle / "reports").mkdir(parents=True)
-        write_json(bundle / "reports/run.json", {"run_id": "source-run"})
         shutil.copytree(self.package, bundle / "input")
         definition = read_data(bundle / "input/robot.yaml")
         definition["provenance"] = {"native_inventory_sha256": "d" * 64}
@@ -394,7 +411,6 @@ class WorkflowTests(unittest.TestCase):
         for name in ("model", "urdf", "meshes"):
             (bundle / name).mkdir()
         (bundle / "README.md").write_text("Synthetic driver fixture")
-        write_json(bundle / "reports/input.json", {"synthetic": True})
         write_json(bundle / "reports/tool.json", {})
         write_json(bundle / "tool.json", {})
         source_subject = subject_digest(bundle)
@@ -415,9 +431,6 @@ class WorkflowTests(unittest.TestCase):
             result = solidworks.rebuild(bundle, self.output)
         self.assertFalse(result["passed"])
         self.assertIn("Frozen evidence changed during rebuild preparation", result["error"])
-        self.assertEqual(result["rebuild_from"]["run_id"], "source-run")
-        self.assertEqual(result["rebuild_from"]["handoff_sha256"], "d" * 64)
-        self.assertEqual(result["handoff_sha256"], "d" * 64)
         self.assertFalse(self.output.exists())
 
     def test_annotated_diagnostic_is_preserved_on_retry(self):

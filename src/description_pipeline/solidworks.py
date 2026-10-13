@@ -19,7 +19,7 @@ from datetime import datetime, UTC
 from pathlib import Path
 
 from . import __version__
-from .delivery import BUNDLE_SCHEMA, PIPELINE_ID, subject_inventory
+from .delivery import BUNDLE_SCHEMA, PIPELINE_ID, stamped_output, subject_inventory
 from .io import PipelineError, acquire_process_lock, digest, file_digest, inventory, read_data, write_json
 
 from .runtime import RUNTIME_VERSIONS, native_readiness, required_packages, runtime_role
@@ -43,27 +43,6 @@ def output_lock(output: Path):
         yield output
     finally:
         os.close(handle)
-
-
-def _owned_output(path: Path) -> bool:
-    if not path.exists():
-        return True
-    if path.is_symlink() or path.is_junction() or not path.is_dir():
-        return False
-    if not any(path.iterdir()):
-        return True
-    marker = path / "reports/run.json"
-    if not marker.is_file():
-        return False
-    try:
-        receipt = read_data(marker)
-        return (
-            isinstance(receipt, dict)
-            and receipt.get("schema_version") == BUNDLE_SCHEMA
-            and receipt.get("owned_files") == inventory(path, exclude=("reports/run.json",))
-        )
-    except (ValueError, OSError):
-        return False
 
 
 #: The checkpoint parts each portable stage seeds from its predecessor.  A stage
@@ -186,7 +165,7 @@ def _stage_receipt(stage: str, run_id, prior_events, *, resume, handoff_sha256) 
 def _install(staging: Path, target: Path) -> None:
     """Replace only a marked pipeline output; roll back a failed directory swap."""
 
-    if not _owned_output(target):
+    if not stamped_output(target):
         raise PipelineError(f"Refusing to replace a directory not owned by this pipeline: {target}")
     backup = Path(tempfile.mkdtemp(prefix=f".{target.name}-previous-", dir=target.parent))
     backup.rmdir()
@@ -221,11 +200,9 @@ def _stamp(root: Path, receipt: dict) -> None:
         from .structural_report import write_structural_report
 
         receipt["structural_report"] = write_structural_report(root, receipt, evidence_root=root)
-    receipt["artifacts"] = inventory(root, exclude=("reports/run.json", "reports/stages.json"))
+    receipt["artifacts"] = inventory(root, exclude=("reports/stages.json",))
     write_json(root / "reports/stages.json", stage_view(receipt))
     receipt["stage_report"] = {"path": "reports/stages.json", "sha256": file_digest(root / "reports/stages.json")}
-    receipt["owned_files"] = inventory(root, exclude=("reports/run.json",))
-    write_json(root / "reports/run.json", receipt)
 
 
 def _check(root: Path) -> dict:
@@ -237,7 +214,7 @@ def _check(root: Path) -> dict:
 def _keep_diagnostic(staging: Path, output: Path, receipt: dict) -> Path:
     _stamp(staging, receipt)
     failed = output.with_name(output.name + ".failed")
-    if not _owned_output(failed):
+    if not stamped_output(failed):
         failed = Path(tempfile.mkdtemp(prefix=output.name + ".failed-", dir=output.parent))
         failed.rmdir()
     _install(staging, failed)
@@ -353,7 +330,7 @@ def capture(
     if output.resolve().is_relative_to(package) or package.is_relative_to(output.resolve()):
         raise PipelineError("Input and output directories must be separate")
     with output_lock(output) as output:
-        if not _owned_output(output):
+        if not stamped_output(output):
             raise PipelineError(f"Output contains unrelated files: {output}")
         staging = Path(tempfile.mkdtemp(prefix=f".{output.name}-capture-", dir=output.parent))
         receipt = _stage_receipt("capture", run_id, prior_events, resume=resume, handoff_sha256=handoff_sha256)
@@ -407,7 +384,7 @@ def generate(
     if output.resolve().is_relative_to(seed_dir.resolve()) or seed_dir.resolve().is_relative_to(output.resolve()):
         raise PipelineError("Stage checkpoints and output must be separate")
     with output_lock(output) as output:
-        if not _owned_output(output):
+        if not stamped_output(output):
             raise PipelineError(f"Output contains unrelated files: {output}")
         staging = Path(tempfile.mkdtemp(prefix=f".{output.name}-generate-", dir=output.parent))
         receipt = _stage_receipt("generate", run_id, prior_events, resume=resume, handoff_sha256=handoff_sha256)
@@ -453,7 +430,7 @@ def verify(
     if output.resolve().is_relative_to(seed_dir.resolve()) or seed_dir.resolve().is_relative_to(output.resolve()):
         raise PipelineError("Stage checkpoints and output must be separate")
     with output_lock(output) as output:
-        if not _owned_output(output):
+        if not stamped_output(output):
             raise PipelineError(f"Output contains unrelated files: {output}")
         staging = Path(tempfile.mkdtemp(prefix=f".{output.name}-verify-", dir=output.parent))
         receipt = _stage_receipt("verify", run_id, prior_events, resume=resume, handoff_sha256=handoff_sha256)
@@ -515,7 +492,7 @@ def publish(
     if output.resolve().is_relative_to(repository.resolve()) or repository.resolve().is_relative_to(output.resolve()):
         raise PipelineError("Build output and the model repository must be separate directories")
     with output_lock(output) as output:
-        if not _owned_output(output):
+        if not stamped_output(output):
             raise PipelineError(f"Output contains unrelated files: {output}")
         staging = Path(tempfile.mkdtemp(prefix=f".{output.name}-publish-", dir=output.parent))
         receipt = _stage_receipt("publish", run_id, prior_events, resume=resume, handoff_sha256=handoff_sha256)
@@ -556,32 +533,26 @@ def publish(
 def rebuild(
     bundle: Path,
     output: Path,
-    *,
-    repository: Path | None = None,
-    base: str | None = None,
-    message: str | None = None,
 ) -> dict:
-    """Rebuild a verified frozen capture without Windows or a CAD session."""
+    """Rebuild a verified frozen capture without Windows or a CAD session.
+
+    Maintenance only: generation and independent verification run again, the
+    native evidence stays untouched and nothing is published - the output is
+    never registered as a platform checkpoint.
+    """
 
     bundle = Path(bundle).resolve()
     output = Path(output)
     if output.resolve().is_relative_to(bundle) or bundle.is_relative_to(output.resolve()):
         raise PipelineError("Rebuild input and output must be separate")
-    if repository is not None:
-        repo = Path(repository).resolve()
-        if output.resolve().is_relative_to(repo) or repo.is_relative_to(output.resolve()):
-            raise PipelineError("Build output and the model repository must be separate directories")
     previous = _check(bundle)
     if previous.get("passed") is not True:
         raise PipelineError("The frozen bundle failed verification; repair its author inputs and recapture")
     source_files = subject_inventory(bundle)
     if digest(source_files) != previous["subject_sha256"]:
         raise PipelineError("Frozen delivery changed after verification")
-    definition = read_data(bundle / "input/robot.yaml")
-    source_receipt = read_data(bundle / "reports/run.json") if (bundle / "reports/run.json").is_file() else {}
-    handoff_sha256 = (definition.get("provenance") or {}).get("native_inventory_sha256")
     with output_lock(output) as output:
-        if not _owned_output(output):
+        if not stamped_output(output):
             raise PipelineError(f"Output contains unrelated files: {output}")
         staging = Path(tempfile.mkdtemp(prefix=f".{output.name}-rebuild-", dir=output.parent))
         receipt = {
@@ -590,13 +561,8 @@ def rebuild(
             "run_id": str(uuid.uuid4()),
             "state": "failed",
             "passed": False,
-            "rebuild_from": {
-                "subject_sha256": previous.get("subject_sha256"),
-                "run_id": source_receipt.get("run_id"),
-                "handoff_sha256": handoff_sha256,
-            },
-            "handoff_sha256": handoff_sha256,
-            "execution_scope": ["generate", "verify"] + (["publish"] if repository else []),
+            "rebuild_from": {"subject_sha256": previous.get("subject_sha256")},
+            "execution_scope": ["generate", "verify"],
         }
         event = _event_sink(receipt)
         try:
@@ -617,11 +583,13 @@ def rebuild(
                 or subject_inventory(bundle) != source_files
             ):
                 raise PipelineError("Frozen evidence changed during rebuild preparation")
-            from .steps import generate_model, publish_model, verify_delivery
+            definition, input_report = _replay_seeded_inputs(staging)
+            handoff_sha256 = (definition.get("provenance") or {}).get("native_inventory_sha256")
+            receipt["handoff_sha256"] = handoff_sha256
+            receipt["rebuild_from"]["handoff_sha256"] = handoff_sha256
+            from .steps import generate_model, verify_delivery
 
-            generated_subject = generate_model(
-                staging, definition, read_data(bundle / "input/handoff.json"), on_event=event
-            )
+            generated_subject = generate_model(staging, definition, input_report, on_event=event)
             report = verify_delivery(staging, generated_subject, on_event=event)
             receipt.update(
                 state="verified" if report.get("passed") is True else "failed",
@@ -634,10 +602,6 @@ def rebuild(
                 failed = _keep_diagnostic(staging, output, receipt)
                 return {**receipt, "diagnostic_path": str(failed)}
             _install(staging, output)
-            if repository is not None:
-                submitted = publish_model(output, repository, base=base, message=message, on_event=event)
-                receipt.update(submission=submitted, state=submitted["state"], passed=submitted["passed"])
-                _stamp(output, receipt)
             return {**receipt, "output": str(output)}
         except Exception as error:
             return _failed_run(staging, output, receipt, event, error)

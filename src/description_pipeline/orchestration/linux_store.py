@@ -14,7 +14,7 @@ import os
 import tempfile
 from pathlib import Path
 
-from ..delivery import BUNDLE_SCHEMA, PIPELINE_ID, subject_digest, subject_inventory
+from ..delivery import PIPELINE_ID, stamped_output, subject_digest, subject_inventory
 from ..io import PipelineError, confined, inventory, read_data, write_json
 from ..stages import PORTABLE_STAGES, STAGE_IDS, stage_view
 from ..verification.solidworks_urdf import check_bundle, require_qualified_report
@@ -424,10 +424,12 @@ class LinuxStore:
         inventory, the embedded receipt's run id, handoff and subject equal to this
         attempt's recorded ones, the transfer provenance (when present) naming the
         native capture owner and the same handoff, and the archived input bytes equal
-        to that owner's admitted capture.  A linked attempt reuses the parent's
-        immutable transfer and checkpoints, so its own receipts must name the child
-        while the transfer may legitimately name the parent.  Failure at any step is
-        an integrity error, never a reason to serve something else, so a foreign
+        to that owner's admitted capture.  The delivery itself is bound by
+        recomputing its subject from the retained bytes - the receipt no longer
+        travels inside the delivery.  A linked attempt reuses the parent's immutable
+        transfer and checkpoints, so its own receipts must name the child while the
+        transfer may legitimately name the parent.  Failure at any step is an
+        integrity error, never a reason to serve something else, so a foreign
         stamped bundle copied into another attempt cannot be mislabeled as its
         diagnostic preview.
         """
@@ -448,24 +450,23 @@ class LinuxStore:
         candidate = Path(recorded).resolve()
         if candidate != run_root and run_root not in candidate.parents:
             raise PipelineError("The retained diagnostic location is outside this attempt")
-        embedded = _stamped_receipt(candidate)
-        if embedded is None:
+        if not stamped_output(candidate):
             raise PipelineError("The retained diagnostic delivery is not a stamped pipeline output")
         if receipt.get("run_id") != run_id:
             raise PipelineError("The retained verify receipt belongs to another attempt")
         subject = receipt.get("subject_sha256")
         if not isinstance(subject, str):
             raise PipelineError("The failed verify receipt is not bound to a subject")
+        try:
+            computed_subject = subject_digest(candidate)
+        except PipelineError as error:
+            raise PipelineError("The retained diagnostic delivery is not a stamped pipeline output") from error
+        if computed_subject != subject:
+            raise PipelineError("The retained diagnostic delivery does not match its recorded subject")
         meta = self.meta(run_id) or {}
         expected_handoff = meta.get("handoff_sha256") or receipt.get("handoff_sha256")
         if not isinstance(expected_handoff, str) or not expected_handoff:
             raise PipelineError("This attempt records no handoff identity for its diagnostic delivery")
-        if (
-            embedded.get("run_id") != run_id
-            or embedded.get("handoff_sha256") != expected_handoff
-            or embedded.get("subject_sha256") != subject
-        ):
-            raise PipelineError("The retained diagnostic delivery belongs to another run or handoff")
         try:
             capture_owner = self.checkpoint_owner(run_id, "capture")
             capture = self.capture_dir(capture_owner)
@@ -605,30 +606,6 @@ def _delivery_fingerprint(delivery: Path) -> tuple:
             stat = path.stat()
             rows.append((path.relative_to(delivery).as_posix(), stat.st_size, stat.st_mtime_ns))
     return tuple(rows)
-
-
-def _stamped_receipt(path: Path) -> dict | None:
-    """The receipt of a directory this pipeline stamped, when members match its inventory."""
-
-    path = Path(path)
-    if path.is_symlink() or path.is_junction() or not path.is_dir():
-        return None
-    if not (path / "input").is_dir() or not (path / "reports").is_dir():
-        return None
-    marker = path / "reports/run.json"
-    if not marker.is_file():
-        return None
-    try:
-        receipt = read_data(marker)
-    except (PipelineError, OSError, ValueError):
-        return None
-    if (
-        isinstance(receipt, dict)
-        and receipt.get("schema_version") == BUNDLE_SCHEMA
-        and receipt.get("owned_files") == inventory(path, exclude=("reports/run.json",))
-    ):
-        return receipt
-    return None
 
 
 def _read_optional_json(path: Path) -> object | None:

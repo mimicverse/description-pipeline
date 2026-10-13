@@ -22,7 +22,7 @@ from pathlib import Path
 from unittest import mock
 
 from description_pipeline.delivery import subject_digest
-from description_pipeline.io import PipelineError, inventory, write_json
+from description_pipeline.io import PipelineError, write_json
 from description_pipeline.orchestration import portal as portal_module
 from description_pipeline.orchestration import linux_store as store_module
 from description_pipeline.orchestration.airflow_client import EndpointError, native_run_id
@@ -123,9 +123,13 @@ class DiagnosticPreviewTests(unittest.TestCase):
         payload = json.loads(discovery_path.read_text(encoding="utf-8"))
         payload["findings"] = DISCOVERY_FINDINGS["findings"]
         write_json(discovery_path, payload)
+        handoff_path = self.store.capture_dir(RUN) / "input/handoff.json"
+        handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
+        handoff["warnings"] = INPUT_WARNINGS["warnings"]
+        write_json(handoff_path, handoff)
 
     # ------------------------------------------------------------------ fixture
-    def _retained_failed_verify(self, *, passed: bool = False, stamp: bool = True) -> Path:
+    def _retained_failed_verify(self, *, passed: bool = False) -> Path:
         """Build the state a failing verify stage leaves behind: bytes, report, receipt."""
 
         failed = self.store.stage_dir(RUN, "verify").with_name("verify.failed")
@@ -136,7 +140,6 @@ class DiagnosticPreviewTests(unittest.TestCase):
         (failed / "urdf/robot.urdf").write_bytes(URDF)
         (failed / "meshes/base_link.stl").write_text("solid base_link\nendsolid base_link\n", encoding="utf-8")
         (failed / "README.md").write_text("diagnostic delivery\n", encoding="utf-8")
-        write_json(failed / "reports/input.json", INPUT_WARNINGS)
         write_json(
             failed / "reports/tool.json",
             {"pipeline_id": "solidworks-to-urdf", "schema_version": "solidworks-to-urdf.tool/v1"},
@@ -149,20 +152,6 @@ class DiagnosticPreviewTests(unittest.TestCase):
         subject = subject_digest(failed)
         report = {"passed": passed, "subject_sha256": subject, "checks": FAILING_CHECKS}
         write_json(failed / "reports/quality.json", report)
-        if stamp:
-            write_json(
-                failed / "reports/run.json",
-                {
-                    "schema_version": "solidworks-to-urdf.bundle/v1",
-                    "run_id": RUN,
-                    "state": "failed",
-                    "passed": False,
-                    "stage": "verify",
-                    "handoff_sha256": HANDOFF,
-                    "subject_sha256": subject,
-                    "owned_files": inventory(failed, exclude=("reports/run.json",)),
-                },
-            )
         self.store.record_stage(
             RUN,
             "verify",
@@ -224,8 +213,8 @@ class DiagnosticPreviewTests(unittest.TestCase):
             },
         )
 
-    def _restamp(self, bundle: Path, *, run_id: str, handoff: str, manifest_run_id: str) -> str:
-        """Re-label a copied bundle self-consistently, then re-stamp it; returns its subject."""
+    def _restamp(self, bundle: Path, *, handoff: str, manifest_run_id: str) -> str:
+        """Re-label a copied bundle self-consistently; returns its subject."""
 
         manifest_path = bundle / "transfer-manifest.json"
         if manifest_path.is_file():
@@ -236,10 +225,6 @@ class DiagnosticPreviewTests(unittest.TestCase):
         report = json.loads((bundle / "reports/quality.json").read_text(encoding="utf-8"))
         report["subject_sha256"] = subject
         write_json(bundle / "reports/quality.json", report)
-        embedded = json.loads((bundle / "reports/run.json").read_text(encoding="utf-8"))
-        embedded.update(run_id=run_id, handoff_sha256=handoff, subject_sha256=subject)
-        embedded["owned_files"] = inventory(bundle, exclude=("reports/run.json",))
-        write_json(bundle / "reports/run.json", embedded)
         return subject
 
     # ------------------------------------------------------- foreign bundle binding
@@ -248,7 +233,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         self._foreign_receipt(FOREIGN, copy)
         with self.assertRaises(PipelineError) as caught:
             self.store.preview(FOREIGN)
-        self.assertIn("another run or handoff", str(caught.exception))
+        self.assertIn("transfer provenance", str(caught.exception))
 
     def test_a_foreign_receipt_run_id_is_refused(self) -> None:
         copy = self._copied_bundle()
@@ -259,7 +244,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
 
     def test_a_rebadged_foreign_bundle_still_fails_the_input_binding(self) -> None:
         copy = self._copied_bundle()
-        self._restamp(copy, run_id=FOREIGN, handoff=FOREIGN_HANDOFF, manifest_run_id=FOREIGN)
+        self._restamp(copy, handoff=FOREIGN_HANDOFF, manifest_run_id=FOREIGN)
         self._foreign_receipt(FOREIGN, copy)
         with self.assertRaises(PipelineError) as caught:
             self.store.preview(FOREIGN)
@@ -267,19 +252,19 @@ class DiagnosticPreviewTests(unittest.TestCase):
 
     def test_foreign_transfer_provenance_is_refused(self) -> None:
         copy = self._copied_bundle()
-        self._restamp(copy, run_id=FOREIGN, handoff=FOREIGN_HANDOFF, manifest_run_id=RUN)
+        self._restamp(copy, handoff=FOREIGN_HANDOFF, manifest_run_id=RUN)
         self._foreign_receipt(FOREIGN, copy)
         with self.assertRaises(PipelineError) as caught:
             self.store.preview(FOREIGN)
         self.assertIn("transfer provenance", str(caught.exception))
 
-    def test_embedded_handoff_must_match_the_attempt(self) -> None:
+    def test_a_handoff_mismatch_is_refused(self) -> None:
         copy = self._copied_bundle()
-        self._restamp(copy, run_id=FOREIGN, handoff=HANDOFF, manifest_run_id=FOREIGN)
+        self._restamp(copy, handoff=HANDOFF, manifest_run_id=FOREIGN)
         self._foreign_receipt(FOREIGN, copy)
         with self.assertRaises(PipelineError) as caught:
             self.store.preview(FOREIGN)
-        self.assertIn("another run or handoff", str(caught.exception))
+        self.assertIn("transfer provenance", str(caught.exception))
 
     # ------------------------------------------------------- linked attempts
     def _linked_child(self) -> str:
@@ -293,7 +278,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         shutil.copytree(parent_failed, child_failed)
         # The immutable native transfer still records the capture owner (RUN); the
         # embedded receipt and the store receipt must name the linked child.
-        self._restamp(child_failed, run_id=LINKED_CHILD, handoff=HANDOFF, manifest_run_id=RUN)
+        self._restamp(child_failed, handoff=HANDOFF, manifest_run_id=RUN)
         self._foreign_receipt(LINKED_CHILD, child_failed, handoff=HANDOFF)
         self.store.update_meta(
             LINKED_CHILD,
@@ -317,7 +302,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         child = self._linked_child()
         bundle = self.store.stage_dir(child, "verify").with_name("verify.failed")
         # A manifest naming neither the child nor its capture owner breaks the lineage.
-        self._restamp(bundle, run_id=child, handoff=HANDOFF, manifest_run_id=FOREIGN)
+        self._restamp(bundle, handoff=HANDOFF, manifest_run_id=FOREIGN)
         self._foreign_receipt(child, bundle, handoff=HANDOFF)
         with self.assertRaises(PipelineError) as caught:
             self.store.preview(child)
@@ -364,7 +349,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         with self.assertRaises(PipelineError):
             self.store.open_artifact(RUN, "urdf/robot.urdf", sha256="0" * 64)
         with self.assertRaises(PipelineError):
-            self.store.open_artifact(RUN, "../reports/run.json", sha256=digest)
+            self.store.open_artifact(RUN, "../reports/quality.json", sha256=digest)
         # A member edit after the binding is refused on the serving stream itself.
         (failed / "urdf/robot.urdf").write_bytes(b'<robot name="tampered"/>\n')
         tampered, _size = self.store.open_artifact(RUN, "urdf/robot.urdf", sha256=digest)
@@ -378,7 +363,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         (failed / "urdf/robot.urdf").write_bytes(b'<robot name="tampered"/>\n')
         with self.assertRaises(PipelineError) as caught:
             self.store.preview(RUN)
-        self.assertIn("stamped pipeline output", str(caught.exception))
+        self.assertIn("does not match its recorded subject", str(caught.exception))
 
     def test_forged_quality_report_denies_the_diagnostic(self) -> None:
         self._retained_failed_verify(passed=True)
@@ -387,7 +372,8 @@ class DiagnosticPreviewTests(unittest.TestCase):
         self.assertIn("failed report", str(caught.exception))
 
     def test_missing_stamp_or_foreign_location_denies_the_diagnostic(self) -> None:
-        self._retained_failed_verify(stamp=False)
+        failed = self._retained_failed_verify()
+        (failed / "stray.bin").write_bytes(b"unrelated bytes\n")
         with self.assertRaises(PipelineError) as caught:
             self.store.preview(RUN)
         self.assertIn("stamped pipeline output", str(caught.exception))
@@ -456,7 +442,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         self.assertEqual(captured["status"], "200 OK")
         self.assertEqual(body, URDF)
         with self.assertRaises(portal_module.PortalError):
-            app._artifact(environ, start_response, DAG_RUN_ID, "reports/run.json")
+            app._artifact(environ, start_response, DAG_RUN_ID, "reports/stages.json")
 
     # ---------------------------------------------------------------------- ui
     def test_preview_ui_labels_the_diagnostic_and_forbids_publication(self) -> None:
