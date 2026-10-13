@@ -21,7 +21,7 @@ py -3.12 -m venv .venv
 .venv\Scripts\python.exe -m pip install --no-deps /path/to/mimicverse_description-<version>-py3-none-any.whl
 ```
 
-锁文件记录完整角色依赖。开发工具链机器记录固定 CPython、Node.js 与构建器的精确版本；Linux 开发与 CI 显式安装并校验该 Node.js 以运行浏览器逻辑回归；缺少必需测试运行时须失败，不能以静默跳过减少覆盖。
+锁文件记录完整角色依赖。开发工具链机器记录固定 CPython、Node.js 与构建器的精确版本（`.python-version`、`.nvmrc`、`requirements/build-py312.lock`）；Linux 开发与 CI 显式安装并校验该 Node.js 以运行浏览器逻辑回归；缺少必需测试运行时须失败，不能以静默跳过减少覆盖。
 
 ## 代码边界
 

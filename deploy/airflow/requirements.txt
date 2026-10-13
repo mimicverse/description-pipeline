@@ -2,10 +2,10 @@
 # the socket DSN (psycopg2), and the async driver Airflow 3 uses alongside it (asyncpg).
 #
 # requirements.lock is the full Linux CPython 3.12 closure of these pins plus the built
-# mimicverse_description wheel with its verify extra, so the core runtime dependencies
-# and MuJoCo's transitive closure (absl-py, etils, glfw, PyOpenGL, …) are pinned and hashed too.
-# The lock is the single resolved stack the installer consumes; the direct pins above are its
-# inputs.
+# mimicverse_description wheel with its portable and verify extras, so the portable
+# runtime dependencies and MuJoCo's transitive closure (absl-py, etils, glfw, PyOpenGL,
+# …) are pinned and hashed too. The lock is the single resolved stack the installer consumes;
+# the direct pins above are its inputs.
 #
 # Regeneration commands and acceptance: docs/deployment.md, Maintenance.
 apache-airflow==3.3.2

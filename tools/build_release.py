@@ -5,25 +5,76 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 from packaging.utils import parse_wheel_filename
 from packaging.requirements import Requirement
 
-from description_pipeline import __version__
-from description_pipeline.build.archive import normalize_sdist, normalize_zip, write_zip
-from description_pipeline.delivery import PIPELINE_ID
-from description_pipeline.io import PipelineError, digest, file_digest, inventory, write_json
-
 BUILD_PACKAGES = {"setuptools", "wheel", "build"}
 
 
-def locked_builders(root):
+def bind_source_closure(source: Path) -> SimpleNamespace:
+    """Load version, release identity and codecs from the specified source closure only.
+
+    The release identity can never be decided by an ambient installation: ambient
+    ``description_pipeline`` modules are set aside while the specified source root is
+    the only path entry, every loaded module must actually live inside it, and the
+    caller's module state is restored before returning - the returned objects stay
+    bound to the source closure.
+    """
+
+    source = Path(source).resolve()
+
+    def pipeline_modules() -> list[str]:
+        return [
+            name
+            for name in sys.modules
+            if name == "description_pipeline" or name.startswith("description_pipeline.")
+        ]
+
+    saved = {name: sys.modules[name] for name in pipeline_modules()}
+    for name in saved:
+        del sys.modules[name]
+    sys.path.insert(0, str(source))
+    try:
+        import description_pipeline  # noqa: PLC0415
+        from description_pipeline import io as pipeline_io  # noqa: PLC0415
+        from description_pipeline.build import archive as build_archive  # noqa: PLC0415
+        from description_pipeline.delivery import PIPELINE_ID  # noqa: PLC0415
+
+        for module in (description_pipeline, pipeline_io, build_archive):
+            module_file = getattr(module, "__file__", "") or ""
+            if not Path(module_file).resolve().is_relative_to(source):
+                raise pipeline_io.PipelineError(
+                    f"the release build bound a module outside the source closure: {module_file}"
+                )
+        return SimpleNamespace(
+            version=description_pipeline.__version__,
+            PIPELINE_ID=PIPELINE_ID,
+            PipelineError=pipeline_io.PipelineError,
+            digest=pipeline_io.digest,
+            file_digest=pipeline_io.file_digest,
+            inventory=pipeline_io.inventory,
+            write_json=pipeline_io.write_json,
+            normalize_zip=build_archive.normalize_zip,
+            normalize_sdist=build_archive.normalize_sdist,
+            write_zip=build_archive.write_zip,
+        )
+    finally:
+        sys.path.remove(str(source))
+        for name in pipeline_modules():
+            del sys.modules[name]
+        sys.modules.update(saved)
+
+
+def locked_builders(root, bound):
     versions = {}
     for line in (root / "requirements/build-py312.lock").read_text(encoding="utf-8").splitlines():
         if not line or line.startswith("#"):
@@ -32,10 +83,10 @@ def locked_builders(root):
         if requirement.name in BUILD_PACKAGES:
             (spec,) = requirement.specifier
             if spec.operator != "==":
-                raise PipelineError("Release builders must use exact versions")
+                raise bound.PipelineError("Release builders must use exact versions")
             versions[requirement.name] = spec.version
     if set(versions) != BUILD_PACKAGES:
-        raise PipelineError("Builder lock is incomplete")
+        raise bound.PipelineError("Builder lock is incomplete")
     return versions
 
 
@@ -43,7 +94,21 @@ def git(root, *arguments):
     return subprocess.check_output(["git", *arguments], cwd=root, text=True).strip()
 
 
-def offline_bundle(source, output, wheel, platform):
+def source_inventory(directory: Path, bound: SimpleNamespace) -> dict[str, str]:
+    """The source file inventory with interpreter bytecode caches ignored.
+
+    A committed checkout must stay buildable after running tests: ``__pycache__`` is
+    never part of the source closure and never enters the archived inventory.
+    """
+
+    return {
+        name: digest
+        for name, digest in bound.inventory(directory).items()
+        if "__pycache__" not in Path(name).parts
+    }
+
+
+def offline_bundle(source, output, wheel, platform, bound):
     """Include exactly the resolved target wheels and a SHA-256 installation lock."""
     with tempfile.TemporaryDirectory(prefix="description-offline-") as temporary:
         staging = Path(temporary)
@@ -66,7 +131,7 @@ def offline_bundle(source, output, wheel, platform):
         locked = []
         for path in sorted(wheels.glob("*.whl")):
             name, version, _, _ = parse_wheel_filename(path.name)
-            locked.append(f"{name}=={version} --hash=sha256:{file_digest(path)}")
+            locked.append(f"{name}=={version} --hash=sha256:{bound.file_digest(path)}")
         (staging / "requirements.lock").write_text("\n".join(locked) + "\n", encoding="utf-8")
         (staging / "README.md").write_text(
             "# Offline installation\n\nRequires CPython 3.12, x86_64. Create a dedicated virtual environment, "
@@ -75,24 +140,25 @@ def offline_bundle(source, output, wheel, platform):
             "description doctor\n```\n\nFollow docs/deployment.md in the matching deployment archive.\n",
             encoding="utf-8",
         )
-        write_json(staging / "files.json", inventory(staging))
-        target = output / f"description-{__version__}-{platform}-cp312-x86_64.zip"
-        write_zip(target, ((name, (staging / name).read_bytes()) for name in inventory(staging)))
+        bound.write_json(staging / "files.json", bound.inventory(staging))
+        target = output / f"description-{bound.version}-{platform}-cp312-x86_64.zip"
+        bound.write_zip(target, ((name, (staging / name).read_bytes()) for name in bound.inventory(staging)))
         return target
 
 
 def build(root, output, *, offline=False):
     root, output = root.resolve(), output.resolve()
+    bound = bind_source_closure(root / "src")
     if sys.version_info[:2] != (3, 12):
-        raise PipelineError("Release builds require CPython 3.12")
+        raise bound.PipelineError("Release builds require CPython 3.12")
     if git(root, "status", "--porcelain", "--untracked-files=normal"):
-        raise PipelineError("Release builds require a clean committed checkout")
+        raise bound.PipelineError("Release builds require a clean committed checkout")
     if output.exists() and any(output.iterdir()):
-        raise PipelineError("Use an empty release output directory")
-    builders = locked_builders(root)
+        raise bound.PipelineError("Use an empty release output directory")
+    builders = locked_builders(root, bound)
     for name, expected in builders.items():
         if importlib.metadata.version(name) != expected:
-            raise PipelineError(f"Install requirements/build-py312.lock: {name} must be {expected}")
+            raise bound.PipelineError(f"Install requirements/build-py312.lock: {name} must be {expected}")
     output.mkdir(parents=True, exist_ok=True)
     commit = git(root, "rev-parse", "HEAD")
     with tempfile.TemporaryDirectory(prefix="description-release-") as temporary:
@@ -104,25 +170,30 @@ def build(root, output, *, offline=False):
         with tarfile.open(archive) as handle:
             handle.extractall(source, filter="data")
         package = source / "src/description_pipeline"
-        files = inventory(package)
+        if source_inventory(root / "src/description_pipeline", bound) != source_inventory(package, bound):
+            raise bound.PipelineError("the bound source closure differs from the archived commit")
+        files = bound.inventory(package)
         identity = {
             "schema_version": "solidworks-to-urdf.release/v1",
-            "pipeline_id": PIPELINE_ID,
-            "version": __version__,
+            "pipeline_id": bound.PIPELINE_ID,
+            "version": bound.version,
             "source_commit": commit,
-            "source_sha256": digest(files),
+            "source_sha256": bound.digest(files),
             "package_files": files,
             "builder": {"python": sys.version.split()[0], **builders},
         }
-        write_json(package / "tool-release.json", identity)
+        bound.write_json(package / "tool-release.json", identity)
+        build_env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
         subprocess.run(
-            [sys.executable, "-m", "build", "--no-isolation", "--outdir", str(output), str(source)], check=True
+            [sys.executable, "-m", "build", "--no-isolation", "--outdir", str(output), str(source)],
+            check=True,
+            env=build_env,
         )
         (wheel,) = output.glob("*.whl")
         (sdist,) = output.glob("*.tar.gz")
-        normalize_zip(wheel)
-        normalize_sdist(sdist)
-        deployment = output / f"description-{__version__}-deployment.zip"
+        bound.normalize_zip(wheel)
+        bound.normalize_sdist(sdist)
+        deployment = output / f"description-{bound.version}-deployment.zip"
         resources = [
             path
             for directory in ("deploy", "docs", "requirements")
@@ -132,19 +203,17 @@ def build(root, output, *, offline=False):
         resources += [
             source / name for name in ("README.md", "LICENSE", "CODE_OF_CONDUCT.md", "CONTRIBUTING.md", "RELEASING.md")
         ]
-        write_zip(deployment, ((path.relative_to(source).as_posix(), path.read_bytes()) for path in resources))
+        bound.write_zip(deployment, ((path.relative_to(source).as_posix(), path.read_bytes()) for path in resources))
         if offline:
             for platform in ("linux", "windows"):
-                offline_bundle(source, output, wheel, platform)
-        write_json(output / "release.json", {**identity, "artifacts": inventory(output)})
-        artifacts = inventory(output)
-        write_json(output / "SHA256SUMS.json", artifacts)
+                offline_bundle(source, output, wheel, platform, bound)
+        artifacts = bound.inventory(output)
+        bound.write_json(output / "release.json", {**identity, "artifacts": artifacts})
     return {
         "passed": True,
         "source_commit": commit,
         "source_sha256": identity["source_sha256"],
         "artifacts": artifacts,
-        "checksum_manifest_sha256": file_digest(output / "SHA256SUMS.json"),
     }
 
 

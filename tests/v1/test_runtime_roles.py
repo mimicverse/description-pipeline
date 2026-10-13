@@ -6,6 +6,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
+
 from description_pipeline import runtime, solidworks
 from description_pipeline.io import PipelineError
 from description_pipeline.verification import consumer
@@ -117,6 +120,42 @@ class RuntimeRoleTests(unittest.TestCase):
                     set(locked) & {"numpy", "jsonschema", "python-multipart", "attrs", "referencing", "rpds-py"},
                     "packages owned by the portable surfaces must not return to the Windows lock",
                 )
+
+    def test_wheel_metadata_carries_the_exact_role_closures(self):
+        """The wheel's base set and role extras are the closures the runtime enforces."""
+
+        root = Path(__file__).resolve().parents[2]
+        project = tomllib.loads((root / "pyproject.toml").read_text())["project"]
+        extras = project["optional-dependencies"]
+        base = [Requirement(value) for value in project["dependencies"]]
+
+        def platform_names(platform: str) -> set[str]:
+            names = set()
+            for requirement in base:
+                if requirement.marker is None or requirement.marker.evaluate({"sys_platform": platform}):
+                    names.add(canonicalize_name(requirement.name))
+            return names
+
+        def extra_names(extra: str) -> set[str]:
+            return {canonicalize_name(Requirement(value).name) for value in extras[extra]}
+
+        self.assertEqual(set(extras), {"portable", "verify", "dev"})
+        self.assertEqual(
+            platform_names("win32"),
+            {canonicalize_name(name) for name in runtime.required_packages("native")},
+            "the wheel's Windows base requirements must be exactly the native role closure",
+        )
+        portable = platform_names("linux") | extra_names("portable") | extra_names("verify")
+        self.assertEqual(
+            portable,
+            {canonicalize_name(name) for name in runtime.required_packages("portable")},
+            "the base plus the portable and verify extras must be exactly the portable closure",
+        )
+        self.assertFalse(
+            (platform_names("linux") | platform_names("win32"))
+            & {"numpy", "jsonschema", "python-multipart", "mujoco"},
+            "packages owned by the portable surfaces must never be base requirements",
+        )
 
 
 if __name__ == "__main__":
