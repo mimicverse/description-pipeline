@@ -9,8 +9,10 @@
 --   scheduling rows: the retained side is the platform dispatch intent / business binding
 --   (operation kinds dispatch/native/publish/cancel), LEFT JOINed to the real Airflow
 --   task_instance on the full unique key (dag_id, task_id, run_id, map_index).  A missing
---   binding key or a missing source row keeps the row visible with state NULL / bucket
---   unknown (no INNER JOIN, no silent loss).  For a present source row updated_at freezes to
+--   binding key never matches - equality against NULL matches nothing, and no key is ever
+--   manufactured (no COALESCE): the retained row stays visible with state NULL / bucket
+--   unknown (no INNER JOIN, no silent loss).  Only an explicit map_index = -1 (the real
+--   unmapped-task value) can bind.  For a present source row updated_at freezes to
 --   end_date, falling back to start_date.
 --   request rows are accepted facts for reports only; the stop/drain gates ignore the kind.
 
@@ -80,7 +82,7 @@ FROM (
            ON ti.dag_id = o.dag_id
           AND ti.task_id = o.task_id
           AND ti.run_id = o.dag_run_id
-          AND ti.map_index = COALESCE(o.map_index, -1)
+          AND ti.map_index = o.map_index
     WHERE o.kind IN ('dispatch', 'native', 'publish', 'cancel')
 ) AS rows;
 

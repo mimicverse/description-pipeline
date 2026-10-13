@@ -21,6 +21,12 @@ BEGIN
     END IF;
 END $$;
 
+-- Role attributes are enforced idempotently as well: the roles are cluster-scoped and may
+-- already exist from an earlier definition.
+ALTER ROLE platform_owner NOLOGIN;
+ALTER ROLE platform_service LOGIN;
+ALTER ROLE operator_ro LOGIN;
+
 GRANT USAGE ON SCHEMA :"airflow_schema" TO platform_owner;
 GRANT SELECT ON :"airflow_schema".task_instance TO platform_owner;
 
