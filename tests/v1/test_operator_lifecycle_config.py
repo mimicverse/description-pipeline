@@ -17,6 +17,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from description_pipeline import schemas
+
 ROOT = Path(__file__).resolve().parents[2]
 OPERATOR = ROOT / "deploy" / "operator"
 CONTROL = OPERATOR / "operatorctl.sh"
@@ -44,7 +46,7 @@ def run(args: list[str]) -> subprocess.CompletedProcess:
 
 def platform_document(root: Path) -> dict:
     return {
-        "schema_version": "solidworks-to-urdf.platform/v1",
+        "schema_version": schemas.PLATFORM_CONFIG_SCHEMA,
         "operator": {
             "origin": "https://10.0.0.235:9443",
             "certificate_file": str(root / "secrets" / "tls.crt"),
