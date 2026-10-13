@@ -182,6 +182,40 @@ the portal (and the Airflow connection rendered from the same file) configuratio
 Back up the run store with platform state; it owns portable checkpoints and
 published model receipts.
 
+## Release staging and rehearsal
+
+Every deployment archive stages its own release machinery: the staged tree carries
+`deploy/operator/rehearsal/{prepare-venv,stage-and-validate,switch,quiesce-admission}.sh`,
+`deploy/operator/inspect-release.py`, `deploy/windows/{endpoint-launcher.py,endpoint.example.json}`
+and `deploy/windows/candidate/` (the Windows candidate harness). Run them from the staged release
+tree; they are idempotent and fail closed, and the live rollback runtime is supplied as an explicit
+parameter (no generation-pinned constants ship in the repository).
+
+| variable | meaning | default |
+|---|---|---|
+| `OPERATOR_ROOT` | operator state root (venvs, releases, state) | `/home/andy/operator` |
+| `LIVE_TAG` | live/rollback venv tag; required by prepare-venv, stage-and-validate and switch | — |
+| `LIVE_RELEASE` | live/rollback release directory name; required by switch | — |
+| `REHEARSAL_DIR` | rehearsal working directory | `$OPERATOR_ROOT/split-$TAG-rehearsal` |
+| `EXPECTED_DAG_TASKS` | pinned DAG task count checked while staging | `8` |
+| `OPERATOR_URL` | operator URL used by the health checks | `https://10.0.0.235:8443` |
+| `OPERATOR_TLS_CA` | CA bundle used by the health checks | `$OPERATOR_ROOT/state/tls/operator-tls-fullchain.crt` |
+| `POSTGRES_ROOT`, `POSTGRES_MAJOR`, `POSTGRES_PORT` | portable PostgreSQL used for the drain gate | `$OPERATOR_ROOT/airflow-pg`, `14`, `5433` |
+| `UV_PYTHON` | base CPython used to build candidate venvs | uv-managed 3.12.14 path |
+
+`switch.sh stage <tag> …` installs the inactive runtime and imports the DAG without live change;
+`switch.sh switch <tag> …` re-stages, requires zero active Airflow rows, backs up `operator.env`,
+promotes, starts and health-checks; `switch.sh rollback <tag>` restores the newest
+`operator.env.bak-pre-<tag>-*` and the live rollback runtime. `quiesce-admission.sh` stops ingress,
+pauses the DAG and runs the read-only `inspect-release.py` drain check.
+
+The Windows candidate harness runs from `deploy/windows/candidate/` with a mandatory `-Tag`
+(plus `-Root`, `-Stamp`, and `-TemplateTask` for registration); `endpoint.example.json` mirrors the
+endpoint configuration schema with placeholder paths and no secret values (the bearer token stays
+in the host's mode-`0600` token file), and `endpoint-launcher.py` takes the endpoint root from
+`DESCRIPTION_ENDPOINT_ROOT`. `tools/acceptance/m3_acceptance.py <run-dir> [<bundle-dir>]` runs the
+read-only RC acceptance from the repository.
+
 Set `DISCOVERY_SETTINGS_FILE` to the absolute path of a private JSON file, for example
 `{"record_roots":["/srv/description/cad-records"],"frozen_names_file":"/srv/description/interface-names.json"}`.
 Omit unused keys. Installation carries this object through `pipeline.discovery`
