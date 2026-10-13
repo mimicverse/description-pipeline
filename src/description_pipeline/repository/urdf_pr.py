@@ -129,6 +129,19 @@ def _identity_of(source: dict) -> dict:
     }
 
 
+def _check_successor(previous: dict, current: dict) -> None:
+    """Platform successor semantics for the review branch.
+
+    The CAD label is raw engineering metadata, not a content identity, so a new
+    content identity under the same label is allowed; lost-update protection is
+    the request's fixed base/head, the published subject chain and CAS/ff.  This
+    guard only refuses a changed hardware target.
+    """
+
+    if previous["hardware_id"] != current["hardware_id"]:
+        raise PrError("cad_revision_conflict", "CAD hardware identity changed across the review branch")
+
+
 def _validate(bundle: Path) -> tuple[str, dict, dict]:
     for name in REQUIRED_FILES:
         if not (bundle / name).is_file():
@@ -576,6 +589,8 @@ def submit_bundle(
         try:
             _prepare_worktree(repository, worktree, base_sha, head_sha)
             previous = _previous_revision(worktree, hardware)
+            if previous is not None:
+                _check_successor(previous, current_revision)
             commit, noop = _stage_commit(
                 bundle, worktree, subject, message or f"feat({hardware}): publish SolidWorks-to-URDF bundle"
             )

@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from description_pipeline.delivery import write_delivery_manifest, subject_digest
+from description_pipeline.delivery import read_source_record, subject_digest, write_delivery_manifest
 from description_pipeline.interface_records import check_policy_digest
 from description_pipeline.io import digest
 from description_pipeline.repository import urdf_pr
@@ -577,6 +577,66 @@ class PublishTests(unittest.TestCase):
             mock.patch.object(urdf_pr.subprocess, "run", side_effect=fake_run),
             self.assertRaises(urdf_pr.PrError) as raised,
         ):
+            urdf_pr.published_revision(self.fx.repo, "m3.0")
+        self.assertEqual(raised.exception.code, "published_revision_unknown")
+
+    def test_w12_probe_1_publisher_accepts_missing_revision(self) -> None:
+        """W12-1: a legal source with revision=null plus a re-sealed manifest is accepted."""
+        source = read_source_record(self.fx.bundle)
+        source["metadata"]["revision"] = None
+        (self.fx.bundle / "input/source.json").write_text(json.dumps(source), encoding="utf-8")
+        self.fx.write_manifest()
+        hardware, _, current = urdf_pr._validate(self.fx.bundle)
+        self.assertEqual(hardware, "m3.0")
+        self.assertIsNone(current["revision"])
+        self.assertIn(self.submit()["state"], {"published", "updated"})
+
+    def test_w12_probe_2_previous_revision_keeps_content_identity_without_label(self) -> None:
+        """W12-2: the platform content identity survives a missing CAD label."""
+        source = read_source_record(self.fx.bundle)
+        source["metadata"]["revision"] = None
+        (self.fx.bundle / "input/source.json").write_text(json.dumps(source), encoding="utf-8")
+        self.fx.write_manifest()
+        previous = urdf_pr._previous_revision(self.fx.bundle, "m3.0")
+        self.assertIsNotNone(previous)
+        self.assertIsNone(previous["revision"])
+        self.assertEqual(previous["source_revision_id"], source["source_revision_id"])
+
+    def test_w12_probe_3_same_label_new_content_is_allowed(self) -> None:
+        """W12-3: successor judgement is platform-level, not label-vs-content."""
+        before = urdf_pr._identity_of(read_source_record(self.fx.bundle))
+        after = dict(before, source_revision_id="d" * 64)
+        urdf_pr._check_successor(before, before)
+        urdf_pr._check_successor(before, after)
+        with self.assertRaises(urdf_pr.PrError):
+            urdf_pr._check_successor(before, dict(after, hardware_id="other"))
+
+    def test_w12_probe_4_transport_failure_never_reads_old_fetch_head(self) -> None:
+        """W12-4: a failed fetch must not surface a stale FETCH_HEAD identity."""
+        self.submit()
+        stale = urdf_pr.published_revision(self.fx.repo, "m3.0")
+        self.assertIsNotNone(stale)
+        failure = subprocess.CompletedProcess(
+            args=[], returncode=128, stdout="", stderr="review injected transport failure"
+        )
+        real_run = subprocess.run
+
+        def fail_fetch_only(args, *positional, **kwargs):
+            if isinstance(args, list) and args[:2] == ["git", "-C"] and "fetch" in args:
+                return failure
+            return real_run(args, *positional, **kwargs)
+
+        with (
+            mock.patch.object(urdf_pr.subprocess, "run", side_effect=fail_fetch_only),
+            self.assertRaises(urdf_pr.PrError) as raised,
+        ):
+            urdf_pr.published_revision(self.fx.repo, "m3.0")
+        self.assertEqual(raised.exception.code, "published_revision_unknown")
+
+    def test_w12_probe_5_unavailable_remote_is_not_absent(self) -> None:
+        """W12-5: an unreachable origin is unresolved, never a proven absence."""
+        run("git", "remote", "set-url", "origin", str(self.fx.tmp / "unavailable.git"), cwd=self.fx.repo)
+        with self.assertRaises(urdf_pr.PrError) as raised:
             urdf_pr.published_revision(self.fx.repo, "m3.0")
         self.assertEqual(raised.exception.code, "published_revision_unknown")
 
