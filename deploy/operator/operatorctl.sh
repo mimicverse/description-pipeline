@@ -109,25 +109,6 @@ load_active_env() {
   [ -f "$ENV_FILE" ] || die "derived environment missing for generation $ACTIVE_ID; run install"
 }
 
-[ -n "$CONFIG_FILE" ] || usage
-if [ -n "$INSTALL_ID$WHEEL_FILE$ENDPOINT_IDENTITY$RELEASE_FILE" ] && [ "$ACTION" != "install" ]; then usage; fi
-[ -f "$CONFIG_FILE" ] || die "config file not found: $CONFIG_FILE"
-# Every verb passes the same static config gate first; the install record and its derived
-# per-generation environment stay the single authority for the operational verbs.
-python3 "$HERE/platform_config.py" validate --config "$CONFIG_FILE" >/dev/null || exit $?
-case "$ACTION" in
-  validate)
-    echo "operatorctl: configuration valid: $CONFIG_FILE"
-    exit 0 ;;
-  install)
-    install_from_config ;;
-  start|drain|stop|status|health)
-    load_active_env ;;
-  *)
-    echo "operatorctl: '$ACTION' is recognized but its --config bridge is not implemented in this increment" >&2
-    exit 3 ;;
-esac
-
 airflow_render() {
   AIRFLOW_VENV="$AIRFLOW_VENV" AIRFLOW_HOME="$AIRFLOW_HOME" \
   POSTGRES_ROOT="${POSTGRES_ROOT:-}" POSTGRES_MAJOR="${POSTGRES_MAJOR:-14}" \
@@ -268,6 +249,37 @@ drift_check() {
   return "$rc"
 }
 
+[ -n "$CONFIG_FILE" ] || usage
+if [ -n "$INSTALL_ID$WHEEL_FILE$ENDPOINT_IDENTITY$RELEASE_FILE" ] && [ "$ACTION" != "install" ]; then usage; fi
+[ -f "$CONFIG_FILE" ] || die "config file not found: $CONFIG_FILE"
+# Every verb passes the same static config gate first; the install record and its derived
+# per-generation environment stay the single authority for the operational verbs.
+python3 "$HERE/platform_config.py" validate --config "$CONFIG_FILE" >/dev/null || exit $?
+case "$ACTION" in
+  validate)
+    echo "operatorctl: configuration valid: $CONFIG_FILE"
+    exit 0 ;;
+  install)
+    install_from_config ;;
+  start)
+    # Start-window precondition: close the gate through the controlled entry BEFORE any
+    # verification, so an identity or configuration failure during this start attempt cannot
+    # leave a leftover open gate; already-admitted runs continue.
+    START_STATE_ROOT="$(python3 "$HERE/platform_config.py" resolve --config "$CONFIG_FILE" | \
+      python3 -c 'import json,sys; print(json.load(sys.stdin)["storage"]["state_root"])')" || exit $?
+    [ -f "$START_STATE_ROOT/resolved.env" ] \
+      || die "not installed: $START_STATE_ROOT/resolved.env is missing (run install first)"
+    # shellcheck disable=SC1090
+    source "$START_STATE_ROOT/resolved.env"
+    platform_close_admission "start-window" "operatorctl start"
+    load_active_env ;;
+  drain|stop|status|health)
+    load_active_env ;;
+  *)
+    echo "operatorctl: '$ACTION' is recognized but its --config bridge is not implemented in this increment" >&2
+    exit 3 ;;
+esac
+
 case "$ACTION" in
   install)
     RENDER_LOG="$(mktemp)"
@@ -310,52 +322,33 @@ case "$ACTION" in
         "$PG_BIN/createdb" -h "$POSTGRES_ROOT/socket" -p "$POSTGRES_PORT" -U solidworks airflow_meta \
           || die "could not create the airflow_meta database"
       fi
-      # One instance, separate schemas.  The cluster bootstrap identity only prepares the
-      # migrator role, its schema and the search_path both roles run with; the actual Airflow
-      # migration then runs as the least-privilege migrator (airflow_migrate), which can DDL
-      # inside the airflow schema only - its version ledger resolves into that schema too, so
-      # no public object and no cross-schema DDL are ever needed.
-      "$PG_BIN/psql" -h "$POSTGRES_ROOT/socket" -p "$POSTGRES_PORT" -U solidworks -d airflow_meta \
-        -v ON_ERROR_STOP=1 -q -v airflow_bootstrap=1 <<'SQL' || die "could not bootstrap the airflow schema"
-DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'airflow_migrate') THEN
-    CREATE ROLE airflow_migrate LOGIN;
-END IF; END $$;
-CREATE SCHEMA IF NOT EXISTS airflow AUTHORIZATION airflow_migrate;
-ALTER SCHEMA airflow OWNER TO airflow_migrate;
-ALTER ROLE airflow_migrate IN DATABASE airflow_meta SET search_path = airflow, pg_catalog;
--- Normalize object ownership inside the airflow schema only (reinstalls across the identity
--- transition); nothing outside that schema is touched.
-DO $$
-DECLARE item record;
-BEGIN
-    FOR item IN
-        SELECT c.relkind, c.relname FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'airflow' AND pg_get_userbyid(c.relowner) <> 'airflow_migrate'
-    LOOP
-        EXECUTE format('ALTER %s airflow.%I OWNER TO airflow_migrate',
-            CASE item.relkind
-                WHEN 'S' THEN 'SEQUENCE'
-                WHEN 'v' THEN 'VIEW'
-                WHEN 'm' THEN 'MATERIALIZED VIEW'
-                ELSE 'TABLE'
-            END, item.relname);
-    END LOOP;
-END $$;
-SQL
+      # One instance, separate schemas.  The cluster bootstrap identity (the only step that
+      # runs with it) prepares the roles, the two schemas and the per-role search_path from
+      # deploy/platform/bootstrap.sql; every migration and all platform objects then run as
+      # the least-privilege identities (airflow_migrate / platform_migrate) that own only
+      # their own schema - no public objects, no superuser migration, no cross-schema DDL.
+      PLATFORM_PSQL="$PG_BIN/psql" bash "$HERE/../platform/apply.sh" --bootstrap \
+        --database airflow_meta --socket "$POSTGRES_ROOT/socket" --port "$POSTGRES_PORT" \
+        --user solidworks --airflow-schema "${AIRFLOW_SCHEMA:-airflow}" >&2 \
+        || die "platform bootstrap failed"
     fi
     AIRFLOW_VENV="$AIRFLOW_VENV" AIRFLOW_HOME="$AIRFLOW_HOME" AIRFLOW_PYTHON="${AIRFLOW_PYTHON:-}" \
       PIPELINE_WHEEL="${PIPELINE_WHEEL:?PIPELINE_WHEEL is required for install}" \
       AIRFLOW_DB_URL="$AIRFLOW_DB_URL" AIRFLOW_RUNTIME_DB_URL="$AIRFLOW_RUNTIME_DB_URL" \
       AIRFLOW_API_PORT="$AIRFLOW_API_PORT" \
       bash "$AIRFLOW_HERE/install.sh"
-    # U0: initialize the platform schema, the read models and the role boundary (idempotent)
-    # AFTER the migration created the airflow schema and its tables (the views bind them), and
-    # before the runtime grants below (the roles must exist first).  The admission starts
-    # closed until "start" opens it.
+    # The platform view owner reads the real Airflow metadata (owner-privilege views): the
+    # platform migration identity receives exactly that read grant, nothing else.
+    "$PG_BIN/psql" -h "$POSTGRES_ROOT/socket" -p "$POSTGRES_PORT" -U solidworks -d airflow_meta \
+      -v ON_ERROR_STOP=1 -q \
+      -c "GRANT USAGE ON SCHEMA ${AIRFLOW_SCHEMA:-airflow} TO platform_migrate; \
+          GRANT SELECT ON ${AIRFLOW_SCHEMA:-airflow}.task_instance TO platform_migrate" \
+      || die "could not grant the platform read boundary"
+    # The platform objects and the consumer grants run as the platform migration identity
+    # (idempotent); the admission starts closed until "start" opens it.
     PLATFORM_PSQL="$PG_BIN/psql" bash "$HERE/../platform/apply.sh" \
       --database airflow_meta --socket "$POSTGRES_ROOT/socket" --port "$POSTGRES_PORT" \
-      --user solidworks --airflow-schema "${AIRFLOW_SCHEMA:-airflow}" >&2 \
+      --user platform_migrate --airflow-schema "${AIRFLOW_SCHEMA:-airflow}" >&2 \
       || die "platform apply failed"
     # The runtime identity is least privilege: DML inside the airflow schema only, no DDL
     # anywhere.  Grants are re-applied after every migration (new tables included).
@@ -370,7 +363,6 @@ ALTER DEFAULT PRIVILEGES FOR ROLE airflow_migrate IN SCHEMA airflow
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO airflow_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE airflow_migrate IN SCHEMA airflow
     GRANT USAGE, SELECT ON SEQUENCES TO airflow_runtime;
-REVOKE ALL ON SCHEMA public FROM airflow_runtime;
 SQL
     # The wheel must provide the portal and the Feishu auth manager before the units start.
     if ! "$AIRFLOW_VENV/bin/python" -c 'import importlib.util, sys; sys.exit(0 if all(
@@ -403,10 +395,6 @@ SQL
   start)
     load_installed
     drift_check || die "configuration drift detected; run install before start"
-    # Start precondition: the gate is closed for the whole start window (a leftover open gate
-    # from an interrupted window is closed through the same controlled entry), so any failure
-    # below keeps it closed while already-admitted runs continue.
-    platform_close_admission "start-window" "operatorctl start"
     airflow_lifecycle start
     airflow_unpause_dag
     systemctl --user enable --now description-portal.service description-operator-proxy.service \

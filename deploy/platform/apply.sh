@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# Apply the platform schema, the read models and the role boundary (idempotent).
+# Apply the platform schema, the read models and the consumer grants (idempotent).
+#   default mode: run as the platform migration identity (platform_migrate) after the Airflow
+#                 migration; creates/updates the platform objects and the consumer grants.
+#   --bootstrap:  the ONLY cluster-identity step; creates the roles, the two schemas and the
+#                 per-role search_path (run by installer before the Airflow migration).
 #
 # Usage:
-#   apply.sh --psql PATH --database DB [--airflow-schema NAME]
+#   apply.sh [--bootstrap] --psql PATH --database DB [--airflow-schema NAME]
 #            [--socket DIR | --host HOST] [--port PORT] [--user USER]
 #
 # The caller is the maintenance role that may create the platform schema, the roles and the
@@ -14,16 +18,18 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PSQL="${PLATFORM_PSQL:-psql}"
 DATABASE=""
 AIRFLOW_SCHEMA="airflow"
+BOOTSTRAP=0
 CONNECTION=()
 
 usage() {
-  echo "usage: apply.sh --psql PATH --database DB [--airflow-schema NAME]" >&2
+  echo "usage: apply.sh [--bootstrap] --psql PATH --database DB [--airflow-schema NAME]" >&2
   echo "                [--socket DIR | --host HOST] [--port PORT] [--user USER]" >&2
   exit 2
 }
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --bootstrap) BOOTSTRAP=1; shift ;;
     --psql) PSQL="${2:?}"; shift 2 ;;
     --database) DATABASE="${2:?}"; shift 2 ;;
     --airflow-schema) AIRFLOW_SCHEMA="${2:?}"; shift 2 ;;
@@ -43,7 +49,11 @@ run() {
     -v airflow_schema="$AIRFLOW_SCHEMA" -v platform_database="$DATABASE" -f "$file" >&2
 }
 
-run "$HERE/schema.sql"
-run "$HERE/views.sql"
-run "$HERE/roles.sql"
+if [ "$BOOTSTRAP" = "1" ]; then
+  run "$HERE/bootstrap.sql"
+else
+  run "$HERE/schema.sql"
+  run "$HERE/views.sql"
+  run "$HERE/roles.sql"
+fi
 echo "platform apply: complete" >&2

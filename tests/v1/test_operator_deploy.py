@@ -1276,10 +1276,12 @@ class InstallOrderingTests(unittest.TestCase):
             "#!/usr/bin/env bash\n"
             + client_libraries
             + 'case "$*" in\n'
+            '  *-f*platform/bootstrap.sql*)\n'
+            '    echo "psql_platform_bootstrap" >> "$ORDER_LOG"; exit 0 ;;\n'
             '  *-f*platform/schema.sql*|*-f*platform/views.sql*|*-f*platform/roles.sql*)\n'
             '    echo "psql_platform_apply" >> "$ORDER_LOG"; exit 0 ;;\n'
-            '  *-v*airflow_bootstrap*)\n'
-            '    echo "psql_airflow_bootstrap" >> "$ORDER_LOG"; exit 0 ;;\n'
+            '  *-c*platform_migrate*)\n'
+            '    echo "psql_airflow_reader_grant" >> "$ORDER_LOG"; exit 0 ;;\n'
             '  *-v*ON_ERROR_STOP=1*q*)\n'
             '    echo "psql_airflow_grants" >> "$ORDER_LOG"; exit 0 ;;\n'
             "esac\n"
@@ -1343,9 +1345,11 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertLess(lines.index("pg_isready 2"), lines.index("airflow_install"))
             self.assertLess(lines.index("pg_isready 2"), lines.index("psql_db_query"))
             self.assertLess(lines.index("psql_db_query"), lines.index("createdb"))
-            self.assertLess(lines.index("createdb"), lines.index("psql_airflow_bootstrap"))
-            self.assertLess(lines.index("psql_airflow_bootstrap"), lines.index("airflow_install"))
+            self.assertLess(lines.index("createdb"), lines.index("psql_platform_bootstrap"))
+            self.assertLess(lines.index("psql_platform_bootstrap"), lines.index("airflow_install"))
             self.assertLess(lines.index("createdb"), lines.index("airflow_install"))
+            self.assertLess(lines.index("airflow_install"), lines.index("psql_airflow_reader_grant"))
+            self.assertLess(lines.index("psql_airflow_reader_grant"), lines.index("psql_platform_apply"))
             self.assertLess(lines.index("airflow_install"), lines.index("psql_platform_apply"))
             self.assertLess(lines.index("psql_platform_apply"), lines.index("psql_airflow_grants"))
             self.assertEqual(

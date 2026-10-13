@@ -1,7 +1,8 @@
 -- Platform schema: the admission gate, the business rows and their controlled fields.
 -- Frozen structure: A v3.3 (reviews/target-architecture-20261013/platform-admission-and-projection-A-final.md).
--- Applied by the maintenance role via apply.sh; idempotent.  The read models live in
--- views.sql, the grants in roles.sql.  Scheduling facts are deliberately NOT stored here:
+-- The schema itself is created by bootstrap.sql (cluster identity); this file is applied by
+-- the platform migration identity (platform_migrate) via apply.sh; idempotent.  The read
+-- models live in views.sql, the consumer grants in roles.sql.  Scheduling facts are not stored here:
 -- the lifecycle view reads the real Airflow metadata in the same consistent snapshot
 -- (no cache, no TTL, no third view).
 --
@@ -10,8 +11,6 @@
 --   stage      pending / running / completed / failed / cancelled / unresolved / blocked
 --   operation  queued / running / succeeded / failed / cancelled / unresolved
 --   request    immutable record; the projection reports the accepted fact only
-
-CREATE SCHEMA IF NOT EXISTS platform;
 
 CREATE TABLE IF NOT EXISTS platform.admission (
     id smallint PRIMARY KEY CHECK (id = 1),
