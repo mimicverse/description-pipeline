@@ -36,7 +36,48 @@ class InputSealReadinessTests(unittest.TestCase):
         root = Path(directory) / "delivery"
         content = b"native bytes for the admin-deferral tests"
         record = support.frozen_discovery_payload(
-            {"namespace": "dp", "raw": {"identity": raw_identity}, "identity": raw_identity},
+            {
+                "namespace": "dp",
+                "raw": {
+                    "identity": raw_identity,
+                    "components": [
+                        {
+                            "name2": "base_part-1",
+                            "document": "robot.SLDPRT",
+                            "suppressed": False,
+                            "lightweight": False,
+                            "suppression_state": 2,
+                        }
+                    ],
+                    "datums": [
+                        {
+                            "name": "CS_base_link",
+                            "owner": "base_part-1",
+                            "array": [
+                                1.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                1.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                1.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                1.0,
+                            ],
+                        }
+                    ],
+                    "mates": [],
+                    "properties": {"components": {}},
+                },
+                "identity": raw_identity,
+            },
             files={"robot.SLDASM": hashlib.sha256(content).hexdigest()},
             robot={
                 "hardware_id": "fixture",

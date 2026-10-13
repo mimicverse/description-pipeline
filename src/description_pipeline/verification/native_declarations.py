@@ -784,4 +784,36 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
         "members": {name: sorted(values) for name, values in state.get("members", {}).items()},
         "joints": len(state.get("joints") or {}),
         "completion": state.get("completion", {}),
+        #: The consumer expectations decoded from the sealed declaration itself (mode routing
+        #: for the URDF stage): same decode the audit above verified, never the derived copy.
+        "carrier": {
+            "bodies": [
+                {
+                    "id": name,
+                    "name": name,
+                    "components": sorted(state["members"][name]),
+                    "frame": {"coordinate_system": state["frame_names"][name]},
+                }
+                for name in sorted(state.get("links") or {})
+                if name in (state.get("members") or {}) and name in (state.get("frame_names") or {})
+            ],
+            "joints": [
+                {
+                    "id": name,
+                    "name": name,
+                    "type": joint["type"],
+                    "parent": joint["parent_link"],
+                    "child": joint["child_link"],
+                    "axis": joint.get("axis"),
+                    "axis_reference": (state.get("axes") or {}).get(name),
+                    "limits": (
+                        {key: joint["limit"][key] for key in ("effort", "velocity")}
+                        if joint["type"] == "continuous" and isinstance(joint.get("limit"), dict)
+                        else joint.get("limit")
+                    ),
+                }
+                for name, joint in sorted((state.get("joints") or {}).items())
+            ],
+            "frames": [],
+        },
     }

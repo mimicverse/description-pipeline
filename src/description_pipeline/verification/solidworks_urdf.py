@@ -22,7 +22,7 @@ import numpy as np
 from ..delivery import PIPELINE_ID, read_delivery_manifest, read_source_record, subject_digest
 from ..geometry import stl
 from ..io import PipelineError, confined, digest, file_digest, inventory, read_data
-from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, TOOL_SCHEMA
+from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, TOOL_SCHEMA, exporter_declaration_present
 from ..sources.solidworks.revision import NATIVE_SUFFIXES
 from ..interface_records import CHECK_POLICY_V1
 from ..stages import required_rows_complete
@@ -229,14 +229,26 @@ def _input(root, diagnostics=None):
     diagnostics = [] if diagnostics is None else diagnostics
     discovery_record = ev.discovery(root)
     _require(isinstance(discovery_record.get("raw"), dict), "Discovery record carries no raw capture")
-    from .native_discovery import rebuild_interface_frames, rebuild_joint_facts, rebuild_rigid_bodies
+    raw = discovery_record["raw"]
+    if exporter_declaration_present(raw):
+        # The declaration domain carries its own independent decode: the consumer
+        # expectations come from the sealed declaration, and the failure cause is never
+        # swallowed into zero objects.
+        from .native_declarations import verify_declarations
 
-    try:
+        declarations = verify_declarations(raw)
+        _require(
+            declarations["passed"],
+            f"the discovery record declaration gate failed: {declarations['errors'][:1]}",
+        )
+        carrier = declarations["carrier"]
+        bodies, joints, frames = carrier["bodies"], carrier["joints"], carrier["frames"]
+    else:
+        from .native_discovery import rebuild_interface_frames, rebuild_joint_facts, rebuild_rigid_bodies
+
         bodies = rebuild_rigid_bodies(discovery_record)
         joints = rebuild_joint_facts(discovery_record, root)
         frames = rebuild_interface_frames(discovery_record)
-    except Exception:  # noqa: BLE001 - this binder stays total; the URDF gates fail closed on empty carriers
-        bodies, joints, frames = [], [], []
     source = read_source_record(root)
     handoff = ev.handoff(root)
     identity = source["identity"]

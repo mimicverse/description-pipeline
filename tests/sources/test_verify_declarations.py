@@ -19,6 +19,8 @@ from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape
 
 from description_pipeline.verification import v14_declarations as v14
+from description_pipeline.io import PipelineError
+from description_pipeline.verification import solidworks_urdf
 from description_pipeline.verification.native_declarations import verify_declarations
 from description_pipeline.verification.native_discovery import verify_discovery
 
@@ -452,6 +454,89 @@ def lock(left, right, *, error=0, kind="lock"):
         "error_code": error,
         "entities": [{"component": left, "point": [0, 0, 0]}, {"component": right, "point": [0, 0, 0]}],
     }
+
+
+class DeclarationConsumerTests(unittest.TestCase):
+    """The URDF-stage binder must receive the declared carrier, never zero objects."""
+
+    def _delivery(self, directory: str, mutate_raw=None) -> Path:
+        package = Path(directory) / "delivery"
+        native = b"synthetic native bytes for verification tests only"
+        native_files = {"robot.SLDASM": hashlib.sha256(native).hexdigest()}
+        raw = fixture()
+        if mutate_raw is not None:
+            mutate_raw(raw)
+        raw["files"] = native_files
+        raw["source_selection"] = sealed_selection(native_files, "robot.SLDASM", edges={"robot.SLDASM": []})
+        raw["masses"] = [
+            {"component": item["name2"], "mass_kg": 1.0}
+            for item in raw["components"]
+            if not item["document"].endswith(".SLDASM")
+        ]
+        robot = {"hardware_id": "fixture", "source": source_claims(), "checks": {}}
+        robot["source"]["robot_name"] = "fixture"
+        payload = support.frozen_discovery_payload(
+            {
+                "schema_version": "solidworks-to-urdf.native-discovery/v1",
+                "run_id": "declaration-consumer",
+                "contract": "native-discovery/v1",
+                "raw": raw,
+                "identity": copy.deepcopy(raw["identity"]),
+            },
+            files=native_files,
+            robot=robot,
+        )
+        source = support.default_source_record(
+            main_assembly="robot.SLDASM",
+            configuration="Default",
+            hardware_id="fixture",
+            revision="r1",
+        )
+        support.write_target_delivery(
+            package,
+            capture={"declared_masses": {"items": {}, "evidence": None}},
+            discovery=payload,
+            source=source,
+            originals={"robot.SLDASM": native.decode("utf-8")},
+        )
+        return package
+
+    def test_declaration_consumer_binds_the_declared_carrier(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            returned = solidworks_urdf._input(self._delivery(directory), [])
+        bodies = {body["name"]: body["components"] for body in returned["source"]["bodies"]}
+        self.assertEqual(
+            bodies,
+            {"base": ["base_part"], "tool": ["module-1/bracket", "module-1/tool_part"]},
+        )
+        self.assertEqual(
+            [
+                (joint["name"], joint["type"], joint["parent"], joint["child"])
+                for joint in returned["source"]["joints"]
+            ],
+            [("hinge", "revolute", "base", "tool")],
+        )
+        self.assertEqual(returned["source"]["frames"], [])
+
+    def test_declaration_consumer_refuses_invalid_states_without_zero_objects(self) -> None:
+        for label, mutate in (
+            ("unreadable", lambda raw: raw["exporter"].update(state="unreadable")),
+            ("unknown", lambda raw: raw["exporter"].update(state="unknown")),
+            ("corrupt", lambda raw: raw["exporter"].update(raw_xml="<broken")),
+        ):
+            with (
+                self.subTest(case=label),
+                tempfile.TemporaryDirectory() as directory,
+                self.assertRaises(PipelineError),
+            ):
+                solidworks_urdf._input(self._delivery(directory, mutate), [])
+
+    def test_declaration_consumer_absent_state_raises_the_geometric_cause(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(Exception) as raised:  # noqa: B017
+            solidworks_urdf._input(
+                self._delivery(directory, lambda raw: raw["exporter"].update(state="absent")), []
+            )
+        self.assertIn("CS_<link>", str(raised.exception))
 
 
 class NativeDeclarationsTests(unittest.TestCase):
