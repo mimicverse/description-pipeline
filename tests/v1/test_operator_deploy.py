@@ -1284,7 +1284,7 @@ class InstallOrderingTests(unittest.TestCase):
         (release / "airflow" / "dags").mkdir()
         (release / "operator" / "operatorctl.sh").write_bytes(CONTROL.read_bytes())
         (release / "operator" / "render_operator.py").write_bytes(RENDER.read_bytes())
-        for module in ("platform_config.py", "platform_env.py", "install_record.py", "promotion.py"):
+        for module in ("platform_config.py", "platform_env.py", "install_record.py", "promotion.py", "backup.py"):
             (release / "operator" / module).write_bytes((OPERATOR / module).read_bytes())
         (release / "airflow" / "dags" / "solidworks_to_urdf.py").write_text("# dag fixture\n", encoding="utf-8")
         for template in ("nginx.conf.template", "portal.json.template"):
@@ -1504,7 +1504,7 @@ class InstallOrderingTests(unittest.TestCase):
             pgbin / "pg_dump",
             "#!/usr/bin/env bash\n" + client_libraries + 'echo "pg_dump" >> "$ORDER_LOG"\n'
             'out=""\nprev=""\nfor argument in "$@"; do [ "$prev" = "-f" ] && out="$argument"; prev="$argument"; done\n'
-            '[ -n "$out" ] && : > "$out"\nexit 0\n',
+            "[ -n \"$out\" ] && printf 'PGDUMP-DOUBLE\\n' > \"$out\"\nexit 0\n",
         )
         write_stub(bindir / "sleep", '#!/usr/bin/env bash\necho "sleep" >> "$ORDER_LOG"\nexit 0\n')
         write_stub(bindir / "scp", '#!/usr/bin/env bash\necho "scp $*" >> "$ORDER_LOG"\nexit 0\n')
@@ -1789,6 +1789,37 @@ class InstallOrderingTests(unittest.TestCase):
                     "rollback-linux", "rollback-verify",
                 ],
             )
+            # Real restore drill on the sealed archive: open it, then rebuild a broken record
+            # from the backup bytes and re-verify the running generation.
+            tree = release.parent
+            sealed = state / "promotions" / "gen-2" / "backup.tar.enc"
+            self.assertTrue(sealed.is_file())
+            manifest = json.loads(
+                (state / "promotions" / "gen-2" / "evidence" / "backup-manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["encrypted"]["sha256"], hashlib.sha256(sealed.read_bytes()).hexdigest())
+            key = state / "secrets" / "backup.key"
+            self.assertEqual(stat.S_IMODE(key.stat().st_mode), 0o600)
+            scratch = Path(tmp) / "restore"
+            opened = run(
+                [
+                    "python3", str(release / "operator" / "backup.py"), "open",
+                    "--archive", str(sealed), "--key", str(key), "--dest", str(scratch),
+                ],
+                {},
+            )
+            self.assertEqual(opened.returncode, 0, opened.stderr)
+            (state / "install-record.json").write_bytes(
+                (scratch / "state" / "install-record.json").read_bytes()
+            )
+            verified = run(
+                [
+                    "python3", str(release / "operator" / "install_record.py"), "verify-active",
+                    "--config", str(tree / "platform.json"), "--state-root", str(state),
+                ],
+                {},
+            )
+            self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
 
     def test_promote_failure_keeps_the_admission_closed_and_records_it(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1893,6 +1924,44 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertEqual(
                 len([line for line in lines if line.startswith("ssh ") and "-Verb status" in line]), 1
             )
+
+    def test_config_upgrade_flows_through_stage_and_promote(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, _ = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            self.assertEqual(self._install(release, control_env).returncode, 0)
+            state = Path(tmp) / "state"
+            tree = release.parent
+            # A legitimate configuration upgrade: the candidate describes new storage roots; the
+            # running generation keeps its own snapshot and the maintenance window flows.
+            document = json.loads((tree / "platform.json").read_text(encoding="utf-8"))
+            document["storage"]["handoff_root"] = str(Path(tmp) / "handoffs-next")
+            document["storage"]["artifact_root"] = str(Path(tmp) / "artifacts-next")
+            (tree / "platform.json").write_text(json.dumps(document), encoding="utf-8")
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            self._health_double(release, control_env)
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            candidate = json.loads((state / "snapshots" / "gen-2.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                candidate["resolved"]["storage"]["handoff_root"], str(Path(tmp) / "handoffs-next")
+            )
+            self.assertEqual(
+                json.loads((state / "install-record.json").read_text(encoding="utf-8"))["install_id"], "gen-1"
+            )
+            self._clone_generation_stubs(state)
+            promoted = self._maintenance(release, control_env, "promote", "gen-2")
+            self.assertEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
+            self.assertEqual(
+                json.loads((state / "install-record.json").read_text(encoding="utf-8"))["install_id"], "gen-2"
+            )
+            verified = run(
+                [
+                    "python3", str(release / "operator" / "install_record.py"), "verify-active",
+                    "--config", str(tree / "platform.json"), "--state-root", str(state),
+                ],
+                {},
+            )
+            self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
 
     def test_ack_loss_with_live_before_state_records_never_switched(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

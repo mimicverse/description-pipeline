@@ -122,6 +122,22 @@ load_active_env() {
   [ -f "$ENV_FILE" ] || die "derived environment missing for generation $ACTIVE_ID; run install"
 }
 
+# The maintenance window (stage/promote/rollback) verifies the RUNNING record and its immutable
+# snapshot only: the candidate configuration is the subject of the switch, not drift of the
+# running generation.  Current-config binding stays with verify-active on the steady-state verbs.
+load_running_env() {
+  STATE_ROOT="$(python3 "$HERE/platform_config.py" resolve --config "$CONFIG_FILE" | \
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["storage"]["state_root"])')" || exit $?
+  [ -f "$STATE_ROOT/resolved.env" ] || die "not installed: $STATE_ROOT/resolved.env is missing (run install first)"
+  # shellcheck disable=SC1090
+  source "$STATE_ROOT/resolved.env"
+  ACTIVE_ID="$(AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" \
+    verify-running --state-root "$STATE_ROOT" | sed -n 's/^install_id=//p')" || exit $?
+  [ -n "$ACTIVE_ID" ] || die "active install record did not declare a generation"
+  ENV_FILE="$STATE_ROOT/derived/$ACTIVE_ID/operator.env"
+  [ -f "$ENV_FILE" ] || die "derived environment missing for generation $ACTIVE_ID; run install"
+}
+
 # The gates read the platform authority from the managed database, so the start window must
 # begin by bringing that database up and confirming its socket.  The cluster identity never
 # runs here; this is the same managed unit the installation created.
@@ -431,8 +447,10 @@ case "$ACTION" in
     ensure_postgres_ready
     platform_close_admission "start-window" "operatorctl start"
     load_active_env ;;
-  drain|stop|status|health|reconcile|stage|promote|rollback)
+  drain|stop|status|health|reconcile)
     load_active_env ;;
+  stage|promote|rollback)
+    load_running_env ;;
   *)
     usage ;;
 esac
@@ -717,7 +735,10 @@ PY
     cp -a "$STATE_ROOT/snapshots" "$BACKUP_DIR/state/snapshots"
     cp -a "$STATE_ROOT/derived" "$BACKUP_DIR/state/derived"
     cp -p "$STATE_ROOT/resolved.env" "$BACKUP_DIR/state/resolved.env"
-    python3 - "$SNAPSHOT_PATH" "$BACKUP_DIR" <<'PY'
+    # The closure references the RUNNING generation's snapshot (the candidate describes where
+    # the system is going, not where it is).
+    RUNNING_SNAPSHOT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["snapshot"]["path"])' "$STATE_ROOT/install-record.json")"
+    python3 - "$RUNNING_SNAPSHOT" "$BACKUP_DIR" <<'PY'
 import json
 import shutil
 import sys
@@ -756,20 +777,43 @@ PY
       promotion_step "$CANDIDATE_ID" promote backup failed "$EVIDENCE_DIR/pg-dump.out"
       die "the PostgreSQL backup snapshot failed (the admission stays closed)"
     fi
-    python3 - "$BACKUP_DIR" "$EVIDENCE_DIR/backup-manifest.json" <<'PY'
+    # The archive is sealed with the state-root key: controlled, and the only artifact the
+    # manifest binds for restore.
+    BACKUP_KEY="$STATE_ROOT/secrets/backup.key"
+    if ! python3 "$HERE/backup.py" key --path "$BACKUP_KEY" > "$EVIDENCE_DIR/backup-key.out" 2>&1 \
+        || ! python3 "$HERE/backup.py" seal --source "$BACKUP_DIR" --key "$BACKUP_KEY" \
+            --out "$RECEIPT_DIR/backup.tar.enc" > "$EVIDENCE_DIR/backup-seal.out" 2>&1; then
+      promotion_step "$CANDIDATE_ID" promote backup failed "$EVIDENCE_DIR/backup-seal.out"
+      die "the backup archive could not be sealed (the admission stays closed)"
+    fi
+    python3 - "$BACKUP_DIR" "$EVIDENCE_DIR/backup-manifest.json" "$RECEIPT_DIR/backup.tar.enc" "$BACKUP_KEY" <<'PY'
 import hashlib
 import json
 import sys
 from pathlib import Path
 
-backup, out = Path(sys.argv[1]), Path(sys.argv[2])
+backup, out, sealed, key = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4])
 files = {
     path.relative_to(backup).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
     for path in sorted(backup.rglob("*"))
     if path.is_file()
 }
 out.write_text(
-    json.dumps({"schema": "solidworks-to-urdf.promote-backup/v1", "files": files}, indent=2, sort_keys=True) + "\n",
+    json.dumps(
+        {
+            "schema": "solidworks-to-urdf.promote-backup/v1",
+            "files": files,
+            "encrypted": {
+                "path": str(sealed),
+                "sha256": hashlib.sha256(sealed.read_bytes()).hexdigest(),
+                "cipher": "aes-256-cbc",
+                "key": str(key),
+            },
+        },
+        indent=2,
+        sort_keys=True,
+    )
+    + "\n",
     encoding="utf-8",
 )
 PY
@@ -1031,8 +1075,10 @@ PY
       # recorded with the receipt itself as evidence.
       promotion_step "$ROLLBACK_ID" rollback rollback-linux completed "$RECEIPT_DIR/receipt.json"
     fi
-    # The restored generation starts through its own environment and both ends re-verify.
-    load_active_env
+    # The restored generation starts through its own environment and both ends re-verify; the
+    # restored record is checked against its own immutable snapshot (the operator's current
+    # platform.json may already describe a candidate).
+    load_running_env
     load_installed
     if ! {
       python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --units-dir "$TARGET" \
@@ -1042,8 +1088,8 @@ PY
       && airflow_unpause_dag \
       && systemctl --user enable --now description-portal.service description-operator-proxy.service \
       && systemctl --user is-active --quiet description-portal.service description-operator-proxy.service \
-      && "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" verify-active \
-        --config "$CONFIG_FILE" --state-root "$STATE_ROOT" \
+      && "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" verify-running \
+        --state-root "$STATE_ROOT" \
       && WINDOWS_HEALTH="$(WINDOWS_RELEASE_OVERRIDE="$PREVIOUS_RELEASE_TRIPLE" instance_lifecycle health "$ACTIVE_ID")" \
       && promotion_extract_health "$WINDOWS_HEALTH" "$EVIDENCE_DIR/rollback-health.json" \
       && "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" endpoint-identity \

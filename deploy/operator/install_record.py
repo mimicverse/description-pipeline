@@ -199,6 +199,32 @@ def _canonical_records():
     return interface_records
 
 
+def verify_running_generation(state_root: Path) -> dict:
+    """The running record and its immutable snapshot, without binding the current platform.json.
+
+    A candidate configuration is the subject of stage/promote, not drift of the running
+    generation; this check proves the running record is internally consistent and its snapshot
+    matches the recorded digest.
+    """
+
+    state_root = Path(state_root)
+    record_path = state_root / "install-record.json"
+    require(record_path.is_file(), f"not installed: install record missing at {record_path} (run install first)")
+    interface_records = _canonical_records()
+    try:
+        record = interface_records.validate_install_record(json.loads(record_path.read_text(encoding="utf-8")))
+    except Exception as error:
+        die(f"install record invalid: {error}")
+    snapshot_path = Path(record["snapshot"]["path"])
+    require(snapshot_path.is_file(), f"snapshot missing: {snapshot_path}")
+    actual = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
+    require(
+        actual == record["snapshot"]["digest"],
+        f"snapshot digest mismatch (tampered or replaced): {snapshot_path}",
+    )
+    return record
+
+
 def verify_active_generation(config_path: Path, state_root: Path) -> dict:
     """Operational gate: complete record + snapshot digest + current-config binding."""
 
@@ -495,6 +521,8 @@ def main(argv: list[str] | None = None) -> int:
     verify = subparsers.add_parser("verify-active")
     verify.add_argument("--config", type=Path, required=True)
     verify.add_argument("--state-root", type=Path, required=True)
+    running = subparsers.add_parser("verify-running")
+    running.add_argument("--state-root", type=Path, required=True)
     repoint = subparsers.add_parser("repoint")
     repoint.add_argument("--state-root", type=Path, required=True)
     repoint.add_argument("--record", type=Path, required=True, help="the generation file to activate (rollback)")
@@ -507,6 +535,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.action == "verify-active":
         record = verify_active_generation(args.config, args.state_root)
+        print(f"install_id={record['install_id']}")
+        return 0
+    if args.action == "verify-running":
+        record = verify_running_generation(args.state_root)
         print(f"install_id={record['install_id']}")
         return 0
     if args.action == "repoint":
