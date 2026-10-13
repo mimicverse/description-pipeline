@@ -1114,6 +1114,9 @@ class InstallOrderingTests(unittest.TestCase):
         (release / "operator" / "systemd").mkdir()
         for unit in (OPERATOR / "systemd").glob("*.service"):
             (release / "operator" / "systemd" / unit.name).write_bytes(unit.read_bytes())
+        (release / "platform").mkdir()
+        for artifact in ("apply.sh", "schema.sql", "views.sql", "roles.sql"):
+            (release / "platform" / artifact).write_bytes((OPERATOR.parent / "platform" / artifact).read_bytes())
         write_stub(
             release / "operator" / "scripts" / "install_toolchain.sh",
             '#!/usr/bin/env bash\necho "AIRFLOW_PYTHON=/usr/bin/python3"\n',
@@ -1240,7 +1243,13 @@ class InstallOrderingTests(unittest.TestCase):
         )
         write_stub(
             pgbin / "psql",
-            "#!/usr/bin/env bash\n" + client_libraries + 'echo "psql_db_query" >> "$ORDER_LOG"\n'
+            "#!/usr/bin/env bash\n"
+            + client_libraries
+            + 'case "$*" in\n'
+            '  *-f*platform/schema.sql*|*-f*platform/views.sql*|*-f*platform/roles.sql*)\n'
+            '    echo "psql_platform_apply" >> "$ORDER_LOG"; exit 0 ;;\n'
+            "esac\n"
+            'echo "psql_db_query" >> "$ORDER_LOG"\n'
             'rc="${PSQL_QUERY_RC:-0}"\n'
             '[ "$rc" != "0" ] && exit "$rc"\n'
             'echo "${DB_EXISTS:-}"\n'
@@ -1300,7 +1309,8 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertLess(lines.index("pg_isready 2"), lines.index("airflow_install"))
             self.assertLess(lines.index("pg_isready 2"), lines.index("psql_db_query"))
             self.assertLess(lines.index("psql_db_query"), lines.index("createdb"))
-            self.assertLess(lines.index("createdb"), lines.index("airflow_install"))
+            self.assertLess(lines.index("createdb"), lines.index("psql_platform_apply"))
+            self.assertLess(lines.index("psql_platform_apply"), lines.index("airflow_install"))
             self.assertEqual(
                 [line for line in lines if line.startswith("pg_isready ")], ["pg_isready 1", "pg_isready 2"]
             )

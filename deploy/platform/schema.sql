@@ -87,6 +87,22 @@ CREATE TABLE IF NOT EXISTS platform.operation (
 );
 
 -- The single admission row starts open; the store API owns every later transition.
+-- U0: installation initializes the gate CLOSED; the start verb opens it through the store.
 INSERT INTO platform.admission (id, state, reason, actor)
-VALUES (1, 'open', 'initial', 'install')
+VALUES (1, 'closed', 'install', 'apply')
 ON CONFLICT (id) DO NOTHING;
+
+-- Append-only run event log (U2): events are registered in the same transaction as the state
+-- change they describe.  ``seq`` is assigned by the application inside the run-locked
+-- transaction; the primary key serializes duplicates.  The role boundary keeps this table
+-- append-only (INSERT/SELECT only - no UPDATE/DELETE grants, no triggers).
+CREATE TABLE IF NOT EXISTS platform.run_event (
+    run_id text NOT NULL REFERENCES platform.run (run_id),
+    seq bigint NOT NULL CHECK (seq > 0),
+    at timestamptz NOT NULL DEFAULT now(),
+    kind text NOT NULL,
+    stage text,
+    operation_id text,
+    payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+    PRIMARY KEY (run_id, seq)
+);

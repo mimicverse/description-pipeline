@@ -306,6 +306,12 @@ case "$ACTION" in
         "$PG_BIN/createdb" -h "$POSTGRES_ROOT/socket" -p "$POSTGRES_PORT" -U solidworks airflow_meta \
           || die "could not create the airflow_meta database"
       fi
+      # U0: initialize the platform schema, the read models and the role boundary (idempotent);
+      # the admission starts closed until "start" opens it.
+      PLATFORM_PSQL="$PG_BIN/psql" bash "$HERE/../platform/apply.sh" \
+        --database airflow_meta --socket "$POSTGRES_ROOT/socket" --port "$POSTGRES_PORT" \
+        --user solidworks --airflow-schema "${AIRFLOW_SCHEMA:-airflow}" >&2 \
+        || die "platform apply failed"
     fi
     AIRFLOW_VENV="$AIRFLOW_VENV" AIRFLOW_HOME="$AIRFLOW_HOME" AIRFLOW_PYTHON="${AIRFLOW_PYTHON:-}" \
       PIPELINE_WHEEL="${PIPELINE_WHEEL:?PIPELINE_WHEEL is required for install}" \

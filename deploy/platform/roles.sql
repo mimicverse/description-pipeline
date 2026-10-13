@@ -43,6 +43,8 @@ GRANT USAGE ON SCHEMA platform TO platform_service;
 GRANT SELECT, INSERT, UPDATE ON
     platform.admission, platform.request, platform.run, platform.stage, platform.operation
     TO platform_service;
+-- The event log is append-only by privilege: no UPDATE/DELETE is ever granted.
+GRANT SELECT, INSERT ON platform.run_event TO platform_service;
 -- The store's read functions consume the same two read models.
 GRANT SELECT ON platform.lifecycle_projection, platform.admission_projection TO platform_service;
 
