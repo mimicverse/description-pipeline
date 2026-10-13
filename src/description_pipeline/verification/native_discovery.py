@@ -13,7 +13,8 @@ bound by digest to the package's provenance block; every derived value is
 recomputed here before it is accepted.
 
 Two verification regimes are supported by design, selected by the same shared
-predicate as the producer (``sources/solidworks/discovery.py`` ``exporter_mode``):
+predicate as the producer (``schemas.exporter_declaration_present`` — the helper
+behind ``sources/solidworks/discovery.py`` ``exporter_mode``):
 an exporter-declaration capture keeps the declaration suite, while a capture whose
 exporter state is a proven ``absent`` runs the mate-inference suite.  Gate ownership
 (VER-01):
@@ -40,7 +41,7 @@ from pathlib import Path, PurePosixPath
 
 import yaml
 
-from ..schemas import CAD_REVISION_SCHEMA, INPUT_SCHEMA
+from ..schemas import CAD_REVISION_SCHEMA, INPUT_SCHEMA, exporter_declaration_present
 
 VERIFICATION_SCHEMA = "solidworks-to-urdf.native-discovery-verification/v1"
 DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v1"
@@ -3115,17 +3116,13 @@ def verify_discovery(package: Path) -> dict:
     )
     raw_block = (state.get("payload") or {}).get("raw")
     raw_block = raw_block if isinstance(raw_block, dict) else None
-    # Shared predicate contract with the producer (``sources/solidworks/discovery.py``
-    # ``exporter_mode``): the native capture writes the exporter block unconditionally,
-    # and only a proven ``absent`` state means the CAD carries no v1.4 declaration. That
-    # capture must run the mate-inference suite below; every other present state keeps
-    # the declarations suite, which fails closed on unreadable declarations.
-    exporter_block = raw_block.get("exporter") if raw_block is not None else None
-    declaration_capture = (
-        raw_block is not None
-        and "exporter" in raw_block
-        and not (isinstance(exporter_block, dict) and exporter_block.get("state") == "absent")
-    )
+    # Shared predicate contract with the producer (``schemas.exporter_declaration_present``,
+    # used as ``sources/solidworks/discovery.py`` ``exporter_mode``): the native capture
+    # writes the exporter block unconditionally, and only a proven ``absent`` state means
+    # the CAD carries no v1.4 declaration. That capture must run the mate-inference suite
+    # below; every other present state keeps the declarations suite, which fails closed on
+    # unreadable declarations.
+    declaration_capture = exporter_declaration_present(raw_block)
     if bound["passed"] and declaration_capture:
         # Explicit native declarations do not require incomplete mate inference to
         # rediscover memberships or impose unrelated CS_/dp.* naming conventions.

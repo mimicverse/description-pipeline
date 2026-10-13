@@ -28,6 +28,7 @@ from ..delivery import PIPELINE_ID, TRANSFER_FILES
 from ..io import PipelineError, artifact_path_parts, canonical, confined, digest, file_digest, inventory, read_data
 from ..runtime import RUNTIME_VERSIONS, required_packages
 from ..sources.snapshot import verify_snapshot
+from ..sources.solidworks.handoff import MAX_HANDOFF_BYTES, MAX_HANDOFF_FILES
 from ..sources.solidworks.revision import package_inventory
 from ..schemas import TOOL_SCHEMA
 from ..stages import CONTRACT, CONTRACT_FILE_SHA256, CONTRACT_SHA256, STAGE_IDS, VIEW_SCHEMA, stage_view
@@ -39,8 +40,10 @@ TRANSFER_SCHEMA = "solidworks-to-urdf.transfer/v1"
 #: The stages the Windows host executes; the remaining stages run on Linux after admission.
 NATIVE_STAGE_SCOPE = ("freeze", "discover", "capture")
 
-MAX_TRANSFER_FILES = 100_000
-MAX_TRANSFER_BYTES = 16 * 1024**3
+#: The transfer-side view of the one owned intake bound (``sources.solidworks.handoff``);
+#: the sealed payload must never exceed what the intake admits.
+MAX_TRANSFER_FILES = MAX_HANDOFF_FILES
+MAX_TRANSFER_BYTES = MAX_HANDOFF_BYTES
 MAX_MANIFEST_BYTES = 64 * 1024**2
 
 #: The immutable native provenance reports; the live ``reports/stages.json`` view is a Linux-side

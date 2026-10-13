@@ -10,8 +10,7 @@ from unittest.mock import Mock, patch
 
 from . import _paths  # noqa: F401
 from description_pipeline.sources.solidworks import isolation  # noqa: E402
-from description_pipeline.sources.solidworks.errors import BridgeError, CadError, EnvironmentError_  # noqa: E402
-from description_pipeline.sources.solidworks.executor import ComExecutor  # noqa: E402
+from description_pipeline.sources.solidworks.errors import CadError, EnvironmentError_  # noqa: E402
 from description_pipeline.sources.solidworks.isolation import (  # noqa: E402
     CadSession,
     terminate_remnant_processes,
@@ -23,117 +22,51 @@ from description_pipeline.sources.solidworks.native import (  # noqa: E402
 )
 
 
-class ExecutorTests(unittest.TestCase):
-    def setUp(self):
-        self.release = threading.Event()
-        self.backend = SimpleNamespace()
-        self.executor = ComExecutor(self.backend)
+class AbortOwnedProcessesTests(unittest.TestCase):
+    """Reclaim-on-timeout coverage, migrated to its live owner (NAT-01).
 
-    def tearDown(self):
-        self.release.set()
-        self.executor.close()
-        self.assertFalse(self.executor.alive)
+    The retired ``ComExecutor`` covered the timeout/cancel reclaim path; the live
+    owner is ``SolidWorksBackend.abort_owned_processes`` — it must cancel the
+    capture, terminate every open owned session, keep an unreachable session from
+    stopping the sweep, and refuse further CAD work once cancelled.
+    """
 
-    def test_timeout_reclaims_owned_process_and_recovers(self):
-        def reclaim():
-            self.release.set()
-            return {"terminated": [42]}
+    @staticmethod
+    def _session(pid: int, *, closed: bool = False, error: Exception | None = None):
+        session = SimpleNamespace(
+            closed=closed,
+            identity=Mock(return_value={"pid": pid, "executable": "SLDWORKS.exe"}),
+        )
+        session.terminate = Mock(side_effect=error)
+        return session
 
-        abort = Mock(side_effect=reclaim)
-        self.backend.abort_owned_processes = abort
-        with self.assertRaises(BridgeError) as caught:
-            self.executor.run(lambda: self.release.wait(10), timeout=0.05)
-        self.assertEqual(caught.exception.code, "modal_dialog_blocked")
-        assert isinstance(caught.exception.detail, dict)
-        self.assertTrue(caught.exception.detail["operation_stopped"])
-        abort.assert_called_once()
-        self.assertFalse(self.executor.busy)
-        self.assertEqual(self.executor.run(lambda: 42), 42)
+    def test_abort_terminates_open_owned_sessions_and_collects_failures(self):
+        backend = SolidWorksBackend()
+        healthy = self._session(42)
+        failing = self._session(43, error=OSError("termination refused"))
+        retired = self._session(44, closed=True)
+        backend._sessions.update({"source": healthy, "copy": failing, "retired": retired})
 
-    def test_unstopped_timeout_blocks_admission_and_remains_busy(self):
-        with self.assertRaises(BridgeError) as caught:
-            self.executor.run(lambda: self.release.wait(10), timeout=0.05)
-        assert isinstance(caught.exception.detail, dict)
-        self.assertFalse(caught.exception.detail["operation_stopped"])
-        self.assertTrue(self.executor.busy)
-        with self.assertRaisesRegex(BridgeError, "previous CAD operation"):
-            self.executor.run(lambda: None)
+        receipt = backend.abort_owned_processes()
 
-    def test_queued_timeout_does_not_abort_active_job(self):
-        started = threading.Event()
-        failures = []
-        self.backend.abort_owned_processes = Mock()
+        self.assertTrue(backend._cancelled.is_set())
+        self.assertEqual(receipt["terminated"], [{"pid": 42, "executable": "SLDWORKS.exe"}])
+        self.assertEqual(
+            receipt["errors"],
+            [{"pid": 43, "executable": "SLDWORKS.exe", "error": "termination refused"}],
+        )
+        healthy.terminate.assert_called_once_with()
+        failing.terminate.assert_called_once_with()
+        retired.terminate.assert_not_called()
 
-        def first():
-            try:
+    def test_cancelled_backend_refuses_further_cad_work(self):
+        backend = SolidWorksBackend()
+        backend.abort_owned_processes()
 
-                def wait_for_release():
-                    started.set()
-                    self.release.wait(10)
+        with self.assertRaises(EnvironmentError_) as caught:
+            backend._app_obj()
 
-                self.executor.run(wait_for_release)
-            except BaseException as error:
-                failures.append(error)
-
-        thread = threading.Thread(target=first)
-        thread.start()
-        self.assertTrue(started.wait(2))
-        should_not_run = Mock()
-        with self.assertRaises(BridgeError):
-            self.executor.run(should_not_run, timeout=0.05)
-        self.backend.abort_owned_processes.assert_not_called()
-        self.release.set()
-        thread.join(2)
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(failures, [])
-        self.assertEqual(self.executor.run(lambda: "recovered"), "recovered")
-        should_not_run.assert_not_called()
-
-    def test_callable_timeout_error_is_not_watchdog_timeout(self):
-        def operation():
-            raise TimeoutError("input transport failed")
-
-        with self.assertRaisesRegex(TimeoutError, "input transport failed"):
-            self.executor.run(operation)
-        self.assertFalse(self.executor.busy)
-        self.assertEqual(self.executor.run(lambda: 7), 7)
-
-    def test_named_cancellation_does_not_abort_another_operation(self):
-        started = threading.Event()
-        errors = []
-
-        def reclaim():
-            self.release.set()
-            return {"terminated": [42]}
-
-        self.backend.abort_owned_processes = Mock(side_effect=reclaim)
-
-        def operation():
-            started.set()
-            self.release.wait(5)
-
-        def run():
-            try:
-                self.executor.run(operation, operation_id="job-one")
-            except Exception as error:
-                errors.append(error)
-
-        thread = threading.Thread(target=run)
-        thread.start()
-        self.assertTrue(started.wait(2))
-        self.executor.cancel("another-job")
-        self.backend.abort_owned_processes.assert_not_called()
-        self.executor.cancel("job-one")
-        thread.join(2)
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(errors, [])
-        self.backend.abort_owned_processes.assert_called_once()
-        self.assertEqual(self.executor.run(lambda: "next"), "next")
-
-    def test_closed_executor_rejects_work(self):
-        self.executor.close()
-        with self.assertRaisesRegex(BridgeError, "has closed"):
-            self.executor.run(lambda: None)
+        self.assertEqual(caught.exception.code, "cad_session_cancelled")
 
 
 class SessionTests(unittest.TestCase):
