@@ -562,7 +562,8 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 interface_records.require_endpoint_matches_install_record(health, record)
             except Exception as error:
-                die(f"endpoint does not match the active record: {error}")
+                detail = getattr(error, "detail", None)
+                die(f"endpoint does not match the active record: {error} {detail if detail else ''}")
             endpoint = {
                 "install_id": health["install"]["install_id"],
                 "config_digest": health["install"]["config_digest"],

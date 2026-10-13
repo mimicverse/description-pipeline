@@ -25,13 +25,14 @@ from description_pipeline.schemas import (
     RESOURCE_POLICY_SCHEMA,
     SOURCE_RECORD_SCHEMA,
 )
-from description_pipeline.stages import CONTRACT, STAGE_IDS
+from description_pipeline.stages import CONTRACT, CONTRACT_SHA256, STAGE_IDS
 
 HEX = "a" * 64
 OTHER_HEX = "b" * 64
 COMMIT = "c" * 40
 OTHER_COMMIT = "d" * 40
 TS = "2026-10-13T09:00:00Z"
+_SNAPSHOT_FILE = Path(tempfile.mkdtemp(prefix="ir-snapshot-")) / "gen-1.json"
 
 
 def release(role: str | None = None) -> dict:
@@ -63,8 +64,8 @@ def health(ready: bool = True) -> dict:
         "native_platform": True,
         "ready": ready,
         "release": release("native"),
-        "contract": {"schema_version": CONTRACT["schema_version"], "digest": HEX},
-        "resource_policy": {"schema_version": RESOURCE_POLICY_SCHEMA, "digest": ir.resource_policy_digest(policy())},
+        "contract": {"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
+        "resource_policy": {"schema_version": RESOURCE_POLICY_SCHEMA, "digest": ir.resource_policy_v1_digest()},
         "install": {"config_digest": HEX, "install_id": "gen-1"},
         "endpoint": {"port": 8765},
         "cad": {"external_session_detected": False, "owned_sessions": 0, "lease_held": False},
@@ -179,12 +180,14 @@ def config_snapshot() -> dict:
 
 def install_record(*, previous: bool = False, journal: list | None = None) -> dict:
     generation = "gen-2" if previous else "gen-1"
+    if _SNAPSHOT_FILE is not None:
+        _SNAPSHOT_FILE.write_text(json.dumps(config_snapshot()), encoding="utf-8")
     record = {
         "schema_version": INSTALL_RECORD_SCHEMA,
         "install_id": generation,
         "timestamp": TS,
         "snapshot": {
-            "path": f"/srv/description/state/snapshots/{generation}.json",
+            "path": str(_SNAPSHOT_FILE),
             "digest": HEX,
             "install_id": generation,
         },
@@ -876,12 +879,43 @@ class InterfaceRecordTests(unittest.TestCase):
         payload = health(True)
         payload["install"] = {"config_digest": OTHER_HEX, "install_id": "ep-7"}
         ir.require_endpoint_matches_install_record(payload, record)
+        # Owned active/queued work with the same complete identity must not be refused.
+        owned = copy.deepcopy(payload)
+        owned["jobs"] = {"active": 2, "queued": 1, "unresolved": 0}
+        ir.require_endpoint_matches_install_record(owned, record)
         bad = copy.deepcopy(payload)
         bad["install"]["config_digest"] = HEX
         self.reject("endpoint_end_mismatch", lambda: ir.require_endpoint_matches_install_record(bad, record))
         bad = copy.deepcopy(payload)
         bad["release"]["source_commit"] = OTHER_COMMIT
         self.reject("release_identity_mismatch", lambda: ir.require_endpoint_matches_install_record(bad, record))
+        # Not-ready endpoints (every precondition) and drifted port/owner digests are refused.
+        not_ready = copy.deepcopy(payload)
+        not_ready.update(ready=False)
+        not_ready["readiness"] = {
+            "reason_code": "solidworks_unregistered",
+            "native": {"ok": False, "problems": ["solidworks_unregistered"]},
+        }
+        self.reject("endpoint_not_ready", lambda: ir.require_endpoint_matches_install_record(not_ready, record))
+        external = copy.deepcopy(payload)
+        external.update(ready=False)
+        external["cad"]["external_session_detected"] = True
+        external["readiness"] = {"reason_code": "external_cad_session", "native": {"ok": True, "problems": []}}
+        self.reject("endpoint_not_ready", lambda: ir.require_endpoint_matches_install_record(external, record))
+        unresolved = copy.deepcopy(payload)
+        unresolved.update(ready=False)
+        unresolved["jobs"]["unresolved"] = 1
+        unresolved["readiness"] = {"reason_code": "unresolved_operations", "native": {"ok": True, "problems": []}}
+        self.reject("endpoint_not_ready", lambda: ir.require_endpoint_matches_install_record(unresolved, record))
+        drifted = copy.deepcopy(payload)
+        drifted["endpoint"]["port"] = 8766
+        self.reject("endpoint_end_mismatch", lambda: ir.require_endpoint_matches_install_record(drifted, record))
+        contract = copy.deepcopy(payload)
+        contract["contract"]["digest"] = "0" * 64
+        self.reject("endpoint_end_mismatch", lambda: ir.require_endpoint_matches_install_record(contract, record))
+        policy_drift = copy.deepcopy(payload)
+        policy_drift["resource_policy"]["digest"] = "0" * 64
+        self.reject("endpoint_end_mismatch", lambda: ir.require_endpoint_matches_install_record(policy_drift, record))
 
     def test_install_record_validation_is_static(self) -> None:
         source = Path(ir.__file__).read_text(encoding="utf-8")

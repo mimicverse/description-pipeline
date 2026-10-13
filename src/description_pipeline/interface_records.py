@@ -16,6 +16,7 @@ static: it never probes services, ports or the network (probes belong to
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import re
@@ -1047,10 +1048,13 @@ def validate_install_record(record, *, previous_required: bool = False) -> dict:
 def require_endpoint_matches_install_record(health, record) -> None:
     """Runtime-only cross-check of the Windows end against ``/health`` (IF-16).
 
-    Static validation cannot know the endpoint; this helper compares
-    ``ends.windows`` per-end: the release identity is the common triple
-    (``role`` is not compared), and install id / config digest compare against
-    ``health.install``.  Cross-end config digest equality is never required.
+    Static validation cannot know the endpoint; this helper is the single runtime admission /
+    health owner and binds the complete installed identity: the per-end release triple (``role``
+    is not compared), install id / config digest, the immutable snapshot's configured endpoint
+    port, the contract and resource-policy digests to their single owners, and ``ready`` with
+    every precondition ``validate_health`` enforces (external CAD session, unresolved
+    operations, registered native platform).  Cross-end config digest equality is never
+    required.
     """
 
     validate_health(health)
@@ -1066,6 +1070,34 @@ def require_endpoint_matches_install_record(health, record) -> None:
         end["config_digest"] == health["install"]["config_digest"],
         "endpoint_end_mismatch",
         {"field": "config_digest"},
+    )
+    _require(
+        health["ready"] is True,
+        "endpoint_not_ready",
+        {"reason_code": health["readiness"]["reason_code"]},
+    )
+    snapshot_path = Path(record["snapshot"]["path"])
+    _require(snapshot_path.is_file(), "endpoint_end_mismatch", {"where": "snapshot"})
+    try:
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise InterfaceRecordError("endpoint_end_mismatch", {"where": "snapshot", "reason": str(error)}) from error
+    validate_config_snapshot(snapshot)
+    expected_port = snapshot["resolved"]["windows"]["endpoint_port"]
+    _require(
+        health["endpoint"]["port"] == expected_port,
+        "endpoint_end_mismatch",
+        {"field": "endpoint.port", "expected": expected_port},
+    )
+    _require(
+        health["contract"]["digest"] == CONTRACT_SHA256,
+        "endpoint_end_mismatch",
+        {"field": "contract.digest"},
+    )
+    _require(
+        health["resource_policy"]["digest"] == resource_policy_v1_digest(),
+        "endpoint_end_mismatch",
+        {"field": "resource_policy.digest"},
     )
 
 

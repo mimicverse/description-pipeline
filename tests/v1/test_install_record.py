@@ -643,6 +643,43 @@ class InstallRecordTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             install_record.verify_running_generation(state_root)
 
+    def test_if11_connection_identity_consumers_are_canonical_and_strict(self):
+        from description_pipeline import interface_records as ir
+
+        record = build_record(self.root)
+        state_root = self.root / "state"
+        snapshot_path = state_root / "snapshots" / "gen-1.json"
+        reference = {
+            "schema_version": ir.CONFIG_SNAPSHOT_SCHEMA,
+            "path": str(snapshot_path),
+            "sha256": hashlib.sha256(snapshot_path.read_bytes()).hexdigest(),
+        }
+        identity = ir.validate_connection_config_identity(
+            {"host": "", "port": None, "password": "", "extra": {"config_identity": reference}}
+        )
+        payload = ir.check_config_identity_file(identity, allowed_root=str(state_root))
+        ir.verify_config_identity_digest(payload, identity)
+        ir.require_active_config_identity(identity, record)
+
+        # A surviving route copy and a divergent digest are refused by the same owners.
+        with self.assertRaises(ir.InterfaceRecordError):
+            ir.validate_connection_config_identity(
+                {"host": "127.0.0.1", "port": None, "password": "", "extra": {"config_identity": reference}}
+            )
+        with self.assertRaises(ir.InterfaceRecordError):
+            ir.validate_connection_config_identity(
+                {
+                    "host": "",
+                    "port": None,
+                    "password": "",
+                    "extra": {"config_identity": reference, "repositories": {}},
+                }
+            )
+        with self.assertRaises(ir.InterfaceRecordError):
+            ir.require_active_config_identity({**reference, "sha256": "0" * 64}, record)
+        with self.assertRaises(ir.InterfaceRecordError):
+            ir.check_config_identity_file(identity, allowed_root=str(self.root / "distribution"))
+
     def test_verify_active_consumes_the_canonical_validator(self):
         with tempfile.TemporaryDirectory(prefix="verify-active-") as temporary:
             root = Path(temporary)

@@ -16,7 +16,7 @@ from pathlib import Path
 
 from description_pipeline import schemas
 from description_pipeline import interface_records as ir
-from description_pipeline.stages import CONTRACT
+from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
 
 from .contract_wheel import write_contract_wheel
 
@@ -767,8 +767,8 @@ class LifecycleTests(unittest.TestCase):
             "native_platform": True,
             "ready": True,
             "release": {"version": "1.4.0", "source_commit": "c" * 40, "source_sha256": "a" * 64, "role": "native"},
-            "contract": {"schema_version": CONTRACT["schema_version"], "digest": "e" * 64},
-            "resource_policy": {"schema_version": ir.RESOURCE_POLICY_SCHEMA, "digest": "f" * 64},
+            "contract": {"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
+            "resource_policy": {"schema_version": ir.RESOURCE_POLICY_SCHEMA, "digest": ir.resource_policy_v1_digest()},
             "install": {"config_digest": "d" * 64, "install_id": "ep-1"},
             "endpoint": {"port": 9765},
             "cad": {"external_session_detected": False, "owned_sessions": 0, "lease_held": False},
@@ -1762,8 +1762,8 @@ class InstallOrderingTests(unittest.TestCase):
             "native_platform": True,
             "ready": True,
             "release": {"version": "1.4.0", "source_commit": "c" * 40, "source_sha256": "a" * 64, "role": "native"},
-            "contract": {"schema_version": CONTRACT["schema_version"], "digest": "e" * 64},
-            "resource_policy": {"schema_version": ir.RESOURCE_POLICY_SCHEMA, "digest": "f" * 64},
+            "contract": {"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
+            "resource_policy": {"schema_version": ir.RESOURCE_POLICY_SCHEMA, "digest": ir.resource_policy_v1_digest()},
             "install": {"config_digest": "d" * 64, "install_id": "ep-7"},
             "endpoint": {"port": 9765},
             "cad": {"external_session_detected": False, "owned_sessions": 0, "lease_held": False},
