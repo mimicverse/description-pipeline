@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
 # The one supported lifecycle for the Linux operator deployment:
-#   install  pinned toolchain + PostgreSQL + Airflow runtime + config/units + proxy binary
-#   start    enable/start PostgreSQL, Airflow, tunnel, portal and the HTTPS proxy
-#   stop     disable/stop them in reverse order
-#   status   systemctl --user is-active for every managed unit
-#   health   deploy/operator/health.sh (static checks plus live service/HTTP checks)
+#   validate  static platform.json checks (schema/paths/targets/ports; no probes)
+#   install   render the immutable config snapshot, then install the pinned runtime
+#   start     enable/start PostgreSQL, Airflow, tunnel, portal and the HTTPS proxy
+#   drain     close submissions and DAG admission, keep in-flight, return active/unresolved
+#   stop      disable/stop them in reverse order (only when drained and settled)
+#   status    systemctl --user is-active for every managed unit
+#   health    deploy/operator/health.sh (static checks plus live service/HTTP checks)
+#   reconcile confirm and register external outcomes; never repeats unknown side effects
+#   stage     build the two-end candidate installation (isolated targets)
+#   promote   switch both ends to the staged candidate (admission closed until verified)
+#   rollback  restore both ends from the recorded previous installation
 #
-#   operatorctl.sh <install|start|stop|status|health> --env-file FILE
+#   operatorctl.sh <verb> --config FILE
+#   transitional until the lifecycle bridge lands:
+#     operatorctl.sh <install|start|stop|status|health> --env-file FILE
 #
 # Only description-* units are written; unrelated user units are untouched. Credentials and state
-# live under OPERATOR_STATE (outside Git).
+# live under the configured state root (outside Git).
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AIRFLOW_HERE="$HERE/../airflow"
@@ -20,21 +28,45 @@ UNITS=(description-postgres description-solidworks-tunnel description-airflow-da
 die() { echo "operatorctl: $*" >&2; exit 1; }
 usage() {
   cat >&2 <<'USAGE'
-usage: operatorctl.sh <install|start|stop|status|health> --env-file FILE
+usage: operatorctl.sh <validate|install|start|drain|stop|status|health|reconcile|stage|promote|rollback> --config FILE
+       operatorctl.sh <install|start|stop|status|health> --env-file FILE  # transitional entry
+exit codes: 0 ok; 1 configuration/environment error; 2 usage; 3 recognized verb without its --config bridge yet
 USAGE
   exit 2
 }
 
 ACTION="${1:-}"
 shift || true
+CONFIG_FILE=""
 ENV_FILE=""
 while [ $# -gt 0 ]; do
   case "$1" in
+    --config) CONFIG_FILE="${2:-}"; shift 2 ;;
     --env-file) ENV_FILE="${2:-}"; shift 2 ;;
     *) usage ;;
   esac
 done
-[ -n "$ACTION" ] && [ -n "$ENV_FILE" ] || usage
+[ -n "$ACTION" ] || usage
+case "$ACTION" in
+  validate|install|start|drain|stop|status|health|reconcile|stage|promote|rollback) ;;
+  *) usage ;;
+esac
+if [ -n "$CONFIG_FILE" ] && [ -n "$ENV_FILE" ]; then usage; fi
+if [ -n "$CONFIG_FILE" ]; then
+  [ -f "$CONFIG_FILE" ] || die "config file not found: $CONFIG_FILE"
+  # Every verb passes the same static config gate first; the snapshot rendered at install stays
+  # the single authority for the whole lifecycle.
+  python3 "$HERE/platform_config.py" validate --config "$CONFIG_FILE" >/dev/null || exit $?
+  if [ "$ACTION" = "validate" ]; then
+    echo "operatorctl: configuration valid: $CONFIG_FILE"
+    exit 0
+  fi
+  echo "operatorctl: '$ACTION' is recognized but its --config bridge is not implemented in this increment;" >&2
+  echo "use the transitional --env-file entry for the current deployment" >&2
+  exit 3
+fi
+# Transitional env-file entry, removed when the lifecycle bridge lands.
+[ -n "$ENV_FILE" ] || usage
 [ -f "$ENV_FILE" ] || die "env file not found: $ENV_FILE"
 case "$ACTION" in
   install|start|stop|status|health) ;;
