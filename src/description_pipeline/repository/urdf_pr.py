@@ -111,6 +111,15 @@ def _remote_ref(repository: Path, ref: str) -> str:
     return listing.split()[0] if listing else ""
 
 
+def _observe_remote_ref(repository: Path, ref: str) -> str | None:
+    """One remote ref, or None when the observation itself is unavailable."""
+
+    try:
+        return _remote_ref(repository, ref)
+    except subprocess.CalledProcessError:
+        return None
+
+
 def _unresolved(code: str, detail, *, commit: str, branch: str, subject: str, base: str, url: str = "") -> dict:
     """A side-effect-unknown or baseline-changed receipt that blocks on reconciliation."""
 
@@ -128,7 +137,7 @@ def _unresolved(code: str, detail, *, commit: str, branch: str, subject: str, ba
             "note": (
                 "re-read both remote refs; nothing was written"
                 if not commit
-                else "reconcile the retained candidate write against the advanced base"
+                else "reconcile the retained candidate write against the remote state"
             ),
         },
     }
@@ -672,36 +681,57 @@ def submit_bundle(
                         "origin",
                         f"HEAD:refs/heads/{branch}",
                     )
-                except subprocess.CalledProcessError:
-                    moved_base = _remote_ref(repository, f"refs/heads/{base}")
-                    if moved_base != base_sha:
-                        observed(
-                            "publication.receipt",
-                            "failed",
-                            {"error": "base_moved_before_write", "planned_base": base_sha, "observed_base": moved_base},
+                except subprocess.CalledProcessError as error:
+                    # The response was lost.  Compare the actual remote head
+                    # against the candidate fixed before the write first: a
+                    # confirmed candidate write is retained for reconciliation,
+                    # and an unobservable side effect stays unresolved - the
+                    # base alone may never assert "nothing was written".
+                    observed_head = _observe_remote_ref(repository, f"refs/heads/{branch}")
+                    observed_base = _observe_remote_ref(repository, f"refs/heads/{base}")
+                    detail = {
+                        "candidate": commit,
+                        "expected_head": head_sha,
+                        "observed_head": observed_head,
+                        "planned_base": base_sha,
+                        "observed_base": observed_base,
+                        "stderr": (error.stderr or "")[-300:],
+                    }
+                    if observed_head == commit:
+                        observed("publication.receipt", "failed", {"error": "push_response_lost", **detail})
+                        return _unresolved(
+                            "push_response_lost",
+                            detail,
+                            commit=commit,
+                            branch=branch,
+                            subject=subject,
+                            base=base,
                         )
+                    if observed_head is None or observed_base is None:
+                        observed("publication.receipt", "failed", {"error": "push_unverified", **detail})
+                        return _unresolved(
+                            "push_unverified",
+                            detail,
+                            commit=commit,
+                            branch=branch,
+                            subject=subject,
+                            base=base,
+                        )
+                    if observed_base != base_sha:
+                        observed("publication.receipt", "failed", {"error": "base_moved_before_write", **detail})
                         return _unresolved(
                             "base_moved_before_write",
-                            {"planned_base": base_sha, "observed_base": moved_base},
+                            detail,
                             commit="",
                             branch=branch,
                             subject=subject,
                             base=base,
                         )
-                    observed_head = _remote_ref(repository, f"refs/heads/{branch}")
                     if observed_head != head_sha:
-                        observed(
-                            "publication.receipt",
-                            "failed",
-                            {
-                                "error": "candidate_head_changed",
-                                "expected_head": head_sha,
-                                "observed_head": observed_head,
-                            },
-                        )
+                        observed("publication.receipt", "failed", {"error": "candidate_head_changed", **detail})
                         return _unresolved(
                             "candidate_head_changed",
-                            {"expected_head": head_sha, "observed_head": observed_head},
+                            detail,
                             commit="",
                             branch=branch,
                             subject=subject,

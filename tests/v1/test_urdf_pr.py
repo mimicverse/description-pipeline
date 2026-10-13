@@ -300,6 +300,58 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(result["url"], "https://github.com/example/m3.0/pull/1")
         self.assertEqual(result["commit"], self.fx.remote_head())
 
+    def _lost_push_case(self, *, advance_base=False, break_queries=False):
+        first = self.submit()
+        self.assertIn(first["state"], {"published", "updated"})
+        fixed_head = self.fx.remote_head()
+        self.fx.write_bundle("lost push response evidence\n")
+        real_git = urdf_pr._git
+        state = {"injected": False}
+
+        def git_with_race(repository, *args, **kwargs):
+            if state["injected"] and break_queries and args[:1] == ("ls-remote",):
+                raise subprocess.CalledProcessError(128, ["git", *args], stderr="injected unavailable observation")
+            if not state["injected"] and args[:1] == ("push",):
+                state["injected"] = True
+                accepted = real_git(repository, *args, **kwargs)
+                self.assertEqual(accepted.returncode, 0)
+                if advance_base:
+                    self._advance_base()
+                raise subprocess.CalledProcessError(
+                    128, ["git", *args], stderr="injected response loss after accepted write"
+                )
+            return real_git(repository, *args, **kwargs)
+
+        with mock.patch.object(urdf_pr, "_git", side_effect=git_with_race):
+            result = self.submit()
+        self.assertTrue(state["injected"])
+        return result, fixed_head
+
+    def test_lost_push_response_retains_the_written_candidate(self):
+        result, fixed_head = self._lost_push_case()
+        self.assertEqual(result["state"], "unresolved")
+        self.assertEqual(result["error"], "push_response_lost")
+        remote = self.fx.remote_head()
+        self.assertNotEqual(remote, fixed_head)
+        self.assertEqual(result["commit"], remote)
+        self.assertIn("retained", result["retry"]["note"])
+
+    def test_lost_push_response_with_base_advance_retains_the_candidate(self):
+        result, fixed_head = self._lost_push_case(advance_base=True)
+        self.assertEqual(result["state"], "unresolved")
+        self.assertEqual(result["error"], "push_response_lost")
+        remote = self.fx.remote_head()
+        self.assertNotEqual(remote, fixed_head)
+        self.assertEqual(result["commit"], remote)
+        self.assertEqual(result["detail"]["observed_base"], self.fx.remote_head("feature/m3.0"))
+
+    def test_lost_push_with_unobservable_refs_keeps_the_candidate_unresolved(self):
+        result, fixed_head = self._lost_push_case(break_queries=True)
+        self.assertEqual(result["state"], "unresolved")
+        self.assertEqual(result["error"], "push_unverified")
+        self.assertEqual(result["commit"], self.fx.remote_head())
+        self.assertNotEqual(result["commit"], fixed_head)
+
     def submit(self, **kwargs):
         return urdf_pr.submit_bundle(self.fx.bundle, self.fx.repo, base="feature/m3.0", branch=BRANCH, **kwargs)
 
