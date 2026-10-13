@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
+import os
 import stat
 import subprocess
 import sys
@@ -160,6 +161,13 @@ class ValidationTests(unittest.TestCase):
                 "malformed",
             ),
             (
+                "distinct repositories share one checkout",
+                lambda d: d["targets"].__setitem__(
+                    "m4.0", {"repository_slug": "another-owner/model-repository", "base": "main"}
+                ),
+                "share one checkout",
+            ),
+            (
                 "overlapping storage roots",
                 lambda d: d["storage"].__setitem__("artifact_root", d["storage"]["state_root"]),
                 "must not overlap",
@@ -182,6 +190,16 @@ class ValidationTests(unittest.TestCase):
                 "origin collides with tunnel port",
                 lambda d: d["operator"].__setitem__("origin", "https://10.0.0.235:18765"),
                 "must not collide",
+            ),
+            (
+                "origin port zero",
+                lambda d: d["operator"].__setitem__("origin", "https://10.0.0.235:0"),
+                "TCP port",
+            ),
+            (
+                "origin port too large",
+                lambda d: d["operator"].__setitem__("origin", "https://10.0.0.235:99999"),
+                "TCP port",
             ),
             ("string tunnel port", lambda d: d["windows"].__setitem__("tunnel_loopback_port", "x"), "TCP port"),
             ("empty tenant keys", lambda d: d["auth"].__setitem__("tenant_keys", []), "must not be empty"),
@@ -292,6 +310,54 @@ class RenderTests(unittest.TestCase):
             tampered["generated_at"] = "2026-10-13T00:00:01Z"
             with self.assertRaises(SystemExit):
                 platform_config.write_snapshot(tampered, snapshots)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires a POSIX fork")
+    def test_concurrent_different_payloads_for_one_generation_never_overwrite(self):
+        resolved = platform_config.validate_platform(platform_document(VALID_ROOT))
+        first = platform_config.build_snapshot(
+            resolved,
+            platform_json_sha256="a" * 64,
+            install_id="gen-race",
+            generated_at="2026-10-13T00:00:00Z",
+        )
+        second = platform_config.build_snapshot(
+            resolved,
+            platform_json_sha256="b" * 64,
+            install_id="gen-race",
+            generated_at="2026-10-13T00:00:00Z",
+        )
+        with tempfile.TemporaryDirectory(prefix="platform-config-race-") as temporary:
+            snapshots = Path(temporary) / "snapshots"
+            go_ahead, wait_for_write = os.pipe()
+            pid = os.fork()
+            if pid == 0:  # child: the second writer, released together with the first
+                child_code = 2
+                try:
+                    os.close(wait_for_write)
+                    os.read(go_ahead, 1)
+                    platform_config.write_snapshot(second, snapshots)
+                    child_code = 0
+                except SystemExit:
+                    child_code = 1
+                except Exception:
+                    child_code = 2
+                finally:
+                    os._exit(child_code)
+            os.close(go_ahead)
+            parent_ok = True
+            try:
+                os.write(wait_for_write, b"x")
+                platform_config.write_snapshot(first, snapshots)
+            except SystemExit:
+                parent_ok = False
+            finally:
+                os.close(wait_for_write)
+            _, status = os.waitpid(pid, 0)
+            child_code = os.waitstatus_to_exitcode(status)
+            self.assertIn(child_code, (0, 1), f"child writer crashed with {child_code}")
+            self.assertNotEqual(parent_ok, child_code == 0, "exactly one writer must win")
+            stored = json.loads((snapshots / "gen-race.json").read_text(encoding="utf-8"))
+            self.assertEqual(stored, first if parent_ok else second)
 
     def test_cli_usage_and_error_exit_codes(self):
         result = run_cli("validate")

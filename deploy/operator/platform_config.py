@@ -157,7 +157,7 @@ def validate_platform(document) -> dict:
     origin = text(operator["origin"], "operator.origin")
     match = _ORIGIN.match(origin)
     require(match is not None, f"operator.origin must be an https origin, got {origin!r}")
-    origin_port = int(match.group(2)) if match.group(2) else 443
+    origin_port = tcp_port(int(match.group(2)) if match.group(2) else 443, "operator.origin port")
     absolute_path(operator["certificate_file"], "operator.certificate_file")
     absolute_path(operator["private_key_file"], "operator.private_key_file")
 
@@ -244,11 +244,13 @@ def validate_platform(document) -> dict:
     # exactly one checkout under workspace_root, and discovery consumes the specification roots.
     store_root = storage_paths["state_root"] / "runs"
     repositories: dict[str, str] = {}
+    checkouts: dict[str, str] = {}
     for slug in sorted(slugs):
-        checkout = storage_paths["workspace_root"] / slug.split("/", 1)[1]
-        other = repositories.get(str(checkout))
+        checkout = str(storage_paths["workspace_root"] / slug.split("/", 1)[1])
+        other = checkouts.get(checkout)
         require(other is None, f"target repositories {other!r} and {slug!r} share one checkout: {checkout}")
-        repositories[slug] = str(checkout)
+        checkouts[checkout] = slug
+        repositories[slug] = checkout
 
     named_roots = [(name, storage_paths[name]) for name in _STORAGE_KEYS]
     named_roots += [(f"specifications.record_roots[{index}]", path) for index, path in enumerate(record_paths)]
@@ -325,25 +327,43 @@ def build_snapshot(resolved: dict, *, platform_json_sha256: str, install_id: str
     }
 
 
+def _require_same_snapshot(path: Path, payload: bytes) -> Path:
+    """An existing generation is accepted only when its bytes are identical."""
+
+    require(
+        path.read_bytes() == payload,
+        f"the generation snapshot already exists with different bytes: {path}",
+    )
+    return path
+
+
 def write_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
-    """Write the generation snapshot atomically (0600); a generation is never rewritten."""
+    """Write the generation snapshot atomically (0600); a generation is never rewritten.
+
+    The commit is an atomic create-if-absent (``os.link`` of a fully written temporary file), so
+    two concurrent writers with different payloads for one generation can never overwrite each
+    other: the loser observes the existing bytes and fails closed.
+    """
 
     snapshots_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(snapshots_dir, stat.S_IRWXU)
     path = snapshots_dir / f"{snapshot['install_id']}.json"
     payload = canonical(snapshot)
     if path.exists():
-        require(
-            path.read_bytes() == payload,
-            f"the generation snapshot already exists with different bytes: {path}",
-        )
-        return path
+        return _require_same_snapshot(path, payload)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     try:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(payload)
-        os.replace(temporary, path)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            return _require_same_snapshot(path, payload)
+        except OSError as error:
+            die(f"cannot commit the generation snapshot {path}: {error}")
     finally:
         temporary.unlink(missing_ok=True)
     os.chmod(path, 0o600)
