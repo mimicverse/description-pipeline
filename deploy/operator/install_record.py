@@ -251,7 +251,18 @@ def main(argv: list[str] | None = None) -> int:
     build.add_argument("--endpoint-identity", type=Path, required=True)
     build.add_argument("--services", required=True, help="comma-separated managed unit names")
     build.add_argument("--dag", type=Path, required=True)
+    check = subparsers.add_parser("check")
+    check.add_argument("--release-file", type=Path, required=True)
+    check.add_argument("--endpoint-identity", type=Path, required=True)
     args = parser.parse_args(argv)
+
+    if args.action == "check":
+        release = release_identity(_load_json(args.release_file, "release file"))
+        verified = verify_artifacts(args.release_file.parent, release["artifacts"])
+        endpoint_identity(_load_json(args.endpoint_identity, "endpoint identity"))
+        print("check=ok")
+        print(f"verified_artifacts={verified}")
+        return 0
 
     timestamp = args.timestamp or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     release = release_identity(_load_json(args.release_file, "release file"))
