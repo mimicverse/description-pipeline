@@ -278,7 +278,7 @@ class EndpointFixture:
     def run_to_terminal(self, jobs: Jobs, run_id: str, *, timeout: float = 20.0) -> dict:
         """The whole native boundary: selection -> definition -> capture."""
 
-        sealed = self.stage_and_seal(jobs, run_id)
+        sealed = self.stage_and_seal(jobs, run_id, statuses={"running", "awaiting_definition"})
         if sealed["status"] == "failed":
             return sealed
         state = self.wait_state_any_status(jobs, run_id, {"awaiting_definition"}, timeout=timeout)
