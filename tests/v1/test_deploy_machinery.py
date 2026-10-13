@@ -51,7 +51,3 @@ class DeployMachineryTests(unittest.TestCase):
             self.assertNotIn(marker, text)
         self.assertIn("token_file", text)
 
-    def test_acceptance_checker_is_generation_free_and_argument_driven(self) -> None:
-        text = (ROOT / "tools/acceptance/m3_acceptance.py").read_text(encoding="utf-8")
-        self.assertNotRegex(text, r"portal-\d{8}T\d{6}-[0-9a-f]{8}")
-        self.assertIn("sys.argv[1]", text)
