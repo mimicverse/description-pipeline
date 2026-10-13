@@ -107,6 +107,16 @@ class RuntimeRoleTests(unittest.TestCase):
             for name in runtime.required_packages(role):
                 self.assertEqual(locked[name.lower()], runtime.RUNTIME_VERSIONS[name])
             self.assertEqual("mujoco" in locked, role == "portable")
+            if role == "native":
+                self.assertEqual(
+                    set(locked),
+                    {name.lower() for name in runtime.required_packages(role)},
+                    "the Windows lock must carry exactly the native closure - no unused packages",
+                )
+                self.assertFalse(
+                    set(locked) & {"numpy", "jsonschema", "python-multipart", "attrs", "referencing", "rpds-py"},
+                    "packages owned by the portable surfaces must not return to the Windows lock",
+                )
 
 
 if __name__ == "__main__":

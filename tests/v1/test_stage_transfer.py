@@ -583,8 +583,13 @@ class StageTransferTests(unittest.TestCase):
             ("python", {"runtime": {**native_tool()["runtime"], "python": "3.11.9"}}, "Python 3.12"),
             (
                 "pin",
-                {"runtime": {**native_tool()["runtime"], "packages": {"numpy": "0.0.1"}}},
-                "pin numpy",
+                {
+                    "runtime": {
+                        **native_tool()["runtime"],
+                        "packages": {required_packages("native")[0]: "0.0.1"},
+                    }
+                },
+                f"pin {required_packages('native')[0]}",
             ),
             (
                 "mujoco",

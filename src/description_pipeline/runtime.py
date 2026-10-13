@@ -13,7 +13,15 @@ from .delivery import PIPELINE_ID
 from .io import PipelineError, digest, file_digest, read_data
 from .schemas import TOOL_SCHEMA
 
-RUNTIME_PACKAGES = ("numpy", "PyYAML", "jsonschema", "packaging", "python-multipart")
+#: The exact runtime dependency closure per role.  The native (Windows) endpoint runs the
+#: staged capture/conversion pipeline: it imports packaging (stage transfer and tool records)
+#: and the pywin32 COM bindings.  numpy, jsonschema and python-multipart belong to the
+#: portable (Linux) surfaces (model derivation, pages, uploads).  PyYAML leaves the native
+#: set together with the robot.yaml write side of the native discovery reshape.
+RUNTIME_PACKAGES = {
+    "native": ("PyYAML", "packaging", "pywin32"),
+    "portable": ("numpy", "PyYAML", "jsonschema", "packaging", "python-multipart", "mujoco"),
+}
 RUNTIME_VERSIONS = {
     "numpy": "2.5.3",
     "PyYAML": "6.0.3",
@@ -33,7 +41,7 @@ def runtime_role(role: str | None = None) -> str:
 
 
 def required_packages(role: str | None = None) -> tuple[str, ...]:
-    return RUNTIME_PACKAGES + (("pywin32",) if runtime_role(role) == "native" else ("mujoco",))
+    return RUNTIME_PACKAGES[runtime_role(role)]
 
 
 def native_readiness() -> dict:
