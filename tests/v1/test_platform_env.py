@@ -11,7 +11,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
+
+from .contract_wheel import write_contract_wheel
 
 ROOT = Path(__file__).resolve().parents[2]
 OPERATOR = ROOT / "deploy" / "operator"
@@ -27,6 +30,17 @@ def _load_from_path(name: str, path: Path):
 platform_config = _load_from_path("deploy_platform_config_env", OPERATOR / "platform_config.py")
 platform_env = _load_from_path("deploy_platform_env", OPERATOR / "platform_env.py")
 install_record = _load_from_path("deploy_install_record_env", OPERATOR / "install_record.py")
+
+
+def tree_digest(root: Path) -> str:
+    """Digest every file under ``root`` so zero-write claims are detectable."""
+    if not root.exists():
+        return "missing"
+    rows = []
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            rows.append([path.relative_to(root).as_posix(), hashlib.sha256(path.read_bytes()).hexdigest()])
+    return json.dumps(rows)
 
 
 def write_release(root: Path, *wheels: Path) -> dict:
@@ -95,7 +109,7 @@ class PlatformEnvTests(unittest.TestCase):
         self.tree = self.root / "deployment"
         self.tree.mkdir()
         self.wheel = self.tree / "mimicverse_description-1.4.0-py3-none-any.whl"
-        self.wheel.write_bytes(b"wheel")
+        write_contract_wheel(self.wheel)
         self.release = write_release(self.root, self.wheel)
 
     def derive(self, snapshot, *, install_id, tree_root=None, wheel=None):
@@ -143,7 +157,7 @@ class PlatformEnvTests(unittest.TestCase):
 
     def test_wheel_selection_is_bound_to_the_release(self):
         second = self.tree / "another.whl"
-        second.write_bytes(b"other")
+        write_contract_wheel(second)
         with self.assertRaises(SystemExit) as raised:
             self.derive(self.snapshot, install_id="gen-1")
         self.assertIn("exactly one", str(raised.exception))
@@ -245,6 +259,7 @@ class PlatformEnvTests(unittest.TestCase):
         self.assertEqual(Path(first["env_path"]).read_bytes(), first_env_bytes)
 
     def test_malformed_inputs_fail_closed_without_writing(self):
+        state = self.root / "state"
         cases = []
         broken = json.loads(json.dumps(self.snapshot))
         broken["resolved"]["storage"]["state_root"] = "relative/state"
@@ -257,11 +272,99 @@ class PlatformEnvTests(unittest.TestCase):
         foreign["schema_version"] = "review.foreign-snapshot/v99"
         cases.append(("foreign schema", foreign, "gen-1"))
         cases.append(("bad install id", self.snapshot, "bad/id"))
+        # The canonical IF-16 snapshot rules must refuse at the derive/emit boundary before
+        # any write, not only inside the validator function.
+        unknown_key = json.loads(json.dumps(self.snapshot))
+        unknown_key["extra"] = 1
+        cases.append(("unknown top key", unknown_key, "gen-1"))
+        missing_sources = json.loads(json.dumps(self.snapshot))
+        del missing_sources["sources"]
+        cases.append(("missing sources", missing_sources, "gen-1"))
+        impossible = json.loads(json.dumps(self.snapshot))
+        impossible["generated_at"] = "2026-99-99T99:99:99Z"
+        cases.append(("impossible instant", impossible, "gen-1"))
+        secret = json.loads(json.dumps(self.snapshot))
+        secret["resolved"]["auth"]["app_secret"] = "x"
+        cases.append(("secret in auth", secret, "gen-1"))
+        collision = json.loads(json.dumps(self.snapshot))
+        collision["resolved"]["windows"]["tunnel_loopback_port"] = 9443
+        cases.append(("origin port collision", collision, "gen-1"))
+        outside = json.loads(json.dumps(self.snapshot))
+        outside["resolved"]["derived"]["store_root"] = "/elsewhere/runs"
+        cases.append(("store root outside state", outside, "gen-1"))
+        no_concurrency = json.loads(json.dumps(self.snapshot))
+        no_concurrency["resolved"]["execution"]["linux_concurrency"] = 0
+        cases.append(("execution zero", no_concurrency, "gen-1"))
         for label, snapshot, install_id in cases:
             with self.subTest(label):
+                before = tree_digest(state)
                 with self.assertRaises(SystemExit):
                     self.derive(snapshot, install_id=install_id, tree_root=self.tree)
-                self.assertFalse((self.root / "state" / "derived").exists(), "no derived files may be written")
+                self.assertEqual(tree_digest(state), before, "a refused snapshot must not write state")
+                self.assertFalse((state / "derived").exists(), "no derived files may be written")
+
+    def test_a_valid_derivation_shows_detectable_writes(self):
+        state = self.root / "state"
+        before = tree_digest(state)
+        result = self.derive(self.snapshot, install_id="gen-1", tree_root=self.tree)
+        self.assertNotEqual(tree_digest(state), before, "the zero-write detector must detect successful writes")
+        written = {path.relative_to(state).as_posix() for path in state.rglob("*") if path.is_file()}
+        self.assertTrue(
+            {
+                "derived/gen-1/operator.env",
+                "derived/gen-1/repositories.json",
+                "derived/gen-1/targets.json",
+                "derived/gen-1/discovery.json",
+            }
+            <= written
+        )
+        targets = json.loads(Path(result["env"]["MODEL_TARGETS_FILE"]).read_text(encoding="utf-8"))
+        self.assertEqual(targets["m3.0"]["base"], "main")
+
+    def test_wheel_without_the_contract_closure_is_refused_before_any_write(self):
+        hollow = self.root / "hollow.whl"
+        with zipfile.ZipFile(hollow, "w") as archive:
+            archive.writestr("mimicverse_description-1.4.0.dist-info/METADATA", "Name: mimicverse-description\n")
+        self.release = write_release(self.root, hollow)
+        state = self.root / "state"
+        before = tree_digest(state)
+        with self.assertRaises(SystemExit) as raised:
+            self.derive(self.snapshot, install_id="gen-1", wheel=hollow)
+        self.assertIn("contract closure", str(raised.exception))
+        self.assertEqual(tree_digest(state), before, "a wheel without the closure must not write state")
+        self.assertFalse((state / "derived").exists())
+
+    def test_contract_closure_loads_in_an_isolated_interpreter(self):
+        script = f"""
+import pathlib
+import sys
+
+sys.path.insert(0, {str(OPERATOR)!r})
+import platform_env
+
+records = platform_env.load_contract_closure(pathlib.Path(sys.argv[1]))
+print(records.CONFIG_SNAPSHOT_SCHEMA)
+print("yaml" in sys.modules)
+from description_pipeline import io
+
+print(io.parse_data(b'{{"a": 1}}', pathlib.Path("x.json"))["a"])
+try:
+    io.parse_data(b"a: 1", pathlib.Path("x.yaml"))
+except ModuleNotFoundError:
+    print("yaml-required")
+"""
+        completed = subprocess.run(
+            [sys.executable, "-I", "-S", "-c", script, str(self.wheel)],
+            capture_output=True,
+            text=True,
+            cwd=str(ROOT),
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        schema, yaml_loaded, parsed, yaml_required = completed.stdout.strip().splitlines()
+        self.assertEqual(schema, platform_config.SNAPSHOT_SCHEMA)
+        self.assertEqual(yaml_loaded, "False", "the closure must load without PyYAML")
+        self.assertEqual(parsed, "1")
+        self.assertEqual(yaml_required, "yaml-required", "the YAML read path still requires PyYAML")
 
 
 if __name__ == "__main__":

@@ -16,6 +16,8 @@ from pathlib import Path
 
 from description_pipeline import schemas
 
+from .contract_wheel import write_contract_wheel
+
 ROOT = Path(__file__).resolve().parents[2]
 OPERATOR = ROOT / "deploy" / "operator"
 RENDER = OPERATOR / "render_operator.py"
@@ -112,7 +114,7 @@ def platform_fixture(
     token.write_text("test-token\n", encoding="utf-8")
     token.chmod(0o600)
     wheel = tmp / "mimicverse_description-test-py3-none-any.whl"
-    wheel.write_bytes(b"wheel")
+    write_contract_wheel(wheel)
     release_document = {
         "schema_version": "solidworks-to-urdf.release/v1",
         "pipeline_id": "solidworks-to-urdf",
@@ -1132,7 +1134,7 @@ class InstallOrderingTests(unittest.TestCase):
             (tmp / "state" / "airflow-pg" / "data" / "PG_VERSION").write_text("14\n", encoding="utf-8")
         tree = tmp / "release"
         wheel = tree / "mimicverse_description-1.4.0-py3-none-any.whl"
-        wheel.write_bytes(b"wheel-bytes")
+        write_contract_wheel(wheel)
         config = {
             "schema_version": schemas.PLATFORM_CONFIG_SCHEMA,
             "operator": {

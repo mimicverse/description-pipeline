@@ -19,6 +19,11 @@ Derivations (all paths under the configured storage roots; converged here as the
 The derived env file is written 0600 under <state_root>/derived and is an internal artifact of
 the lifecycle, never an external interface.
 
+Every emit runs the canonical IF-16 contract validation from the contract closure carried
+inside the digest-bound release wheel and refuses an invalid or tampered snapshot before the
+first write - the bootstrap enforces the same rules as the installed pipeline, with no local
+mirror and no venv/service/checkout dependency.
+
 Exit codes: 0 success; 1 error (message on stderr); 2 usage error.
 """
 
@@ -32,9 +37,22 @@ from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from platform_config import SNAPSHOT_SCHEMA, atomic_write_once, canonical  # noqa: E402  (shared helpers)
+from platform_config import atomic_write_once, canonical  # noqa: E402  (shared helpers)
 from install_record import release_identity, wheel_binding  # noqa: E402  (single release/asset binding)
 from render_operator import PORT_DEFAULTS  # noqa: E402  (single deploy-layer port source, DEP-01)
+
+#: The minimal same-source contract closure inside the release wheel: the schema owner modules
+#: plus the stage contract they read.  These files are the frozen interface validators the
+#: bootstrap runs itself; the rest of the package is not needed before a venv exists.
+CLOSURE_MEMBERS = (
+    "__init__.py",
+    "schemas.py",
+    "io.py",
+    "delivery.py",
+    "stages.py",
+    "stage-contract.json",
+    "interface_records.py",
+)
 
 
 def die(message: str) -> None:
@@ -44,6 +62,35 @@ def die(message: str) -> None:
 def require(condition: bool, message: str) -> None:
     if not condition:
         die(message)
+
+
+def load_contract_closure(wheel: Path):
+    """Import the canonical contract validators from the release wheel itself.
+
+    Bootstrap runs before any venv, service or checkout exists, so the same-source minimal
+    closure is extracted from the digest-bound release artifact into a private directory
+    and imported there with the plain interpreter.  A wheel missing any closure member is
+    refused - the gate never falls back to weaker local checks.
+    """
+    import atexit  # noqa: PLC0415
+    import shutil  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+    import zipfile  # noqa: PLC0415
+
+    directory = Path(tempfile.mkdtemp(prefix="description-contract-"))
+    atexit.register(shutil.rmtree, directory, ignore_errors=True)
+    package = directory / "description_pipeline"
+    package.mkdir()
+    with zipfile.ZipFile(wheel) as archive:
+        names = set(archive.namelist())
+        for member in CLOSURE_MEMBERS:
+            name = f"description_pipeline/{member}"
+            require(name in names, f"the release artifact {wheel.name} misses the contract closure member {name}")
+            (package / member).write_bytes(archive.read(name))
+    sys.path.insert(0, str(directory))
+    from description_pipeline import interface_records  # noqa: PLC0415  (from the extracted closure)
+
+    return interface_records
 
 
 def _text(value, where: str) -> str:
@@ -81,28 +128,30 @@ def derive(
 
     require(bool(install_id) and all(character not in install_id for character in "\n\r/"), "install_id is malformed")
     require(
-        snapshot.get("schema_version") == SNAPSHOT_SCHEMA,
-        f"snapshot schema_version must be {SNAPSHOT_SCHEMA}",
+        isinstance(release, dict) and "artifacts" in release,
+        "the release identity is required to bind the consumed wheel",
     )
-    declared = snapshot.get("install_id")
-    require(isinstance(declared, str) and bool(declared), "snapshot install_id is missing")
+    wheel_path = wheel_binding(release, wheel=wheel, tree_root=tree_root)
+    # The canonical IF-16 validation runs before the emit's first write.  The closure travels
+    # inside the digest-bound release wheel, so the bootstrap enforces exactly the rules of the
+    # installed pipeline - no local mirror, no venv, no checkout dependency.
+    interface_records = load_contract_closure(wheel_path)
+    try:
+        interface_records.validate_config_snapshot(snapshot)
+    except interface_records.InterfaceRecordError as error:
+        die(f"snapshot invalid: {error}")
+    declared = snapshot["install_id"]
     require(
         declared == install_id,
         f"snapshot generation mismatch: the snapshot declares {declared!r}, the request is {install_id!r}",
     )
-    resolved = snapshot.get("resolved")
-    require(isinstance(resolved, dict), "snapshot resolved tree is missing")
-    storage = resolved.get("storage")
-    windows = resolved.get("windows")
-    operator = resolved.get("operator")
-    auth = resolved.get("auth")
-    targets = resolved.get("targets")
-    specifications = resolved.get("specifications")
-    derived = resolved.get("derived")
-    require(
-        all(isinstance(block, dict) for block in (storage, windows, operator, auth, targets, specifications, derived)),
-        "snapshot resolved tree is incomplete",
-    )
+    resolved = snapshot["resolved"]
+    storage = resolved["storage"]
+    windows = resolved["windows"]
+    operator = resolved["operator"]
+    auth = resolved["auth"]
+    targets = resolved["targets"]
+    derived = resolved["derived"]
 
     state_root = _absolute(storage.get("state_root"), "resolved.storage.state_root")
     release_root = _absolute(storage.get("release_root"), "resolved.storage.release_root")
@@ -144,11 +193,6 @@ def derive(
     discovery_file = derived_dir / "discovery.json"
     env_path = derived_dir / "operator.env"
 
-    require(
-        isinstance(release, dict) and "artifacts" in release,
-        "the release identity is required to bind the consumed wheel",
-    )
-    wheel_path = wheel_binding(release, wheel=wheel, tree_root=tree_root)
     venv = f"{release_root.rstrip('/')}/airflow-venv-{install_id}"
     home = f"{state_root.rstrip('/')}/airflow-home"
     postgres_root = f"{state_root.rstrip('/')}/airflow-pg"
