@@ -150,6 +150,7 @@ Complete these configuration groups once:
 | `SOLIDWORKS_HANDOFF_ROOT` | Dedicated Linux intake, such as `/srv/description/cad-handoffs`, outside runtime and state |
 | `PIPELINE_STORE_ROOT` | Linux stage checkpoints, model deliveries and diagnostics; defaults to `OPERATOR_STATE/runs` |
 | `MODEL_REPOSITORIES_FILE` | Mode-`0600` JSON mapping repository slugs to dedicated Linux model checkouts |
+| `MODEL_TARGETS_FILE` | Optional mode-`0600` JSON mapping hardware identities to `{repository_slug, base}` publication targets |
 | `DISCOVERY_SETTINGS_FILE` | Optional mode-`0600` JSON with Linux `record_roots` and `frozen_names_file` |
 | `FEISHU_APP_SECRET_FILE`, `FEISHU_TENANT_KEYS` | App credentials and mandatory tenant allowlist |
 | `FEISHU_ADMIN_OPEN_IDS` | Explicit administrator identities; optional, no automatic administrator |
@@ -165,6 +166,19 @@ The slug must match the Windows target's `repository_slug`; its Git origin must
 match that slug. Keep checkouts separate from CAD intake, runtime and run storage.
 Installation renders the same store and routing into the portal and Airflow
 Connection. Health refuses an empty mapping. Reinstall after changing routing.
+
+Create the publication-target mapping before accepting submissions, for example:
+
+```json
+{"m3.0": {"repository_slug": "<owner>/<model-repository>", "base": "main"}}
+```
+
+Set `MODEL_TARGETS_FILE` to its absolute path and restrict it to mode `0600`; every
+target must name a configured `MODEL_REPOSITORIES_FILE` key. The portal offers these
+targets in the upload window and derives the publication identity when the CAD records
+do not carry `dp.hardware_id`. The Windows endpoint exposes its own target list on
+`/health`, and the operator health check fails when the endpoint's targets differ from
+the portal (and the Airflow connection rendered from the same file) configuration.
 Back up the run store with platform state; it owns portable checkpoints and
 published model receipts.
 

@@ -35,6 +35,7 @@ from ..sources.solidworks.discovery import (
     DISCOVERY_FILE,
     DISCOVERY_SCHEMA,
     FINDINGS_FILE,
+    IDENTITY_FILE,
     NAMESPACE,
     PREPARED_SCHEMA,
     RECORD_DIR,
@@ -42,6 +43,7 @@ from ..sources.solidworks.discovery import (
     ROBOT_FILE,
     DiscoverySettings,
     PreparedPackage,
+    SubmissionIdentity,
     derive_native_package,
 )
 from ..sources.solidworks.input import load_package
@@ -85,7 +87,7 @@ MAX_REQUEST_BYTES = 512 * 1024 * 1024
 #: A capture request only carries the actual derive outputs: the generated
 #: contract files plus the embedded controlled records (``records/<sha8>_<stem>.txt``).
 _EMBEDDED_RECORD_MEMBER = re.compile(rf"{re.escape(RECORD_DIR)}/[0-9a-f]{{8}}_[0-9A-Za-z._-]{{1,48}}\.txt")
-_GENERATED_MEMBERS = frozenset({ROBOT_FILE, REVISION_FILE, DISCOVERY_FILE, FINDINGS_FILE})
+_GENERATED_MEMBERS = frozenset({ROBOT_FILE, REVISION_FILE, DISCOVERY_FILE, FINDINGS_FILE, IDENTITY_FILE})
 _REQUIRED_GENERATED = frozenset({ROBOT_FILE, DISCOVERY_FILE, FINDINGS_FILE})
 
 _RECORD_MANIFEST_KEYS = frozenset(
@@ -542,6 +544,7 @@ def derive_from_raw_bundle(
     settings: DiscoverySettings | None = None,
     configuration: str | None = None,
     assembly: str | None = None,
+    submission_identity: SubmissionIdentity | None = None,
     on_event: Any = None,
 ) -> PreparedPackage:
     """Admit the bundle, then derive the prepared package from the frozen selected CAD (Linux)."""
@@ -567,6 +570,7 @@ def derive_from_raw_bundle(
         settings=settings,
         configuration=configuration,
         assembly=assembly,
+        submission_identity=submission_identity,
         on_event=on_event,
     )
 

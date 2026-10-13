@@ -9,11 +9,13 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from tests.v1._airflow_env import pinned_airflow_home
 
 from description_pipeline.io import digest
+from description_pipeline.orchestration.airflow_client import EndpointConfig
 
 ROOT = Path(__file__).resolve().parents[2]
 DAG_DIR = ROOT / "deploy/airflow/dags"
@@ -57,6 +59,25 @@ except Exception:  # pragma: no cover - exercised only without Airflow installed
 
 @unittest.skipUnless(AIRFLOW_AVAILABLE, "Airflow is not installed in this interpreter")
 class DagTests(unittest.TestCase):
+    def test_submission_identity_rejects_an_unconfigured_target(self) -> None:
+        bag = DagBag(str(DAG_DIR))
+        resolve = bag.dags["solidworks_to_urdf"].task_dict["resolve_handoff"].python_callable
+        module = sys.modules[resolve.__module__]
+        config = EndpointConfig(
+            "http://127.0.0.1:1",
+            "t" * 32,
+            targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
+        )
+        context = {
+            "dag_run": SimpleNamespace(conf={"target_hardware": "m4.0"}, triggering_user_name="ops"),
+            "params": {},
+        }
+        with (
+            patch.object(module, "config_from_airflow_connection", return_value=config),
+            self.assertRaises(module.AirflowFailException),
+        ):
+            module._submission_identity(context)
+
     def test_dag_parses(self) -> None:
         bag = DagBag(str(DAG_DIR))
         self.assertEqual(bag.import_errors, {})
@@ -83,7 +104,9 @@ class DagTests(unittest.TestCase):
         self.assertEqual(edges["run_verify"], {"run_generate"})
         self.assertEqual(edges["run_publish"], {"run_verify"})
         self.assertEqual(edges["confirm_job"], {"run_publish"})
-        self.assertEqual(set(dag.params), {"handoff_path", "main_assembly"})
+        self.assertEqual(
+            set(dag.params), {"handoff_path", "main_assembly", "target_hardware", "change_summary"}
+        )
         handoff_param = dict(dag.params.items())["handoff_path"]
         self.assertEqual(handoff_param.schema["title"], "Engineering folder path")
         self.assertEqual(handoff_param.schema["type"], "string")

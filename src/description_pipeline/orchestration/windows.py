@@ -1418,6 +1418,7 @@ def handler(jobs, token):
                             "pipeline_id": PIPELINE_ID,
                             "ready": jobs.thread.is_alive(),
                             "native_platform": sys.platform == "win32",
+                            "targets": sorted(jobs.config["targets"]),
                         },
                     )
                 elif self.path.startswith("/v1/jobs/"):

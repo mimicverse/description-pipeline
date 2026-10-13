@@ -268,6 +268,52 @@ def validate_main_assembly(value: object) -> str:
     return value
 
 
+def submission_identity(
+    *,
+    target_hardware,
+    change_summary=None,
+    principal=None,
+    config: EndpointConfig,
+    as_of: str,
+    published_revision=None,
+    warn=None,
+) -> dict | None:
+    """Build the validated submission identity carried beside the endpoint request.
+
+    Returns ``None`` when no target was selected (today's deferred behavior).
+    An unconfigured target fails closed; the previous published revision is read
+    best-effort through the supplied reader (any failure only warns and leaves
+    ``parent_revision`` absent).
+    """
+
+    target = str(target_hardware or "").strip()
+    summary = str(change_summary or "").strip()
+    if not target:
+        return None
+    routing = config.targets.get(target)
+    if routing is None:
+        raise EndpointProtocolError(f"target_hardware {target!r} is not a configured publication target")
+    parent = None
+    repository = config.repositories.get(str(routing["repository_slug"]))
+    if repository is not None and published_revision is not None:
+        try:
+            previous = published_revision(repository, target)
+        except Exception as error:  # noqa: BLE001 - identity derivation stays best-effort
+            if warn is not None:
+                warn(f"previous revision unavailable for {target}: {error}")
+        else:
+            if isinstance(previous, dict) and isinstance(previous.get("revision"), str):
+                parent = previous["revision"]
+    owner = principal if isinstance(principal, str) and principal.strip() else None
+    return {
+        "hardware_id": target,
+        "owner": owner,
+        "change_summary": summary or None,
+        "parent_revision": parent,
+        "as_of": as_of,
+    }
+
+
 def validate_artifact_name(value: str) -> str:
     return _validate_relative_path(value, "artifact name")
 
@@ -321,6 +367,8 @@ class EndpointConfig:
     store_root: Path | None = None
     #: Linux-side derivation controls: controlled-record roots and the frozen-name registry.
     discovery: dict = dataclass_field(default_factory=dict)
+    #: Configured publication targets: hardware identity to repository slug and base branch.
+    targets: dict[str, dict] = dataclass_field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "base_url", _validate_base_url(self.base_url))
@@ -332,6 +380,7 @@ class EndpointConfig:
         object.__setattr__(self, "repositories", _linux_repositories(self.repositories))
         object.__setattr__(self, "store_root", _linux_store_root(self.store_root))
         object.__setattr__(self, "discovery", _linux_discovery(self.discovery))
+        object.__setattr__(self, "targets", _linux_targets(self.targets))
 
 
 def _handoff_roots(values) -> tuple[Path, ...]:
@@ -374,6 +423,38 @@ def _linux_store_root(value) -> Path | None:
     if not candidate.is_absolute():
         raise EndpointProtocolError("store_root must be an absolute Linux path")
     return candidate
+
+
+_TARGET_HARDWARE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
+_TARGET_BASE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
+
+
+def _linux_targets(values) -> dict[str, dict]:
+    """Validate the hardware-to-publication-target map used for identity resolution."""
+
+    if values in (None, "", {}):
+        return {}
+    if not isinstance(values, dict):
+        raise EndpointProtocolError("targets must map hardware identities to repository routing")
+    resolved: dict[str, dict] = {}
+    for hardware, target in values.items():
+        if not isinstance(hardware, str) or _TARGET_HARDWARE.fullmatch(hardware) is None:
+            raise EndpointProtocolError(f"target hardware identity must be an ASCII identifier: {hardware!r}")
+        if not isinstance(target, dict) or set(target) != {"repository_slug", "base"}:
+            raise EndpointProtocolError(f"target {hardware!r} must carry exactly repository_slug and base")
+        slug, base = target["repository_slug"], target["base"]
+        if not isinstance(slug, str) or _REPOSITORY_SLUG.fullmatch(slug) is None:
+            raise EndpointProtocolError(f"target {hardware!r} repository slug must be owner/name")
+        if (
+            not isinstance(base, str)
+            or _TARGET_BASE.fullmatch(base) is None
+            or ".." in base
+            or base.endswith(".lock")
+            or base.startswith("-")
+        ):
+            raise EndpointProtocolError(f"target {hardware!r} base must be a well-formed git branch")
+        resolved[hardware] = {"repository_slug": slug, "base": base}
+    return resolved
 
 
 def _discovery_path(value, label: str) -> Path:
@@ -432,6 +513,7 @@ def config_from_airflow_connection(conn_id: str, *, timeout: float = 30.0) -> En
         repositories=extra.get("repositories") or {},
         store_root=extra.get("store_root"),
         discovery=extra.get("discovery") or {},
+        targets=extra.get("targets") or {},
     )
 
 

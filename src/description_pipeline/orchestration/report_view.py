@@ -85,6 +85,8 @@ _DISCOVERY_CODE_LABELS_ZH = {
     "discovery.joint_drive_unspecified": "关节驱动力矩/速度为零",
     "discovery.jcs_alias": "JCS_ 与刚体基准重合（别名）",
     "discovery.design_budget_unspecified": "未指定设计预算（可选范围不适用）",
+    "discovery.identity_derived": "发布身份由提交信息派生（CAD 缺省字段）",
+    "discovery.identity_conflict": "提交的硬件身份与 CAD 记录冲突（阻止发布）",
 }
 
 #: Readable names for verifier diagnostics carried on check details (recorded warnings).
