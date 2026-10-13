@@ -72,7 +72,7 @@ class FakeWorld:
         self.transactions = 0
         self.open_transactions = 0
         self.closes = 0
-        self.hidden_for_one_find = False
+        self.hidden_finds = 0
         self.statements: list[str] = []
 
     def connect(self):
@@ -138,8 +138,8 @@ class FakeCursor:
             " FROM platform.operation WHERE operation_key"
         ):
             record = world.operations.get(params[0])
-            if world.hidden_for_one_find:
-                world.hidden_for_one_find = False
+            if world.hidden_finds:
+                world.hidden_finds -= 1
                 record = None
             self._rows = [record] if record else []
         elif "SELECT state, from_stage FROM platform.run WHERE run_id = %s" in normalized:
@@ -406,7 +406,7 @@ class PlatformStoreTests(unittest.TestCase):
         self._running_run(from_stage="publish")
         self._publish_registration(operation_key="k")
         before = len(self.world.operations)
-        self.world.hidden_for_one_find = True  # the winner commits between our select and insert
+        self.world.hidden_finds = 2  # the winner commits between the identity read and the insert
         recovered = self._publish_registration(operation_key="k")
         self.assertEqual(recovered.params_digest, "b" * 64)
         self.assertEqual(len(self.world.operations), before, "the collision was not re-sent as a new side effect")
@@ -585,6 +585,29 @@ class PlatformStoreTests(unittest.TestCase):
             self.store.register_operation(**payload)
         self.assertNotIn("r-1/verify:0", self.world.operations)
         self.assertEqual(self.store.register_operation(**payload).stage, "verify")
+
+    def test_a_duplicate_request_returns_the_operation_without_consuming_the_checkpoint(self) -> None:
+        self._running_run()
+        self.world.stages[("r-1", "generate")] = ("completed", self.generate_receipt(), CHECKPOINT)
+        payload = {
+            "run_id": "r-1",
+            "stage": "verify",
+            "kind": "dispatch",
+            "operation_key": "r-1/verify:0",
+            "params_digest": "d" * 64,
+        }
+        first = self.store.register_operation(**payload)
+        before = len(self.world.operations)
+        self.world.stages[("r-1", "generate")] = ("completed", self.generate_receipt(), "checkpoint-moved")
+        guarded = PlatformStore(
+            self.world.connect,
+            sealed=lambda uri: self.fail("the operation identity lookup consumed the checkpoint"),
+        )
+        again = guarded.register_operation(**payload)
+        self.assertEqual(again, first)
+        self.assertEqual(len(self.world.operations), before, "the recorded side effect was not re-sent")
+        with self.assertRaises(OperationConflictError):
+            guarded.register_operation(**{**payload, "params_digest": "e" * 64})
 
     def test_unresolved_is_confirmed_only_by_evidenced_reconciliation(self) -> None:
         self._running_run(from_stage="generate")

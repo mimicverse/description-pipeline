@@ -325,12 +325,19 @@ class PlatformStore:
         settled by the unique key: the insert does nothing and the same
         result is recovered, never re-sent as a new side effect.
 
-        A downstream stage's registered predecessor is rebound from its
-        sealed root *before* the registration transaction opens; the locked
-        transaction itself only re-checks that same predecessor identity,
-        reference and state before the insert.
+        A duplicate request is settled by a pure identity read of the same
+        key before any checkpoint is touched; only a genuinely new
+        registration rebinds its predecessor from the sealed root *before*
+        the transaction opens, and the locked transaction re-checks only the
+        idempotency key and that same predecessor identity, reference and
+        state before the insert.
         """
 
+        existing = self._identity_operation(
+            run_id=run_id, stage=stage, kind=kind, operation_key=operation_key, params_digest=params_digest
+        )
+        if existing is not None:
+            return existing
         binding = self._rebind_predecessor(run_id=run_id, stage=stage, kind=kind)
         with self._transaction() as connection:
             cursor = connection.cursor()
@@ -350,6 +357,26 @@ class PlatformStore:
                 params_digest=params_digest,
                 dispatch=dispatch or {},
             )
+
+    def _identity_operation(
+        self, *, run_id: str, stage: str, kind: str, operation_key: str, params_digest: str
+    ) -> OperationRecord | None:
+        """Pure identity read of one operation key; never touches a checkpoint.
+
+        The duplicate path returns the registered record without consuming or
+        re-verifying the sealed checkpoint: the lookup only proves the frozen
+        idempotency contract (the same request returns the same operation and
+        a recorded side effect is never re-sent), and parameter drift is the
+        same conflict as in the locked re-check.
+        """
+
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(_FIND_OPERATION, (operation_key,))
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return _matching_operation(row, run_id=run_id, stage=stage, kind=kind, params_digest=params_digest)
 
     def _rebind_predecessor(self, *, run_id: str, stage: str, kind: str) -> dict | None:
         """Rebind the successor's registered predecessor, outside any lock.
