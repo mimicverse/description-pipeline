@@ -14,6 +14,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from description_pipeline import schemas
+
 ROOT = Path(__file__).resolve().parents[2]
 OPERATOR = ROOT / "deploy" / "operator"
 RENDER = OPERATOR / "render_operator.py"
@@ -801,7 +803,7 @@ class InstallOrderingTests(unittest.TestCase):
         wheel = tree / "mimicverse_description-1.4.0-py3-none-any.whl"
         wheel.write_bytes(b"wheel-bytes")
         config = {
-            "schema_version": "solidworks-to-urdf.platform/v1",
+            "schema_version": schemas.PLATFORM_CONFIG_SCHEMA,
             "operator": {
                 "origin": "https://rehearsal.local:18443",
                 "certificate_file": str(tmp / "secrets" / "tls.crt"),
