@@ -318,6 +318,7 @@ CLOSURE_MEMBERS = (
     "delivery.py",
     "stages.py",
     "runtime.py",
+    "model/schema.json",
     "stage-contract.json",
     "interface_records.py",
 )
@@ -339,6 +340,7 @@ def extract_contract_closure(wheel: Path) -> Path:
         for member in CLOSURE_MEMBERS:
             name = f"description_pipeline/{member}"
             require(name in names, f"the release artifact {wheel.name} misses the contract closure member {name}")
+            (package / member).parent.mkdir(parents=True, exist_ok=True)
             (package / member).write_bytes(archive.read(name))
     return directory
 
