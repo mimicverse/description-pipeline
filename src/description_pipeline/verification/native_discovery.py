@@ -1783,7 +1783,10 @@ def verify_discovery(package: Path) -> dict:
         identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
         robot = {
             "schema_version": payload.get("schema_version"),
-            "hardware_id": identity.get("hardware_id") or source["selection"]["hardware_id"],
+            # The carrier must reflect the authored claim the identity gate
+            # compares it against; a missing value stays missing (readiness),
+            # never silently substituted from the selection.
+            "hardware_id": identity.get("hardware_id"),
             "robot_name": payload.get("robot_name"),
             "source": {
                 "assembly": source["selection"]["main_assembly"],
@@ -1798,6 +1801,7 @@ def verify_discovery(package: Path) -> dict:
         state["robot"] = robot
         state["payload"] = payload
         return {
+            "discovery_sha256": hashlib.sha256(payload_bytes).hexdigest(),
             "native_inventory_sha256": payload.get("native_inventory_sha256"),
             "run_id": payload.get("run_id"),
             "contract": payload.get("contract"),

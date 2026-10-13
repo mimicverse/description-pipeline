@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from . import _paths  # noqa: F401
+from . import support
 
 from description_pipeline.io import PipelineError
 from description_pipeline.verification.native_mesh_observations import verify_native_mesh_observations
@@ -17,10 +18,13 @@ class NativeMeshObservationTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
-        (self.root / "evidence/raw").mkdir(parents=True)
-        (self.root / "evidence/manifest.json").write_text(json.dumps({
-            "identity": {"capture": {"evidence_class": "cad"}},
-        }))
+        support.write_target_delivery(
+            self.root,
+            capture={
+                "collection": {"kind": "solidworks", "evidence_class": "cad"},
+                "geometry": [],
+            },
+        )
         self.row = {
             "component": "pcb", "bodies": {"solid": 0, "sheet": 4},
             "tessellation": {"faces": 12, "no_facets_faces": [{
@@ -32,7 +36,13 @@ class NativeMeshObservationTests(unittest.TestCase):
         }
 
     def verify(self):
-        (self.root / "evidence/raw/geometry.json").write_text(json.dumps([self.row]))
+        # Adversarial rows keep NaN/Infinity literals on purpose: the verifier
+        # must reject them semantically, so the block bytes are written raw.
+        path = support.capture_file_for(self.root)
+        capture = json.loads(path.read_text(encoding="utf-8"))
+        capture["geometry"] = [self.row]
+        path.write_text(json.dumps(capture, ensure_ascii=False, allow_nan=True), encoding="utf-8")
+        support.seal_delivery(self.root)
         return verify_native_mesh_observations(self.root)
 
     def test_native_refusal_is_explicit_unqualified_surface_warning(self):

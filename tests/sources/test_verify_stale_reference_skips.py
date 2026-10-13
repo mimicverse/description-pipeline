@@ -21,11 +21,11 @@ class StaleStoredReferenceSkipTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="stale-skip-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        (self.root / "input/discovery").mkdir(parents=True)
+        (self.root / "evidence").mkdir(parents=True)
 
     def _write_payload(self, *, files=None, documents=None) -> None:
         write_json(
-            self.root / "input/discovery/native-discovery.json",
+            self.root / "evidence/discovery.json",
             {
                 "raw": {
                     "source_selection": {

@@ -40,6 +40,7 @@ from description_pipeline.sources.solidworks.native import _merge_property_scope
 from description_pipeline.verification.native_discovery import verify_discovery  # noqa: E402
 
 from .selection_support import sealed_selection  # noqa: E402
+from . import support  # noqa: E402
 from description_pipeline.verification.solidworks_urdf import _native_discovery  # noqa: E402
 
 IDENTITY = [
@@ -336,6 +337,15 @@ class DiscoveryTests(unittest.TestCase):
         self.assertFalse(result.passed)
         return [finding["code"] for finding in result.findings]
 
+    def _deliver(self, output: Path) -> Path:
+        """The target-tree delivery the frozen producer conversion yields."""
+
+        self.serial += 1
+        return support.native_discovery_delivery(self.tmp / f"delivery{self.serial}", output)
+
+    def _verify(self, output: Path) -> dict:
+        return verify_discovery(self._deliver(output))
+
     def test_native_preparation_forwards_the_guarded_activity_sink(self):
         class ActivityBackend:
             def __init__(self):
@@ -445,7 +455,7 @@ class DiscoveryTests(unittest.TestCase):
                 if Path(name).suffix.lower() in {".sldasm", ".sldprt"}
             },
         )
-        report = verify_discovery(output)
+        report = self._verify(output)
         self.assertTrue(report["passed"], report["errors"])
         self.assertEqual(report["joints"], 1)
 
@@ -458,7 +468,7 @@ class DiscoveryTests(unittest.TestCase):
         self.assertIn("arm_link", names)
         payload = json.loads((output / "discovery/native-discovery.json").read_text(encoding="utf-8"))
         self.assertEqual(payload["frozen_names"].get("arm-1"), "arm_link")
-        self.assertTrue(verify_discovery(output)["passed"])
+        self.assertTrue(self._verify(output)["passed"])
 
     def test_duplicate_controlled_records_block_regardless_of_content_or_root_order(self):
         _source, records = self._native()
@@ -495,7 +505,7 @@ class DiscoveryTests(unittest.TestCase):
         _source, records = self._native()
         result, _source, output = self._prepare(settings=DiscoverySettings(record_roots=(records, records / ".")))
         self.assertTrue(result.passed, result.findings)
-        self.assertTrue(verify_discovery(output)["passed"])
+        self.assertTrue(self._verify(output)["passed"])
 
     def test_hardlinked_files_in_distinct_roots_are_competing_authorities(self):
         _source, records = self._native()
@@ -535,7 +545,7 @@ class DiscoveryTests(unittest.TestCase):
         empty.mkdir()
         result, _source, output = self._prepare(settings=DiscoverySettings(record_roots=(empty, records)))
         self.assertTrue(result.passed, result.findings)
-        self.assertTrue(verify_discovery(output)["passed"])
+        self.assertTrue(self._verify(output)["passed"])
 
     def test_versioned_references_coexist_without_changing_the_library(self):
         _source, records = self._native()
@@ -558,7 +568,7 @@ class DiscoveryTests(unittest.TestCase):
                 self.assertEqual(
                     yaml.safe_load((output / "robot.yaml").read_text())["checks"]["expected_mass_kg"], bounds
                 )
-                self.assertTrue(verify_discovery(output)["passed"])
+                self.assertTrue(self._verify(output)["passed"])
 
     def test_record_bytes_are_parsed_hashed_and_embedded_from_one_read(self):
         _source, records = self._native()
@@ -592,7 +602,7 @@ class DiscoveryTests(unittest.TestCase):
             yaml.safe_load((output / "robot.yaml").read_text())["checks"]["expected_mass_kg"], [0.28, 0.32]
         )
         self.assertEqual((records / "budget.json").read_bytes(), replacement)
-        self.assertTrue(verify_discovery(output)["passed"])
+        self.assertTrue(self._verify(output)["passed"])
 
     def test_one_record_cannot_change_between_keys_in_the_same_job(self):
         def change_after_first_reference(content, path):
@@ -633,7 +643,7 @@ class DiscoveryTests(unittest.TestCase):
         base = next(body for body in document["source"]["bodies"] if body["name"] == "base_link")
         self.assertEqual(base["components"], ["a_mount-1", "base-1"])
         self.assertEqual(document["source"]["joints"][0]["parent"], "base_link")
-        report = verify_discovery(output)
+        report = self._verify(output)
         self.assertTrue(report["passed"], report["errors"])
 
     def test_assembly_frame_mate_is_blocked_explicitly_and_never_silently_dropped(self):
@@ -1035,7 +1045,7 @@ class DiscoveryTests(unittest.TestCase):
                 base = next(body for body in document["source"]["bodies"] if body["name"] == "base_link")
                 self.assertEqual(base["components"], ["base-1"])
                 self.assertEqual(base["frame"]["coordinate_system"], "CS_base_link")
-                report = verify_discovery(output)
+                report = self._verify(output)
                 self.assertTrue(report["passed"], report["errors"])
 
     # ----------------------------------------------------------------- blocking
@@ -1328,7 +1338,7 @@ class DiscoveryTests(unittest.TestCase):
         joint = document["source"]["joints"][0]
         self.assertEqual(joint["type"], "revolute")
         self.assertEqual(joint["axis"], [0.0, 1.0, 0.0])
-        self.assertEqual(verify_discovery(output)["passed"], True)
+        self.assertEqual(self._verify(output)["passed"], True)
 
     def test_child_frame_off_the_native_axis_blocks(self):
         def mutate(payload):
@@ -1479,7 +1489,7 @@ class DiscoveryTests(unittest.TestCase):
         )
         names = [body["name"] for body in document["source"]["bodies"]]
         self.assertEqual(names, ["arm_link", "base_link"])
-        self.assertTrue(verify_discovery(output)["passed"])
+        self.assertTrue(self._verify(output)["passed"])
 
     def test_unowned_interface_datum_blocks(self):
         result, _source, _output = self._prepare(
@@ -1495,11 +1505,12 @@ class DiscoveryTests(unittest.TestCase):
 
         result, _source, output = self._prepare(mutate=mutate)
         self.assertTrue(result.passed, result.findings)
-        destination = self.tmp / "no-frame"
-        shutil.copytree(output, destination)
-        document = yaml.safe_load((destination / "robot.yaml").read_text(encoding="utf-8"))
-        document["source"].pop("frames")
-        (destination / "robot.yaml").write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+        destination = self._deliver(output)
+        path = destination / "evidence/discovery.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["derived"].pop("frames")
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        support.seal_delivery(destination)
         report = verify_discovery(destination)
         self.assertFalse(report["passed"])
         self.assertIn("discovery.frames", [item["code"] for item in report["errors"]])
@@ -1514,7 +1525,7 @@ class DiscoveryTests(unittest.TestCase):
         result, _source, output = self._prepare(mutate=alias)
         self.assertTrue(result.passed, result.findings)
         self.assertIn("discovery.jcs_alias", [finding["code"] for finding in result.findings])
-        self.assertTrue(verify_discovery(output)["passed"])
+        self.assertTrue(self._verify(output)["passed"])
 
         def mismatch(payload):
             child = next(datum for datum in payload["datums"] if datum["name"] == "CS_arm_link")
@@ -1641,7 +1652,7 @@ class DiscoveryTests(unittest.TestCase):
         ] = "CS_renamed_link"
         document["provenance"]["discovery_sha256"] = file_digest(path)
         robot_path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
-        report = verify_discovery(output)
+        report = self._verify(output)
         self.assertTrue(next(check for check in report["checks"] if check["id"] == "discovery.binding")["passed"])
         self.assertIn("discovery.names", [item["code"] for item in report["errors"]])
 
@@ -1665,7 +1676,7 @@ class DiscoveryTests(unittest.TestCase):
         joint = document["source"]["joints"][0]
         self.assertEqual(joint["type"], "revolute")
         self.assertEqual(joint["axis"], [0.0, 0.0, 1.0])
-        self.assertTrue(verify_discovery(output)["passed"])
+        self.assertTrue(self._verify(output)["passed"])
 
     def test_nonparallel_circle_edges_block(self):
         def mutate(payload):
@@ -1960,25 +1971,25 @@ class DiscoveryTests(unittest.TestCase):
     def test_verifier_rejects_deleted_or_stripped_metadata(self):
         result, _source, output = self._prepare()
         self.assertTrue(result.passed)
-        without_record = self.tmp / "without-record"
-        shutil.copytree(output, without_record)
-        (without_record / "discovery" / "native-discovery.json").unlink()
+        without_record = self._deliver(output)
+        (without_record / "evidence" / "discovery.json").unlink()
         report = verify_discovery(without_record)
         self.assertFalse(report["passed"])
         self.assertIn("discovery.file", [item["code"] for item in report["errors"]])
-        without_provenance = self.tmp / "without-provenance"
-        shutil.copytree(output, without_provenance)
-        document = yaml.safe_load((without_provenance / "robot.yaml").read_text(encoding="utf-8"))
-        document.pop("provenance")
-        (without_provenance / "robot.yaml").write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
-        report = verify_discovery(without_provenance)
+        without_derived = self._deliver(output)
+        record_path = without_derived / "evidence" / "discovery.json"
+        payload = json.loads(record_path.read_text(encoding="utf-8"))
+        payload.pop("derived")
+        record_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        support.seal_delivery(without_derived)
+        report = verify_discovery(without_derived)
         self.assertFalse(report["passed"])
         self.assertIn("discovery.binding", [item["code"] for item in report["errors"]])
 
     def test_gate_is_mandatory_and_has_no_legacy_mode(self):
         result, _source, output = self._prepare()
         self.assertTrue(result.passed)
-        self.assertEqual(_native_discovery(output)["bodies"], 2)
+        self.assertEqual(_native_discovery(self._deliver(output))["bodies"], 2)
         authored = self.tmp / "authored"
         authored.mkdir()
         (authored / "robot.yaml").write_text("schema_version: x\n", encoding="utf-8")
@@ -1988,12 +1999,14 @@ class DiscoveryTests(unittest.TestCase):
     def test_gate_rejects_a_tampered_record(self):
         result, _source, output = self._prepare()
         self.assertTrue(result.passed)
-        path = output / "discovery" / "native-discovery.json"
+        delivery = self._deliver(output)
+        path = delivery / "evidence" / "discovery.json"
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload["raw"]["mates"][0]["entities"][0]["cylinder"]["radius"] = -1.0
-        path.write_text(json.dumps(payload), encoding="utf-8")
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        support.seal_delivery(delivery)
         with self.assertRaises(PipelineError):
-            _native_discovery(output)
+            _native_discovery(delivery)
 
 
 class NativePropertyScopeTests(unittest.TestCase):

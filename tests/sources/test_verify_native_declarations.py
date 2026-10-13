@@ -12,6 +12,7 @@ from description_pipeline.verification.native_declarations import verify_declara
 from description_pipeline.verification.native_discovery import verify_discovery
 from .test_verify_v14_declarations import document_xml
 from .selection_support import sealed_selection
+from . import support
 
 NS = "{http://schemas.datacontract.org/2004/07/SW2URDF}"
 Z = "{http://schemas.microsoft.com/2003/10/Serialization/}"
@@ -528,9 +529,8 @@ class NativeDeclarationsTests(unittest.TestCase):
 
     def test_package_gate_uses_bound_declaration_without_old_naming_or_graph_requirements(self):
         with tempfile.TemporaryDirectory() as directory:
-            package = Path(directory)
+            package = Path(directory) / "delivery"
             native = b"synthetic native bytes for verification tests only"
-            (package / "robot.SLDASM").write_bytes(native)
             native_files = {"robot.SLDASM": hashlib.sha256(native).hexdigest()}
             raw = fixture()
             raw["files"] = native_files
@@ -540,58 +540,73 @@ class NativeDeclarationsTests(unittest.TestCase):
                 for item in raw["components"]
                 if not item["document"].endswith(".SLDASM")
             ]
-            payload = {
-                "schema_version": "solidworks-to-urdf.native-discovery/v1",
-                "run_id": "test",
-                "contract": "native-discovery/v1",
-                "raw": raw,
-                "native_files": native_files,
-                "identity": copy.deepcopy(raw["identity"]),
-            }
-            data = json.dumps(payload).encode()
-            (package / "discovery").mkdir()
-            (package / "discovery/native-discovery.json").write_bytes(data)
-            inventory = (json.dumps(native_files, sort_keys=True, ensure_ascii=False, indent=2) + "\n").encode()
             robot = {
-                "schema_version": "solidworks-to-urdf.input/v1",
                 "hardware_id": "fixture",
                 "source": source_claims(),
-                "provenance": {
-                    "generator": "native-discovery",
-                    "generator_version": "test",
-                    "contract": "native-discovery/v1",
-                    "run_id": "test",
-                    "discovery_sha256": hashlib.sha256(data).hexdigest(),
-                    "native_inventory_sha256": hashlib.sha256(inventory).hexdigest(),
-                },
+                "checks": {},
             }
             robot["source"]["robot_name"] = "fixture"
-            (package / "robot.yaml").write_text(json.dumps(robot))
-            (package / "cad-revision.json").write_text(
-                json.dumps(
-                    {
-                        "schema_version": "solidworks-to-urdf.cad-revision/v1",
-                        **{key: value for key, value in raw["identity"].items() if key != "robot_name"},
-                        "cad_files": native_files,
-                    }
-                )
+            payload = support.frozen_discovery_payload(
+                {
+                    "schema_version": "solidworks-to-urdf.native-discovery/v1",
+                    "run_id": "test",
+                    "contract": "native-discovery/v1",
+                    "raw": raw,
+                    "identity": copy.deepcopy(raw["identity"]),
+                },
+                files=native_files,
+                robot=robot,
             )
+            source = support.default_source_record(
+                main_assembly="robot.SLDASM",
+                configuration="Default",
+                hardware_id="fixture",
+                revision="r1",
+            )
+            support.write_target_delivery(
+                package,
+                capture={},
+                discovery=payload,
+                source=source,
+                originals={"robot.SLDASM": native.decode("utf-8")},
+            )
+
+            def sync_robot() -> None:
+                derived = payload.setdefault("derived", {})
+                block = robot.get("source") or {}
+                derived["bodies"] = copy.deepcopy(block.get("bodies") or [])
+                derived["joints"] = copy.deepcopy(block.get("joints") or [])
+                derived["frames"] = copy.deepcopy(block.get("frames") or [])
+                derived["checks"] = copy.deepcopy(robot.get("checks") or {})
+                payload["robot_name"] = block.get("robot_name")
+
+            def reseal() -> None:
+                sync_robot()
+                payload["raw"] = copy.deepcopy(raw)
+                from description_pipeline.io import write_json
+
+                (package / "evidence/discovery.json").write_bytes(json.dumps(payload).encode())
+                write_json(package / "input/source.json", source)
+                support.seal_delivery(package)
+
             report = verify_discovery(package)
             self.assertTrue(report["passed"], report["errors"])
             self.assertEqual((report["bodies"], report["joints"]), (2, 1))
             self.assertIn("discovery.declarations", {check["id"] for check in report["checks"]})
             self.assertNotIn("discovery.budgets", {check["id"] for check in report["checks"]})
 
-            def reseal():
-                data = json.dumps(payload).encode()
-                (package / "discovery/native-discovery.json").write_bytes(data)
-                robot["provenance"]["discovery_sha256"] = hashlib.sha256(data).hexdigest()
-                (package / "robot.yaml").write_text(json.dumps(robot))
-
             authored = copy.deepcopy(raw["identity"])
-            manifest = (package / "cad-revision.json").read_bytes()
-            (package / "cad-revision.json").unlink()
-            self.assertIn("discovery.revision", {item["code"] for item in verify_discovery(package)["errors"]})
+            source["metadata"]["revision"] = None
+            reseal()
+            unsealed = verify_discovery(package)
+            self.assertTrue(unsealed["passed"], unsealed["errors"])
+            self.assertNotIn("discovery.revision", {item["id"] for item in unsealed["checks"]})
+            self.assertEqual(
+                [item["code"] for item in unsealed["diagnostics"]],
+                ["discovery.revision_absent"],
+            )
+            self.assertTrue(all(item["blocking"] is False for item in unsealed["diagnostics"]))
+
             raw["identity"] = dict.fromkeys(authored)
             payload["identity"] = copy.deepcopy(raw["identity"])
             robot["hardware_id"] = None
@@ -602,11 +617,11 @@ class NativeDeclarationsTests(unittest.TestCase):
             self.assertNotIn("discovery.revision", {item["id"] for item in unsealed["checks"]})
             self.assertEqual(
                 [item["code"] for item in unsealed["diagnostics"]],
-                ["discovery.publication_metadata_incomplete", "discovery.revision_not_sealed"],
+                ["discovery.publication_metadata_incomplete", "discovery.revision_absent"],
             )
             self.assertTrue(all(item["blocking"] is False for item in unsealed["diagnostics"]))
             for mutate in (
-                lambda: robot.update(hardware_id="fabricated"),
+                lambda: payload["identity"].update(hardware_id="fabricated"),
                 lambda: raw["identity"].update(owner=42),
                 lambda: raw["identity"].update(control={"system": "unknown", "reference": None}),
                 lambda: raw["identity"].update(control={"system": "git", "reference": "short-hash"}),
@@ -620,13 +635,14 @@ class NativeDeclarationsTests(unittest.TestCase):
                 payload["identity"] = copy.deepcopy(raw["identity"])
                 robot["hardware_id"] = None
                 robot["source"]["robot_name"] = "robot"
-            (package / "cad-revision.json").write_bytes(manifest)
-            reseal()
-            self.assertIn("discovery.revision", {item["code"] for item in verify_discovery(package)["errors"]})
             raw["identity"] = authored
             payload["identity"] = copy.deepcopy(authored)
             robot["hardware_id"] = "fixture"
             robot["source"]["robot_name"] = "fixture"
+            source["metadata"]["revision"] = "r9"
+            reseal()
+            self.assertIn("discovery.revision", {item["code"] for item in verify_discovery(package)["errors"]})
+            source["metadata"]["revision"] = "r1"
             reseal()
             self.assertTrue(verify_discovery(package)["passed"])
 
@@ -636,7 +652,7 @@ class NativeDeclarationsTests(unittest.TestCase):
             self.assertIn("discovery.budgets", {item["code"] for item in malformed["errors"]})
             budget = {"expected_mass_kg": [1, 5], "expected_extent_m": [0, 1]}
             budget_bytes = json.dumps(budget).encode()
-            (package / "budget.json").write_bytes(budget_bytes)
+            (package / "input/records/budget.json").write_bytes(budget_bytes)
             payload["budget"] = {
                 "package_file": "budget.json",
                 "key": "",
@@ -645,10 +661,14 @@ class NativeDeclarationsTests(unittest.TestCase):
             robot["checks"] = budget
             reseal()
             self.assertTrue(verify_discovery(package)["passed"])
-            (package / "budget.json").write_bytes(budget_bytes + b" ")
+            (package / "input/records/budget.json").write_bytes(budget_bytes + b" ")
+            # Re-sealing the manifest is not enough: the record bytes must still
+            # match the entry hash the discovery record carries.
+            support.seal_delivery(package)
             changed_budget = verify_discovery(package)
             self.assertIn("discovery.record", {item["code"] for item in changed_budget["errors"]})
-            (package / "robot.SLDASM").write_bytes(native + b"tampered")
+            (package / "input/cad/robot.SLDASM").write_bytes(native + b"tampered")
+            support.seal_delivery(package)
             changed = verify_discovery(package)
             self.assertFalse(changed["passed"])
             self.assertIn("discovery.files", {item["code"] for item in changed["errors"]})

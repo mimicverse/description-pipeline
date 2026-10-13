@@ -8,9 +8,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from description_pipeline.verification.native_discovery import DISCOVERY_SCHEMA, INPUT_SCHEMA, verify_discovery
+from description_pipeline.verification.native_discovery import DISCOVERY_SCHEMA, verify_discovery
 
 from .selection_support import sealed_selection
+from . import support
 
 ROOT = r"C:\description-v1-review\probe-46986340\input-copy"
 TEMP = r"C:\Users\33985\AppData\Local\Temp\swx42380\IC~~"
@@ -165,14 +166,12 @@ def relocated_carrier(owner_sha, np_sha):
 
 class ImportedSourceTests(unittest.TestCase):
     def _package(self, directory, contents, components, *, raw_files=None, extra_raw=None):
-        package = Path(directory)
-        (package / "discovery").mkdir()
+        package = Path(directory) / "delivery"
         native = {}
+        originals = {}
         for name, data in contents.items():
-            path = package / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(data)
             native[name] = hashlib.sha256(data).hexdigest()
+            originals[name] = data.decode("utf-8")
         payload = {
             "schema_version": DISCOVERY_SCHEMA,
             "contract": "native-discovery/v1",
@@ -185,28 +184,19 @@ class ImportedSourceTests(unittest.TestCase):
                 **(extra_raw or {}),
             },
             "identity": {},
-            "native_files": native,
         }
-        record = json.dumps(payload).encode()
-        (package / "discovery/native-discovery.json").write_bytes(record)
-        (package / "robot.yaml").write_text(
-            json.dumps(
-                {
-                    "schema_version": INPUT_SCHEMA,
-                    "hardware_id": None,
-                    "source": {"robot_name": "robot"},
-                    "provenance": {
-                        "generator": "native-discovery",
-                        "generator_version": "test",
-                        "contract": "native-discovery/v1",
-                        "run_id": "imported-source-test",
-                        "discovery_sha256": hashlib.sha256(record).hexdigest(),
-                        "native_inventory_sha256": canonical(native),
-                    },
-                }
-            )
+        payload = support.frozen_discovery_payload(
+            payload,
+            files=native,
+            robot={"hardware_id": None, "source": {"robot_name": "robot"}, "checks": {}},
         )
-        return package
+        return support.write_target_delivery(
+            package,
+            capture={},
+            discovery=payload,
+            source=support.default_source_record(),
+            originals=originals,
+        )
 
     @staticmethod
     def _check(report):
@@ -232,7 +222,7 @@ class ImportedSourceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             package = self._package(directory, {"NP-F550.step": content}, [json.loads(json.dumps(baseline))])
             report = verify_discovery(package)
-            sealed_hash = hashlib.sha256((package / "discovery/native-discovery.json").read_bytes()).hexdigest()
+            sealed_hash = hashlib.sha256((package / "evidence/discovery.json").read_bytes()).hexdigest()
         # The binding check stays first so the passed report keeps its sealed provenance hash.
         self.assertEqual(report["checks"][0]["id"], "discovery.binding")
         self.assertEqual(report["discovery_sha256"], sealed_hash)
@@ -279,14 +269,11 @@ class ImportedSourceTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             package = self._package(directory, {"NP-F550.step": content}, [component])
-            record_path = package / "discovery/native-discovery.json"
+            record_path = package / "evidence/discovery.json"
             payload = json.loads(record_path.read_bytes())
             payload["raw"] = None
-            record = json.dumps(payload).encode()
-            record_path.write_bytes(record)
-            robot = json.loads((package / "robot.yaml").read_bytes())
-            robot["provenance"]["discovery_sha256"] = hashlib.sha256(record).hexdigest()
-            (package / "robot.yaml").write_text(json.dumps(robot))
+            record_path.write_bytes(json.dumps(payload).encode())
+            support.seal_delivery(package)
             report = verify_discovery(package)
         self.assertFalse(report["passed"])
         failed = next(item for item in report["checks"] if item["id"] == "discovery.suppression_state")
