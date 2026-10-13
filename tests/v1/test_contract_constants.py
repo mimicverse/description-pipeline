@@ -97,6 +97,7 @@ class ContractConvergenceTests(unittest.TestCase):
                 "INSTALL_RECORD_SCHEMA",
                 "DELIVERY_MANIFEST_SCHEMA",
                 "SOURCE_RECORD_SCHEMA",
+                "PLATFORM_CONFIG_SCHEMA",
             },
             set(owned),
         )

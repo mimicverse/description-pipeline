@@ -16,9 +16,11 @@ static: it never probes services, ports or the network (probes belong to
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import re
 import stat
+from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 
 from .delivery import PIPELINE_ID
@@ -31,6 +33,7 @@ from .schemas import (
     DELIVERY_MANIFEST_SCHEMA,
     HEALTH_SCHEMA,
     INSTALL_RECORD_SCHEMA,
+    PLATFORM_CONFIG_SCHEMA,
     RESOURCE_POLICY_SCHEMA,
     SOURCE_RECORD_SCHEMA,
 )
@@ -46,9 +49,9 @@ class InterfaceRecordError(PipelineError):
         self.detail = detail or {}
 
 
-_HEX64 = re.compile(r"^[0-9a-f]{64}$")
-_COMMIT = re.compile(r"^[0-9a-f]{40}$")
-_RFC3339_UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$")
+_HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
+_COMMIT = re.compile(r"\A[0-9a-f]{40}\Z")
+_RFC3339_UTC = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z\Z")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 RELEASE_ROLES = ("native", "portable")
@@ -64,7 +67,7 @@ POLICY_TIMEOUT_KEYS = ("upload_seconds", "unpack_seconds", "admission_seconds", 
 POLICY_CAPACITY_KEYS = ("min_free_bytes",)
 
 HEALTH_KEYS = (
-    "health_schema",
+    "schema_version",
     "pipeline_id",
     "native_platform",
     "ready",
@@ -72,7 +75,6 @@ HEALTH_KEYS = (
     "contract",
     "resource_policy",
     "install",
-    "auth",
     "endpoint",
     "cad",
     "jobs",
@@ -123,6 +125,15 @@ def _non_negative_int(value, code: str, where: str) -> int:
 
 def _utc(value, code: str, where: str) -> str:
     _require(isinstance(value, str) and bool(_RFC3339_UTC.match(value)), code, {"where": where})
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise InterfaceRecordError(code, {"where": where, "reason": str(error)}) from error
+    _require(
+        parsed.tzinfo is not None and parsed.utcoffset() == timedelta(0),
+        code,
+        {"where": where, "reason": "UTC offset required"},
+    )
     return value
 
 
@@ -151,6 +162,21 @@ def _check_release_triple(block, code: str, where: str) -> None:
     _hex64(block["source_sha256"], code, f"{where}.source_sha256")
 
 
+def _require_triple_fields(block, code: str, where: str) -> None:
+    """Require the three identity fields to be present and well formed (extra keys allowed)."""
+
+    _require(isinstance(block, dict), code, {"where": where})
+    missing = sorted({"version", "source_commit", "source_sha256"} - set(block))
+    _require(not missing, code, {"where": where, "missing": missing})
+    _text(block["version"], code, f"{where}.version")
+    _require(
+        isinstance(block["source_commit"], str) and bool(_COMMIT.match(block["source_commit"])),
+        code,
+        {"where": f"{where}.source_commit"},
+    )
+    _hex64(block["source_sha256"], code, f"{where}.source_sha256")
+
+
 def validate_release_identity(record, *, role: str | None = None, code: str = "release_identity_invalid") -> dict:
     """The common release identity block: ``version`` + ``source_commit`` + ``source_sha256``.
 
@@ -169,6 +195,8 @@ def validate_release_identity(record, *, role: str | None = None, code: str = "r
 def require_same_release_identity(left, right, *, code: str = "release_identity_mismatch") -> None:
     """Reject any triple divergence, including equal digests with different commits."""
 
+    _require_triple_fields(left, code, "left")
+    _require_triple_fields(right, code, "right")
     fields = ("version", "source_commit", "source_sha256")
     differing = [field for field in fields if left.get(field) != right.get(field)]
     _require(
@@ -214,7 +242,7 @@ def validate_resource_policy(policy) -> dict:
     for key in POLICY_TIMEOUT_KEYS:
         value = policy["timeouts"][key]
         _require(
-            isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0,
+            isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0,
             code,
             {"where": f"timeouts.{key}"},
         )
@@ -229,12 +257,47 @@ def resource_policy_digest(policy) -> str:
     return digest(validate_resource_policy(policy))
 
 
+#: Canonical IF-04 resource-policy instance (W1, owner B).  Every value is
+#: adopted from an existing implementation constant - do not invent new ones.
+RESOURCE_POLICY_V1 = {
+    "schema_version": RESOURCE_POLICY_SCHEMA,
+    "limits": {
+        "max_files": 4096,  # uploads.py:61 MAX_FILES
+        "max_file_bytes": 512 * 1024**2,  # uploads.py:63 MAX_FILE_BYTES
+        "max_total_bytes": 2 * 1024**3,  # uploads.py:62 MAX_TOTAL_BYTES
+        "max_unpacked_bytes": 16
+        * 1024**3,  # handoff.py:16 MAX_HANDOFF_BYTES (native accept/unpack bound, windows.py:1522)
+        "max_upload_bytes": 2 * 1024**3 + 4096 * 1024 + 65536,  # uploads.py:68-69 MAX_BODY_BYTES derivation
+    },
+    "timeouts": {
+        # W1 新默认: no absolute timeout exists today (only per-request socket
+        # deadlines); rationale per key.
+        "upload_seconds": 3600,  # W1 新默认: 2 GiB upload on a slow link
+        "unpack_seconds": 900,  # W1 新默认: bounded for the 16 GiB accept limit
+        "admission_seconds": 300,  # W1 新默认: path/inventory/capacity admission checks
+        "job_seconds": 86400,  # W1 新默认: long native capture on the serial endpoint queue
+    },
+    "capacity": {
+        "min_free_bytes": 2
+        * 1024**3,  # uploads.py:71 DISK_RESERVE_FLOOR; the 0.05 fraction stays host-side (uploads.py:72)
+    },
+}
+# Fail fast if a constant above drifts out of the frozen shape.
+validate_resource_policy(RESOURCE_POLICY_V1)
+
+
+def resource_policy_v1_digest() -> str:
+    """Stable digest of the canonical instance (requests and ``/health`` compare it)."""
+
+    return resource_policy_digest(RESOURCE_POLICY_V1)
+
+
 def validate_health(payload) -> dict:
     """Endpoint ``/health`` v1 (IF-09): confirmed identities only, no secrets."""
 
     code = "health_invalid"
     _exact_keys(payload, HEALTH_KEYS, code, "health")
-    _require(payload["health_schema"] == HEALTH_SCHEMA, code, {"where": "health_schema"})
+    _require(payload["schema_version"] == HEALTH_SCHEMA, code, {"where": "schema_version"})
     _require(payload["pipeline_id"] == PIPELINE_ID, code, {"where": "pipeline_id"})
     _require(type(payload["native_platform"]) is bool, code, {"where": "native_platform"})
     _require(type(payload["ready"]) is bool, code, {"where": "ready"})
@@ -254,9 +317,6 @@ def validate_health(payload) -> dict:
     _exact_keys(payload["install"], {"config_digest", "install_id"}, code, "install")
     _hex64(payload["install"]["config_digest"], code, "install.config_digest")
     _text(payload["install"]["install_id"], code, "install.install_id")
-    _exact_keys(payload["auth"], {"scheme", "token_fingerprint"}, code, "auth")
-    _require(payload["auth"]["scheme"] == "bearer", code, {"where": "auth.scheme"})
-    _text(payload["auth"]["token_fingerprint"], code, "auth.token_fingerprint")
     _exact_keys(payload["endpoint"], {"port"}, code, "endpoint")
     port = payload["endpoint"]["port"]
     _require(type(port) is int and 0 < port < 65536, code, {"where": "endpoint.port"})
@@ -284,26 +344,35 @@ def validate_health(payload) -> dict:
     reason = payload["readiness"]["reason_code"]
     if payload["ready"]:
         _require(reason in (None, ""), code, {"rule": "ready payload carries no reason_code"})
+        # One ready semantics: proven absence of external sessions, no unresolved
+        # operations and native readiness.  Owned active/queued work stays healthy;
+        # admission/drain is judged separately by the admission window.
+        _require(payload["native_platform"] is True, code, {"rule": "ready requires the native platform"})
+        _require(payload["readiness"]["native"]["ok"] is True, code, {"rule": "ready requires native readiness ok"})
+        _require(not problems, code, {"rule": "ready requires no native problems"})
+        _require(
+            payload["cad"]["external_session_detected"] is False,
+            code,
+            {"rule": "ready requires no external CAD session"},
+        )
+        _require(payload["jobs"]["unresolved"] == 0, code, {"rule": "ready requires no unresolved operations"})
     else:
         _text(reason, code, "readiness.reason_code")
     _reject_secrets(payload, code=code)
     return payload
 
 
-def cache_release_params_digest(import_block) -> str:
-    """The parameter digest bound by a cache-release operation id."""
+def cache_release_params_digest(confirmation) -> str:
+    """The parameter digest bound by a cache-release operation id.
 
-    validate_cache_import_block(import_block)
-    return digest({"operation": "cache.release", "import": import_block})
+    The request's ``import`` block IS the complete minimal import confirmation
+    (run id, manifest/receipt digests, files, bytes, confirmed_at); a receipt
+    binds ``operation_id`` + ``params_sha256`` + this same object, so the same
+    operation id replayed with the same parameters returns the original receipt.
+    """
 
-
-def validate_cache_import_block(import_block) -> dict:
-    code = "cache_release_invalid"
-    _exact_keys(import_block, {"run_id", "manifest_sha256", "receipt_sha256"}, code, "import")
-    _text(import_block["run_id"], code, "import.run_id")
-    _hex64(import_block["manifest_sha256"], code, "import.manifest_sha256")
-    _hex64(import_block["receipt_sha256"], code, "import.receipt_sha256")
-    return import_block
+    validate_cache_import_confirmation(confirmation)
+    return digest({"operation": "cache.release", "import": confirmation})
 
 
 def validate_cache_release_request(request) -> dict:
@@ -313,7 +382,7 @@ def validate_cache_release_request(request) -> dict:
     _exact_keys(request, {"schema_version", "binding", "import"}, code, "request")
     _require(request["schema_version"] == CACHE_RELEASE_SCHEMA, code, {"where": "schema_version"})
     validate_call_binding(request["binding"])
-    validate_cache_import_block(request["import"])
+    validate_cache_import_confirmation(request["import"])
     expected = cache_release_params_digest(request["import"])
     _require(
         request["binding"]["params_sha256"] == expected,
@@ -356,15 +425,38 @@ def validate_cache_release_receipt(receipt) -> dict:
     code = "cache_release_receipt_invalid"
     _exact_keys(
         receipt,
-        {"schema_version", "status", "released", "retained", "released_at", "identity", "receipt_sha256"},
+        {
+            "schema_version",
+            "status",
+            "operation_id",
+            "params_sha256",
+            "import",
+            "released",
+            "retained",
+            "released_at",
+            "identity",
+            "receipt_sha256",
+        },
         code,
         "receipt",
     )
     _require(receipt["schema_version"] == CACHE_RELEASE_RECEIPT_SCHEMA, code, {"where": "schema_version"})
     _require(receipt["status"] in {"released", "already_released"}, code, {"where": "status"})
+    _text(receipt["operation_id"], code, "operation_id")
+    _hex64(receipt["params_sha256"], code, "params_sha256")
+    validate_cache_import_confirmation(receipt["import"])
+    _require(
+        receipt["params_sha256"] == cache_release_params_digest(receipt["import"]),
+        code,
+        {"rule": "receipt binds operation params to the released import"},
+    )
     _exact_keys(receipt["released"], {"files", "bytes"}, code, "released")
     _non_negative_int(receipt["released"]["files"], code, "released.files")
     _non_negative_int(receipt["released"]["bytes"], code, "released.bytes")
+    if receipt["status"] == "released":
+        # A claimed release that deleted nothing is refused; a replay of an
+        # already released import keeps its original (possibly zero) counts.
+        _positive_int(receipt["released"]["files"], code, "released.files")
     retained = receipt["retained"]
     _require(
         isinstance(retained, list) and all(isinstance(item, str) and item for item in retained),
@@ -451,21 +543,203 @@ def require_active_config_identity(reference, install_record) -> None:
     )
 
 
+PLATFORM_STORAGE_ROOTS = ("state_root", "handoff_root", "artifact_root", "workspace_root", "release_root")
+_TARGET_KEY = re.compile(r"\A[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
+_REPOSITORY_SLUG = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+_BASE_BRANCH = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
+_SSH_HOST = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
+_ORIGIN = re.compile(r"\Ahttps://([A-Za-z0-9][A-Za-z0-9.-]*)(?::([0-9]{1,5}))?\Z")
+
+
+def _absolute_path(value, code: str, where: str) -> PurePosixPath:
+    _require(isinstance(value, str) and bool(value) and not _CONTROL.search(value), code, {"where": where})
+    path = PurePosixPath(value)
+    _require(path.is_absolute() and ".." not in path.parts, code, {"where": where})
+    return path
+
+
+def _within(child: PurePosixPath, parent: PurePosixPath) -> bool:
+    return child == parent or parent in child.parents
+
+
+def _string_list(value, code: str, where: str, *, allow_empty: bool) -> list:
+    _require(isinstance(value, list), code, {"where": where})
+    if not allow_empty:
+        _require(bool(value), code, {"where": where})
+    _require(
+        all(isinstance(item, str) and item and item == item.strip() for item in value)
+        and len(set(value)) == len(value),
+        code,
+        {"where": where},
+    )
+    return value
+
+
 def validate_config_snapshot(snapshot) -> dict:
-    """Immutable generation snapshot (IF-16): references and digests, no secrets."""
+    """Immutable generation snapshot (IF-16): the full rendered platform tree, no secrets.
+
+    Shape per ``docs/deployment.md`` §配置权威 and C's authoritative field table
+    (``config-snapshot-resolved-fields-C.md``): every level rejects unknown keys,
+    paths are absolute without ``..`` (symlink/mode/readability checks belong to
+    the consuming host), and configured roots must not overlap.  ``derived``
+    carries the IF-11 consumables (store root, repository checkouts, discovery
+    roots).
+    """
 
     code = "config_snapshot_invalid"
     _exact_keys(snapshot, {"schema_version", "install_id", "generated_at", "resolved", "sources"}, code, "snapshot")
     _require(snapshot["schema_version"] == CONFIG_SNAPSHOT_SCHEMA, code, {"where": "schema_version"})
     _text(snapshot["install_id"], code, "install_id")
     _utc(snapshot["generated_at"], code, "generated_at")
+    resolved = snapshot["resolved"]
     _exact_keys(
-        snapshot["resolved"],
-        {"operator", "storage", "windows", "execution", "retention", "targets"},
+        resolved,
+        {
+            "schema_version",
+            "operator",
+            "storage",
+            "database",
+            "windows",
+            "auth",
+            "targets",
+            "specifications",
+            "execution",
+            "retention",
+            "derived",
+        },
         code,
         "resolved",
     )
-    _require(all(isinstance(value, dict) for value in snapshot["resolved"].values()), code, {"where": "resolved"})
+    _require(resolved["schema_version"] == PLATFORM_CONFIG_SCHEMA, code, {"where": "resolved.schema_version"})
+    operator = resolved["operator"]
+    _exact_keys(operator, {"origin", "certificate_file", "private_key_file"}, code, "resolved.operator")
+    match = _ORIGIN.match(operator["origin"] if isinstance(operator["origin"], str) else "")
+    _require(match is not None, code, {"where": "resolved.operator.origin"})
+    origin_port = int(match.group(2)) if match.group(2) else 443
+    _require(0 < origin_port < 65536, code, {"where": "resolved.operator.origin"})
+    _absolute_path(operator["certificate_file"], code, "resolved.operator.certificate_file")
+    _absolute_path(operator["private_key_file"], code, "resolved.operator.private_key_file")
+    storage = resolved["storage"]
+    _exact_keys(storage, set(PLATFORM_STORAGE_ROOTS), code, "resolved.storage")
+    storage_roots = {
+        name: _absolute_path(storage[name], code, f"resolved.storage.{name}") for name in PLATFORM_STORAGE_ROOTS
+    }
+    _exact_keys(resolved["database"], {"dsn_file"}, code, "resolved.database")
+    _absolute_path(resolved["database"]["dsn_file"], code, "resolved.database.dsn_file")
+    windows = resolved["windows"]
+    _exact_keys(windows, {"ssh_host", "endpoint_port", "token_file", "tunnel_loopback_port"}, code, "resolved.windows")
+    _require(
+        isinstance(windows["ssh_host"], str) and bool(_SSH_HOST.match(windows["ssh_host"])),
+        code,
+        {"where": "resolved.windows.ssh_host"},
+    )
+    endpoint_port = windows["endpoint_port"]
+    _require(
+        type(endpoint_port) is int and 0 < endpoint_port < 65536, code, {"where": "resolved.windows.endpoint_port"}
+    )
+    tunnel_port = windows["tunnel_loopback_port"]
+    _require(
+        type(tunnel_port) is int and 0 < tunnel_port < 65536,
+        code,
+        {"where": "resolved.windows.tunnel_loopback_port"},
+    )
+    _require(origin_port != tunnel_port, code, {"rule": "origin port differs from tunnel_loopback_port"})
+    _absolute_path(windows["token_file"], code, "resolved.windows.token_file")
+    auth = resolved["auth"]
+    _exact_keys(auth, {"feishu_secret_file", "tenant_keys", "admin_open_ids"}, code, "resolved.auth")
+    _absolute_path(auth["feishu_secret_file"], code, "resolved.auth.feishu_secret_file")
+    _string_list(auth["tenant_keys"], code, "resolved.auth.tenant_keys", allow_empty=False)
+    _string_list(auth["admin_open_ids"], code, "resolved.auth.admin_open_ids", allow_empty=True)
+    targets = resolved["targets"]
+    _require(isinstance(targets, dict) and bool(targets), code, {"where": "resolved.targets"})
+    slugs = set()
+    for hardware, target in targets.items():
+        _require(isinstance(hardware, str) and bool(_TARGET_KEY.match(hardware)), code, {"where": "resolved.targets"})
+        _exact_keys(target, {"repository_slug", "base"}, code, f"resolved.targets.{hardware}")
+        _require(
+            isinstance(target["repository_slug"], str) and bool(_REPOSITORY_SLUG.match(target["repository_slug"])),
+            code,
+            {"where": f"resolved.targets.{hardware}.repository_slug"},
+        )
+        base = target["base"]
+        _require(
+            isinstance(base, str)
+            and bool(_BASE_BRANCH.match(base))
+            and ".." not in base
+            and not base.endswith(".lock"),
+            code,
+            {"where": f"resolved.targets.{hardware}.base"},
+        )
+        slugs.add(target["repository_slug"])
+    specifications = resolved["specifications"]
+    _exact_keys(specifications, {"record_roots"}, code, "resolved.specifications")
+    record_roots = specifications["record_roots"]
+    _string_list(record_roots, code, "resolved.specifications.record_roots", allow_empty=False)
+    record_paths = [
+        _absolute_path(value, code, f"resolved.specifications.record_roots[{index}]")
+        for index, value in enumerate(record_roots)
+    ]
+    execution = resolved["execution"]
+    _exact_keys(execution, {"linux_concurrency"}, code, "resolved.execution")
+    _require(
+        type(execution["linux_concurrency"]) is int and execution["linux_concurrency"] >= 1,
+        code,
+        {"where": "resolved.execution.linux_concurrency"},
+    )
+    retention = resolved["retention"]
+    _exact_keys(retention, {"unreferenced_evidence_days"}, code, "resolved.retention")
+    days = retention["unreferenced_evidence_days"]
+    _require(
+        days is None or (type(days) is int and days > 0),
+        code,
+        {"where": "resolved.retention.unreferenced_evidence_days"},
+    )
+    derived = resolved["derived"]
+    _exact_keys(derived, {"store_root", "repositories", "discovery"}, code, "resolved.derived")
+    store_root = _absolute_path(derived["store_root"], code, "resolved.derived.store_root")
+    _require(_within(store_root, storage_roots["state_root"]), code, {"rule": "store_root lives under state_root"})
+    repositories = derived["repositories"]
+    _require(
+        isinstance(repositories, dict) and bool(repositories) and set(repositories) >= slugs,
+        code,
+        {"where": "resolved.derived.repositories", "rule": "covers every target repository slug"},
+    )
+    for slug, path in repositories.items():
+        _require(
+            isinstance(slug, str) and bool(_REPOSITORY_SLUG.match(slug)),
+            code,
+            {"where": "resolved.derived.repositories"},
+        )
+        _require(
+            _within(
+                _absolute_path(path, code, f"resolved.derived.repositories[{slug}]"), storage_roots["workspace_root"]
+            ),
+            code,
+            {"rule": "repository checkouts live under workspace_root"},
+        )
+    discovery = derived["discovery"]
+    _exact_keys(discovery, {"record_roots"}, code, "resolved.derived.discovery")
+    _require(
+        discovery["record_roots"] == record_roots,
+        code,
+        {"where": "resolved.derived.discovery.record_roots", "rule": "normalized copy of specifications.record_roots"},
+    )
+    named_roots = [(name, storage_roots[name]) for name in PLATFORM_STORAGE_ROOTS] + [
+        (f"record_roots[{index}]", path) for index, path in enumerate(record_paths)
+    ]
+    for index, (left_name, left) in enumerate(named_roots):
+        for right_name, right in named_roots[index + 1 :]:
+            _require(
+                not _within(left, right) and not _within(right, left),
+                code,
+                {"rule": "configured roots must not overlap", "left": left_name, "right": right_name},
+            )
+        if left_name in PLATFORM_STORAGE_ROOTS and left_name != "state_root":
+            _require(
+                not _within(store_root, left) and not _within(left, store_root),
+                code,
+                {"rule": "store_root must not overlap other roots", "other": left_name},
+            )
     _exact_keys(snapshot["sources"], {"platform_json_sha256"}, code, "sources")
     _hex64(snapshot["sources"]["platform_json_sha256"], code, "sources.platform_json_sha256")
     _reject_secrets(snapshot, code=code)
@@ -509,9 +783,10 @@ def validate_install_record(record, *, previous_required: bool = False) -> dict:
     _require(record["schema_version"] == INSTALL_RECORD_SCHEMA, code, {"where": "schema_version"})
     _text(record["install_id"], code, "install_id")
     _utc(record["timestamp"], code, "timestamp")
-    _exact_keys(record["snapshot"], {"path", "digest"}, code, "snapshot")
+    _exact_keys(record["snapshot"], {"path", "digest", "install_id"}, code, "snapshot")
     _text(record["snapshot"]["path"], code, "snapshot.path")
     _hex64(record["snapshot"]["digest"], code, "snapshot.digest")
+    _text(record["snapshot"]["install_id"], code, "snapshot.install_id")
     _exact_keys(record["release"], {"version", "source_commit", "source_sha256", "artifacts"}, code, "release")
     _check_release_triple(
         {key: record["release"][key] for key in ("version", "source_commit", "source_sha256")}, code, "release"
@@ -549,6 +824,20 @@ def validate_install_record(record, *, previous_required: bool = False) -> dict:
         _hex64(end["config_digest"], code, f"ends.{side}.config_digest")
         validate_release_identity(end["release"], role=role, code=code)
     require_same_release_identity(record["release"], record["ends"]["linux"]["release"])
+    # The common release identity spans both ends (same source release); the
+    # per-end config digests and install generations stay per-end and are never
+    # required to be equal (or different) here.
+    require_same_release_identity(record["release"], record["ends"]["windows"]["release"])
+    _require(
+        record["install_id"] == record["snapshot"]["install_id"] == record["ends"]["linux"]["install_id"],
+        code,
+        {"rule": "install_id chain: record == snapshot == Linux end"},
+    )
+    _require(
+        record["ends"]["linux"]["config_digest"] == record["snapshot"]["digest"],
+        code,
+        {"rule": "Linux end config digest equals the active snapshot digest"},
+    )
     previous = record["previous"]
     if previous is None:
         _require(
@@ -587,6 +876,31 @@ def validate_install_record(record, *, previous_required: bool = False) -> dict:
     return record
 
 
+def require_endpoint_matches_install_record(health, record) -> None:
+    """Runtime-only cross-check of the Windows end against ``/health`` (IF-16).
+
+    Static validation cannot know the endpoint; this helper compares
+    ``ends.windows`` per-end: the release identity is the common triple
+    (``role`` is not compared), and install id / config digest compare against
+    ``health.install``.  Cross-end config digest equality is never required.
+    """
+
+    validate_health(health)
+    validate_install_record(record)
+    end = record["ends"]["windows"]
+    require_same_release_identity(end["release"], health["release"])
+    _require(
+        end["install_id"] == health["install"]["install_id"],
+        "endpoint_end_mismatch",
+        {"field": "install_id"},
+    )
+    _require(
+        end["config_digest"] == health["install"]["config_digest"],
+        "endpoint_end_mismatch",
+        {"field": "config_digest"},
+    )
+
+
 def validate_delivery_manifest(manifest) -> dict:
     """``manifest.json`` (IF-13): subject inventory, subject digest, identities."""
 
@@ -595,12 +909,23 @@ def validate_delivery_manifest(manifest) -> dict:
     _require(manifest["schema_version"] == DELIVERY_MANIFEST_SCHEMA, code, {"where": "schema_version"})
     _exact_keys(manifest["subject"], {"files", "digest"}, code, "subject")
     files = manifest["subject"]["files"]
-    _require(isinstance(files, dict) and files, code, {"where": "subject.files"})
-    for name, checksum in files.items():
+    _require(isinstance(files, list) and files, code, {"where": "subject.files"})
+    # Each record carries path, byte length and SHA-256 (contracts §交付格式与摘要);
+    # paths are unique, sorted relative POSIX paths and every byte is bound.
+    mapping: dict[str, str] = {}
+    paths: list[str] = []
+    for index, record in enumerate(files):
+        where = f"subject.files[{index}]"
+        _exact_keys(record, {"path", "bytes", "sha256"}, code, where)
+        name = record["path"]
+        _require(isinstance(name, str), code, {"where": f"{where}.path"})
         artifact_path_parts(name)
-        _hex64(checksum, code, f"subject.files[{name}]")
-    _require(sorted(files) == list(files), code, {"where": "subject.files", "reason": "sorted relative POSIX paths"})
-    expected = digest(files)
+        _require(name not in mapping, code, {"where": f"{where}.path", "reason": "duplicate subject path"})
+        _non_negative_int(record["bytes"], code, f"{where}.bytes")
+        mapping[name] = _hex64(record["sha256"], code, f"{where}.sha256")
+        paths.append(name)
+    _require(paths == sorted(paths), code, {"where": "subject.files", "reason": "sorted relative POSIX paths"})
+    expected = digest(mapping)
     _require(manifest["subject"]["digest"] == expected, "delivery_manifest_subject_mismatch", {"expected": expected})
     _exact_keys(manifest["contract"], {"schema_version", "digest"}, code, "contract")
     _require(

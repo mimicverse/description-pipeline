@@ -33,6 +33,10 @@ INSTALL_RECORD_SCHEMA = "solidworks-to-urdf.install-record/v1"
 DELIVERY_MANIFEST_SCHEMA = "solidworks-to-urdf.delivery-manifest/v1"
 SOURCE_RECORD_SCHEMA = "solidworks-to-urdf.source-record/v1"
 
+#: Platform configuration schema rendered into the immutable config snapshot
+#: (deployment.md §配置权威; consumed by IF-11/IF-16).
+PLATFORM_CONFIG_SCHEMA = "solidworks-to-urdf.platform/v1"
+
 
 def exporter_declaration_present(record: object) -> bool:
     """The shared producer/verifier predicate over the raw record's exporter block.

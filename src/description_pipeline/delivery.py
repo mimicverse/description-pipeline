@@ -74,6 +74,16 @@ def subject_digest(root: Path) -> str:
     return digest(subject_inventory(root))
 
 
+def subject_records(root: Path) -> list[dict]:
+    """Subject file records ``{path, bytes, sha256}`` sorted by path (manifest shape)."""
+
+    root = Path(root)
+    return [
+        {"path": path, "bytes": (root / path).stat().st_size, "sha256": checksum}
+        for path, checksum in subject_inventory(root).items()
+    ]
+
+
 def check_layout(root: Path) -> None:
     """Refuse unregistered files: subject, ``manifest.json``, ``reports/quality.json``."""
 
@@ -102,7 +112,7 @@ def build_delivery_manifest(root: Path, *, contract: dict, policy: dict) -> dict
     files = subject_inventory(root)
     manifest = {
         "schema_version": DELIVERY_MANIFEST_SCHEMA,
-        "subject": {"files": files, "digest": digest(files)},
+        "subject": {"files": subject_records(root), "digest": digest(files)},
         "contract": contract,
         "policy": policy,
     }

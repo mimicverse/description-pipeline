@@ -1,4 +1,4 @@
-"""Positive/negative guards for the W1 machine records (frozen-interfaces-v1.1)."""
+"""Positive/negative guards for the W1 machine records (frozen-interfaces-v1.1, b4-fix)."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from description_pipeline.schemas import (
     DELIVERY_MANIFEST_SCHEMA,
     HEALTH_SCHEMA,
     INSTALL_RECORD_SCHEMA,
+    PLATFORM_CONFIG_SCHEMA,
     RESOURCE_POLICY_SCHEMA,
     SOURCE_RECORD_SCHEMA,
 )
@@ -57,7 +58,7 @@ def policy() -> dict:
 
 def health(ready: bool = True) -> dict:
     return {
-        "health_schema": HEALTH_SCHEMA,
+        "schema_version": HEALTH_SCHEMA,
         "pipeline_id": "solidworks-to-urdf",
         "native_platform": True,
         "ready": ready,
@@ -65,7 +66,6 @@ def health(ready: bool = True) -> dict:
         "contract": {"schema_version": CONTRACT["schema_version"], "digest": HEX},
         "resource_policy": {"schema_version": RESOURCE_POLICY_SCHEMA, "digest": ir.resource_policy_digest(policy())},
         "install": {"config_digest": HEX, "install_id": "gen-1"},
-        "auth": {"scheme": "bearer", "token_fingerprint": "3e1d"},
         "endpoint": {"port": 8765},
         "cad": {"external_session_detected": False, "owned_sessions": 0, "lease_held": False},
         "jobs": {"active": 0, "queued": 0, "unresolved": 0},
@@ -77,12 +77,20 @@ def health(ready: bool = True) -> dict:
     }
 
 
-def import_block() -> dict:
-    return {"run_id": "7c9b44b3-0b9c-5ffe-9f4f-4bbdafb4a865", "manifest_sha256": HEX, "receipt_sha256": OTHER_HEX}
+def import_confirmation() -> dict:
+    return {
+        "schema_version": CACHE_IMPORT_CONFIRMATION_SCHEMA,
+        "run_id": "7c9b44b3-0b9c-5ffe-9f4f-4bbdafb4a865",
+        "manifest_sha256": HEX,
+        "receipt_sha256": OTHER_HEX,
+        "files": 12,
+        "bytes": 4096,
+        "confirmed_at": TS,
+    }
 
 
 def cache_request() -> dict:
-    block = import_block()
+    block = import_confirmation()
     return {
         "schema_version": CACHE_RELEASE_SCHEMA,
         "binding": {
@@ -95,11 +103,15 @@ def cache_request() -> dict:
     }
 
 
-def cache_receipt() -> dict:
+def cache_receipt(*, status: str = "released", released_files: int = 12) -> dict:
+    block = import_confirmation()
     receipt = {
         "schema_version": CACHE_RELEASE_RECEIPT_SCHEMA,
-        "status": "released",
-        "released": {"files": 12, "bytes": 4096},
+        "status": status,
+        "operation_id": "op-0001",
+        "params_sha256": ir.cache_release_params_digest(block),
+        "import": block,
+        "released": {"files": released_files, "bytes": 4096},
         "retained": ["jobs/1/events.json", "artifacts/run-1"],
         "released_at": TS,
         "identity": release("native"),
@@ -115,28 +127,56 @@ def config_snapshot() -> dict:
         "install_id": "gen-1",
         "generated_at": TS,
         "resolved": {
-            "operator": {"origin": "https://operator.example.com:8443"},
-            "storage": {"state_root": "/srv/description/state", "handoff_root": "/srv/description/handoffs"},
+            "schema_version": PLATFORM_CONFIG_SCHEMA,
+            "operator": {
+                "origin": "https://operator.example.com:8443",
+                "certificate_file": "/srv/description/secrets/tls.crt",
+                "private_key_file": "/srv/description/secrets/tls.key",
+            },
+            "storage": {
+                "state_root": "/srv/description/state",
+                "handoff_root": "/srv/description/handoffs",
+                "artifact_root": "/srv/description/artifacts",
+                "workspace_root": "/srv/description/workspaces",
+                "release_root": "/srv/description/releases",
+            },
+            "database": {"dsn_file": "/srv/description/secrets/postgres.dsn"},
             "windows": {
                 "ssh_host": "solidworks-worker",
                 "endpoint_port": 8765,
-                "tunnel_loopback_port": 18765,
                 "token_file": "/srv/description/secrets/endpoint.token",
+                "tunnel_loopback_port": 18765,
             },
+            "auth": {
+                "feishu_secret_file": "/srv/description/secrets/feishu.json",
+                "tenant_keys": ["tenant-key"],
+                "admin_open_ids": [],
+            },
+            "targets": {"arm": {"repository_slug": "owner/model-repository", "base": "main"}},
+            "specifications": {"record_roots": ["/srv/description/specifications"]},
             "execution": {"linux_concurrency": 1},
             "retention": {"unreferenced_evidence_days": None},
-            "targets": {"arm": {"repository_slug": "owner/repo", "base": "main"}},
+            "derived": {
+                "store_root": "/srv/description/state/runs",
+                "repositories": {"owner/model-repository": "/srv/description/workspaces/model-repository"},
+                "discovery": {"record_roots": ["/srv/description/specifications"]},
+            },
         },
         "sources": {"platform_json_sha256": HEX},
     }
 
 
 def install_record(*, previous: bool = False, journal: list | None = None) -> dict:
+    generation = "gen-2" if previous else "gen-1"
     record = {
         "schema_version": INSTALL_RECORD_SCHEMA,
-        "install_id": "gen-2" if previous else "gen-1",
+        "install_id": generation,
         "timestamp": TS,
-        "snapshot": {"path": "/srv/description/state/snapshots/gen-2.json", "digest": HEX},
+        "snapshot": {
+            "path": f"/srv/description/state/snapshots/{generation}.json",
+            "digest": HEX,
+            "install_id": generation,
+        },
         "release": {**release(), "artifacts": [{"name": "linux.tar.gz", "sha256": OTHER_HEX}]},
         "services": ["description-postgres", "description-operator-proxy"],
         "paths": {"state_root": "/srv/description/state", "release_root": "/srv/description/releases"},
@@ -147,11 +187,7 @@ def install_record(*, previous: bool = False, journal: list | None = None) -> di
             "tasks": len(STAGE_IDS),
         },
         "ends": {
-            "linux": {
-                "install_id": "gen-2" if previous else "gen-1",
-                "config_digest": HEX,
-                "release": release("portable"),
-            },
+            "linux": {"install_id": generation, "config_digest": HEX, "release": release("portable")},
             "windows": {"install_id": "ep-7", "config_digest": OTHER_HEX, "release": release("native")},
         },
         "previous": None
@@ -207,13 +243,261 @@ def source_record() -> dict:
 
 
 def manifest() -> dict:
-    files = {"evidence/discovery.json": HEX, "input/handoff.json": OTHER_HEX, "tool.json": HEX}
+    mapping = {"evidence/discovery.json": HEX, "input/handoff.json": OTHER_HEX, "tool.json": HEX}
+    files = [{"path": path, "bytes": 1, "sha256": checksum} for path, checksum in sorted(mapping.items())]
     return {
         "schema_version": DELIVERY_MANIFEST_SCHEMA,
-        "subject": {"files": files, "digest": digest(files)},
+        "subject": {"files": files, "digest": digest(mapping)},
         "contract": {"schema_version": CONTRACT["schema_version"], "digest": HEX},
         "policy": {"schema_version": "solidworks-to-urdf.quality-policy/v1", "digest": OTHER_HEX},
     }
+
+
+class B4FixSingleVariableTests(unittest.TestCase):
+    """Acceptance form: a complete legal positive first, then exactly one change per negative.
+
+    Each negative asserts the stable error code and that validation has no side
+    effect (the candidate is unchanged; the untouched positive still passes).
+    """
+
+    def assert_rejected_by_one_change(self, validator, positive, mutate, code: str) -> None:
+        validator(copy.deepcopy(positive))
+        candidate = copy.deepcopy(positive)
+        mutate(candidate)
+        frozen = copy.deepcopy(candidate)
+        with self.assertRaises(ir.InterfaceRecordError) as raised:
+            validator(candidate)
+        self.assertEqual(raised.exception.code, code)
+        self.assertEqual(candidate, frozen)
+        validator(copy.deepcopy(positive))
+
+    def test_legal_positives_are_accepted(self) -> None:
+        from description_pipeline.orchestration import uploads
+
+        ir.validate_health(health(True))
+        ir.validate_health(health(False))
+        ir.validate_config_snapshot(config_snapshot())
+        ir.validate_delivery_manifest(manifest())
+        ir.validate_cache_release_request(cache_request())
+        ir.validate_cache_release_receipt(cache_receipt())
+        ir.validate_install_record(install_record(previous=True), previous_required=True)
+        ir.validate_resource_policy(ir.RESOURCE_POLICY_V1)
+        self.assertEqual(ir.RESOURCE_POLICY_V1["limits"]["max_upload_bytes"], uploads.MAX_BODY_BYTES)
+        self.assertEqual(
+            ir.resource_policy_v1_digest(), "e38f696ec0fe8668313e55dff852d1832800e5f7fd1806457b244d1cb416b4a6"
+        )
+
+    def test_health_single_variable_negatives(self) -> None:
+        positive = health(True)
+        cases = (
+            (
+                "ready with native.ok=false",
+                lambda h: h["readiness"]["native"].__setitem__("ok", False),
+                "health_invalid",
+            ),
+            (
+                "ready with native problems",
+                lambda h: h["readiness"]["native"]["problems"].append("x"),
+                "health_invalid",
+            ),
+            (
+                "ready with external CAD",
+                lambda h: h["cad"].__setitem__("external_session_detected", True),
+                "health_invalid",
+            ),
+            ("ready with unresolved jobs", lambda h: h["jobs"].__setitem__("unresolved", 1), "health_invalid"),
+            ("ready without native platform", lambda h: h.__setitem__("native_platform", False), "health_invalid"),
+            (
+                "old health_schema field",
+                lambda h: h.__setitem__("health_schema", h.pop("schema_version")),
+                "health_invalid",
+            ),
+            (
+                "re-added auth fingerprint",
+                lambda h: h.__setitem__("auth", {"scheme": "bearer", "token_fingerprint": "3e1d"}),
+                "health_invalid",
+            ),
+        )
+        for label, mutate, code in cases:
+            with self.subTest(label):
+                self.assert_rejected_by_one_change(ir.validate_health, positive, mutate, code)
+        unready = health(False)
+        self.assert_rejected_by_one_change(
+            ir.validate_health, unready, lambda h: h["readiness"].__setitem__("reason_code", None), "health_invalid"
+        )
+
+    def test_config_snapshot_single_variable_negatives(self) -> None:
+        positive = config_snapshot()
+        cases = (
+            ("missing database", lambda c: c["resolved"].pop("database"), "config_snapshot_invalid"),
+            ("missing auth", lambda c: c["resolved"].pop("auth"), "config_snapshot_invalid"),
+            ("missing specifications", lambda c: c["resolved"].pop("specifications"), "config_snapshot_invalid"),
+            ("empty operator object", lambda c: c["resolved"].__setitem__("operator", {}), "config_snapshot_invalid"),
+            (
+                "empty tenant_keys",
+                lambda c: c["resolved"]["auth"].__setitem__("tenant_keys", []),
+                "config_snapshot_invalid",
+            ),
+            (
+                "string endpoint port",
+                lambda c: c["resolved"]["windows"].__setitem__("endpoint_port", "8765"),
+                "config_snapshot_invalid",
+            ),
+            (
+                "origin port collision",
+                lambda c: c["resolved"]["windows"].__setitem__("tunnel_loopback_port", 8443),
+                "config_snapshot_invalid",
+            ),
+            (
+                "relative dsn path",
+                lambda c: c["resolved"]["database"].__setitem__("dsn_file", "secrets/postgres.dsn"),
+                "config_snapshot_invalid",
+            ),
+            ("empty targets", lambda c: c["resolved"].__setitem__("targets", {}), "config_snapshot_invalid"),
+            (
+                "base starts with dash",
+                lambda c: c["resolved"]["targets"]["arm"].__setitem__("base", "-x"),
+                "config_snapshot_invalid",
+            ),
+            (
+                "repositories missing slug",
+                lambda c: c["resolved"]["derived"]["repositories"].clear(),
+                "config_snapshot_invalid",
+            ),
+            (
+                "overlapping storage roots",
+                lambda c: c["resolved"]["storage"].__setitem__("release_root", "/srv/description/artifacts"),
+                "config_snapshot_invalid",
+            ),
+            (
+                "impossible calendar date",
+                lambda c: c.__setitem__("generated_at", "2026-99-99T99:99:99Z"),
+                "config_snapshot_invalid",
+            ),
+            (
+                "inline secret value",
+                lambda c: c["resolved"]["windows"].__setitem__("token", "inline"),
+                "config_snapshot_invalid",
+            ),
+        )
+        for label, mutate, code in cases:
+            with self.subTest(label):
+                self.assert_rejected_by_one_change(ir.validate_config_snapshot, positive, mutate, code)
+
+    def test_manifest_and_cache_single_variable_negatives(self) -> None:
+        manifest_positive = manifest()
+        manifest_cases = (
+            ("file record without bytes", lambda m: m["subject"]["files"][0].pop("bytes"), "delivery_manifest_invalid"),
+            (
+                "duplicate subject path",
+                lambda m: m["subject"]["files"][1].__setitem__("path", m["subject"]["files"][0]["path"]),
+                "delivery_manifest_invalid",
+            ),
+            (
+                "subject digest changed",
+                lambda m: m["subject"].__setitem__("digest", OTHER_HEX),
+                "delivery_manifest_subject_mismatch",
+            ),
+            (
+                "mapping instead of records",
+                lambda m: m["subject"].__setitem__("files", {r["path"]: r["sha256"] for r in m["subject"]["files"]}),
+                "delivery_manifest_invalid",
+            ),
+        )
+        for label, mutate, code in manifest_cases:
+            with self.subTest(label):
+                self.assert_rejected_by_one_change(ir.validate_delivery_manifest, manifest_positive, mutate, code)
+        request_positive = cache_request()
+        request_cases = (
+            (
+                "import reduced to receipt hash",
+                lambda r: r.__setitem__(
+                    "import", {k: r["import"][k] for k in ("run_id", "manifest_sha256", "receipt_sha256")}
+                ),
+                "cache_import_confirmation_invalid",
+            ),
+            (
+                "binding parameter mismatch",
+                lambda r: r["binding"].__setitem__("params_sha256", OTHER_HEX),
+                "cache_release_params_mismatch",
+            ),
+        )
+        for label, mutate, code in request_cases:
+            with self.subTest(label):
+                self.assert_rejected_by_one_change(ir.validate_cache_release_request, request_positive, mutate, code)
+        receipt_positive = cache_receipt()
+        receipt_cases = (
+            (
+                "claimed release deleted nothing",
+                lambda r: r.__setitem__("status", "released") or r["released"].__setitem__("files", 0),
+                "cache_release_receipt_invalid",
+            ),
+            (
+                "receipt tampered after signing",
+                lambda r: r["released"].__setitem__("bytes", 1),
+                "cache_release_receipt_mismatch",
+            ),
+            ("receipt without operation import binding", lambda r: r.pop("import"), "cache_release_receipt_invalid"),
+        )
+        for label, mutate, code in receipt_cases:
+            with self.subTest(label):
+                self.assert_rejected_by_one_change(ir.validate_cache_release_receipt, receipt_positive, mutate, code)
+
+    def test_install_and_release_single_variable_negatives(self) -> None:
+        positive = install_record(previous=True)
+        cases = (
+            (
+                "windows release commit differs",
+                lambda r: r["ends"]["windows"]["release"].__setitem__("source_commit", OTHER_COMMIT),
+                "release_identity_mismatch",
+            ),
+            (
+                "linux digest differs from snapshot",
+                lambda r: r["ends"]["linux"].__setitem__("config_digest", OTHER_HEX),
+                "install_record_invalid",
+            ),
+            (
+                "linux generation differs from record",
+                lambda r: r["ends"]["linux"].__setitem__("install_id", "other"),
+                "install_record_invalid",
+            ),
+            (
+                "snapshot generation differs from record",
+                lambda r: r["snapshot"].__setitem__("install_id", "other"),
+                "install_record_invalid",
+            ),
+            (
+                "journal step without evidence",
+                lambda r: r["journal"][0].__setitem__("evidence", []),
+                "install_record_invalid",
+            ),
+        )
+        for label, mutate, code in cases:
+            with self.subTest(label):
+                self.assert_rejected_by_one_change(ir.validate_install_record, positive, mutate, code)
+        release_positive = release()
+        for label, mutate in (
+            ("sha256 trailing newline", lambda r: r.__setitem__("source_sha256", r["source_sha256"] + "\n")),
+            ("commit trailing newline", lambda r: r.__setitem__("source_commit", r["source_commit"] + "\n")),
+        ):
+            with self.subTest(label):
+                self.assert_rejected_by_one_change(
+                    ir.validate_release_identity, release_positive, mutate, "release_identity_invalid"
+                )
+        pair_positive = (release(), release())
+        with self.subTest("missing vs present release identity"):
+            left, right = copy.deepcopy(pair_positive)
+            with self.assertRaises(ir.InterfaceRecordError) as raised:
+                ir.require_same_release_identity({}, right)
+            self.assertEqual(raised.exception.code, "release_identity_mismatch")
+            self.assertEqual(left, release())
+            ir.require_same_release_identity(*pair_positive)
+        with self.subTest("equal digest different commit"):
+            left, right = copy.deepcopy(pair_positive)
+            right["source_commit"] = OTHER_COMMIT
+            with self.assertRaises(ir.InterfaceRecordError) as raised:
+                ir.require_same_release_identity(left, right)
+            self.assertEqual(raised.exception.code, "release_identity_mismatch")
 
 
 class InterfaceRecordTests(unittest.TestCase):
@@ -222,41 +506,72 @@ class InterfaceRecordTests(unittest.TestCase):
             mutate()
         self.assertEqual(raised.exception.code, code)
 
-    def test_release_identity_triple_rejects_equal_digest_different_commit(self) -> None:
+    def test_release_identity_triple_and_strict_digests(self) -> None:
         left, right = release(), release()
         ir.require_same_release_identity(left, right)
+        self.reject("release_identity_mismatch", lambda: ir.require_same_release_identity({}, {}))
         right["source_commit"] = OTHER_COMMIT
         self.reject("release_identity_mismatch", lambda: ir.require_same_release_identity(left, right))
-        right = release()
-        right["version"] = "1.4.1"
-        self.reject("release_identity_mismatch", lambda: ir.require_same_release_identity(left, right))
-        ir.validate_release_identity(left)
+        for mutated in (HEX + "\n", "z" * 64):
+            bad = release()
+            bad["source_sha256"] = mutated
+            self.reject("release_identity_invalid", lambda bad=bad: ir.validate_release_identity(bad))
+        bad = release()
+        bad["source_commit"] = COMMIT + "\n"
+        self.reject("release_identity_invalid", lambda: ir.validate_release_identity(bad))
         ir.validate_release_identity(release("native"), role="native")
-        self.reject("release_identity_invalid", lambda: ir.validate_release_identity(release("platform")))
 
     def test_resource_policy_positive_and_negative(self) -> None:
         policy_value = policy()
         ir.validate_resource_policy(policy_value)
         self.assertEqual(len(ir.resource_policy_digest(policy_value)), 64)
         bad = copy.deepcopy(policy_value)
+        bad["timeouts"]["job_seconds"] = float("inf")
+        self.reject("resource_policy_invalid", lambda: ir.validate_resource_policy(bad))
+        bad = copy.deepcopy(policy_value)
         bad["limits"]["max_upload_bytes"] = bad["limits"]["max_total_bytes"] - 1
         self.reject("resource_policy_invalid", lambda: ir.validate_resource_policy(bad))
         bad = copy.deepcopy(policy_value)
         bad["capacity"]["cache_root"] = "/srv/cache"
         self.reject("resource_policy_invalid", lambda: ir.validate_resource_policy(bad))
-        bad = copy.deepcopy(policy_value)
-        bad["timeouts"].pop("job_seconds")
-        self.reject("resource_policy_invalid", lambda: ir.validate_resource_policy(bad))
-        bad = copy.deepcopy(policy_value)
-        bad["limits"]["max_files"] = 0
-        self.reject("resource_policy_invalid", lambda: ir.validate_resource_policy(bad))
 
-    def test_health_positive_ready_and_unready(self) -> None:
+    def test_resource_policy_v1_adopts_existing_constants(self) -> None:
+        from description_pipeline.orchestration import uploads
+
+        ir.validate_resource_policy(ir.RESOURCE_POLICY_V1)
+        limits = ir.RESOURCE_POLICY_V1["limits"]
+        self.assertEqual(limits["max_files"], uploads.MAX_FILES)
+        self.assertEqual(limits["max_total_bytes"], uploads.MAX_TOTAL_BYTES)
+        self.assertEqual(limits["max_file_bytes"], uploads.MAX_FILE_BYTES)
+        self.assertEqual(limits["max_upload_bytes"], uploads.MAX_BODY_BYTES)
+        self.assertGreaterEqual(limits["max_upload_bytes"], limits["max_total_bytes"])
+        self.assertEqual(ir.RESOURCE_POLICY_V1["capacity"]["min_free_bytes"], uploads.DISK_RESERVE_FLOOR)
+        # Pinned digest: changing any adopted value intentionally breaks this guard.
+        self.assertEqual(
+            ir.resource_policy_v1_digest(), "e38f696ec0fe8668313e55dff852d1832800e5f7fd1806457b244d1cb416b4a6"
+        )
+
+    def test_health_ready_is_single_semantics(self) -> None:
         ir.validate_health(health(True))
         ir.validate_health(health(False))
+        busy = health(True)
+        busy["jobs"]["active"] = 2
+        busy["jobs"]["queued"] = 1
+        ir.validate_health(busy)  # owned active/queued work stays healthy; drain is judged separately
         bad = health(False)
         bad["readiness"]["reason_code"] = None
         self.reject("health_invalid", lambda: ir.validate_health(bad))
+        contradictions = (
+            lambda value: value["readiness"]["native"].__setitem__("ok", False),
+            lambda value: value["readiness"]["native"]["problems"].append("solidworks_unregistered"),
+            lambda value: value["cad"].__setitem__("external_session_detected", True),
+            lambda value: value["jobs"].__setitem__("unresolved", 1),
+            lambda value: value.__setitem__("native_platform", False),
+        )
+        for mutate in contradictions:
+            bad = health(True)
+            mutate(bad)
+            self.reject("health_invalid", lambda bad=bad: ir.validate_health(bad))
         bad = health(True)
         bad["release"]["role"] = "portable"
         self.reject("health_invalid", lambda: ir.validate_health(bad))
@@ -264,43 +579,57 @@ class InterfaceRecordTests(unittest.TestCase):
         bad["endpoint"]["port"] = 70000
         self.reject("health_invalid", lambda: ir.validate_health(bad))
         bad = health(True)
-        bad["jobs"]["unknown_total"] = 1
+        bad["auth"] = {"scheme": "bearer"}
         self.reject("health_invalid", lambda: ir.validate_health(bad))
 
-    def test_cache_release_request_binds_parameter_digest(self) -> None:
+    def test_obsolete_positive_fixtures_are_rejected(self) -> None:
+        """Design probe parity: old-shape positives must fail the final schemas."""
+        obsolete_health = health(True)
+        obsolete_health["health_schema"] = obsolete_health.pop("schema_version")
+        obsolete_health["auth"] = {"scheme": "bearer", "token_fingerprint": "3e1d"}
+        self.reject("health_invalid", lambda: ir.validate_health(obsolete_health))
+        mapping_only = manifest()
+        mapping_only["subject"]["files"] = {
+            record["path"]: record["sha256"] for record in mapping_only["subject"]["files"]
+        }
+        self.reject("delivery_manifest_invalid", lambda: ir.validate_delivery_manifest(mapping_only))
+        all_empty = config_snapshot()
+        all_empty["resolved"] = {key: {} for key in all_empty["resolved"]}
+        self.reject("config_snapshot_invalid", lambda: ir.validate_config_snapshot(all_empty))
+        receipt_hash_only = cache_request()
+        receipt_hash_only["import"] = {
+            key: receipt_hash_only["import"][key] for key in ("run_id", "manifest_sha256", "receipt_sha256")
+        }
+        self.reject("cache_import_confirmation_invalid", lambda: ir.validate_cache_release_request(receipt_hash_only))
+
+    def test_cache_release_binds_full_import_confirmation(self) -> None:
         ir.validate_cache_release_request(cache_request())
         bad = cache_request()
         bad["binding"]["params_sha256"] = OTHER_HEX
         self.reject("cache_release_params_mismatch", lambda: ir.validate_cache_release_request(bad))
         bad = cache_request()
         bad["import"]["receipt_sha256"] = "not-hex"
-        self.reject("cache_release_invalid", lambda: ir.validate_cache_release_request(bad))
+        self.reject("cache_import_confirmation_invalid", lambda: ir.validate_cache_release_request(bad))
         bad = cache_request()
         bad["binding"]["operation_id"] = ""
         self.reject("call_binding_invalid", lambda: ir.validate_cache_release_request(bad))
 
-    def test_cache_confirmation_and_immutable_receipt(self) -> None:
-        confirmation = {
-            "schema_version": CACHE_IMPORT_CONFIRMATION_SCHEMA,
-            "run_id": "7c9b44b3-0b9c-5ffe-9f4f-4bbdafb4a865",
-            "manifest_sha256": HEX,
-            "receipt_sha256": OTHER_HEX,
-            "files": 12,
-            "bytes": 4096,
-            "confirmed_at": TS,
-        }
-        ir.validate_cache_import_confirmation(confirmation)
-        good = cache_receipt()
-        ir.validate_cache_release_receipt(good)
-        tampered = copy.deepcopy(good)
+    def test_cache_receipt_zero_delete_and_immutability(self) -> None:
+        ir.validate_cache_release_receipt(cache_receipt())
+        ir.validate_cache_release_receipt(cache_receipt(status="already_released", released_files=0))
+        self.reject(
+            "cache_release_receipt_invalid",
+            lambda: ir.validate_cache_release_receipt(cache_receipt(status="released", released_files=0)),
+        )
+        tampered = cache_receipt()
         tampered["released"]["bytes"] = 1
         self.reject("cache_release_receipt_mismatch", lambda: ir.validate_cache_release_receipt(tampered))
-        bad = copy.deepcopy(good)
-        bad["status"] = "maybe"
+        bad = cache_receipt()
+        bad["params_sha256"] = OTHER_HEX
         self.reject("cache_release_receipt_invalid", lambda: ir.validate_cache_release_receipt(bad))
-        bad = copy.deepcopy(confirmation)
-        bad["confirmed_at"] = "2026-10-13 09:00"
-        self.reject("cache_import_confirmation_invalid", lambda: ir.validate_cache_import_confirmation(bad))
+        bad = cache_receipt()
+        bad.pop("import")
+        self.reject("cache_release_receipt_invalid", lambda: ir.validate_cache_release_receipt(bad))
 
     def test_config_identity_shape_legacy_and_file_checks(self) -> None:
         reference = {
@@ -325,9 +654,6 @@ class InterfaceRecordTests(unittest.TestCase):
         self.reject("config_identity_legacy", lambda: ir.validate_connection_config_identity(legacy))
         bad = copy.deepcopy(connection)
         bad["extra"]["config_identity"]["path"] = "state/snap.json"
-        self.reject("config_identity_invalid", lambda: ir.validate_connection_config_identity(bad))
-        bad = copy.deepcopy(connection)
-        bad["extra"]["config_identity"]["schema_version"] = "solidworks-to-urdf.config-snapshot/v2"
         self.reject("config_identity_invalid", lambda: ir.validate_connection_config_identity(bad))
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -356,8 +682,6 @@ class InterfaceRecordTests(unittest.TestCase):
         ir.require_active_config_identity(active, record)
         sealed = dict(active, sha256=OTHER_HEX)
         self.reject("config_identity_not_active", lambda: ir.require_active_config_identity(sealed, record))
-        # A sealed request keeps its fixed record: only the shape is validated and
-        # the reference and its parameters stay byte-identical across a switch.
         before = json.dumps(sealed, sort_keys=True)
         ir.validate_connection_config_identity(
             {
@@ -371,27 +695,66 @@ class InterfaceRecordTests(unittest.TestCase):
         )
         self.assertEqual(json.dumps(sealed, sort_keys=True), before)
 
-    def test_config_snapshot_positive_and_secret_rejection(self) -> None:
+    def test_config_snapshot_full_tree_and_negative_cases(self) -> None:
         snapshot = config_snapshot()
         ir.validate_config_snapshot(snapshot)
         self.assertEqual(len(ir.config_snapshot_digest(snapshot)), 64)
+        mutations = (
+            ("config_snapshot_invalid", lambda value: value["resolved"].__setitem__("auth", None)),
+            ("config_snapshot_invalid", lambda value: value["resolved"]["auth"].__setitem__("tenant_keys", [])),
+            (
+                "config_snapshot_invalid",
+                lambda value: value["resolved"]["windows"].__setitem__("endpoint_port", "8765"),
+            ),
+            (
+                "config_snapshot_invalid",
+                lambda value: value["resolved"]["database"].__setitem__("dsn_file", "secrets/postgres.dsn"),
+            ),
+            ("config_snapshot_invalid", lambda value: value["resolved"].__setitem__("targets", {})),
+            ("config_snapshot_invalid", lambda value: value["resolved"]["targets"]["arm"].__setitem__("base", "-x")),
+            (
+                "config_snapshot_invalid",
+                lambda value: value["resolved"]["derived"]["repositories"].clear(),
+            ),
+            (
+                "config_snapshot_invalid",
+                lambda value: value["resolved"]["windows"].__setitem__("tunnel_loopback_port", 8443),
+            ),
+            (
+                "config_snapshot_invalid",
+                lambda value: value["resolved"]["storage"].__setitem__("release_root", "/srv/description/artifacts"),
+            ),
+            ("config_snapshot_invalid", lambda value: value["resolved"]["derived"].__setitem__("extra", {})),
+        )
+        for code, mutate in mutations:
+            bad = copy.deepcopy(snapshot)
+            mutate(bad)
+            self.reject(code, lambda bad=bad: ir.validate_config_snapshot(bad))
         bad = copy.deepcopy(snapshot)
-        bad["resolved"]["windows"]["token"] = "abc"
+        bad["resolved"]["windows"]["token"] = "inline-secret"
         self.reject("config_snapshot_invalid", lambda: ir.validate_config_snapshot(bad))
         bad = copy.deepcopy(snapshot)
-        bad["resolved"]["mystery"] = {}
+        bad["generated_at"] = "2026-13-01T09:00:00Z"
         self.reject("config_snapshot_invalid", lambda: ir.validate_config_snapshot(bad))
 
-    def test_install_record_positive_previous_and_journal_rules(self) -> None:
+    def test_install_record_ends_and_journal_rules(self) -> None:
         ir.validate_install_record(install_record())
-        second = install_record(previous=True)
-        ir.validate_install_record(second, previous_required=True)
-        # Per-host generations: the two ends are never compared for equality (or inequality).
-        self.assertNotEqual(second["ends"]["linux"]["config_digest"], second["ends"]["windows"]["config_digest"])
-        ir.validate_install_record(install_record(previous=True))
-        self.reject(
-            "install_record_invalid", lambda: ir.validate_install_record(install_record(), previous_required=True)
+        ir.validate_install_record(install_record(previous=True), previous_required=True)
+        # Per-end config digests differ and are never compared; the common release
+        # identity triple is compared across ends (role excluded).
+        different_ends = install_record()
+        self.assertNotEqual(
+            different_ends["ends"]["linux"]["config_digest"], different_ends["ends"]["windows"]["config_digest"]
         )
+        bad = install_record()
+        bad["ends"]["windows"]["release"]["source_commit"] = OTHER_COMMIT
+        self.reject("release_identity_mismatch", lambda: ir.validate_install_record(bad))
+        bad = install_record()
+        bad["snapshot"]["install_id"] = "gen-9"
+        self.reject("install_record_invalid", lambda: ir.validate_install_record(bad))
+        bad = install_record()
+        bad["ends"]["linux"]["config_digest"] = OTHER_HEX
+        self.reject("install_record_invalid", lambda: ir.validate_install_record(bad))
         bad = install_record()
         bad["dag"]["tasks"] = len(STAGE_IDS) + 1
         self.reject("install_record_invalid", lambda: ir.validate_install_record(bad))
@@ -401,15 +764,27 @@ class InterfaceRecordTests(unittest.TestCase):
         bad = install_record()
         bad["journal"][0]["evidence"] = []
         self.reject("install_record_invalid", lambda: ir.validate_install_record(bad))
-        bad = install_record(previous=True)
-        bad["ends"]["windows"]["release"]["source_commit"] = OTHER_COMMIT
-        ir.validate_install_record(bad)  # per-end identity is checked against that end's health, not the record
         bad = install_record()
         bad["journal"][0]["seq"] = 2
         self.reject("install_record_invalid", lambda: ir.validate_install_record(bad))
         bad = install_record()
         bad["snapshot"]["token"] = "secret"
         self.reject("install_record_invalid", lambda: ir.validate_install_record(bad))
+        self.reject(
+            "install_record_invalid", lambda: ir.validate_install_record(install_record(), previous_required=True)
+        )
+
+    def test_endpoint_matches_install_record_helper(self) -> None:
+        record = install_record()
+        payload = health(True)
+        payload["install"] = {"config_digest": OTHER_HEX, "install_id": "ep-7"}
+        ir.require_endpoint_matches_install_record(payload, record)
+        bad = copy.deepcopy(payload)
+        bad["install"]["config_digest"] = HEX
+        self.reject("endpoint_end_mismatch", lambda: ir.require_endpoint_matches_install_record(bad, record))
+        bad = copy.deepcopy(payload)
+        bad["release"]["source_commit"] = OTHER_COMMIT
+        self.reject("release_identity_mismatch", lambda: ir.require_endpoint_matches_install_record(bad, record))
 
     def test_install_record_validation_is_static(self) -> None:
         source = Path(ir.__file__).read_text(encoding="utf-8")
@@ -427,14 +802,20 @@ class InterfaceRecordTests(unittest.TestCase):
         with mock.patch("socket.socket", side_effect=AssertionError("no network in validation")):
             ir.validate_install_record(install_record(previous=True))
 
-    def test_delivery_manifest_subject_binding(self) -> None:
+    def test_delivery_manifest_subject_records(self) -> None:
         manifest_value = manifest()
         ir.validate_delivery_manifest(manifest_value)
         bad = copy.deepcopy(manifest_value)
         bad["subject"]["digest"] = OTHER_HEX
         self.reject("delivery_manifest_subject_mismatch", lambda: ir.validate_delivery_manifest(bad))
         bad = copy.deepcopy(manifest_value)
-        bad["subject"]["files"] = dict(reversed(list(bad["subject"]["files"].items())))
+        bad["subject"]["files"][0].pop("bytes")
+        self.reject("delivery_manifest_invalid", lambda: ir.validate_delivery_manifest(bad))
+        bad = copy.deepcopy(manifest_value)
+        bad["subject"]["files"] = list(reversed(bad["subject"]["files"]))
+        self.reject("delivery_manifest_invalid", lambda: ir.validate_delivery_manifest(bad))
+        bad = copy.deepcopy(manifest_value)
+        bad["subject"]["files"][1]["path"] = bad["subject"]["files"][0]["path"]
         self.reject("delivery_manifest_invalid", lambda: ir.validate_delivery_manifest(bad))
         bad = copy.deepcopy(manifest_value)
         bad["extra"] = True
