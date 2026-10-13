@@ -652,9 +652,22 @@ class LifecycleTests(unittest.TestCase):
             '    fi\n'
             "    echo '{\"passed\":true,\"verb\":\"promote\",\"generation\":\"gen-2\","
             "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\"}' ;;\n"
-            "  *\"-Verb status\"*) echo '{\"passed\":true,\"verb\":\"status\",\"last_promotion\":"
-            "{\"generation\":\"C:/description-e2e/state/lifecycle/gen-2/generation\","
-            "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\"}}' ;;\n"
+            "  *\"-Verb status\"*)\n"
+            '    if [ "${FIXTURE_STATUS:-switched}" = "before" ]; then\n'
+            "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
+            "{\"execute\":\"C:/description-e2e/runtime/Scripts/description.exe\","
+            "\"arguments\":\"serve --config C:/description-e2e/state/endpoint.json\",\"state\":\"Running\"},"
+            "\"pending\":null,\"last_promotion\":null}'\n"
+            "    else\n"
+            "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
+            "{\"execute\":\"C:/description-e2e/state/lifecycle/gen-2/generation/runtime/Scripts/description.exe\","
+            "\"arguments\":\"serve --config C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\","
+            "\"state\":\"Running\"},"
+            "\"pending\":{\"intent\":true,\"verb\":\"promote\","
+            "\"generation\":\"C:/description-e2e/state/lifecycle/gen-2/generation\","
+            "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\"},"
+            "\"last_promotion\":null}'\n"
+            "    fi ;;\n"
             "  *\"-Verb rollback\"*) echo '{\"passed\":true,\"verb\":\"rollback\","
             "\"restored_from\":\"C:/description-e2e/state/instance-promotions/previous-0001\"}' ;;\n"
             "  *\"-Verb health\"*) cat \"$FIXTURE_HEALTH_FILE\" ;;\n"
@@ -1510,9 +1523,22 @@ class InstallOrderingTests(unittest.TestCase):
             "  *\"-Verb rollback\"*) echo '{\"passed\":true,\"verb\":\"rollback\","
             "\"restored_from\":\"C:/description-e2e/state/instance-promotions/previous-0001\"}' ;;\n"
             "  *\"-Verb health\"*) cat \"$FIXTURE_HEALTH_FILE\" ;;\n"
-            "  *\"-Verb status\"*) echo '{\"passed\":true,\"verb\":\"status\",\"last_promotion\":"
-            "{\"generation\":\"C:/description-e2e/state/lifecycle/gen-2/generation\","
-            "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\"}}' ;;\n"
+            "  *\"-Verb status\"*)\n"
+            '    if [ "${FIXTURE_STATUS:-switched}" = "before" ]; then\n'
+            "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
+            "{\"execute\":\"C:/description-e2e/runtime/Scripts/description.exe\","
+            "\"arguments\":\"serve --config C:/description-e2e/state/endpoint.json\",\"state\":\"Running\"},"
+            "\"pending\":null,\"last_promotion\":null}'\n"
+            "    else\n"
+            "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
+            "{\"execute\":\"C:/description-e2e/state/lifecycle/gen-2/generation/runtime/Scripts/description.exe\","
+            "\"arguments\":\"serve --config C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\","
+            "\"state\":\"Running\"},"
+            "\"pending\":{\"intent\":true,\"verb\":\"promote\","
+            "\"generation\":\"C:/description-e2e/state/lifecycle/gen-2/generation\","
+            "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\"},"
+            "\"last_promotion\":null}'\n"
+            "    fi ;;\n"
             "esac\n"
             "exit 0\n",
         )
@@ -1859,6 +1885,41 @@ class InstallOrderingTests(unittest.TestCase):
             rolled = {row["step"]: row["status"] for row in final["steps"] if row["verb"] == "rollback"}
             self.assertEqual(rolled["rollback-windows"], "completed")
             self.assertEqual(rolled["rollback-linux"], "completed")
+            # The accepted remote switch is actually restored: exactly one bound rollback call.
+            lines = Path(tmp, "order.log").read_text(encoding="utf-8").splitlines()
+            rollback_calls = [line for line in lines if line.startswith("ssh ") and "-Verb rollback" in line]
+            self.assertEqual(len(rollback_calls), 1, lines[-8:])
+            self.assertIn("previous-0001", rollback_calls[0])
+            self.assertEqual(
+                len([line for line in lines if line.startswith("ssh ") and "-Verb status" in line]), 1
+            )
+
+    def test_ack_loss_with_live_before_state_records_never_switched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, _ = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            self.assertEqual(self._install(release, control_env).returncode, 0)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            self._health_double(release, control_env)
+            self.assertEqual(self._maintenance(release, control_env, "stage", "gen-2").returncode, 0)
+            self._clone_generation_stubs(state)
+            lost = self._maintenance(release, dict(control_env, FIXTURE_ACK_LOSS="1"), "promote", "gen-2")
+            self.assertEqual(lost.returncode, 1)
+            reconciled = self._maintenance(
+                release, dict(control_env, FIXTURE_STATUS="before"), "rollback", "gen-2"
+            )
+            self.assertEqual(reconciled.returncode, 0, reconciled.stdout + reconciled.stderr)
+            self.assertEqual(
+                json.loads((state / "install-record.json").read_text(encoding="utf-8"))["install_id"], "gen-1"
+            )
+            final = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
+            rolled = {row["step"]: row["status"] for row in final["steps"] if row["verb"] == "rollback"}
+            self.assertEqual(rolled["rollback-windows"], "completed")
+            lines = Path(tmp, "order.log").read_text(encoding="utf-8").splitlines()
+            self.assertFalse(
+                [line for line in lines if line.startswith("ssh ") and "-Verb rollback" in line],
+                "a provably unswitched endpoint must not receive a rollback",
+            )
 
     def test_not_ready_postgres_fails_before_migration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -101,12 +101,19 @@ if ($Verb -eq 'health') {
 }
 
 if ($Verb -eq 'status') {
-  # Read-only relay of the endpoint's own last recorded maintenance result: the platform host
-  # reconciles an unacknowledged switch from this instead of resending it.
+  # Read-only relay of the LIVE task facts plus the maintenance records: the platform host
+  # reconciles an unacknowledged switch from what the task actually runs, never by resending it.
+  $live = $null
+  if ($task) {
+    $live = @{execute=$task.Actions[0].Execute; arguments=$task.Actions[0].Arguments; state=[string]$task.State}
+  }
+  $pending = $null
+  $pendingPath = Join-Path $promotions 'pending-promotion.json'
+  if (Test-Path -LiteralPath $pendingPath) { $pending = Read-Json $pendingPath }
   $last = $null
   $lastPath = Join-Path $promotions 'last-promotion.json'
   if (Test-Path -LiteralPath $lastPath) { $last = Read-Json $lastPath }
-  Emit @{passed=$true; verb='status'; last_promotion=$last}
+  Emit @{passed=$true; verb='status'; live_task=$live; pending=$pending; last_promotion=$last}
   exit 0
 }
 
@@ -165,6 +172,11 @@ if ($Verb -eq 'promote') {
   New-Item -ItemType Directory -Path $previous | Out-Null
   Export-ScheduledTask -TaskName $binding.task_name | Set-Content -LiteralPath (Join-Path $previous 'task.xml') -Encoding UTF8
   Copy-Item -LiteralPath $previousConfig -Destination (Join-Path $previous 'endpoint-before.json')
+  # The intent record is written BEFORE anything switches: even a mid-switch death leaves the
+  # generation identity and the bound previous generation on record.
+  Write-Receipt (Join-Path $promotions 'pending-promotion.json') @{
+    intent=$true; verb='promote'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
+    previous=$previous; task_before=(Join-Path $previous 'task.xml')}
   $action = New-ScheduledTaskAction -Execute (Runtime-Launcher $StageDir) `
     -Argument ('serve --config "' + (Config-Path $StageDir) + '"') -WorkingDirectory $binding.state_root
   Set-ScheduledTask -TaskName $binding.task_name -Action $action | Out-Null

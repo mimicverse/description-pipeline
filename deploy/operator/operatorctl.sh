@@ -935,22 +935,46 @@ except Exception:
         promotion_step "$ROLLBACK_ID" rollback rollback-windows unknown "$RECEIPT_DIR/windows-status.out"
         die "the endpoint status is unreadable; the Windows end cannot be reconciled (the admission stays closed)"
       fi
-      PREVIOUS_GENERATION_DIR="$(python3 - "$WINDOWS_STATUS" "$ROLLBACK_ID" <<'PY'
+      RECONCILIATION="$(python3 - "$RECEIPT_DIR/windows-binding.json" "$WINDOWS_STATUS" <<'PY'
 import json
 import sys
 
-document = json.load(open(sys.argv[1], encoding="utf-8"))
-last = document.get("last_promotion")
-if (
-    document.get("passed") is True
-    and document.get("verb") == "status"
-    and isinstance(last, dict)
-    and str(last.get("generation", "")).replace("\\", "/").endswith("/" + sys.argv[2])
-    and last.get("previous")
-):
-    print(last["previous"])
+def normalize(value):
+    return str(value or "").replace("\\", "/").rstrip("/")
+
+binding = json.load(open(sys.argv[1], encoding="utf-8"))
+status = json.load(open(sys.argv[2], encoding="utf-8"))
+expected = normalize(binding.get("dir")) + "/generation"
+live = status.get("live_task") if isinstance(status, dict) else None
+if not isinstance(live, dict) or not normalize(live.get("arguments")):
+    print("unknown")
+    raise SystemExit(0)
+arguments = normalize(live.get("arguments"))
+records = [row for row in (status.get("pending"), status.get("last_promotion")) if isinstance(row, dict)]
+record = next((row for row in records if normalize(row.get("generation")) == expected), None)
+if expected not in arguments:
+    # The live task provably does not run this generation: nothing was switched.
+    print("before")
+elif record is not None and normalize(record.get("previous")):
+    print(record["previous"])
+else:
+    # The task runs this generation but no bound previous generation is on record: the state is
+    # not provably recoverable.
+    print("unknown")
 PY
 )"
+      case "$RECONCILIATION" in
+        before)
+          PREVIOUS_GENERATION_DIR=""
+          ;;
+        /*|*:*)
+          PREVIOUS_GENERATION_DIR="$RECONCILIATION"
+          ;;
+        *)
+          promotion_step "$ROLLBACK_ID" rollback rollback-windows unknown "$RECEIPT_DIR/windows-status.out"
+          die "the endpoint state is not provably recoverable (the admission stays closed); the unacknowledged switch is never resent"
+          ;;
+      esac
     fi
     # Rollback is a maintenance switch too: the current ends close, drain and stop first.
     if ! platform_close_admission "rollback" "operatorctl rollback" > "$EVIDENCE_DIR/rollback-close.out" 2>&1; then
