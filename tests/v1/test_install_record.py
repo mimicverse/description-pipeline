@@ -284,7 +284,7 @@ class InstallRecordTests(unittest.TestCase):
             (
                 "snapshot without storage",
                 lambda i, r: (r / "state" / "snapshots" / "gen-1.json").write_text("{}", encoding="utf-8"),
-                "missing keys",
+                "schema_version",
             ),
             ("bad install id", lambda i, r: None, "install_id is malformed"),
         )
@@ -544,6 +544,56 @@ class InstallRecordTests(unittest.TestCase):
     def test_no_production_task_or_path_fallback_exists(self):
         source = (OPERATOR / "install_record.py").read_text(encoding="utf-8")
         self.assertNotIn("description-v1-endpoint", source)
+
+    def test_verify_active_consumes_the_canonical_validator(self):
+        with tempfile.TemporaryDirectory(prefix="verify-active-") as temporary:
+            root = Path(temporary)
+            config_path = root / "platform.json"
+            config_path.write_text(json.dumps(platform_document(root)), encoding="utf-8")
+            resolved = platform_config.validate_platform(json.loads(config_path.read_text(encoding="utf-8")))
+            snapshot = platform_config.build_snapshot(
+                resolved,
+                platform_json_sha256=hashlib.sha256(config_path.read_bytes()).hexdigest(),
+                install_id="gen-1",
+                generated_at=TIMESTAMP,
+            )
+            snapshot_path = platform_config.write_snapshot(snapshot, root / "state" / "snapshots")
+            make_release(root)
+            make_endpoint_identity(root)
+            dag = make_dag(root)
+            release = install_record.release_identity(
+                json.loads((root / "distribution" / "release.json").read_text(encoding="utf-8"))
+            )
+            endpoint = install_record.endpoint_identity(
+                json.loads((root / "endpoint-identity.json").read_text(encoding="utf-8"))
+            )
+            record = install_record.build_install_record(
+                install_id="gen-1",
+                timestamp=TIMESTAMP,
+                snapshot_path=snapshot_path,
+                release=release,
+                endpoint=endpoint,
+                services=list(SERVICES),
+                dag_file=dag,
+            )
+            install_record.write_install_record(record, root / "state")
+            verified = install_record.verify_active_generation(config_path, root / "state")
+            self.assertEqual(verified["install_id"], "gen-1")
+
+            record_path = root / "state" / "install-record.json"
+            broken = json.loads(record_path.read_text(encoding="utf-8"))
+            broken["previous"] = {"release": {}, "config": {"path": "/x", "digest": "a" * 64}, "record": "/y"}
+            record_path.write_text(json.dumps(broken), encoding="utf-8")
+            with self.assertRaises(SystemExit) as raised:
+                install_record.verify_active_generation(config_path, root / "state")
+            self.assertIn("install record invalid", str(raised.exception))
+
+            broken["previous"] = None
+            broken["timestamp"] = "2026-99-99T00:00:00Z"
+            record_path.write_text(json.dumps(broken), encoding="utf-8")
+            with self.assertRaises(SystemExit) as raised:
+                install_record.verify_active_generation(config_path, root / "state")
+            self.assertIn("install record invalid", str(raised.exception))
 
 
 if __name__ == "__main__":

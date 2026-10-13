@@ -1,10 +1,15 @@
-"""Operational lifecycle projection for the drain/stop gates (single owner).
+"""Operational lifecycle projection for the drain/stop gates (C consumer).
 
-Service control consumes this projection; it never scans run artifacts.  The scheduler half
-reads Airflow's PostgreSQL state (dag_run/task_instance) - the shared platform authority owned
-with A.  Platform outcome rows (``unresolved``/publishing) attach to the same projection when
-the platform schema lands; until then they arrive solely through this entry point and are never
-re-derived from files by service control.
+Domain split (joint with A): A owns the platform business state in the deployment PostgreSQL -
+the same instance, a separate schema and separate privileges: requests, runs, stage receipts and
+publish intents are the business authority.  This module is the consumer entry for the
+operatorctl gates; service control never scans run artifacts and never substitutes scheduler
+state for business receipts.
+
+The projection is fail-closed: only recognized terminal outcomes settle.  Unresolved, unknown
+and NULL states block drain completion, and every non-terminal object blocks stop.  The
+scheduler observation below queries Airflow rows without any state pre-filter so NULL/unknown
+states are never silently dropped.
 
 Exit codes: 0 projection satisfies the requested requirement; 1 it does not; 2 usage.
 """
@@ -15,20 +20,44 @@ import argparse
 import json
 import sys
 
-#: Scheduler states that mean work is still in flight (Airflow task_instance vocabulary).
-ACTIVE_STATES = frozenset(
-    {"running", "queued", "scheduled", "up_for_retry", "up_for_reschedule", "restarting", "deferred"}
+#: Recognized terminal outcomes across the platform vocabulary (runs, stages, publish intents).
+TERMINAL_STATES = frozenset({"succeeded", "success", "published", "completed", "failed", "cancelled"})
+#: Recognized non-terminal work still progressing (blocks stop; drain may complete).
+IN_FLIGHT_STATES = frozenset(
+    {
+        "pending",
+        "queued",
+        "running",
+        "scheduled",
+        "up_for_retry",
+        "up_for_reschedule",
+        "restarting",
+        "deferred",
+        "publishing",
+        "cancel_requested",
+    }
 )
 UNRESOLVED_STATES = frozenset({"unresolved"})
-UNKNOWN_STATES = frozenset({"", "unknown"})
 
 
 def classify(rows) -> dict:
-    """Split projection rows into in-flight, unresolved and unknown outcomes."""
+    """Split projection rows into in-flight, unresolved and unknown outcomes (fail-closed).
 
-    in_flight = [row for row in rows if str(row.get("state") or "") in ACTIVE_STATES]
-    unresolved = [row for row in rows if str(row.get("state") or "") in UNRESOLVED_STATES]
-    unknown = [row for row in rows if str(row.get("state") or "") in UNKNOWN_STATES]
+    Anything that is not a recognized terminal state lands in in-flight, unresolved or unknown;
+    unrecognized vocabulary - including NULL/empty states - is unknown and blocks both gates.
+    """
+
+    in_flight, unresolved, unknown = [], [], []
+    for row in rows:
+        state = str(row.get("state") or "")
+        if state in TERMINAL_STATES:
+            continue
+        if state in UNRESOLVED_STATES:
+            unresolved.append(row)
+        elif state in IN_FLIGHT_STATES:
+            in_flight.append(row)
+        else:
+            unknown.append(row)
     return {
         "in_flight": in_flight,
         "unresolved": unresolved,
@@ -37,27 +66,33 @@ def classify(rows) -> dict:
     }
 
 
+def observe(session, dag_run_model, task_instance_model) -> list[dict]:
+    """Real ORM walk: rows are observed unfiltered so NULL/unknown states stay visible."""
+
+    rows: list[dict] = []
+    for run in session.query(dag_run_model).all():
+        rows.append({"run_id": run.run_id, "state": run.state, "kind": "dag_run"})
+    for instance in session.query(task_instance_model).all():
+        rows.append(
+            {
+                "run_id": instance.run_id,
+                "task_id": instance.task_id,
+                "state": instance.state,
+                "kind": "task_instance",
+            }
+        )
+    return rows
+
+
 def collect_airflow() -> list[dict]:
-    """Read the non-terminal scheduler state from Airflow's PostgreSQL."""
+    """Read the scheduler half through the real ORM walk above (unfiltered)."""
 
     from airflow.models.dagrun import DagRun  # noqa: PLC0415
     from airflow.models.taskinstance import TaskInstance  # noqa: PLC0415
     from airflow.utils.session import create_session  # noqa: PLC0415
 
-    rows: list[dict] = []
     with create_session() as session:
-        for run in session.query(DagRun).filter(DagRun.state.in_(tuple(sorted(ACTIVE_STATES)))).all():
-            rows.append({"run_id": run.run_id, "state": str(run.state), "kind": "dag_run"})
-        for instance in session.query(TaskInstance).filter(TaskInstance.state.in_(tuple(sorted(ACTIVE_STATES)))).all():
-            rows.append(
-                {
-                    "run_id": instance.run_id,
-                    "task_id": instance.task_id,
-                    "state": str(instance.state),
-                    "kind": "task_instance",
-                }
-            )
-    return rows
+        return observe(session, DagRun, TaskInstance)
 
 
 def main(argv: list[str] | None = None, *, collect=collect_airflow) -> int:

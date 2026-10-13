@@ -33,13 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from platform_config import (  # noqa: E402  (shared helpers)
-    atomic_write_once,
-    canonical,
-    reject_secret_keys,
-    require_keys,
-    validate_snapshot_document,
-)
+from platform_config import SNAPSHOT_SCHEMA, atomic_write_once, canonical  # noqa: E402  (shared helpers)
 
 INSTALL_RECORD_SCHEMA = "solidworks-to-urdf.install-record/v1"
 RELEASE_SCHEMA = "solidworks-to-urdf.release/v1"
@@ -190,169 +184,14 @@ def require_matching_release(release: dict, endpoint: dict) -> None:
     require(not differing, f"endpoint release identity mismatch on {differing}")
 
 
-def validate_install_record_document(record) -> dict:
-    """Local mirror of the frozen IF-16 install-record validator (parity-tested)."""
+def _canonical_records():
+    """The frozen contract implementation from the single schema owner (mandatory)."""
 
-    keys = {
-        "schema_version",
-        "install_id",
-        "timestamp",
-        "snapshot",
-        "release",
-        "services",
-        "paths",
-        "dag",
-        "ends",
-        "previous",
-        "journal",
-    }
-    require_keys(record, allowed=keys, required=keys, where="install record")
-    require(
-        record["schema_version"] == INSTALL_RECORD_SCHEMA,
-        f"install record schema_version must be {INSTALL_RECORD_SCHEMA}",
-    )
-    install_id = _text(record["install_id"], "install record install_id")
-    require(
-        bool(_RFC3339_UTC.match(_text(record["timestamp"], "install record timestamp"))),
-        "install record timestamp must be RFC3339 UTC",
-    )
-    snapshot = record["snapshot"]
-    require_keys(
-        snapshot,
-        allowed={"path", "digest", "install_id"},
-        required={"path", "digest", "install_id"},
-        where="install record snapshot",
-    )
-    _text(snapshot["path"], "install record snapshot.path")
-    _hex64(snapshot["digest"], "install record snapshot.digest")
-    require(
-        _text(snapshot["install_id"], "install record snapshot.install_id") == install_id,
-        "install record snapshot.install_id must equal the record install_id",
-    )
-    release = record["release"]
-    require_keys(
-        release,
-        allowed={"version", "source_commit", "source_sha256", "artifacts"},
-        required={"version", "source_commit", "source_sha256", "artifacts"},
-        where="install record release",
-    )
-    version = _text(release["version"], "install record release.version")
-    commit = _text(release["source_commit"], "install record release.source_commit")
-    require(bool(_COMMIT.match(commit)), "install record release.source_commit is malformed")
-    source_sha = _hex64(release["source_sha256"], "install record release.source_sha256")
-    artifacts = release["artifacts"]
-    require(
-        isinstance(artifacts, list) and bool(artifacts), "install record release.artifacts must be a non-empty list"
-    )
-    for index, artifact in enumerate(artifacts):
-        require_keys(
-            artifact,
-            allowed={"name", "sha256"},
-            required={"name", "sha256"},
-            where=f"install record release.artifacts[{index}]",
-        )
-        _text(artifact["name"], f"install record release.artifacts[{index}].name")
-        _hex64(artifact["sha256"], f"install record release.artifacts[{index}].sha256")
-    services = record["services"]
-    require(
-        isinstance(services, list) and bool(services) and all(isinstance(unit, str) and unit for unit in services),
-        "install record services must be a non-empty list of unit names",
-    )
-    paths = record["paths"]
-    require(
-        isinstance(paths, dict)
-        and bool(paths)
-        and all(isinstance(key, str) and isinstance(value, str) and value for key, value in paths.items()),
-        "install record paths must be a non-empty string map",
-    )
-    dag = record["dag"]
-    require_keys(
-        dag,
-        allowed={"id", "path", "digest", "tasks"},
-        required={"id", "path", "digest", "tasks"},
-        where="install record dag",
-    )
-    _text(dag["id"], "install record dag.id")
-    _text(dag["path"], "install record dag.path")
-    _hex64(dag["digest"], "install record dag.digest")
-    require(dag["tasks"] == DAG_TASK_COUNT, f"install record dag.tasks must be {DAG_TASK_COUNT}")
-    ends = record["ends"]
-    require_keys(ends, allowed={"linux", "windows"}, required={"linux", "windows"}, where="install record ends")
-    for side, role in (("linux", "portable"), ("windows", "native")):
-        end = ends[side]
-        require_keys(
-            end,
-            allowed={"install_id", "config_digest", "release"},
-            required={"install_id", "config_digest", "release"},
-            where=f"install record ends.{side}",
-        )
-        _text(end["install_id"], f"install record ends.{side}.install_id")
-        _hex64(end["config_digest"], f"install record ends.{side}.config_digest")
-        end_release = end["release"]
-        require_keys(
-            end_release,
-            allowed={"version", "source_commit", "source_sha256", "role"},
-            required={"version", "source_commit", "source_sha256", "role"},
-            where=f"install record ends.{side}.release",
-        )
-        require(end_release["role"] == role, f"install record ends.{side}.release.role must be {role}")
-        for key, value in (("version", version), ("source_commit", commit), ("source_sha256", source_sha)):
-            require(
-                end_release[key] == value,
-                f"install record ends.{side}.release.{key} must equal the common release identity",
-            )
-    require(
-        ends["linux"]["install_id"] == install_id,
-        "install record ends.linux.install_id must equal the record install_id",
-    )
-    require(
-        ends["linux"]["config_digest"] == snapshot["digest"],
-        "install record ends.linux.config_digest must equal the snapshot digest",
-    )
-    previous = record["previous"]
-    if previous is not None:
-        require_keys(
-            previous,
-            allowed={"release", "config", "record"},
-            required={"release", "config", "record"},
-            where="install record previous",
-        )
-        require(isinstance(previous["release"], dict), "install record previous.release must be an object")
-        require_keys(
-            previous["config"],
-            allowed={"path", "digest"},
-            required={"path", "digest"},
-            where="install record previous.config",
-        )
-        _text(previous["config"]["path"], "install record previous.config.path")
-        _hex64(previous["config"]["digest"], "install record previous.config.digest")
-        _text(previous["record"], "install record previous.record")
-    journal = record["journal"]
-    require(isinstance(journal, list), "install record journal must be a list")
-    for index, step in enumerate(journal):
-        require_keys(
-            step,
-            allowed={"seq", "verb", "step", "status", "at", "evidence"},
-            required={"seq", "verb", "step", "status", "at", "evidence"},
-            where=f"install record journal[{index}]",
-        )
-        require(step["seq"] == index + 1, f"install record journal[{index}].seq must be sequential")
-        require(step["verb"] in {"promote", "rollback"}, f"install record journal[{index}].verb is unknown")
-        _text(step["step"], f"install record journal[{index}].step")
-        require(
-            step["status"] in {"completed", "failed", "unknown"}, f"install record journal[{index}].status is unknown"
-        )
-        require(
-            bool(_RFC3339_UTC.match(_text(step["at"], f"install record journal[{index}].at"))),
-            f"install record journal[{index}].at must be RFC3339 UTC",
-        )
-        evidence = step["evidence"]
-        require(
-            isinstance(evidence, list) and bool(evidence) and all(isinstance(item, str) and item for item in evidence),
-            f"install record journal[{index}].evidence must be a non-empty list",
-        )
-    reject_secret_keys(record, "install record")
-    return record
+    try:
+        from description_pipeline import interface_records  # noqa: PLC0415
+    except ImportError as error:
+        die(f"cannot import the canonical schema module (run with the deployment interpreter): {error}")
+    return interface_records
 
 
 def verify_active_generation(config_path: Path, state_root: Path) -> dict:
@@ -362,10 +201,11 @@ def verify_active_generation(config_path: Path, state_root: Path) -> dict:
     require(config_path.is_file(), f"config file not found: {config_path}")
     record_path = state_root / "install-record.json"
     require(record_path.is_file(), f"not installed: install record missing at {record_path} (run install first)")
+    interface_records = _canonical_records()
     try:
-        record = validate_install_record_document(json.loads(record_path.read_text(encoding="utf-8")))
-    except (UnicodeDecodeError, ValueError) as error:
-        die(f"cannot read install record {record_path}: {error}")
+        record = interface_records.validate_install_record(json.loads(record_path.read_text(encoding="utf-8")))
+    except Exception as error:
+        die(f"install record invalid: {error}")
     snapshot_path = Path(record["snapshot"]["path"])
     require(snapshot_path.is_file(), f"snapshot missing: {snapshot_path}")
     snapshot_bytes = snapshot_path.read_bytes()
@@ -378,7 +218,10 @@ def verify_active_generation(config_path: Path, state_root: Path) -> dict:
         document = json.loads(snapshot_bytes.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as error:
         die(f"cannot parse snapshot {snapshot_path}: {error}")
-    validate_snapshot_document(document)
+    try:
+        interface_records.validate_config_snapshot(document)
+    except Exception as error:
+        die(f"snapshot invalid: {error}")
     require(
         document["install_id"] == record["install_id"],
         "snapshot generation does not match the install record",
@@ -454,7 +297,10 @@ def build_install_record(
         snapshot_document = json.loads(snapshot_bytes.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as error:
         die(f"cannot parse snapshot {snapshot_path}: {error}")
-    validate_snapshot_document(snapshot_document)
+    require(
+        snapshot_document.get("schema_version") == SNAPSHOT_SCHEMA,
+        f"snapshot schema_version must be {SNAPSHOT_SCHEMA}",
+    )
     actual_install_id = snapshot_document["install_id"]
     require(
         actual_install_id == install_id,

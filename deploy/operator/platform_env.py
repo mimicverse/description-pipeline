@@ -32,7 +32,7 @@ from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from platform_config import atomic_write_once, canonical, validate_snapshot_document  # noqa: E402  (shared helpers)
+from platform_config import SNAPSHOT_SCHEMA, atomic_write_once, canonical  # noqa: E402  (shared helpers)
 from install_record import release_identity, wheel_binding  # noqa: E402  (single release/asset binding)
 from render_operator import PORT_DEFAULTS  # noqa: E402  (single deploy-layer port source, DEP-01)
 
@@ -80,13 +80,18 @@ def derive(
     """Return ``{env, env_path, derived_dir, wheel}`` for one install generation."""
 
     require(bool(install_id) and all(character not in install_id for character in "\n\r/"), "install_id is malformed")
-    validate_snapshot_document(snapshot)
-    declared = snapshot["install_id"]
+    require(
+        snapshot.get("schema_version") == SNAPSHOT_SCHEMA,
+        f"snapshot schema_version must be {SNAPSHOT_SCHEMA}",
+    )
+    declared = snapshot.get("install_id")
+    require(isinstance(declared, str) and bool(declared), "snapshot install_id is missing")
     require(
         declared == install_id,
         f"snapshot generation mismatch: the snapshot declares {declared!r}, the request is {install_id!r}",
     )
-    resolved = snapshot["resolved"]
+    resolved = snapshot.get("resolved")
+    require(isinstance(resolved, dict), "snapshot resolved tree is missing")
     storage = resolved.get("storage")
     windows = resolved.get("windows")
     operator = resolved.get("operator")

@@ -42,7 +42,11 @@ def base_env(state: Path, **overrides: str) -> dict[str, str]:
 
 
 def run(cmd: list[str], env: dict[str, str], cwd: Path = ROOT) -> subprocess.CompletedProcess:
-    merged = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(Path.home())}
+    merged = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(Path.home()),
+        "PYTHONPATH": str(ROOT / "src"),
+    }
     merged.update(env)
     return subprocess.run(cmd, capture_output=True, text=True, env=merged, cwd=str(cwd))
 
@@ -194,6 +198,9 @@ def platform_fixture(
         key, _, value = line.partition("=")
         if key:
             env[key] = value
+    venv_bin = Path(env["AIRFLOW_VENV"]) / "bin"
+    venv_bin.mkdir(parents=True, exist_ok=True)
+    write_stub(venv_bin / "python", '#!/bin/bash\nexec python3 "$@"\n')
     identity_path = tmp / "endpoint-identity.json"
     identity_path.write_text(
         json.dumps(
@@ -610,7 +617,7 @@ class LifecycleTests(unittest.TestCase):
         write_stub(bindir / "systemctl", '#!/bin/bash\necho "systemctl $*" >> "$ORDER_LOG"\n')
         write_stub(bindir / "sleep", "#!/bin/bash\nexit 0\n")
         venv = Path(derived_env["AIRFLOW_VENV"]) / "bin"
-        venv.mkdir(parents=True)
+        venv.mkdir(parents=True, exist_ok=True)
         write_stub(
             venv / "airflow",
             '#!/bin/bash\necho "airflow $*" >> "$ORDER_LOG"\n'
@@ -629,7 +636,13 @@ class LifecycleTests(unittest.TestCase):
             venv / "python",
             "#!/bin/bash\n"
             'case "$*" in\n'
+            "  *install_record.py*)\n"
+            '    exec python3 "$@" ;;\n'
             '  "-m description_pipeline.orchestration.lifecycle_state"*)\n'
+            "    python3 -c 'import json,os; from pathlib import Path; "
+            'Path(os.environ["LIFECYCLE_ENV_LOG"]).write_text(json.dumps('
+            '{"home": os.environ.get("AIRFLOW_HOME"), "expected_home": os.environ["EXPECTED_LIFECYCLE_HOME"]}))\'\n'
+            '    [ "${AIRFLOW_HOME:-}" = "$EXPECTED_LIFECYCLE_HOME" ] || exit 77\n'
             '    if [ -n "$PROJECTION_FILE" ] && [ -f "$PROJECTION_FILE" ]; then cat "$PROJECTION_FILE"; fi\n'
             '    exit "${PROJECTION_RC:-0}" ;;\n'
             "esac\n"
@@ -662,6 +675,8 @@ class LifecycleTests(unittest.TestCase):
             "UNPAUSE_RC": str(unpause_rc),
             "PAUSE_RC": str(pause_rc),
             "PROJECTION_FILE": str(projection),
+            "LIFECYCLE_ENV_LOG": str(tmp / "query-environment.json"),
+            "EXPECTED_LIFECYCLE_HOME": str(state / "airflow-home"),
         }
         return config_path, env, admission, order
 
@@ -790,6 +805,38 @@ class LifecycleTests(unittest.TestCase):
             result = run(["bash", str(CONTROL), "drain", "--config", str(config_path)], env)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('"run_id": "run-active"', result.stdout)
+
+    def test_gates_query_with_the_installed_airflow_home(self) -> None:
+        for action in ("drain", "stop"):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as tmp:
+                config_path, env, _, _ = self._admission_fixture(Path(tmp))
+                result = run(["bash", str(CONTROL), action, "--config", str(config_path)], env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                observed = json.loads(Path(env["LIFECYCLE_ENV_LOG"]).read_text(encoding="utf-8"))
+                self.assertEqual(observed["home"], observed["expected_home"])
+
+    def test_operational_entry_rejects_canonical_validator_divergence(self) -> None:
+        def break_previous(record: dict) -> None:
+            record["previous"] = {"release": {}, "config": {"path": "/x", "digest": "a" * 64}, "record": "/y"}
+
+        for label, mutate in (
+            ("previous.release", break_previous),
+            ("impossible timestamp", lambda record: record.__setitem__("timestamp", "2026-99-99T00:00:00Z")),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                config_path, state, config_home, target = self._render_units(Path(tmp))
+                record_path = state / "install-record.json"
+                record = json.loads(record_path.read_text(encoding="utf-8"))
+                mutate(record)
+                record_path.write_text(json.dumps(record), encoding="utf-8")
+                before = {path: digest(path) for path in target.glob("*.service")}
+                result = run(
+                    ["bash", str(CONTROL), "status", "--config", str(config_path)],
+                    {"XDG_CONFIG_HOME": str(config_home)},
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("install record invalid", result.stderr)
+                self.assertEqual(before, {path: digest(path) for path in target.glob("*.service")})
 
     def test_units_render_and_static_health_passes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

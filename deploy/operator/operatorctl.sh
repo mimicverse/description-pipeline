@@ -96,10 +96,14 @@ install_from_config() {
 load_active_env() {
   STATE_ROOT="$(python3 "$HERE/platform_config.py" resolve --config "$CONFIG_FILE" | \
     python3 -c 'import json,sys; print(json.load(sys.stdin)["storage"]["state_root"])')" || exit $?
+  [ -f "$STATE_ROOT/resolved.env" ] || die "not installed: $STATE_ROOT/resolved.env is missing (run install first)"
+  # shellcheck disable=SC1090
+  source "$STATE_ROOT/resolved.env"
   # The operational entry verifies the complete install record, the snapshot digest and the
-  # current-config binding before anything else (one gate, injected by install_record.py).
-  ACTIVE_ID="$(python3 "$HERE/install_record.py" verify-active --config "$CONFIG_FILE" \
-    --state-root "$STATE_ROOT" | sed -n 's/^install_id=//p')" || exit $?
+  # current-config binding before anything else; the check runs with the deployment interpreter
+  # so it consumes the canonical schema implementation (single owner, no local mirror).
+  ACTIVE_ID="$(AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" \
+    verify-active --config "$CONFIG_FILE" --state-root "$STATE_ROOT" | sed -n 's/^install_id=//p')" || exit $?
   [ -n "$ACTIVE_ID" ] || die "active install record did not declare a generation"
   ENV_FILE="$STATE_ROOT/derived/$ACTIVE_ID/operator.env"
   [ -f "$ENV_FILE" ] || die "derived environment missing for generation $ACTIVE_ID; run install"
@@ -306,8 +310,8 @@ case "$ACTION" in
     # In-flight executions continue; drain completes only when no unresolved/unknown outcomes
     # remain (their closure is the reconcile bridge's job). The projection comes from the single
     # PostgreSQL authority through the platform layer - service control never scans artifacts.
-    if ! "$AIRFLOW_VENV/bin/python" -m description_pipeline.orchestration.lifecycle_state report \
-        --require-no-unresolved; then
+    if ! AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" \
+        -m description_pipeline.orchestration.lifecycle_state report --require-no-unresolved; then
       echo "drain: unresolved or unknown outcomes remain; reconcile must close them before drain completes" >&2
       exit 1
     fi
@@ -318,8 +322,9 @@ case "$ACTION" in
     # stop only when drained and settled: active, unresolved or unknown runs block it, and the
     # admission must already be closed by drain. The projection is the platform layer's, backed
     # by the single PostgreSQL authority.
-    "$AIRFLOW_VENV/bin/python" -m description_pipeline.orchestration.lifecycle_state report \
-      --require-settled >/dev/null || die "stop refused: runs are active, unresolved or unknown; run drain first"
+    AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" \
+      -m description_pipeline.orchestration.lifecycle_state report --require-settled \
+      >/dev/null || die "stop refused: runs are active, unresolved or unknown; run drain first"
     if ! AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" - <<'PY'
 # admission-closed-gate: drain closes the DAG admission before stop may run.
 import sys

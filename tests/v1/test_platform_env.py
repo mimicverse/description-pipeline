@@ -227,7 +227,6 @@ class PlatformEnvTests(unittest.TestCase):
         second_snapshot = json.loads(json.dumps(self.snapshot))
         second_snapshot["install_id"] = "gen-2"
         second_snapshot["resolved"]["targets"]["m3.0"]["base"] = "feature/review-next"
-        platform_config.validate_snapshot_document(second_snapshot)
         second = self.derive(second_snapshot, install_id="gen-2", tree_root=self.tree)
         self.assertNotEqual(first["env_path"], second["env_path"])
         self.assertEqual(Path(first["env_path"]).read_bytes(), first_env_bytes)
