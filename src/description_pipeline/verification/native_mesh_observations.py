@@ -4,7 +4,7 @@ import math
 from pathlib import Path
 
 from ..io import PipelineError
-from . import evidence_tree as ev
+from . import native_discovery as evidence
 
 
 def _require(condition, message):
@@ -13,9 +13,9 @@ def _require(condition, message):
 
 
 def verify_native_mesh_observations(bundle: Path) -> dict:
-    collection = ev.collection(bundle)
+    collection = evidence.collection(bundle)
     native = collection.get("kind") == "solidworks" and collection.get("evidence_class") == "cad"
-    rows = ev.geometry(bundle)
+    rows = evidence.geometry(bundle)
     warnings = []
     observed = 0
     for entry in rows:

@@ -26,7 +26,7 @@ from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, TOOL_SCHEMA, exporter_declarat
 from ..sources.solidworks.revision import NATIVE_SUFFIXES
 from ..interface_records import CHECK_POLICY_V1
 from ..stages import required_rows_complete
-from . import evidence_tree as ev
+from . import native_discovery as evidence
 from .consumer import load as load_consumer
 
 QUALITY_SCHEMA = "solidworks-to-urdf.quality/v1"
@@ -227,7 +227,7 @@ def _input(root, diagnostics=None):
     """
 
     diagnostics = [] if diagnostics is None else diagnostics
-    discovery_record = ev.discovery(root)
+    discovery_record = evidence.discovery(root)
     _require(isinstance(discovery_record.get("raw"), dict), "Discovery record carries no raw capture")
     raw = discovery_record["raw"]
     from .native_discovery import rebuild_interface_frames, rebuild_joint_facts, rebuild_rigid_bodies
@@ -255,7 +255,7 @@ def _input(root, diagnostics=None):
         joints = rebuild_joint_facts(discovery_record, root)
         frames = rebuild_interface_frames(discovery_record)
     source = read_source_record(root)
-    handoff = ev.handoff(root)
+    handoff = evidence.handoff(root)
     identity = source["identity"]
     _require(
         handoff.get("main_assembly") == identity["main_assembly"],
@@ -267,7 +267,7 @@ def _input(root, diagnostics=None):
     )
     robot_name = discovery_record.get("robot_name")
     _require(isinstance(robot_name, str) and robot_name, "Discovery record carries no robot name")
-    declared = ev.declared_masses(root)
+    declared = evidence.declared_masses(root)
     recorded = (handoff.get("input_receipt") or {}).get("inventory")
     if isinstance(recorded, dict) and recorded:
         archived = inventory(root / "input/cad")
@@ -319,13 +319,13 @@ def _input(root, diagnostics=None):
 
 def _native(root):
     source = read_source_record(root)
-    collection = ev.collection(root)
+    collection = evidence.collection(root)
     _require(
         collection.get("kind") == "solidworks" and collection.get("evidence_class") == "cad",
         "A release requires native SolidWorks evidence",
     )
     _require(collection.get("identity") == source["identity"], "Collection and archived source identities differ")
-    environment = ev.runtime(root)
+    environment = evidence.runtime(root)
     _require(environment == collection.get("environment"), "Environment evidence differs")
     revision = str(environment["solidworks"]["revision"])
     _require(revision.split(".")[0] == "34", "Native inertia API qualification currently covers SolidWorks 34 only")
@@ -375,7 +375,7 @@ def _native_discovery(package, diagnostics=None):
 
 
 def _dependencies(root, definition):
-    closure = ev.dependency_closure(root)
+    closure = evidence.dependency_closure(root)
     _require(not closure["declared_unresolved"], "Unresolved CAD references")
     stale_skips = _stale_stored_reference_skips(root, closure)
     _require(closure["configuration"] == definition["source"]["configuration"], "Captured another configuration")
@@ -390,7 +390,7 @@ def _dependencies(root, definition):
     # platform's frozen upload storage, so their identity is the handoff upload
     # index (name -> original digest), never an equality with the - possibly
     # engine-rewritten - copy bytes.
-    handoff = ev.handoff(root)
+    handoff = evidence.handoff(root)
     package_files = handoff.get("package_files")
     _require(isinstance(package_files, dict) and bool(package_files), "The frozen upload index is missing")
     upload_hashes = {str(checksum) for checksum in package_files.values()}
@@ -428,7 +428,7 @@ def _dependencies(root, definition):
         == {ntpath.normcase(str(path)) for path in original},
         "The copied graph does not cover the captured original files",
     )
-    record = ev.discovery(root)
+    record = evidence.discovery(root)
     selected = ((record.get("raw") or {}).get("source_selection") or {}).get("files") or {}
     for name, checksum in sorted(selected.items()):
         suffix = ntpath.normcase(str(name).replace("/", "\\"))
@@ -473,7 +473,7 @@ def _dependencies(root, definition):
     # enters the delivery tree).  The closure block is re-read against the
     # record these checks consumed, and the stability record must cover the
     # captured input inventory.
-    capture = ev.capture(root)
+    capture = evidence.capture(root)
     _require(capture.get("dependency_closure") == closure, "Capture dependency record differs")
     stability = capture.get("originals_unchanged")
     _require(
@@ -505,7 +505,7 @@ def _stale_stored_reference_skips(root: Path, closure: dict) -> int:
         return 0
     skips = closure["stale_stored_references"]
     _require(isinstance(skips, list), "Stored-reference skip record is malformed")
-    record = ev.discovery(root)
+    record = evidence.discovery(root)
     manifest = (record.get("raw") or {}).get("source_selection") or {}
     sealed = manifest.get("closure") or {}
     files = manifest.get("files") or {}
@@ -636,7 +636,7 @@ def _handoff_native_hashes(root: Path) -> set[str]:
     The raw record may only confirm a matching subset of that inventory.
     """
 
-    payload = ev.discovery(root)
+    payload = evidence.discovery(root)
     native = payload.get("files") if isinstance(payload, dict) else None
     _require(isinstance(native, list) and bool(native), "The archived native file inventory is missing")
     frozen = {str(row["path"]): str(row["sha256"]) for row in native}
@@ -980,8 +980,8 @@ def _qualified_surface_only(root, occurrence: str) -> bool:
     """
 
     try:
-        record = ev.effective_instances(root)
-        mass_properties = ev.mass_properties(root)
+        record = evidence.effective_instances(root)
+        mass_properties = evidence.mass_properties(root)
     except (PipelineError, OSError, ValueError):
         return False
     if not isinstance(record, dict) or record.get("schema_version") != EFFECTIVE_INSTANCES_SCHEMA:
@@ -1174,7 +1174,7 @@ def evaluate_bundle(root: Path, *, native_receipts=None) -> dict:
     if manifest is not None:
         gates.add("source.native", lambda: _native(root))
     model = gates.add("model.schema", lambda: _model(root))
-    raw = gates.add("source.raw", lambda: ev.scene(root))
+    raw = gates.add("source.raw", lambda: evidence.scene(root))
     gates.add("physics.mass_closure_equality", lambda: _mass_closure_equality(root, definition))
     if definition is not None:
         gates.add("source.dependencies", lambda: _dependencies(root, definition))
@@ -1260,7 +1260,7 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
     gates.add("physics.independent", lambda: _physics(root, source, model, verify_physics))
     datums = gates.add(
         "frames.native",
-        lambda: {name: _cad_pose(value) for name, value in ev.datums(root).items()},
+        lambda: {name: _cad_pose(value) for name, value in evidence.datums(root).items()},
     )
     components = gates.add(
         "frames.components", lambda: {row["name"]: _cad_pose(row["transform"]) for row in raw["components"]}
@@ -1285,7 +1285,7 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
     joints = {node.attrib["name"]: node for node in document.findall("joint")}
     model_links = {link["name"]: link for link in model["links"]}
     model_joints = {joint["name"]: joint for joint in model["joints"]}
-    axes = ev.axes(root)
+    axes = evidence.axes(root)
     axis_map = {row["joint"]: row for row in axes}
     for authored in source["joints"]:
         name = authored["name"]
@@ -1299,7 +1299,7 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
             )
     for frame in source.get("frames", []):
         gates.add("frames." + frame["name"], lambda f=frame: _frame(f, model, joints, links, datums, body_datums))
-    geometry_rows = ev.geometry(root)
+    geometry_rows = evidence.geometry(root)
     geometry = {row["component"]: row for row in geometry_rows}
     gates.add("geometry.coverage", lambda: _geometry_coverage(geometry_rows, components))
     points, used = [], []

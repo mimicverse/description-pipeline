@@ -1,4 +1,4 @@
-"""Guards for the verification evidence-tree accessors (frozen block shapes)."""
+"""Guards for the verification delivery-evidence reads (frozen block shapes)."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from description_pipeline.interface_records import check_policy_digest
 from description_pipeline.io import PipelineError, digest
 from description_pipeline.schemas import CHECK_POLICY_SCHEMA, SOURCE_RECORD_SCHEMA
 from description_pipeline.stages import CONTRACT
-from description_pipeline.verification import evidence_tree as ev
+from description_pipeline.verification import native_discovery as ev
 
 HEX = "a" * 64
 
@@ -46,7 +46,7 @@ def source_record() -> dict:
     }
 
 
-class EvidenceTreeTests(unittest.TestCase):
+class EvidenceReadTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -62,13 +62,9 @@ class EvidenceTreeTests(unittest.TestCase):
         (self.root / "evidence/native-runtime.json").write_text(json.dumps({"solidworks": {"revision": "34.0"}}))
         capture = {
             "scene": {"mass_properties": {"a": {"mass": 1}}, "coordinate_systems": {"CS_a": [[1, 0, 0, 0]] * 4}},
-            "instances": [{"name": "a", "mass": 1, "com": [0, 0, 0], "inertia": [0] * 9}],
             "components": [{"name": "a", "mass_properties": {"mass": 1}}],
             "datums": [{"name": "CS_a", "matrix": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]}],
             "axes": [{"entity": "AX_j", "kinds": ["reference_axis"]}],
-            "meshes": [
-                {"triangles": 4, "path": "a.stl", "sha256": HEX, "tessellation": {"faces": [], "no_facets_faces": []}}
-            ],
             "geometry": [{"component": "a", "faces": 1}],
             "mass_closure": {"top_level": {}, "component_context": {"instances": []}, "unassigned": []},
             "material_provenance": {"a": {"density": 1}},
@@ -99,9 +95,7 @@ class EvidenceTreeTests(unittest.TestCase):
         self.assertEqual(ev.mass_properties(self.root), {"a": {"mass": 1}})
         self.assertEqual(ev.datums(self.root)["CS_a"][0], 1)
         self.assertEqual(ev.axes(self.root)[0]["kinds"], ["reference_axis"])
-        self.assertEqual(len(ev.instances(self.root)), 1)
         self.assertEqual(len(ev.components(self.root)), 1)
-        self.assertEqual(ev.meshes(self.root)[0]["triangles"], 4)
         self.assertEqual(ev.geometry(self.root)[0]["component"], "a")
         self.assertEqual(ev.mass_closure(self.root)["unassigned"], [])
         self.assertEqual(ev.material_provenance(self.root)["a"]["density"], 1)
@@ -118,8 +112,6 @@ class EvidenceTreeTests(unittest.TestCase):
         (self.root / "evidence/capture.json").write_text(json.dumps(capture))
         with self.assertRaises(PipelineError):
             ev.material_provenance(self.root)
-        with self.assertRaises(PipelineError):
-            ev.datums(self.root / "does-not-exist")
 
 
 if __name__ == "__main__":

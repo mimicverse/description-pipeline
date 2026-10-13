@@ -17,7 +17,7 @@ import numpy as np
 from ..io import PipelineError, confined
 from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, LINK_GROUP_MASS_SCHEMA
 from ..sources.solidworks import verify as oracle
-from . import evidence_tree as ev
+from . import native_discovery as evidence
 
 MASS_RTOL = 1e-6
 MASS_CLOSURE_ATOL = 1e-12
@@ -106,7 +106,7 @@ def _require_measured_reading(measured: dict, row: dict, reference: dict, name: 
 def _unassigned_mass_rows(evidence_root: Path, source: dict) -> list[dict]:
     """The measured masses of native leaves that no selected body claims."""
 
-    scene = ev.scene(evidence_root)
+    scene = evidence.scene(evidence_root)
     rows_scene = scene.get("components") if isinstance(scene, dict) else None
     _require(isinstance(rows_scene, list), "The raw scene carries no component inventory")
     _require(
@@ -115,7 +115,7 @@ def _unassigned_mass_rows(evidence_root: Path, source: dict) -> list[dict]:
     )
     leaves = [str(row["name"]) for row in rows_scene]
     _require(len(set(leaves)) == len(leaves), "The raw scene component inventory carries duplicate names")
-    payload = ev.mass_closure(evidence_root)
+    payload = evidence.mass_closure(evidence_root)
     context = payload.get("component_context") if isinstance(payload, dict) else None
     instances = context.get("instances") if isinstance(context, dict) else None
     _require(isinstance(instances, list), "Unassigned accounting awaits the recorded component context")
@@ -166,7 +166,7 @@ def _unassigned_readings(evidence_root: Path, source: dict) -> list[dict]:
     conflicting or unqualified reading is refused.
     """
 
-    scene = ev.scene(evidence_root)
+    scene = evidence.scene(evidence_root)
     scene_rows = scene.get("components") if isinstance(scene, dict) else None
     _require(isinstance(scene_rows, list), "The raw scene carries no component inventory")
     leaves = [str(row.get("name")) for row in scene_rows if isinstance(row, dict)]
@@ -175,7 +175,7 @@ def _unassigned_readings(evidence_root: Path, source: dict) -> list[dict]:
         str(component) for body in source.get("bodies") or [] for component in body.get("components") or []
     }
     expected = sorted(set(leaves) - selected)
-    native = ev.mass_closure(evidence_root)
+    native = evidence.mass_closure(evidence_root)
     recorded = native.get("unassigned") if isinstance(native, dict) else None
     if not expected:
         _require(recorded in (None, []), "Unassigned readings recorded for a fully assigned partition")
@@ -184,7 +184,7 @@ def _unassigned_readings(evidence_root: Path, source: dict) -> list[dict]:
         isinstance(recorded, list) and len(recorded) == len(expected),
         "The unassigned partition requires an independent measured reading for every member",
     )
-    components = {str(row.get("name")): row for row in ev.components(evidence_root) if isinstance(row, dict)}
+    components = {str(row.get("name")): row for row in evidence.components(evidence_root) if isinstance(row, dict)}
     notes = oracle._notes_effective(scene)
     readings: list[dict] = []
     seen: set[str] = set()
@@ -355,7 +355,7 @@ def _link_direct_record(evidence_root: Path) -> dict:
     """The sealed direct link group readout record (one supported schema)."""
 
     try:
-        payload = ev.link_group_mass_properties(evidence_root)
+        payload = evidence.link_group_mass_properties(evidence_root)
     except (OSError, PipelineError) as error:
         raise PipelineError(f"The link group mass record is unreadable: {error}") from error
     _require(
@@ -439,7 +439,7 @@ def verify_urdf_mass_equality(bundle_root: Path, source: dict | None = None) -> 
 
     root = Path(bundle_root)
     try:
-        payload = ev.mass_closure(root)
+        payload = evidence.mass_closure(root)
     except (OSError, PipelineError) as error:
         raise PipelineError(f"Whole-CAD mass evidence is unreadable: {error}") from error
     _require(
@@ -564,11 +564,11 @@ def _capture_identity(root):
     identity is no longer a read point.
     """
 
-    collection = ev.collection(root)
+    collection = evidence.collection(root)
     identity = collection.get("identity")
     _require(isinstance(identity, dict), "Capture collection identity is missing")
     _require(
-        identity == ev.source(root).get("identity"),
+        identity == evidence.source(root).get("identity"),
         "Collection and archived source identities differ",
     )
     _require(
@@ -609,9 +609,9 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
 
     root = Path(evidence_root)
     try:
-        raw = ev.scene(root)
-        masses = ev.mass_properties(root)
-        datums = ev.datums(root)
+        raw = evidence.scene(root)
+        masses = evidence.mass_properties(root)
+        datums = evidence.datums(root)
         _require(masses == raw["mass_properties"] and datums == raw["coordinate_systems"], "Raw reading files disagree")
         _require(isinstance(masses, dict) and bool(masses), "No component mass readings")
     except (OSError, ValueError, TypeError, KeyError) as error:
@@ -622,7 +622,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
     declared = source.get("documented_masses") or {}
 
     def authority():
-        recorded = ev.declared_masses(root)
+        recorded = evidence.declared_masses(root)
         _require(
             recorded["items"] == declared and recorded["evidence"] == source.get("mass_evidence"),
             "Captured mass decisions differ from author inputs",
@@ -673,7 +673,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
 
     def material_provenance():
         try:
-            record = ev.material_provenance(root)
+            record = evidence.material_provenance(root)
         except PipelineError:
             record = None
         if source.get("material_source") != "cad":
@@ -773,7 +773,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
 
     def effective_instances():
         try:
-            record = ev.effective_instances(root)
+            record = evidence.effective_instances(root)
         except PipelineError:
             record = None
         if source.get("material_source") != "cad":
@@ -799,7 +799,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
         notes = raw.get("notes") if isinstance(raw.get("notes"), dict) else {}
         mirrored = notes.get("effective_instances") if isinstance(notes.get("effective_instances"), dict) else {}
         _require(mirrored == readings, "Effective instance readings differ from the captured scene notes")
-        closure = ev.mass_closure(root)
+        closure = evidence.mass_closure(root)
         context = closure.get("component_context") if isinstance(closure, dict) else None
         _require(isinstance(context, dict), "Effective instances need the component context")
         instances = {str(row["name"]): row for row in context.get("instances") or [] if isinstance(row, dict)}
@@ -1229,7 +1229,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
     )
 
     def closure():
-        payload = ev.mass_closure(root)
+        payload = evidence.mass_closure(root)
         _require(
             payload["status"] == "recorded" and payload["mode"] == "full",
             "Full whole-assembly physics evidence is required",
