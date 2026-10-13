@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -1023,6 +1024,159 @@ class InstallPostgresBehaviorTests(unittest.TestCase):
             conf = (pgroot / "data" / "postgresql.conf").read_text(encoding="utf-8")
             self.assertIn("# >>> description-postgres", conf)
             self.assertFalse((pgroot / "data" / ".running").exists())
+
+
+class NativePoolTests(unittest.TestCase):
+    """`windows_native` (capacity 1) exists after install and is a health item.
+
+    Contract: contracts.md §六阶段契约 (native operations use a capacity-1 pool;
+    waiting for native results releases Airflow worker slots) and frozen
+    interface IF-02.
+    """
+
+    SCRIPT = ROOT / "deploy" / "airflow" / "scripts" / "ensure_pool.py"
+    INSTALL = ROOT / "deploy" / "airflow" / "install.sh"
+
+    class _NameSlot:
+        """Descriptor so ``pool_class.pool == name`` evaluates to a named tuple."""
+
+        def __get__(self, instance, owner):
+            return NativePoolTests._NameSlot()
+
+        def __eq__(self, other):
+            return ("name", other)
+
+    class _FakePool:
+        pool = None
+
+        def __init__(self, *, pool, slots, description, include_deferred=False):
+            self.pool = pool
+            self.slots = slots
+            self.description = description
+            self.include_deferred = include_deferred
+
+    class _FakeQuery:
+        def __init__(self, store, persist):
+            self._store = store
+            self._persist = persist
+            self._condition = None
+
+        def filter(self, condition):
+            self._condition = condition
+            return self
+
+        def one_or_none(self):
+            if not self._persist:
+                return None
+            _kind, name = self._condition
+            return self._store.get(name)
+
+    class _FakeSession:
+        def __init__(self, store, persist=True):
+            self._store = store
+            self._persist = persist
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def query(self, pool_class):
+            return NativePoolTests._FakeQuery(self._store, self._persist)
+
+        def add(self, pool):
+            if self._persist:
+                self._store[pool.pool] = pool
+
+        def commit(self):
+            return None
+
+    _FakePool.pool = _NameSlot()
+
+    def _load(self):
+        spec = importlib.util.spec_from_file_location("ensure_pool_under_test", self.SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _session(self, store, persist=True):
+        return NativePoolTests._FakeSession(store, persist=persist)
+
+    def test_defaults_follow_the_stage_contract(self) -> None:
+        module = self._load()
+        self.assertEqual(module.DEFAULT_NAME, "windows_native")
+        self.assertEqual(module.DEFAULT_SLOTS, 1)
+
+    def test_missing_pool_is_created_with_capacity_one(self) -> None:
+        module = self._load()
+        store: dict = {}
+        result = module.ensure_pool(
+            "windows_native",
+            1,
+            "desc",
+            session_factory=lambda: self._session(store),
+            pool_class=self._FakePool,
+        )
+        self.assertEqual(result, {"name": "windows_native", "slots": 1, "created": True})
+        self.assertEqual(store["windows_native"].slots, 1)
+        self.assertEqual(store["windows_native"].description, "desc")
+        self.assertFalse(store["windows_native"].include_deferred)
+
+    def test_existing_pool_keeps_other_fields_and_enforces_capacity(self) -> None:
+        module = self._load()
+        pool = self._FakePool(pool="windows_native", slots=4, description="keep-me", include_deferred=True)
+        store = {"windows_native": pool}
+        result = module.ensure_pool(
+            "windows_native",
+            1,
+            "ignored",
+            session_factory=lambda: self._session(store),
+            pool_class=self._FakePool,
+        )
+        self.assertFalse(result["created"])
+        self.assertEqual(pool.slots, 1)
+        self.assertEqual(pool.description, "keep-me")
+        self.assertTrue(pool.include_deferred)
+
+    def test_existing_pool_at_capacity_is_a_noop(self) -> None:
+        module = self._load()
+        pool = self._FakePool(pool="windows_native", slots=1, description="keep-me", include_deferred=True)
+        store = {"windows_native": pool}
+        result = module.ensure_pool(
+            "windows_native",
+            1,
+            "ignored",
+            session_factory=lambda: self._session(store),
+            pool_class=self._FakePool,
+        )
+        self.assertFalse(result["created"])
+        self.assertEqual((pool.slots, pool.description, pool.include_deferred), (1, "keep-me", True))
+
+    def test_failed_verification_exits_nonzero(self) -> None:
+        module = self._load()
+        with self.assertRaises(SystemExit):
+            module.ensure_pool(
+                "windows_native",
+                1,
+                "desc",
+                session_factory=lambda: self._session({}, persist=False),
+                pool_class=self._FakePool,
+            )
+
+    def test_install_runs_the_ensure_step_after_migration(self) -> None:
+        text = self.INSTALL.read_text(encoding="utf-8")
+        self.assertIn("scripts/ensure_pool.py", text)
+        self.assertLess(text.index("db migrate"), text.index("scripts/ensure_pool.py"))
+
+    def test_health_battery_requires_the_pool(self) -> None:
+        text = HEALTH.read_text(encoding="utf-8")
+        self.assertIn("windows_native", text)
+        self.assertIn("native pool windows_native is missing or its capacity is not 1", text)
+
+    def test_script_help_runs_without_airflow(self) -> None:
+        result = run([sys.executable, str(self.SCRIPT), "--help"], {})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

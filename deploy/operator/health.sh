@@ -165,6 +165,28 @@ else
   report FAIL "run-ownership request-context plugin cannot be verified: AIRFLOW_VENV is not executable"
 fi
 
+# The native-stage pool is part of the six-stage contract: a missing pool or a
+# capacity other than 1 is a deployment failure (contracts §六阶段契约 / IF-02).
+if [ -x "${AIRFLOW_VENV:-}/bin/python" ]; then
+  if AIRFLOW_HOME="${AIRFLOW_HOME:-}" "$AIRFLOW_VENV/bin/python" - <<'PY'
+import sys
+
+from airflow.models.pool import Pool
+from airflow.settings import Session
+
+with Session() as session:
+    pool = session.query(Pool).filter(Pool.pool == "windows_native").one_or_none()
+    sys.exit(0 if pool is not None and int(pool.slots) == 1 else 1)
+PY
+  then
+    report PASS "native pool windows_native capacity=1"
+  else
+    report FAIL "native pool windows_native is missing or its capacity is not 1"
+  fi
+else
+  report FAIL "native pool cannot be verified: AIRFLOW_VENV is not executable"
+fi
+
 command -v systemctl >/dev/null 2>&1 || { report FAIL "systemctl unavailable"; exit 1; }
 for unit in description-postgres description-airflow-dag-processor description-airflow-scheduler \
             description-airflow-api-server description-portal description-operator-proxy; do
