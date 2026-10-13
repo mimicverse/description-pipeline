@@ -75,7 +75,7 @@ from .jsonio import write_json
 from .errors import CadError
 from .exporter import ExporterDeclarationError, decode_exporter_v14
 from .revision import package_inventory, seal_revision
-from ...schemas import INPUT_SCHEMA
+from ...schemas import INPUT_SCHEMA, exporter_declaration_present
 
 DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v1"
 PREPARED_SCHEMA = "solidworks-to-urdf.prepared-package/v1"
@@ -4139,10 +4139,7 @@ def derive_native_package(
             },
         )
     checks, budget_entry = _budgets(record, settings, findings)
-    exporter_block = record.get("exporter")
-    exporter_mode = "exporter" in record and not (
-        isinstance(exporter_block, dict) and exporter_block.get("state") == "absent"
-    )
+    exporter_mode = exporter_declaration_present(record)
     if exporter_mode:
         declaration = _exporter_declaration(record, identity, findings)
         bodies, joints, frames, derived_names = [], [], [], {}

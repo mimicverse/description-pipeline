@@ -1,4 +1,4 @@
-"""Single definitions for record schema ids shared across pipeline boundaries.
+"""Single definitions for record schema ids and native-record predicates crossing boundaries.
 
 Each id is written by one boundary and read by others (VER-04); declaring it here
 keeps producer and verifier seams from drifting while the strings that seal
@@ -14,3 +14,19 @@ EFFECTIVE_INSTANCES_SCHEMA = "solidworks-to-urdf.effective-instances/v1"
 LINK_GROUP_MASS_SCHEMA = "solidworks-to-urdf.link-group-mass-properties/v1"
 MASS_CLOSURE_REPORT_SCHEMA = "solidworks-to-urdf.mass-closure-report/v1"
 CAD_REVISION_SCHEMA = "solidworks-to-urdf.cad-revision/v1"
+
+
+def exporter_declaration_present(record: object) -> bool:
+    """The shared producer/verifier predicate over the raw record's exporter block.
+
+    The native capture writes the exporter block unconditionally, so presence alone
+    carries no claim: only a proven ``absent`` state means the CAD carries no saved
+    v1.4 exporter declaration.  Every other present state (including ``unread``)
+    keeps the declaration suite, which fails closed on unreadable declarations; a
+    proven ``absent`` state runs the mate-inference suite.
+    """
+
+    if not isinstance(record, dict):
+        return False
+    block = record.get("exporter")
+    return "exporter" in record and not (isinstance(block, dict) and block.get("state") == "absent")

@@ -3,8 +3,10 @@
 import unittest
 
 from description_pipeline.orchestration import report_view
+from description_pipeline.schemas import exporter_declaration_present
+from description_pipeline.sources.solidworks import discovery
 from description_pipeline.stages import FIXED_REQUIRED_CHECKS, HOST_BY_STAGE, PORTABLE_STAGES, required_rows_complete
-from description_pipeline.verification import solidworks_urdf
+from description_pipeline.verification import native_discovery, solidworks_urdf
 
 
 class ContractConvergenceTests(unittest.TestCase):
@@ -41,3 +43,20 @@ class ContractConvergenceTests(unittest.TestCase):
         ):
             with self.subTest(required=required, rows=rows):
                 self.assertFalse(required_rows_complete(required, rows))
+
+
+class ExporterPredicateTests(unittest.TestCase):
+    """The producer mode and the verifier regime share one predicate (VER-12 residual)."""
+
+    def test_only_a_proven_absent_block_selects_mate_inference(self) -> None:
+        self.assertFalse(exporter_declaration_present(None))
+        self.assertFalse(exporter_declaration_present({}))
+        self.assertFalse(exporter_declaration_present({"exporter": {"state": "absent"}}))
+        self.assertTrue(exporter_declaration_present({"exporter": {"state": "unread"}}))
+        self.assertTrue(exporter_declaration_present({"exporter": {"state": "extracted"}}))
+        self.assertTrue(exporter_declaration_present({"exporter": None}))
+        self.assertTrue(exporter_declaration_present({"exporter": "unexpected"}))
+
+    def test_both_halves_use_the_single_owner(self) -> None:
+        self.assertIs(discovery.exporter_declaration_present, exporter_declaration_present)
+        self.assertIs(native_discovery.exporter_declaration_present, exporter_declaration_present)
