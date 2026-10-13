@@ -643,15 +643,26 @@ class LifecycleTests(unittest.TestCase):
             '  "-m description_pipeline.orchestration.lifecycle_state"*)\n'
             "    python3 -c 'import json,os; from pathlib import Path; "
             'Path(os.environ["LIFECYCLE_ENV_LOG"]).write_text(json.dumps('
-            '{"home": os.environ.get("AIRFLOW_HOME"), "expected_home": os.environ["EXPECTED_LIFECYCLE_HOME"]}))\'\n'
-            '    [ "${AIRFLOW_HOME:-}" = "$EXPECTED_LIFECYCLE_HOME" ] || exit 77\n'
+            '{"dsn": os.environ.get("PLATFORM_OPERATOR_DSN"), '
+            '"expected_dsn": os.environ["EXPECTED_PLATFORM_DSN"]}))\'\n'
+            '    [ "${PLATFORM_OPERATOR_DSN:-}" = "$EXPECTED_PLATFORM_DSN" ] || exit 77\n'
+            '    case "$*" in\n'
+            '      *--require-admission-closed*)\n'
+            '        [ "$(cat "$ADMISSION" 2>/dev/null)" = "true" ] || exit 1 ;;\n'
+            '    esac\n'
             '    if [ -n "$PROJECTION_FILE" ] && [ -f "$PROJECTION_FILE" ]; then cat "$PROJECTION_FILE"; fi\n'
             '    exit "${PROJECTION_RC:-0}" ;;\n'
             "esac\n"
             'script="$(cat)"\n'
             'case "$script" in\n'
-            "  *admission-closed-gate*)\n"
-            '    [ "$(cat "$ADMISSION" 2>/dev/null)" = "true" ] ;;\n'
+            "  *platform-close-admission*)\n"
+            '    echo true > "$ADMISSION"\n'
+            '    echo "platform close_admission" >> "$ORDER_LOG"\n'
+            '    echo "admission=closed revision=2" ;;\n'
+            "  *platform-open-admission*)\n"
+            '    echo false > "$ADMISSION"\n'
+            '    echo "platform open_admission" >> "$ORDER_LOG"\n'
+            '    echo "admission=open revision=3" ;;\n'
             "  *)\n"
             '    echo "airflow admission check" >> "$ORDER_LOG"\n'
             '    count=$(cat "$REGISTER_COUNT" 2>/dev/null || echo 0)\n'
@@ -678,7 +689,7 @@ class LifecycleTests(unittest.TestCase):
             "PAUSE_RC": str(pause_rc),
             "PROJECTION_FILE": str(projection),
             "LIFECYCLE_ENV_LOG": str(tmp / "query-environment.json"),
-            "EXPECTED_LIFECYCLE_HOME": str(state / "airflow-home"),
+            "EXPECTED_PLATFORM_DSN": derived_env["PLATFORM_OPERATOR_DSN"],
         }
         return config_path, env, admission, order
 
@@ -694,6 +705,7 @@ class LifecycleTests(unittest.TestCase):
                     "systemctl --user enable --now description-portal.service description-operator-proxy.service"
                 )
                 self.assertLess(max(i for i, line in enumerate(lines) if line == "airflow admission check"), ingress)
+                self.assertLess(lines.index("platform open_admission"), ingress)
                 self.assertEqual(lines.count("airflow dags unpause solidworks_to_urdf"), register_after + 1)
 
     def test_unpause_failure_does_not_start_ingress(self) -> None:
@@ -775,7 +787,7 @@ class LifecycleTests(unittest.TestCase):
             config_path, env, admission, order = self._admission_fixture(Path(tmp), pause_rc=9)
             result = run(["bash", str(CONTROL), "drain", "--config", str(config_path)], env)
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            self.assertIn("could not close the DAG admission", result.stderr)
+            self.assertIn("could not pause the DAG scheduling", result.stderr)
         with tempfile.TemporaryDirectory() as tmp:
             config_path, env, admission, order = self._admission_fixture(Path(tmp))
             self._project(
@@ -808,14 +820,15 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('"run_id": "run-active"', result.stdout)
 
-    def test_gates_query_with_the_installed_airflow_home(self) -> None:
+    def test_gates_query_with_the_installed_platform_dsn(self) -> None:
         for action in ("drain", "stop"):
             with self.subTest(action=action), tempfile.TemporaryDirectory() as tmp:
                 config_path, env, _, _ = self._admission_fixture(Path(tmp))
                 result = run(["bash", str(CONTROL), action, "--config", str(config_path)], env)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 observed = json.loads(Path(env["LIFECYCLE_ENV_LOG"]).read_text(encoding="utf-8"))
-                self.assertEqual(observed["home"], observed["expected_home"])
+                self.assertEqual(observed["dsn"], observed["expected_dsn"])
+                self.assertIn("operator_ro@", observed["dsn"])
 
     def test_operational_entry_rejects_canonical_validator_divergence(self) -> None:
         def break_previous(record: dict) -> None:

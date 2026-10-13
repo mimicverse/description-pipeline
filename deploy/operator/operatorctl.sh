@@ -148,7 +148,7 @@ airflow_lifecycle() {
     bash "$AIRFLOW_HERE/services.sh" "$1"
 }
 
-open_admission() {
+airflow_unpause_dag() {
   local deadline=$((SECONDS + 60))
   # Unpause alone silently succeeds before the DAG is registered. Confirm its
   # persisted state before exposing ingress, including on a fresh installation.
@@ -169,6 +169,49 @@ PY
     sleep 2
   done
   die "DAG admission did not open; ingress was not started"
+}
+
+# The platform admission is the authority for new work; the DAG unpause above and the pause in
+# drain are scheduling measures only.  Both transitions go through the single controlled store
+# entry (transaction-serialized with new admissions); the gates never write it directly.
+platform_close_admission() {
+  [ -n "${PLATFORM_SERVICE_DSN:-}" ] || die "PLATFORM_SERVICE_DSN is missing; run install to derive it"
+  "$AIRFLOW_VENV/bin/python" - <<'PY' || die "could not close the platform admission"
+# platform-close-admission
+import os
+
+import psycopg2
+
+from description_pipeline.platform.store import PlatformStore
+
+
+def connect():
+    return psycopg2.connect(os.environ["PLATFORM_SERVICE_DSN"])
+
+
+view = PlatformStore(connect).close_admission(reason="drain", actor="operatorctl drain")
+print(f"admission={view.state} revision={view.revision}")
+PY
+}
+
+platform_open_admission() {
+  [ -n "${PLATFORM_SERVICE_DSN:-}" ] || die "PLATFORM_SERVICE_DSN is missing; run install to derive it"
+  "$AIRFLOW_VENV/bin/python" - <<'PY' || die "could not open the platform admission"
+# platform-open-admission
+import os
+
+import psycopg2
+
+from description_pipeline.platform.store import PlatformStore
+
+
+def connect():
+    return psycopg2.connect(os.environ["PLATFORM_SERVICE_DSN"])
+
+
+view = PlatformStore(connect).open_admission(reason="start", actor="operatorctl start")
+print(f"admission={view.state} revision={view.revision}")
+PY
 }
 
 load_installed() {
@@ -300,45 +343,42 @@ case "$ACTION" in
     load_installed
     drift_check || die "configuration drift detected; run install before start"
     airflow_lifecycle start
-    open_admission
+    airflow_unpause_dag
+    platform_open_admission
     systemctl --user enable --now description-portal.service description-operator-proxy.service
     ;;
   drain)
     load_installed
+    platform_close_admission
     AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/airflow" dags pause solidworks_to_urdf \
-      || die "could not close the DAG admission"
-    # In-flight executions continue; drain completes only when no unresolved/unknown outcomes
-    # remain (their closure is the reconcile bridge's job). The projection comes from the single
-    # PostgreSQL authority through the platform layer - service control never scans artifacts.
-    if ! AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" \
-        -m description_pipeline.orchestration.lifecycle_state report --require-no-unresolved; then
-      echo "drain: unresolved or unknown outcomes remain; reconcile must close them before drain completes" >&2
-      exit 1
-    fi
-    echo "drain: admission closed; in-flight executions continue"
+      || die "could not pause the DAG scheduling (the platform admission is closed)"
+    # Acknowledged: the platform admission is closed and in-flight work continues (the pause is
+    # a scheduling measure).  "draining" and "drained" are distinct facts; the projection - one
+    # read of the platform PostgreSQL authority - decides which one holds.
+    projection="$(PLATFORM_OPERATOR_DSN="${PLATFORM_OPERATOR_DSN:-}" "$AIRFLOW_VENV/bin/python" \
+      -m description_pipeline.orchestration.lifecycle_state report --require-no-unresolved)" || {
+        echo "$projection"
+        echo "drain: unresolved or unknown outcomes remain; reconcile must close them (the admission stays closed)" >&2
+        exit 1
+      }
+    echo "$projection"
+    case "$projection" in
+      *'"settled": true'*) echo "drain: drained - no in-flight, unresolved or unknown work remains" ;;
+      *) echo "drain: draining - admission closed; in-flight executions continue" ;;
+    esac
     ;;
   stop)
     load_installed
-    # stop only when drained and settled: active, unresolved or unknown runs block it, and the
-    # admission must already be closed by drain. The projection is the platform layer's, backed
-    # by the single PostgreSQL authority.
-    AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" \
+    # stop only when drained and settled: active, unresolved or unknown work blocks it, and the
+    # platform admission must already be closed by drain.  One consistent read of the platform
+    # authority decides both; the gates never fall back to files or the scheduler.
+    projection="$(PLATFORM_OPERATOR_DSN="${PLATFORM_OPERATOR_DSN:-}" "$AIRFLOW_VENV/bin/python" \
       -m description_pipeline.orchestration.lifecycle_state report --require-settled \
-      >/dev/null || die "stop refused: runs are active, unresolved or unknown; run drain first"
-    if ! AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" - <<'PY'
-# admission-closed-gate: drain closes the DAG admission before stop may run.
-import sys
-
-from airflow.models.dag import DagModel
-from airflow.utils.session import create_session
-
-with create_session() as session:
-    dag = session.get(DagModel, "solidworks_to_urdf")
-    sys.exit(0 if dag is not None and dag.is_paused is True else 1)
-PY
-    then
-      die "stop refused: admission is open; run drain first"
-    fi
+      --require-admission-closed)" || {
+        echo "$projection"
+        die "stop refused: active, unresolved or unknown work remains, or the admission is open; run drain first"
+      }
+    echo "$projection"
     drift_check || true
     systemctl --user disable --now description-operator-proxy.service description-portal.service || true
     ADMISSION_RC=0
