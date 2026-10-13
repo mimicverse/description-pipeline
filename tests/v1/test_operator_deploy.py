@@ -646,11 +646,15 @@ class LifecycleTests(unittest.TestCase):
             'case "$*" in\n'
             "  *\"-Verb stage\"*) echo '{\"passed\":true,\"verb\":\"stage\"}' ;;\n"
             "  *\"-Verb promote\"*)\n"
+            '    if [ "${FIXTURE_ACK_LOSS:-0}" = "1" ]; then exit 255; fi\n'
             '    if [ "${FIXTURE_FAIL_PROMOTE:-0}" = "1" ]; then\n'
             "      echo '{\"passed\":false,\"verb\":\"promote\",\"code\":\"probe\",\"message\":\"refused\"}'; exit 0\n"
             '    fi\n'
             "    echo '{\"passed\":true,\"verb\":\"promote\",\"generation\":\"gen-2\","
             "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\"}' ;;\n"
+            "  *\"-Verb status\"*) echo '{\"passed\":true,\"verb\":\"status\",\"last_promotion\":"
+            "{\"generation\":\"C:/description-e2e/state/lifecycle/gen-2/generation\","
+            "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\"}}' ;;\n"
             "  *\"-Verb rollback\"*) echo '{\"passed\":true,\"verb\":\"rollback\","
             "\"restored_from\":\"C:/description-e2e/state/instance-promotions/previous-0001\"}' ;;\n"
             "  *\"-Verb health\"*) cat \"$FIXTURE_HEALTH_FILE\" ;;\n"
@@ -1284,7 +1288,11 @@ class InstallOrderingTests(unittest.TestCase):
         )
         write_stub(release / "operator" / "scripts" / "install_proxy.sh", "#!/usr/bin/env bash\nexit 0\n")
         write_stub(
-            release / "airflow" / "services.sh", '#!/usr/bin/env bash\necho "services_render" >> "$ORDER_LOG"\nexit 0\n'
+            release / "airflow" / "services.sh",
+            '#!/usr/bin/env bash\necho "services_$1" >> "$ORDER_LOG"\n'
+            'case "$1" in\n  stop) exit "${FIXTURE_FAIL_STOP:-0}" ;;\n'
+            '  start) exit "${FIXTURE_FAIL_START:-0}" ;;\nesac\n'
+            "exit 0\n",
         )
         write_stub(
             release / "airflow" / "install.sh", '#!/usr/bin/env bash\necho "airflow_install" >> "$ORDER_LOG"\nexit 0\n'
@@ -1493,6 +1501,7 @@ class InstallOrderingTests(unittest.TestCase):
             'case "$*" in\n'
             "  *\"-Verb stage\"*) echo '{\"passed\":true,\"verb\":\"stage\"}' ;;\n"
             "  *\"-Verb promote\"*)\n"
+            '    if [ "${FIXTURE_ACK_LOSS:-0}" = "1" ]; then exit 255; fi\n'
             '    if [ "${FIXTURE_FAIL_PROMOTE:-0}" = "1" ]; then\n'
             "      echo '{\"passed\":false,\"verb\":\"promote\",\"code\":\"probe\",\"message\":\"refused\"}'; exit 0\n"
             '    fi\n'
@@ -1501,6 +1510,9 @@ class InstallOrderingTests(unittest.TestCase):
             "  *\"-Verb rollback\"*) echo '{\"passed\":true,\"verb\":\"rollback\","
             "\"restored_from\":\"C:/description-e2e/state/instance-promotions/previous-0001\"}' ;;\n"
             "  *\"-Verb health\"*) cat \"$FIXTURE_HEALTH_FILE\" ;;\n"
+            "  *\"-Verb status\"*) echo '{\"passed\":true,\"verb\":\"status\",\"last_promotion\":"
+            "{\"generation\":\"C:/description-e2e/state/lifecycle/gen-2/generation\","
+            "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\"}}' ;;\n"
             "esac\n"
             "exit 0\n",
         )
@@ -1736,6 +1748,8 @@ class InstallOrderingTests(unittest.TestCase):
                 (state / "promotions" / "gen-2" / "evidence" / "backup-manifest.json").read_text(encoding="utf-8")
             )
             self.assertIn("platform.pgc", backup_manifest["files"])
+            self.assertIn("state/resolved.env", backup_manifest["files"])
+            self.assertTrue((state / "promotions" / "gen-2" / "backup" / "closure.json").is_file())
             rolled = self._maintenance(release, control_env, "rollback")
             self.assertEqual(rolled.returncode, 0, rolled.stdout + rolled.stderr)
             restored = json.loads((state / "install-record.json").read_text(encoding="utf-8"))
@@ -1771,6 +1785,80 @@ class InstallOrderingTests(unittest.TestCase):
             steps = {row["step"]: row["status"] for row in receipt["steps"]}
             self.assertEqual(steps["windows-switch"], "failed")
             self.assertNotIn("open-admission", steps)
+
+    def test_promote_stop_failure_stays_closed_without_switching(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, _ = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            self.assertEqual(self._install(release, control_env).returncode, 0)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            self._health_double(release, control_env)
+            self.assertEqual(self._maintenance(release, control_env, "stage", "gen-2").returncode, 0)
+            self._clone_generation_stubs(state)
+            failed = self._maintenance(release, dict(control_env, FIXTURE_FAIL_STOP="1"), "promote", "gen-2")
+            self.assertEqual(failed.returncode, 1)
+            self.assertIn("did not stop", failed.stderr)
+            active = json.loads((state / "install-record.json").read_text(encoding="utf-8"))
+            self.assertEqual(active["install_id"], "gen-1")
+            self.assertEqual((Path(tmp) / "admission").read_text().strip(), "true")
+            receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
+            steps = {row["step"]: row["status"] for row in receipt["steps"]}
+            self.assertEqual(steps["stop-services"], "failed")
+            self.assertNotIn("windows-switch", steps)
+
+    def test_promote_start_failure_stays_closed_and_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, _ = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            self.assertEqual(self._install(release, control_env).returncode, 0)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            self._health_double(release, control_env)
+            self.assertEqual(self._maintenance(release, control_env, "stage", "gen-2").returncode, 0)
+            self._clone_generation_stubs(state)
+            failed = self._maintenance(release, dict(control_env, FIXTURE_FAIL_START="1"), "promote", "gen-2")
+            self.assertEqual(failed.returncode, 1)
+            self.assertIn("did not start", failed.stderr)
+            active = json.loads((state / "install-record.json").read_text(encoding="utf-8"))
+            self.assertEqual(active["install_id"], "gen-2")
+            self.assertEqual((Path(tmp) / "admission").read_text().strip(), "true")
+            receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
+            steps = {row["step"]: row["status"] for row in receipt["steps"]}
+            self.assertEqual(steps["start-services"], "failed")
+            self.assertNotIn("open-admission", steps)
+            rolled = self._maintenance(release, control_env, "rollback")
+            self.assertEqual(rolled.returncode, 0, rolled.stdout + rolled.stderr)
+            restored = json.loads((state / "install-record.json").read_text(encoding="utf-8"))
+            self.assertEqual(restored["install_id"], "gen-1")
+            self.assertEqual((Path(tmp) / "admission").read_text().strip(), "true")
+
+    def test_ack_loss_records_unknown_and_reconciles_from_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, _ = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            self.assertEqual(self._install(release, control_env).returncode, 0)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            self._health_double(release, control_env)
+            self.assertEqual(self._maintenance(release, control_env, "stage", "gen-2").returncode, 0)
+            self._clone_generation_stubs(state)
+            lost = self._maintenance(release, dict(control_env, FIXTURE_ACK_LOSS="1"), "promote", "gen-2")
+            self.assertEqual(lost.returncode, 1)
+            self.assertIn("unacknowledged", lost.stderr)
+            active = json.loads((state / "install-record.json").read_text(encoding="utf-8"))
+            self.assertEqual(active["install_id"], "gen-1")
+            self.assertEqual((Path(tmp) / "admission").read_text().strip(), "true")
+            receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
+            steps = {row["step"]: row["status"] for row in receipt["steps"]}
+            self.assertEqual(steps["windows-switch"], "unknown")
+            reconciled = self._maintenance(release, control_env, "rollback", "gen-2")
+            self.assertEqual(reconciled.returncode, 0, reconciled.stdout + reconciled.stderr)
+            self.assertEqual(
+                json.loads((state / "install-record.json").read_text(encoding="utf-8"))["install_id"], "gen-1"
+            )
+            self.assertEqual((Path(tmp) / "admission").read_text().strip(), "true")
+            final = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
+            rolled = {row["step"]: row["status"] for row in final["steps"] if row["verb"] == "rollback"}
+            self.assertEqual(rolled["rollback-windows"], "completed")
+            self.assertEqual(rolled["rollback-linux"], "completed")
 
     def test_not_ready_postgres_fails_before_migration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

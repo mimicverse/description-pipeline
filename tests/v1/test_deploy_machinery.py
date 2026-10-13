@@ -25,6 +25,8 @@ class DeployMachineryTests(unittest.TestCase):
             "'promote'",
             "'rollback'",
             "'health'",
+            "'status'",
+            "Write-Utf8NoBom",
             "description.exe",
             "serve --config",
             "stage-receipt.json",

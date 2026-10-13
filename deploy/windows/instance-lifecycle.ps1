@@ -12,7 +12,7 @@
 #   instance-lifecycle.ps1 -Verb stage|promote|rollback|health -Binding FILE [-StageDir DIR]
 #       [-Previous DIR]
 param(
-  [Parameter(Mandatory=$true)][ValidateSet('stage','promote','rollback','health')][string]$Verb,
+  [Parameter(Mandatory=$true)][ValidateSet('stage','promote','rollback','health','status')][string]$Verb,
   [Parameter(Mandatory=$true)][string]$Binding,
   [string]$StageDir = '',
   [string]$Previous = ''
@@ -33,10 +33,15 @@ function Read-Json([string]$path) {
 function Sha256([string]$path) {
   (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLower()
 }
+function Write-Utf8NoBom([string]$path, [string]$text) {
+  # The one canonical byte writer: powershell.exe 5.1 Set-Content -Encoding UTF8 prepends a
+  # BOM, which every strict UTF-8 JSON consumer rejects.
+  [System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))
+}
 function Write-Receipt([string]$path, [hashtable]$payload) {
   $parent = Split-Path -Parent $path
   if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent | Out-Null }
-  Emit $payload | Set-Content -LiteralPath $path -Encoding UTF8
+  Write-Utf8NoBom $path (Emit $payload)
 }
 function Runtime-Python([string]$generation) { Join-Path $generation 'runtime\Scripts\python.exe' }
 function Runtime-Launcher([string]$generation) { Join-Path $generation 'runtime\Scripts\description.exe' }
@@ -86,11 +91,22 @@ foreach ($field in ('task_name','state_root','generation','dir','archive','artif
   if (-not $binding.$field) { Die 'binding_incomplete' "the binding misses $field" }
 }
 $task = Get-ScheduledTask -TaskName $binding.task_name -ErrorAction SilentlyContinue
+$promotions = Join-Path $binding.state_root 'instance-promotions'
 
 if ($Verb -eq 'health') {
   if (-not $task) { Die 'task_missing' 'the instance task is not registered' }
   try { $probe = Health-Probe (Action-Config $task) $binding } catch { Die 'endpoint_unhealthy' $_.Exception.Message }
   Emit @{passed=$true; verb='health'; health=$probe}
+  exit 0
+}
+
+if ($Verb -eq 'status') {
+  # Read-only relay of the endpoint's own last recorded maintenance result: the platform host
+  # reconciles an unacknowledged switch from this instead of resending it.
+  $last = $null
+  $lastPath = Join-Path $promotions 'last-promotion.json'
+  if (Test-Path -LiteralPath $lastPath) { $last = Read-Json $lastPath }
+  Emit @{passed=$true; verb='status'; last_promotion=$last}
   exit 0
 }
 
@@ -120,11 +136,9 @@ if ($Verb -eq 'stage') {
   # The generation carries its own minimal endpoint configuration; the token path stays the one
   # the running instance already uses.  The expected config digest is computed by the staged
   # runtime's own canonical owner - the endpoint's own /health stays the only install identity.
-  $currentConfig = Read-Json (Action-Config $task)
-  $config = @{schema_version='solidworks-to-urdf.endpoint/v1'; package_root=$binding.package_root;
-              output_root=$binding.output_root; state_root=$binding.state_root;
-              token_file=$currentConfig.token_file; host='127.0.0.1'; port=$binding.port}
-  $config | ConvertTo-Json | Set-Content -LiteralPath (Config-Path $StageDir) -Encoding UTF8
+  # The generation configuration is a byte copy of the running instance's own configuration
+  # (token path and roots preserved; no re-serialization, no BOM).
+  Copy-Item -LiteralPath (Action-Config $task) -Destination (Config-Path $StageDir)
   $expected = & $runtime -I -c "import json,sys;from description_pipeline import io;print(io.digest(json.load(open(sys.argv[1],encoding='utf-8'))))" (Config-Path $StageDir)
   if ($LASTEXITCODE -ne 0) { Die 'config_digest_failed' 'the staged runtime could not digest the generation configuration' }
   Write-Receipt (Join-Path $StageDir 'candidate-identity.json') @{
@@ -136,8 +150,6 @@ if ($Verb -eq 'stage') {
   Emit @{passed=$true; verb='stage'; generation=$StageDir; receipt=(Join-Path $StageDir 'stage-receipt.json')}
   exit 0
 }
-
-$promotions = Join-Path $binding.state_root 'instance-promotions'
 
 if ($Verb -eq 'promote') {
   if (-not $StageDir) { Die 'stage_dir_required' 'promote needs -StageDir (the staged generation directory)' }
@@ -185,7 +197,10 @@ if ($Verb -eq 'rollback') {
   if (-not $task) { Die 'task_missing' 'the instance task is not registered' }
   Stop-Endpoint $binding
   Register-ScheduledTask -TaskName $binding.task_name -Xml (Get-Content -LiteralPath (Join-Path $Previous 'task.xml') -Raw) -Force | Out-Null
-  $previousConfig = Action-Config $task
+  # The restored task names the previous generation's own configuration; that file is the one
+  # the recorded endpoint-before.json replaces - the candidate generation stays untouched.
+  $restored = Get-ScheduledTask -TaskName $binding.task_name
+  $previousConfig = Action-Config $restored
   Copy-Item -LiteralPath (Join-Path $Previous 'endpoint-before.json') -Destination $previousConfig -Force
   Start-ScheduledTask -TaskName $binding.task_name
   try { $health = Health-Probe $previousConfig $binding } catch {

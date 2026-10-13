@@ -304,20 +304,29 @@ PY
   [ -z "$previous" ] || previous_argument=" -Previous \"$previous\""
   ssh -o BatchMode=yes "$SOLIDWORKS_SSH_HOST" \
     "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"$remote/instance-lifecycle.ps1\" -Verb $verb -Binding \"$remote/windows-binding.json\"$stage_argument$previous_argument" \
-    > "$output" || { echo "instance_lifecycle: $verb failed; see $output" >&2; return 1; }
+    > "$output" || { echo "instance_lifecycle: $verb transport failed; see $output" >&2; return 2; }
   # Only the script's own strict result counts: an exit-0 shell whose JSON is not a passed
   # object of the requested verb is a failure, never a recorded success.
-  python3 - "$output" "$verb" <<'PY' || { echo "instance_lifecycle: the $verb result did not pass (see $output)" >&2; return 1; }
+  local parse_rc=0
+  python3 - "$output" "$verb" <<'PY' || parse_rc=$?
 import json
 import sys
 
 try:
     document = json.loads(open(sys.argv[1], encoding="utf-8").read().strip().splitlines()[-1])
 except (OSError, ValueError, IndexError) as error:
-    raise SystemExit(f"unreadable lifecycle output: {error}")
+    raise SystemExit(3)
 if not isinstance(document, dict) or document.get("passed") is not True or document.get("verb") != sys.argv[2]:
-    raise SystemExit(f"the lifecycle result is not a passed {sys.argv[2]}: {document}")
+    raise SystemExit(1)
 PY
+  if [ "$parse_rc" = "1" ]; then
+    echo "instance_lifecycle: the $verb result is a definite refusal; see $output" >&2
+    return 1
+  fi
+  if [ "$parse_rc" != "0" ]; then
+    echo "instance_lifecycle: the $verb outcome is unreadable; see $output" >&2
+    return 2
+  fi
   echo "$output"
 }
 
@@ -328,6 +337,19 @@ promotion_step() {
   local item
   for item in "$@"; do arguments+=(--evidence "$item"); done
   python3 "$HERE/promotion.py" step "${arguments[@]}" >/dev/null
+}
+
+promotion_extract_health() {
+  python3 - "$1" "$2" <<'PY'
+import json
+import sys
+
+document = json.load(open(sys.argv[1], encoding="utf-8"))
+health = document.get("health")
+if document.get("passed") is not True or document.get("verb") != "health" or not isinstance(health, dict):
+    raise SystemExit("the health relay is not a passed health object")
+open(sys.argv[2], "w", encoding="utf-8").write(json.dumps(health) + "\n")
+PY
 }
 
 load_installed() {
@@ -632,6 +654,7 @@ PY
       --from "$STATE_ROOT/install-records/$ACTIVE_ID.json" --to "$SNAPSHOT_PATH" \
       --plan "linux-generation,windows-generation,close-admission,drain,backup,stop-services,windows-switch,endpoint-identity,switch-pointer,start-services,verify,open-admission,rollback-close,rollback-drain,rollback-stop,rollback-windows,rollback-linux,rollback-verify" \
       >/dev/null
+    printf '%s\n' "$CANDIDATE_WHEEL" > "$RECEIPT_DIR/candidate-wheel"
     set -a
     # shellcheck disable=SC1090
     source "$CANDIDATE_ENV"
@@ -685,12 +708,49 @@ PY
     fi
     promotion_step "$CANDIDATE_ID" promote drain completed "$EVIDENCE_DIR/drain.out"
     # 3. a recoverable backup: one consistent PostgreSQL snapshot plus the referenced
-    #    generation files, bound in one manifest with their real digests
+    #    configuration closure (records, snapshots, derived files, resolved.env), the frozen
+    #    handoff originals and the artifact roots - bound in one manifest with real digests
     BACKUP_DIR="$RECEIPT_DIR/backup"
-    mkdir -p "$BACKUP_DIR"
-    cp -p "$STATE_ROOT/install-record.json" "$BACKUP_DIR/install-record.json"
-    cp -p "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["snapshot"]["path"])' "$STATE_ROOT/install-record.json")" "$BACKUP_DIR/snapshot.json"
-    cp -p "$ENV_FILE" "$BACKUP_DIR/operator.env"
+    mkdir -p "$BACKUP_DIR/state"
+    cp -p "$STATE_ROOT/install-record.json" "$BACKUP_DIR/state/install-record.json"
+    cp -a "$STATE_ROOT/install-records" "$BACKUP_DIR/state/install-records"
+    cp -a "$STATE_ROOT/snapshots" "$BACKUP_DIR/state/snapshots"
+    cp -a "$STATE_ROOT/derived" "$BACKUP_DIR/state/derived"
+    cp -p "$STATE_ROOT/resolved.env" "$BACKUP_DIR/state/resolved.env"
+    python3 - "$SNAPSHOT_PATH" "$BACKUP_DIR" <<'PY'
+import json
+import shutil
+import sys
+from pathlib import Path
+
+snapshot = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+backup = Path(sys.argv[2])
+storage = snapshot["resolved"]["storage"]
+copied = {}
+for name, target in (("handoff_root", "handoff"), ("artifact_root", "artifacts")):
+    source = Path(storage[name])
+    if source.is_dir():
+        destination = backup / target
+        if destination.exists():
+            shutil.rmtree(destination)
+        shutil.copytree(source, destination, symlinks=False)
+        copied[name] = str(destination)
+(backup / "closure.json").write_text(
+    json.dumps(
+        {
+            "captured_roots": copied,
+            "not_captured": {
+                "workspace_root": "scratch working copies are rebuilt on demand",
+                "store_root": "model store roots are reconstructible from the release archives",
+            },
+        },
+        indent=2,
+        sort_keys=True,
+    )
+    + "\n",
+    encoding="utf-8",
+)
+PY
     if ! "$PG_BIN/pg_dump" -h "$POSTGRES_ROOT/socket" -p "$POSTGRES_PORT" -U solidworks -d airflow_meta \
         -Fc -f "$BACKUP_DIR/platform.pgc" > "$EVIDENCE_DIR/pg-dump.out" 2>&1; then
       promotion_step "$CANDIDATE_ID" promote backup failed "$EVIDENCE_DIR/pg-dump.out"
@@ -703,7 +763,11 @@ import sys
 from pathlib import Path
 
 backup, out = Path(sys.argv[1]), Path(sys.argv[2])
-files = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(backup.iterdir()) if path.is_file()}
+files = {
+    path.relative_to(backup).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+    for path in sorted(backup.rglob("*"))
+    if path.is_file()
+}
 out.write_text(
     json.dumps({"schema": "solidworks-to-urdf.promote-backup/v1", "files": files}, indent=2, sort_keys=True) + "\n",
     encoding="utf-8",
@@ -712,8 +776,8 @@ PY
     promotion_step "$CANDIDATE_ID" promote backup completed "$EVIDENCE_DIR/backup-manifest.json"
     # 4. both ends' execution services stop before the pointers move
     if ! {
-      airflow_lifecycle stop
-      systemctl --user disable --now description-operator-proxy.service description-portal.service
+      airflow_lifecycle stop \
+      && systemctl --user disable --now description-operator-proxy.service description-portal.service
     } > "$EVIDENCE_DIR/stop-services.out" 2>&1; then
       promotion_step "$CANDIDATE_ID" promote stop-services failed "$EVIDENCE_DIR/stop-services.out"
       die "the execution services did not stop (the admission stays closed)"
@@ -722,7 +786,14 @@ PY
     # 5. the Windows end switches through the single lifecycle script (stop, task+config, IF-09 health)
     [ -n "$RELEASE_FILE" ] || RELEASE_FILE="$HERE/../../release.json"
     [ -f "$RELEASE_FILE" ] || die "release manifest not found: $RELEASE_FILE"
-    if ! WINDOWS_PROMOTE="$(instance_lifecycle promote "$CANDIDATE_ID")"; then
+    WINDOWS_PROMOTE=""
+    WINDOWS_PROMOTE_STATUS=0
+    WINDOWS_PROMOTE="$(instance_lifecycle promote "$CANDIDATE_ID")" || WINDOWS_PROMOTE_STATUS=$?
+    if [ "$WINDOWS_PROMOTE_STATUS" = "2" ]; then
+      promotion_step "$CANDIDATE_ID" promote windows-switch unknown "$RECEIPT_DIR/windows-promote.out"
+      die "the Windows switch outcome is unacknowledged (the admission stays closed); reconcile with: operatorctl rollback --config <platform.json> --install-id $CANDIDATE_ID"
+    fi
+    if [ "$WINDOWS_PROMOTE_STATUS" != "0" ]; then
       promotion_step "$CANDIDATE_ID" promote windows-switch failed "$RECEIPT_DIR/windows-promote.out"
       die "the Windows switch failed (the admission stays closed; the receipt records it)"
     fi
@@ -734,18 +805,9 @@ PY
       promotion_step "$CANDIDATE_ID" promote endpoint-identity failed "$RECEIPT_DIR/windows-health.out"
       die "the running endpoint health did not pass (the admission stays closed)"
     fi
-    if ! python3 - "$WINDOWS_HEALTH" "$EVIDENCE_DIR/health.json" <<'PY'
-import json
-import sys
-
-document = json.load(open(sys.argv[1], encoding="utf-8"))
-health = document.get("health")
-if document.get("passed") is not True or document.get("verb") != "health" or not isinstance(health, dict):
-    raise SystemExit("the health relay is not a passed health object")
-open(sys.argv[2], "w", encoding="utf-8").write(json.dumps(health) + "\n")
-PY
-    then
-      promotion_step "$CANDIDATE_ID" promote endpoint-identity failed "$RECEIPT_DIR/windows-health.out"
+    if ! promotion_extract_health "$WINDOWS_HEALTH" "$EVIDENCE_DIR/health.json" \
+        > "$EVIDENCE_DIR/health-extract.out" 2>&1; then
+      promotion_step "$CANDIDATE_ID" promote endpoint-identity failed "$EVIDENCE_DIR/health-extract.out"
       die "the health relay did not carry a health object (the admission stays closed)"
     fi
     if ! "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" endpoint-identity \
@@ -778,10 +840,12 @@ row = {
 open(out, "w", encoding="utf-8").write(json.dumps([row]) + "\n")
 PY
     SERVICES_CSV="$(IFS=,; printf '%s' "${UNITS[*]}")"
+    CANDIDATE_WHEEL="$(cat "$RECEIPT_DIR/candidate-wheel")"
+    [ -f "$CANDIDATE_WHEEL" ] || die "the staged candidate wheel is missing: $CANDIDATE_WHEEL"
     if ! "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" build --state-root "$STATE_ROOT" \
         --install-id "$CANDIDATE_ID" --snapshot "$SNAPSHOT_PATH" --release-file "$RELEASE_FILE" \
         --endpoint-identity "$EVIDENCE_DIR/endpoint-identity.json" --services "$SERVICES_CSV" \
-        --dag "$AIRFLOW_HERE/dags/solidworks_to_urdf.py" --wheel "$PIPELINE_WHEEL" \
+        --dag "$AIRFLOW_HERE/dags/solidworks_to_urdf.py" --wheel "$CANDIDATE_WHEEL" \
         --previous-record "$PREVIOUS_RECORD" --journal "$EVIDENCE_DIR/journal.json" \
         > "$EVIDENCE_DIR/switch-pointer.out" 2>&1; then
       promotion_step "$CANDIDATE_ID" promote switch-pointer failed "$EVIDENCE_DIR/switch-pointer.out"
@@ -792,13 +856,13 @@ PY
     load_active_env
     load_installed
     if ! {
-      python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --units-dir "$TARGET"
-      airflow_render
-      systemctl --user daemon-reload
-      airflow_lifecycle start
-      airflow_unpause_dag
-      systemctl --user enable --now description-portal.service description-operator-proxy.service
-      systemctl --user is-active --quiet description-portal.service description-operator-proxy.service
+      python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --units-dir "$TARGET" \
+      && airflow_render \
+      && systemctl --user daemon-reload \
+      && airflow_lifecycle start \
+      && airflow_unpause_dag \
+      && systemctl --user enable --now description-portal.service description-operator-proxy.service \
+      && systemctl --user is-active --quiet description-portal.service description-operator-proxy.service
     } > "$EVIDENCE_DIR/start-services.out" 2>&1; then
       promotion_step "$CANDIDATE_ID" promote start-services failed "$EVIDENCE_DIR/start-services.out"
       die "the switched generation did not start (the admission stays closed)"
@@ -807,11 +871,10 @@ PY
     # 9. both ends verify: the record against the current config, the running endpoint against the record
     if ! {
       "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" verify-active \
-        --config "$CONFIG_FILE" --state-root "$STATE_ROOT"
-      WINDOWS_HEALTH="$(instance_lifecycle health "$CANDIDATE_ID")"
-      python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["health"]))' "$WINDOWS_HEALTH" \
-        > "$EVIDENCE_DIR/final-health.json"
-      "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" endpoint-identity \
+        --config "$CONFIG_FILE" --state-root "$STATE_ROOT" \
+      && WINDOWS_HEALTH="$(instance_lifecycle health "$CANDIDATE_ID")" \
+      && promotion_extract_health "$WINDOWS_HEALTH" "$EVIDENCE_DIR/final-health.json" \
+      && "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" endpoint-identity \
         --health "$EVIDENCE_DIR/final-health.json" --release-file "$RELEASE_FILE" \
         --record "$STATE_ROOT/install-record.json" --out "$EVIDENCE_DIR/final-identity.json"
     } > "$EVIDENCE_DIR/verify.out" 2>&1; then
@@ -828,23 +891,67 @@ PY
     echo "promote complete: $CANDIDATE_ID (admission open)"
     ;;
   rollback)
-    [ -n "$ACTIVE_ID" ] || die "no active generation"
-    ROLLBACK_ID="$ACTIVE_ID"
+    MAINT_ID="${INSTALL_ID:-$ACTIVE_ID}"
+    [ -n "$MAINT_ID" ] || die "no active generation and no --install-id to reconcile"
+    ROLLBACK_ID="$MAINT_ID"
     RECEIPT_DIR="$OPERATOR_STATE/promotions/$ROLLBACK_ID"
-    [ -f "$RECEIPT_DIR/receipt.json" ] || die "no promotion receipt for the active generation $ROLLBACK_ID"
+    [ -f "$RECEIPT_DIR/receipt.json" ] || die "no promotion receipt for maintenance $ROLLBACK_ID; nothing is guessed"
     EVIDENCE_DIR="$RECEIPT_DIR/evidence"
     mkdir -p "$EVIDENCE_DIR"
-    PREVIOUS_RECORD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["previous"]["record"])' "$STATE_ROOT/install-record.json")" \
-      || die "the active record carries no rollback binding"
-    [ -f "$PREVIOUS_RECORD" ] || die "the recorded previous generation is missing: $PREVIOUS_RECORD"
-    [ -f "$RECEIPT_DIR/windows-promote.out" ] || die "the receipt carries no Windows switch record; nothing is guessed"
-    PREVIOUS_GENERATION_DIR="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["previous"])' "$RECEIPT_DIR/windows-promote.out")" \
-      || die "the Windows switch record carries no bound previous generation"
-    PREVIOUS_RELEASE_TRIPLE="$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1]))["previous"]["release"]; print(r["version"], r["source_commit"], r["source_sha256"])' "$STATE_ROOT/install-record.json")" \
+    LINUX_SWITCHED=1
+    if [ "$ROLLBACK_ID" = "$ACTIVE_ID" ]; then
+      PREVIOUS_RECORD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["previous"]["record"])' "$STATE_ROOT/install-record.json")" \
+        || die "the active record carries no rollback binding"
+    else
+      # The Linux pointer never moved for this maintenance attempt; its source generation comes
+      # from the receipt's bound immutable generation, never from the mutable active pointer.
+      LINUX_SWITCHED=0
+      PREVIOUS_RECORD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["from"])' "$RECEIPT_DIR/receipt.json")" \
+        || die "the receipt carries no source generation"
+    fi
+    [ -f "$PREVIOUS_RECORD" ] || die "the recorded source generation is missing: $PREVIOUS_RECORD"
+    PREVIOUS_RELEASE_TRIPLE="$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1]))["release"]; print(r["version"], r["source_commit"], r["source_sha256"])' "$PREVIOUS_RECORD")" \
       || die "the rollback binding carries no release identity"
+    PREVIOUS_GENERATION_DIR=""
+    if [ -f "$RECEIPT_DIR/windows-promote.out" ]; then
+      PREVIOUS_GENERATION_DIR="$(python3 -c '
+import json, sys
+try:
+    print(json.load(open(sys.argv[1]))["previous"])
+except Exception:
+    pass
+' "$RECEIPT_DIR/windows-promote.out")"
+    fi
     [ -n "$RELEASE_FILE" ] || RELEASE_FILE="$HERE/../../release.json"
     [ -f "$RELEASE_FILE" ] || die "release manifest not found: $RELEASE_FILE"
     ensure_postgres_ready
+    if [ -z "$PREVIOUS_GENERATION_DIR" ]; then
+      # An unacknowledged switch is reconciled from the endpoint's own recorded status; the
+      # unknown switch itself is never resent.
+      WINDOWS_STATUS_STATUS=0
+      WINDOWS_STATUS="$(WINDOWS_RELEASE_OVERRIDE="$PREVIOUS_RELEASE_TRIPLE" instance_lifecycle status "$ROLLBACK_ID")" \
+        || WINDOWS_STATUS_STATUS=$?
+      if [ "$WINDOWS_STATUS_STATUS" != "0" ]; then
+        promotion_step "$ROLLBACK_ID" rollback rollback-windows unknown "$RECEIPT_DIR/windows-status.out"
+        die "the endpoint status is unreadable; the Windows end cannot be reconciled (the admission stays closed)"
+      fi
+      PREVIOUS_GENERATION_DIR="$(python3 - "$WINDOWS_STATUS" "$ROLLBACK_ID" <<'PY'
+import json
+import sys
+
+document = json.load(open(sys.argv[1], encoding="utf-8"))
+last = document.get("last_promotion")
+if (
+    document.get("passed") is True
+    and document.get("verb") == "status"
+    and isinstance(last, dict)
+    and str(last.get("generation", "")).replace("\\", "/").endswith("/" + sys.argv[2])
+    and last.get("previous")
+):
+    print(last["previous"])
+PY
+)"
+    fi
     # Rollback is a maintenance switch too: the current ends close, drain and stop first.
     if ! platform_close_admission "rollback" "operatorctl rollback" > "$EVIDENCE_DIR/rollback-close.out" 2>&1; then
       promotion_step "$ROLLBACK_ID" rollback rollback-close failed "$EVIDENCE_DIR/rollback-close.out"
@@ -859,8 +966,8 @@ PY
     fi
     promotion_step "$ROLLBACK_ID" rollback rollback-drain completed "$EVIDENCE_DIR/rollback-drain.out"
     if ! {
-      airflow_lifecycle stop
-      systemctl --user disable --now description-operator-proxy.service description-portal.service
+      airflow_lifecycle stop \
+      && systemctl --user disable --now description-operator-proxy.service description-portal.service
     } > "$EVIDENCE_DIR/rollback-stop.out" 2>&1; then
       promotion_step "$ROLLBACK_ID" rollback rollback-stop failed "$EVIDENCE_DIR/rollback-stop.out"
       die "the execution services did not stop (the admission stays closed)"
@@ -868,44 +975,54 @@ PY
     promotion_step "$ROLLBACK_ID" rollback rollback-stop completed "$EVIDENCE_DIR/rollback-stop.out"
     # The Windows end restores exactly the generation this maintenance bound, then verifies its
     # own health against that generation's release identity.
-    if ! WINDOWS_ROLLBACK="$(WINDOWS_RELEASE_OVERRIDE="$PREVIOUS_RELEASE_TRIPLE" \
-        instance_lifecycle rollback "$ROLLBACK_ID" "$PREVIOUS_GENERATION_DIR")"; then
-      promotion_step "$ROLLBACK_ID" rollback rollback-windows failed "$RECEIPT_DIR/windows-rollback.out"
-      die "the Windows rollback failed; nothing further was moved"
+    if [ -n "$PREVIOUS_GENERATION_DIR" ]; then
+      WINDOWS_ROLLBACK=""
+      WINDOWS_ROLLBACK_STATUS=0
+      WINDOWS_ROLLBACK="$(WINDOWS_RELEASE_OVERRIDE="$PREVIOUS_RELEASE_TRIPLE" \
+          instance_lifecycle rollback "$ROLLBACK_ID" "$PREVIOUS_GENERATION_DIR")" || WINDOWS_ROLLBACK_STATUS=$?
+      if [ "$WINDOWS_ROLLBACK_STATUS" = "2" ]; then
+        promotion_step "$ROLLBACK_ID" rollback rollback-windows unknown "$RECEIPT_DIR/windows-rollback.out"
+        die "the Windows rollback outcome is unacknowledged (the admission stays closed)"
+      fi
+      if [ "$WINDOWS_ROLLBACK_STATUS" != "0" ]; then
+        promotion_step "$ROLLBACK_ID" rollback rollback-windows failed "$RECEIPT_DIR/windows-rollback.out"
+        die "the Windows rollback failed; nothing further was moved"
+      fi
+      promotion_step "$ROLLBACK_ID" rollback rollback-windows completed "$WINDOWS_ROLLBACK"
+    else
+      # The endpoint's own status shows this maintenance never completed there: nothing to
+      # restore on Windows, and the reconciliation is recorded with that relay as evidence.
+      promotion_step "$ROLLBACK_ID" rollback rollback-windows completed "$RECEIPT_DIR/windows-status.out"
     fi
-    promotion_step "$ROLLBACK_ID" rollback rollback-windows completed "$WINDOWS_ROLLBACK"
     # The Linux end re-activates the recorded previous generation; no generation file is rewritten.
-    if ! "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" repoint \
-        --state-root "$STATE_ROOT" --record "$PREVIOUS_RECORD" > "$EVIDENCE_DIR/rollback-linux.out" 2>&1; then
-      promotion_step "$ROLLBACK_ID" rollback rollback-linux failed "$EVIDENCE_DIR/rollback-linux.out"
-      die "could not restore the previous Linux generation"
+    if [ "$LINUX_SWITCHED" = "1" ]; then
+      if ! "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" repoint \
+          --state-root "$STATE_ROOT" --record "$PREVIOUS_RECORD" > "$EVIDENCE_DIR/rollback-linux.out" 2>&1; then
+        promotion_step "$ROLLBACK_ID" rollback rollback-linux failed "$EVIDENCE_DIR/rollback-linux.out"
+        die "could not restore the previous Linux generation"
+      fi
+      promotion_step "$ROLLBACK_ID" rollback rollback-linux completed "$EVIDENCE_DIR/rollback-linux.out"
+    else
+      # The pointer never moved (receipt source == active generation); the reconciliation is
+      # recorded with the receipt itself as evidence.
+      promotion_step "$ROLLBACK_ID" rollback rollback-linux completed "$RECEIPT_DIR/receipt.json"
     fi
-    promotion_step "$ROLLBACK_ID" rollback rollback-linux completed "$EVIDENCE_DIR/rollback-linux.out"
     # The restored generation starts through its own environment and both ends re-verify.
     load_active_env
     load_installed
     if ! {
-      python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --units-dir "$TARGET"
-      airflow_render
-      systemctl --user daemon-reload
-      airflow_lifecycle start
-      airflow_unpause_dag
-      systemctl --user enable --now description-portal.service description-operator-proxy.service
-      systemctl --user is-active --quiet description-portal.service description-operator-proxy.service
-      "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" verify-active \
-        --config "$CONFIG_FILE" --state-root "$STATE_ROOT"
-      WINDOWS_HEALTH="$(WINDOWS_RELEASE_OVERRIDE="$PREVIOUS_RELEASE_TRIPLE" instance_lifecycle health "$ACTIVE_ID")"
-      python3 - "$WINDOWS_HEALTH" "$EVIDENCE_DIR/rollback-health.json" <<'PY'
-import json
-import sys
-
-document = json.load(open(sys.argv[1], encoding="utf-8"))
-health = document.get("health")
-if document.get("passed") is not True or document.get("verb") != "health" or not isinstance(health, dict):
-    raise SystemExit("the health relay is not a passed health object")
-open(sys.argv[2], "w", encoding="utf-8").write(json.dumps(health) + "\n")
-PY
-      "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" endpoint-identity \
+      python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --units-dir "$TARGET" \
+      && airflow_render \
+      && systemctl --user daemon-reload \
+      && airflow_lifecycle start \
+      && airflow_unpause_dag \
+      && systemctl --user enable --now description-portal.service description-operator-proxy.service \
+      && systemctl --user is-active --quiet description-portal.service description-operator-proxy.service \
+      && "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" verify-active \
+        --config "$CONFIG_FILE" --state-root "$STATE_ROOT" \
+      && WINDOWS_HEALTH="$(WINDOWS_RELEASE_OVERRIDE="$PREVIOUS_RELEASE_TRIPLE" instance_lifecycle health "$ACTIVE_ID")" \
+      && promotion_extract_health "$WINDOWS_HEALTH" "$EVIDENCE_DIR/rollback-health.json" \
+      && "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" endpoint-identity \
         --health "$EVIDENCE_DIR/rollback-health.json" --release-file "$RELEASE_FILE" \
         --record "$STATE_ROOT/install-record.json" --out "$EVIDENCE_DIR/rollback-identity.json"
     } > "$EVIDENCE_DIR/rollback-verify.out" 2>&1; then
