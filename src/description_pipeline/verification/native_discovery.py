@@ -1716,7 +1716,7 @@ def rebuild_rigid_bodies(record: dict) -> list[dict]:
     return bodies
 
 
-def rebuild_interface_frames(record: dict) -> list[dict]:
+def rebuild_interface_frames(record: dict, *, bodies: list[dict] | None = None, base: dict | None = None) -> list[dict]:
     """Rebuild the interface-frame carrier from the raw capture alone (IF-17, in memory).
 
     ``record`` is the raw native capture (or a payload carrying it under ``raw``).
@@ -1728,28 +1728,36 @@ def rebuild_interface_frames(record: dict) -> list[dict]:
     must already be exact snake_case.  A recognised interface that cannot be
     attributed, a duplicate frame name or a body-name collision refuses instead of
     guessing, and the saved derived carrier is never read.
+
+    ``bodies``/``base`` let the declaration domain supply its independently decoded
+    tree (the same native interface interpretation, its own membership proof);
+    without them the rigid bodies and the proven frame-attached base are rebuilt
+    from the raw capture.
     """
 
     raw = record["raw"] if isinstance(record.get("raw"), dict) else record
-    bodies = rebuild_rigid_bodies(raw)
-    by_material, _by_component = _cluster_bindings(raw)
-    full_of_body: dict[str, frozenset[str]] = {}
-    for body in bodies:
-        material = frozenset(str(value) for value in body["components"])
-        full_of_body[str(body["name"])] = by_material.get(material, material)
+    if bodies is None:
+        bodies = rebuild_rigid_bodies(raw)
+        by_material, _by_component = _cluster_bindings(raw)
+        full_of_body: dict[str, frozenset[str]] = {}
+        for body in bodies:
+            material = frozenset(str(value) for value in body["components"])
+            full_of_body[str(body["name"])] = by_material.get(material, material)
+        named = [body for body in bodies if str(body["frame"]["coordinate_system"]) == "CS_base_link"]
+        _require(
+            len(named) == 1,
+            "discovery.interface_frame_rebuild",
+            "the rebuilt carrier has no unique CS_base_link body",
+            {"datums": [str(body["frame"]["coordinate_system"]) for body in named]},
+        )
+        root = named[0]
+        attached = _frame_attached_members(raw)
+        base = root if attached and full_of_body[str(root["name"])] == attached else None
+    else:
+        full_of_body = {str(body["name"]): frozenset(str(value) for value in body["components"]) for body in bodies}
     body_of_component = {
         str(component): str(body["name"]) for body in bodies for component in full_of_body[str(body["name"])]
     }
-    named = [body for body in bodies if str(body["frame"]["coordinate_system"]) == "CS_base_link"]
-    _require(
-        len(named) == 1,
-        "discovery.interface_frame_rebuild",
-        "the rebuilt carrier has no unique CS_base_link body",
-        {"datums": [str(body["frame"]["coordinate_system"]) for body in named]},
-    )
-    root = named[0]
-    attached = _frame_attached_members(raw)
-    base = root if attached and full_of_body[str(root["name"])] == attached else None
     # Link datums: every cluster member paired with the body's own CS_ frame datum
     # (the producer excludes the whole member scope, not only the datum's owner).
     link_datums = {
@@ -1776,6 +1784,15 @@ def rebuild_interface_frames(record: dict) -> list[dict]:
         name = str(datum.get("name") or "")
         if not name.startswith(INTERFACE_PREFIXES):
             continue
+        if "configuration" in datum and str(datum.get("configuration") or "") != str(
+            raw.get("saved_configuration") or ""
+        ):
+            _require(
+                False,
+                "discovery.interface_frame_rebuild",
+                "interface datum was read in another configuration",
+                {"datum": name, "configuration": datum.get("configuration")},
+            )
         owner = str(datum.get("owner") or "")
         if (owner, name) in link_datums:
             continue

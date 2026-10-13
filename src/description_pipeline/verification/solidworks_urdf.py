@@ -230,6 +230,8 @@ def _input(root, diagnostics=None):
     discovery_record = ev.discovery(root)
     _require(isinstance(discovery_record.get("raw"), dict), "Discovery record carries no raw capture")
     raw = discovery_record["raw"]
+    from .native_discovery import rebuild_interface_frames, rebuild_joint_facts, rebuild_rigid_bodies
+
     if exporter_declaration_present(raw):
         # The declaration domain carries its own independent decode: the consumer
         # expectations come from the sealed declaration, and the failure cause is never
@@ -242,10 +244,13 @@ def _input(root, diagnostics=None):
             f"the discovery record declaration gate failed: {declarations['errors'][:1]}",
         )
         carrier = declarations["carrier"]
-        bodies, joints, frames = carrier["bodies"], carrier["joints"], carrier["frames"]
+        bodies, joints = carrier["bodies"], carrier["joints"]
+        # The native interface interpretation is shared across the two modes: each mode
+        # proves its own members/base first, then rebuilds the CS_/TCP_/SCS_ interfaces
+        # from the raw datums (a missing declaration extension never proves absence).
+        base = next((body for body in bodies if body["name"] == carrier.get("root")), None)
+        frames = rebuild_interface_frames(raw, bodies=bodies, base=base)
     else:
-        from .native_discovery import rebuild_interface_frames, rebuild_joint_facts, rebuild_rigid_bodies
-
         bodies = rebuild_rigid_bodies(discovery_record)
         joints = rebuild_joint_facts(discovery_record, root)
         frames = rebuild_interface_frames(discovery_record)

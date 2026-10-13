@@ -757,7 +757,6 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
                     "generated joint axis or operating values differ",
                     joint=name,
                 )
-        _require(source.get("frames") == [], "v14.claims", "generated interface frames have no saved declaration")
         return {"bodies": len(bodies), "joints": len(joints)}
 
     if check("declarations.binding", boundary) and check("declarations.topology", topology):
@@ -787,6 +786,7 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
         #: The consumer expectations decoded from the sealed declaration itself (mode routing
         #: for the URDF stage): same decode the audit above verified, never the derived copy.
         "carrier": {
+            "root": ((state.get("declaration") or {}).get("root") or {}).get("name"),
             "bodies": [
                 {
                     "id": name,
@@ -814,6 +814,5 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
                 }
                 for name, joint in sorted((state.get("joints") or {}).items())
             ],
-            "frames": [],
         },
     }

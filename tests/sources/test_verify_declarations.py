@@ -538,6 +538,76 @@ class DeclarationConsumerTests(unittest.TestCase):
             )
         self.assertIn("CS_<link>", str(raised.exception))
 
+    @staticmethod
+    def _interface(name: str, owner: str, configuration: str = "Default") -> dict:
+        return {
+            "name": name,
+            "owner": owner,
+            "configuration": configuration,
+            "array": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        }
+
+    def test_declaration_frames_rebuild_native_interfaces(self) -> None:
+        """A declaration without extension interfaces never proves their absence."""
+
+        def inject(raw):
+            raw["datums"].append(self._interface("TCP_tool_tcp", "module-1/tool_part"))
+            raw["datums"].append(self._interface("SCS_sensor_mount", "module-1/bracket"))
+            raw["datums"].append(self._interface("TCP_base_mount", "base_part"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            returned = solidworks_urdf._input(self._delivery(directory, inject), [])
+        frames = {
+            frame["name"]: (frame["parent"], frame["coordinate_system"]) for frame in returned["source"]["frames"]
+        }
+        self.assertEqual(
+            frames,
+            {
+                "tool_tcp": ("tool", "TCP_tool_tcp"),
+                "sensor_mount": ("tool", "SCS_sensor_mount"),
+                "base_mount": ("base", "TCP_base_mount"),
+            },
+        )
+        # The frames become required gates: a model that drops or reparents an interface
+        # fails the qualified report instead of passing with an unverified interface.
+        identifiers = solidworks_urdf.required_checks(returned)
+        self.assertIn("frames.tool_tcp", identifiers)
+        self.assertIn("frames.base_mount", identifiers)
+
+    def test_declaration_frame_gate_refuses_foreign_duplicate_and_wrong_configuration(self) -> None:
+        cases = (
+            (
+                "foreign owner",
+                lambda raw: raw["datums"].append(self._interface("TCP_orphan", "ghost-1")),
+                "not owned by any rebuilt body",
+            ),
+            (
+                "duplicate frame name",
+                lambda raw: [
+                    raw["datums"].append(self._interface("TCP_tool_tcp", "module-1/tool_part")) for _ in range(2)
+                ],
+                "derive the same frame name",
+            ),
+            (
+                "wrong configuration",
+                lambda raw: raw["datums"].append(self._interface("TCP_tool_tcp", "module-1/tool_part", "Other")),
+                "another configuration",
+            ),
+            (
+                "body name collision",
+                lambda raw: raw["datums"].append(self._interface("TCP_base", "module-1/tool_part")),
+                "collides with a body name",
+            ),
+        )
+        for label, mutate, needle in cases:
+            with (
+                self.subTest(case=label),
+                tempfile.TemporaryDirectory() as directory,
+                self.assertRaises(Exception) as raised,  # noqa: B017 - classification asserted below
+            ):
+                solidworks_urdf._input(self._delivery(directory, mutate), [])
+            self.assertIn(needle, str(raised.exception))
+
 
 class NativeDeclarationsTests(unittest.TestCase):
     def errors(self, raw, source=None):
