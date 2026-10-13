@@ -309,9 +309,20 @@ def _snapshot_details(staging, manifest):
 
 
 def capture_evidence(
-    package: Path, staging: Path, *, expected_inputs=None, handoff_sha256=None, backend=None, on_event=None
+    package: Path,
+    staging: Path,
+    *,
+    expected_inputs=None,
+    handoff_sha256=None,
+    backend=None,
+    on_event=None,
+    on_activity=None,
 ):
-    """Inspect generated inputs, archive them and capture a complete immutable snapshot."""
+    """Inspect generated inputs, archive them and capture a complete immutable snapshot.
+
+    ``on_activity`` optionally observes best-effort capture progress records for the
+    live-activity view; it never changes the snapshot, its checks or a failure path.
+    """
     from .sources.solidworks.freeze import freeze
     from .sources.solidworks.input import native_source_closure, resolve_package
 
@@ -367,7 +378,13 @@ def capture_evidence(
 
     checked(on_event, "capture", "input", "runtime.ready", ready)
     _require(package_inventory(package) == original_files, "Prepared inputs changed before native capture")
-    freeze(definition["source"], staging / "evidence", backend=backend, worker_version=__version__)
+    freeze(
+        definition["source"],
+        staging / "evidence",
+        backend=backend,
+        worker_version=__version__,
+        on_activity=on_activity,
+    )
     checked(
         on_event,
         "capture",
