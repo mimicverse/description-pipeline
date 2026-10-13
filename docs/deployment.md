@@ -39,7 +39,13 @@ Linux 使用一份私有 `platform.json`。schema 拒绝未知键、不安全路
   "windows": {
     "ssh_host": "solidworks-worker",
     "endpoint_port": 8765,
-    "token_file": "/srv/description/secrets/endpoint.token"
+    "token_file": "/srv/description/secrets/endpoint.token",
+    "instance": {
+      "task_name": "description-endpoint",
+      "package_root": "C:/description/packages",
+      "output_root": "C:/description/results",
+      "state_root": "C:/description/state"
+    }
   },
   "auth": {
     "feishu_secret_file": "/srv/description/secrets/feishu.json",
@@ -56,6 +62,8 @@ Linux 使用一份私有 `platform.json`。schema 拒绝未知键、不安全路
 ```
 
 `execution.linux_concurrency` 为 Linux 工程任务并行上限，默认 `1`；原生资源始终为 `1`。`retention.unreferenced_evidence_days` 默认为 `null`，不自动删除封存证据；正整数只控制无引用证据保留天数。
+
+`windows.instance` 固定 Windows 执行端的任务名及工程、产物和状态目录，维护命令依据配置和安装记录定位该目标。同一主机上的任务共享 CAD 排他资源约束，新用户或新目录不形成独立资源域。
 
 配置、状态、上传、交付、临时工作区、发行安装和规格库使用专用目录，禁止使用主目录/操作系统根、目录重叠、符号链接或 junction。Linux 私有配置和秘密文件权限为 `0600`，私有目录为 `0700`；Windows 使用仅执行用户可读写的 ACL。日志只展示标识、摘要和路径，不展示秘密值。
 
@@ -91,7 +99,7 @@ C:\description\runtime\Scripts\description.exe doctor
 C:\description\runtime\Scripts\description.exe serve --config C:\description\endpoint.json
 ```
 
-验收后以同一账户的登录 Scheduled Task 启动同一命令，保持桌面登录和主机唤醒。此主机只有一个配置 state root，执行期间无独立 CAD 活动；就绪检查发现外部会话时显示不可执行原因，不能关闭该会话。保持时钟同步、桌面有效和磁盘容量充足，系统更新/重启使用同一排空流程。所有启动与清理入口共用资源域，遵守[CAD 所有权契约](contracts.md#resources)。
+验收后以同一账户的登录 Scheduled Task 启动同一命令，保持桌面登录和主机唤醒。每个执行端只使用安装记录绑定的配置和 state root，执行期间无独立 CAD 活动；就绪检查发现外部会话时显示不可执行原因，不能关闭该会话。保持时钟同步、桌面有效和磁盘容量充足，系统更新/重启使用同一排空流程。所有启动与清理入口共用资源域，遵守[CAD 所有权契约](contracts.md#resources)。
 
 ## 安装 Linux 平台
 
