@@ -101,8 +101,9 @@ class PlatformEnvTests(unittest.TestCase):
         self.assertEqual(env["SOLIDWORKS_ENDPOINT_PORT"], "9765")
         self.assertIn("airflow-pg/socket", env["AIRFLOW_DB_URL"])
 
-        derived_dir = Path(env["OPERATOR_STATE"]) / "derived"
+        derived_dir = Path(env["OPERATOR_STATE"]) / "derived" / "gen-1"
         self.assertEqual(result["derived_dir"], derived_dir)
+        self.assertFalse((Path(env["OPERATOR_STATE"]) / "derived" / "operator.env").exists())
         repositories = json.loads((derived_dir / "repositories.json").read_text(encoding="utf-8"))
         self.assertEqual(repositories, self.snapshot["resolved"]["derived"]["repositories"])
         targets = json.loads((derived_dir / "targets.json").read_text(encoding="utf-8"))
@@ -178,17 +179,51 @@ class PlatformEnvTests(unittest.TestCase):
         self.assertTrue(Path(summary["env"]).is_file())
         self.assertEqual(Path(summary["wheel"]), self.wheel)
 
-    def test_malformed_inputs_fail_closed(self):
+    def test_generations_are_independent_and_immutable(self):
+        first = platform_env.derive(self.snapshot, install_id="gen-1", tree_root=self.tree)
+        first_env_bytes = Path(first["env_path"]).read_bytes()
+        first_targets_path = Path(first["env"]["MODEL_TARGETS_FILE"])
+        first_targets_bytes = first_targets_path.read_bytes()
+
+        second_snapshot = json.loads(json.dumps(self.snapshot))
+        second_snapshot["install_id"] = "gen-2"
+        second_snapshot["resolved"]["targets"]["m3.0"]["base"] = "feature/review-next"
+        platform_config.validate_snapshot_document(second_snapshot)
+        second = platform_env.derive(second_snapshot, install_id="gen-2", tree_root=self.tree)
+        self.assertNotEqual(first["env_path"], second["env_path"])
+        self.assertEqual(Path(first["env_path"]).read_bytes(), first_env_bytes)
+        self.assertEqual(first_targets_path.read_bytes(), first_targets_bytes)
+        self.assertEqual(json.loads(first_targets_path.read_text())["m3.0"]["base"], "main")
+        self.assertEqual(
+            json.loads(Path(second["env"]["MODEL_TARGETS_FILE"]).read_text())["m3.0"]["base"],
+            "feature/review-next",
+        )
+
+        conflicting = json.loads(json.dumps(self.snapshot))
+        conflicting["resolved"]["targets"]["m3.0"]["base"] = "other"
+        with self.assertRaises(SystemExit):
+            platform_env.derive(conflicting, install_id="gen-1", tree_root=self.tree)
+        self.assertEqual(first_targets_path.read_bytes(), first_targets_bytes)
+        self.assertEqual(Path(first["env_path"]).read_bytes(), first_env_bytes)
+
+    def test_malformed_inputs_fail_closed_without_writing(self):
+        cases = []
         broken = json.loads(json.dumps(self.snapshot))
         broken["resolved"]["storage"]["state_root"] = "relative/state"
-        with self.assertRaises(SystemExit):
-            platform_env.derive(broken, install_id="gen-1", tree_root=self.tree)
+        cases.append(("relative state root", broken, "gen-1"))
         broken = json.loads(json.dumps(self.snapshot))
         broken["resolved"]["windows"]["endpoint_port"] = "9765"
-        with self.assertRaises(SystemExit):
-            platform_env.derive(broken, install_id="gen-1", tree_root=self.tree)
-        with self.assertRaises(SystemExit):
-            platform_env.derive(self.snapshot, install_id="bad/id", tree_root=self.tree)
+        cases.append(("string endpoint port", broken, "gen-1"))
+        cases.append(("generation mismatch", self.snapshot, "gen-2"))
+        foreign = json.loads(json.dumps(self.snapshot))
+        foreign["schema_version"] = "review.foreign-snapshot/v99"
+        cases.append(("foreign schema", foreign, "gen-1"))
+        cases.append(("bad install id", self.snapshot, "bad/id"))
+        for label, snapshot, install_id in cases:
+            with self.subTest(label):
+                with self.assertRaises(SystemExit):
+                    platform_env.derive(snapshot, install_id=install_id, tree_root=self.tree)
+                self.assertFalse((self.root / "state" / "derived").exists(), "no derived files may be written")
 
 
 if __name__ == "__main__":

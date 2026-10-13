@@ -25,14 +25,13 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from platform_config import canonical  # noqa: E402  (shared canonical serialization)
+from platform_config import atomic_write_once, canonical, validate_snapshot_document  # noqa: E402  (shared helpers)
 from render_operator import PORT_DEFAULTS  # noqa: E402  (single deploy-layer port source, DEP-01)
 
 
@@ -82,31 +81,17 @@ def resolve_wheel(tree_root: Path, wheel: Path | None) -> Path:
     return candidates[0]
 
 
-def _write_replaced(path: Path, payload: bytes) -> Path:
-    """Atomic replace for re-derivable artifacts (0600, private directory)."""
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(path.parent, 0o700)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-    os.chmod(path, 0o600)
-    return path
-
-
 def derive(snapshot: dict, *, install_id: str, tree_root: Path, wheel: Path | None = None) -> dict:
     """Return ``{env, env_path, derived_dir, wheel}`` for one install generation."""
 
     require(bool(install_id) and all(character not in install_id for character in "\n\r/"), "install_id is malformed")
-    resolved = snapshot.get("resolved") if isinstance(snapshot, dict) else None
-    require(isinstance(resolved, dict), "snapshot resolved tree is missing")
+    validate_snapshot_document(snapshot)
+    declared = snapshot["install_id"]
+    require(
+        declared == install_id,
+        f"snapshot generation mismatch: the snapshot declares {declared!r}, the request is {install_id!r}",
+    )
+    resolved = snapshot["resolved"]
     storage = resolved.get("storage")
     windows = resolved.get("windows")
     operator = resolved.get("operator")
@@ -150,10 +135,14 @@ def derive(snapshot: dict, *, install_id: str, tree_root: Path, wheel: Path | No
     require(isinstance(repositories, dict) and bool(repositories), "resolved.derived.repositories is empty")
     require(isinstance(discovery, dict), "resolved.derived.discovery is missing")
 
-    derived_dir = Path(state_root) / "derived"
-    repositories_file = _write_replaced(derived_dir / "repositories.json", canonical(repositories))
-    targets_file = _write_replaced(derived_dir / "targets.json", canonical(targets))
-    discovery_file = _write_replaced(derived_dir / "discovery.json", canonical(discovery))
+    # Derived artifacts bind to their immutable installation generation: a candidate preparation
+    # writes only inside <state_root>/derived/<install_id>/ and never edits an older generation's
+    # referenced bytes; active reference switching belongs to promote/rollback alone.
+    derived_dir = Path(state_root) / "derived" / install_id
+    repositories_file = derived_dir / "repositories.json"
+    targets_file = derived_dir / "targets.json"
+    discovery_file = derived_dir / "discovery.json"
+    env_path = derived_dir / "operator.env"
 
     wheel_path = resolve_wheel(tree_root, wheel)
     venv = f"{release_root.rstrip('/')}/airflow-venv-{install_id}"
@@ -190,7 +179,10 @@ def derive(snapshot: dict, *, install_id: str, tree_root: Path, wheel: Path | No
         "DISCOVERY_SETTINGS_FILE": str(discovery_file),
     }
     lines = [f"{key}={value}" for key, value in sorted(env.items())]
-    env_path = _write_replaced(derived_dir / "operator.env", ("\n".join(lines) + "\n").encode("utf-8"))
+    atomic_write_once(repositories_file, canonical(repositories))
+    atomic_write_once(targets_file, canonical(targets))
+    atomic_write_once(discovery_file, canonical(discovery))
+    atomic_write_once(env_path, ("\n".join(lines) + "\n").encode("utf-8"))
     return {"env": env, "env_path": env_path, "derived_dir": derived_dir, "wheel": wheel_path}
 
 
