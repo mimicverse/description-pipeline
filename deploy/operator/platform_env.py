@@ -14,6 +14,9 @@ Derivations (all paths under the configured storage roots; converged here as the
   AIRFLOW_DB_URL = postgresql+psycopg2://solidworks@/airflow_meta?host=<POSTGRES_ROOT>/socket&port=<POSTGRES_PORT>
   PIPELINE_WHEEL = the installed wheel (explicit ``--wheel`` or the single ``*.whl`` under the
   deployment tree), bound to a release artifact by name+digest before any leg runs
+  PLATFORM_SERVICE_DSN / PLATFORM_OPERATOR_DSN = the platform store and read roles over the
+  deployment PostgreSQL socket - the operator role carries SELECT on the two platform views
+  and nothing else; both roles are authenticated by the deployment pg_hba
   MODEL_* / DISCOVERY files = derived JSON under <state_root>/derived (0600)
 
 The derived env file is written 0600 under <state_root>/derived and is an internal artifact of
@@ -282,6 +285,12 @@ def derive(
         "POSTGRES_PORT": str(postgres_port),
         "AIRFLOW_DB_URL": (
             f"postgresql+psycopg2://solidworks@/airflow_meta?host={postgres_root}/socket&port={postgres_port}"
+        ),
+        "PLATFORM_SERVICE_DSN": (
+            f"postgresql://platform_service@/airflow_meta?host={postgres_root}/socket&port={postgres_port}"
+        ),
+        "PLATFORM_OPERATOR_DSN": (
+            f"postgresql://operator_ro@/airflow_meta?host={postgres_root}/socket&port={postgres_port}"
         ),
         "PIPELINE_WHEEL": str(wheel_path),
         "PIPELINE_STORE_ROOT": store_root,

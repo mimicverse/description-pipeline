@@ -1,14 +1,28 @@
-"""Lifecycle projection classification and gate exit codes (fail-closed view-owned buckets)."""
+"""Lifecycle projection consumption: bucket-only classification, admission facts, gate codes."""
 
 from __future__ import annotations
 
 import contextlib
 import io
 import json
+import os
 import unittest
-from types import SimpleNamespace
+from unittest.mock import patch
 
 from description_pipeline.orchestration import lifecycle_state
+
+
+def collected(rows, admission_state="closed"):
+    return {
+        "rows": rows,
+        "admission": {
+            "state": admission_state,
+            "reason": "test",
+            "actor": "test",
+            "changed_at": None,
+            "revision": 1,
+        },
+    }
 
 
 class LifecycleStateTests(unittest.TestCase):
@@ -33,83 +47,75 @@ class LifecycleStateTests(unittest.TestCase):
                 self.assertFalse(data["settled"], "a row without a recognized bucket must never settle")
                 self.assertEqual([entry["run_id"] for entry in data["unknown"]], ["r"])
 
-    def test_observe_keeps_null_states_visible_without_filters(self):
-        observed_filters = []
-
-        class Query:
-            def __init__(self, model):
-                self.model = model
-                self.members = [SimpleNamespace(run_id="run-1", task_id="verify", state=None)]
-
-            def filter(self, expression):
-                observed_filters.append(self.model.__name__)
-                return self
-
-            def all(self):
-                return self.members
-
-        class Session:
-            def query(self, model):
-                return Query(model)
-
-        collected = lifecycle_state.observe(
-            Session(),
-            type("DagRunModel", (), {}),
-            type("TaskInstanceModel", (), {}),
-        )
-        self.assertEqual(observed_filters, [], "the observation must not pre-filter by state")
-        data = lifecycle_state.classify(collected)
-        self.assertFalse(data["settled"], "a NULL scheduler state must block, not settle")
-        self.assertTrue(data["unknown"])
-
-    def test_bucket_rows_are_consumed_verbatim_and_unknown_buckets_fail_closed(self):
+    def test_request_rows_never_enter_the_activity_gates(self):
         rows = [
-            {"run_id": "a", "state": "running", "bucket": "terminal"},
-            {"run_id": "b", "state": "publishing", "bucket": "in_flight"},
-            {"run_id": "c", "state": "unresolved", "bucket": "unresolved"},
-            {"run_id": "d", "state": None, "bucket": "unknown"},
-            {"run_id": "e", "state": "running", "bucket": "unrecognized"},
+            {"object_kind": "request", "object_id": "req-1", "state": "accepted", "bucket": "terminal"},
+            {"object_kind": "request", "object_id": "req-2", "state": None, "bucket": "unknown"},
         ]
         data = lifecycle_state.classify(rows)
-        self.assertEqual([row["run_id"] for row in data["in_flight"]], ["b"])
-        self.assertEqual([row["run_id"] for row in data["unresolved"]], ["c"])
-        self.assertEqual([row["run_id"] for row in data["unknown"]], ["d", "e"])
-        self.assertFalse(data["settled"])
-        self.assertTrue(
-            lifecycle_state.classify([{"run_id": "a", "state": "running", "bucket": "terminal"}])["settled"]
-        )
+        self.assertTrue(data["settled"], "request rows are acceptance facts, not activity")
+        self.assertEqual(data["in_flight"], [])
+        self.assertEqual(data["unresolved"], [])
+        self.assertEqual(data["unknown"], [])
+        self.assertEqual([row["object_id"] for row in data["requests"]], ["req-1", "req-2"])
 
-    def test_projection_seam_is_the_default_collector(self):
-        self.assertTrue(callable(lifecycle_state.collect_projection))
+    def test_unreadable_projection_refuses_the_gate(self):
+        def broken():
+            raise RuntimeError("connection refused")
+
         stream = io.StringIO()
-        with contextlib.redirect_stdout(stream):
-            code = lifecycle_state.main(["report"], collect=lambda: [{"run_id": "a", "state": "success"}])
-        self.assertEqual(code, 0)
+        with contextlib.redirect_stderr(stream):
+            code = lifecycle_state.main(["report", "--require-settled"], collect=broken)
+        self.assertEqual(code, 1, "an unreadable authority must refuse")
+        self.assertIn("projection unreadable", stream.getvalue())
+
+    def test_missing_read_dsn_refuses(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PLATFORM_OPERATOR_DSN", None)
+            with self.assertRaises(RuntimeError):
+                lifecycle_state.collect_projection()
 
     def test_report_exit_codes(self):
-        def run(rows, *flags):
+        def run(rows, *flags, admission_state="closed"):
             stream = io.StringIO()
             with contextlib.redirect_stdout(stream):
-                code = lifecycle_state.main(["report", *flags], collect=lambda: rows)
+                code = lifecycle_state.main(
+                    ["report", *flags], collect=lambda: collected(rows, admission_state)
+                )
             return code, json.loads(stream.getvalue())
 
-        code, data = run([{"run_id": "a", "state": "running", "bucket": "in_flight"}], "--require-no-unresolved")
-        self.assertEqual(code, 0)
+        in_flight = {"object_kind": "run", "run_id": "a", "state": "running", "bucket": "in_flight"}
+        unresolved = {"object_kind": "operation", "run_id": "a", "state": "unresolved", "bucket": "unresolved"}
+        terminal = {"object_kind": "run", "run_id": "a", "state": "succeeded", "bucket": "terminal"}
+
+        code, data = run([in_flight], "--require-no-unresolved")
+        self.assertEqual(code, 0, "in-flight work is allowed while draining")
         self.assertEqual(data["in_flight"][0]["run_id"], "a")
-        code, _ = run([{"run_id": "a", "state": "running", "bucket": "in_flight"}], "--require-settled")
+        code, _ = run([in_flight], "--require-settled")
         self.assertEqual(code, 1)
-        code, _ = run([{"run_id": "a", "state": "unresolved", "bucket": "unresolved"}], "--require-no-unresolved")
+        code, _ = run([unresolved], "--require-no-unresolved")
         self.assertEqual(code, 1)
-        code, _ = run([{"run_id": "a", "state": "unresolved", "bucket": "unresolved"}], "--require-settled")
+        code, _ = run([unresolved], "--require-settled")
         self.assertEqual(code, 1)
-        code, _ = run(
-            [{"run_id": "a", "state": "completed", "bucket": "terminal"}],
-            "--require-settled",
-            "--require-no-unresolved",
-        )
+        code, _ = run([terminal], "--require-settled", "--require-no-unresolved")
         self.assertEqual(code, 0)
-        code, _ = run([{"run_id": "a", "state": "success"}], "--require-settled")
-        self.assertEqual(code, 1, "scheduler rows without the view's bucket are unknown and must block")
+        code, _ = run([], "--require-admission-closed")
+        self.assertEqual(code, 0)
+        code, data = run([], "--require-admission-closed", admission_state="open")
+        self.assertEqual(code, 1)
+        self.assertFalse(data["drain_requested"])
+
+    def test_snapshot_distinguishes_acknowledged_and_drained(self):
+        in_flight = {"object_kind": "stage", "run_id": "a", "state": "running", "bucket": "in_flight"}
+        draining = lifecycle_state.snapshot(lambda: collected([in_flight], "closed"))
+        self.assertTrue(draining["drain_requested"], "a successful close acknowledges draining")
+        self.assertFalse(draining["drained"])
+        drained = lifecycle_state.snapshot(lambda: collected([], "closed"))
+        self.assertTrue(drained["drain_requested"])
+        self.assertTrue(drained["drained"])
+        open_run = lifecycle_state.snapshot(lambda: collected([], "open"))
+        self.assertFalse(open_run["drain_requested"])
+        self.assertFalse(open_run["drained"])
 
 
 if __name__ == "__main__":
