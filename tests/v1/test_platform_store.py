@@ -105,6 +105,7 @@ class FakeWorld:
         self.run_from_stage: dict[str, str | None] = {}
         self.operations: dict[str, tuple] = {}
         self.stages: dict[tuple[str, str], tuple] = {}
+        self.events: list[tuple] = []
         self.confirmed_publishes: set[tuple[str, str]] = set()
         self.lifecycle_rows = [
             ("run", "r-1", "r-1", "running", "in_flight", NOW),
@@ -158,7 +159,7 @@ class FakeCursor:
         elif normalized.startswith("INSERT INTO platform.request"):
             world.requests.append(tuple(params))
             self._rows = []
-        elif normalized.startswith("INSERT INTO platform.run"):
+        elif normalized.startswith("INSERT INTO platform.run ("):
             world.runs.append(tuple(params))
             world.run_states[params[0]] = "queued"
             world.run_from_stage[params[0]] = params[3]
@@ -220,6 +221,12 @@ class FakeCursor:
                 (name,) for name in ("object_kind", "object_id", "run_id", "state", "bucket", "updated_at")
             )
             self._rows = list(world.lifecycle_rows)
+        elif normalized.startswith("SELECT COALESCE(MAX(seq), 0) + 1 FROM platform.run_event"):
+            highest = max((item[1] for item in world.events if item[0] == params[0]), default=0)
+            self._rows = [(highest + 1,)]
+        elif normalized.startswith("INSERT INTO platform.run_event"):
+            world.events.append(tuple(params))
+            self._rows = []
         else:
             raise AssertionError(f"Unexpected statement: {normalized}")
         return self
@@ -539,6 +546,27 @@ class PlatformStoreTests(unittest.TestCase):
         self.assertEqual([row["object_kind"] for row in rows], ["run", "scheduling"])
         self.assertEqual(rows[1]["bucket"], "in_flight")
         self.assertEqual(self.store.admission().state, "open")
+
+    def test_confirm_stage_appends_the_event_in_the_same_transaction(self) -> None:
+        self._running_run()
+        transactions = self.world.transactions
+        self.store.confirm_stage(
+            run_id="r-1", stage="generate", state="completed", checkpoint_uri=CHECKPOINT, receipt=generate_receipt()
+        )
+        self.assertEqual(self.world.transactions - transactions, 1, "state, receipt and event share one transaction")
+        self.assertEqual(len(self.world.events), 1)
+        run_id, sequence, kind, stage, operation_id, payload = self.world.events[0]
+        self.assertEqual((run_id, sequence, kind, stage), ("r-1", 1, "stage", "generate"))
+        self.assertIsNone(operation_id)
+        self.assertEqual(payload, '{"state":"completed"}')
+        self.store.confirm_stage(run_id="r-1", stage="verify", state="pending", checkpoint_uri=None)
+        self.assertEqual(self.world.events[1][1], 2, "the sequence is assigned under the run lock")
+
+    def test_the_environment_factory_needs_the_derived_service_dsn(self) -> None:
+        with self.assertRaisesRegex(PlatformStoreError, "PLATFORM_SERVICE_DSN"):
+            PlatformStore.from_environment({})
+        store = PlatformStore.from_environment({"PLATFORM_SERVICE_DSN": "postgresql://service@/platform?host=/sock"})
+        self.assertIsInstance(store, PlatformStore)
 
     def test_missing_admission_row_is_refused_without_typing_it_closed(self) -> None:
         self.world.admission = None

@@ -17,8 +17,9 @@ closes the connection again; no transaction ever spans an external call.
 from __future__ import annotations
 
 import json
+import os
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -131,6 +132,11 @@ _RECONCILE_STAGE = (
 _READ_LIFECYCLE = (
     "SELECT object_kind, object_id, run_id, state, bucket, updated_at FROM platform.lifecycle_projection"
 )
+_NEXT_EVENT_SEQ = "SELECT COALESCE(MAX(seq), 0) + 1 FROM platform.run_event WHERE run_id = %s"
+_INSERT_EVENT = (
+    "INSERT INTO platform.run_event (run_id, seq, kind, stage, operation_id, payload)"
+    " VALUES (%s, %s, %s, %s, %s, %s::jsonb)"
+)
 
 #: Operation kinds that may continue on a terminal run (the reconciliation and
 #: cancellation commands); every other kind needs a non-terminal run.
@@ -158,6 +164,28 @@ class PlatformStore:
 
     def __init__(self, connect: Callable[[], Any]):
         self._connect = connect
+
+    @classmethod
+    def from_environment(cls, environ: Mapping[str, str] | None = None) -> PlatformStore:
+        """Build the store from the deploy side's derived service DSN.
+
+        Install (``platform_env``) exports ``PLATFORM_SERVICE_DSN`` for the
+        platform_service role; the driver is imported lazily so the package
+        carries no database dependency, and a missing DSN is an explicit
+        refusal - never a silent fallback to another store.
+        """
+
+        source = os.environ if environ is None else environ
+        dsn = source.get("PLATFORM_SERVICE_DSN")
+        if not dsn:
+            raise PlatformStoreError("PLATFORM_SERVICE_DSN is not configured; the platform store is unavailable")
+
+        def connect():
+            import psycopg2
+
+            return psycopg2.connect(dsn)
+
+        return cls(connect)
 
     @contextmanager
     def _transaction(self):
@@ -376,6 +404,9 @@ class PlatformStore:
             raise PlatformStoreError("A reconciliation confirms a definite outcome; unresolved is not an outcome")
         with self._transaction() as connection:
             cursor = connection.cursor()
+            cursor.execute(_LOCK_RUN, (run_id,))
+            if cursor.fetchone() is None:
+                raise PlatformStoreError(f"The run {run_id!r} is not admitted")
             cursor.execute(_LOCK_STAGE, (run_id, stage))
             row = cursor.fetchone()
             current = row[0] if row else None
@@ -418,6 +449,14 @@ class PlatformStore:
                 )
                 if cursor.fetchone() is None:
                     raise PlatformStoreError("The reconciliation lost its unresolved stage to another writer")
+                self._insert_event(
+                    connection,
+                    run_id=run_id,
+                    stage=stage,
+                    kind="stage",
+                    operation_id=reconcile.get("operation_id") if reconcile is not None else None,
+                    payload={"state": state},
+                )
                 return
             cursor.execute(
                 _INSERT_STAGE,
@@ -427,6 +466,23 @@ class PlatformStore:
                 raise PlatformStoreError(
                     f"The {stage!r} stage of run {run_id!r} is already terminal; start a linked run instead"
                 )
+            self._insert_event(
+                connection,
+                run_id=run_id,
+                stage=stage,
+                kind="stage",
+                operation_id=reconcile.get("operation_id") if reconcile is not None else None,
+                payload={"state": state},
+            )
+
+    def _insert_event(self, connection, *, run_id: str, stage: str, kind: str, operation_id, payload) -> None:
+        """Append one run event in the same transaction as the state change it describes."""
+
+        cursor = connection.cursor()
+        cursor.execute(_NEXT_EVENT_SEQ, (run_id,))
+        row = cursor.fetchone()
+        sequence = row[0] if row else 1
+        cursor.execute(_INSERT_EVENT, (run_id, sequence, kind, stage, operation_id, _json(payload)))
 
     def confirmed_stage(self, run_id: str, stage: str) -> dict | None:
         """The platform-authority reuse query: the sealed receipt of a confirmed stage, or refusal.
