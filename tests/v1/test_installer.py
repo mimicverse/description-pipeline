@@ -57,6 +57,7 @@ class RenderConfigTest(unittest.TestCase):
             text = cfg.read_text(encoding="utf-8")
             self.assertIn("# managed-by: description-airflow", text)
             self.assertIn(f"sql_alchemy_conn = {DSN}", text)
+            self.assertIn("sql_alchemy_schema = airflow", text)
             self.assertIn("execution_api_server_url = http://127.0.0.1:8791/execution", text)
             self.assertIn(f"dags_folder = {DEPLOY / 'dags'}", text)
             self.assertIn("auth_manager = description_pipeline.orchestration.feishu_auth.FeishuAuthManager", text)
@@ -222,6 +223,7 @@ class InstallGuardsTest(unittest.TestCase):
             "AIRFLOW_HOME": f"{tmp}/home",
             "PIPELINE_WHEEL": f"{tmp}/wheels/mimicverse_description-0.3.25-py3-none-any.whl",
             "AIRFLOW_DB_URL": DSN,
+            "AIRFLOW_RUNTIME_DB_URL": DSN,
             "AIRFLOW_API_PORT": "8791",
         }
         base.update(env)

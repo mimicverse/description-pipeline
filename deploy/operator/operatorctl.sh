@@ -306,17 +306,40 @@ case "$ACTION" in
         "$PG_BIN/createdb" -h "$POSTGRES_ROOT/socket" -p "$POSTGRES_PORT" -U solidworks airflow_meta \
           || die "could not create the airflow_meta database"
       fi
-      # U0: initialize the platform schema, the read models and the role boundary (idempotent);
-      # the admission starts closed until "start" opens it.
-      PLATFORM_PSQL="$PG_BIN/psql" bash "$HERE/../platform/apply.sh" \
-        --database airflow_meta --socket "$POSTGRES_ROOT/socket" --port "$POSTGRES_PORT" \
-        --user solidworks --airflow-schema "${AIRFLOW_SCHEMA:-airflow}" >&2 \
-        || die "platform apply failed"
+      # One instance, separate schemas: the deployment initialization owns the airflow schema
+      # (the migration identity creates it); the platform schema comes from apply below.
+      "$PG_BIN/psql" -h "$POSTGRES_ROOT/socket" -p "$POSTGRES_PORT" -U solidworks -d airflow_meta \
+        -v ON_ERROR_STOP=1 -q -c "CREATE SCHEMA IF NOT EXISTS airflow" \
+        || die "could not initialize the airflow schema"
     fi
     AIRFLOW_VENV="$AIRFLOW_VENV" AIRFLOW_HOME="$AIRFLOW_HOME" AIRFLOW_PYTHON="${AIRFLOW_PYTHON:-}" \
       PIPELINE_WHEEL="${PIPELINE_WHEEL:?PIPELINE_WHEEL is required for install}" \
-      AIRFLOW_DB_URL="$AIRFLOW_DB_URL" AIRFLOW_API_PORT="$AIRFLOW_API_PORT" \
+      AIRFLOW_DB_URL="$AIRFLOW_DB_URL" AIRFLOW_RUNTIME_DB_URL="$AIRFLOW_RUNTIME_DB_URL" \
+      AIRFLOW_API_PORT="$AIRFLOW_API_PORT" \
       bash "$AIRFLOW_HERE/install.sh"
+    # U0: initialize the platform schema, the read models and the role boundary (idempotent)
+    # AFTER the migration created the airflow schema and its tables (the views bind them), and
+    # before the runtime grants below (the roles must exist first).  The admission starts
+    # closed until "start" opens it.
+    PLATFORM_PSQL="$PG_BIN/psql" bash "$HERE/../platform/apply.sh" \
+      --database airflow_meta --socket "$POSTGRES_ROOT/socket" --port "$POSTGRES_PORT" \
+      --user solidworks --airflow-schema "${AIRFLOW_SCHEMA:-airflow}" >&2 \
+      || die "platform apply failed"
+    # The runtime identity is least privilege: DML inside the airflow schema only, no DDL
+    # anywhere.  Grants are re-applied after every migration (new tables included).
+    "$PG_BIN/psql" -h "$POSTGRES_ROOT/socket" -p "$POSTGRES_PORT" -U solidworks -d airflow_meta \
+      -v ON_ERROR_STOP=1 -q <<'SQL' || die "grants for airflow_runtime failed"
+ALTER ROLE airflow_runtime LOGIN;
+GRANT USAGE ON SCHEMA airflow TO airflow_runtime;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA airflow TO airflow_runtime;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA airflow TO airflow_runtime;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA airflow TO airflow_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE solidworks IN SCHEMA airflow
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO airflow_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE solidworks IN SCHEMA airflow
+    GRANT USAGE, SELECT ON SEQUENCES TO airflow_runtime;
+REVOKE ALL ON SCHEMA public FROM airflow_runtime;
+SQL
     # The wheel must provide the portal and the Feishu auth manager before the units start.
     if ! "$AIRFLOW_VENV/bin/python" -c 'import importlib.util, sys; sys.exit(0 if all(
         importlib.util.find_spec(name) for name in
@@ -350,8 +373,14 @@ case "$ACTION" in
     drift_check || die "configuration drift detected; run install before start"
     airflow_lifecycle start
     airflow_unpause_dag
+    systemctl --user enable --now description-portal.service description-operator-proxy.service \
+      || die "ingress services failed to start; the platform admission stays closed"
+    systemctl --user is-active --quiet description-portal.service description-operator-proxy.service \
+      || die "ingress services are not active; the platform admission stays closed"
+    # The gate opens only after every precondition, the identity check, the services and the
+    # ingress readiness confirmation succeeded; any failure above leaves it closed.
     platform_open_admission
-    systemctl --user enable --now description-portal.service description-operator-proxy.service
+    echo "start complete: admission open"
     ;;
   drain)
     load_installed

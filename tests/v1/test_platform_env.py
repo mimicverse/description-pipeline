@@ -162,6 +162,7 @@ class PlatformEnvTests(unittest.TestCase):
         self.assertEqual(env["FEISHU_ADMIN_OPEN_IDS"], "ou_admin")
         self.assertEqual(env["SOLIDWORKS_ENDPOINT_PORT"], "9765")
         self.assertIn("airflow-pg/socket", env["AIRFLOW_DB_URL"])
+        self.assertIn("airflow_runtime@", env["AIRFLOW_RUNTIME_DB_URL"])
         self.assertIn("platform_service@", env["PLATFORM_SERVICE_DSN"])
         self.assertIn("operator_ro@", env["PLATFORM_OPERATOR_DSN"])
         self.assertIn("airflow-pg/socket", env["PLATFORM_OPERATOR_DSN"])

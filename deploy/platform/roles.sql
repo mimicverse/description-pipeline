@@ -19,6 +19,9 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'operator_ro') THEN
         CREATE ROLE operator_ro LOGIN;
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'airflow_runtime') THEN
+        CREATE ROLE airflow_runtime LOGIN;
+    END IF;
 END $$;
 
 -- Role attributes are enforced idempotently as well: the roles are cluster-scoped and may
@@ -26,6 +29,10 @@ END $$;
 ALTER ROLE platform_owner NOLOGIN;
 ALTER ROLE platform_service LOGIN;
 ALTER ROLE operator_ro LOGIN;
+-- The Airflow runtime identity: least privilege, no DDL anywhere.  Its grants on the airflow
+-- schema are applied right after the migration (operatorctl install), because the schema does
+-- not exist yet when this file runs.
+ALTER ROLE airflow_runtime LOGIN;
 
 GRANT USAGE ON SCHEMA :"airflow_schema" TO platform_owner;
 GRANT SELECT ON :"airflow_schema".task_instance TO platform_owner;

@@ -616,7 +616,14 @@ class LifecycleTests(unittest.TestCase):
                 derived_env[key] = value
         bindir = tmp / "bin"
         bindir.mkdir()
-        write_stub(bindir / "systemctl", '#!/bin/bash\necho "systemctl $*" >> "$ORDER_LOG"\n')
+        write_stub(
+            bindir / "systemctl",
+            '#!/bin/bash\necho "systemctl $*" >> "$ORDER_LOG"\n'
+            'case "$*" in\n'
+            '  "--user enable --now description-portal.service description-operator-proxy.service")\n'
+            '    [ "${START_INGRESS_RC:-0}" = "0" ] || exit "${START_INGRESS_RC}" ;;\n'
+            "esac\n",
+        )
         write_stub(bindir / "sleep", "#!/bin/bash\nexit 0\n")
         venv = Path(derived_env["AIRFLOW_VENV"]) / "bin"
         venv.mkdir(parents=True, exist_ok=True)
@@ -693,7 +700,7 @@ class LifecycleTests(unittest.TestCase):
         }
         return config_path, env, admission, order
 
-    def test_start_opens_verified_admission_before_ingress(self) -> None:
+    def test_start_opens_the_admission_only_after_the_ingress_is_ready(self) -> None:
         for register_after in (0, 1):
             with self.subTest(register_after=register_after), tempfile.TemporaryDirectory() as tmp:
                 config_path, env, admission, order = self._admission_fixture(Path(tmp), register_after=register_after)
@@ -705,8 +712,23 @@ class LifecycleTests(unittest.TestCase):
                     "systemctl --user enable --now description-portal.service description-operator-proxy.service"
                 )
                 self.assertLess(max(i for i, line in enumerate(lines) if line == "airflow admission check"), ingress)
-                self.assertLess(lines.index("platform open_admission"), ingress)
+                ready = lines.index(
+                    "systemctl --user is-active --quiet description-portal.service description-operator-proxy.service"
+                )
+                self.assertLess(ingress, ready)
+                self.assertLess(ready, lines.index("platform open_admission"))
                 self.assertEqual(lines.count("airflow dags unpause solidworks_to_urdf"), register_after + 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            env["START_INGRESS_RC"] = "7"
+            result = run(["bash", str(CONTROL), "start", "--config", str(config_path)], env)
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("platform admission stays closed", result.stderr)
+            # The DAG scheduling unpause already happened (a recorded fact); the PLATFORM gate
+            # never opened - that is the boundary under test.
+            order_text = order.read_text()
+            self.assertNotIn("is-active", order_text)
+            self.assertNotIn("platform open_admission", order_text)
 
     def test_unpause_failure_does_not_start_ingress(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1248,6 +1270,10 @@ class InstallOrderingTests(unittest.TestCase):
             + 'case "$*" in\n'
             '  *-f*platform/schema.sql*|*-f*platform/views.sql*|*-f*platform/roles.sql*)\n'
             '    echo "psql_platform_apply" >> "$ORDER_LOG"; exit 0 ;;\n'
+            '  *-c*CREATE\\ SCHEMA*airflow*)\n'
+            '    echo "psql_airflow_schema" >> "$ORDER_LOG"; exit 0 ;;\n'
+            '  *-v*ON_ERROR_STOP=1*q*)\n'
+            '    echo "psql_airflow_grants" >> "$ORDER_LOG"; exit 0 ;;\n'
             "esac\n"
             'echo "psql_db_query" >> "$ORDER_LOG"\n'
             'rc="${PSQL_QUERY_RC:-0}"\n'
@@ -1309,8 +1335,11 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertLess(lines.index("pg_isready 2"), lines.index("airflow_install"))
             self.assertLess(lines.index("pg_isready 2"), lines.index("psql_db_query"))
             self.assertLess(lines.index("psql_db_query"), lines.index("createdb"))
-            self.assertLess(lines.index("createdb"), lines.index("psql_platform_apply"))
-            self.assertLess(lines.index("psql_platform_apply"), lines.index("airflow_install"))
+            self.assertLess(lines.index("createdb"), lines.index("psql_airflow_schema"))
+            self.assertLess(lines.index("psql_airflow_schema"), lines.index("airflow_install"))
+            self.assertLess(lines.index("createdb"), lines.index("airflow_install"))
+            self.assertLess(lines.index("airflow_install"), lines.index("psql_platform_apply"))
+            self.assertLess(lines.index("psql_platform_apply"), lines.index("psql_airflow_grants"))
             self.assertEqual(
                 [line for line in lines if line.startswith("pg_isready ")], ["pg_isready 1", "pg_isready 2"]
             )

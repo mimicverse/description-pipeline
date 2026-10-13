@@ -286,6 +286,9 @@ def derive(
         "AIRFLOW_DB_URL": (
             f"postgresql+psycopg2://solidworks@/airflow_meta?host={postgres_root}/socket&port={postgres_port}"
         ),
+        "AIRFLOW_RUNTIME_DB_URL": (
+            f"postgresql+psycopg2://airflow_runtime@/airflow_meta?host={postgres_root}/socket&port={postgres_port}"
+        ),
         "PLATFORM_SERVICE_DSN": (
             f"postgresql://platform_service@/airflow_meta?host={postgres_root}/socket&port={postgres_port}"
         ),
