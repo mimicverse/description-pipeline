@@ -627,6 +627,7 @@ class FakePlatformStore:
         self.read_error: Exception | None = None
         self.admit_error: Exception | None = None
         self.admits: list[dict] = []
+        self.displays: dict[str, object] = {}
 
     def admission(self):
         if self.read_error is not None:
@@ -637,6 +638,12 @@ class FakePlatformStore:
         if self.admit_error is not None:
             raise self.admit_error
         self.admits.append(kwargs)
+
+    def run_display(self, run_id: str):
+        return self.displays.get(run_id)
+
+    def run_displays(self) -> dict:
+        return dict(self.displays)
 
 
 class PortalTests(unittest.TestCase):

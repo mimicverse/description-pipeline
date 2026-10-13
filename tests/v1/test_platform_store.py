@@ -74,6 +74,8 @@ class FakeWorld:
         self.closes = 0
         self.hidden_finds = 0
         self.statements: list[str] = []
+        #: run_id -> [display_name, hidden_at, hidden_reason, updated_at]
+        self.run_display_rows: dict[str, list] = {}
 
     def connect(self):
         return FakeConnection(self)
@@ -145,6 +147,46 @@ class FakeCursor:
         elif "SELECT state, from_stage FROM platform.run WHERE run_id = %s" in normalized:
             state = world.run_states.get(params[0])
             self._rows = [(state, world.run_from_stage.get(params[0]))] if state is not None else []
+        elif normalized.startswith(
+            "SELECT run_id, display_name, hidden_at, hidden_reason, updated_at FROM platform.run"
+        ):
+            if "WHERE run_id = %s" in normalized:
+                row = world.run_display_rows.get(params[0])
+                self._rows = [(params[0], *row)] if row is not None else []
+            else:
+                self._rows = [
+                    (run_id, *row)
+                    for run_id, row in world.run_display_rows.items()
+                    if row[0] is not None or row[1] is not None
+                ]
+        elif normalized.startswith("UPDATE platform.run SET display_name"):
+            row = world.run_display_rows.get(params[1])
+            if row is not None:
+                row[0] = params[0]
+                row[3] = NOW
+                self._rows = [(params[1], *row)]
+            else:
+                self._rows = []
+        elif normalized.startswith("UPDATE platform.run SET hidden_at = COALESCE"):
+            row = world.run_display_rows.get(params[1])
+            if row is not None:
+                if row[1] is None:
+                    row[1] = NOW
+                if row[2] is None:
+                    row[2] = params[0]
+                row[3] = NOW
+                self._rows = [(params[1], *row)]
+            else:
+                self._rows = []
+        elif normalized.startswith("UPDATE platform.run SET hidden_at = NULL"):
+            row = world.run_display_rows.get(params[0])
+            if row is not None:
+                row[1] = None
+                row[2] = None
+                row[3] = NOW
+                self._rows = [(params[0], *row)]
+            else:
+                self._rows = []
         elif "FROM platform.operation WHERE run_id = %s AND kind = 'publish' AND state = 'succeeded'" in normalized:
             self._rows = [(1,)] if (params[0], "publish") in world.confirmed_publishes else []
         elif (
@@ -608,6 +650,49 @@ class PlatformStoreTests(unittest.TestCase):
         self.assertEqual(len(self.world.operations), before, "the recorded side effect was not re-sent")
         with self.assertRaises(OperationConflictError):
             guarded.register_operation(**{**payload, "params_digest": "e" * 64})
+
+    def test_run_display_rename_hide_restore_round_trip(self) -> None:
+        self._running_run()
+        self.world.run_display_rows["r-1"] = [None, None, None, NOW]
+
+        renamed = self.store.set_run_display("r-1", "装配线 A")
+        self.assertEqual(renamed.display_name, "装配线 A")
+        self.assertIsNone(renamed.hidden_at)
+
+        hidden = self.store.hide_run("r-1", actor="崔工")
+        self.assertEqual(hidden.hidden_reason, "崔工")
+        self.assertIsNotNone(hidden.hidden_at)
+        repeat = self.store.hide_run("r-1", actor="someone else")
+        self.assertEqual(repeat.hidden_at, hidden.hidden_at, "the first tombstone survives repeats")
+        self.assertEqual(repeat.hidden_reason, "崔工")
+
+        restored = self.store.restore_run("r-1")
+        self.assertIsNone(restored.hidden_at)
+        self.assertIsNone(restored.hidden_reason)
+        self.assertEqual(restored.display_name, "装配线 A", "the display name survives the tombstone")
+        self.assertIsNone(self.store.restore_run("r-1").hidden_at, "restore is idempotent")
+
+        cleared = self.store.set_run_display("r-1", None)
+        self.assertIsNone(cleared.display_name)
+        self.assertNotIn("r-1", self.store.run_displays(), "a run without display data is not listed")
+
+    def test_run_display_writes_refuse_a_run_without_a_platform_row(self) -> None:
+        with self.assertRaisesRegex(PlatformStoreError, "is not admitted"):
+            self.store.set_run_display("r-9", "x")
+        with self.assertRaisesRegex(PlatformStoreError, "is not admitted"):
+            self.store.hide_run("r-9", actor="崔工")
+        with self.assertRaisesRegex(PlatformStoreError, "is not admitted"):
+            self.store.restore_run("r-9")
+        self.assertIsNone(self.store.run_display("r-9"))
+
+    def test_run_displays_lists_only_runs_with_display_data(self) -> None:
+        self.world.run_display_rows["r-2"] = ["备选", None, None, NOW]
+        self.world.run_display_rows["r-3"] = [None, NOW, "崔工", NOW]
+        self.world.run_display_rows["r-4"] = [None, None, None, NOW]
+        listed = self.store.run_displays()
+        self.assertEqual(sorted(listed), ["r-2", "r-3"])
+        self.assertEqual(listed["r-2"].display_name, "备选")
+        self.assertIsNotNone(listed["r-3"].hidden_at)
 
     def test_unresolved_is_confirmed_only_by_evidenced_reconciliation(self) -> None:
         self._running_run(from_stage="generate")

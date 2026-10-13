@@ -28,6 +28,7 @@ import re
 import secrets
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from http import HTTPStatus
@@ -75,7 +76,6 @@ from .run_ownership import (
     classify_transport_retry,
     recorded_actor_principal,
 )
-from .run_metadata import RunMetadataError, RunMetadataStore, TitleError
 from .report_view import build_report
 from .uploads import (
     MAX_FILE_BYTES,
@@ -102,8 +102,44 @@ _STAGE_NAMES_ZH = {stage["id"]: stage.get("name_zh") or stage["id"] for stage in
 _RERUN_PAGE = 100
 _RERUN_PAGE_CAP = 10
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
-#: Row overlay when a run has no ledger entry (treated read-only).
+#: Row overlay when a run has no platform display row (treated read-only).
 _EMPTY_OVERLAY = {"title": None, "deleted": False, "deleted_at": None, "deleted_by": None}
+
+MAX_TITLE = 120
+
+
+class TitleError(ValueError):
+    """One rejected display title."""
+
+
+def normalise_title(value: object) -> str | None:
+    """One display title: printable text up to ``MAX_TITLE``; ``None`` clears it."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TitleError("运行名称必须是文本")
+    text = value.strip()
+    if not text:
+        raise TitleError("运行名称不能为空；如需恢复默认名称请传入 null")
+    if len(text) > MAX_TITLE:
+        raise TitleError(f"运行名称最多 {MAX_TITLE} 个字符")
+    if any(unicodedata.category(character).startswith("C") for character in text):
+        raise TitleError("运行名称包含不可见的控制字符")
+    return text
+
+
+def _display_overlay(display: object) -> dict:
+    """One platform run-display row as the portal's overlay surface.
+
+    The platform owns the display state - the name and the reversible
+    ``hidden_at``/``hidden_reason`` tombstone; the portal only shapes it.
+    """
+    return {
+        "title": display.display_name,
+        "deleted": display.hidden_at is not None,
+        "deleted_at": display.hidden_at.isoformat() if display.hidden_at is not None else None,
+        "deleted_by": display.hidden_reason,
+    }
 #: Task states that still own execution; an unknown (None) state stays a refusal too.
 _ACTIVE_TASK_STATES = {"running", "queued", "scheduled", "up_for_retry", "up_for_reschedule", "deferred"}
 #: Task states that are terminal; anything else (including new Airflow states) fails closed.
@@ -778,9 +814,6 @@ class PortalApp:
         self._store_cache: LinuxStore | None = None
         self._upload_gate = UploadGate(config.upload_concurrency)
         self._rerun_lock = threading.Lock()
-        self.run_metadata = RunMetadataStore(
-            config.upload_root / ".run-metadata.json" if config.upload_root is not None else None
-        )
         self._platform_store = config.platform_store
         self._platform_lock = threading.Lock()
 
@@ -1290,23 +1323,25 @@ class PortalApp:
 
     # ------------------------------------------------------- run metadata
     def _metadata_snapshot(self) -> dict[str, dict]:
-        """All overlays with one ledger read; an unreadable ledger fails closed."""
+        """Every display overlay with one platform read; failures fail closed."""
         try:
-            return self.run_metadata.snapshot()
-        except RunMetadataError as error:
-            log.error("run metadata unavailable: %s", error)
+            displays = self._platform().run_displays()
+        except PlatformStoreError as error:
+            log.error("run display state unavailable: %s", error)
             raise PortalError(
                 HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用；为避免显示错误请稍后重试"
             ) from error
+        return {run_id: _display_overlay(display) for run_id, display in displays.items()}
 
     def _metadata_overlay(self, dag_run_id: str) -> dict:
         try:
-            return self.run_metadata.overlay(dag_run_id)
-        except RunMetadataError as error:
-            log.error("run metadata unavailable: %s", error)
+            display = self._platform().run_display(dag_run_id)
+        except PlatformStoreError as error:
+            log.error("run display state unavailable: %s", error)
             raise PortalError(
                 HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用；为避免显示错误请稍后重试"
             ) from error
+        return _display_overlay(display) if display is not None else dict(_EMPTY_OVERLAY)
 
     def _require_run(self, session: PortalSession, dag_run_id: str) -> dict:
         """One authoritative Airflow run, or the existing 401/404/502 mapping."""
@@ -1336,15 +1371,20 @@ class PortalApp:
         if not self._can_manage(session, run):
             raise PortalError(HTTPStatus.FORBIDDEN, "只有发起人或平台管理员可重命名此运行")
         try:
-            overlay = self.run_metadata.rename(
-                dag_run_id, body["title"], actor=self._actor_label(session, dag_run_id, run)
-            )
+            title = normalise_title(body["title"])
         except TitleError as error:
             raise PortalError(HTTPStatus.BAD_REQUEST, str(error)) from error
-        except RunMetadataError as error:
-            log.error("run metadata rename failed: %s", error)
+        try:
+            display = self._platform().set_run_display(dag_run_id, title)
+        except PlatformStoreError as error:
+            log.error("run display rename failed: %s", error)
             raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用，请稍后重试") from error
-        return _json_response(start_response, 200, {"dag_run_id": dag_run_id, **overlay}, self.config)
+        return _json_response(
+            start_response,
+            200,
+            {"dag_run_id": dag_run_id, **_display_overlay(display), "updated_at": display.updated_at.isoformat()},
+            self.config,
+        )
 
     def _delete_run(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
         """Reversible tombstone: the record moves to the shared Deleted view, nothing else changes."""
@@ -1367,10 +1407,11 @@ class PortalApp:
                     start_response, HTTPStatus.CONFLICT, {"error": message, "reason": reason}, self.config
                 )
             try:
-                overlay = self.run_metadata.delete(dag_run_id, actor=self._actor_label(session, dag_run_id, run))
-            except RunMetadataError as error:
-                log.error("run metadata delete failed: %s", error)
+                display = self._platform().hide_run(dag_run_id, actor=self._actor_label(session, dag_run_id, run))
+            except PlatformStoreError as error:
+                log.error("run display hide failed: %s", error)
                 raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用，请稍后重试") from error
+            overlay = _display_overlay(display)
         log.info("portal deleted dag_run_id=%s principal=%s", dag_run_id, session.principal)
         return _json_response(start_response, 200, {"dag_run_id": dag_run_id, **overlay}, self.config)
 
@@ -1417,9 +1458,9 @@ class PortalApp:
         if not self._can_manage(session, run):
             raise PortalError(HTTPStatus.FORBIDDEN, "只有发起人或平台管理员可恢复此运行")
         try:
-            overlay = self.run_metadata.restore(dag_run_id)
-        except RunMetadataError as error:
-            log.error("run metadata restore failed: %s", error)
+            overlay = _display_overlay(self._platform().restore_run(dag_run_id))
+        except PlatformStoreError as error:
+            log.error("run display restore failed: %s", error)
             raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用，请稍后重试") from error
         log.info("portal restored dag_run_id=%s principal=%s", dag_run_id, session.principal)
         return _json_response(start_response, 200, {"dag_run_id": dag_run_id, **overlay}, self.config)

@@ -72,6 +72,17 @@ class OperationRecord:
     kind: str
 
 
+@dataclass(frozen=True)
+class RunDisplay:
+    """One run's display surface: the name and the reversible tombstone."""
+
+    run_id: str
+    display_name: str | None
+    hidden_at: datetime | None
+    hidden_reason: str | None
+    updated_at: datetime
+
+
 _LOCK_ADMISSION = (
     "SELECT state, reason, actor, changed_at, revision FROM platform.admission WHERE id = 1 FOR UPDATE"
 )
@@ -101,6 +112,26 @@ _FIND_OPERATION = (
 )
 _LOCK_RUN = "SELECT state, from_stage FROM platform.run WHERE run_id = %s FOR UPDATE"
 _READ_RUN = "SELECT state, from_stage FROM platform.run WHERE run_id = %s"
+_READ_RUN_DISPLAY = (
+    "SELECT run_id, display_name, hidden_at, hidden_reason, updated_at FROM platform.run WHERE run_id = %s"
+)
+_READ_RUN_DISPLAYS = (
+    "SELECT run_id, display_name, hidden_at, hidden_reason, updated_at FROM platform.run"
+    " WHERE display_name IS NOT NULL OR hidden_at IS NOT NULL"
+)
+_SET_RUN_DISPLAY = (
+    "UPDATE platform.run SET display_name = %s, updated_at = now() WHERE run_id = %s"
+    " RETURNING run_id, display_name, hidden_at, hidden_reason, updated_at"
+)
+_SET_RUN_HIDDEN = (
+    "UPDATE platform.run SET hidden_at = COALESCE(hidden_at, now()),"
+    " hidden_reason = COALESCE(hidden_reason, %s), updated_at = now()"
+    " WHERE run_id = %s RETURNING run_id, display_name, hidden_at, hidden_reason, updated_at"
+)
+_RESTORE_RUN = (
+    "UPDATE platform.run SET hidden_at = NULL, hidden_reason = NULL, updated_at = now()"
+    " WHERE run_id = %s RETURNING run_id, display_name, hidden_at, hidden_reason, updated_at"
+)
 _CONFIRMED_PUBLISH = (
     "SELECT 1 FROM platform.operation WHERE run_id = %s AND kind = 'publish' AND state = 'succeeded' LIMIT 1"
 )
@@ -652,6 +683,49 @@ class PlatformStore:
         return receipt
 
     # ------------------------------------------------------------- read side
+
+    # ------------------------------------------------------------ run display
+    def run_display(self, run_id: str) -> RunDisplay | None:
+        """One run's display fields; ``None`` while the run has no platform row."""
+
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(_READ_RUN_DISPLAY, (run_id,))
+            row = cursor.fetchone()
+        return RunDisplay(*row) if row is not None else None
+
+    def run_displays(self) -> dict[str, RunDisplay]:
+        """Every run carrying display data (name or tombstone), in one read."""
+
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(_READ_RUN_DISPLAYS)
+            rows = cursor.fetchall()
+        return {row[0]: RunDisplay(*row) for row in rows}
+
+    def set_run_display(self, run_id: str, display_name: str | None) -> RunDisplay:
+        """Set or clear the display name of an admitted run (display-only)."""
+
+        return self._update_run_display(_SET_RUN_DISPLAY, (display_name, run_id), run_id)
+
+    def hide_run(self, run_id: str, *, actor: str) -> RunDisplay:
+        """Tombstone the run; repeating keeps the first tombstone; the actor is recorded."""
+
+        return self._update_run_display(_SET_RUN_HIDDEN, (actor, run_id), run_id)
+
+    def restore_run(self, run_id: str) -> RunDisplay:
+        """Clear the tombstone; idempotent for a never-hidden run."""
+
+        return self._update_run_display(_RESTORE_RUN, (run_id,), run_id)
+
+    def _update_run_display(self, statement, parameters, run_id: str) -> RunDisplay:
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(statement, parameters)
+            row = cursor.fetchone()
+        if row is None:
+            raise PlatformStoreError(f"The run {run_id!r} is not admitted")
+        return RunDisplay(*row)
 
     def lifecycle_rows(self) -> list[dict]:
         """Every row of the lifecycle projection (single query, no pre-filtering)."""
