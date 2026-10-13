@@ -28,7 +28,7 @@ def run(cmd: list[str], env: dict[str, str], cwd: Path = ROOT) -> subprocess.Com
 
 
 class RenderConfigTest(unittest.TestCase):
-    def _render(self, home: Path, venv: Path, dsn: str = DSN) -> subprocess.CompletedProcess:
+    def _render(self, home: Path, venv: Path, dsn: str = DSN, api_port: str = "8791") -> subprocess.CompletedProcess:
         return run(
             [
                 sys.executable,
@@ -42,7 +42,7 @@ class RenderConfigTest(unittest.TestCase):
                 "--dags-folder",
                 str(DEPLOY / "dags"),
             ],
-            {"AIRFLOW_DB_URL": dsn},
+            {"AIRFLOW_DB_URL": dsn, "AIRFLOW_API_PORT": api_port},
         )
 
     def test_renders_private_config_and_preserves_secrets(self) -> None:
@@ -57,6 +57,7 @@ class RenderConfigTest(unittest.TestCase):
             text = cfg.read_text(encoding="utf-8")
             self.assertIn("# managed-by: description-airflow", text)
             self.assertIn(f"sql_alchemy_conn = {DSN}", text)
+            self.assertIn("execution_api_server_url = http://127.0.0.1:8791/execution", text)
             self.assertIn(f"dags_folder = {DEPLOY / 'dags'}", text)
             self.assertIn("auth_manager = description_pipeline.orchestration.feishu_auth.FeishuAuthManager", text)
             self.assertNotIn("simple_auth_manager_users", text)
@@ -103,6 +104,12 @@ class RenderConfigTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("PostgreSQL", result.stderr)
 
+    def test_rejects_missing_api_port(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self._render(Path(tmp) / "home", Path(tmp) / "venv", api_port="")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("AIRFLOW_API_PORT", result.stderr)
+
 
 class ServicesRenderTest(unittest.TestCase):
     def test_render_writes_only_description_units(self) -> None:
@@ -118,6 +125,8 @@ class ServicesRenderTest(unittest.TestCase):
                     "AIRFLOW_VENV": str(Path(tmp) / "venv"),
                     "AIRFLOW_HOME": str(Path(tmp) / "home"),
                     "POSTGRES_ROOT": str(Path(tmp) / "pg"),
+                    "AIRFLOW_API_PORT": "8791",
+                    "POSTGRES_PORT": "5433",
                 },
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -136,6 +145,7 @@ class ServicesRenderTest(unittest.TestCase):
             self.assertIn("/usr/lib/postgresql/14/bin/postgres", postgres)
             self.assertIn(f"-D {Path(tmp) / 'pg'}/data", postgres)
             self.assertIn("listen_addresses=", postgres)
+            self.assertIn("-p 5433", postgres)
             self.assertNotIn("127.0.0.1", postgres)
             self.assertIn("UMask=0077", postgres)
             scheduler = (target / "description-airflow-scheduler.service").read_text(encoding="utf-8")
@@ -158,6 +168,7 @@ class ServicesRenderTest(unittest.TestCase):
                     "XDG_CONFIG_HOME": str(config_home),
                     "AIRFLOW_VENV": str(Path(tmp) / "venv"),
                     "AIRFLOW_HOME": str(Path(tmp) / "home"),
+                    "AIRFLOW_API_PORT": "8791",
                 },
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -171,6 +182,9 @@ class ServicesRenderTest(unittest.TestCase):
                 "XDG_CONFIG_HOME": str(Path(tmp) / "config"),
                 "AIRFLOW_VENV": str(Path(tmp) / "venv"),
                 "AIRFLOW_HOME": str(Path(tmp) / "home"),
+                "AIRFLOW_API_PORT": "8791",
+                "SOLIDWORKS_ENDPOINT_PORT": "8765",
+                "TUNNEL_LOOPBACK_PORT": "18765",
                 "SOLIDWORKS_SSH_HOST": "windows-worker",
             }
             result = run(["bash", str(DEPLOY / "services.sh"), "render"], env)
@@ -186,6 +200,11 @@ class ServicesRenderTest(unittest.TestCase):
             )
             self.assertNotEqual(bad_port.returncode, 0)
             self.assertIn("127.0.0.1:18765:127.0.0.1:9999 windows-worker", unit.read_text())
+            loopback = run(
+                ["bash", str(DEPLOY / "services.sh"), "render"], {**env, "TUNNEL_LOOPBACK_PORT": "19965"}
+            )
+            self.assertEqual(loopback.returncode, 0, loopback.stderr)
+            self.assertIn("127.0.0.1:19965:127.0.0.1:8765 windows-worker", unit.read_text())
             run(["bash", str(DEPLOY / "services.sh"), "render"], env)
             self.assertEqual(before, unit.read_bytes())
             result = run(
@@ -203,6 +222,7 @@ class InstallGuardsTest(unittest.TestCase):
             "AIRFLOW_HOME": f"{tmp}/home",
             "PIPELINE_WHEEL": f"{tmp}/wheels/mimicverse_description-0.3.25-py3-none-any.whl",
             "AIRFLOW_DB_URL": DSN,
+            "AIRFLOW_API_PORT": "8791",
         }
         base.update(env)
         return run(["bash", str(DEPLOY / "install.sh")], base)
@@ -342,6 +362,11 @@ class LockAndScriptsTest(unittest.TestCase):
                         defaults[node.args[0].value] = ast.literal_eval(keyword.value)
         self.assertEqual(defaults.get("--conn-id"), "solidworks_windows")
         self.assertIn("--handoff-root", defaults)
+        # DEP-01: the tunnel loopback port has no silent default; the lifecycle passes the
+        # rendered value from resolved.env.
+        self.assertNotIn("--port", defaults)
+        control = (DEPLOY.parent / "operator" / "operatorctl.sh").read_text(encoding="utf-8")
+        self.assertIn('--port "$TUNNEL_LOOPBACK_PORT"', control)
         source = (DEPLOY / "scripts" / "add_connection.py").read_text(encoding="utf-8")
         self.assertIn("handoff_roots", source)
         dag = (DEPLOY / "dags" / "solidworks_to_urdf.py").read_text(encoding="utf-8")

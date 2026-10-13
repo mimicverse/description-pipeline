@@ -140,6 +140,22 @@ class RenderTests(unittest.TestCase):
             self.assertEqual(san.returncode, 0, san.stderr)
             self.assertIn("DNS:rehearsal.local", san.stdout)
 
+    def test_port_overrides_render_into_every_artifact(self) -> None:
+        """DEP-01: the renderer is the one deploy source; overrides reach every rendered file."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            result = render(state, AIRFLOW_API_PORT="19991", TUNNEL_LOOPBACK_PORT="19965")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            nginx = (state / "nginx/nginx.conf").read_text(encoding="utf-8")
+            self.assertIn("proxy_pass http://127.0.0.1:19991;", nginx)
+            self.assertNotIn("8791", nginx)
+            portal = (state / "portal.json").read_text(encoding="utf-8")
+            self.assertIn('"url": "http://127.0.0.1:19965"', portal)
+            resolved = (state / "resolved.env").read_text(encoding="utf-8")
+            self.assertIn("AIRFLOW_API_PORT=19991", resolved)
+            self.assertIn("TUNNEL_LOOPBACK_PORT=19965", resolved)
+
     def test_rejects_invalid_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp) / "state"
@@ -405,6 +421,10 @@ class LifecycleTests(unittest.TestCase):
                 "AIRFLOW_HOME": env["AIRFLOW_HOME"],
                 "POSTGRES_ROOT": env["POSTGRES_ROOT"],
                 "POSTGRES_MAJOR": "14",
+                "AIRFLOW_API_PORT": "8791",
+                "POSTGRES_PORT": "5433",
+                "TUNNEL_LOOPBACK_PORT": "18765",
+                "SOLIDWORKS_ENDPOINT_PORT": "8765",
                 "SOLIDWORKS_SSH_HOST": "windows-m3",
                 "FEISHU_ENV_FILE": str(state / "feishu.env"),
             },
@@ -577,7 +597,9 @@ class LifecycleTests(unittest.TestCase):
 
     def test_health_probes_endpoint_auth_and_connection(self) -> None:
         health = HEALTH.read_text(encoding="utf-8")
-        self.assertIn("http://127.0.0.1:18765/health", health)
+        self.assertIn("TUNNEL_LOOPBACK_PORT", health)
+        self.assertIn("/health", health)
+        self.assertIn(":${AIRFLOW_API_PORT}/", health)
         self.assertIn("Authorization", health)
         self.assertIn("handoff_roots", health)
         self.assertIn("solidworks_windows", health)
@@ -612,6 +634,10 @@ class LifecycleTests(unittest.TestCase):
                     "AIRFLOW_HOME": env["AIRFLOW_HOME"],
                     "POSTGRES_ROOT": env["POSTGRES_ROOT"],
                     "POSTGRES_MAJOR": "14",
+                    "AIRFLOW_API_PORT": "8791",
+                    "POSTGRES_PORT": "5433",
+                    "TUNNEL_LOOPBACK_PORT": "18765",
+                    "SOLIDWORKS_ENDPOINT_PORT": "8765",
                     "SOLIDWORKS_SSH_HOST": "windows-m3",
                     "FEISHU_ENV_FILE": str(state / "feishu.env"),
                 },
@@ -959,6 +985,7 @@ class InstallPostgresBehaviorTests(unittest.TestCase):
             "PATH": f"{pathbin}:{os.environ.get('PATH', '/usr/bin:/bin')}",
             "POSTGRES_ROOT": str(pgroot),
             "POSTGRES_MAJOR": "14",
+            "POSTGRES_PORT": "5433",
             "ORDER_LOG": str(order),
         }
         return order, env, pgroot

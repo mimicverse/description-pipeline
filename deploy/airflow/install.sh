@@ -6,6 +6,7 @@
 #   AIRFLOW_HOME=/home/<user>/solidworks-urdf/airflow-home
 #   PIPELINE_WHEEL=/home/<user>/solidworks-urdf/wheels/mimicverse_description-<version>-py3-none-any.whl
 #   AIRFLOW_DB_URL=postgresql+psycopg2://solidworks@/airflow_meta?host=/abs/socket&port=5433
+#   AIRFLOW_API_PORT=<loopback port rendered from the operator deployment>
 #
 # Rerunning is safe: the existing Fernet key and [api_auth] jwt_secret in
 # $AIRFLOW_HOME/airflow.cfg are preserved (see render_config.py).
@@ -18,6 +19,7 @@ die() { echo "install.sh: $*" >&2; exit 1; }
 : "${AIRFLOW_HOME:?set AIRFLOW_HOME to the Airflow home directory}"
 : "${PIPELINE_WHEEL:?set PIPELINE_WHEEL to the built mimicverse_description wheel}"
 : "${AIRFLOW_DB_URL:?set AIRFLOW_DB_URL to the dedicated PostgreSQL DSN}"
+: "${AIRFLOW_API_PORT:?set AIRFLOW_API_PORT to the Airflow api-server loopback port}"
 
 for pair in "AIRFLOW_VENV:$AIRFLOW_VENV" "AIRFLOW_HOME:$AIRFLOW_HOME" "PIPELINE_WHEEL:$PIPELINE_WHEEL"; do
   name="${pair%%:*}" value="${pair#*:}"
@@ -58,7 +60,7 @@ fi
 "$AIRFLOW_VENV/bin/description" doctor
 
 # Atomic 0600 config; preserves previously generated Fernet/JWT secrets on rerun.
-AIRFLOW_DB_URL="$AIRFLOW_DB_URL" "$AIRFLOW_VENV/bin/python" "$HERE/render_config.py" \
+AIRFLOW_DB_URL="$AIRFLOW_DB_URL" AIRFLOW_API_PORT="$AIRFLOW_API_PORT" "$AIRFLOW_VENV/bin/python" "$HERE/render_config.py" \
   --home "$AIRFLOW_HOME" --venv "$AIRFLOW_VENV" \
   --template "$HERE/airflow.cfg.template" --dags-folder "$HERE/dags"
 

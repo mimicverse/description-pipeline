@@ -21,24 +21,36 @@ UNITS+=(description-airflow-dag-processor description-airflow-scheduler descript
 
 render_units() {
   mkdir -p "$TARGET"
+  case "${AIRFLOW_API_PORT:?set AIRFLOW_API_PORT (rendered resolved.env)}" in
+    *[!0-9]*|"") echo 'AIRFLOW_API_PORT must be a TCP port' >&2; exit 1 ;;
+  esac
   if [ -n "${SOLIDWORKS_SSH_HOST:-}" ]; then
     [[ "$SOLIDWORKS_SSH_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || {
       echo 'SOLIDWORKS_SSH_HOST must be a configured SSH host alias' >&2; exit 1;
     }
-    case "${SOLIDWORKS_ENDPOINT_PORT:-8765}" in
+    case "${SOLIDWORKS_ENDPOINT_PORT:?set SOLIDWORKS_ENDPOINT_PORT}" in
       *[!0-9]*|"") echo 'SOLIDWORKS_ENDPOINT_PORT must be a TCP port' >&2; exit 1 ;;
     esac
+    case "${TUNNEL_LOOPBACK_PORT:?set TUNNEL_LOOPBACK_PORT}" in
+      *[!0-9]*|"") echo 'TUNNEL_LOOPBACK_PORT must be a TCP port' >&2; exit 1 ;;
+    esac
     sed -e "s#@SSH_HOST@#$SOLIDWORKS_SSH_HOST#g" \
-        -e "s#@ENDPOINT_PORT@#${SOLIDWORKS_ENDPOINT_PORT:-8765}#g" \
+        -e "s#@TUNNEL_LOOPBACK_PORT@#$TUNNEL_LOOPBACK_PORT#g" \
+        -e "s#@ENDPOINT_PORT@#$SOLIDWORKS_ENDPOINT_PORT#g" \
       "$HERE/systemd/description-solidworks-tunnel.service" > "$TARGET/description-solidworks-tunnel.service"
   fi
   if [ -n "${POSTGRES_ROOT:-}" ]; then
+    case "${POSTGRES_PORT:?set POSTGRES_PORT}" in
+      *[!0-9]*|"") echo 'POSTGRES_PORT must be a TCP port' >&2; exit 1 ;;
+    esac
     sed -e "s#@POSTGRES_ROOT@#$POSTGRES_ROOT#g" \
+        -e "s#@POSTGRES_PORT@#$POSTGRES_PORT#g" \
         -e "s#@POSTGRES_MAJOR@#${POSTGRES_MAJOR:-14}#g" \
       "$HERE/systemd/description-postgres.service" > "$TARGET/description-postgres.service"
   fi
   for unit in description-airflow-dag-processor description-airflow-scheduler description-airflow-api-server; do
     sed -e "s#@VENV@#$AIRFLOW_VENV#g" -e "s#@AIRFLOW_HOME@#$AIRFLOW_HOME#g" \
+        -e "s#@AIRFLOW_API_PORT@#$AIRFLOW_API_PORT#g" \
         -e "s#@FEISHU_ENV@#${FEISHU_ENV_FILE:-$AIRFLOW_HOME/feishu.env}#g" \
       "$HERE/systemd/$unit.service" > "$TARGET/$unit.service"
   done

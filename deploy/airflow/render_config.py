@@ -50,6 +50,9 @@ def main() -> int:
     db_url = os.environ.get("AIRFLOW_DB_URL", "")
     if not db_url.startswith(("postgresql+psycopg2://",)):
         raise SystemExit("AIRFLOW_DB_URL must be the dedicated PostgreSQL DSN")
+    api_port = os.environ.get("AIRFLOW_API_PORT", "")
+    if not api_port.isdigit() or not 1 <= int(api_port) <= 65535:
+        raise SystemExit("AIRFLOW_API_PORT must be the Airflow api-server TCP port (1-65535)")
     home.mkdir(parents=True, exist_ok=True)
     os.chmod(home, stat.S_IRWXU)
     cfg = home / "airflow.cfg"
@@ -65,6 +68,7 @@ def main() -> int:
         .replace("@FERNET_KEY@", fernet)
         .replace("@JWT_SECRET@", jwt)
         .replace("@AIRFLOW_DB_URL@", db_url)
+        .replace("@AIRFLOW_API_PORT@", api_port)
     )
     if not rendered.startswith("#"):
         rendered = MARKER + rendered

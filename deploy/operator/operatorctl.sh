@@ -45,7 +45,8 @@ airflow_render() {
   AIRFLOW_VENV="$AIRFLOW_VENV" AIRFLOW_HOME="$AIRFLOW_HOME" \
   POSTGRES_ROOT="${POSTGRES_ROOT:-}" POSTGRES_MAJOR="${POSTGRES_MAJOR:-14}" \
   SOLIDWORKS_SSH_HOST="${SOLIDWORKS_SSH_HOST:-}" \
-  SOLIDWORKS_ENDPOINT_PORT="${SOLIDWORKS_ENDPOINT_PORT:-8765}" \
+  AIRFLOW_API_PORT="$AIRFLOW_API_PORT" POSTGRES_PORT="$POSTGRES_PORT" \
+  TUNNEL_LOOPBACK_PORT="$TUNNEL_LOOPBACK_PORT" SOLIDWORKS_ENDPOINT_PORT="$SOLIDWORKS_ENDPOINT_PORT" \
   FEISHU_ENV_FILE="${FEISHU_ENV_FILE:-$AIRFLOW_HOME/feishu.env}" \
     bash "$AIRFLOW_HERE/services.sh" render
 }
@@ -54,7 +55,8 @@ airflow_lifecycle() {
   AIRFLOW_VENV="$AIRFLOW_VENV" AIRFLOW_HOME="$AIRFLOW_HOME" \
   POSTGRES_ROOT="${POSTGRES_ROOT:-}" POSTGRES_MAJOR="${POSTGRES_MAJOR:-14}" \
   SOLIDWORKS_SSH_HOST="${SOLIDWORKS_SSH_HOST:-}" \
-  SOLIDWORKS_ENDPOINT_PORT="${SOLIDWORKS_ENDPOINT_PORT:-8765}" \
+  AIRFLOW_API_PORT="$AIRFLOW_API_PORT" POSTGRES_PORT="$POSTGRES_PORT" \
+  TUNNEL_LOOPBACK_PORT="$TUNNEL_LOOPBACK_PORT" SOLIDWORKS_ENDPOINT_PORT="$SOLIDWORKS_ENDPOINT_PORT" \
   FEISHU_ENV_FILE="${FEISHU_ENV_FILE:-$AIRFLOW_HOME/feishu.env}" \
     bash "$AIRFLOW_HERE/services.sh" "$1"
 }
@@ -89,6 +91,10 @@ load_installed() {
     || die "not installed: $OPERATOR_STATE_DIR/resolved.env is missing (run install first)"
   # shellcheck disable=SC1090
   source "$OPERATOR_STATE_DIR/resolved.env"
+  # Every port comes from the single deploy source (render_operator.py) via resolved.env.
+  for key in AIRFLOW_API_PORT TUNNEL_LOOPBACK_PORT POSTGRES_PORT SOLIDWORKS_ENDPOINT_PORT; do
+    [ -n "${!key:-}" ] || die "resolved.env is missing $key; run install to re-render the deployment"
+  done
   TARGET="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 }
 
@@ -146,7 +152,7 @@ case "$ACTION" in
     airflow_render
     if [ -n "${POSTGRES_ROOT:-}" ]; then
       if [ ! -f "$POSTGRES_ROOT/data/PG_VERSION" ]; then
-        POSTGRES_ROOT="$POSTGRES_ROOT" POSTGRES_MAJOR="${POSTGRES_MAJOR:-14}" \
+        POSTGRES_ROOT="$POSTGRES_ROOT" POSTGRES_MAJOR="${POSTGRES_MAJOR:-14}" POSTGRES_PORT="$POSTGRES_PORT" \
           bash "$AIRFLOW_HERE/scripts/install_postgres.sh"
       fi
       # One path for a fresh install and a stopped reinstall: the managed unit owns the server
@@ -159,21 +165,21 @@ case "$ACTION" in
       export LD_LIBRARY_PATH="$POSTGRES_ROOT/root/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
       ready=0
       for _ in $(seq 1 20); do
-        if "$PG_BIN/pg_isready" -q -h "$POSTGRES_ROOT/socket" -p 5433; then ready=1; break; fi
+        if "$PG_BIN/pg_isready" -q -h "$POSTGRES_ROOT/socket" -p "$POSTGRES_PORT"; then ready=1; break; fi
         sleep 0.5
       done
       [ "$ready" = "1" ] || die "PostgreSQL did not become ready on $POSTGRES_ROOT/socket"
-      db_state="$("$PG_BIN/psql" -h "$POSTGRES_ROOT/socket" -p 5433 -U solidworks -d postgres \
+      db_state="$("$PG_BIN/psql" -h "$POSTGRES_ROOT/socket" -p "$POSTGRES_PORT" -U solidworks -d postgres \
         -tAc "select 1 from pg_database where datname='airflow_meta'")" \
         || die "could not query pg_database for airflow_meta"
       if [ "$db_state" != "1" ]; then
-        "$PG_BIN/createdb" -h "$POSTGRES_ROOT/socket" -p 5433 -U solidworks airflow_meta \
+        "$PG_BIN/createdb" -h "$POSTGRES_ROOT/socket" -p "$POSTGRES_PORT" -U solidworks airflow_meta \
           || die "could not create the airflow_meta database"
       fi
     fi
     AIRFLOW_VENV="$AIRFLOW_VENV" AIRFLOW_HOME="$AIRFLOW_HOME" AIRFLOW_PYTHON="${AIRFLOW_PYTHON:-}" \
       PIPELINE_WHEEL="${PIPELINE_WHEEL:?PIPELINE_WHEEL is required for install}" \
-      AIRFLOW_DB_URL="$AIRFLOW_DB_URL" \
+      AIRFLOW_DB_URL="$AIRFLOW_DB_URL" AIRFLOW_API_PORT="$AIRFLOW_API_PORT" \
       bash "$AIRFLOW_HERE/install.sh"
     # The wheel must provide the portal and the Feishu auth manager before the units start.
     if ! "$AIRFLOW_VENV/bin/python" -c 'import importlib.util, sys; sys.exit(0 if all(
@@ -187,7 +193,7 @@ case "$ACTION" in
     chmod 700 "$PIPELINE_STORE_ROOT"
     [ -f "$ENDPOINT_TOKEN_FILE" ] || die "endpoint token file missing: $ENDPOINT_TOKEN_FILE"
     AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$AIRFLOW_HERE/scripts/add_connection.py" \
-      --token-file "$ENDPOINT_TOKEN_FILE" --host 127.0.0.1 --port 18765 \
+      --token-file "$ENDPOINT_TOKEN_FILE" --host 127.0.0.1 --port "$TUNNEL_LOOPBACK_PORT" \
       --handoff-root "$SOLIDWORKS_HANDOFF_ROOT" --pipeline-config "$PORTAL_CONFIG"
     if [ ! -x "${NGINX_BIN:-/usr/sbin/nginx}" ]; then
       OPERATOR_STATE="$OPERATOR_STATE" bash "$HERE/scripts/install_proxy.sh" >/dev/null
