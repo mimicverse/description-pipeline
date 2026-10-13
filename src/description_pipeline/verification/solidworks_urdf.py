@@ -601,10 +601,61 @@ def _entities(source, raw, model):
     }
 
 
-def _tool(root):
+def _native_receipts_evidence(root, receipts):
+    """Independently validate native receipts supplied as immutable bytes.
+
+    The orchestration adapter resolves and transports the sealed receipt bytes;
+    verification never imports the store or trusts a stored status.  Identity,
+    schema, byte digests and release binding are re-checked here, and the parsed
+    bytes are the evidence (never a re-serialized copy).
+    """
+
+    import hashlib
+
+    names = ("native_tool_bytes", "native_stages_bytes", "transfer_manifest_bytes")
+    _require(isinstance(receipts, dict), "Native receipts must be supplied as an object")
+    blobs = {}
+    for name in names:
+        blob = receipts.get(name)
+        _require(
+            isinstance(blob, (bytes, bytearray)) and bool(blob),
+            f"Native receipt {name} is missing",
+        )
+        blobs[name] = bytes(blob)
+    parsed = {}
+    for name, blob in blobs.items():
+        try:
+            parsed[name] = json.loads(blob.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as error:
+            raise PipelineError(f"Native receipt {name} is not sealed JSON") from error
+    native_tool = parsed["native_tool_bytes"]
+    _require(
+        isinstance(native_tool, dict) and native_tool.get("schema_version") == TOOL_SCHEMA,
+        "Native tool receipt schema changed",
+    )
+    runtime = native_tool.get("runtime") or {}
+    _require(runtime.get("role") == "native", "Native tool receipt carries another role")
+    delivery = read_data(confined(root, "tool.json"))
+    _require(
+        native_tool.get("version") == delivery.get("version")
+        and native_tool.get("source_sha256") == delivery.get("source_sha256"),
+        "Native receipt does not bind this delivery's release identity",
+    )
+    stages = parsed["native_stages_bytes"]
+    transfer = parsed["transfer_manifest_bytes"]
+    _require(isinstance(stages, dict) and isinstance(transfer, dict), "Native receipts are not sealed records")
+    return {
+        "digests": {name: hashlib.sha256(blob).hexdigest() for name, blob in blobs.items()},
+        "native_tool": {"version": native_tool.get("version"), "source_sha256": native_tool.get("source_sha256")},
+        "native_stages": stages,
+        "transfer_manifest": transfer,
+    }
+
+
+def _tool(root, native_receipts=None):
     from packaging.version import Version
 
-    tool = read_data(confined(root, "reports/tool.json"))
+    tool = read_data(confined(root, "tool.json"))
     _require(
         tool["pipeline_id"] == PIPELINE_ID and tool["schema_version"] == TOOL_SCHEMA,
         "Unknown build tool",
@@ -615,14 +666,9 @@ def _tool(root):
     for version in runtime["packages"].values():
         _require(isinstance(version, str), "Invalid dependency versions")
         Version(version)
-    from ..orchestration.stage_transfer import TEAM_REPORTS, verify_transfer
-
     result = {"version": tool["version"], "source_sha256": tool["source_sha256"]}
-    # A delivery re-creates the structural-team report from its own receipt; the sealed
-    # native copy stays bound in the admitted capture.
-    provenance = verify_transfer(root, regenerated=TEAM_REPORTS)
-    if provenance is not None:
-        result["transfer"] = provenance
+    if native_receipts is not None:
+        result["transfer"] = _native_receipts_evidence(root, native_receipts)
     return result
 
 
@@ -1022,15 +1068,20 @@ def _geometry(root, body, node, model_link, geometry, components, body_pose, urd
     return used, world_points
 
 
-def evaluate_bundle(root: Path) -> dict:
-    """Recompute the quality report without reading the saved quality decision."""
+def evaluate_bundle(root: Path, *, native_receipts=None) -> dict:
+    """Recompute the quality report without reading the saved quality decision.
+
+    ``native_receipts`` are the immutable receipt bytes resolved by the
+    orchestration adapter; verification validates them independently and never
+    imports the store or treats a stored status as evidence.
+    """
     root = Path(root)
     diagnostics: list[dict] = []
     gates = _Gates()
     subject = gates.add("bundle.subject", lambda: {"sha256": subject_digest(root)})
     definition = gates.add("input.valid", lambda: _input(root, diagnostics))
     gates.add("source.native_discovery", lambda: _native_discovery(root / "input", diagnostics))
-    gates.add("tool.identity", lambda: _tool(root))
+    gates.add("tool.identity", lambda: _tool(root, native_receipts))
     manifest = gates.add("source.integrity", lambda: verify_snapshot(root / "evidence"))
     if manifest is not None:
         gates.add("source.native", lambda: _native(root, manifest))
@@ -1288,9 +1339,9 @@ def _expectation_bounds(bounds):
     return list(bounds)
 
 
-def check_bundle(root: Path) -> dict:
+def check_bundle(root: Path, *, native_receipts=None) -> dict:
     """Recompute all gates and require an exact binding to the saved report."""
-    report = evaluate_bundle(root)
+    report = evaluate_bundle(root, native_receipts=native_receipts)
     try:
         saved = read_data(confined(Path(root), "reports/quality.json"))
         # The quality report is a JSON document: bind in the JSON data model so a

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib
 import re
 import unittest
@@ -182,6 +183,23 @@ class ContractConvergenceTests(unittest.TestCase):
             if pattern.search(path.read_text(encoding="utf-8"))
         ]
         self.assertEqual(sites, ["src/description_pipeline/orchestration/uploads.py"])
+
+    def test_verification_never_imports_orchestration_or_the_store(self) -> None:
+        """Independence guard: receipts arrive as entry inputs, never via the store."""
+
+        offenders = []
+        for path in (REPO / "src/description_pipeline/verification").rglob("*.py"):
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if isinstance(node, ast.Import):
+                    modules = [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom):
+                    modules = [node.module or ""]
+                else:
+                    continue
+                for module in modules:
+                    if "orchestration" in module.split(".") or module.endswith("linux_store"):
+                        offenders.append((path.relative_to(REPO).as_posix(), module))
+        self.assertEqual(offenders, [])
 
     def test_completeness_helper_matches_the_nested_gate_contract(self) -> None:
         passed = {"id": "a", "state": "passed", "passed": True}
