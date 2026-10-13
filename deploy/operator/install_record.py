@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""Assemble and persist the Linux-side install record for one generation (IF-16).
+
+Contract: ``docs/deployment.md`` §安装 Linux 平台 / §维护、升级与恢复 (the install record names
+every managed service and path; the lifecycle reads the same record), frozen-interfaces-v1.1
+IF-16, and the D04 per-end binding: ``ends.linux`` carries this host's snapshot digest while
+``ends.windows`` carries the isolated endpoint's own generation - the two are never compared for
+equality.  The record's release identity is bound to the deployment's ``release.json``: equal
+package digests with a different ``source_commit`` are a mismatch, never a pass.
+
+The Windows end's identity is an explicit input: the endpoint preparation produces
+``{install_id, config_digest, release{version, source_commit, source_sha256, role: native}}`` and
+this module refuses to write a record without it (fail closed) - no fabricated placeholder
+generation is ever recorded.
+
+Like the other deploy-side modules this one is standalone (stdlib only); the terminal
+``tests/v1/test_install_record.py`` holds the parity guards against
+``description_pipeline.interface_records``.
+
+Exit codes: 0 success; 1 error (message on stderr); 2 usage error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from platform_config import atomic_write_once, canonical  # noqa: E402  (shared write-once/canonical)
+
+INSTALL_RECORD_SCHEMA = "solidworks-to-urdf.install-record/v1"
+RELEASE_SCHEMA = "solidworks-to-urdf.release/v1"
+DAG_ID = "solidworks_to_urdf"
+#: Frozen stage contract size; tests guard parity with description_pipeline.stages.STAGE_IDS.
+DAG_TASK_COUNT = 6
+
+_COMMIT = re.compile(r"\A[0-9a-f]{40}\Z")
+_HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_INSTALL_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_RFC3339_UTC = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\Z")
+
+
+def die(message: str) -> None:
+    raise SystemExit(f"install_record: {message}")
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        die(message)
+
+
+def _text(value, where: str) -> str:
+    require(isinstance(value, str) and bool(value) and not _CONTROL.search(value), f"{where} must be non-empty text")
+    return value
+
+
+def _hex64(value, where: str) -> str:
+    require(isinstance(value, str) and bool(_HEX64.match(value)), f"{where} must be lowercase sha256 hex")
+    return value
+
+
+def _load_json(path: Path, what: str) -> object:
+    require(path.is_file(), f"{what} not found: {path}")
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        die(f"cannot read {what} {path}: {error}")
+
+
+def release_identity(document) -> dict:
+    """Bind the deployment's ``release.json`` to the record's release block."""
+
+    require(isinstance(document, dict), "release.json must be an object")
+    require(document.get("schema_version") == RELEASE_SCHEMA, f"release.json schema_version must be {RELEASE_SCHEMA}")
+    for key in ("version", "source_commit", "source_sha256", "artifacts"):
+        require(key in document, f"release.json is missing {key}")
+    version = _text(document["version"], "release.json version")
+    commit = _text(document["source_commit"], "release.json source_commit")
+    require(bool(_COMMIT.match(commit)), f"release.json source_commit is malformed: {commit!r}")
+    source_sha = _hex64(document["source_sha256"], "release.json source_sha256")
+    artifacts = document["artifacts"]
+    require(isinstance(artifacts, dict) and bool(artifacts), "release.json artifacts must be a non-empty object")
+    rows = []
+    for name, checksum in sorted(artifacts.items()):
+        _text(name, "release.json artifact name")
+        rows.append({"name": name, "sha256": _hex64(checksum, f"release.json artifact {name!r}")})
+    return {"version": version, "source_commit": commit, "source_sha256": source_sha, "artifacts": rows}
+
+
+def verify_artifacts(root: Path, artifacts: list[dict]) -> int:
+    """Verify every cited artifact that is present under ``root``; at least one must be."""
+
+    verified = 0
+    for row in artifacts:
+        candidate = root / row["name"]
+        if not candidate.is_file():
+            continue
+        actual = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        require(actual == row["sha256"], f"artifact {row['name']} does not match release.json ({actual})")
+        verified += 1
+    require(verified > 0, f"no release artifact is present under {root}")
+    return verified
+
+
+def endpoint_identity(document) -> dict:
+    """The isolated endpoint's own generation identity (produced by the endpoint preparation)."""
+
+    require(isinstance(document, dict), "endpoint identity must be an object")
+    require(
+        set(document) == {"install_id", "config_digest", "release"},
+        "endpoint identity must carry exactly install_id, config_digest, release",
+    )
+    install_id = _text(document["install_id"], "endpoint identity install_id")
+    config_digest = _hex64(document["config_digest"], "endpoint identity config_digest")
+    release = document["release"]
+    require(isinstance(release, dict), "endpoint identity release must be an object")
+    require(
+        set(release) == {"version", "source_commit", "source_sha256", "role"},
+        "endpoint identity release must carry exactly version, source_commit, source_sha256, role",
+    )
+    require(release["role"] == "native", "endpoint identity release role must be native")
+    version = _text(release["version"], "endpoint identity release version")
+    commit = _text(release["source_commit"], "endpoint identity release source_commit")
+    require(bool(_COMMIT.match(commit)), "endpoint identity release source_commit is malformed")
+    source_sha = _hex64(release["source_sha256"], "endpoint identity release source_sha256")
+    return {
+        "install_id": install_id,
+        "config_digest": config_digest,
+        "release": {"version": version, "source_commit": commit, "source_sha256": source_sha, "role": "native"},
+    }
+
+
+def build_install_record(
+    *,
+    install_id: str,
+    timestamp: str,
+    snapshot_path: Path,
+    release: dict,
+    endpoint: dict,
+    services: list[str],
+    dag_file: Path,
+) -> dict:
+    """Assemble a record that passes the frozen IF-16 validator (parity-tested)."""
+
+    require(bool(_INSTALL_ID.match(install_id)), f"install_id is malformed: {install_id!r}")
+    require(bool(_RFC3339_UTC.match(timestamp)), f"timestamp must be RFC3339 UTC: {timestamp!r}")
+    require(
+        isinstance(services, list)
+        and bool(services)
+        and len(set(services)) == len(services)
+        and all(isinstance(unit, str) and bool(unit) for unit in services),
+        "services must be unique non-empty unit names",
+    )
+
+    snapshot_path = Path(snapshot_path)
+    require(snapshot_path.is_file(), f"snapshot file not found: {snapshot_path}")
+    snapshot_bytes = snapshot_path.read_bytes()
+    snapshot_digest = hashlib.sha256(snapshot_bytes).hexdigest()
+    try:
+        snapshot_document = json.loads(snapshot_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as error:
+        die(f"cannot parse snapshot {snapshot_path}: {error}")
+    resolved = snapshot_document.get("resolved") if isinstance(snapshot_document, dict) else None
+    storage = resolved.get("storage") if isinstance(resolved, dict) else None
+    require(isinstance(storage, dict), "snapshot resolved.storage is missing")
+    paths = {}
+    for name in ("state_root", "handoff_root", "artifact_root", "workspace_root", "release_root"):
+        paths[name] = _text(storage.get(name), f"snapshot resolved.storage.{name}")
+
+    require(
+        set(release) == {"version", "source_commit", "source_sha256", "artifacts"},
+        "release block is malformed",
+    )
+    triple = {key: release[key] for key in ("version", "source_commit", "source_sha256")}
+    windows_release = endpoint["release"]
+    differing = [key for key in triple if windows_release.get(key) != triple[key]]
+    require(not differing, f"endpoint release identity mismatch on {differing}")
+
+    dag_file = Path(dag_file)
+    require(dag_file.is_file(), f"dag file not found: {dag_file}")
+    dag_digest = hashlib.sha256(dag_file.read_bytes()).hexdigest()
+    return {
+        "schema_version": INSTALL_RECORD_SCHEMA,
+        "install_id": install_id,
+        "timestamp": timestamp,
+        "snapshot": {"path": str(snapshot_path), "digest": snapshot_digest, "install_id": install_id},
+        "release": {
+            "version": triple["version"],
+            "source_commit": triple["source_commit"],
+            "source_sha256": triple["source_sha256"],
+            "artifacts": list(release["artifacts"]),
+        },
+        "services": list(services),
+        "paths": paths,
+        "dag": {"id": DAG_ID, "path": str(dag_file), "digest": dag_digest, "tasks": DAG_TASK_COUNT},
+        "ends": {
+            "linux": {
+                "install_id": install_id,
+                "config_digest": snapshot_digest,
+                "release": {**triple, "role": "portable"},
+            },
+            "windows": {
+                "install_id": endpoint["install_id"],
+                "config_digest": endpoint["config_digest"],
+                "release": dict(windows_release),
+            },
+        },
+        "previous": None,
+        "journal": [],
+    }
+
+
+def write_install_record(record: dict, state_root: Path) -> tuple[Path, Path]:
+    """Persist one generation (write-once) and update the active record pointer atomically."""
+
+    payload = canonical(record)
+    generation = atomic_write_once(state_root / "install-records" / f"{record['install_id']}.json", payload)
+    active = state_root / "install-record.json"
+    active.parent.mkdir(parents=True, exist_ok=True)
+    temporary = active.with_name(f".{active.name}.{os.getpid()}.tmp")
+    descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, active)
+    finally:
+        temporary.unlink(missing_ok=True)
+    os.chmod(active, 0o600)
+    return generation, active
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="install_record.py", description=__doc__.splitlines()[0])
+    subparsers = parser.add_subparsers(dest="action", required=True)
+    build = subparsers.add_parser("build")
+    build.add_argument("--state-root", type=Path, required=True)
+    build.add_argument("--install-id", required=True)
+    build.add_argument("--timestamp", default=None)
+    build.add_argument("--snapshot", type=Path, required=True)
+    build.add_argument("--release-file", type=Path, required=True)
+    build.add_argument("--endpoint-identity", type=Path, required=True)
+    build.add_argument("--services", required=True, help="comma-separated managed unit names")
+    build.add_argument("--dag", type=Path, required=True)
+    args = parser.parse_args(argv)
+
+    timestamp = args.timestamp or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    release = release_identity(_load_json(args.release_file, "release file"))
+    verified = verify_artifacts(args.release_file.parent, release["artifacts"])
+    endpoint = endpoint_identity(_load_json(args.endpoint_identity, "endpoint identity"))
+    services = [unit for unit in args.services.split(",") if unit]
+    record = build_install_record(
+        install_id=args.install_id,
+        timestamp=timestamp,
+        snapshot_path=args.snapshot,
+        release=release,
+        endpoint=endpoint,
+        services=services,
+        dag_file=args.dag,
+    )
+    generation, active = write_install_record(record, args.state_root)
+    print(f"generation={generation}")
+    print(f"active={active}")
+    print(f"record_digest={hashlib.sha256(canonical(record)).hexdigest()}")
+    print(f"verified_artifacts={verified}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

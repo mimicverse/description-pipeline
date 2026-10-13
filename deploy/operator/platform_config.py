@@ -327,30 +327,28 @@ def build_snapshot(resolved: dict, *, platform_json_sha256: str, install_id: str
     }
 
 
-def _require_same_snapshot(path: Path, payload: bytes) -> Path:
+def _require_same_bytes(path: Path, payload: bytes) -> Path:
     """An existing generation is accepted only when its bytes are identical."""
 
     require(
         path.read_bytes() == payload,
-        f"the generation snapshot already exists with different bytes: {path}",
+        f"{path} already exists with different bytes (write-once)",
     )
     return path
 
 
-def write_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
-    """Write the generation snapshot atomically (0600); a generation is never rewritten.
+def atomic_write_once(path: Path, payload: bytes) -> Path:
+    """Create ``path`` atomically with exactly ``payload``; never overwrite existing bytes.
 
-    The commit is an atomic create-if-absent (``os.link`` of a fully written temporary file), so
-    two concurrent writers with different payloads for one generation can never overwrite each
-    other: the loser observes the existing bytes and fails closed.
+    The commit is an atomic create-if-absent (``os.link`` of a fully written+fsynced temporary
+    file): two concurrent writers with different payloads can never overwrite each other - the
+    loser observes the existing bytes and fails closed.
     """
 
-    snapshots_dir.mkdir(parents=True, exist_ok=True)
-    os.chmod(snapshots_dir, stat.S_IRWXU)
-    path = snapshots_dir / f"{snapshot['install_id']}.json"
-    payload = canonical(snapshot)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, stat.S_IRWXU)
     if path.exists():
-        return _require_same_snapshot(path, payload)
+        return _require_same_bytes(path, payload)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     try:
@@ -361,13 +359,19 @@ def write_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
         try:
             os.link(temporary, path)
         except FileExistsError:
-            return _require_same_snapshot(path, payload)
+            return _require_same_bytes(path, payload)
         except OSError as error:
-            die(f"cannot commit the generation snapshot {path}: {error}")
+            die(f"cannot commit {path}: {error}")
     finally:
         temporary.unlink(missing_ok=True)
     os.chmod(path, 0o600)
     return path
+
+
+def write_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
+    """Write the generation snapshot atomically (0600); a generation is never rewritten."""
+
+    return atomic_write_once(snapshots_dir / f"{snapshot['install_id']}.json", canonical(snapshot))
 
 
 def load_document(path: Path) -> tuple[bytes, object]:
