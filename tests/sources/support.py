@@ -494,7 +494,7 @@ class FixtureCadBackend(CadBackend):
         self,
         doc_path: str,
         coordinate_systems: Sequence[str],
-        progress=None,
+        on_activity=None,
         require_material: bool = True,
     ) -> RawScene:
         order = getattr(self, "order", None)
@@ -520,11 +520,34 @@ class FixtureCadBackend(CadBackend):
         scene.coordinate_systems = {name: _matrix16(matrix) for name, matrix in self.coordinate_system_matrices.items()}
         scene.mass_properties = {str(entry["name"]): dict(entry["mass"]) for entry in self.components}
         scene.notes = {"backend": self.name}
+        if on_activity is not None:
+            total = len(self.components)
+            for index, entry in enumerate(self.components, start=1):
+                on_activity(
+                    {
+                        "phase": "capture",
+                        "action": "instance_reads",
+                        "current_object": str(entry["name"]),
+                        "completed": index,
+                        "total": total,
+                    }
+                )
         return scene
 
-    def export_component_meshes(self, destinations: dict[str, str], progress=None) -> dict[str, dict[str, Any]]:
+    def export_component_meshes(self, destinations: dict[str, str], on_activity=None) -> dict[str, dict[str, Any]]:
         entries = {}
-        for component, dest_path in destinations.items():
+        total = len(destinations)
+        for index, (component, dest_path) in enumerate(destinations.items(), start=1):
+            if on_activity is not None:
+                on_activity(
+                    {
+                        "phase": "capture",
+                        "action": "mesh_export",
+                        "current_object": component,
+                        "completed": index,
+                        "total": total,
+                    }
+                )
             triangles = cube_stl(Path(dest_path))
             self.exported.append(str(dest_path))
             entries[component] = {

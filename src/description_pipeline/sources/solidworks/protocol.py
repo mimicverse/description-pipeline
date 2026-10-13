@@ -101,13 +101,28 @@ class CadBackend:
         self,
         doc_path: str,
         coordinate_systems: Sequence[str],
-        progress=None,
+        on_activity=None,
         require_material: bool = True,
     ) -> RawScene:
+        """Read one captured scene's occurrence tree and per-instance evidence.
+
+        ``on_activity`` optionally receives partial live-activity records
+        (``phase``/``action`` plus optional ``params``, ``current_object``,
+        ``completed``/``total``, ``unit``) while the read is blocking; it is
+        observation only and can never change the scene or the failure
+        behaviour.  Callbacks observed by the pipeline are invoked defensively.
+        """
+
         raise NotImplementedError
 
-    def export_component_meshes(self, destinations: dict[str, str], progress=None) -> dict[str, dict]:
-        """Export one geometry batch while its native parent interfaces stay alive."""
+    def export_component_meshes(self, destinations: dict[str, str], on_activity=None) -> dict[str, dict]:
+        """Export one geometry batch while its native parent interfaces stay alive.
+
+        ``on_activity`` follows the same record contract as
+        :meth:`collect_scene`; it observes mesh progress (current component
+        name plus ``completed``/``total``) and can never fail the export.
+        """
+
         raise NotImplementedError
 
     def verify_sources_unchanged(self) -> dict[str, dict]:

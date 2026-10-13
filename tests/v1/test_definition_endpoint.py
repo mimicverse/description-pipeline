@@ -36,7 +36,7 @@ from .endpoint_support import MAIN, TOOL, EndpointFixture, source_bytes
 
 class DefinitionEndpointTests(EndpointFixture, unittest.TestCase):
     def reached_definition(self, jobs, run_id: str) -> dict:
-        sealed = self.stage_and_seal(jobs, run_id)
+        sealed = self.stage_and_seal(jobs, run_id, statuses={"running", "awaiting_definition"})
         self.assertNotEqual("failed", sealed["status"], sealed.get("error"))
         snapshot = self.wait_state_any_status(jobs, run_id, {"awaiting_definition"})
         self.assertEqual("awaiting_definition", snapshot["status"], snapshot.get("error"))

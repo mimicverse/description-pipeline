@@ -172,14 +172,19 @@ class EndpointFixture:
         self.addCleanup(jobs.close)
         return jobs
 
-    def stage_and_seal(self, jobs: Jobs, run_id: str, *, timeout: float = 15.0) -> dict:
-        """Stage the exact full indexed folder once and wait for the sealed closure."""
+    def stage_and_seal(self, jobs: Jobs, run_id: str, *, timeout: float = 15.0, statuses=None) -> dict:
+        """Stage the exact full indexed folder once and wait for the sealed closure.
+
+        ``statuses`` defaults to ``running``; a caller that accepts the job racing
+        ahead may include ``awaiting_definition`` so the bounded wait cannot miss a
+        transition under load.
+        """
 
         snapshot = jobs.snapshot(run_id)
         if snapshot["status"] != "selecting":
             raise AssertionError(f"the native job is not staging: {snapshot['status']!r}")
         jobs.submit_files(run_id, self.batch_zip())
-        return self.wait_state_any_status(jobs, run_id, {"running"}, timeout=timeout)
+        return self.wait_state_any_status(jobs, run_id, statuses or {"running"}, timeout=timeout)
 
     def observed_stage_root(self) -> str:
         for entry in reversed(self.reader_log):
@@ -273,7 +278,7 @@ class EndpointFixture:
     def run_to_terminal(self, jobs: Jobs, run_id: str, *, timeout: float = 20.0) -> dict:
         """The whole native boundary: selection -> definition -> capture."""
 
-        sealed = self.stage_and_seal(jobs, run_id)
+        sealed = self.stage_and_seal(jobs, run_id, statuses={"running", "awaiting_definition"})
         if sealed["status"] == "failed":
             return sealed
         state = self.wait_state_any_status(jobs, run_id, {"awaiting_definition"}, timeout=timeout)
