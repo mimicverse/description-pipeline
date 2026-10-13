@@ -2181,9 +2181,10 @@ def _retry_transient_com(
 class SolidWorksBackend(CadBackend):
     name = "solidworks"
 
-    def __init__(self, *, session_factory=None):
+    def __init__(self, *, session_factory=None, cad_ownership_file=None):
         self._local = threading.local()
         self._session_factory = session_factory
+        self._cad_ownership_file = cad_ownership_file
         self._sessions = {}
         self._sessions_lock = threading.Lock()
         self._owner_thread = None
@@ -2235,7 +2236,8 @@ class SolidWorksBackend(CadBackend):
                     raise
             from .isolation import CadSession
 
-            session = (self._session_factory or CadSession)()
+            factory = self._session_factory
+            session = factory() if factory is not None else CadSession(ownership_file=self._cad_ownership_file)
             with self._sessions_lock:
                 if self._cancelled.is_set():
                     session.close()

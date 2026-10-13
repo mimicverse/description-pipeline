@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -483,49 +485,106 @@ class SessionTests(unittest.TestCase):
 
 
 class RemnantSweepTests(unittest.TestCase):
-    """The pre-start sweep kills only same-executable leftovers."""
+    """The pre-start sweep terminates only RECORDED leftovers; any unrecorded
+    same-executable process refuses the launch instead of being killed."""
 
     EXE = "/opt/SLDPRT/SLDWORKS.exe"
+    OTHER = "/opt/other/other.exe"
+    BOOT = 1_700_000_000.0
 
-    def test_same_executable_leftovers_are_terminated_with_one_settle(self):
-        killed = []
-        slept = []
-        table = [(11, self.EXE), (22, "/opt/other/other.exe"), (33, self.EXE)]
-        with patch.object(isolation, "_TRACKED_PIDS", set()):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ledger = Path(self.tmp.name) / "cad-ownership.json"
+
+    def _record(self, pid, *, creation=100, boot=None, owner="earlier-owner"):
+        isolation.OwnershipStore(self.ledger).add(
+            {
+                "pid": pid,
+                "executable": self.EXE,
+                "creation_time": creation,
+                "boot_epoch": self.BOOT if boot is None else boot,
+                "owner": owner,
+                "owner_pid": 999,
+                "recorded_at": 0.0,
+            }
+        )
+
+    def _sweep(self, table, *, tracked=(), exclude=(), creation=None, boot=None):
+        killed, slept = [], []
+        with patch.object(isolation, "_TRACKED_PIDS", set(tracked)):
             result = terminate_remnant_processes(
                 self.EXE,
+                exclude_pids=exclude,
                 process_table=lambda: table,
                 terminate_pid=killed.append,
                 sleep=slept.append,
+                ownership_file=self.ledger,
+                creation_time=creation or (lambda pid: 100),
+                boot_epoch=boot or (lambda: self.BOOT),
             )
-        self.assertEqual(result, [11, 33])
-        self.assertEqual(killed, [11, 33])
+        return result, killed, slept
+
+    def test_recorded_leftover_of_an_earlier_owner_is_swept_with_one_settle(self):
+        self._record(11)
+        result, killed, slept = self._sweep([(11, self.EXE), (22, self.OTHER)])
+        self.assertEqual(result, [11])
+        self.assertEqual(killed, [11])
         self.assertEqual(slept, [isolation.REMNANT_SETTLE_SECONDS])
+        self.assertEqual(isolation.OwnershipStore(self.ledger).load(), {})
 
-    def test_tracked_and_excluded_pids_are_never_swept(self):
-        killed = []
-        slept = []
-        table = [(11, self.EXE), (33, self.EXE)]
-        with patch.object(isolation, "_TRACKED_PIDS", {11}):
-            result = terminate_remnant_processes(
-                self.EXE,
-                exclude_pids={33},
-                process_table=lambda: table,
-                terminate_pid=killed.append,
-                sleep=slept.append,
-            )
+    def test_unrecorded_same_executable_refuses_and_is_never_terminated(self):
+        with self.assertRaises(EnvironmentError_) as caught:
+            self._sweep([(4242, self.EXE)])
+        self.assertEqual(caught.exception.code, "cad_external_solidworks")
+        self.assertIn("close it before capturing", str(caught.exception))
+        self.assertEqual(caught.exception.detail["pids"], [4242])
+
+    def test_tracked_and_excluded_pids_are_never_swept_or_refused(self):
+        result, killed, slept = self._sweep([(11, self.EXE), (33, self.EXE)], tracked={11}, exclude={33})
+        self.assertEqual((result, killed, slept), ([], [], []))
+
+    def test_other_executable_is_untouched(self):
+        result, killed, slept = self._sweep([(22, self.OTHER)])
+        self.assertEqual((result, killed, slept), ([], [], []))
+
+    def test_pid_reuse_with_a_different_creation_time_is_never_terminated(self):
+        self._record(11, creation=100)
+        with self.assertRaises(EnvironmentError_) as caught:
+            self._sweep([(11, self.EXE)], creation=lambda pid: 200)
+        self.assertEqual(caught.exception.code, "cad_external_solidworks")
+
+    def test_record_from_another_boot_is_not_trusted(self):
+        self._record(11, boot=self.BOOT - 3600.0)
+        with self.assertRaises(EnvironmentError_) as caught:
+            self._sweep([(11, self.EXE)])
+        self.assertEqual(caught.exception.code, "cad_external_solidworks")
+
+    def test_own_record_is_left_to_the_windows_job(self):
+        self._record(11, owner=isolation._OWNER_TOKEN)
+        result, killed, slept = self._sweep([(11, self.EXE)])
+        self.assertEqual((result, killed, slept), ([], [], []))
+
+    def test_unreadable_creation_time_is_skipped_without_termination(self):
+        self._record(11)
+        result, killed, slept = self._sweep([(11, self.EXE)], creation=lambda pid: None)
+        self.assertEqual((result, killed, slept), ([], [], []))
+
+    def test_stale_record_for_a_gone_pid_is_pruned(self):
+        self._record(99)
+        result, _killed, _slept = self._sweep([(22, self.OTHER)])
         self.assertEqual(result, [])
-        self.assertEqual(killed, [])
-        self.assertEqual(slept, [])
+        self.assertEqual(isolation.OwnershipStore(self.ledger).load(), {})
 
     def test_no_leftovers_leave_the_settle_untouched(self):
-        slept = []
-        with patch.object(isolation, "_TRACKED_PIDS", set()):
-            result = terminate_remnant_processes(
-                self.EXE,
-                process_table=list,
-                terminate_pid=Mock(),
-                sleep=slept.append,
-            )
-        self.assertEqual(result, [])
-        self.assertEqual(slept, [])
+        result, killed, slept = self._sweep([])
+        self.assertEqual((result, killed, slept), ([], [], []))
+
+    def test_ledger_roundtrip_and_foreign_schema_reads_empty(self):
+        store = isolation.OwnershipStore(self.ledger)
+        store.add({"pid": 7, "executable": self.EXE, "creation_time": 1, "boot_epoch": 0.0, "owner": "x"})
+        self.assertEqual(list(store.load()), [7])
+        store.remove(7, creation_time=1)
+        self.assertEqual(store.load(), {})
+        self.ledger.write_text('{"schema_version": "foreign/v9", "records": []}', encoding="utf-8")
+        self.assertEqual(store.load(), {})

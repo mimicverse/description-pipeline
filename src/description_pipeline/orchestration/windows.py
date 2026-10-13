@@ -1187,13 +1187,12 @@ class Jobs:
             self._save(job)
         return package, target
 
-    @staticmethod
-    def _sealed_backend(package, files):
+    def _sealed_backend(self, package, files):
         from ..runtime import native_readiness
         from ..sources.solidworks.native import SolidWorksBackend
 
         native_readiness()
-        backend = SolidWorksBackend()
+        backend = SolidWorksBackend(cad_ownership_file=self.config["state_root"] / "cad-ownership.json")
         backend.configure_staged_search(package)
         backend.seal_documents([confined(package, name) for name in files])
         return backend

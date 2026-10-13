@@ -9,6 +9,7 @@ import time
 import uuid
 from pathlib import Path
 
+from ...io import PipelineError, read_data, write_json
 from .errors import EnvironmentError_
 
 # Published ISldWorks dual-interface IID in the SolidWorks type library.
@@ -31,6 +32,14 @@ REMNANT_TERMINATE_WAIT_MS = 5000
 #: a crashed capture.
 _TRACKED_PIDS: set[int] = set()
 _TRACKED_PIDS_LOCK = threading.Lock()
+
+#: Persisted launch ownership: only a process matching its record (image,
+#: creation time and host boot) and an earlier owner token may be terminated.
+OWNERSHIP_SCHEMA = "solidworks-to-urdf.cad-ownership/v1"
+#: Boot-moment tolerance when matching a persisted record against the host boot.
+BOOT_ID_TOLERANCE_SECONDS = 30
+#: This pipeline process; records carrying another token are earlier owners.
+_OWNER_TOKEN = uuid.uuid4().hex
 
 
 def registered_executable() -> str:
@@ -116,6 +125,106 @@ def _windows_terminate_pid(pid: int) -> None:
         handle.Close()
 
 
+def _windows_creation_time(pid: int) -> int | None:
+    """The process creation FILETIME (100 ns ticks), or None when unreadable.
+
+    A pid without a readable creation time is never termination authority: it
+    either exited between enumeration and this query or cannot be inspected,
+    and both cases stay untouched.
+    """
+
+    import win32api
+    import win32con
+    import win32process
+
+    handle = None
+    try:
+        handle = win32api.OpenProcess(win32con.PROCESS_QUERY_INFORMATION, False, pid)
+        created, _exited, _kernel, _user = win32process.GetProcessTimes(handle)
+        return (created.dwHighDateTime << 32) | created.dwLowDateTime
+    except Exception:  # noqa: BLE001 - unreadable processes are never terminated
+        return None
+    finally:
+        if handle is not None:
+            with contextlib.suppress(Exception):
+                handle.Close()
+
+
+def _windows_boot_epoch() -> float:
+    """The host boot moment in Unix seconds (uptime-derived; no registry writes)."""
+
+    import win32api
+
+    return time.time() - win32api.GetTickCount64() / 1000.0
+
+
+def _ownership_path(override=None) -> Path:
+    """The endpoint-owned launch ledger; callers may pin it explicitly."""
+
+    if override is not None:
+        return Path(override)
+    configured = os.environ.get("DESCRIPTION_CAD_OWNERSHIP_FILE")
+    if configured:
+        return Path(configured)
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_STATE_HOME")
+    if not base:
+        base = str(Path.home() / ".local" / "state")
+    return Path(base) / "description-pipeline" / "cad-ownership.json"
+
+
+class OwnershipStore:
+    """The small launch ledger; records only shrink through matching removals.
+
+    A malformed or foreign ledger reads as empty: it must never become
+    termination authority, and the unrecorded-process refusal covers the rest.
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._lock = threading.Lock()
+
+    def load(self) -> dict[int, dict]:
+        if not self.path.is_file():
+            return {}
+        try:
+            payload = read_data(self.path)
+        except (PipelineError, OSError, ValueError):
+            return {}
+        if not isinstance(payload, dict) or payload.get("schema_version") != OWNERSHIP_SCHEMA:
+            return {}
+        records = payload.get("records")
+        if not isinstance(records, list):
+            return {}
+        loaded = {}
+        for item in records:
+            if isinstance(item, dict) and type(item.get("pid")) is int and item["pid"] > 0:
+                loaded[item["pid"]] = item
+        return loaded
+
+    def add(self, record: dict) -> None:
+        with self._lock:
+            records = self.load()
+            records[record["pid"]] = record
+            self._save(records)
+
+    def remove(self, pid: int, *, creation_time=None) -> None:
+        with self._lock:
+            records = self.load()
+            record = records.get(pid)
+            if record is None:
+                return
+            if creation_time is not None and record.get("creation_time") != creation_time:
+                return
+            del records[pid]
+            self._save(records)
+
+    def _save(self, records: dict[int, dict]) -> None:
+        write_json(
+            self.path,
+            {"schema_version": OWNERSHIP_SCHEMA, "records": [records[key] for key in sorted(records)]},
+        )
+
+
 def terminate_remnant_processes(
     executable: str,
     *,
@@ -123,28 +232,70 @@ def terminate_remnant_processes(
     process_table=None,
     terminate_pid=None,
     sleep=time.sleep,
+    ownership_file=None,
+    creation_time=None,
+    boot_epoch=None,
 ) -> list[int]:
-    """Terminate same-executable leftovers that no live session tracks.
+    """Terminate RECORDED same-executable leftovers; refuse unrecorded ones.
 
     SolidWorks is a single-instance COM server: a process left behind by a
     crashed capture keeps the LocalServer32 registration, so the next owned
     launch would attach to the corpse and never complete startup (native18).
-    The sweep runs before every owned start and only addresses processes whose
-    image path equals the registered executable; PIDs tracked by a live
-    ``WindowsCadProcess`` (plus explicitly excluded ones) are never touched.
-    After a kill the caller settles briefly so the COM registration clears
-    before the fresh launch.
+    Ownership is persisted per owned launch ({pid, executable, creation time,
+    host boot, owner token}); the sweep terminates a same-executable process
+    only when a record matches its image, creation time and host boot and the
+    record carries an earlier owner token.  A same-executable process with no
+    matching record is never touched - the operator is running SolidWorks
+    outside the pipeline, so the launch refuses (fail closed) instead.  PIDs
+    tracked by a live ``WindowsCadProcess`` (plus explicitly excluded ones) are
+    always skipped: they are the live owner, not a remnant.  After a kill the
+    caller settles briefly so the COM registration clears before the launch.
     """
 
-    excluded = _tracked_pids() | set(exclude_pids)
-    killed = []
-    for pid in _matching_process_ids(executable, (process_table or _windows_process_table)()):
-        if pid in excluded:
+    store = OwnershipStore(_ownership_path(ownership_file))
+    records = store.load()
+    table = (process_table or _windows_process_table)()
+    tracked = _tracked_pids() | set(exclude_pids)
+    read_creation = creation_time or _windows_creation_time
+    current_boot = (boot_epoch or _windows_boot_epoch)()
+    killed: list[int] = []
+    unrecorded: list[int] = []
+    for pid in _matching_process_ids(executable, table):
+        if pid in tracked:
             continue
+        record = records.get(pid)
+        if record is None:
+            unrecorded.append(pid)
+            continue
+        live_creation = read_creation(pid)
+        if live_creation is None:
+            continue  # exited between enumeration and the query; nothing to judge
+        boot = record.get("boot_epoch")
+        matches = (
+            record.get("creation_time") == live_creation
+            and isinstance(boot, (int, float))
+            and abs(float(boot) - float(current_boot)) <= BOOT_ID_TOLERANCE_SECONDS
+        )
+        if not matches:
+            unrecorded.append(pid)  # PID reuse or a record from another boot
+            continue
+        if record.get("owner") == _OWNER_TOKEN:
+            continue  # this process's own launch; the Windows job owns its cleanup
         (terminate_pid or _windows_terminate_pid)(pid)
         killed.append(pid)
+        store.remove(pid, creation_time=record.get("creation_time"))
+    present = {row[0] for row in table}
+    for pid in list(records):
+        if pid not in present:
+            store.remove(pid, creation_time=records[pid].get("creation_time"))
     if killed:
         sleep(REMNANT_SETTLE_SECONDS)
+    if unrecorded:
+        raise EnvironmentError_(
+            "cad_external_solidworks",
+            "SolidWorks is running outside the pipeline; close it before capturing",
+            {"pids": sorted(unrecorded), "executable": executable},
+        )
     return killed
 
 
@@ -152,12 +303,13 @@ class WindowsCadProcess:
     """A suspended child is assigned to our job before it can create descendants.
 
     Closing the job kills only this process tree, and the PID is published in
-    ``_TRACKED_PIDS`` so the startup remnant sweep never touches it.  That
-    sweep is the single deliberate exception to "no PID snapshot is termination
-    authority": it kills only same-executable leftovers of a crashed capture.
+    ``_TRACKED_PIDS`` so the startup remnant sweep never touches it.  Each
+    owned launch is also persisted in the ownership ledger: the sweep may only
+    terminate a process that matches its record, and any other same-executable
+    process refuses the launch instead of being killed.
     """
 
-    def __init__(self, executable: str):
+    def __init__(self, executable: str, *, ownership_file: Path | None = None):
         import win32api
         import win32job
         import win32process
@@ -166,13 +318,15 @@ class WindowsCadProcess:
         self.pid = 0
         self._lock = threading.Lock()
         self._job = self._process = self._thread = None
+        self._ownership = OwnershipStore(_ownership_path(ownership_file))
+        self._record_creation = None
         try:
             # SolidWorks is a single-instance COM server: a process left behind
             # by a crashed capture keeps the LocalServer32 registration, and a
             # fresh owned launch would attach to it and never complete startup
-            # (native18).  Only same-executable leftovers are swept, never a
-            # PID tracked by a live instance.
-            terminate_remnant_processes(executable)
+            # (native18).  Only RECORDED leftovers are swept; any other
+            # same-executable process refuses the launch instead of being killed.
+            terminate_remnant_processes(executable, ownership_file=ownership_file)
             self._job = win32job.CreateJobObject(None, "description-cad-" + uuid.uuid4().hex)
             limits = win32job.QueryInformationJobObject(self._job, win32job.JobObjectExtendedLimitInformation)
             limits["BasicLimitInformation"]["LimitFlags"] |= win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
@@ -191,15 +345,39 @@ class WindowsCadProcess:
             with _TRACKED_PIDS_LOCK:
                 _TRACKED_PIDS.add(self.pid)
             try:
+                self._record_creation = self._creation_time()
+                self._ownership.add(
+                    {
+                        "pid": self.pid,
+                        "executable": self.executable,
+                        "creation_time": self._record_creation,
+                        "boot_epoch": _windows_boot_epoch(),
+                        "owner": _OWNER_TOKEN,
+                        "owner_pid": os.getpid(),
+                        "recorded_at": time.time(),
+                    }
+                )
                 win32job.AssignProcessToJobObject(self._job, self._process)
             except BaseException:
                 # This still-suspended process is ours even if job assignment fails.
                 win32api.TerminateProcess(self._process, 1)
                 raise
             win32process.ResumeThread(self._thread)
+        except EnvironmentError_:
+            self.close()
+            raise
         except Exception as error:
             self.close()
             raise EnvironmentError_("cad_process_start_failed", str(error)) from error
+
+    def _creation_time(self) -> int | None:
+        import win32process
+
+        try:
+            created, _exited, _kernel, _user = win32process.GetProcessTimes(self._process)
+            return (created.dwHighDateTime << 32) | created.dwLowDateTime
+        except Exception:  # noqa: BLE001 - the record stays valid, it just cannot be swept
+            return None
 
     def alive(self) -> bool:
         import win32process
@@ -230,6 +408,9 @@ class WindowsCadProcess:
             finally:
                 with _TRACKED_PIDS_LOCK:
                     _TRACKED_PIDS.discard(self.pid)
+                if self._ownership is not None:
+                    with contextlib.suppress(Exception):
+                        self._ownership.remove(self.pid, creation_time=self._record_creation)
             if errors:
                 raise EnvironmentError_("cad_process_cleanup_failed", "; ".join(errors), {"pid": self.pid})
 
@@ -265,8 +446,19 @@ def application_for_pid(pid: int):
 class CadSession:
     """One owned application; COM references remain on the calling STA thread."""
 
-    def __init__(self, *, process=None, binder=None, startup_timeout: float = STARTUP_TIMEOUT_SECONDS):
-        self.process = process if process is not None else WindowsCadProcess(registered_executable())
+    def __init__(
+        self,
+        *,
+        process=None,
+        binder=None,
+        startup_timeout: float = STARTUP_TIMEOUT_SECONDS,
+        ownership_file: Path | None = None,
+    ):
+        self.process = (
+            process
+            if process is not None
+            else WindowsCadProcess(registered_executable(), ownership_file=ownership_file)
+        )
         self._binder = binder or application_for_pid
         self.startup_timeout = startup_timeout
         self.app = None
