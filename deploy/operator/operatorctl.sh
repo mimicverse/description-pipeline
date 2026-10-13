@@ -805,37 +805,12 @@ PY
       promotion_step "$CANDIDATE_ID" promote backup failed "$EVIDENCE_DIR/backup-seal.out"
       die "the backup archive could not be sealed (the admission stays closed)"
     fi
-    python3 - "$BACKUP_DIR" "$EVIDENCE_DIR/backup-manifest.json" "$RECEIPT_DIR/backup.tar.enc" "$BACKUP_KEY" <<'PY'
-import hashlib
-import json
-import sys
-from pathlib import Path
-
-backup, out, sealed, key = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4])
-files = {
-    path.relative_to(backup).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
-    for path in sorted(backup.rglob("*"))
-    if path.is_file()
-}
-out.write_text(
-    json.dumps(
-        {
-            "schema": "solidworks-to-urdf.promote-backup/v1",
-            "files": files,
-            "encrypted": {
-                "path": str(sealed),
-                "sha256": hashlib.sha256(sealed.read_bytes()).hexdigest(),
-                "cipher": "aes-256-cbc",
-                "key": str(key),
-            },
-        },
-        indent=2,
-        sort_keys=True,
-    )
-    + "\n",
-    encoding="utf-8",
-)
-PY
+    # The manifest format has one owner: backup.py writes and strictly reads it.
+    if ! python3 "$HERE/backup.py" manifest --source "$BACKUP_DIR" --sealed "$RECEIPT_DIR/backup.tar.enc" \
+        --key "$BACKUP_KEY" --out "$EVIDENCE_DIR/backup-manifest.json" > "$EVIDENCE_DIR/backup-manifest.out" 2>&1; then
+      promotion_step "$CANDIDATE_ID" promote backup failed "$EVIDENCE_DIR/backup-manifest.out"
+      die "the backup manifest could not be written (the admission stays closed)"
+    fi
     promotion_step "$CANDIDATE_ID" promote backup completed "$EVIDENCE_DIR/backup-manifest.json"
     # The sealed archive replaces the plaintext staging: the encrypted artifact plus the
     # manifest are the only restore inputs that remain.

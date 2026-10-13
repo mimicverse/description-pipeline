@@ -21,6 +21,9 @@ from pathlib import Path
 
 import install_record
 
+MANIFEST_SCHEMA = "solidworks-to-urdf.promote-backup/v1"
+CIPHER = "aes-256-cbc"
+
 
 def die(message: str) -> None:
     raise SystemExit(f"backup: {message}")
@@ -38,6 +41,77 @@ def ensure_key(path: Path) -> None:
         with os.fdopen(handle, "wb") as stream:
             stream.write(os.urandom(32).hex().encode("ascii"))
     os.chmod(path, 0o600)
+
+
+def _reject_duplicate_keys(pairs):
+    seen = set()
+    for key, _ in pairs:
+        if key in seen:
+            die(f"duplicate manifest key: {key!r}")
+        seen.add(key)
+    return dict(pairs)
+
+
+def load_manifest(path: Path) -> dict:
+    """The one strict manifest reader: no duplicate keys, exact fields, verified cipher."""
+
+    try:
+        manifest = json.loads(Path(path).read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    except (OSError, ValueError) as error:
+        die(f"cannot read the backup manifest: {error}")
+    require(
+        isinstance(manifest, dict) and set(manifest) == {"schema", "files", "encrypted"},
+        "the backup manifest carries unknown or missing fields",
+    )
+    require(manifest["schema"] == MANIFEST_SCHEMA, "the backup manifest schema is not supported")
+    sealed = manifest["encrypted"]
+    require(
+        isinstance(sealed, dict) and set(sealed) == {"path", "sha256", "cipher", "key"},
+        "the backup manifest encrypted block is malformed",
+    )
+    require(sealed["cipher"] == CIPHER, f"unsupported backup cipher: {sealed['cipher']!r}")
+    require(
+        isinstance(sealed["sha256"], str) and len(sealed["sha256"]) == 64,
+        "the backup manifest sealed digest is malformed",
+    )
+    require(all(isinstance(sealed[key], str) and sealed[key] for key in ("path", "key")), "sealed paths are malformed")
+    declared = manifest["files"]
+    require(isinstance(declared, dict) and bool(declared), "the backup manifest carries no member digests")
+    validated = {}
+    for name, checksum in declared.items():
+        validated[install_record.confined_relative(name, "manifest member")] = checksum
+    for name, checksum in validated.items():
+        require(
+            isinstance(checksum, str) and len(checksum) == 64,
+            f"manifest member digest is malformed: {name}",
+        )
+    manifest["files"] = validated
+    return manifest
+
+
+def write_manifest(source: Path, sealed: Path, key: Path, out: Path) -> dict:
+    """The one manifest writer: same format the strict reader accepts, digests from the source."""
+
+    require(source.is_dir(), f"backup source is missing: {source}")
+    require(sealed.is_file(), f"sealed archive is missing: {sealed}")
+    files = {
+        path.relative_to(source).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(source.rglob("*"))
+        if path.is_file()
+    }
+    require(files, "the backup source carries no files")
+    manifest = {
+        "schema": MANIFEST_SCHEMA,
+        "files": files,
+        "encrypted": {
+            "path": str(sealed),
+            "sha256": hashlib.sha256(sealed.read_bytes()).hexdigest(),
+            "cipher": CIPHER,
+            "key": str(key),
+        },
+    }
+    out.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return manifest
 
 
 def _openssl(arguments: list[str]) -> None:
@@ -69,29 +143,14 @@ def seal(source: Path, key: Path, out: Path) -> str:
 def open_archive(archive: Path, key: Path, manifest_path: Path, dest: Path) -> None:
     require(archive.is_file(), f"backup archive is missing: {archive}")
     require(key.is_file(), f"backup key is missing: {key}")
-    try:
-        manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as error:
-        die(f"cannot read the backup manifest: {error}")
-    require(
-        isinstance(manifest, dict) and manifest.get("schema") == "solidworks-to-urdf.promote-backup/v1",
-        "the backup manifest schema is not supported",
-    )
-    sealed = manifest.get("encrypted") if isinstance(manifest, dict) else None
-    expected = sealed.get("sha256") if isinstance(sealed, dict) else None
+    manifest = load_manifest(manifest_path)
+    sealed = manifest["encrypted"]
+    expected = sealed["sha256"]
     require(
         isinstance(expected, str) and hashlib.sha256(archive.read_bytes()).hexdigest() == expected,
         "the sealed archive digest does not match the manifest",
     )
-    declared = manifest.get("files")
-    require(isinstance(declared, dict) and bool(declared), "the backup manifest carries no member digests")
-    # The single path owner decides every member name before anything is read or written.
-    validated = {install_record.confined_relative(name, "manifest member"): value for name, value in declared.items()}
-    for name, checksum in validated.items():
-        require(
-            isinstance(checksum, str) and len(checksum) == 64,
-            f"manifest member digest is malformed: {name}",
-        )
+    validated = manifest["files"]
     require(not dest.exists(), f"refuse to overwrite the restore destination: {dest}")
     dest.mkdir(parents=True)
     with tempfile.NamedTemporaryFile(dir=dest.parent, delete=False) as handle:
@@ -132,6 +191,11 @@ def main(argv: list[str] | None = None) -> int:
     open_parser.add_argument("--key", type=Path, required=True)
     open_parser.add_argument("--manifest", type=Path, required=True)
     open_parser.add_argument("--dest", type=Path, required=True)
+    manifest_parser = subparsers.add_parser("manifest")
+    manifest_parser.add_argument("--source", type=Path, required=True)
+    manifest_parser.add_argument("--sealed", type=Path, required=True)
+    manifest_parser.add_argument("--key", type=Path, required=True)
+    manifest_parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
     if args.action == "key":
         ensure_key(args.path)
@@ -145,6 +209,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.action == "open":
         open_archive(args.archive, args.key, args.manifest, args.dest)
         print(f"opened={args.dest}")
+        return 0
+    if args.action == "manifest":
+        manifest = write_manifest(args.source, args.sealed, args.key, args.out)
+        print(f"manifest={args.out}")
+        print(f"sealed_sha256={manifest['encrypted']['sha256']}")
         return 0
     return 2
 

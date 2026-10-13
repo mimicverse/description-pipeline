@@ -1868,6 +1868,36 @@ class InstallOrderingTests(unittest.TestCase):
             )
             self.assertNotEqual(escape.returncode, 0)
             self.assertIn("escapes its root", escape.stderr)
+            base_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+            def refused_manifest(label: str, text: str, needle: str) -> None:
+                forged = Path(tmp) / f"manifest-{label}.json"
+                forged.write_text(text, encoding="utf-8")
+                result = run(
+                    [
+                        "python3", str(release / "operator" / "backup.py"), "open",
+                        "--archive", str(sealed), "--key", str(key), "--manifest", str(forged),
+                        "--dest", str(Path(tmp) / f"out-{label}"),
+                    ],
+                    {},
+                )
+                self.assertNotEqual(result.returncode, 0, label)
+                self.assertIn(needle, result.stderr, label)
+
+            with_unknown = dict(base_manifest)
+            with_unknown["extra"] = 1
+            refused_manifest(
+                "unknown-field", json.dumps(with_unknown), "unknown or missing fields"
+            )
+            with_cipher = json.loads(json.dumps(base_manifest))
+            with_cipher["encrypted"]["cipher"] = "unsupported-invented-cipher"
+            refused_manifest("cipher", json.dumps(with_cipher), "unsupported backup cipher")
+            duplicate = (
+                '{"schema": "solidworks-to-urdf.promote-backup/v1", '
+                '"files": {"retained.dat": "' + "0" * 64 + '", "retained.dat": "' + "1" * 64 + '"}, '
+                '"encrypted": {"path": "x", "sha256": "' + "2" * 64 + '", "cipher": "aes-256-cbc", "key": "k"}}'
+            )
+            refused_manifest("duplicate", duplicate, "duplicate manifest key")
             (state / "install-record.json").write_bytes(
                 (scratch / "state" / "install-record.json").read_bytes()
             )
