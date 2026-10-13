@@ -474,6 +474,67 @@ def terminate_remnant_processes(
     return killed
 
 
+def cad_session_facts(
+    executable: str,
+    *,
+    process_table=None,
+    creation_time=None,
+    boot_epoch=None,
+    ownership_file=None,
+) -> dict:
+    """Observe-only CAD facts for the IF-09 health identity; never terminates anything.
+
+    The full recorded identity is checked - image match through the process
+    table, the live creation moment, the host boot and the owning process's
+    token - and anything unprovable is reported as a problem instead of a
+    fabricated quiet zero.  A matching process this pipeline cannot prove to
+    own counts as an external session: it blocks captures exactly like the
+    sweep refuses, and it is never counted as an owned lease.
+    """
+
+    store = OwnershipStore(_ownership_path(ownership_file))
+    records = store.load()
+    table = process_table if process_table is not None else _windows_process_table()
+    read_creation = creation_time if creation_time is not None else _windows_creation_time
+    current_boot = boot_epoch() if boot_epoch is not None else _windows_boot_epoch()
+    tracked = _tracked_pids()
+    owned = 0
+    external = 0
+    problems: list[str] = []
+    for pid in _matching_process_ids(executable, table):
+        record = records.get(pid)
+        if record is None:
+            external += 1
+            continue
+        recorded_creation = record.get("creation_time")
+        boot = record.get("boot_epoch")
+        live_creation = read_creation(pid)
+        if (
+            type(recorded_creation) is not int
+            or not isinstance(boot, (int, float))
+            or live_creation is None
+            or type(live_creation) is not int
+        ):
+            # An unprovable identity is a problem, never a silent zero.
+            problems.append("cad_identity_unverified")
+            external += 1
+            continue
+        if recorded_creation != live_creation or abs(float(boot) - float(current_boot)) > BOOT_ID_TOLERANCE_SECONDS:
+            # PID reuse or a record from another boot: the recorded launch is gone.
+            external += 1
+            continue
+        if pid in tracked or record.get("owner") == _OWNER_TOKEN:
+            owned += 1
+            continue
+        external += 1  # verified process, but this endpoint does not own it
+    return {
+        "owned_sessions": owned,
+        "lease_held": owned > 0,
+        "external_session_detected": external > 0,
+        "problems": problems,
+    }
+
+
 class WindowsCadProcess:
     """A suspended child is assigned to our job before it can create descendants.
 

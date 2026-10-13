@@ -304,27 +304,26 @@ _HEALTH_TERMINAL_JOB_STATES = frozenset({"passed", "failed", "native_complete"})
 
 
 def _cad_health(jobs) -> tuple[dict, list[str]]:
-    """Process-fact CAD ownership for the health identity; the probe never opens CAD."""
+    """CAD session facts via the isolation owner; observe-only, never opens or terminates CAD."""
 
     if sys.platform != "win32":
         return {"external_session_detected": False, "owned_sessions": 0, "lease_held": False}, ["unsupported_platform"]
     try:
         from ..sources.solidworks import isolation
 
-        records = isolation.OwnershipStore(jobs.cad_ownership_file).load()
-        external = [
-            pid
-            for pid in isolation._matching_process_ids(
-                isolation.registered_executable(), isolation._windows_process_table()
-            )
-            if pid not in records
-        ]
-        return (
-            {"external_session_detected": bool(external), "owned_sessions": len(records), "lease_held": bool(records)},
-            [],
+        facts = isolation.cad_session_facts(
+            isolation.registered_executable(), ownership_file=jobs.cad_ownership_file
         )
     except Exception:  # noqa: BLE001 - an unprovable CAD state is a readiness problem, never a pass
         return {"external_session_detected": False, "owned_sessions": 0, "lease_held": False}, ["cad_state_unavailable"]
+    return (
+        {
+            "external_session_detected": facts["external_session_detected"],
+            "owned_sessions": facts["owned_sessions"],
+            "lease_held": facts["lease_held"],
+        },
+        list(facts["problems"]),
+    )
 
 
 def health_payload(jobs) -> dict:
@@ -333,6 +332,10 @@ def health_payload(jobs) -> dict:
     config = jobs.config
     record = tool_record()
     embedded = record.get("release") if isinstance(record.get("release"), dict) else None
+    if embedded is None:
+        # An unreadable own identity is never a green health document: the
+        # handler turns this into the stable 500 identity-unavailable code.
+        raise PipelineError("The endpoint has no installed release identity; /health cannot report an IF-09 identity")
     release = {
         "version": str(record.get("version") or ""),
         "source_commit": str((embedded or {}).get("source_commit") or ""),
@@ -343,8 +346,15 @@ def health_payload(jobs) -> dict:
     native_ok = sys.platform == "win32"
     if not native_ok:
         problems.append("unsupported_platform")
-    if embedded is None:
-        problems.append("release_identity_missing")
+    if not getattr(jobs, "thread", None) or not jobs.thread.is_alive():
+        problems.append("queue_thread_unavailable")
+    if native_ok:
+        try:
+            from ..runtime import native_readiness
+
+            native_readiness()
+        except Exception:  # noqa: BLE001 - an unprovable native state is a readiness problem, never a pass
+            problems.append("native_readiness_failed")
     for key in ("package_root", "output_root"):
         if not Path(config[key]).is_dir():
             problems.append(f"missing_{key}")
@@ -1600,7 +1610,12 @@ def handler(jobs, token):
                 return
             try:
                 if self.path == "/health":
-                    self._reply(200, health_payload(jobs))
+                    try:
+                        payload = health_payload(jobs)
+                    except PipelineError as error:
+                        self._reply(500, {"error": str(error), "error_code": "health_identity_unavailable"})
+                    else:
+                        self._reply(200, payload)
                 elif self.path.startswith("/v1/jobs/"):
                     suffix = self.path[len("/v1/jobs/") :]
                     if "/artifacts/" in suffix:
