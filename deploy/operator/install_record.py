@@ -515,14 +515,29 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.action == "endpoint-identity":
         release = release_identity(_load_json(args.release_file, "release file"))
-        endpoint, health = validate_endpoint_health(_load_json(args.health, "endpoint health"), release)
+        health_document = _load_json(args.health, "endpoint health")
         if args.record is not None:
+            # The record is the authority for its own per-end release (rollback verifies the
+            # restored generation, whose release differs from the current manifest).
             interface_records = _canonical_records()
             try:
+                health = interface_records.validate_health(health_document)
                 record = interface_records.validate_install_record(_load_json(args.record, "install record"))
+            except Exception as error:
+                die(f"endpoint health or record invalid: {error}")
+            try:
                 interface_records.require_endpoint_matches_install_record(health, record)
             except Exception as error:
                 die(f"endpoint does not match the active record: {error}")
+            endpoint = {
+                "install_id": health["install"]["install_id"],
+                "config_digest": health["install"]["config_digest"],
+                "release": {
+                    key: health["release"][key] for key in ("version", "source_commit", "source_sha256", "role")
+                },
+            }
+        else:
+            endpoint, health = validate_endpoint_health(health_document, release)
         args.out.write_text(json.dumps(endpoint, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         print(f"install_id={endpoint['install_id']}")
         return 0

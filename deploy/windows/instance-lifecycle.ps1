@@ -1,15 +1,21 @@
 # The one isolated-instance lifecycle script.  Every path, task name and port comes from the
 # single binding file rendered on the platform host from platform.json + the release manifest;
-# nothing here defaults to a personal path, a production task name or a Git credential.  The
-# promoted instance runs the documented single native launch:
-#     <generation>\runtime\Scripts\description.exe serve --config <generation>\endpoint.json
+# nothing here defaults to a personal path, a production task name or a Git credential.
+#   stage   verifies the transferred archive, installs the generation runtime, renders the
+#           generation's own minimal endpoint.json and records its expected config digest
+#   promote stops the old endpoint, switches the task to the generation runtime + config,
+#           starts it and gates on the running endpoint's own IF-09 /health
+#   rollback restores exactly the previous generation directory the caller bounds
+#   health  relays the running endpoint's own /health payload
 # Each invocation prints one JSON object; receipts stay under the instance state root.
 #
 #   instance-lifecycle.ps1 -Verb stage|promote|rollback|health -Binding FILE [-StageDir DIR]
+#       [-Previous DIR]
 param(
   [Parameter(Mandatory=$true)][ValidateSet('stage','promote','rollback','health')][string]$Verb,
   [Parameter(Mandatory=$true)][string]$Binding,
-  [string]$StageDir = ''
+  [string]$StageDir = '',
+  [string]$Previous = ''
 )
 $ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
@@ -32,8 +38,9 @@ function Write-Receipt([string]$path, [hashtable]$payload) {
   if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent | Out-Null }
   Emit $payload | Set-Content -LiteralPath $path -Encoding UTF8
 }
-function Runtime-Python([string]$instanceDir) { Join-Path $instanceDir 'runtime\Scripts\python.exe' }
-function Runtime-Launcher([string]$instanceDir) { Join-Path $instanceDir 'runtime\Scripts\description.exe' }
+function Runtime-Python([string]$generation) { Join-Path $generation 'runtime\Scripts\python.exe' }
+function Runtime-Launcher([string]$generation) { Join-Path $generation 'runtime\Scripts\description.exe' }
+function Config-Path([string]$generation) { Join-Path $generation 'endpoint.json' }
 function Action-Config([object]$task) {
   $match = [regex]::Match([string]$task.Actions[0].Arguments, 'serve --config\s+"?([^"]+)"?')
   if (-not $match.Success) { Die 'task_ambiguous' 'the instance task does not run serve --config' }
@@ -55,19 +62,31 @@ function Health-Probe([string]$configPath, [object]$binding) {
     throw 'the instance endpoint /health is not a ready IF-09 identity'
   }
   if ($health.release.version -ne $binding.version -or $health.release.source_commit -ne $binding.source_commit -or $health.release.source_sha256 -ne $binding.source_sha256) {
-    throw 'the instance endpoint /health release identity differs from the release manifest'
+    throw 'the instance endpoint /health release identity differs from the bound release'
   }
   if (-not $health.install.install_id -or -not $health.install.config_digest) {
     throw 'the instance endpoint /health does not carry its install identity'
   }
   return $health
 }
+function Stop-Endpoint([object]$binding) {
+  Stop-ScheduledTask -TaskName $binding.task_name
+  $deadline = (Get-Date).AddSeconds(30)
+  while ((Get-NetTCPConnection -LocalPort $binding.port -State Listen -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) {
+    Start-Sleep -Milliseconds 500
+  }
+  if (Get-NetTCPConnection -LocalPort $binding.port -State Listen -ErrorAction SilentlyContinue) {
+    Die 'stop_failed' 'the old endpoint is still listening; refusing to switch'
+  }
+}
 
 $binding = Read-Json $Binding
-foreach ($field in ('task_name','state_root','generation','dir','archive','artifact_sha256','version','source_commit','source_sha256')) {
+foreach ($field in ('task_name','state_root','generation','dir','archive','artifact_sha256','port',
+                    'package_root','output_root','version','source_commit','source_sha256')) {
   if (-not $binding.$field) { Die 'binding_incomplete' "the binding misses $field" }
 }
 $task = Get-ScheduledTask -TaskName $binding.task_name -ErrorAction SilentlyContinue
+
 if ($Verb -eq 'health') {
   if (-not $task) { Die 'task_missing' 'the instance task is not registered' }
   try { $probe = Health-Probe (Action-Config $task) $binding } catch { Die 'endpoint_unhealthy' $_.Exception.Message }
@@ -78,6 +97,7 @@ if ($Verb -eq 'health') {
 if ($Verb -eq 'stage') {
   if (-not $StageDir) { Die 'stage_dir_required' 'stage needs -StageDir (the new generation directory)' }
   if (Test-Path -LiteralPath $StageDir) { Die 'stage_exists' "preserve the existing generation: $StageDir" }
+  if (-not $task) { Die 'task_missing' 'the instance task is not registered' }
   $archive = Join-Path $binding.dir $binding.archive
   if ((Sha256 $archive) -ne $binding.artifact_sha256) { Die 'archive_mismatch' 'the transferred archive digest differs from the release manifest' }
   New-Item -ItemType Directory -Path $StageDir | Out-Null
@@ -97,6 +117,19 @@ if ($Verb -eq 'stage') {
   if ($identity.tool.version -ne $binding.version -or $identity.tool.source_sha256 -ne $binding.source_sha256 -or $identity.tool.release.source_commit -ne $binding.source_commit -or -not $identity.doctor.passed) {
     Die 'identity_mismatch' 'the staged runtime identity differs from the release manifest'
   }
+  # The generation carries its own minimal endpoint configuration; the token path stays the one
+  # the running instance already uses.  The expected config digest is computed by the staged
+  # runtime's own canonical owner - the endpoint's own /health stays the only install identity.
+  $currentConfig = Read-Json (Action-Config $task)
+  $config = @{schema_version='solidworks-to-urdf.endpoint/v1'; package_root=$binding.package_root;
+              output_root=$binding.output_root; state_root=$binding.state_root;
+              token_file=$currentConfig.token_file; host='127.0.0.1'; port=$binding.port}
+  $config | ConvertTo-Json | Set-Content -LiteralPath (Config-Path $StageDir) -Encoding UTF8
+  $expected = & $runtime -I -c "import json,sys;from description_pipeline import io;print(io.digest(json.load(open(sys.argv[1],encoding='utf-8'))))" (Config-Path $StageDir)
+  if ($LASTEXITCODE -ne 0) { Die 'config_digest_failed' 'the staged runtime could not digest the generation configuration' }
+  Write-Receipt (Join-Path $StageDir 'candidate-identity.json') @{
+    expected=$true; config_digest=("$expected".Trim()); version=$binding.version;
+    source_commit=$binding.source_commit; source_sha256=$binding.source_sha256}
   Write-Receipt (Join-Path $StageDir 'stage-receipt.json') @{
     passed=$true; verb='stage'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
     version=$binding.version; source_commit=$binding.source_commit; source_sha256=$binding.source_sha256}
@@ -110,30 +143,26 @@ if ($Verb -eq 'promote') {
   if (-not $StageDir) { Die 'stage_dir_required' 'promote needs -StageDir (the staged generation directory)' }
   $receiptPath = Join-Path $StageDir 'stage-receipt.json'
   if (-not (Test-Path -LiteralPath $receiptPath)) { Die 'stage_receipt_missing' 'the generation has no completed stage receipt' }
+  if (-not (Test-Path -LiteralPath (Config-Path $StageDir))) { Die 'generation_config_missing' 'the generation carries no endpoint configuration' }
   if (-not $task) { Die 'task_missing' 'the instance task is not registered; install the instance before promoting' }
   if (@($task.Actions).Count -ne 1) { Die 'task_ambiguous' 'the instance task must carry exactly one action' }
-  $configPath = Action-Config $task
-  # The old endpoint stops before anything switches; a listener that survives the stop refuses
-  # the promotion instead of being overwritten.
-  Stop-ScheduledTask -TaskName $binding.task_name
-  $stopDeadline = (Get-Date).AddSeconds(30)
-  while ((Get-NetTCPConnection -LocalPort $binding.port -State Listen -ErrorAction SilentlyContinue) -and (Get-Date) -lt $stopDeadline) {
-    Start-Sleep -Milliseconds 500
-  }
-  if (Get-NetTCPConnection -LocalPort $binding.port -State Listen -ErrorAction SilentlyContinue) {
-    Die 'stop_failed' 'the old endpoint is still listening; refusing to switch'
-  }
+  $previousConfig = Action-Config $task
+  Stop-Endpoint $binding
   New-Item -ItemType Directory -Path $promotions -ErrorAction SilentlyContinue | Out-Null
   $previous = Join-Path $promotions ('previous-' + (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ'))
   New-Item -ItemType Directory -Path $previous | Out-Null
   Export-ScheduledTask -TaskName $binding.task_name | Set-Content -LiteralPath (Join-Path $previous 'task.xml') -Encoding UTF8
-  Copy-Item -LiteralPath $configPath -Destination (Join-Path $previous 'endpoint-before.json')
+  Copy-Item -LiteralPath $previousConfig -Destination (Join-Path $previous 'endpoint-before.json')
   $action = New-ScheduledTaskAction -Execute (Runtime-Launcher $StageDir) `
-    -Argument ('serve --config "' + $configPath + '"') -WorkingDirectory $binding.state_root
+    -Argument ('serve --config "' + (Config-Path $StageDir) + '"') -WorkingDirectory $binding.state_root
   Set-ScheduledTask -TaskName $binding.task_name -Action $action | Out-Null
   try {
     Start-ScheduledTask -TaskName $binding.task_name
-    $health = Health-Probe $configPath $binding
+    $health = Health-Probe (Config-Path $StageDir) $binding
+    $candidate = Read-Json (Join-Path $StageDir 'candidate-identity.json')
+    if ($health.install.config_digest -ne $candidate.config_digest) {
+      throw 'the running endpoint config digest differs from the staged generation configuration'
+    }
     Write-Receipt (Join-Path $promotions 'last-promotion.json') @{
       passed=$true; verb='promote'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
       previous=$previous; health=$health}
@@ -150,22 +179,23 @@ if ($Verb -eq 'promote') {
 }
 
 if ($Verb -eq 'rollback') {
-  $record = Join-Path $promotions 'last-promotion.json'
-  if (-not (Test-Path -LiteralPath $record)) { Die 'no_promotion_receipt' 'no recorded promotion exists to roll back' }
-  $last = Read-Json $record
+  # Exactly the generation directory the caller bounds - never "the latest promotion".
+  if (-not $Previous) { Die 'previous_required' 'rollback needs -Previous (the bound previous generation directory)' }
+  if (-not (Test-Path -LiteralPath (Join-Path $Previous 'task.xml'))) { Die 'previous_missing' "the bound previous generation carries no task snapshot: $Previous" }
   if (-not $task) { Die 'task_missing' 'the instance task is not registered' }
-  $configPath = Action-Config $task
-  Register-ScheduledTask -TaskName $binding.task_name -Xml (Get-Content -LiteralPath (Join-Path $last.previous 'task.xml') -Raw) -Force | Out-Null
-  Copy-Item -LiteralPath (Join-Path $last.previous 'endpoint-before.json') -Destination $configPath -Force
+  Stop-Endpoint $binding
+  Register-ScheduledTask -TaskName $binding.task_name -Xml (Get-Content -LiteralPath (Join-Path $Previous 'task.xml') -Raw) -Force | Out-Null
+  $previousConfig = Action-Config $task
+  Copy-Item -LiteralPath (Join-Path $Previous 'endpoint-before.json') -Destination $previousConfig -Force
   Start-ScheduledTask -TaskName $binding.task_name
-  try { $health = Health-Probe $configPath $binding } catch {
+  try { $health = Health-Probe $previousConfig $binding } catch {
     Write-Receipt (Join-Path $promotions 'failed-rollback.json') @{
       passed=$false; verb='rollback'; at=(Get-Date).ToUniversalTime().ToString('o'); message=$_.Exception.Message}
     Die 'rollback_failed' $_.Exception.Message
   }
-  Write-Receipt (Join-Path $promotions 'last-rollback.json') @{
+  Write-Receipt (Join-Path $promotions ('rollback-' + (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ') + '.json')) @{
     passed=$true; verb='rollback'; at=(Get-Date).ToUniversalTime().ToString('o');
-    restored_from=$last.generation; previous=$last.previous; health=$health}
-  Emit @{passed=$true; verb='rollback'; restored_from=$last.generation}
+    restored_from=$Previous; health=$health}
+  Emit @{passed=$true; verb='rollback'; restored_from=$Previous}
   exit 0
 }

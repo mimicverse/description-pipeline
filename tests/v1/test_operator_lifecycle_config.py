@@ -83,7 +83,7 @@ def platform_document(root: Path) -> dict:
     }
 
 
-class LifecycleSkeletonTests(unittest.TestCase):
+class OperatorctlSurfaceTests(unittest.TestCase):
     def setUp(self) -> None:
         self._temporary = tempfile.TemporaryDirectory(prefix="operatorctl-config-")
         self.root = Path(self._temporary.name)

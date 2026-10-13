@@ -15,6 +15,8 @@ import unittest
 from pathlib import Path
 
 from description_pipeline import schemas
+from description_pipeline import interface_records as ir
+from description_pipeline.stages import CONTRACT
 
 from .contract_wheel import write_contract_wheel
 
@@ -115,13 +117,21 @@ def platform_fixture(
     token.chmod(0o600)
     wheel = tmp / "mimicverse_description-test-py3-none-any.whl"
     write_contract_wheel(wheel)
+    (tmp / "description-1.4.0-windows-cp312-x86_64.zip").write_bytes(b"windows-archive")
+    (tmp / "description-1.4.0-linux-cp312-x86_64.zip").write_bytes(b"linux-archive")
+    (tmp / "description-1.4.0-deployment.zip").write_bytes(b"deployment-archive")
     release_document = {
         "schema_version": "solidworks-to-urdf.release/v1",
         "pipeline_id": "solidworks-to-urdf",
         "version": "1.4.0",
         "source_commit": "c" * 40,
         "source_sha256": "a" * 64,
-        "artifacts": {wheel.name: hashlib.sha256(wheel.read_bytes()).hexdigest()},
+        "artifacts": {
+            wheel.name: hashlib.sha256(wheel.read_bytes()).hexdigest(),
+            "description-1.4.0-windows-cp312-x86_64.zip": hashlib.sha256(b"windows-archive").hexdigest(),
+            "description-1.4.0-linux-cp312-x86_64.zip": hashlib.sha256(b"linux-archive").hexdigest(),
+            "description-1.4.0-deployment.zip": hashlib.sha256(b"deployment-archive").hexdigest(),
+        },
     }
     release_path = tmp / "release.json"
     release_path.write_text(json.dumps(release_document), encoding="utf-8")
@@ -624,6 +634,30 @@ class LifecycleTests(unittest.TestCase):
         pgbin.mkdir(parents=True, exist_ok=True)
         write_stub(pgbin / "pg_isready", '#!/bin/bash\necho "pg_isready" >> "$ORDER_LOG"\nexit 0\n')
         write_stub(
+            pgbin / "pg_dump",
+            '#!/bin/bash\necho "pg_dump" >> "$ORDER_LOG"\nout=""\nprev=""\n'
+            'for argument in "$@"; do [ "$prev" = "-f" ] && out="$argument"; prev="$argument"; done\n'
+            '[ -n "$out" ] && : > "$out"\nexit 0\n',
+        )
+        write_stub(bindir / "scp", '#!/bin/bash\necho "scp $*" >> "$ORDER_LOG"\nexit 0\n')
+        write_stub(
+            bindir / "ssh",
+            '#!/bin/bash\necho "ssh $*" >> "$ORDER_LOG"\n'
+            'case "$*" in\n'
+            "  *\"-Verb stage\"*) echo '{\"passed\":true,\"verb\":\"stage\"}' ;;\n"
+            "  *\"-Verb promote\"*)\n"
+            '    if [ "${FIXTURE_FAIL_PROMOTE:-0}" = "1" ]; then\n'
+            "      echo '{\"passed\":false,\"verb\":\"promote\",\"code\":\"probe\",\"message\":\"refused\"}'; exit 0\n"
+            '    fi\n'
+            "    echo '{\"passed\":true,\"verb\":\"promote\",\"generation\":\"gen-2\","
+            "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\"}' ;;\n"
+            "  *\"-Verb rollback\"*) echo '{\"passed\":true,\"verb\":\"rollback\","
+            "\"restored_from\":\"C:/description-e2e/state/instance-promotions/previous-0001\"}' ;;\n"
+            "  *\"-Verb health\"*) cat \"$FIXTURE_HEALTH_FILE\" ;;\n"
+            "esac\n"
+            "exit 0\n",
+        )
+        write_stub(
             bindir / "systemctl",
             '#!/bin/bash\necho "systemctl $*" >> "$ORDER_LOG"\n'
             'case "$*" in\n'
@@ -697,6 +731,23 @@ class LifecycleTests(unittest.TestCase):
         projection.write_text(
             json.dumps({"in_flight": [], "unresolved": [], "unknown": [], "settled": True}), encoding="utf-8"
         )
+        health = {
+            "schema_version": ir.HEALTH_SCHEMA,
+            "pipeline_id": ir.PIPELINE_ID,
+            "native_platform": True,
+            "ready": True,
+            "release": {"version": "1.4.0", "source_commit": "c" * 40, "source_sha256": "a" * 64, "role": "native"},
+            "contract": {"schema_version": CONTRACT["schema_version"], "digest": "e" * 64},
+            "resource_policy": {"schema_version": ir.RESOURCE_POLICY_SCHEMA, "digest": "f" * 64},
+            "install": {"config_digest": "d" * 64, "install_id": "ep-1"},
+            "endpoint": {"port": 9765},
+            "cad": {"external_session_detected": False, "owned_sessions": 0, "lease_held": False},
+            "jobs": {"active": 0, "queued": 0, "unresolved": 0},
+            "capacity": {"free_bytes": 1, "reserved_bytes": 0},
+            "readiness": {"reason_code": "", "native": {"ok": True, "problems": []}},
+        }
+        health_file = tmp / "windows-health.json"
+        health_file.write_text(json.dumps({"passed": True, "verb": "health", "health": health}), encoding="utf-8")
         env = {
             "PATH": f"{bindir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
             "XDG_CONFIG_HOME": str(config_home),
@@ -709,6 +760,7 @@ class LifecycleTests(unittest.TestCase):
             "PROJECTION_FILE": str(projection),
             "LIFECYCLE_ENV_LOG": str(tmp / "query-environment.json"),
             "EXPECTED_PLATFORM_DSN": derived_env["PLATFORM_OPERATOR_DSN"],
+            "FIXTURE_HEALTH_FILE": str(health_file),
         }
         return config_path, env, admission, order
 
@@ -1247,7 +1299,45 @@ class InstallOrderingTests(unittest.TestCase):
         (tmp / "releases" / "airflow-venv-gen-1" / "bin").mkdir(parents=True)
         write_stub(
             tmp / "releases" / "airflow-venv-gen-1" / "bin" / "python",
-            "#!/usr/bin/env bash\ncase \"$*\" in\n  *install_record.py*) exec python3 \"$@\" ;;\nesac\nexit 0\n",
+            "#!/usr/bin/env bash\n"
+            "case \"$*\" in\n"
+            "  *install_record.py*)\n"
+            '    exec python3 "$@" ;;\n'
+            '  "-m description_pipeline.orchestration.lifecycle_state"*)\n'
+            "    python3 -c 'import json,os; from pathlib import Path; "
+            'Path(os.environ["LIFECYCLE_ENV_LOG"]).write_text(json.dumps('
+            '{"dsn": os.environ.get("PLATFORM_OPERATOR_DSN"), '
+            '"expected_dsn": os.environ["EXPECTED_PLATFORM_DSN"]}))\'\n'
+            '    [ "${PLATFORM_OPERATOR_DSN:-}" = "$EXPECTED_PLATFORM_DSN" ] || exit 77\n'
+            '    case "$*" in\n'
+            "      *--require-admission-closed*)\n"
+            '        [ "$(cat "$ADMISSION" 2>/dev/null)" = "true" ] || exit 1 ;;\n'
+            "    esac\n"
+            '    if [ -n "$PROJECTION_FILE" ] && [ -f "$PROJECTION_FILE" ]; then cat "$PROJECTION_FILE"; fi\n'
+            '    exit "${PROJECTION_RC:-0}" ;;\n'
+            "esac\n"
+            'script="$(cat)"\n'
+            'case "$script" in\n'
+            "  *platform-close-admission*)\n"
+            '    echo true > "$ADMISSION"\n'
+            '    echo "platform close_admission" >> "$ORDER_LOG"\n'
+            '    echo "admission=closed revision=2" ;;\n'
+            "  *platform-open-admission*)\n"
+            '    echo false > "$ADMISSION"\n'
+            '    echo "platform open_admission" >> "$ORDER_LOG"\n'
+            '    echo "admission=open revision=3" ;;\n'
+            "  *platform-reconcile*)\n"
+            '    [ -n "${RECONCILE_RUN_ID:-}" ] && [ -n "${RECONCILE_OUTCOME:-}" ] || exit 61\n'
+            '    echo "platform reconcile ${RECONCILE_RUN_ID}:${RECONCILE_STAGE}:${RECONCILE_OUTCOME}"'
+            ' >> "$ORDER_LOG"\n'
+            '    echo "reconciled=${RECONCILE_RUN_ID}:${RECONCILE_STAGE} outcome=${RECONCILE_OUTCOME}" ;;\n'
+            "esac\n"
+            "exit 0\n",
+        )
+        write_stub(tmp / "releases" / "airflow-venv-gen-1" / "bin" / "airflow", "#!/usr/bin/env bash\nexit 0\n")
+        (tmp / "admission").write_text("true")
+        (tmp / "projection.json").write_text(
+            json.dumps({"in_flight": [], "unresolved": [], "unknown": [], "settled": True}), encoding="utf-8"
         )
         (tmp / "token").write_text("test-token\n", encoding="utf-8")
         (tmp / "token").chmod(0o600)
@@ -1344,6 +1434,9 @@ class InstallOrderingTests(unittest.TestCase):
             'case "$*" in\n'
             '  "--user daemon-reload") exit 0 ;;\n'
             '  "--user start description-postgres.service") exit "${START_RC:-0}" ;;\n'
+            '  *"disable --now"*) exit 0 ;;\n'
+            '  *"enable --now"*) exit 0 ;;\n'
+            '  *"is-active"*) exit 0 ;;\n'
             '  *) echo "unexpected systemctl call: $*" >&2; exit 1 ;;\n'
             "esac\n",
         )
@@ -1386,11 +1479,30 @@ class InstallOrderingTests(unittest.TestCase):
             pgbin / "createdb",
             "#!/usr/bin/env bash\n" + client_libraries + 'echo "createdb" >> "$ORDER_LOG"\nexit "${CREATEDB_RC:-0}"\n',
         )
+        write_stub(
+            pgbin / "pg_dump",
+            "#!/usr/bin/env bash\n" + client_libraries + 'echo "pg_dump" >> "$ORDER_LOG"\n'
+            'out=""\nprev=""\nfor argument in "$@"; do [ "$prev" = "-f" ] && out="$argument"; prev="$argument"; done\n'
+            '[ -n "$out" ] && : > "$out"\nexit 0\n',
+        )
         write_stub(bindir / "sleep", '#!/usr/bin/env bash\necho "sleep" >> "$ORDER_LOG"\nexit 0\n')
         write_stub(bindir / "scp", '#!/usr/bin/env bash\necho "scp $*" >> "$ORDER_LOG"\nexit 0\n')
         write_stub(
             bindir / "ssh",
-            '#!/usr/bin/env bash\necho "ssh $*" >> "$ORDER_LOG"\necho "windows lifecycle ok"\nexit 0\n',
+            '#!/usr/bin/env bash\necho "ssh $*" >> "$ORDER_LOG"\n'
+            'case "$*" in\n'
+            "  *\"-Verb stage\"*) echo '{\"passed\":true,\"verb\":\"stage\"}' ;;\n"
+            "  *\"-Verb promote\"*)\n"
+            '    if [ "${FIXTURE_FAIL_PROMOTE:-0}" = "1" ]; then\n'
+            "      echo '{\"passed\":false,\"verb\":\"promote\",\"code\":\"probe\",\"message\":\"refused\"}'; exit 0\n"
+            '    fi\n'
+            "    echo '{\"passed\":true,\"verb\":\"promote\",\"generation\":\"gen-2\","
+            "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\"}' ;;\n"
+            "  *\"-Verb rollback\"*) echo '{\"passed\":true,\"verb\":\"rollback\","
+            "\"restored_from\":\"C:/description-e2e/state/instance-promotions/previous-0001\"}' ;;\n"
+            "  *\"-Verb health\"*) cat \"$FIXTURE_HEALTH_FILE\" ;;\n"
+            "esac\n"
+            "exit 0\n",
         )
 
         order = tmp / "order.log"
@@ -1406,6 +1518,13 @@ class InstallOrderingTests(unittest.TestCase):
             "START_RC": str(start_rc),
             "PG_CLIENT_LIB": str(tmp / "state" / "airflow-pg" / "root" / "usr" / "lib" / "x86_64-linux-gnu"),
             "LD_LIBRARY_PATH": "/unrelated/vendor",
+            "ADMISSION": str(tmp / "admission"),
+            "REGISTER_COUNT": str(tmp / "register-count"),
+            "REGISTER_AFTER": "0",
+            "UNPAUSE_RC": "0",
+            "PAUSE_RC": "0",
+            "PROJECTION_FILE": str(tmp / "projection.json"),
+            "LIFECYCLE_ENV_LOG": str(tmp / "query-environment.json"),
         }
         return release, control_env, order
 
@@ -1541,6 +1660,117 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertNotIn("linux-cp312", lines[scp_line])
             self.assertNotIn("deployment.zip", lines[scp_line])
             self.assertNotIn("platform close_admission", lines)
+
+    @staticmethod
+    def _derived_value(state: Path, generation: str, key: str) -> str:
+        for line in (state / "derived" / generation / "operator.env").read_text(encoding="utf-8").splitlines():
+            if line.startswith(key + "="):
+                return line.split("=", 1)[1]
+        raise AssertionError(f"the derived environment carries no {key}")
+
+    def _clone_generation_stubs(self, state: Path) -> None:
+        source = Path(self._derived_value(state, "gen-1", "AIRFLOW_VENV")) / "bin"
+        target = Path(self._derived_value(state, "gen-2", "AIRFLOW_VENV")) / "bin"
+        target.mkdir(parents=True, exist_ok=True)
+        for name in ("python", "airflow"):
+            (target / name).write_bytes((source / name).read_bytes())
+            (target / name).chmod(0o755)
+
+    def _maintenance(self, release: Path, env: dict, verb: str, generation: str = ""):
+        tree = release.parent
+        command = ["bash", str(release / "operator" / "operatorctl.sh"), verb, "--config", str(tree / "platform.json")]
+        if generation:
+            command += ["--install-id", generation]
+        return run(command, env)
+
+    def _health_double(self, release: Path, env: dict) -> None:
+        health = {
+            "schema_version": ir.HEALTH_SCHEMA,
+            "pipeline_id": ir.PIPELINE_ID,
+            "native_platform": True,
+            "ready": True,
+            "release": {"version": "1.4.0", "source_commit": "c" * 40, "source_sha256": "a" * 64, "role": "native"},
+            "contract": {"schema_version": CONTRACT["schema_version"], "digest": "e" * 64},
+            "resource_policy": {"schema_version": ir.RESOURCE_POLICY_SCHEMA, "digest": "f" * 64},
+            "install": {"config_digest": "d" * 64, "install_id": "ep-7"},
+            "endpoint": {"port": 9765},
+            "cad": {"external_session_detected": False, "owned_sessions": 0, "lease_held": False},
+            "jobs": {"active": 0, "queued": 0, "unresolved": 0},
+            "capacity": {"free_bytes": 1, "reserved_bytes": 0},
+            "readiness": {"reason_code": "", "native": {"ok": True, "problems": []}},
+        }
+        health_file = release.parent / "windows-health.json"
+        health_file.write_text(json.dumps({"passed": True, "verb": "health", "health": health}), encoding="utf-8")
+        env["FIXTURE_HEALTH_FILE"] = str(health_file)
+
+    def test_stage_promote_rollback_drill_with_bound_doubles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, _ = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            installed = self._install(release, control_env)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            self._health_double(release, control_env)
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            self._clone_generation_stubs(state)
+            promoted = self._maintenance(release, control_env, "promote", "gen-2")
+            self.assertEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
+            active = json.loads((state / "install-record.json").read_text(encoding="utf-8"))
+            self.assertEqual(active["install_id"], "gen-2")
+            self.assertEqual([row["step"] for row in active["journal"]], ["promotion-receipt"])
+            self.assertTrue(active["previous"]["record"].endswith("install-records/gen-1.json"))
+            admission = Path(tmp) / "admission"
+            self.assertEqual(admission.read_text().strip(), "false")
+            receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                [row["step"] for row in receipt["steps"]],
+                [
+                    "linux-generation", "windows-generation", "close-admission", "drain", "backup",
+                    "stop-services", "windows-switch", "endpoint-identity", "switch-pointer",
+                    "start-services", "verify", "open-admission",
+                ],
+            )
+            self.assertEqual({row["status"] for row in receipt["steps"]}, {"completed"})
+            backup_manifest = json.loads(
+                (state / "promotions" / "gen-2" / "evidence" / "backup-manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertIn("platform.pgc", backup_manifest["files"])
+            rolled = self._maintenance(release, control_env, "rollback")
+            self.assertEqual(rolled.returncode, 0, rolled.stdout + rolled.stderr)
+            restored = json.loads((state / "install-record.json").read_text(encoding="utf-8"))
+            self.assertEqual(restored["install_id"], "gen-1")
+            self.assertEqual(admission.read_text().strip(), "true", "rollback keeps the admission closed")
+            final_receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                [row["step"] for row in final_receipt["steps"] if row["verb"] == "rollback"],
+                [
+                    "rollback-close", "rollback-drain", "rollback-stop", "rollback-windows",
+                    "rollback-linux", "rollback-verify",
+                ],
+            )
+
+    def test_promote_failure_keeps_the_admission_closed_and_records_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, _ = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            installed = self._install(release, control_env)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            self._health_double(release, control_env)
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            self._clone_generation_stubs(state)
+            failed = self._maintenance(release, dict(control_env, FIXTURE_FAIL_PROMOTE="1"), "promote", "gen-2")
+            self.assertEqual(failed.returncode, 1)
+            self.assertIn("Windows switch failed", failed.stderr)
+            active = json.loads((state / "install-record.json").read_text(encoding="utf-8"))
+            self.assertEqual(active["install_id"], "gen-1", "a refused switch must not move the pointer")
+            self.assertEqual((Path(tmp) / "admission").read_text().strip(), "true")
+            receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
+            steps = {row["step"]: row["status"] for row in receipt["steps"]}
+            self.assertEqual(steps["windows-switch"], "failed")
+            self.assertNotIn("open-admission", steps)
 
     def test_not_ready_postgres_fails_before_migration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
