@@ -16,7 +16,6 @@ static: it never probes services, ports or the network (probes belong to
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 import os
 import re
@@ -26,7 +25,7 @@ from pathlib import Path, PurePosixPath
 
 from . import schemas as _schemas
 from .delivery import PIPELINE_ID
-from .io import PipelineError, artifact_path_parts, digest, file_digest
+from .io import PipelineError, artifact_path_parts, digest, file_digest, parse_data
 from .runtime import RUNTIME_HOSTS, RUNTIME_VERSIONS, SUPPORTED_PYTHON, required_packages
 from .schemas import (
     CACHE_IMPORT_CONFIRMATION_SCHEMA,
@@ -1089,13 +1088,28 @@ def require_endpoint_matches_install_record(health, record) -> None:
         "endpoint_not_ready",
         {"reason_code": health["readiness"]["reason_code"]},
     )
-    snapshot_path = Path(record["snapshot"]["path"])
-    _require(snapshot_path.is_file(), "endpoint_end_mismatch", {"where": "snapshot"})
+    # The snapshot is consumed as a config-identity reference: the existing IF-11 file checks
+    # (absolute, no links, 0600, inside the record's state root), the recorded digest, and the
+    # single strict IO on exactly those checked bytes - then the schema and the generation bind.
+    reference = {
+        "schema_version": CONFIG_SNAPSHOT_SCHEMA,
+        "path": record["snapshot"]["path"],
+        "sha256": record["snapshot"]["digest"],
+    }
     try:
-        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as error:
+        payload = check_config_identity_file(reference, allowed_root=record["paths"]["state_root"])
+        verify_config_identity_digest(payload, reference)
+        snapshot = parse_data(payload, Path(reference["path"]))
+    except InterfaceRecordError:
+        raise
+    except (OSError, ValueError, PipelineError) as error:
         raise InterfaceRecordError("endpoint_end_mismatch", {"where": "snapshot", "reason": str(error)}) from error
     validate_config_snapshot(snapshot)
+    _require(
+        snapshot["install_id"] == record["install_id"],
+        "endpoint_end_mismatch",
+        {"field": "snapshot.install_id"},
+    )
     expected_port = snapshot["resolved"]["windows"]["endpoint_port"]
     _require(
         health["endpoint"]["port"] == expected_port,

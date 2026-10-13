@@ -180,20 +180,21 @@ def config_snapshot() -> dict:
 
 def install_record(*, previous: bool = False, journal: list | None = None) -> dict:
     generation = "gen-2" if previous else "gen-1"
-    if _SNAPSHOT_FILE is not None:
-        _SNAPSHOT_FILE.write_text(json.dumps(config_snapshot()), encoding="utf-8")
+    _SNAPSHOT_FILE.write_text(json.dumps(config_snapshot()), encoding="utf-8")
+    _SNAPSHOT_FILE.chmod(0o600)
+    snapshot_digest = hashlib.sha256(_SNAPSHOT_FILE.read_bytes()).hexdigest()
     record = {
         "schema_version": INSTALL_RECORD_SCHEMA,
         "install_id": generation,
         "timestamp": TS,
         "snapshot": {
             "path": str(_SNAPSHOT_FILE),
-            "digest": HEX,
+            "digest": snapshot_digest,
             "install_id": generation,
         },
         "release": {**release(), "artifacts": [{"name": "linux.tar.gz", "sha256": OTHER_HEX}]},
         "services": ["description-postgres", "description-operator-proxy"],
-        "paths": {"state_root": "/srv/description/state", "release_root": "/srv/description/releases"},
+        "paths": {"state_root": str(_SNAPSHOT_FILE.parent), "release_root": "/srv/description/releases"},
         "dag": {
             "id": "solidworks_to_urdf",
             "path": "/srv/description/dags/solidworks_to_urdf.py",
@@ -201,7 +202,7 @@ def install_record(*, previous: bool = False, journal: list | None = None) -> di
             "tasks": len(STAGE_IDS),
         },
         "ends": {
-            "linux": {"install_id": generation, "config_digest": HEX, "release": release("portable")},
+            "linux": {"install_id": generation, "config_digest": snapshot_digest, "release": release("portable")},
             "windows": {"install_id": "ep-7", "config_digest": OTHER_HEX, "release": release("native")},
         },
         "previous": None
@@ -916,6 +917,60 @@ class InterfaceRecordTests(unittest.TestCase):
         policy_drift = copy.deepcopy(payload)
         policy_drift["resource_policy"]["digest"] = "0" * 64
         self.reject("endpoint_end_mismatch", lambda: ir.require_endpoint_matches_install_record(policy_drift, record))
+        # Snapshot binding: the recorded digest, the strict single-byte reader, the generation
+        # identity and the IF-11 file checks all guard the same checked bytes.
+        original = _SNAPSHOT_FILE.read_bytes()
+        snapshot = json.loads(original)
+        snapshot["resolved"]["windows"]["endpoint_port"] = 9999
+        _SNAPSHOT_FILE.write_text(json.dumps(snapshot), encoding="utf-8")
+        port_follow = copy.deepcopy(payload)
+        port_follow["endpoint"]["port"] = 9999
+        self.reject(
+            "config_identity_mismatch", lambda: ir.require_endpoint_matches_install_record(port_follow, record)
+        )
+
+        snapshot = json.loads(original)
+        snapshot["install_id"] = "gen-9"
+        sealed = json.dumps(snapshot).encode("utf-8")
+        _SNAPSHOT_FILE.write_bytes(sealed)
+        resealed = copy.deepcopy(record)
+        resealed["snapshot"]["digest"] = hashlib.sha256(sealed).hexdigest()
+        resealed["ends"]["linux"]["config_digest"] = resealed["snapshot"]["digest"]
+        self.reject(
+            "endpoint_end_mismatch",
+            lambda: ir.require_endpoint_matches_install_record(copy.deepcopy(payload), resealed),
+        )
+
+        forged = original.replace(b'"endpoint_port": 8765', b'"endpoint_port": 8765, "endpoint_port": 8765')
+        self.assertNotEqual(forged, original)
+        _SNAPSHOT_FILE.write_bytes(forged)
+        duplicate = copy.deepcopy(record)
+        duplicate["snapshot"]["digest"] = hashlib.sha256(forged).hexdigest()
+        duplicate["ends"]["linux"]["config_digest"] = duplicate["snapshot"]["digest"]
+        self.reject(
+            "endpoint_end_mismatch",
+            lambda: ir.require_endpoint_matches_install_record(copy.deepcopy(payload), duplicate),
+        )
+
+        _SNAPSHOT_FILE.write_bytes(original)
+        outside = Path(tempfile.mkdtemp(prefix="ir-outside-")) / "gen-1.json"
+        outside.write_bytes(original)
+        outside.chmod(0o600)
+        displaced = copy.deepcopy(record)
+        displaced["snapshot"]["path"] = str(outside)
+        self.reject(
+            "config_identity_unreadable",
+            lambda: ir.require_endpoint_matches_install_record(copy.deepcopy(payload), displaced),
+        )
+        link = _SNAPSHOT_FILE.parent / "gen-link.json"
+        link.unlink(missing_ok=True)
+        link.symlink_to(_SNAPSHOT_FILE)
+        linked = copy.deepcopy(record)
+        linked["snapshot"]["path"] = str(link)
+        self.reject(
+            "config_identity_unreadable",
+            lambda: ir.require_endpoint_matches_install_record(copy.deepcopy(payload), linked),
+        )
 
     def test_install_record_validation_is_static(self) -> None:
         source = Path(ir.__file__).read_text(encoding="utf-8")
