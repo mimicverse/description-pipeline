@@ -787,6 +787,10 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
         #: for the URDF stage): same decode the audit above verified, never the derived copy.
         "carrier": {
             "root": ((state.get("declaration") or {}).get("root") or {}).get("name"),
+            "expansion": {
+                name: sorted(_expanded(name, state.get("leaves") or set()))
+                for name in (state.get("components") or {})
+            },
             "bodies": [
                 {
                     "id": name,

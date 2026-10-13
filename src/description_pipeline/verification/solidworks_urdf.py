@@ -249,7 +249,7 @@ def _input(root, diagnostics=None):
         # proves its own members/base first, then rebuilds the CS_/TCP_/SCS_ interfaces
         # from the raw datums (a missing declaration extension never proves absence).
         base = next((body for body in bodies if body["name"] == carrier.get("root")), None)
-        frames = rebuild_interface_frames(raw, bodies=bodies, base=base)
+        frames = rebuild_interface_frames(raw, bodies=bodies, base=base, expansion=carrier.get("expansion"))
     else:
         bodies = rebuild_rigid_bodies(discovery_record)
         joints = rebuild_joint_facts(discovery_record, root)

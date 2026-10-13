@@ -1716,7 +1716,13 @@ def rebuild_rigid_bodies(record: dict) -> list[dict]:
     return bodies
 
 
-def rebuild_interface_frames(record: dict, *, bodies: list[dict] | None = None, base: dict | None = None) -> list[dict]:
+def rebuild_interface_frames(
+    record: dict,
+    *,
+    bodies: list[dict] | None = None,
+    base: dict | None = None,
+    expansion: dict | None = None,
+) -> list[dict]:
     """Rebuild the interface-frame carrier from the raw capture alone (IF-17, in memory).
 
     ``record`` is the raw native capture (or a payload carrying it under ``raw``).
@@ -1732,7 +1738,11 @@ def rebuild_interface_frames(record: dict, *, bodies: list[dict] | None = None, 
     ``bodies``/``base`` let the declaration domain supply its independently decoded
     tree (the same native interface interpretation, its own membership proof);
     without them the rigid bodies and the proven frame-attached base are rebuilt
-    from the raw capture.
+    from the raw capture.  ``expansion`` maps a native owner occurrence to its full
+    leaf set (declaration domain): a sub-assembly owned interface is attributed
+    only when every expanded leaf proves the same body, never by name prefix.
+    Interface datums carrying a configuration bind the native owner's referenced
+    configuration (the main assembly configuration only applies to ownerless datums).
     """
 
     raw = record["raw"] if isinstance(record.get("raw"), dict) else record
@@ -1758,6 +1768,22 @@ def rebuild_interface_frames(record: dict, *, bodies: list[dict] | None = None, 
     body_of_component = {
         str(component): str(body["name"]) for body in bodies for component in full_of_body[str(body["name"])]
     }
+    referenced_configurations = {
+        str(item.get("name2")): item.get("configuration")
+        for item in raw.get("components") or []
+        if isinstance(item, dict) and isinstance(item.get("name2"), str)
+    }
+
+    def _body_of(owner: str) -> str | None:
+        direct = body_of_component.get(owner)
+        if direct is not None:
+            return direct
+        if expansion is not None:
+            expanded = {str(leaf) for leaf in expansion.get(owner, ())}
+            mapped = {body_of_component.get(leaf) for leaf in expanded}
+            if expanded and len(mapped) == 1 and None not in mapped:
+                return str(next(iter(mapped)))
+        return None
     # Link datums: every cluster member paired with the body's own CS_ frame datum
     # (the producer excludes the whole member scope, not only the datum's owner).
     link_datums = {
@@ -1784,19 +1810,10 @@ def rebuild_interface_frames(record: dict, *, bodies: list[dict] | None = None, 
         name = str(datum.get("name") or "")
         if not name.startswith(INTERFACE_PREFIXES):
             continue
-        if "configuration" in datum and str(datum.get("configuration") or "") != str(
-            raw.get("saved_configuration") or ""
-        ):
-            _require(
-                False,
-                "discovery.interface_frame_rebuild",
-                "interface datum was read in another configuration",
-                {"datum": name, "configuration": datum.get("configuration")},
-            )
         owner = str(datum.get("owner") or "")
         if (owner, name) in link_datums:
             continue
-        body_name = body_of_component.get(owner)
+        body_name = _body_of(owner)
         if body_name is None and base is not None and owner == "":
             body_name = str(base["name"])
         _require(
@@ -1805,6 +1822,25 @@ def rebuild_interface_frames(record: dict, *, bodies: list[dict] | None = None, 
             "recognised interface datum is not owned by any rebuilt body",
             {"datum": name, "owner": owner},
         )
+        if "configuration" in datum:
+            carried = str(datum.get("configuration") or "")
+            if owner == "":
+                expected = str(raw.get("saved_configuration") or "")
+            else:
+                referenced = referenced_configurations.get(owner)
+                _require(
+                    isinstance(referenced, str) and bool(referenced),
+                    "discovery.interface_frame_rebuild",
+                    "interface datum names an owner with no recorded referenced configuration",
+                    {"datum": name, "owner": owner},
+                )
+                expected = str(referenced)
+            _require(
+                carried == expected,
+                "discovery.interface_frame_rebuild",
+                "interface datum belongs to another referenced configuration",
+                {"datum": name, "owner": owner, "configuration": carried, "referenced": expected},
+            )
         _prefix, _separator, suffix = name.partition("_")
         _require(
             _SNAKE.fullmatch(suffix) is not None,

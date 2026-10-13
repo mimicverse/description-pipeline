@@ -22,7 +22,7 @@ from description_pipeline.verification import v14_declarations as v14
 from description_pipeline.io import PipelineError
 from description_pipeline.verification import solidworks_urdf
 from description_pipeline.verification.native_declarations import verify_declarations
-from description_pipeline.verification.native_discovery import verify_discovery
+from description_pipeline.verification.native_discovery import _Failure, rebuild_interface_frames, verify_discovery
 
 from .selection_support import sealed_selection
 from . import support
@@ -591,7 +591,7 @@ class DeclarationConsumerTests(unittest.TestCase):
             (
                 "wrong configuration",
                 lambda raw: raw["datums"].append(self._interface("TCP_tool_tcp", "module-1/tool_part", "Other")),
-                "another configuration",
+                "another referenced configuration",
             ),
             (
                 "body name collision",
@@ -607,6 +607,72 @@ class DeclarationConsumerTests(unittest.TestCase):
             ):
                 solidworks_urdf._input(self._delivery(directory, mutate), [])
             self.assertIn(needle, str(raised.exception))
+
+    def test_declaration_frames_expand_subassembly_owners(self) -> None:
+        """A sub-assembly owner attributes through its full proven leaf set, never by prefix."""
+
+        def inject(raw):
+            raw["datums"].append(self._interface("TCP_module_tcp", "module-1"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            returned = solidworks_urdf._input(self._delivery(directory, inject), [])
+        frames = {frame["name"]: frame["parent"] for frame in returned["source"]["frames"]}
+        self.assertEqual(frames, {"module_tcp": "tool"})
+
+    def test_interface_expansion_refuses_cross_body_and_empty(self) -> None:
+        raw = {
+            "components": [
+                {"name2": "a-1", "configuration": "Default"},
+                {"name2": "b-1", "configuration": "Default"},
+                {"name2": "cont-1", "configuration": "Default"},
+                {"name2": "cont-2", "configuration": "Default"},
+            ],
+            "datums": [self._interface("TCP_span", "cont-1")],
+        }
+        bodies = [
+            {"id": "a", "name": "a", "components": ["a-1"], "frame": {"coordinate_system": "CS_a"}},
+            {"id": "b", "name": "b", "components": ["b-1"], "frame": {"coordinate_system": "CS_b"}},
+        ]
+        with self.assertRaises(_Failure):
+            rebuild_interface_frames(raw, bodies=bodies, base=None, expansion={"cont-1": ["a-1", "b-1"]})
+        empty = copy.deepcopy(raw)
+        empty["datums"][0]["owner"] = "cont-2"
+        with self.assertRaises(_Failure):
+            rebuild_interface_frames(empty, bodies=bodies, base=None, expansion={"cont-2": []})
+
+    def test_declaration_frames_bind_each_owner_referenced_configuration(self) -> None:
+        """Configuration binds the datum's native owner, not the shared main assembly."""
+
+        def inject(raw):
+            for collection in (raw["components"], raw["exporter"]["pid_bindings"]):
+                for item in collection:
+                    if item["name2"] == "module-1/tool_part":
+                        item["configuration"] = "ToolR2"
+            raw["datums"].append(self._interface("TCP_tool_tcp", "module-1/tool_part", "ToolR2"))
+            raw["datums"].append(self._interface("TCP_base_mount", "base_part", "Default"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            returned = solidworks_urdf._input(self._delivery(directory, inject), [])
+        frames = {frame["name"]: frame["parent"] for frame in returned["source"]["frames"]}
+        self.assertEqual(frames, {"tool_tcp": "tool", "base_mount": "base"})
+
+    def test_declaration_frame_gate_refuses_wrong_owner_referenced_configuration(self) -> None:
+        def mismatch(raw):
+            raw["datums"].append(self._interface("TCP_tool_tcp", "module-1/tool_part", "ToolR9"))
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            self.assertRaises(Exception) as raised,  # noqa: B017 - classification asserted below
+        ):
+            solidworks_urdf._input(self._delivery(directory, mismatch), [])
+        self.assertIn("another referenced configuration", str(raised.exception))
+
+    def test_interface_expansion_refuses_a_missing_referenced_configuration(self) -> None:
+        raw = {"components": [{"name2": "a-1"}], "datums": [self._interface("TCP_x", "a-1")]}
+        bodies = [{"id": "a", "name": "a", "components": ["a-1"], "frame": {"coordinate_system": "CS_a"}}]
+        with self.assertRaises(_Failure) as raised:
+            rebuild_interface_frames(raw, bodies=bodies, base=None)
+        self.assertIn("no recorded referenced configuration", str(raised.exception))
 
 
 class NativeDeclarationsTests(unittest.TestCase):
