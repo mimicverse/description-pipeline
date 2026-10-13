@@ -69,7 +69,14 @@ class ScheduledSmokeTests(unittest.TestCase):
         self.assertEqual(tasks["run_generate"]["state"], "success")
         self.assertEqual(tasks["run_verify"]["state"], "failed")
         self.assertGreaterEqual(tasks["run_verify"]["try_number"], 1)
-        for task_id in ("run_publish",):
+        # The native wait must release its Airflow slot between polls: reschedule mode is a
+        # contract invariant (six-stage contract L43), so the smoke pins it and the wait task
+        # must show at least one reschedule cycle instead of one long poke attempt.
+        self.assertEqual(report["sensor_mode"], "reschedule")
+        self.assertGreaterEqual(
+            tasks["wait_for_job"]["try_number"], 2, "wait_for_job must reschedule while waiting"
+        )
+        for task_id in ("run_publish", "confirm_job"):
             # Blocked without execution: the scheduler marked it upstream_failed (or skipped) and
             # it never entered a running attempt, so publication starting and failing early can
             # never be mistaken for a prevention proof.
