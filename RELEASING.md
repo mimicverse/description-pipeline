@@ -17,6 +17,13 @@ evidence.
    and independent verification report. Include repeated part occurrences with
    distinct saved configurations and a nested rigid assembly to verify context,
    geometry and mass coverage.
+   Exercise both supported discovery regimes: a saved exporter declaration and
+   a proven-absent declaration using mate inference. Identify the regime in each
+   native receipt; evidence from one does not qualify the other. Before native
+   work, verify with injected process observations that an unrelated CAD process
+   cannot be terminated or adopted, and that only proven owned resources are
+   released. Repeat affected ownership/COM behavior on Windows in an agreed idle
+   execution window; never use an engineer's active session as a test fixture.
 3. Verify capture transfer rejects missing, extra, changed and foreign-run files.
    Confirm native capture works without MuJoCo installed, and Linux refuses
    publication when consumer verification fails.
@@ -43,12 +50,15 @@ inputs and evidence for its intended use.
 
 ## Distribution
 
-Activate the environment in [CONTRIBUTING.md](CONTRIBUTING.md), then build
-into two empty directories outside the clean checkout:
+Activate the environment in [CONTRIBUTING.md](CONTRIBUTING.md) and run from the
+clean committed checkout being released. Confirm the imported package is that
+checkout's `src/description_pipeline`, rather than an editable installation of
+another worktree, then build into two empty directories outside the checkout:
 
 ```sh
-python tools/build_release.py --output /path/to/release-a --offline
-python tools/build_release.py --output /path/to/release-b --offline
+PYTHONPATH=src python -c 'import description_pipeline; print(description_pipeline.__version__, description_pipeline.__file__)'
+PYTHONPATH=src python tools/build_release.py --output /path/to/release-a --offline
+PYTHONPATH=src python tools/build_release.py --output /path/to/release-b --offline
 diff /path/to/release-a/SHA256SUMS.json /path/to/release-b/SHA256SUMS.json
 ```
 
@@ -64,6 +74,13 @@ metadata, and emits the wheel, source, deployment and Linux/Windows offline
 runtime archives. Each offline archive contains exact runtime wheels and a
 hash-locked installation file. Installed code checks its embedded inventory.
 Exercise both runtime archives and deploy the same tool identity on both hosts.
+
+Compare `release.json` and the isolated installed tool identity with the intended
+release commit and package version before accepting the artifacts. Two matching
+builds establish byte reproducibility for those build inputs; they do not by
+themselves establish that the intended source was built. CI currently gates
+regression and static checks; this double-build and installed-identity acceptance
+is a separate release obligation.
 
 Published tags and assets are immutable. A changed implementation uses a new
 version; release status comes from retained acceptance evidence.

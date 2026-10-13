@@ -28,15 +28,18 @@ Save the designated delivery configuration and collect its native dependencies
 with Pack and Go or an equivalent method. Reopen the collected assembly without
 relying on the original directory and confirm the intended configuration.
 
-Retain the product identity, structural revision, owner and change record in
-native engineering properties or linked controlled records. A submitted version
-must remain retrievable and unchanged. Engineering corrections create a new
-structural version.
+Retain authored product identity, structural revision, responsibility and change
+records in native engineering properties or controlled records. Publication can
+resolve absent administrative fields from the authenticated submission under the
+[identity contract](mechanical-handoff-spec.md#12-工程身份); it preserves the raw
+CAD absence and does not infer an engineering approval. A submitted version must
+remain retrievable and unchanged. Engineering corrections create a new version.
 
 For an existing model, `dp.parent_revision` names the structural revision in its
 current review-branch delivery, or in the configured base if no review delivery
-exists. Each new delivery continues that baseline. Reusing a revision requires
-identical revision content.
+exists. For a platform-derived revision with no CAD parent, the platform attempts
+to read the previous review-branch revision; publication still requires the exact
+successor baseline. Reusing a revision requires identical revision content.
 
 Choose the complete project folder from your own computer in the operator page.
 The page states the platform's fixed upload limits.
@@ -54,10 +57,13 @@ dependency and physical checks still apply to the native data.
 
 ## 3. Start and inspect the run
 
-Sign in to the operator page with Feishu. Select the engineering folder and, when
-it offers more than one `.SLDASM`, choose the main assembly; then click **Start**.
-Hardware, revision, repository and branch are derived or configured by the platform;
-they are not operator form fields.
+Sign in with Feishu. Select the engineering folder and, when it offers more than
+one `.SLDASM`, choose the main assembly. The upload window lists configured
+publication targets and suggests a unique match from the folder or assembly
+name. Confirm that target or choose the intended one; a naming match is only a
+suggestion. Review the change description, then click **Start**. Repository and
+branch routing are maintained by the platform. CAD-carried identity wins over
+submission metadata; conflicting hardware identities block publication.
 
 Approved Feishu users may start new pipeline runs and view shared results. A run
 records its initiator's stable authenticated identity and shows that operator's
@@ -188,10 +194,10 @@ an unsupported native pattern is not proof of a mechanical design error.
 | Finding | Correction |
 |---|---|
 | Dependency, configuration or saved-state error | Repair and save the native engineering package |
-| Administrative metadata missing (hardware ID, revision, owner, control record) | Publication readiness only ([quality](quality.md#scope-of-acceptance)): measurement, capture and inspection continue; record the authored facts at their source - never invent values |
+| Publication identity incomplete or conflicting | Follow the [identity contract](mechanical-handoff-spec.md#12-工程身份): select the configured target and supply missing submission information, or correct conflicting CAD records. Raw CAD absence remains recorded; submission metadata cannot establish engineering responsibility or approval |
 | Ambiguous body, joint, name or frame | Check native evidence coverage, then correct the reader or the unresolved engineering definition |
 | Zero, direction, limit or drive disagreement | Correct its mechanical definition or controlled specification; authored zero-width ranges and zero drives stay stage warnings until a usable controlled record is supplied - never fill defaults |
-| Unowned occurrence (stage warning) | Bind the occurrence in the declaration or correct the native structure; qualification still requires complete coverage and exact whole-CAD mass equality - never exclude an instance or its mass to clear the warning |
+| Unowned occurrence (stage warning) | Check the intended model boundary. Declared membership must be complete, and every remaining native occurrence must be explicitly accounted for with independently measured mass. The warning does not establish full-assembly URDF coverage; never discard an instance or normalize mass to clear it |
 | Material, mass or inertia disagreement | Missing explicit material assignment alone is a retained warning (CAD-measured values preserved, no verified-material claim); correct the assignment for physical qualification. A material/mass/inertia disagreement with reviewed evidence still blocks - correct scope or the documented physical source |
 | Independent verification disagreement | Trace the native evidence and generation rule; preserve the failed diagnostics |
 | Infrastructure error | Restore the service; continue transport or rerun from the earliest valid engineering step shown |
@@ -250,6 +256,15 @@ description submit /path/to/verified-delivery --repository /path/to/model-clone 
 Rebuild preserves native evidence and generated definitions. Submission
 reverifies the copied delivery and committed Git blobs before updating its PR.
 These maintenance commands do not create an alternative engineering input path.
+
+Use `description --version` to identify the installed tool and
+`description <command> --help` for command options. `check --report <path>` writes
+the recomputed report outside the delivery, or updates its existing
+`reports/quality.json`; it cannot overwrite another delivery subject file.
+`rebuild --repository <clone>` additionally publishes the rebuilt result;
+`--base` requires `--repository`. `rebuild` and `submit` accept `--message` for
+the Git commit message. That message does not change CAD revision identity or
+replace engineering approval.
 
 ### Native endpoint exit codes
 

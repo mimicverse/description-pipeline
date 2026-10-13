@@ -26,6 +26,9 @@ The page is **SolidWorks2URDF 交付操作台**.
    main assembly before starting
    ([operations](docs/operations.md#2-collect-and-save-a-controlled-version));
    a single assembly is selected automatically.
+   Confirm the configured publication target suggested in the upload window,
+   or select the intended target explicitly. Submission metadata follows the
+   [identity contract](docs/mechanical-handoff-spec.md#12-工程身份).
    The complete uploaded folder is staged to the Windows worker; dependency
    closure is admitted only from the engine's resolved bindings inside that
    staging ([design](docs/design.md#2-how-the-system-works)). The worker reads
@@ -53,10 +56,10 @@ If the main assembly carries the saved native URDF exporter declaration
 declared link/joint evidence; zero or placeholder operating values are retained
 and flagged as warnings, never filled with defaults.
 
-Missing administrative metadata (hardware ID, revision, owner, control record)
-is a publication-readiness issue only: it never blocks measurement, the raw
-record keeps the absence, and no value is invented
-([quality](docs/quality.md#scope-of-acceptance)).
+The raw record preserves missing CAD metadata. Publication may resolve absent
+administrative fields from the authenticated submission; this never supplies
+missing mechanical facts or engineering approval
+([mechanical identity](docs/mechanical-handoff-spec.md#12-工程身份)).
 
 Run history and details show the original submitter's Feishu username, obtained
 automatically through Feishu's authentication API.
@@ -111,12 +114,3 @@ collision models or control interfaces.
 | [Release procedure](RELEASING.md) | Tool acceptance and publication |
 
 [Apache License 2.0](LICENSE) · [Code of Conduct](CODE_OF_CONDUCT.md)
-
-## Publication identity
-
-The operator portal's upload window lists the configured publication targets and pre-selects the
-unique hardware identity matched from the folder or main-assembly name; the selector allows an
-explicit override. With a target selected, publication needs no CAD metadata edits or sidecar
-files: hardware, revision (deterministic from the frozen inventory digest and date), owner,
-change summary and handoff control are derived for the submission. CAD-carried `dp.*` values
-always win, and a conflicting submitted hardware identity blocks publication.

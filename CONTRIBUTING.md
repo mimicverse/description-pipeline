@@ -36,6 +36,9 @@ python -m ruff check src tests tools deploy
 
 GitHub Actions runs these two commands on every pull request and on pushes to
 `main`; the `verify` check gates merges into `main`.
+Install Node.js to run the pure JavaScript activity and run-history regressions
+invoked by the Python suite; those tests are skipped when `node` is unavailable.
+Review the reported skips so a missing runtime cannot be mistaken for UI coverage.
 
 Windows uses the native capture dependency lock; its runtime does not include
 MuJoCo. Run native adapter regressions there with `.venv\Scripts\python.exe`.
@@ -54,6 +57,9 @@ Keep examples consistent with command help, schemas and measured behavior.
 Keep `main` within the [Release 1.0 design](docs/design.md): one current workflow,
 no compatibility layers or transitional documentation. Merge implementation and
 instructions together after the required acceptance passes.
+Current readers accept only current schema identifiers. Recheck historical
+sealed evidence in its recorded tool and dependency environment; do not rewrite
+the evidence or add compatibility aliases to the current reader.
 The [design](docs/design.md) owns architecture, [operations](docs/operations.md)
 owns the end-to-end workflow, [deployment](docs/deployment.md) owns availability
 and configuration, and [quality](docs/quality.md) owns verification claims.

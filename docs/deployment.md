@@ -14,8 +14,8 @@ and maintenance; [operations](operations.md) owns the engineering workflow.
 | Host or service | Required preparation |
 |---|---|
 | Linux | Ubuntu 22.04 x86_64, user-level systemd, Git, GitHub CLI, network access to the Windows worker, GitHub and Feishu |
-| Windows | SolidWorks 2026 (native major 34; other versions require platform acceptance first), Python 3.12 x86_64 and OpenSSH Server; an interactive desktop session |
-| Model repository | Private repository, an existing `feature/<hardware>` base and a dedicated clean Linux clone |
+| Windows | Dedicated native execution host with SolidWorks 2026 (major 34; other versions require acceptance first), Python 3.12 x86_64, OpenSSH Server and an interactive desktop session; no independent CAD work during pipeline execution |
+| Model repository | Private repository, an existing configured base such as `feature/<hardware>` or `main`, and a dedicated clean Linux clone |
 | Feishu | Enterprise app, approved tenant keys, registered OAuth callback and access to basic user identity/profile |
 | Storage | Dedicated CAD intake directories; separate frozen inputs, outputs, state, secrets and model clones |
 
@@ -92,7 +92,8 @@ Save `C:\description-state\endpoint.json`:
 }
 ```
 
-Replace `arm` with the CAD's `dp.hardware_id` and configure its model base.
+Replace `arm` with the hardware identity used by CAD or the configured publication
+target, and set its model base.
 Publication requires a configured hardware target; extraction and inspection
 can proceed while routing is absent. The endpoint keeps no discovery settings:
 controlled records and approved interface names are Linux-side derivation
@@ -150,7 +151,7 @@ Complete these configuration groups once:
 | `SOLIDWORKS_HANDOFF_ROOT` | Dedicated Linux intake, such as `/srv/description/cad-handoffs`, outside runtime and state |
 | `PIPELINE_STORE_ROOT` | Linux stage checkpoints, model deliveries and diagnostics; defaults to `OPERATOR_STATE/runs` |
 | `MODEL_REPOSITORIES_FILE` | Mode-`0600` JSON mapping repository slugs to dedicated Linux model checkouts |
-| `MODEL_TARGETS_FILE` | Optional mode-`0600` JSON mapping hardware identities to `{repository_slug, base}` publication targets |
+| `MODEL_TARGETS_FILE` | Mode-`0600` JSON mapping hardware identities to `{repository_slug, base}`; configure it to offer publication targets and match the endpoint's routing |
 | `DISCOVERY_SETTINGS_FILE` | Optional mode-`0600` JSON with Linux `record_roots` and `frozen_names_file` |
 | `FEISHU_APP_SECRET_FILE`, `FEISHU_TENANT_KEYS` | App credentials and mandatory tenant allowlist |
 | `FEISHU_ADMIN_OPEN_IDS` | Explicit administrator identities; optional, no automatic administrator |
@@ -181,40 +182,6 @@ do not carry `dp.hardware_id`. The Windows endpoint exposes its own target list 
 the portal (and the Airflow connection rendered from the same file) configuration.
 Back up the run store with platform state; it owns portable checkpoints and
 published model receipts.
-
-## Release staging and rehearsal
-
-Every deployment archive stages its own release machinery: the staged tree carries
-`deploy/operator/rehearsal/{prepare-venv,stage-and-validate,switch,quiesce-admission}.sh`,
-`deploy/operator/inspect-release.py`, `deploy/windows/{endpoint-launcher.py,endpoint.example.json}`
-and `deploy/windows/candidate/` (the Windows candidate harness). Run them from the staged release
-tree; they are idempotent and fail closed, and the live rollback runtime is supplied as an explicit
-parameter (no generation-pinned constants ship in the repository).
-
-| variable | meaning | default |
-|---|---|---|
-| `OPERATOR_ROOT` | operator state root (venvs, releases, state) | `/home/andy/operator` |
-| `LIVE_TAG` | live/rollback venv tag; required by prepare-venv, stage-and-validate and switch | — |
-| `LIVE_RELEASE` | live/rollback release directory name; required by switch | — |
-| `REHEARSAL_DIR` | rehearsal working directory | `$OPERATOR_ROOT/split-$TAG-rehearsal` |
-| `EXPECTED_DAG_TASKS` | pinned DAG task count checked while staging | `8` |
-| `OPERATOR_URL` | operator URL used by the health checks | `https://10.0.0.235:8443` |
-| `OPERATOR_TLS_CA` | CA bundle used by the health checks | `$OPERATOR_ROOT/state/tls/operator-tls-fullchain.crt` |
-| `POSTGRES_ROOT`, `POSTGRES_MAJOR`, `POSTGRES_PORT` | portable PostgreSQL used for the drain gate | `$OPERATOR_ROOT/airflow-pg`, `14`, `5433` |
-| `UV_PYTHON` | base CPython used to build candidate venvs | uv-managed 3.12.14 path |
-
-`switch.sh stage <tag> …` installs the inactive runtime and imports the DAG without live change;
-`switch.sh switch <tag> …` re-stages, requires zero active Airflow rows, backs up `operator.env`,
-promotes, starts and health-checks; `switch.sh rollback <tag>` restores the newest
-`operator.env.bak-pre-<tag>-*` and the live rollback runtime. `quiesce-admission.sh` stops ingress,
-pauses the DAG and runs the read-only `inspect-release.py` drain check.
-
-The Windows candidate harness runs from `deploy/windows/candidate/` with a mandatory `-Tag`
-(plus `-Root`, `-Stamp`, and `-TemplateTask` for registration); `endpoint.example.json` mirrors the
-endpoint configuration schema with placeholder paths and no secret values (the bearer token stays
-in the host's mode-`0600` token file), and `endpoint-launcher.py` takes the endpoint root from
-`DESCRIPTION_ENDPOINT_ROOT`. `tools/acceptance/m3_acceptance.py <run-dir> [<bundle-dir>]` runs the
-read-only RC acceptance from the repository.
 
 Set `DISCOVERY_SETTINGS_FILE` to the absolute path of a private JSON file, for example
 `{"record_roots":["/srv/description/cad-records"],"frozen_names_file":"/srv/description/interface-names.json"}`.
@@ -358,8 +325,10 @@ Commission the complete workflow with actual native CAD and live Feishu:
    for a recoverable transport failure and confirm it retains the same run.
 4. In the operator page, choose the complete engineering folder once (Chrome or
    Edge); the browser uploads its files to the platform's Linux intake and
-   `Start` creates the run. No server path, YAML, branch, hardware or
-   credential field is entered by hand; selections containing SolidWorks lock
+   `Start` creates the run. Confirm the suggested configured publication target
+   or select another configured target; verify CAD identity takes precedence and
+   a hardware conflict refuses publication. No server path, YAML, free-form
+   repository/branch or credential is supplied; selections containing SolidWorks lock
    transients (`~$…`) are rejected before anything runs.
 5. Verify the UUID, frozen inventory and all six engineering steps. Inspect
    input/input QC/output/output QC in the page, the DAG contract table,
@@ -437,3 +406,76 @@ Preserve every frozen input, delivery, diagnostic, signing key, job and ledger
 row created during the upgrade. Do not restore an older database or state snapshot;
 code rollback requires compatible persisted schemas. Published tags and assets
 remain immutable.
+
+## Release staging and rehearsal
+
+Every deployment archive stages its own release machinery: the staged tree carries
+`deploy/operator/rehearsal/{prepare-venv,stage-and-validate,switch,quiesce-admission}.sh`,
+`deploy/operator/inspect-release.py`, `deploy/windows/{endpoint-launcher.py,endpoint.example.json}`
+and `deploy/windows/candidate/` (the Windows candidate harness). Run them from the staged release
+tree. They retain staged evidence and refuse unverifiable preconditions; the live
+rollback runtime is an explicit parameter. Some failures leave admission paused
+or a promoted runtime unhealthy, so inspect the phase and restore admission or
+roll back before accepting more work.
+
+| variable | meaning | default |
+|---|---|---|
+| `OPERATOR_ROOT` | operator state root (venvs, releases, state) | `/home/andy/operator` |
+| `LIVE_TAG` | live/rollback venv tag; required by prepare-venv, stage-and-validate and switch | — |
+| `LIVE_RELEASE` | live/rollback release directory name; required by switch | — |
+| `REHEARSAL_DIR` | rehearsal working directory | `$OPERATOR_ROOT/split-$TAG-rehearsal` |
+| `EXPECTED_DAG_TASKS` | pinned DAG task count checked while staging | `8` |
+| `OPERATOR_URL` | operator URL used by the health checks | installed `state/resolved.env`; set explicitly if unavailable |
+| `OPERATOR_TLS_CA` | CA bundle used by the health checks | `$OPERATOR_ROOT/state/tls/operator-tls-fullchain.crt` |
+| `POSTGRES_ROOT`, `POSTGRES_MAJOR` | portable PostgreSQL used for the drain gate | `$OPERATOR_ROOT/airflow-pg`, `14` |
+| `POSTGRES_PORT` | installed socket-cluster port; must agree with `AIRFLOW_DB_URL` | required in `operator.env` or exported for `switch.sh` |
+| `UV_PYTHON` | base CPython used to build candidate venvs | host-specific uv path; set explicitly on another host |
+
+Before staging an upgrade, compare the installed private `operator.env` with the
+current example by key, preserving actual paths, secrets and database settings.
+Older configurations may lack `MODEL_TARGETS_FILE` and `POSTGRES_PORT`; configure
+the former to match endpoint routing and copy the actual installed database port
+into the latter. Health checks target agreement; a source-only upgrade does not
+repair these missing settings.
+
+Use explicit paths from the staged release. In particular, `switch.sh` invokes
+its helpers through `REHEARSAL_DIR`, and `quiesce-admission.sh` needs
+`INSPECT_RELEASE_PY` to name the shipped inspector rather than a workstation path:
+
+```sh
+export OPERATOR_ROOT="$HOME/description"
+export OPERATOR_STATE="$OPERATOR_ROOT/state"
+export REHEARSAL_DIR=/path/to/staged-release/deploy/operator/rehearsal
+export INSPECT_RELEASE_PY=/path/to/staged-release/deploy/operator/inspect-release.py
+export UV_PYTHON=/path/to/python3.12
+export LIVE_TAG="<previous-runtime-tag>"
+export LIVE_RELEASE="<previous-release-directory>"
+```
+
+Replace the placeholders with installed values before execution. Set
+`POSTGRES_PORT` to the installed port if it is not in `operator.env`; the switch
+drain gate currently cannot obtain it from `resolved.env` alone. Preserve candidate
+configuration and logs under a distinct tag. If active configuration changes after
+staging, the existing candidate environment refuses drift: retain it for diagnosis
+and stage a fresh tag rather than bypassing the comparison.
+
+`switch.sh stage <tag> …` installs the inactive runtime and imports the DAG without live change;
+`switch.sh switch <tag> …` re-stages, requires zero active Airflow rows, backs up `operator.env`,
+promotes, starts and health-checks; `switch.sh rollback <tag>` restores the newest
+`operator.env.bak-pre-<tag>-*` and the live rollback runtime. `quiesce-admission.sh` stops ingress,
+pauses the DAG and runs the read-only `inspect-release.py` drain check. An inspector
+failure leaves ingress closed and the DAG paused. After resolving the failure and
+confirming the intended runtime, use its `operatorctl.sh start --env-file <file>`
+followed by `health` to restore and verify admission. A post-promotion health failure
+requires correction or the recorded `switch.sh rollback <tag>`; it is not a
+successful upgrade.
+
+The Windows candidate harness runs from `deploy/windows/candidate/` with a mandatory `-Tag`
+(plus `-Root`, `-Stamp`, and `-TemplateTask` for registration); `endpoint.example.json` mirrors the
+endpoint configuration schema with placeholder paths and no secret values (the bearer token stays
+in the host's mode-`0600` token file), and `endpoint-launcher.py` takes the endpoint root from
+`DESCRIPTION_ENDPOINT_ROOT`. `tools/acceptance/m3_acceptance.py <run-dir> [<bundle-dir>]` runs the
+read-only M3-specific acceptance from the repository. That check complements the
+generic gates and does not qualify other hardware or an unexercised discovery
+regime. The candidate scripts currently expect endpoint loopback port `8765`;
+verify their host parameters before using them on a different installation.

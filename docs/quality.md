@@ -30,11 +30,12 @@ creates a candidate PR and cannot set an engineering-approved release state.
 Passed automatic checks do not require manual repetition. Failed checks require
 correction, not human override. Applicable approvals of unchanged engineering
 facts can be reused; changed facts and their effects need review.
-Each receipt declares its `execution_scope`: Windows covers the first three
-stages, including ingestion and derivation of the saved exporter declaration,
-and runs no URDF generation, MuJoCo verification or Git operations; Linux
-covers generation, verification and publication, including an independent
-re-decode of the sealed declaration. A complete
+Each receipt declares its `execution_scope`: Windows covers the native portions
+of freeze, discover and capture, including reading and sealing the saved
+exporter declaration; Linux derives the prepared definition during discovery
+and performs generation, verification and publication, including an independent
+re-decode of the sealed declaration. Windows runs no structure derivation,
+URDF generation, MuJoCo verification or Git operations. A complete
 Airflow run binds both; maintenance runs cover only the stages they execute ([operations](operations.md#6-independent-review-and-recovery));
 unexecuted native stages are shown as out of scope rather than qualified.
 
@@ -109,7 +110,7 @@ Implementation paths below are relative to `src/description_pipeline/`.
 | XML/canonical full tensor | Relative 1e-10, absolute 1e-15 kg·m² |
 | COM/body bounds | 0.1 mm allowance for tessellation |
 | Inertia/radius bound | 1% allowance for tessellation |
-| Degenerate triangles | At most 0.1% of a mesh's triangles |
+| Degenerate triangles | Count ratio ≤ 1% and degenerate-area / total-area ratio ≤ 1e-6; both bounds must pass |
 | Near-zero mesh volume | Requires a documented exceptional-geometry occurrence |
 
 Raw part tensors must declare the measured standard signed convention for
@@ -242,19 +243,24 @@ their own acceptance evidence.
 Unassigned rigid ownership, explicit zero parameters and missing explicit
 material assignments are stage warnings so generation can continue; material
 warnings retain the measured CAD mass/centre-of-mass/inertia and never claim
-verified material; exact whole-CAD mass equality and usable motion remain
-strict independent qualification checks, and conflicting comparable authored
-operating limits still fail.
+verified material. Exact native mass accounting and numerical validity and
+consistency remain required. Zero ranges or drives retain their unqualified
+status even when consistency passes; conflicting comparable authored operating
+limits still fail.
 
-Administrative metadata (hardware ID, revision, owner, control record) is a
-publication-readiness requirement, not a measurement blocker: capture,
-generation and inspection continue when it is absent, the raw record keeps the
-absence, and no revision, owner, hardware ID or neutral technical name is
-invented to fill it.
+Publication identity follows the
+[mechanical identity contract](mechanical-handoff-spec.md#12-工程身份).
+Missing administrative metadata does not block measurement; the raw CAD record
+keeps its absence. CAD-authored values take precedence over authenticated
+submission metadata, whose provenance is retained separately. A submitter-derived
+owner is a submission identity, and a generated revision identifies a frozen
+handoff; neither establishes mechanical responsibility, a PDM revision or
+engineering approval. Remaining publication-readiness gaps still block a PR.
 
 Stage warnings never substitute for acceptance: they stay visible with their
 objects, and the warned facts (material coverage, usable ranges or drives) are
-not verified until the corresponding independent checks pass; a material
+not qualified by a consistency pass; usable motion, drive capability and material
+truth require their applicable engineering evidence. A material
 warning must never be reported as verified material, and numeric evidence that
 is unreadable, non-positive or non-physical still fails closed. Missing
 required evidence remains a failure.
@@ -330,5 +336,7 @@ predicate in the producer and the verifier
 saved exporter declaration (the `exporter` block exists and its state is not a
 proven `absent`), verification re-decodes that declaration and reconciles it with
 the native observations; when the declaration is proven absent, verification runs
-the mate-inference suite instead. Mate-mode real-CAD acceptance is tracked to the
-M3.0 externalized rerun at RC.
+the mate-inference suite instead. Tool releases must retain actual native
+acceptance evidence for each supported regime; a capture using a saved exporter
+declaration cannot qualify the mate-inference path. The
+[release procedure](../RELEASING.md#acceptance) owns that evidence requirement.

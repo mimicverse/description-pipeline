@@ -1,34 +1,50 @@
 # Design
 
-One operator workflow: **SolidWorks folder → Airflow → verified URDF → review PR**.
+One operator workflow: **SolidWorks folder → Airflow → independently verified
+URDF → review PR**. The tool publishes a candidate; engineering approval and
+acceptance for simulation or hardware use remain separate decisions.
 
 ## 1. Core principles
 
-- Single source of truth.
-- Automatic derivation.
-- Verified publication.
+Native CAD owns mechanical facts. Versioned controlled records supply explicitly
+referenced specifications. Generated definitions and reports retain these sources;
+missing or conflicting engineering facts cannot be filled from a reference URDF,
+a default parameter or the generator's own output.
+
+Administrative publication identity has a separate authority: CAD values take
+precedence, and an authenticated submission may supply absent fields under the
+[mechanical identity contract](mechanical-handoff-spec.md#12-工程身份). A
+submission owner identifies the submitter when CAD records no owner; it does not
+establish mechanical responsibility or engineering approval. The raw CAD record
+keeps its original values and absences.
+
+Every boundary verifies the bytes and identities it consumes. Independent
+verification reconstructs expectations from sealed native observations and
+inspects the actual generated XML, meshes and isolated consumer load. A passing
+report qualifies its recorded checks for its exact subject; it cannot prove the
+physical truth of the CAD or an approval outside the platform.
+
+`main` contains the smallest complete current system. Previous implementations
+remain in Git history. Maintenance replay uses the same generation, verification
+and publication rules against complete frozen evidence.
 
 ## 2. How the system works
 
-SolidWorks defines geometry, assembly relationships, motion and datums. Versioned
-component records in the platform's controlled library supply physical and drive
-specifications. CAD references identify their approved versions.
+### Sources and responsibilities
 
-When the main assembly carries the saved native URDF exporter declaration,
-discovery ingests it as explicit declared evidence: link membership by persistent
-component IDs, and joint names, types, origins, axes and named frames. Authored
-limits are preserved verbatim; zero or degenerate values are kept for capture and
-generation, flagged as stage warnings, and never qualify motion. Stored meshes,
-inertias and non-customized joint origins are derived content and are regenerated
-from native CAD, never adopted. Independent verification re-decodes the sealed
-payload. Mates that restrict declared motion in the saved pose remain diagnostics;
-invalid declarations, unresolved references and inconsistent native geometry fail.
+| Information | Authority | Responsibility |
+|---|---|---|
+| Geometry, configurations, occurrences, datums and mechanical declarations | Saved native SolidWorks engineering | Mechanical engineers maintain facts; Windows records them |
+| Physical and drive specifications, optional design budgets | Explicit CAD references to immutable controlled records | Parameter owners approve records; Linux resolves the configured library |
+| Hardware routing and missing publication metadata | Configured target and authenticated submission, subordinate to CAD values | Maintainer configures routing; submitter confirms the target and change description |
+| Robot definition, canonical model, URDF and meshes | Derived from the sealed sources | Linux derives and generates; generated files cannot replace source facts |
+| Verification and publication claims | Independently recomputed report and exact Git/PR receipt | Linux verifies the subject and publishes a candidate |
+| Physical meaning, full-range safety and intended-use approval | Applicable engineering records and review PR | Responsible engineers approve facts outside automatic coverage |
 
-Each fact has one effective definition and a recorded source; conflicting or
-ambiguous definitions stop derivation. Mechanical engineers maintain these inputs;
-the pipeline generates definitions, models, meshes and reports within the
-[supported native constraint scope](mechanical-handoff-spec.md#52-连接与自由度).
-Unsupported or ambiguous evidence produces a diagnostic, not an inferred model.
+The workflow has six engineering steps. Their single machine-readable definition
+is [`stage-contract.json`](../src/description_pipeline/stage-contract.json); it
+renders the table below, the Airflow DAG documentation and the operator view.
+Generated-input inspection is the input check of `capture`.
 
 ```mermaid
 flowchart LR
@@ -37,13 +53,8 @@ flowchart LR
   C --> G[4 Generate URDF]
   G --> V[5 Independent verification]
   V -->|pass| P[6 Publish review PR]
-  V -->|fail| E[Retained findings and diagnostics]
+  V -->|fail| E[Retained findings and diagnostic preview]
 ```
-
-The pipeline has **six engineering steps**. Their single machine-readable definition
-is [`stage-contract.json`](../src/description_pipeline/stage-contract.json); the
-same definition renders this table, the Airflow DAG documentation and the operator view.
-Generated-input inspection is the input check of `capture`.
 
 <!-- stage-contract:start -->
 | # | Stage | Input | Input QC | Output | Output QC |
@@ -56,124 +67,140 @@ Generated-input inspection is the input check of `capture`.
 | 6 | `publish` — Publish review PR | Verified delivery and configured model repository | Reverified delivery, clean repository and deterministic review branch | Candidate commit and PR receipt | Copied, staged and committed bytes match the verified subject; Remote commit, PR head/base and subject agree |
 <!-- stage-contract:end -->
 
-Each boundary records its actual check result before the next step consumes its
-output. Missing checks remain `not_run`; a failure blocks downstream work.
-Live activity is separate from these checks: the worker records its current
-operation, object and known item counts with timestamps and a bounded history.
-The operator page displays these observations without inferring progress from
-polling, inventing a completion percentage or changing qualification results.
-Each receipt declares its `execution_scope`: Windows covers freeze, discover and
-capture, including reading and sealing the raw native record and the saved
-exporter declaration; it runs no structure derivation, URDF generation, MuJoCo
-verification or Git operations. Linux derives the prepared definition and covers
-generate, verify and publish, including an independent re-decode of the sealed
-declaration. The complete Airflow run
-combines both receipts, while maintenance commands cover only the stages they execute
-([operations](operations.md#6-independent-review-and-recovery)); unexecuted
-native stages are reported as out of scope, never as qualified.
-[Quality](quality.md) defines the independent gates and tolerances. Exact selected-set accounting — native-selected plus independently measured unassigned mass closing to the whole within 1e-12 kg — is distinct from full-assembly coverage qualification: the authoritative declared model governs coverage and may leave an explicit unassigned occurrence warning.
-Link mass properties follow the native one-shot direct read over each body's
-full selected component set (the selection the independent verifier recomputes
-and requires verbatim); the model binds to that record by the exact
-assembly→link transform, the per-instance recombination remains a recorded
-audit, and the assembly closure compares the sum of the direct link reads with
-the whole-assembly reading.
-[The mechanical specification](mechanical-handoff-spec.md#111-自动检查与工程师确认)
-defines the remaining external engineering facts. Passed automatic checks are
-accepted without repeated manual review. After verification, the page shows only
-this external review scope; approvals remain in the matching PR or controlled
-records and are not inferred by the portal. Unsupported capabilities stay visible
-on their responsible step.
+### Execution across hosts
 
-Any engineering step can start a new linked run. Upstream results are reused
-only after checking their frozen inputs, tool and dependency identities, and
-checkpoint integrity. The selected step and all downstream steps execute again;
-prior runs remain immutable. Reports identify reused evidence and retain its
-original timestamps. A missing or invalid prerequisite points to the earliest
-safe restart step. Transport recovery reconnects an existing job and remains
-separate from engineering reruns.
+One Linux server hosts the operator page, Airflow, its database, portable run
+store and Git publication. One licensed Windows endpoint serializes native jobs.
+Both hosts use the same tool source release and record their respective runtime
+dependencies. Git credentials, model checkouts and controlled-record libraries
+stay on Linux; Windows requires neither MuJoCo nor GitHub access.
 
-Native input and collected evidence remain immutable. The canonical model contains
-topology, transforms, geometry and full physical properties. Verification reconstructs
-expectations from native observations and inspects the actual XML, mesh bytes and
-isolated consumer loading. Publication checks the copied, staged and committed
-bytes, then confirms the remote commit and PR head/base. A candidate PR requires
-engineering approval before model release.
+| Airflow task | Engineering responsibility | Execution |
+|---|---|---|
+| `resolve_handoff` | Admit the Linux intake and bind its complete upload index, main assembly and submission identity | Linux; prepares the native freeze request |
+| `start_job`, `wait_for_job` | Drive native freeze, discovery and capture, including the definition exchange | Windows reads native facts; Linux derives the definition during discovery |
+| `fetch_capture` | Admit the complete sealed native bundle into the run store | Linux |
+| `run_generate`, `run_verify`, `run_publish` | Generate, independently verify and publish | Linux |
+| `confirm_job` | Require the complete stage receipt and retain the delivery summary | Linux |
 
-Publication generates byte-preserving Git attributes and rejects conflicting
-repository settings. Frozen evidence and controlled records retain their original
-bytes through commits and fresh checkouts.
+Engineering steps and orchestration tasks have different boundaries. Discovery
+spans both hosts: Windows resolves the uploaded main assembly and reads the raw
+native record; Linux admits that record against the sealed selection and derives
+the prepared definition. Only generated text returns to Windows. The full CAD
+folder is not transferred again for this exchange. Windows captures the sealed
+engineering and returns immutable native readings, meshes and source copies.
+Scene construction, closure arithmetic, structural-team report rendering and
+independent verification run on Linux.
 
-The pipeline ID is `solidworks-to-urdf`; every run has a UUID. Source revisions,
-controlled records, tool code, dependencies, environment and file hashes bind the
-execution. Transport retries reconnect to the same UUID and frozen inputs. A
-terminal native failure or source correction requires a new run. Frozen evidence
-can be rebuilt on Linux without reopening CAD.
+Windows receipts cover the native portions of freeze, discover and capture;
+Linux receipts cover definition derivation and the portable stages. The full
+Airflow run binds both. A completed native job is an intermediate acquisition
+state. Maintenance receipts name only the engineering steps they execute and
+cannot qualify unexecuted native work.
 
-Airflow stages the complete uploaded folder to the serialized Windows worker,
-which resolves the main assembly's references inside that staging, reads the raw
-native record and later captures the sealed engineering. Linux
-admits the record against the sealed selection, derives the prepared definition
-from the frozen selected bytes alone and returns only the generated text
-definition; no CAD is re-transferred. Windows then returns a sealed capture
-bundle, including the saved exporter declaration payload and its PID resolution
-rows when present; Linux checks its complete inventory, file hashes, selected
-assembly, run identity and native tool identity before use. Native completion is
-an intermediate state, not a verified model: an extracted declaration is
-evidence to reconcile, extraction warnings (uncovered occurrences, unusable
-ranges or drives) stay visible. Saved-pose mate restrictions do not override the
-declared kinematics. Administrative metadata absence is publication-readiness
-only ([quality](quality.md#scope-of-acceptance)); measurement and the raw record
-continue unchanged.
+### Native admission and mechanical interpretation
 
-The whole uploaded native folder is staged provisionally, then the native
-engine itself resolves the main assembly's references; the pipeline seals the
-dependency closure only when every engine-reported binding lies inside the
-staged root and matches the uploaded index — or is an engine-materialized import
-admitted only through the sealed closure's owner/occurrence evidence matched to
-its staged source by native identity, never by temporary path or file name. A
-missing or outside-stage reference fails the run after resolution, before
-capture. This is a closure-admission rule over reported bindings, not an
-operating-system sandbox and not a pre-geometry read gate.
+The whole upload is staged provisionally. SolidWorks itself resolves the main
+assembly's references; the pipeline admits the dependency closure from the
+engine-reported bindings and the sealed upload index. Engine-materialized imports
+require native owner/occurrence evidence binding them to their staged source.
+An unresolved or outside-stage source fails before capture. This check happens
+after native resolution; it is neither an operating-system sandbox nor a gate
+that prevents the engine from reading geometry. The engineering requirements are
+in the [mechanical specification](mechanical-handoff-spec.md#32-依赖闭合).
 
-Both hosts use the same tool source release and record their own runtime
-requirements. Windows checks SolidWorks and COM readiness. Linux checks MuJoCo
-and loads the actual generated URDF in isolation. Git credentials and model
-checkouts stay on Linux. Each stage's results, checks and execution host appear
-in the operator view; the final receipt binds both hosts' evidence. The Linux
-store supplies model previews, downloads and publication results. Previews are
-explicit about status: a verified delivery is served as verified, while a
-retained failed-verification checkpoint is served only as an explicitly
-unverified diagnostic preview that never asserts verification and never
-authorizes publication.
+A saved native exporter declaration is explicit mechanical evidence. Discovery
+uses its persistent component identities, topology, named frames, axes and
+authored limits, regenerating meshes, inertias and non-customized origins from
+native CAD. Verification independently decodes the sealed declaration and
+reconciles the delivered model with native observations. Saved-pose mate
+restrictions remain diagnostics; invalid declarations, unresolved references,
+inconsistent geometry and conflicting comparable operating limits fail.
 
-Multi-assembly selection is an operator step
-([operations](operations.md#2-collect-and-save-a-controlled-version)): a single
-assembly is selected automatically; otherwise the choice is frozen with the
-handoff, reused by retries and reruns, and fixes only the entry point — every
-identity, dependency and physical check still applies to the native data.
+When the declaration is proven absent, discovery and verification independently
+reconstruct supported constraints. These are two interpretations of the same
+native input workflow, selected by one shared presence predicate; a broken
+present declaration cannot silently fall back to inference. Supported topology,
+constraints and axis evidence are specified in the
+[mechanical specification](mechanical-handoff-spec.md#52-连接与自由度).
+
+Selected-model verification and full-assembly coverage have distinct meanings.
+Unassigned occurrences remain explicit with independently measured mass; exact
+selected-plus-unassigned mass accounting must pass. This does not establish that
+the URDF covers every native occurrence. Direct link mass authority, overrides,
+geometry exceptions and numerical tolerances belong to the
+[quality specification](quality.md#numerical-contract).
+
+### Integrity and independent verification
+
+Each transfer admits a closed inventory with file hashes, run identity, handoff
+selection and tool identity. A generated definition is an input claim to verify,
+not an independent oracle. The verifier reconstructs native membership, motion,
+frames and physical expectations independently of generation, then checks actual
+XML, mesh bytes and isolated MuJoCo loading. Shared schema and presence rules
+choose the contract; they do not provide the expected mechanical answer.
+
+Independent verification uses the captured observations; it does not perform a
+second physical experiment or certify the CAD's material and motion claims.
+The [quality specification](quality.md#scope-of-acceptance) defines the automatic
+acceptance limit and the mechanical specification assigns external engineering
+confirmation. Passed automatic checks need no repeated manual calculation.
+
+The verified subject binds native inputs, evidence, canonical model, artifacts
+and required reports. Receipt and report exclusions prevent circular hashes and
+are owned by the [report identity contract](quality.md#report-identity).
+Publication rechecks copied output and actual staged/committed Git bytes, preserves
+native bytes with generated Git attributes, and confirms remote commit and PR
+head/base. Missing required checks, a stale green flag or a changed subject cannot
+authorize publication. A diagnostic preview after verification failure stays
+explicitly unverified and cannot be published.
+
+### Failures and recovery
+
+Each boundary records its actual result before downstream consumption. Required
+checks without prerequisites remain `not_run`; failure blocks dependent work.
+Warnings retain their affected objects and qualification impact under the
+[step and result contract](quality.md#step-and-result-contract).
+
+Native acquisitions bind the documented interfaces and verify the owned process
+and document. Rebuild refreshes the collected document without saving over CAD;
+post-capture hashes and configuration guards must pass. Lost bindings or
+unreadable state stop work and retain partial diagnostics. Schedule native work
+on a dedicated execution host with no independent CAD activity; deployment and
+native acceptance must establish process ownership and cleanup behavior.
+
+Every run has a UUID. Transport retries reconnect to that UUID and its frozen
+request; terminal native failure or source correction requires a new run. A
+linked engineering rerun validates the retained upstream checkpoints and executes
+the selected step and its successors, preserving prior evidence and original
+check timestamps. A tool change requires a new run from freeze. Frozen complete
+evidence can be rebuilt on Linux without reopening CAD; partial evidence cannot.
+[Operations](operations.md#6-independent-review-and-recovery) owns the exact
+recovery actions.
+
+Live activity reports the operation, object, available counts and timestamps.
+It does not change check results or infer progress from successful polling.
+The portal serves previews and downloads from the Linux run store and preserves
+the distinction between generated, verified and published results. It reports
+external review scope without inferring engineering approval.
 
 ## 3. How engineering is organized
 
 | Repository or system | Responsibility |
 |---|---|
 | Public `description-pipeline`, `main` | Current tool, specifications and neutral tests |
-| Private `description`, `feature/<hardware>` | Reviewed inputs and model deliveries for a hardware design |
-| Private `description`, `work/solidworks/<hardware>` | Generated candidate and its review PR |
-| Private `description`, `release/<hardware>/<release>` | Approved, frozen model delivery |
+| Private model repository, configured base such as `feature/<hardware>` or `main` | Reviewed baseline for that hardware |
+| Private model repository, `work/solidworks/<hardware>` | Generated candidate and its review PR |
+| Private model repository, `release/<hardware>/<release>` | Approved, frozen model delivery |
 | Mechanical PDM, Git LFS or controlled directory | Retrievable CAD revisions and engineering approvals |
 | Controlled component library | Versioned physical and drive specifications |
 
-`main` contains the smallest complete current system. Intermediate implementations
-remain in Git history. Tool releases use ordinary version tags; each model records
-the tool identity used to build it.
-
 ```text
 src/description_pipeline/
-  stage-contract.json    six steps, boundary check identifiers and responsibility references
+  stage-contract.json    six steps, boundary checks and responsibility references
   stages.py              check observations and shared result rendering
-  steps.py               the six engineering handlers
-  solidworks.py          linear delivery/replay driver and output ownership
+  steps.py               engineering boundary handlers
+  solidworks.py          delivery/replay sequencing and output ownership
   runtime.py             installed tool and dependency identity
   sources/solidworks/    native reading and definition derivation
   model/                 canonical mechanical and physical semantics
@@ -181,59 +208,27 @@ src/description_pipeline/
   verification/          independent native, physical and artifact checks
   repository/            verified Git and PR publication
   orchestration/         queue, Airflow, authentication and result access
-  cli.py                 commissioning, diagnostics and frozen replay
 tests/                   neutral, analytic and adversarial fixtures
 deploy/                  platform installation and lifecycle
 docs/                    specifications and operating guides
 ```
 
-`steps.py` owns `freeze_inputs`, `discover_structure`, `capture_evidence`,
-`generate_model`, `verify_delivery` and `publish_model`. Each handler owns its
-input checks, action and output checks. Native adapters, the independent verifier
-and Git publisher own their domain rules. Drivers sequence work and preserve
-receipts; the renderer does not execute engineering work.
+Domain handlers own their checks and action; drivers sequence work and retain
+receipts. Rendering cannot execute or qualify engineering work. Maintainers
+configure storage, library roots, credentials and hardware routing once, separate
+from source inputs, generated output and durable state.
 
-One Linux server hosts Airflow, its database and the operator page. One licensed
-Windows endpoint serializes native jobs in owned processes, separate from an
-engineer's CAD session. Native runtime readiness precedes CAD access; consumer
-readiness is checked on Linux. Native acquisitions
-bind their documented interfaces; each rebuild refreshes and verifies the owned
-document once before continuation. Lost bindings or unavailable capabilities
-stop execution, retain diagnostics and release owned resources.
-
-Feishu API authentication supplies the operator's verified username. Run history
-and details show each run's original submitter by that name. The authenticated
-app, tenant and `open_id` remain the internal audit identity. The platform
-restricts tenant and workflow permissions and keeps credentials server-side.
-
-Approved Feishu users may start new pipeline runs and view shared results. Each
-run records its initiator's stable authenticated identity and displays that
-operator's original Feishu username. The run's initiator and platform
-administrators may start a linked attempt from any step whose retained inputs
-pass validation. Earlier results are reused with their original evidence;
-the selected step and its successors execute again. The original run remains
-unchanged. Recoverable transport interruption has a separate continuation action
-within the same run. Changed CAD requires a new upload. Administrators retain
-broader platform administration.
-
-Maintainers configure storage roots and hardware routing once; operators choose
-one complete engineering folder on their own computer in the page, and the
-platform uploads it to its managed intake before freezing. Deployment settings
-and model facts remain outside tool code.
+Feishu authentication supplies the submitter's stable app/tenant/`open_id` identity
+and original username. Approved users may start new runs and view shared results;
+only the initiator and configured administrators may change a run or start a
+linked attempt. Credentials remain server-side. Display-name changes and history
+deletion do not change engineering identity, evidence or PRs.
 
 ## 4. How to operate
 
-1. Complete the native design and engineering checks under the
-   [mechanical specification](mechanical-handoff-spec.md).
-2. Save the delivery configuration and collect a controlled version with its dependencies.
-3. Sign in, choose the complete engineering folder in the page (Chrome or Edge)
-   and start the run; the browser uploads it to the platform before anything is
-   frozen. If the folder contains several assemblies, choose the main one when the
-   page asks.
-4. Inspect all six steps and their checks; correct engineering findings at their source.
-5. Review the verified URDF, evidence and PR, and complete engineering confirmations.
-6. Approve the intended uses and freeze the model release.
-
-[Operations](operations.md) covers this workflow and recovery;
-[deployment](deployment.md) covers installation and commissioning. URDF consistency,
-simulation, training and hardware control have separate acceptance criteria.
+[Operations](operations.md) owns preparation, submission, findings, model review
+and recovery. [Deployment](deployment.md) owns installation, authentication,
+availability, routing, upgrade and rollback. [Quality](quality.md) owns automatic
+verification claims; the single Chinese
+[mechanical specification](mechanical-handoff-spec.md) owns engineering facts and
+confirmation. Tool release evidence follows [RELEASING.md](../RELEASING.md).
