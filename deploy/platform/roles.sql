@@ -14,10 +14,10 @@ BEGIN
         CREATE ROLE platform_owner NOLOGIN;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'platform_service') THEN
-        CREATE ROLE platform_service NOLOGIN;
+        CREATE ROLE platform_service LOGIN;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'operator_ro') THEN
-        CREATE ROLE operator_ro NOLOGIN;
+        CREATE ROLE operator_ro LOGIN;
     END IF;
 END $$;
 
@@ -37,6 +37,8 @@ GRANT USAGE ON SCHEMA platform TO platform_service;
 GRANT SELECT, INSERT, UPDATE ON
     platform.admission, platform.request, platform.run, platform.stage, platform.operation
     TO platform_service;
+-- The store's read functions consume the same two read models.
+GRANT SELECT ON platform.lifecycle_projection, platform.admission_projection TO platform_service;
 
 REVOKE ALL ON SCHEMA platform FROM PUBLIC;
 GRANT USAGE ON SCHEMA platform TO operator_ro;

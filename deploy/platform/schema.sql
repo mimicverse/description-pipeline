@@ -24,18 +24,25 @@ CREATE TABLE IF NOT EXISTS platform.admission (
 
 CREATE TABLE IF NOT EXISTS platform.request (
     request_id text PRIMARY KEY,
-    accepted_at timestamptz NOT NULL DEFAULT now(),
-    -- The sealed authenticated submission (immutable once written).  The baseline status and
-    -- error references keep an unresolved baseline explicit; they add no projection columns.
-    sealed_receipt jsonb NOT NULL DEFAULT '{}'::jsonb,
-    baseline_status text,
-    baseline_error text
+    principal text NOT NULL,
+    target_hardware text NOT NULL,
+    main_assembly text,
+    configuration jsonb,
+    -- The explicit baseline/status references of the sealed submission (immutable once
+    -- written); they add no projection columns.
+    baseline jsonb,
+    -- C-defined semantics: a request row is a sealed acceptance fact, so the seal instant is
+    -- NOT NULL and defaults to the transaction clock; the API never updates the row.
+    sealed_at timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS platform.run (
     run_id text PRIMARY KEY,
     request_id text NOT NULL REFERENCES platform.request (request_id),
+    parent_run_id text REFERENCES platform.run (run_id),
+    from_stage text,
     state text NOT NULL CHECK (state IN ('queued', 'running', 'succeeded', 'failed', 'cancelled', 'unresolved')),
+    tool_identity jsonb,
     -- Display metadata lives on the run (store-managed); it never enters the six-column view.
     display_name text,
     hidden_at timestamptz,
@@ -61,15 +68,19 @@ CREATE TABLE IF NOT EXISTS platform.operation (
     stage text,
     kind text NOT NULL CHECK (kind IN ('dispatch', 'native', 'publish', 'cancel', 'cache_release')),
     state text NOT NULL CHECK (state IN ('queued', 'running', 'succeeded', 'failed', 'cancelled', 'unresolved')),
+    -- Idempotent registration key: same key + same digest returns the existing record; the
+    -- UNIQUE constraint backstops concurrent registrations.
+    operation_key text NOT NULL UNIQUE,
+    params_digest text NOT NULL,
     -- The dispatch intent's actual Airflow binding (the retained side of the scheduling rows).
     -- The join key is the full unique key (dag_id, task_id, run_id, map_index); try_number is
     -- attempt metadata for reports and is never a join key.  Missing keys must stay visible as
     -- unknown in the view - never silently dropped.
-    airflow_dag_id text,
-    airflow_task_id text,
-    airflow_run_id text,
-    airflow_map_index integer,
-    airflow_try_number integer,
+    dag_id text,
+    dag_run_id text,
+    task_id text,
+    map_index integer,
+    try_number integer,
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 

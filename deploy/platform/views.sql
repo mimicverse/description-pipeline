@@ -22,7 +22,7 @@ FROM (
            NULL::text AS run_id,
            'accepted'::text AS state,
            'terminal'::text AS bucket,
-           accepted_at AS updated_at
+           sealed_at AS updated_at
     FROM platform.request
     UNION ALL
     SELECT 'run'::text,
@@ -77,10 +77,10 @@ FROM (
            COALESCE(ti.end_date, ti.start_date)
     FROM platform.operation o
     LEFT JOIN :"airflow_schema".task_instance ti
-           ON ti.dag_id = o.airflow_dag_id
-          AND ti.task_id = o.airflow_task_id
-          AND ti.run_id = o.airflow_run_id
-          AND ti.map_index = COALESCE(o.airflow_map_index, -1)
+           ON ti.dag_id = o.dag_id
+          AND ti.task_id = o.task_id
+          AND ti.run_id = o.dag_run_id
+          AND ti.map_index = COALESCE(o.map_index, -1)
     WHERE o.kind IN ('dispatch', 'native', 'publish', 'cancel')
 ) AS rows;
 
