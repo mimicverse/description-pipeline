@@ -317,6 +317,7 @@ CLOSURE_MEMBERS = (
     "io.py",
     "delivery.py",
     "stages.py",
+    "runtime.py",
     "stage-contract.json",
     "interface_records.py",
 )
