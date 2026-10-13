@@ -43,12 +43,31 @@ UNRESOLVED_STATES = frozenset({"unresolved"})
 def classify(rows) -> dict:
     """Split projection rows into in-flight, unresolved and unknown outcomes (fail-closed).
 
-    Anything that is not a recognized terminal state lands in in-flight, unresolved or unknown;
-    unrecognized vocabulary - including NULL/empty states - is unknown and blocks both gates.
+    Rows carrying the frozen projection ``bucket`` (the platform view's own classification:
+    terminal/in_flight/unresolved/unknown) are consumed verbatim; anything else falls back to
+    the canonical state vocabulary.  Unrecognized buckets, states - including NULL/empty - are
+    unknown and block both gates.
     """
 
+    bucket_map = {
+        "in_flight": "in_flight",
+        "unresolved": "unresolved",
+        "unknown": "unknown",
+    }
     in_flight, unresolved, unknown = [], [], []
     for row in rows:
+        bucket = str(row.get("bucket") or "")
+        if bucket:
+            target = bucket_map.get(bucket)
+            if bucket == "terminal":
+                continue
+            if target == "in_flight":
+                in_flight.append(row)
+            elif target == "unresolved":
+                unresolved.append(row)
+            else:
+                unknown.append(row)
+            continue
         state = str(row.get("state") or "")
         if state in TERMINAL_STATES:
             continue
@@ -64,6 +83,13 @@ def classify(rows) -> dict:
         "unknown": unknown,
         "settled": not (in_flight or unresolved or unknown),
     }
+
+
+def collect_projection() -> list[dict]:
+    """The single seam the projection source plugs into; rows follow the frozen row contract
+    (``object_kind``/``object_id``/``run_id``/``state``/``bucket``/``updated_at``)."""
+
+    return collect_airflow()
 
 
 def observe(session, dag_run_model, task_instance_model) -> list[dict]:
@@ -95,7 +121,7 @@ def collect_airflow() -> list[dict]:
         return observe(session, DagRun, TaskInstance)
 
 
-def main(argv: list[str] | None = None, *, collect=collect_airflow) -> int:
+def main(argv: list[str] | None = None, *, collect=collect_projection) -> int:
     parser = argparse.ArgumentParser(prog="lifecycle_state.py", description=__doc__.splitlines()[0])
     subparsers = parser.add_subparsers(dest="action", required=True)
     report = subparsers.add_parser("report")

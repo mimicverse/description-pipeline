@@ -59,6 +59,30 @@ class LifecycleStateTests(unittest.TestCase):
         self.assertFalse(data["settled"], "a NULL scheduler state must block, not settle")
         self.assertTrue(data["unknown"])
 
+    def test_bucket_rows_are_consumed_verbatim_and_unknown_buckets_fail_closed(self):
+        rows = [
+            {"run_id": "a", "state": "running", "bucket": "terminal"},
+            {"run_id": "b", "state": "publishing", "bucket": "in_flight"},
+            {"run_id": "c", "state": "unresolved", "bucket": "unresolved"},
+            {"run_id": "d", "state": None, "bucket": "unknown"},
+            {"run_id": "e", "state": "running", "bucket": "unrecognized"},
+        ]
+        data = lifecycle_state.classify(rows)
+        self.assertEqual([row["run_id"] for row in data["in_flight"]], ["b"])
+        self.assertEqual([row["run_id"] for row in data["unresolved"]], ["c"])
+        self.assertEqual([row["run_id"] for row in data["unknown"]], ["d", "e"])
+        self.assertFalse(data["settled"])
+        self.assertTrue(
+            lifecycle_state.classify([{"run_id": "a", "state": "running", "bucket": "terminal"}])["settled"]
+        )
+
+    def test_projection_seam_is_the_default_collector(self):
+        self.assertTrue(callable(lifecycle_state.collect_projection))
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            code = lifecycle_state.main(["report"], collect=lambda: [{"run_id": "a", "state": "success"}])
+        self.assertEqual(code, 0)
+
     def test_report_exit_codes(self):
         def run(rows, *flags):
             stream = io.StringIO()
