@@ -140,6 +140,158 @@ def _unassigned_mass_rows(evidence_root: Path, source: dict) -> list[dict]:
     return rows
 
 
+#: The sealed partition literal for unassigned-group readings.
+UNASSIGNED_PARTITION = "unassigned"
+
+
+def _unassigned_readings(evidence_root: Path, source: dict) -> list[dict]:
+    """The sealed unassigned group: one independently measured reading per member.
+
+    The partition is the set of native leaves no selected body claims.  Every
+    member must carry its own measured mass/COM/full tensor in the capture's
+    ``mass_closure.unassigned[]`` list (same keys/source/units as the
+    component-level readings), covering the partition exactly - no merging, no
+    redistribution.  A wire without that measurement fails closed: a residual
+    or a part-value recombination may never stand in for the independent
+    reading, and a reading that disagrees with the sealed component-level
+    measurement is refused.
+    """
+
+    scene = ev.scene(evidence_root)
+    scene_rows = scene.get("components") if isinstance(scene, dict) else None
+    _require(isinstance(scene_rows, list), "The raw scene carries no component inventory")
+    leaves = [str(row.get("name")) for row in scene_rows if isinstance(row, dict)]
+    _require(len(set(leaves)) == len(leaves), "The raw scene component inventory carries duplicate names")
+    selected = {
+        str(component) for body in source.get("bodies") or [] for component in body.get("components") or []
+    }
+    expected = sorted(set(leaves) - selected)
+    native = ev.mass_closure(evidence_root)
+    recorded = native.get("unassigned") if isinstance(native, dict) else None
+    if not expected:
+        _require(recorded in (None, []), "Unassigned readings recorded for a fully assigned partition")
+        return []
+    _require(
+        isinstance(recorded, list) and len(recorded) == len(expected),
+        "The unassigned partition requires an independent measured reading for every member",
+    )
+    components = {str(row.get("name")): row for row in ev.components(evidence_root) if isinstance(row, dict)}
+    readings: list[dict] = []
+    seen: set[str] = set()
+    for item in recorded:
+        _require(isinstance(item, dict), "Unassigned reading is malformed")
+        name = item.get("name")
+        _require(isinstance(name, str) and name in expected, "Unassigned reading names an outside occurrence")
+        _require(name not in seen, "Unassigned reading repeats an occurrence")
+        seen.add(name)
+        _require(
+            item.get("partition") == UNASSIGNED_PARTITION,
+            name + ": unassigned reading is not partitioned as unassigned",
+        )
+        _require(
+            isinstance(item.get("basis"), str) and bool(item["basis"]),
+            name + ": unassigned reading carries no basis",
+        )
+        mass = item.get("mass")
+        _require(
+            type(mass) in (int, float) and math.isfinite(mass) and mass > 0,
+            name + ": unassigned reading mass is invalid",
+        )
+        com = item.get("com")
+        _require(
+            isinstance(com, list)
+            and len(com) == 3
+            and all(type(value) in (int, float) and math.isfinite(value) for value in com),
+            name + ": unassigned reading COM is malformed",
+        )
+        inertia = item.get("inertia")
+        _require(
+            isinstance(inertia, list)
+            and len(inertia) == 3
+            and all(
+                isinstance(row, list)
+                and len(row) == 3
+                and all(type(value) in (int, float) and math.isfinite(value) for value in row)
+                for row in inertia
+            ),
+            name + ": unassigned reading tensor is malformed",
+        )
+        row = (components.get(name) or {}).get("mass_properties")
+        _require(isinstance(row, dict), name + ": the unassigned occurrence has no component-level reading")
+        measured = {
+            "mass": float(row.get("mass")),
+            "com": [float(value) for value in row.get("com") or []],
+            "inertia": [[float(value) for value in entry] for entry in row.get("inertia") or []],
+        }
+        _require(
+            math.isclose(float(mass), measured["mass"], abs_tol=1e-12, rel_tol=1e-9)
+            and len(measured["com"]) == 3
+            and all(
+                math.isclose(float(a), b, abs_tol=1e-12, rel_tol=1e-9)
+                for a, b in zip(com, measured["com"], strict=True)
+            )
+            and len(measured["inertia"]) == 3
+            and all(
+                math.isclose(float(a), b, abs_tol=1e-12, rel_tol=1e-9)
+                for row_a, row_b in zip(inertia, measured["inertia"], strict=True)
+                for a, b in zip(row_a, row_b, strict=True)
+            ),
+            name + ": the unassigned reading does not match the sealed component measurement",
+        )
+        readings.append(
+            {
+                "name": name,
+                "mass": float(mass),
+                "com": [float(value) for value in com],
+                "inertia": [[float(value) for value in entry] for entry in inertia],
+                "basis": str(item["basis"]),
+            }
+        )
+    _require(sorted(seen) == expected, "Unassigned readings do not cover the unassigned partition exactly")
+    return readings
+
+
+def _combine_groups(entries: list[tuple[float, np.ndarray, np.ndarray]]) -> tuple[float, np.ndarray, np.ndarray]:
+    """Parallel-axis combination of (mass, COM, tensor) groups in one frame."""
+
+    total = math.fsum(float(mass) for mass, _com, _tensor in entries)
+    _require(total > 0.0, "The closure ledger carries no positive mass")
+    weighted = sum(
+        (float(mass) * np.asarray(com, dtype=float) for mass, com, _tensor in entries), np.zeros(3)
+    )
+    center = weighted / total
+    inertia = np.zeros((3, 3))
+    for mass, com, tensor in entries:
+        offset = np.asarray(com, dtype=float) - center
+        inertia += np.asarray(tensor, dtype=float) + float(mass) * (
+            float(offset @ offset) * np.eye(3) - np.outer(offset, offset)
+        )
+    return total, center, inertia
+
+
+def _unassigned_world(item: dict, raw_scene: dict) -> tuple[float, np.ndarray, np.ndarray]:
+    """One sealed unassigned reading placed in the assembly frame."""
+
+    world = oracle._raw_world(
+        {"id": "unassigned", "components": [item["name"]]},
+        raw_scene,
+        {
+            item["name"]: {
+                "mass": item["mass"],
+                "com": item["com"],
+                "inertia": item["inertia"],
+                "reference": {"product_convention": "solidworks_standard"},
+            }
+        },
+        {},
+    )
+    return (
+        float(world["mass"]),
+        np.asarray(world["com"], dtype=float),
+        np.asarray(world["inertia"], dtype=float),
+    )
+
+
 def _link_direct_record(evidence_root: Path) -> dict:
     """The sealed direct link group readout record (one supported schema)."""
 
@@ -1062,12 +1214,18 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
             "The link group mass record is required for the closure ledger",
         )
         direct_sum = _direct_link_sum(direct["record"], source)
-        unassigned = _unassigned_mass_rows(root, source)
-        unassigned_mass = math.fsum(item["mass_kg"] for item in unassigned)
-        accounted_mass = float(direct_sum[0]) + unassigned_mass
+        unassigned = _unassigned_readings(root, source)
+        unassigned_mass = math.fsum(item["mass"] for item in unassigned)
+        accounted_mass, accounted_com, accounted_tensor = _combine_groups(
+            [(float(direct_sum[0]), direct_sum[1], direct_sum[2])]
+            + [
+                _unassigned_world(item, raw)
+                for item in unassigned
+            ]
+        )
         _require(
             abs(accounted_mass - float(top[0])) <= 1e-12,
-            "Whole assembly / direct link sum: mass differs",
+            "Whole assembly / direct link sum + unassigned: mass differs",
         )
         reconciliation = {
             "recombination": {
@@ -1079,20 +1237,21 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
             },
             "direct_sum": {
                 "unassigned_mass_kg": unassigned_mass,
+                "unassigned_readings": len(unassigned),
                 "accounted_mass_kg": accounted_mass,
                 "mass_delta_kg": float(top[0]) - accounted_mass,
-                "com_delta_m": [float(a) - float(b) for a, b in zip(top[1], direct_sum[1], strict=True)],
-                "com_delta_norm_m": float(np.linalg.norm(np.subtract(top[1], direct_sum[1]))),
-                "tensor_delta_max_abs_kg_m2": float(np.max(np.abs(np.subtract(top[2], direct_sum[2])))),
-                "tensor_scale_kg_m2": float(max(np.max(np.abs(direct_sum[2])), 1e-20)),
+                "com_delta_m": [float(a) - float(b) for a, b in zip(top[1], accounted_com, strict=True)],
+                "com_delta_norm_m": float(np.linalg.norm(np.subtract(top[1], accounted_com))),
+                "tensor_delta_max_abs_kg_m2": float(np.max(np.abs(np.subtract(top[2], accounted_tensor)))),
+                "tensor_scale_kg_m2": float(max(np.max(np.abs(accounted_tensor)), 1e-20)),
             },
             "com_atol_m": CLOSURE_COM_ATOL_M,
             "tensor_rtol": CLOSURE_TENSOR_RTOL,
         }
         _compare(
             top,
-            (accounted_mass, direct_sum[1], direct_sum[2]),
-            "Whole assembly / direct link sum",
+            (accounted_mass, accounted_com, accounted_tensor),
+            "Whole assembly / direct link sum + unassigned",
             com_atol=CLOSURE_COM_ATOL_M,
             tensor_rtol=CLOSURE_TENSOR_RTOL,
         )

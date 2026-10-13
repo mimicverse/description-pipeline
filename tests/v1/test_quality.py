@@ -1277,6 +1277,114 @@ class PhysicsTests(unittest.TestCase):
         self.assertIn("physics.closure", self.failures())
 
 
+class UnassignedLedgerTests(unittest.TestCase):
+    """The complete unassigned group closes the common-frame closure ledger (W2).
+
+    Analytic control: two 1 kg occurrences at x=0 and x=1, each with tensor
+    diag(0.01, 0.02, 0.03) about its COM; the whole assembly is mass 2 kg,
+    COM (0.5, 0, 0), tensor diag(0.02, 0.54, 0.56).
+    """
+
+    def setUp(self):
+        self.fixture = PhysicsTests()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+
+    def __getattr__(self, name):
+        if name == "fixture":
+            raise AttributeError(name)
+        return getattr(self.fixture, name)
+
+    def _two_cube_fixture(self, selected, *, sealed_unassigned):
+        individual = [[0.01, 0.0, 0.0], [0.0, 0.02, 0.0], [0.0, 0.0, 0.03]]
+        whole = [[0.02, 0.0, 0.0], [0.0, 0.54, 0.0], [0.0, 0.0, 0.56]]
+        for name in ("a", "b"):
+            self.masses[name]["mass"] = 1.0
+            self.masses[name]["com"] = [0.0, 0.0, 0.0]
+            self.masses[name]["inertia"] = copy.deepcopy(individual)
+        for row, x in zip(self.raw["components"], (0.0, 1.0), strict=True):
+            transform = np.eye(4)
+            transform[0, 3] = x
+            row["transform"] = transform.ravel().tolist()
+        self.raw["coordinate_systems"]["base_datum"] = np.eye(4).ravel().tolist()
+        self.source["bodies"][0]["components"] = list(selected)
+        remaining = sorted({"a", "b"} - set(selected))
+        mass, center, tensor = (
+            (2.0, [0.5, 0.0, 0.0], copy.deepcopy(whole))
+            if not remaining
+            else (1.0, [0.0, 0.0, 0.0], copy.deepcopy(individual))
+        )
+        self.model["links"][0]["inertial"] = {
+            "mass": mass,
+            "xyz": center,
+            "rpy": [0.0, 0.0, 0.0],
+            "inertia": [float(tensor[0][0]), 0.0, 0.0, float(tensor[1][1]), 0.0, float(tensor[2][2])],
+        }
+        top = self.closure["top_level"]
+        top["mass"], top["com"], top["inertia"] = 2.0, [0.5, 0.0, 0.0], copy.deepcopy(whole)
+        self.closure["component_context"]["assembly_mass_kg"] = 2.0
+        for row in self.closure["component_context"]["instances"]:
+            row["context_mass_kg"] = 1.0
+        self.fixture.link_direct = self._link_direct_payload()
+        direct = self.fixture.link_direct["links"]["base_link"]
+        direct["selection"] = list(selected)
+        for read in direct["reads"]:
+            read["mass_kg"] = mass
+            read["com_m"] = list(center)
+            read["inertia_tensor_about_com"] = copy.deepcopy(tensor)
+        self.closure["unassigned"] = (
+            [
+                {
+                    "name": name,
+                    "mass": 1.0,
+                    "com": [0.0, 0.0, 0.0],
+                    "inertia": copy.deepcopy(individual),
+                    "basis": "cad_assembly_instance_measurement",
+                    "partition": "unassigned",
+                }
+                for name in remaining
+            ]
+            if sealed_unassigned
+            else []
+        )
+        self._record_clean_provenance()
+        self.write()
+
+    def test_all_selected_partition_passes_without_unassigned_readings(self):
+        self._two_cube_fixture(["a", "b"], sealed_unassigned=True)
+        self.assertEqual([], self.failures())
+
+    def test_complete_unassigned_measurement_closes_the_full_ledger(self):
+        """Selecting only 'a' still closes: the sealed 'b' reading is combined."""
+
+        self._two_cube_fixture(["a"], sealed_unassigned=True)
+        self.assertEqual([], self.failures())
+        checks = {check["id"]: check for check in verify_physics(self.root, self.source, self.model)}
+        reconciliation = checks["physics.closure"]["details"]["reconciliation"]
+        self.assertEqual(reconciliation["direct_sum"]["unassigned_readings"], 1)
+        self.assertAlmostEqual(reconciliation["direct_sum"]["com_delta_norm_m"], 0.0, places=12)
+        self.assertAlmostEqual(reconciliation["direct_sum"]["tensor_delta_max_abs_kg_m2"], 0.0, places=12)
+
+    def test_missing_unassigned_measurement_fails_closed(self):
+        """No sealed reading: no residual or recomputed substitute may close it."""
+
+        self._two_cube_fixture(["a"], sealed_unassigned=False)
+        failed = self.failures()
+        self.assertIn("physics.closure", failed)
+        checks = {check["id"]: check for check in verify_physics(self.root, self.source, self.model)}
+        self.assertIn("independent measured reading", checks["physics.closure"]["details"]["error"])
+
+    def test_invented_unassigned_reading_is_refused(self):
+        """A reading that disagrees with the sealed component measurement is refused."""
+
+        self._two_cube_fixture(["a"], sealed_unassigned=True)
+        self.closure["unassigned"][0]["com"] = [0.5, 0.0, 0.0]
+        failed = self.failures()
+        self.assertIn("physics.closure", failed)
+        checks = {check["id"]: check for check in verify_physics(self.root, self.source, self.model)}
+        self.assertIn("sealed component measurement", checks["physics.closure"]["details"]["error"])
+
+
 class StructuralQualityTests(unittest.TestCase):
     def test_windows_pywin32_integer_version_is_a_valid_runtime_version(self):
         with tempfile.TemporaryDirectory() as directory:
