@@ -20,11 +20,11 @@ from pathlib import Path
 from .jsonio import read_json
 from .errors import ConfigError
 from .scene import _PartReading, assembly_leaf_total, closure_delta, combine_mass_properties, identity_matrix
+from ...schemas import MASS_CLOSURE_REPORT_SCHEMA as REPORT_SCHEMA
 
 #: The Linux report schema; the native section is the ENTIRE
 #: ``raw/mass_closure.json`` object verbatim and the derived section carries
 #: the comparison evidence rebuilt on Linux.
-REPORT_SCHEMA = "solidworks-to-urdf.mass-closure-report/v1"
 
 
 def _read(root: Path, relative: str):

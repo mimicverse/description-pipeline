@@ -44,6 +44,7 @@ from description_pipeline.orchestration.linux_runner import fetch_capture as fet
 from description_pipeline.orchestration.linux_runner import run_portable_stage
 from description_pipeline.orchestration.linux_store import LinuxStore
 from description_pipeline.stages import (
+    PORTABLE_STAGES,
     STAGE_IDS,
     compact_view,
     contract_markdown,
@@ -57,8 +58,6 @@ from description_pipeline.sources.solidworks.selection import validate_file_inde
 
 DAG_ID = "solidworks_to_urdf"
 CONN_ID = os.environ.get("SOLIDWORKS_ENDPOINT_CONN_ID", "solidworks_windows")
-#: Stages the Linux portable host owns; a linked attempt from one of these skips Windows.
-PORTABLE_STAGES = ("generate", "verify", "publish")
 SENSOR_MODE = os.environ.get("SOLIDWORKS_SENSOR_MODE", "reschedule")
 POLL_INTERVAL = float(os.environ.get("SOLIDWORKS_POLL_INTERVAL", "10"))
 POLL_TIMEOUT = float(os.environ.get("SOLIDWORKS_TIMEOUT", "3600"))

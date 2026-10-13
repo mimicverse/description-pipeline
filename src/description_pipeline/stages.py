@@ -26,6 +26,64 @@ HOST_BY_STAGE = {stage["id"]: stage.get("host") for stage in CONTRACT["stages"]}
 if set(HOST_BY_STAGE.values()) - set(HOST_IDS) or any(host is None for host in HOST_BY_STAGE.values()):
     raise PipelineError("Every engineering stage must declare its execution hosts")
 VIEW_SCHEMA = "solidworks-to-urdf.stages/v1"
+#: Stages the portable Linux host owns, derived from the contract's host field
+#: so the set never depends on stage order (ORC-02).
+PORTABLE_STAGES = tuple(stage for stage, host in HOST_BY_STAGE.items() if host == "portable")
+
+#: Fixed definition-independent required checks every quality report must carry;
+#: ``verification.solidworks_urdf.required_checks`` adds the dynamic per-object gates.
+FIXED_REQUIRED_CHECKS = frozenset(
+    {
+        "bundle.subject",
+        "input.valid",
+        "source.native_discovery",
+        "tool.identity",
+        "source.integrity",
+        "source.native",
+        "model.schema",
+        "source.raw",
+        "physics.mass_closure_equality",
+        "source.dependencies",
+        "source.coverage",
+        "verification.complete",
+        "model.policy",
+        "physics.independent",
+        "frames.native",
+        "frames.components",
+        "frames.references",
+        "urdf.syntax_names",
+        "urdf.topology",
+        "geometry.coverage",
+        "geometry.native_tessellation",
+        "geometry.assets",
+        "consumer.urdf",
+    }
+)
+
+
+def required_rows_complete(required, rows) -> bool:
+    """One completeness predicate for nested gate inventories (VER-02).
+
+    Required ids must be a non-empty list of unique strings, every row must carry
+    a unique string id covering them, and every row must be individually passed.
+    """
+
+    if (
+        not isinstance(required, list)
+        or not required
+        or not all(isinstance(name, str) for name in required)
+        or not isinstance(rows, list)
+        or not all(isinstance(row, dict) for row in rows)
+    ):
+        return False
+    names = [row.get("id") for row in rows]
+    return (
+        all(isinstance(name, str) for name in names)
+        and len(set(names)) == len(names)
+        and len(set(required)) == len(required)
+        and set(required) <= set(names)
+        and all(row.get("state") == "passed" and row.get("passed") is True for row in rows)
+    )
 
 # ---------------------------------------------------------------------------
 # Live activity — what a running stage is doing right now.  This is deliberately
@@ -310,23 +368,7 @@ def checked(emit, stage, boundary, identifier, action, *, describe=None):
 
 def _complete_checks(details):
     """Nested gates must be explicit, unique and individually passed."""
-    required, rows = details.get("required_checks"), details.get("checks")
-    if (
-        not isinstance(required, list)
-        or not required
-        or not all(isinstance(name, str) for name in required)
-        or not isinstance(rows, list)
-        or not all(isinstance(row, dict) for row in rows)
-    ):
-        return False
-    names = [row.get("id") for row in rows]
-    return (
-        all(isinstance(name, str) for name in names)
-        and len(set(names)) == len(names)
-        and len(set(required)) == len(required)
-        and set(required) <= set(names)
-        and all(row.get("state") == "passed" and row.get("passed") is True for row in rows)
-    )
+    return required_rows_complete(details.get("required_checks"), details.get("checks"))
 
 
 def stage_view(job=None):

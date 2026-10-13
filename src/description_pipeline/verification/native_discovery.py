@@ -24,9 +24,10 @@ from pathlib import Path, PurePosixPath
 
 import yaml
 
+from ..schemas import CAD_REVISION_SCHEMA, INPUT_SCHEMA
+
 VERIFICATION_SCHEMA = "solidworks-to-urdf.native-discovery-verification/v1"
 DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v1"
-INPUT_SCHEMA = "solidworks-to-urdf.input/v1"
 ROBOT_FILE = "robot.yaml"
 REVISION_FILE = "cad-revision.json"
 DISCOVERY_FILE = "discovery/native-discovery.json"
@@ -2052,7 +2053,7 @@ def verify_discovery(package: Path) -> dict:
         _require(
             isinstance(revision, dict)
             and not set(revision) - fields
-            and revision.get("schema_version") == "solidworks-to-urdf.cad-revision/v1",
+            and revision.get("schema_version") == CAD_REVISION_SCHEMA,
             "discovery.revision",
             "the supplied revision manifest is malformed",
         )

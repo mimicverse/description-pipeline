@@ -16,13 +16,12 @@ from pathlib import Path
 
 from ..delivery import BUNDLE_SCHEMA, PIPELINE_ID, subject_digest, subject_inventory
 from ..io import PipelineError, confined, inventory, read_data, write_json
-from ..stages import STAGE_IDS, stage_view
+from ..stages import PORTABLE_STAGES, STAGE_IDS, stage_view
 from ..verification.solidworks_urdf import check_bundle, require_qualified_report
 from .airflow_client import JOB_SCHEMA, validate_run_id
 from .stage_transfer import CAPTURE_MANIFEST, TRANSFER_SCHEMA, admit_capture
 
 STORE_SCHEMA = "solidworks-to-urdf.linux-run/v1"
-PORTABLE_STAGES = ("generate", "verify", "publish")
 #: Bounds on the diagnostic preview payload; totals always report the untruncated count.
 MAX_PREVIEW_CHECKS = 60
 MAX_PREVIEW_WARNINGS = 40

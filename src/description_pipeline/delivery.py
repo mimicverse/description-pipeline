@@ -7,7 +7,6 @@ from pathlib import Path
 from .io import PipelineError, confined, digest, file_digest, inventory
 
 PIPELINE_ID = "solidworks-to-urdf"
-INPUT_SCHEMA = "solidworks-to-urdf.input/v1"
 BUNDLE_SCHEMA = "solidworks-to-urdf.bundle/v1"
 SUBJECT_DIRECTORIES = ("input", "evidence", "model", "urdf", "meshes")
 SUBJECT_FILES = ("README.md", "reports/input.json", "reports/tool.json")
@@ -16,6 +15,10 @@ SUBJECT_FILES = ("README.md", "reports/input.json", "reports/tool.json")
 #: admitted on Linux carries all three; neutral local-backend fixtures may carry none.  A partial
 #: set is an error: provenance must never be published without its bindings.
 TRANSFER_FILES = ("reports/native-tool.json", "reports/native-stages.json", "transfer-manifest.json")
+
+#: Linux-derived mass-closure receipt, bound whenever present (VER-11); the
+#: publish whitelist derives its basename from here.
+MASS_CLOSURE_REPORT = "reports/mass-closure.json"
 
 
 def subject_inventory(root: Path) -> dict[str, str]:
@@ -47,7 +50,7 @@ def subject_inventory(root: Path) -> dict[str, str]:
     # Native deliveries carry a Linux-derived comparison receipt. Neutral test
     # snapshots have no native mass capture; when present the receipt is part of
     # the verified subject, so removal or changes invalidate the checkpoint.
-    closure_report = "reports/mass-closure.json"
+    closure_report = MASS_CLOSURE_REPORT
     if (root / closure_report).is_file():
         files[closure_report] = file_digest(confined(root, closure_report))
     present = [name for name in TRANSFER_FILES if (root / name).is_file()]

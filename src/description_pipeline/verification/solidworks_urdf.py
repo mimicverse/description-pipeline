@@ -23,17 +23,19 @@ import yaml
 from ..delivery import PIPELINE_ID, subject_digest
 from ..geometry import stl
 from ..io import PipelineError, confined, file_digest, inventory, read_data
+from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, TOOL_SCHEMA
 from ..sources.snapshot import verify_snapshot
 from ..sources.solidworks.input import inspect_package
 from ..sources.solidworks.revision import NATIVE_SUFFIXES
 from ..sources.solidworks.revision import package_inventory, read_revision
+from ..stages import FIXED_REQUIRED_CHECKS, required_rows_complete
 from .consumer import load as load_consumer
 
 QUALITY_SCHEMA = "solidworks-to-urdf.quality/v1"
 POSITION_TOL_M = 5e-5
 ROTATION_TOL_RAD = math.radians(0.05)
 #: Deterministic MuJoCo-oriented partition limit for one delivered mesh visual.
-CHUNK_TRIANGLES_MAX = 199_999
+CHUNK_TRIANGLES_MAX = stl.MESH_PART_TRIANGLES_MAX
 _NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
@@ -129,31 +131,7 @@ class _Gates:
 
 def required_checks(definition=None):
     """Required independent gates, including every declared body, joint and frame."""
-    identifiers = {
-        "bundle.subject",
-        "input.valid",
-        "source.native_discovery",
-        "tool.identity",
-        "source.integrity",
-        "source.native",
-        "model.schema",
-        "source.raw",
-        "physics.mass_closure_equality",
-        "source.dependencies",
-        "source.coverage",
-        "verification.complete",
-        "model.policy",
-        "physics.independent",
-        "frames.native",
-        "frames.components",
-        "frames.references",
-        "urdf.syntax_names",
-        "urdf.topology",
-        "geometry.coverage",
-        "geometry.native_tessellation",
-        "geometry.assets",
-        "consumer.urdf",
-    }
+    identifiers = set(FIXED_REQUIRED_CHECKS)
     expectations = (definition or {}).get("checks") or {}
     for key, identifier in (
         ("expected_mass_kg", "physics.expected_mass"),
@@ -185,15 +163,10 @@ def require_qualified_report(report):
             and all(isinstance(name, str) for name in expected),
             "Quality gate inventory is malformed",
         )
-        identifiers = {row["id"] for row in rows}
         _require(
             report.get("passed") is True
-            and bool(expected)
-            and len(set(expected)) == len(expected)
             and set(required_checks()) <= set(expected)
-            and set(expected) <= identifiers
-            and len(identifiers) == len(rows)
-            and all(row.get("state") == "passed" and row.get("passed") is True for row in rows),
+            and required_rows_complete(expected, rows),
             "URDF verification failed or required checks were not executed; see reports/quality.json",
         )
     except PipelineError as error:
@@ -619,7 +592,7 @@ def _tool(root):
 
     tool = read_data(confined(root, "reports/tool.json"))
     _require(
-        tool["pipeline_id"] == PIPELINE_ID and tool["schema_version"] == "solidworks-to-urdf.tool/v1",
+        tool["pipeline_id"] == PIPELINE_ID and tool["schema_version"] == TOOL_SCHEMA,
         "Unknown build tool",
     )
     _require(re.fullmatch(r"[0-9a-f]{64}", tool["source_sha256"]) is not None, "Missing tool code digest")
@@ -863,7 +836,7 @@ def _qualified_surface_only(root, occurrence: str) -> bool:
         mass_properties = read_data(confined(root / "evidence", "raw/mass_properties.json"))
     except (PipelineError, OSError, ValueError):
         return False
-    if not isinstance(record, dict) or record.get("schema_version") != "solidworks-to-urdf.effective-instances/v1":
+    if not isinstance(record, dict) or record.get("schema_version") != EFFECTIVE_INSTANCES_SCHEMA:
         return False
     readings = record.get("readings")
     if not isinstance(readings, dict):

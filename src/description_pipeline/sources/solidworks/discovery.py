@@ -75,11 +75,11 @@ from .jsonio import write_json
 from .errors import CadError
 from .exporter import ExporterDeclarationError, decode_exporter_v14
 from .revision import package_inventory, seal_revision
+from ...schemas import INPUT_SCHEMA
 
 DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v1"
 PREPARED_SCHEMA = "solidworks-to-urdf.prepared-package/v1"
 FINDING_SCHEMA = "solidworks-to-urdf.discovery-finding/v1"
-INPUT_SCHEMA = "solidworks-to-urdf.input/v1"
 ROBOT_FILE = "robot.yaml"
 REVISION_FILE = "cad-revision.json"
 DISCOVERY_FILE = "discovery/native-discovery.json"
