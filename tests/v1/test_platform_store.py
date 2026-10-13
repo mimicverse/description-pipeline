@@ -20,6 +20,61 @@ from description_pipeline.platform.store import (
 )
 
 NOW = datetime(2026, 10, 14, 10, 0, tzinfo=UTC)
+SUBJECT = "a" * 64
+HANDOFF = "b" * 64
+
+
+def generate_receipt(**overrides) -> dict:
+    payload = {
+        "schema_version": "solidworks-to-urdf.bundle/v1",
+        "pipeline_id": "solidworks-to-urdf",
+        "run_id": "r-1",
+        "stage": "generate",
+        "state": "generated",
+        "passed": False,
+        "subject_sha256": SUBJECT,
+        "handoff_sha256": HANDOFF,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def verify_receipt(**overrides) -> dict:
+    payload = {
+        "schema_version": "solidworks-to-urdf.bundle/v1",
+        "pipeline_id": "solidworks-to-urdf",
+        "run_id": "r-1",
+        "stage": "verify",
+        "state": "verified",
+        "passed": True,
+        "subject_sha256": SUBJECT,
+        "handoff_sha256": HANDOFF,
+        "quality": {"passed": True, "subject_sha256": SUBJECT},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def publish_receipt(**overrides) -> dict:
+    payload = {
+        "schema_version": "solidworks-to-urdf.bundle/v1",
+        "pipeline_id": "solidworks-to-urdf",
+        "run_id": "r-1",
+        "stage": "publish",
+        "state": "published",
+        "passed": True,
+        "subject_sha256": SUBJECT,
+        "handoff_sha256": HANDOFF,
+        "quality": {"passed": True, "subject_sha256": SUBJECT},
+        "submission": {
+            "passed": True,
+            "state": "published",
+            "url": "https://github.com/example/repo/pull/1",
+            "subject_sha256": SUBJECT,
+        },
+    }
+    payload.update(overrides)
+    return payload
 
 
 class FakeWorld:
@@ -113,7 +168,7 @@ class FakeCursor:
             self._rows = [(state, world.run_from_stage.get(params[0]))] if state is not None else []
         elif "FROM platform.operation WHERE run_id = %s AND kind = 'publish' AND state = 'succeeded'" in normalized:
             self._rows = [(1,)] if (params[0], "publish") in world.confirmed_publishes else []
-        elif normalized.startswith("SELECT state FROM platform.stage WHERE run_id = %s AND stage = %s"):
+        elif normalized.startswith("SELECT state FROM platform.stage WHERE run_id = %s AND stage = %s FOR UPDATE"):
             record = world.stages.get((params[0], params[1]))
             self._rows = [(record[0],)] if record else []
         elif normalized.startswith("SELECT state, receipt FROM platform.stage WHERE run_id = %s AND stage = %s"):
@@ -123,7 +178,13 @@ class FakeCursor:
             run_id, stage, state = params[0], params[1], params[2]
             receipt = json.loads(params[3]) if params[3] is not None else None
             existing = world.stages.get((run_id, stage))
-            if existing is not None and existing[0] in {"completed", "failed", "cancelled", "unresolved"}:
+            if "= 'unresolved'" in normalized:  # the reconciliation statement
+                if existing is not None and existing[0] == "unresolved":
+                    world.stages[(run_id, stage)] = (state, receipt)
+                    self._rows = [(run_id, stage, state)]
+                else:
+                    self._rows = []
+            elif existing is not None and existing[0] in {"completed", "failed", "cancelled", "blocked", "unresolved"}:
                 self._rows = []
             else:
                 world.stages[(run_id, stage)] = (state, receipt)
@@ -152,14 +213,6 @@ NAMED = {
     "main_assembly": "cad/robot.SLDASM",
 }
 
-GENERATE_RECEIPT = {
-    "run_id": "r-1",
-    "stage": "generate",
-    "state": "generated",
-    "passed": False,
-    "subject_sha256": "a" * 64,
-}
-
 
 class PlatformStoreTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -178,7 +231,7 @@ class PlatformStoreTests(unittest.TestCase):
         self.admit(from_stage=from_stage)
         self.world.run_states["r-1"] = "running"
         if verify_done:
-            self.world.stages[("r-1", "verify")] = ("completed", {"stage": "verify"})
+            self.world.stages[("r-1", "verify")] = ("completed", verify_receipt())
 
     def _publish_registration(self, **overrides):
         payload = {
@@ -279,11 +332,14 @@ class PlatformStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(PlatformStoreError, "not running"):
                 self._publish_registration()
 
-    def test_a_stage_after_the_start_requires_its_completed_predecessor(self) -> None:
+    def test_a_stage_after_the_start_requires_a_fully_bound_predecessor(self) -> None:
         self._running_run()  # a fresh run starts at freeze; publish needs verify first
         with self.assertRaisesRegex(PlatformStoreError, "requires the completed 'verify' stage"):
             self._publish_registration()
-        self.world.stages[("r-1", "verify")] = ("completed", {"stage": "verify"})
+        self.world.stages[("r-1", "verify")] = ("completed", {"run_id": "r-1", "stage": "verify"})
+        with self.assertRaisesRegex(PlatformStoreError, "sealed receipt"):
+            self._publish_registration()
+        self.world.stages[("r-1", "verify")] = ("completed", verify_receipt())
         self.assertEqual(self._publish_registration().stage, "publish")
 
     def test_terminal_runs_only_continue_via_cancel_or_reconcile(self) -> None:
@@ -302,37 +358,84 @@ class PlatformStoreTests(unittest.TestCase):
 
     # ----------------------------------------------------------------- stages
 
-    def test_confirm_stage_requires_bound_terminal_receipts_and_is_immutable(self) -> None:
+    def test_completed_confirmations_bind_the_whole_receipt(self) -> None:
         self._running_run()
         with self.assertRaisesRegex(PlatformStoreError, "state must be one of"):
             self.store.confirm_stage(run_id="r-1", stage="generate", state="generated")
-        with self.assertRaisesRegex(PlatformStoreError, "bound sealed receipt"):
-            self.store.confirm_stage(run_id="r-1", stage="generate", state="completed")
+        # gpt's counterexample: run/stage/state strings alone are not a receipt.
+        with self.assertRaisesRegex(PlatformStoreError, "schema"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="verify",
+                state="completed",
+                receipt={"run_id": "r-1", "stage": "verify", "state": "verified"},
+            )
         with self.assertRaisesRegex(PlatformStoreError, "confirmed receipt state"):
             self.store.confirm_stage(
-                run_id="r-1", stage="generate", state="completed", receipt={**GENERATE_RECEIPT, "state": "failed"}
+                run_id="r-1", stage="generate", state="completed", receipt=generate_receipt(state="failed")
+            )
+        with self.assertRaisesRegex(PlatformStoreError, "quality payload"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="verify",
+                state="completed",
+                receipt=verify_receipt(quality={"passed": False, "subject_sha256": SUBJECT}),
             )
         self.store.confirm_stage(run_id="r-1", stage="generate", state="running")
-        self.store.confirm_stage(
-            run_id="r-1", stage="generate", state="completed", receipt=GENERATE_RECEIPT
-        )
+        self.store.confirm_stage(run_id="r-1", stage="generate", state="completed", receipt=generate_receipt())
         with self.assertRaisesRegex(PlatformStoreError, "already terminal"):
-            self.store.confirm_stage(run_id="r-1", stage="generate", state="failed", receipt=GENERATE_RECEIPT)
+            self.store.confirm_stage(run_id="r-1", stage="generate", state="failed", receipt=generate_receipt())
         self.store.confirm_stage(
-            run_id="r-1", stage="verify", state="failed", receipt={"run_id": "r-1", "stage": "verify"}
+            run_id="r-1",
+            stage="verify",
+            state="failed",
+            receipt={**verify_receipt(), "state": "failed", "passed": False},
         )
         with self.assertRaisesRegex(PlatformStoreError, "already terminal"):
             self.store.confirm_stage(run_id="r-1", stage="verify", state="running")
+
+    def test_unresolved_is_confirmed_only_by_evidenced_reconciliation(self) -> None:
+        self._running_run()
+        self.store.confirm_stage(
+            run_id="r-1", stage="generate", state="unresolved", receipt={**generate_receipt(), "state": "unresolved"}
+        )
+        with self.assertRaisesRegex(PlatformStoreError, "evidenced reconciliation"):
+            self.store.confirm_stage(run_id="r-1", stage="generate", state="completed", receipt=generate_receipt())
+        with self.assertRaisesRegex(PlatformStoreError, "definite outcome"):
+            self.store.confirm_stage(
+                run_id="r-1", stage="generate", state="unresolved", receipt=generate_receipt(), reconcile={"ref": "x"}
+            )
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="generate",
+            state="completed",
+            receipt=generate_receipt(),
+            reconcile={"result_ref": "reconcile-42"},
+        )
+        self.assertEqual(self.world.stages[("r-1", "generate")][0], "completed")
+        self.assertEqual(
+            self.world.stages[("r-1", "generate")][1]["reconciliation"], {"result_ref": "reconcile-42"}
+        )
+        with self.assertRaisesRegex(PlatformStoreError, "already terminal"):
+            self.store.confirm_stage(run_id="r-1", stage="generate", state="running")
+
+    def test_blocked_is_terminal_and_carries_no_receipt(self) -> None:
+        self._running_run()
+        self.store.confirm_stage(run_id="r-1", stage="generate", state="blocked")
+        self.assertEqual(self.world.stages[("r-1", "generate")][0], "blocked")
+        with self.assertRaisesRegex(PlatformStoreError, "already terminal"):
+            self.store.confirm_stage(run_id="r-1", stage="generate", state="completed", receipt=generate_receipt())
 
     def test_confirmed_stage_returns_sealed_receipts_or_refuses(self) -> None:
         self._running_run()
         self.assertEqual(self.store.confirmed_stage("r-1", "generate"), None)
         self.store.confirm_stage(run_id="r-1", stage="generate", state="running")
         self.assertEqual(self.store.confirmed_stage("r-1", "generate"), None)
-        self.store.confirm_stage(run_id="r-1", stage="generate", state="completed", receipt=GENERATE_RECEIPT)
-        self.assertEqual(self.store.confirmed_stage("r-1", "generate"), GENERATE_RECEIPT)
-        self.world.stages[("r-1", "generate")] = ("completed", {**GENERATE_RECEIPT, "run_id": "r-2"})
-        with self.assertRaisesRegex(PlatformStoreError, "does not bind"):
+        receipt = generate_receipt()
+        self.store.confirm_stage(run_id="r-1", stage="generate", state="completed", receipt=receipt)
+        self.assertEqual(self.store.confirmed_stage("r-1", "generate"), receipt)
+        self.world.stages[("r-1", "generate")] = ("completed", {**receipt, "run_id": "r-2"})
+        with self.assertRaisesRegex(PlatformStoreError, "another run or stage"):
             self.store.confirmed_stage("r-1", "generate")
 
     # ------------------------------------------------------------------ reads

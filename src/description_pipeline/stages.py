@@ -71,7 +71,9 @@ STAGE_STATES = frozenset({"pending", "running", "completed", "failed", "cancelle
 
 #: Business terminal stage states: once a stage record reaches one of these it
 #: is never overwritten again - a redo is a linked run, not a rewrite.
-TERMINAL_STAGE_STATES = frozenset({"completed", "failed", "cancelled", "unresolved"})
+#: ``unresolved`` is deliberately NOT terminal: it is a pending unknown that
+#: only an evidenced reconciliation of the same operation may confirm.
+TERMINAL_STAGE_STATES = frozenset({"completed", "failed", "cancelled", "blocked"})
 
 #: Fixed definition-independent required checks every quality report must carry;
 #: ``verification.solidworks_urdf.required_checks`` adds the dynamic per-object gates.
