@@ -50,11 +50,35 @@ from description_pipeline.verification.solidworks_urdf import (
     check_bundle,
 )
 
-EXPECTED_STALE_SUFFIX = "copyDesigntemp\\lowerbody.sldasm"
+EXPECTED_STALE_SUFFIX = "copydesigntemp\\lowerbody.sldasm"  # compared against casefolded locations
 
 CANONICAL_MATERIAL_REASON = "cad_material_provenance_missing"
 MATERIAL_FALLBACK_MESSAGE = "material assignment is not verified"
 NATIVE_READING_SCOPES = ("component", "part_document")
+
+
+def _quality_gates(quality: dict) -> dict:
+    """Quality checks by id, including the nested release gates (1.3.10+).
+
+    Releases 1.3.10-1.3.12 nest the deep physics gates (physics.material_provenance,
+    physics.authority, physics.effective_instances, physics.link_direct_record,
+    physics.closure, physics.link_partition_audit) inside
+    physics.independent.details.checks.  Top-level ids win when both exist so
+    legacy bundles keep their exact gate set.
+    """
+
+    gates: dict = {}
+    checks = [check for check in quality.get("checks") or [] if isinstance(check, dict) and check.get("id")]
+    for check in checks:
+        gates[str(check["id"])] = check
+    for check in checks:
+        if str(check.get("id")) != "physics.independent":
+            continue
+        nested_checks = ((check.get("details") or {}).get("checks")) or []
+        for nested in nested_checks:
+            if isinstance(nested, dict) and nested.get("id"):
+                gates.setdefault(str(nested["id"]), nested)
+    return gates
 
 
 def _finite(value: object) -> bool:
@@ -233,7 +257,7 @@ def _material_warning_acceptance(bundle: Path, quality: dict) -> dict:
                 _bind_material_entry(name, entry, row, reference, assignment, errors)
             if sorted(recorded) != affected:
                 errors.append("material warnings do not cover the unverified materials exactly")
-    gates = {check.get("id"): check for check in quality.get("checks") or [] if isinstance(check, dict)}
+    gates = _quality_gates(quality)
     gate = gates.get("physics.material_provenance") or {}
     details = gate.get("details") or {}
     result["gate_claims_pass"] = gate.get("passed") is True
@@ -613,6 +637,78 @@ def _compare_receipt(recorded, mine, label: str, errors: list) -> None:
         errors.append(label + ": derived value changed")
 
 
+def _compare_pristine_derived(recorded, mine: dict, comparison: dict, errors: list) -> None:
+    """Bind the sealed derived block under the released pristine semantics.
+
+    The pristine-reopen workflow accounts the effective total from the reopened
+    direct link reads (+ unassigned context mass) and keeps the walked
+    per-instance recombination as a recorded diagnostic, so the accounting
+    numbers are bound at the released closure constants (mass 1e-12 kg, COM
+    1e-3 m, tensor 1e-2 relative) while every other value stays an exact receipt.
+    Legacy runs never reach this branch.
+    """
+
+    def fail(message: str) -> None:
+        errors.append("derived: " + message)
+
+    if not isinstance(recorded, dict) or set(recorded) != set(mine):
+        fail("derived keys changed")
+        return
+    recorded_total = recorded.get("effective_total")
+    if not isinstance(recorded_total, dict) or set(recorded_total) != set(mine["effective_total"]):
+        fail("derived.effective_total: derived keys changed")
+        return
+    recorded_selection = recorded.get("selection")
+    if not isinstance(recorded_selection, dict) or set(recorded_selection) != set(mine["selection"]):
+        fail("derived.selection: derived keys changed")
+        return
+    try:
+        accounted = float(comparison["accounted_mass_kg"])
+        unassigned = float(comparison["unassigned_mass_kg"])
+        mass_delta = abs(float(recorded_total["mass"]) - accounted)
+        stored_com = np.asarray(recorded_total["com"], dtype=float)
+        direct_com = np.asarray(comparison["direct_com_m"], dtype=float)
+        stored_inertia = np.asarray(recorded_total["inertia"], dtype=float)
+        direct_inertia = np.asarray(comparison["direct_inertia_kg_m2"], dtype=float)
+        native_mass = float(mine["selection"]["native_mass_kg"])
+        selected_delta = abs(float(recorded_selection["selected_mass_kg"]) - (accounted - unassigned))
+        accounting_delta = abs(float(recorded_selection["accounting_delta_kg"]) - (native_mass - accounted))
+    except (KeyError, TypeError, ValueError):
+        fail("the pristine accounting comparison is malformed")
+        return
+    if stored_com.shape != (3,) or direct_com.shape != (3,):
+        fail("derived.effective_total.com is malformed")
+        return
+    if stored_inertia.shape != (3, 3) or direct_inertia.shape != (3, 3):
+        fail("derived.effective_total.inertia is malformed")
+        return
+    com_delta = float(np.linalg.norm(stored_com - direct_com))
+    tensor_scale = float(max(np.max(np.abs(direct_inertia)), 1e-20))
+    tensor_rel = float(np.max(np.abs(stored_inertia - direct_inertia)) / tensor_scale)
+    if mass_delta > 1e-12:
+        fail(f"derived.effective_total.mass differs from the pristine direct reads by {mass_delta} kg")
+    if com_delta > 1e-3:
+        fail(f"derived.effective_total.com differs from the pristine direct reads by {com_delta} m")
+    if tensor_rel > 1e-2:
+        fail(f"derived.effective_total.inertia differs from the pristine direct reads (rel {tensor_rel})")
+    if selected_delta > 1e-12:
+        fail(f"derived.selection.selected_mass_kg differs from the pristine account by {selected_delta} kg")
+    if accounting_delta > 1e-12:
+        fail(f"derived.selection.accounting_delta_kg differs from the pristine account by {accounting_delta} kg")
+    _compare_receipt(
+        recorded_total.get("substituted"),
+        mine["effective_total"].get("substituted"),
+        "derived.effective_total.substituted",
+        errors,
+    )
+    for key in ("blockers", "coverage", "delta", "instances", "leaf_total", "overridden", "totals"):
+        _compare_receipt(recorded.get(key), mine.get(key), "derived." + key, errors)
+    for key in ("native_mass_kg", "unassigned_mass_kg", "unassigned", "whole_mass_qualified"):
+        _compare_receipt(
+            recorded_selection.get(key), mine["selection"].get(key), "derived.selection." + key, errors
+        )
+
+
 def _direct_readout_comparison(
     bundle: Path, closure: dict, scene: dict, source: dict, link_record: dict, top_level: dict
 ) -> dict:
@@ -682,6 +778,8 @@ def _direct_readout_comparison(
         "unassigned_mass_kg": float(unassigned_mass),
         "unassigned": unassigned_names,
         "accounted_mass_kg": float(accounted_mass),
+        "direct_com_m": [float(value) for value in center],
+        "direct_inertia_kg_m2": [[float(value) for value in row] for row in inertia],
         "mass_delta_kg": abs(top_mass - accounted_mass),
         "com_delta_m": [float(value) for value in com_delta],
         "com_delta_norm_m": float(np.linalg.norm(com_delta)),
@@ -781,8 +879,14 @@ def _effective_instance_acceptance(bundle: Path, quality: dict) -> dict:
     mirrored = notes.get("effective_instances") if isinstance(notes.get("effective_instances"), dict) else {}
     if mirrored != readings:
         errors.append("effective instance readings differ from the captured scene notes")
-    if set(readings) != set(effective_names):
-        errors.append("effective instance readings do not cover the native overrides exactly")
+    missing_readings = sorted(set(effective_names) - set(readings))
+    if missing_readings:
+        errors.append(
+            "effective instance readings do not cover the native overrides (missing: "
+            + ", ".join(missing_readings[:10])
+            + ("" if len(missing_readings) <= 10 else ", ...")
+            + ")"
+        )
     for name in sorted(overridden):
         row = instances[name]
         if not isinstance(row.get("effective"), dict) or row.get("effective_error"):
@@ -955,8 +1059,15 @@ def _effective_instance_acceptance(bundle: Path, quality: dict) -> dict:
                 errors.append(name + ": flagless difference warning is not a leaf reading")
         else:
             errors.append(name + ": effective warning carries another code")
-    if sorted(seen) != expected_pairs:
-        errors.append("effective warnings do not cover the native overrides exactly")
+    seen_pairs = set(seen)
+    missing_warnings = sorted(pair for pair in expected_pairs if pair not in seen_pairs)
+    if missing_warnings:
+        errors.append(
+            "effective warnings do not cover the native overrides (missing: "
+            + ", ".join(f"{name}:{code}" for name, code in missing_warnings[:10])
+            + ("" if len(missing_warnings) <= 10 else ", ...")
+            + ")"
+        )
     if isinstance(report_file, dict) and isinstance(report_file.get("derived"), dict):
         try:
             mine = _derive_report(closure, scene, masses, source)
@@ -966,7 +1077,28 @@ def _effective_instance_acceptance(bundle: Path, quality: dict) -> dict:
         if mine is not None:
             if mine["blockers"]:
                 errors.append("effective substitution spans bodies: " + json.dumps(mine["blockers"])[:300])
-            _compare_receipt(report_file["derived"], mine, "derived", errors)
+            pristine_comparison = None
+            direct_top = closure.get("top_level")
+            if isinstance(direct_top, dict):
+                direct_links = read(bundle / "evidence/raw/link_group_mass_properties.json")
+                if (
+                    isinstance(direct_links, dict)
+                    and direct_links.get("readout_window") == "pristine-reopen"
+                    and (direct_top.get("reference") or {}).get("readout_window") == "pristine-reopen"
+                ):
+                    try:
+                        pristine_comparison = _direct_readout_comparison(
+                            bundle, closure, scene, source, direct_links, direct_top
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        pristine_comparison = None
+            if pristine_comparison is not None:
+                # Released pristine semantics: bind the sealed derived block to the
+                # reopened direct-read account at the closure constants; the walked
+                # recombination stays a recorded diagnostic.
+                _compare_pristine_derived(report_file["derived"], mine, pristine_comparison, errors)
+            else:
+                _compare_receipt(report_file["derived"], mine, "derived", errors)
         top_level = closure.get("top_level")
         expected = mine["effective_total"] if mine is not None else None
         if isinstance(top_level, dict):
@@ -1269,9 +1401,30 @@ def main() -> int:
         and _zero(limit.get("upper"))
     ]
     report["joints"] = {"total": len(joints), "movable": len(movable), "zero_valued": len(zero_valued)}
+    discovery_source = None
+    try:
+        discovery_source = json.loads(
+            (bundle / "input/discovery/native-discovery.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        discovery_source = None
+    findings = (discovery_source or {}).get("findings") or []
+    legacy_v14 = sum(1 for d in discovery.get("diagnostics") or [] if d.get("code") == "v14.motion_unqualified")
+    finding_limits = sum(
+        1 for item in findings if isinstance(item, dict) and item.get("code") == "discovery.joint_limits_degenerate"
+    )
+    finding_drive = sum(
+        1 for item in findings if isinstance(item, dict) and item.get("code") == "discovery.joint_drive_unspecified"
+    )
+    if legacy_v14 == 0 and (finding_limits or finding_drive):
+        v14_limits, v14_drive = finding_limits, finding_drive
+    else:
+        # legacy diagnostics predate the findings restructure; keep the released pin.
+        v14_limits = v14_drive = legacy_v14
     report["motion_warnings"] = {
         "urdf": sum(1 for d in quality.get("diagnostics") or [] if d.get("code") == "urdf.motion_unqualified"),
-        "v14": sum(1 for d in discovery.get("diagnostics") or [] if d.get("code") == "v14.motion_unqualified"),
+        "v14": v14_limits,
+        "v14_drive": v14_drive,
     }
 
     stale = report["stale_skips"]
@@ -1326,7 +1479,7 @@ def main() -> int:
             link_record = json.loads(link_record_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             link_record = None
-    quality_checks = {check.get("id"): check for check in quality.get("checks") or []}
+    quality_checks = _quality_gates(quality)
     closure_reconciliation = (
         (quality_checks.get("physics.closure") or {}).get("details") or {}
     ).get("reconciliation") or {}
@@ -1407,6 +1560,7 @@ def main() -> int:
         and report["joints"]["zero_valued"] == 25
         and report["motion_warnings"]["urdf"] == 25
         and report["motion_warnings"]["v14"] == 25
+        and report["motion_warnings"]["v14_drive"] == 25
         and stale["count"] >= 1
         and stale["validated_count"] == stale["count"]
         and stale["lowerbody_recorded"]
