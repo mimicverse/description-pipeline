@@ -137,6 +137,13 @@ def _require(condition: bool, message: str, detail: object | None = None) -> Non
         raise ConfigError(message, detail)
 
 
+def _capture_note(activity, action: str, **fields) -> None:
+    """One best-effort capture activity note; the emitter is inert without a callback."""
+
+    if activity is not None:
+        activity.emit(action, phase="capture", **fields)
+
+
 def _normalise_path(value: str) -> str:
     return os.path.normcase(os.path.abspath(value))
 
@@ -1442,7 +1449,7 @@ def _mass_closure(backend: Any, cfg: dict[str, Any], document: str | None = None
 
 
 def _capture_readings(
-    backend: Any, cfg: dict[str, Any], closure: dict[str, Any], source_root: Path
+    backend: Any, cfg: dict[str, Any], closure: dict[str, Any], source_root: Path, activity=None
 ) -> tuple[Any, dict[str, Any]]:
     """Read the raw scene from the collected copy, never from the working tree.
 
@@ -1464,6 +1471,7 @@ def _capture_readings(
     scene = backend.collect_scene(
         document,
         cfg["coordinate_systems"],
+        on_activity=activity.publish if activity is not None else None,
         require_material=cfg["material_source"] == "cad",
     )
     reported = str(getattr(scene, "document", "") or "")
@@ -1735,7 +1743,7 @@ def _capture_axis_references(backend: Any, cfg: dict[str, Any]) -> list[dict[str
 
 
 def _export_geometry(
-    backend: Any, cfg: dict[str, Any], geometry_dir: Path, components: list[str]
+    backend: Any, cfg: dict[str, Any], geometry_dir: Path, components: list[str], activity=None
 ) -> list[dict[str, Any]]:
     geometry_dir.mkdir(parents=True, exist_ok=True)
     # Keep one native geometry phase alive across all occurrence reads.
@@ -1746,7 +1754,10 @@ def _export_geometry(
     }
     if len(destinations) != len(components):
         raise BridgeError("cad_mesh_export_failed", "geometry contains duplicate occurrence identities", exit_code=3)
-    entries = backend.export_component_meshes(destinations)
+    entries = backend.export_component_meshes(
+        destinations,
+        on_activity=activity.publish if activity is not None else None,
+    )
     if not isinstance(entries, dict) or set(entries) != set(destinations):
         raise BridgeError("cad_mesh_export_failed", "geometry export returned a different occurrence set", exit_code=3)
     exported: list[dict[str, Any]] = []
@@ -2065,6 +2076,7 @@ def _pristine_readout_window(
     cfg: dict[str, Any],
     closure: dict[str, Any],
     selections: dict[str, dict[str, Any]],
+    activity=None,
 ) -> dict[str, Any]:
     """Whole-assembly and direct link reads in the pristine reopen window.
 
@@ -2092,10 +2104,12 @@ def _pristine_readout_window(
             "the backend cannot reopen a pristine readout window",
             exit_code=3,
         )
+    _capture_note(activity, "window_close")
     closer()
     prepare = getattr(backend, "prepare_source", None)
     if callable(prepare):
         prepare(document, cfg["configuration"])
+    _capture_note(activity, "window_reopen")
     opened = opener(document)
     if not isinstance(opened, dict) or not _same_document(str(opened.get("path") or ""), document):
         raise BridgeError(
@@ -2107,16 +2121,19 @@ def _pristine_readout_window(
             },
             exit_code=3,
         )
+    _capture_note(activity, "window_read", params={"scope": "link_groups"})
     payload = reader(document, {name: entry["selection"] for name, entry in selections.items()})
     record = _link_group_record_from_payload(payload, selections, document)
     record["readout_window"] = PRISTINE_WINDOW
     assembly = getattr(backend, "assembly_mass_properties", None)
     top_level = None
     if callable(assembly):
+        _capture_note(activity, "window_read", params={"scope": "assembly"})
         try:
             top_level = assembly(document)
         except Exception:  # noqa: BLE001 - mirrors _mass_closure's optional whole-assembly reader
             top_level = None
+    _capture_note(activity, "window_close")
     closer()
     return {"top_level": top_level, "record": record}
 
@@ -2127,11 +2144,17 @@ def _freeze_local(
     *,
     backend: Any,
     worker_version: str = "unknown",
+    on_activity=None,
 ) -> dict[str, Any]:
     """Capture ``config['assembly']`` into ``destination`` and return the manifest.
 
     With ``source.worker_url`` set, the capture runs on a Windows worker over the
     loopback tunnel instead of calling COM in this process.
+
+    ``on_activity`` optionally observes best-effort capture progress records for
+    the portal's live-activity view (component walk, per-instance reads, mesh
+    export, closure and the pristine window); it never changes the snapshot or
+    its checks.
     """
 
     # Check the path the caller gave us *before* resolving: resolving a symlink
@@ -2163,7 +2186,13 @@ def _freeze_local(
         "joints": len(cfg["joints"]),
         "declared_masses": len(cfg.get("documented_masses") or {}),
     }
+    from .native import ACTIVITY_KEEPALIVE_SECONDS, _ActivityEmitter
+
+    activity = _ActivityEmitter(on_activity, keepalive_seconds=ACTIVITY_KEEPALIVE_SECONDS)
+    activity.start_keepalive()
+    _capture_note(activity, "start", force=True)
     stage = "document_state"
+    _capture_note(activity, "document_state")
     try:
         prepare = getattr(backend, "prepare_source", None)
         if callable(prepare):
@@ -2182,14 +2211,22 @@ def _freeze_local(
             )
 
         stage = "dependency_closure"
+        _capture_note(activity, "closure")
         closure = _dependency_closure(backend, cfg, staging / "source")
+        _capture_note(
+            activity,
+            "closure",
+            params={"documents": len(closure.get("documents") or {}), "files": len(closure.get("copy_files") or {})},
+        )
         # The source is retired and the copy is active. Persist their identities before
         # native reads so a failed geometry capture retains its environment.
         stage = "environment"
+        _capture_note(activity, "environment")
         environment = capture_environment(backend, worker_version)
         write_json(staging / "evidence" / "environment.json", environment)
         stage = "readings"
-        scene, raw = _capture_readings(backend, cfg, closure, staging / "source")
+        _capture_note(activity, "readings")
+        scene, raw = _capture_readings(backend, cfg, closure, staging / "source", activity=activity)
         write_json(staging / "raw" / "scene_raw.json", raw)
         write_json(staging / "raw" / "document_state.json", state)
         write_json(staging / "raw" / "dependency_closure.json", closure)
@@ -2204,6 +2241,7 @@ def _freeze_local(
             write_json(staging / "raw" / "axis_references.json", axis_references)
         # Computed here so `component_context` observes exactly the walked
         # session; `top_level` is replaced by the pristine window reading below.
+        _capture_note(activity, "mass_closure")
         mass_closure = _mass_closure(backend, cfg, getattr(scene, "document", None))
         # Effective instance readings (overridden instances, sheet-only
         # fallback) come from the SAME component-context traversal; they are
@@ -2214,6 +2252,7 @@ def _freeze_local(
         cache_error: dict[str, Any] | None = None
         collector = getattr(backend, "effective_instance_readings", None)
         if callable(collector):
+            _capture_note(activity, "effective_instances")
             try:
                 backend_readings = collector()
             except Exception as error:  # noqa: BLE001 - preserved as evidence, never fatal
@@ -2243,11 +2282,13 @@ def _freeze_local(
         geometry_entries: list[dict[str, Any]] = []
         if cfg["geometry"].get("enabled", True):
             stage = "geometry"
+            _capture_note(activity, "geometry")
             components = [component.name for component in scene.components]
-            geometry_entries = _export_geometry(backend, cfg, staging / "geometry", components)
+            geometry_entries = _export_geometry(backend, cfg, staging / "geometry", components, activity=activity)
             write_json(staging / "raw" / "geometry.json", geometry_entries)
 
         stage = "verify_sources"
+        _capture_note(activity, "verify_sources")
         # Verify the live copy state and saved original bytes independently.
         backend.verify_sources_unchanged()
         originals = _verify_originals_unchanged(closure)
@@ -2274,8 +2315,9 @@ def _freeze_local(
         # follow.  The record selections are the late composition of the walked
         # per-instance evidence and the payload echo must match them exactly.
         stage = "pristine_readout"
+        _capture_note(activity, "pristine_readout")
         selections = _link_group_selections(cfg, scene, backend_readings)
-        window = _pristine_readout_window(backend, cfg, closure, selections)
+        window = _pristine_readout_window(backend, cfg, closure, selections, activity=activity)
         if isinstance(mass_closure, dict) and mass_closure.get("status") == "recorded":
             if not isinstance(window["top_level"], dict):
                 raise BridgeError(
@@ -2338,6 +2380,7 @@ def _freeze_local(
         # Windows cannot rename a directory while CAD owns file handles inside
         # it. Release the owned applications before atomically publishing.
         stage = "release"
+        _capture_note(activity, "release")
         release = getattr(backend, "release", None)
         if callable(release):
             release()
@@ -2349,6 +2392,7 @@ def _freeze_local(
             raise BridgeError("cad_source_changed", "collected files changed during CAD cleanup", exit_code=3)
 
         stage = "publish"
+        _capture_note(activity, "seal")
         write_manifest = _shared_manifest_writer()
         manifest = write_manifest(
             staging,
@@ -2370,6 +2414,8 @@ def _freeze_local(
                 release()
         _retain_failure(staging, destination, error, stage, request)
         raise
+    finally:
+        activity.stop_keepalive()
 
 
 def freeze(
@@ -2378,6 +2424,7 @@ def freeze(
     *,
     backend: Any = None,
     worker_version: str = "unknown",
+    on_activity=None,
 ) -> dict[str, Any]:
     """Freeze from saved files in a job-owned STA session, or submit to its worker."""
     from contextlib import nullcontext
@@ -2390,4 +2437,6 @@ def freeze(
         backend = SolidWorksBackend()
     session = getattr(backend, "session", None)
     with session() if callable(session) else nullcontext():
-        return _freeze_local(config, destination, backend=backend, worker_version=worker_version)
+        return _freeze_local(
+            config, destination, backend=backend, worker_version=worker_version, on_activity=on_activity
+        )

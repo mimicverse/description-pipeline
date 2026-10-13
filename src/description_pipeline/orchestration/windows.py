@@ -1301,6 +1301,7 @@ class Jobs:
                     stop_after="capture",
                     main_assembly=selection,
                     on_event=lambda event, identifier=identifier: self._event(identifier, event),
+                    on_activity=lambda item, identifier=identifier: self._activity(identifier, item),
                     prior_events=list(job["events"]),
                     expected_inputs=job["prepared_files"],
                     handoff_sha256=job["handoff_sha256"],

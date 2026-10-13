@@ -10,6 +10,7 @@ no Windows is involved.
 from __future__ import annotations
 
 import re
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -19,6 +20,7 @@ from description_pipeline.sources.solidworks.native import SolidWorksBackend
 
 from tests.sources.test_solidworks_native_reader import (
     _App,
+    _CaptureBackend,
     _Component,
     _Doc,
     _Session,
@@ -192,6 +194,78 @@ class ActivityEmissionTests(unittest.TestCase):
             self.assertGreaterEqual(len(reads), 1)
             self.assertEqual(reads[0]["completed"], 0)
             self.assertEqual(reads[-1]["completed"], 3)
+
+    def test_capture_emits_the_walk_and_per_instance_reads_with_names(self) -> None:
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            documents = {}
+            components = []
+            for name in ("arm1", "arm2"):
+                path = _write(root, name + ".SLDPRT")
+                document = _Doc(path)
+                documents[path] = document
+                components.append(_Component(name, path, doc=document))
+            assembly = _write(root, "robot.SLDASM")
+            documents[assembly] = _Doc(assembly, doc_type=2, children=components)
+            backend = _CaptureBackend(session_factory=lambda: _Session(_App(documents)))
+            original = native_module._ACTIVITY_MIN_INTERVAL_SECONDS
+            try:
+                native_module._ACTIVITY_MIN_INTERVAL_SECONDS = 0.0
+                records = []
+                scene = backend.collect_scene(str(assembly), [], on_activity=records.append)
+            finally:
+                native_module._ACTIVITY_MIN_INTERVAL_SECONDS = original
+
+            self.assertEqual({component.name for component in scene.components}, {"arm1", "arm2"})
+            self.assertTrue(records)
+            self.assertTrue(all(item["phase"] == "capture" for item in records))
+            walks = [item for item in records if item["action"] == "walk"]
+            self.assertEqual(
+                sorted(item["current_object"] for item in walks if "current_object" in item), ["arm1", "arm2"]
+            )
+            self.assertEqual((walks[-1]["completed"], walks[-1]["total"]), (2, 2))
+            reads = [item for item in records if item["action"] == "instance_reads"]
+            self.assertEqual([item["completed"] for item in reads], [0, 1, 1, 2, 2])
+            self.assertEqual({item["total"] for item in reads}, {2})
+            self.assertEqual(
+                sorted(item["current_object"] for item in reads if "current_object" in item),
+                ["arm1", "arm1", "arm2", "arm2"],
+            )
+
+    def test_capture_progress_failures_never_fail_the_read(self) -> None:
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            path = _write(root, "arm1.SLDPRT")
+            document = _Doc(path)
+            assembly = _write(root, "robot.SLDASM")
+            main = _Doc(assembly, doc_type=2, children=[_Component("arm1", path, doc=document)])
+            backend = _CaptureBackend(session_factory=lambda: _Session(_App({assembly: main, path: document})))
+
+            def exploded(_record):
+                raise RuntimeError("collector exploded")
+
+            scene = backend.collect_scene(str(assembly), [], on_activity=exploded)
+            self.assertEqual([component.name for component in scene.components], ["arm1"])
+
+    def test_keepalive_refreshes_the_last_record_until_stopped(self) -> None:
+        records = []
+        emitter = native_module._ActivityEmitter(records.append, keepalive_seconds=0.05)
+        emitter.emit("start", phase="capture")
+        self.assertEqual(len(records), 1)
+        emitter.start_keepalive()
+        deadline = time.time() + 5.0
+        while len(records) < 3 and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertGreaterEqual(len(records), 3)
+        emitter.stop_keepalive()
+        self.assertIsNone(emitter._keepalive_thread)
+        settled = len(records)
+        time.sleep(0.15)
+        self.assertEqual(len(records), settled)
+        idle = native_module._ActivityEmitter(None, keepalive_seconds=0.01)
+        idle.start_keepalive()
+        self.assertIsNone(idle._keepalive_thread)
+        idle.stop_keepalive()
 
 
 if __name__ == "__main__":

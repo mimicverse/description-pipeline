@@ -275,11 +275,11 @@ class EndpointActivityTests(EndpointFixture, unittest.TestCase):
         )
         request = self.request()
         jobs.create(request)
-        self.stage_and_seal(jobs, request["run_id"])
+        self.stage_and_seal(jobs, request["run_id"], statuses={"running", "awaiting_definition"})
         state = self.wait_state_any_status(jobs, request["run_id"], {"awaiting_definition"})
         self.assertEqual(state["status"], "awaiting_definition")
         self.complete_definition(jobs, request["run_id"])
-        self.assertTrue(capture_running.wait(2))
+        self.assertTrue(capture_running.wait(5))
         snapshot = client.get_job(request["run_id"])
         self.assertEqual(snapshot["status"], "running")
         self.assertIsNone(snapshot["activity"])  # never busy with a stale discovery action
@@ -297,6 +297,83 @@ class EndpointActivityTests(EndpointFixture, unittest.TestCase):
         self.assertEqual(final["status"], "native_complete")
         self.assertIsNone(final["activity"])
         self.assertEqual(activity_view(final)["state"], "finished")
+
+    def test_capture_activity_persists_while_the_capture_runs_and_keeps_the_final_observation(self):
+        capture_running, capture_release = threading.Event(), threading.Event()
+
+        def runner(package, output, **kwargs):
+            on_activity = kwargs.get("on_activity")
+            self.assertIsNotNone(on_activity)
+            on_activity(
+                {
+                    "phase": "capture",
+                    "action": "instance_reads",
+                    "current_object": "arm.SLDPRT",
+                    "completed": 3,
+                    "total": 8,
+                }
+            )
+            on_activity(
+                {
+                    "phase": "capture",
+                    "action": "mesh_export",
+                    "current_object": "arm.SLDPRT",
+                    "completed": 5,
+                    "total": 368,
+                }
+            )
+            capture_running.set()
+            if not capture_release.wait(5):
+                raise RuntimeError("test did not release the capture runner")
+            return self.capture_transfer_result(output, run_id=kwargs["run_id"], on_event=kwargs.get("on_event"))
+
+        jobs = self.jobs(
+            runner=runner,
+            native_reader=lambda frozen, settings, on_activity=None: copy.deepcopy(self.record),
+        )
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler(jobs, self.config["token"]))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(capture_release.set)
+        client = WindowsEndpoint(
+            EndpointConfig(f"http://127.0.0.1:{server.server_port}", self.config["token"], timeout=2)
+        )
+        request = self.request()
+        jobs.create(request)
+        self.stage_and_seal(jobs, request["run_id"], statuses={"running", "awaiting_definition"})
+        state = self.wait_state_any_status(jobs, request["run_id"], {"awaiting_definition"})
+        self.assertEqual(state["status"], "awaiting_definition")
+        self.complete_definition(jobs, request["run_id"])
+        self.assertTrue(capture_running.wait(5))
+        snapshot = client.get_job(request["run_id"])
+        self.assertEqual(snapshot["status"], "running")
+        self.assertEqual((snapshot["activity"]["phase"], snapshot["activity"]["action"]), ("capture", "mesh_export"))
+        self.assertEqual(snapshot["activity"]["current_object"], "arm.SLDPRT")
+        self.assertEqual(snapshot["activity"]["completed"], 5)
+        self.assertEqual(snapshot["activity"]["total"], 368)
+        self.assertEqual(
+            [entry["code"] for entry in snapshot["activity_history"]],
+            ["capture.instance_reads", "capture.mesh_export"],
+        )
+        capture_release.set()
+        deadline = time.time() + 5
+        final = snapshot
+        while time.time() < deadline:
+            final = client.get_job(request["run_id"])
+            if final["status"] == "native_complete":
+                break
+            time.sleep(0.05)
+        self.assertEqual(final["status"], "native_complete")
+        self.assertIsNone(final["activity"])
+        self.assertEqual(
+            (final["activity_final"]["phase"], final["activity_final"]["action"]), ("capture", "mesh_export")
+        )
+        self.assertEqual(final["activity_final"]["completed"], 5)
+        view = activity_view(final)
+        self.assertEqual((view["available"], view["state"]), (True, "finished"))
+        self.assertEqual(view["counts"], {"done": 5, "total": 368})
+        self.assertEqual(view["object"], "arm.SLDPRT")
 
 
 class ActivityClientValidationTests(unittest.TestCase):

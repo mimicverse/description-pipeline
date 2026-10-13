@@ -1936,6 +1936,11 @@ def _solver_observation(component, defining_document, source_root, *, configurat
 _ACTIVITY_ACTION = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _ACTIVITY_OBJECT_LIMIT = 160
 _ACTIVITY_MIN_INTERVAL_SECONDS = 0.25
+#: Capture keepalive: while a capture is in flight the last accepted activity
+#: record is re-emitted at this interval, so one blocking native call (a document
+#: close/reopen, a whole-assembly read, a heavy mesh) cannot leave the portal's
+#: live activity without a fresh observation for longer than this bound.
+ACTIVITY_KEEPALIVE_SECONDS = 30.0
 
 
 def _activity_object(path_value, source_root=None):
@@ -1982,13 +1987,24 @@ class _ActivityEmitter:
     shrink below ``completed``.  The collector owns timestamps and sequencing.
     Operation transitions always pass; only repeats of the current action are
     throttled.  A missing or failing callback can never affect the capture.
+
+    ``freeze`` reuses one emitter for a whole capture: its own stage notes go
+    through :meth:`emit`, the backend capture methods receive :meth:`publish`
+    as their record sink (records produced by a nested emitter then also
+    refresh the last observation), and :meth:`start_keepalive` re-emits that
+    last record while one blocking native call runs.  ``publish`` and
+    ``refresh`` are guarded exactly like ``emit``.
     """
 
-    def __init__(self, callback=None):
+    def __init__(self, callback=None, *, keepalive_seconds=None):
         self._callback = callback
         self._last_emitted: dict = {}
         self._completed: dict = {}
         self._last_action = None
+        self._last_record: dict | None = None
+        self._keepalive_seconds = keepalive_seconds
+        self._keepalive_stop: threading.Event | None = None
+        self._keepalive_thread: threading.Thread | None = None
 
     def emit(
         self,
@@ -2040,7 +2056,57 @@ class _ActivityEmitter:
             self._callback(record)
         except Exception:  # noqa: BLE001 - activity must never fail the capture
             return
+        self._last_record = dict(record)
         self._last_action = (phase, action)
+
+    def publish(self, record: dict) -> None:
+        """Forward one partial record produced by a nested emitter, guarded.
+
+        The capture backend calls this through its own emitter while the walk,
+        the per-instance reads and the mesh batch run; a forwarded record also
+        becomes the keepalive's last observation.  A callback failure stays
+        invisible to the capture.
+        """
+
+        if self._callback is None or not isinstance(record, dict):
+            return
+        try:
+            self._callback(record)
+        except Exception:  # noqa: BLE001 - activity must never fail the capture
+            return
+        self._last_record = dict(record)
+
+    def refresh(self) -> None:
+        """Re-emit the last accepted record so its freshness stays visible."""
+
+        record = self._last_record
+        if record is not None:
+            self.publish(dict(record))
+
+    def start_keepalive(self) -> None:
+        """Refresh the last observation every ``keepalive_seconds`` until stopped."""
+
+        if self._callback is None or not self._keepalive_seconds or self._keepalive_thread is not None:
+            return
+        stop = threading.Event()
+        interval = float(self._keepalive_seconds)
+
+        def loop() -> None:
+            while not stop.wait(interval):
+                self.refresh()
+
+        self._keepalive_stop = stop
+        self._keepalive_thread = threading.Thread(target=loop, name="solidworks-activity-keepalive", daemon=True)
+        self._keepalive_thread.start()
+
+    def stop_keepalive(self) -> None:
+        stop, thread = self._keepalive_stop, self._keepalive_thread
+        if stop is None or thread is None:
+            return
+        stop.set()
+        thread.join(timeout=2.0)
+        self._keepalive_stop = None
+        self._keepalive_thread = None
 
 
 #: SolidWorks COM mid-export transient: DISP_E_EXCEPTION ("服务器出现意外情况").
@@ -3535,7 +3601,13 @@ class SolidWorksBackend(CadBackend):
             detail.update(extra)
         return CadError(error.code, error.message, detail)
 
-    def collect_scene(self, doc_path, coordinate_systems, progress=None, require_material=True):
+    def collect_scene(self, doc_path, coordinate_systems, on_activity=None, require_material=True):
+        activity = _ActivityEmitter(on_activity)
+
+        def note(action: str, **fields) -> None:
+            activity.emit(action, phase="capture", **fields)
+
+        note("prepare_capture", current_object=_activity_object(doc_path), force=True)
         doc = self._document_by_path(doc_path)
         if _member(doc, "GetType") != 2:
             raise CadError("cad_not_assembly", "export requires a saved SLDASM")
@@ -3590,6 +3662,7 @@ class SolidWorksBackend(CadBackend):
                 continue
             borrowed_components.append(comp)
             name = str(_member(comp, "Name2"))
+            note("walk", current_object=_activity_object(name))
             part = _component_document(comp)
             if part is None:
                 raise CadError("cad_component_unresolved", name)
@@ -3628,8 +3701,15 @@ class SolidWorksBackend(CadBackend):
 
         borrowed_components.clear()
         comp = children = part = root = stack = None
-        for occurrence, referenced in occurrences:
+        note("walk", completed=len(occurrences), total=len(occurrences), force=True)
+        for index, (occurrence, referenced) in enumerate(occurrences, start=1):
             name, path = occurrence.name, occurrence.path
+            note(
+                "instance_reads",
+                current_object=_activity_object(name),
+                completed=index - 1,
+                total=len(occurrences),
+            )
             with _temporary_configuration(
                 lambda document_path=path: self._document_by_path(document_path), referenced, name
             ) as (part, _previous):
@@ -3673,6 +3753,12 @@ class SolidWorksBackend(CadBackend):
                     self.notes["effective_instance:" + name] = "cad_authored_effective_instance"
                 properties[name]["reference"]["configuration"] = referenced
                 self.notes["mass_property:" + name] = properties[name]["reference"]["used_api"]
+                note(
+                    "instance_reads",
+                    current_object=_activity_object(name),
+                    completed=index,
+                    total=len(occurrences),
+                )
         if not components:
             raise CadError("cad_empty_model", "assembly has no resolved solid parts")
         missing_datums = sorted(requested_datums - transforms.keys())
@@ -3680,8 +3766,7 @@ class SolidWorksBackend(CadBackend):
             raise CadError(
                 "cad_missing_coordinate_system", "requested native coordinate systems were not found", missing_datums
             )
-        if progress:
-            progress(f"read {len(components)} leaf components; saved CAD sources hashed")
+        note("instance_reads", completed=len(occurrences), total=len(occurrences), force=True)
         self._part_mass_properties = dict(properties)
         return RawScene(doc_path, components, transforms, properties, dict(self.notes))
 
@@ -3937,12 +4022,17 @@ class SolidWorksBackend(CadBackend):
             values.extend(body_values)
         return values, evidence
 
-    def export_component_meshes(self, destinations, progress=None):
+    def export_component_meshes(self, destinations, on_activity=None):
         """Keep one live assembly traversal through the entire geometry batch.
 
         IComponent2 bodies follow the occurrence's referenced configuration;
         the shared part document may have another configuration active.
         """
+        activity = _ActivityEmitter(on_activity)
+
+        def note(action: str, **fields) -> None:
+            activity.emit(action, phase="capture", **fields)
+
         missing = sorted(set(destinations) - self._components)
         if missing:
             raise CadError("cad_missing_component", missing[0])
@@ -3950,7 +4040,14 @@ class SolidWorksBackend(CadBackend):
             raise CadError("cad_mesh_export_failed", "each occurrence needs a distinct mesh destination")
         with self._current_components("geometry") as current:
             entries = {}
-            for component in sorted(destinations):
+            total = len(destinations)
+            for index, component in enumerate(sorted(destinations), start=1):
+                note(
+                    "mesh_export",
+                    current_object=_activity_object(component),
+                    completed=index - 1,
+                    total=total,
+                )
                 dest_path = destinations[component]
                 try:
                     entries[component] = self._write_component_mesh(component, dest_path, current[component])
@@ -3958,6 +4055,12 @@ class SolidWorksBackend(CadBackend):
                     detail = error.detail if isinstance(error.detail, dict) else {"native_detail": error.detail}
                     error.detail = {**detail, "component": component, "completed_components": list(entries)}
                     raise
+                note(
+                    "mesh_export",
+                    current_object=_activity_object(component),
+                    completed=index,
+                    total=total,
+                )
             return entries
 
     def _write_component_mesh(self, component, dest_path, holder):

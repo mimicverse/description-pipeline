@@ -220,6 +220,34 @@ class ComponentMeshExportTests(unittest.TestCase):
         self.assertIn("GetBodies2(1)", entry["used_api"])
         self.assertEqual(read_stl(self.dest).triangles, 1)
 
+    def test_export_emits_component_progress_and_survives_a_failing_callback(self):
+        component = FakeComponent(
+            FakeDocument([]),
+            {0: [FakeBody([FakeFace(TRIANGLE)])], 1: []},
+        )
+        records = []
+        with patch("description_pipeline.sources.solidworks.native._ACTIVITY_MIN_INTERVAL_SECONDS", 0.0):
+            entry = _backend(component).export_component_meshes({"pcb-1": self.dest}, on_activity=records.append)[
+                "pcb-1"
+            ]
+        self.assertEqual(entry["triangles"], 1)
+        self.assertTrue(all(item["phase"] == "capture" for item in records))
+        self.assertEqual(
+            [(item["action"], item["current_object"], item["completed"], item["total"]) for item in records],
+            [("mesh_export", "pcb-1", 0, 1), ("mesh_export", "pcb-1", 1, 1)],
+        )
+
+        def exploded(_record):
+            raise RuntimeError("collector exploded")
+
+        second = self.tmp / "mesh-boom.stl"
+        again = FakeComponent(
+            FakeDocument([]),
+            {0: [FakeBody([FakeFace(TRIANGLE)])], 1: []},
+        )
+        entry = _backend(again).export_component_meshes({"pcb-1": second}, on_activity=exploded)["pcb-1"]
+        self.assertEqual(entry["triangles"], 1)
+
     def test_mixed_part_exports_solids_and_sheets(self):
         component = FakeComponent(
             FakeDocument(list(TRIANGLE)),
@@ -770,7 +798,7 @@ class NoFullScanExportTests(unittest.TestCase):
         payload = self._planar_stl()
 
         class Backend:
-            def export_component_meshes(self, destinations):
+            def export_component_meshes(self, destinations, on_activity=None):
                 entries = {}
                 for component, destination in destinations.items():
                     Path(destination).write_bytes(payload)
