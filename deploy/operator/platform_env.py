@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Derive the internal operator environment from the config snapshot (transitional bridge).
+"""Derive the internal operator environment from the config snapshot.
 
-The private platform.json snapshot is the single configuration authority.  The legacy env-file
-consumers (``render_operator.py``, ``install.sh``, ``health.sh``) keep reading their env keys;
-this module emits those keys from the snapshot plus go-time inputs (install generation,
-deployment tree, wheel) so the unified ``operatorctl --config`` entry never asks a human to
-duplicate configuration.
+The private platform.json snapshot is the single configuration authority; the env consumers
+(``render_operator.py``, ``install.sh``, ``health.sh``) read the derived keys this module emits,
+so the unified ``operatorctl --config`` entry never asks a human to duplicate configuration.
 
 Derivations (all paths under the configured storage roots; converged here as the single table):
   AIRFLOW_VENV   = <release_root>/airflow-venv-<install_id>
