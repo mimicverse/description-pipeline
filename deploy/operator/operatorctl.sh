@@ -13,8 +13,8 @@
 #   rollback  restore both ends from the recorded previous installation
 #
 #   operatorctl.sh <verb> --config FILE
-#   transitional until the lifecycle bridge lands:
-#     operatorctl.sh <install|start|stop|status|health> --env-file FILE
+#   transitional until each verb is bridged:
+#     operatorctl.sh <start|stop|status|health> --env-file FILE
 #
 # Only description-* units are written; unrelated user units are untouched. Credentials and state
 # live under the configured state root (outside Git).
@@ -29,7 +29,8 @@ die() { echo "operatorctl: $*" >&2; exit 1; }
 usage() {
   cat >&2 <<'USAGE'
 usage: operatorctl.sh <validate|install|start|drain|stop|status|health|reconcile|stage|promote|rollback> --config FILE
-       operatorctl.sh <install|start|stop|status|health> --env-file FILE  # transitional entry
+       operatorctl.sh <start|stop|status|health> --env-file FILE  # transitional entry
+install inputs: --install-id ID --wheel FILE --endpoint-identity FILE [--release-file FILE]
 exit codes: 0 ok; 1 configuration/environment error; 2 usage; 3 recognized verb without its --config bridge yet
 USAGE
   exit 2
@@ -39,10 +40,18 @@ ACTION="${1:-}"
 shift || true
 CONFIG_FILE=""
 ENV_FILE=""
+INSTALL_ID=""
+WHEEL_FILE=""
+ENDPOINT_IDENTITY=""
+RELEASE_FILE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --config) CONFIG_FILE="${2:-}"; shift 2 ;;
     --env-file) ENV_FILE="${2:-}"; shift 2 ;;
+    --install-id) INSTALL_ID="${2:-}"; shift 2 ;;
+    --wheel) WHEEL_FILE="${2:-}"; shift 2 ;;
+    --endpoint-identity) ENDPOINT_IDENTITY="${2:-}"; shift 2 ;;
+    --release-file) RELEASE_FILE="${2:-}"; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -51,27 +60,62 @@ case "$ACTION" in
   validate|install|start|drain|stop|status|health|reconcile|stage|promote|rollback) ;;
   *) usage ;;
 esac
+
+install_from_config() {
+  [ -f "$ENDPOINT_IDENTITY" ] || die "--endpoint-identity FILE is required for install"
+  if [ -z "$RELEASE_FILE" ]; then
+    RELEASE_FILE="$HERE/../../release.json"
+  fi
+  [ -f "$RELEASE_FILE" ] || die "release manifest not found: $RELEASE_FILE"
+  # Preflight the bound identities (release triple + artifact digests; endpoint generation)
+  # before any installation step runs.
+  python3 "$HERE/install_record.py" check --release-file "$RELEASE_FILE" \
+    --endpoint-identity "$ENDPOINT_IDENTITY" >/dev/null || exit $?
+  if [ -z "$INSTALL_ID" ]; then
+    INSTALL_ID="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+  fi
+  SNAPSHOT_PATH="$(python3 "$HERE/platform_config.py" render --config "$CONFIG_FILE" \
+    --install-id "$INSTALL_ID" | sed -n 's/^snapshot=//p')" || exit $?
+  [ -f "$SNAPSHOT_PATH" ] || die "config snapshot was not written"
+  if [ -n "$WHEEL_FILE" ]; then
+    DERIVED_ENV="$(python3 "$HERE/platform_env.py" emit --snapshot "$SNAPSHOT_PATH" \
+      --install-id "$INSTALL_ID" --tree "$HERE/../.." --wheel "$WHEEL_FILE" | sed -n 's/^env=//p')" || exit $?
+  else
+    DERIVED_ENV="$(python3 "$HERE/platform_env.py" emit --snapshot "$SNAPSHOT_PATH" \
+      --install-id "$INSTALL_ID" --tree "$HERE/../.." | sed -n 's/^env=//p')" || exit $?
+  fi
+  [ -f "$DERIVED_ENV" ] || die "derived environment was not written"
+  ENV_FILE="$DERIVED_ENV"
+}
+
 if [ -n "$CONFIG_FILE" ] && [ -n "$ENV_FILE" ]; then usage; fi
+if [ -n "$INSTALL_ID$WHEEL_FILE$ENDPOINT_IDENTITY$RELEASE_FILE" ] && [ "$ACTION" != "install" ]; then usage; fi
 if [ -n "$CONFIG_FILE" ]; then
   [ -f "$CONFIG_FILE" ] || die "config file not found: $CONFIG_FILE"
   # Every verb passes the same static config gate first; the snapshot rendered at install stays
   # the single authority for the whole lifecycle.
   python3 "$HERE/platform_config.py" validate --config "$CONFIG_FILE" >/dev/null || exit $?
-  if [ "$ACTION" = "validate" ]; then
-    echo "operatorctl: configuration valid: $CONFIG_FILE"
-    exit 0
-  fi
-  echo "operatorctl: '$ACTION' is recognized but its --config bridge is not implemented in this increment;" >&2
-  echo "use the transitional --env-file entry for the current deployment" >&2
-  exit 3
+  case "$ACTION" in
+    validate)
+      echo "operatorctl: configuration valid: $CONFIG_FILE"
+      exit 0 ;;
+    install)
+      install_from_config ;;
+    *)
+      echo "operatorctl: '$ACTION' is recognized but its --config bridge is not implemented in this increment;" >&2
+      echo "use the transitional --env-file entry for the current deployment" >&2
+      exit 3 ;;
+  esac
 fi
-# Transitional env-file entry, removed when the lifecycle bridge lands.
-[ -n "$ENV_FILE" ] || usage
-[ -f "$ENV_FILE" ] || die "env file not found: $ENV_FILE"
-case "$ACTION" in
-  install|start|stop|status|health) ;;
-  *) usage ;;
-esac
+if [ -z "$CONFIG_FILE" ]; then
+  # Transitional env-file entry, removed as each verb is bridged.
+  [ -n "$ENV_FILE" ] || usage
+  [ -f "$ENV_FILE" ] || die "env file not found: $ENV_FILE"
+  case "$ACTION" in
+    start|stop|status|health) ;;
+    *) usage ;;
+  esac
+fi
 
 airflow_render() {
   AIRFLOW_VENV="$AIRFLOW_VENV" AIRFLOW_HOME="$AIRFLOW_HOME" \
@@ -231,6 +275,14 @@ case "$ACTION" in
       OPERATOR_STATE="$OPERATOR_STATE" bash "$HERE/scripts/install_proxy.sh" >/dev/null
     fi
     systemctl --user daemon-reload
+    # The install record binds this generation to its snapshot, release identity and both ends;
+    # it is written only after the installation legs are ready.
+    STATE_ROOT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["resolved"]["storage"]["state_root"])' "$SNAPSHOT_PATH")"
+    SERVICES_CSV="$(IFS=,; printf '%s' "${UNITS[*]}")"
+    python3 "$HERE/install_record.py" build --state-root "$STATE_ROOT" --install-id "$INSTALL_ID" \
+      --snapshot "$SNAPSHOT_PATH" --release-file "$RELEASE_FILE" \
+      --endpoint-identity "$ENDPOINT_IDENTITY" --services "$SERVICES_CSV" \
+      --dag "$AIRFLOW_HERE/dags/solidworks_to_urdf.py"
     echo "install complete: ${OPERATOR_URL:-unknown}"
     ;;
   start)

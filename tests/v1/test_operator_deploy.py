@@ -558,9 +558,12 @@ class LifecycleTests(unittest.TestCase):
             env_file.write_text("OPERATOR_HOST=rehearsal.local\n", encoding="utf-8")
             removed = run(["bash", str(CONTROL), "rehearse", "--env-file", str(env_file)], {})
             self.assertEqual(removed.returncode, 2)
-            absent = run(["bash", str(CONTROL), "install", "--env-file", str(Path(tmp) / "nope.env")], {})
-            self.assertEqual(absent.returncode, 1)
-            self.assertIn("env file not found", absent.stderr)
+            legacy = run(["bash", str(CONTROL), "health", "--env-file", str(Path(tmp) / "nope.env")], {})
+            self.assertEqual(legacy.returncode, 1)
+            self.assertIn("env file not found", legacy.stderr)
+            config_only = run(["bash", str(CONTROL), "install", "--env-file", str(env_file)], {})
+            self.assertEqual(config_only.returncode, 2)
+            self.assertIn("usage:", config_only.stderr)
 
     def test_status_is_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -749,11 +752,15 @@ class InstallOrderingTests(unittest.TestCase):
         createdb_rc: int = 0,
         start_rc: int = 0,
     ) -> tuple[Path, Path, dict[str, str], Path]:
-        release = tmp / "release"
+        release = tmp / "release" / "deploy"
         (release / "operator" / "scripts").mkdir(parents=True)
         (release / "airflow" / "scripts").mkdir(parents=True)
+        (release / "airflow" / "dags").mkdir()
         (release / "operator" / "operatorctl.sh").write_bytes(CONTROL.read_bytes())
         (release / "operator" / "render_operator.py").write_bytes(RENDER.read_bytes())
+        for module in ("platform_config.py", "platform_env.py", "install_record.py"):
+            (release / "operator" / module).write_bytes((OPERATOR / module).read_bytes())
+        (release / "airflow" / "dags" / "solidworks_to_urdf.py").write_text("# dag fixture\n", encoding="utf-8")
         for template in ("nginx.conf.template", "portal.json.template"):
             (release / "operator" / template).write_bytes((OPERATOR / template).read_bytes())
         (release / "operator" / "systemd").mkdir()
@@ -777,13 +784,85 @@ class InstallOrderingTests(unittest.TestCase):
         )
         (release / "airflow" / "scripts" / "add_connection.py").write_text("# stub\n", encoding="utf-8")
 
-        (tmp / "venv" / "bin").mkdir(parents=True)
-        write_stub(tmp / "venv" / "bin" / "python", "#!/usr/bin/env bash\nexit 0\n")
+        (tmp / "releases" / "airflow-venv-gen-1" / "bin").mkdir(parents=True)
+        write_stub(tmp / "releases" / "airflow-venv-gen-1" / "bin" / "python", "#!/usr/bin/env bash\nexit 0\n")
         (tmp / "token").write_text("test-token\n", encoding="utf-8")
         (tmp / "token").chmod(0o600)
+        secrets = tmp / "secrets"
+        secrets.mkdir()
+        for name in ("tls.crt", "tls.key", "feishu.json", "postgres.dsn"):
+            path = secrets / name
+            path.write_text("{}" if name == "feishu.json" else "x", encoding="utf-8")
+            path.chmod(0o600)
         if not fresh:
-            (tmp / "pg" / "data").mkdir(parents=True)
-            (tmp / "pg" / "data" / "PG_VERSION").write_text("14\n", encoding="utf-8")
+            (tmp / "state" / "airflow-pg" / "data").mkdir(parents=True)
+            (tmp / "state" / "airflow-pg" / "data" / "PG_VERSION").write_text("14\n", encoding="utf-8")
+        tree = tmp / "release"
+        wheel = tree / "mimicverse_description-1.4.0-py3-none-any.whl"
+        wheel.write_bytes(b"wheel-bytes")
+        config = {
+            "schema_version": "solidworks-to-urdf.platform/v1",
+            "operator": {
+                "origin": "https://rehearsal.local:18443",
+                "certificate_file": str(tmp / "secrets" / "tls.crt"),
+                "private_key_file": str(tmp / "secrets" / "tls.key"),
+            },
+            "storage": {
+                "state_root": str(tmp / "state"),
+                "handoff_root": str(tmp / "handoffs"),
+                "artifact_root": str(tmp / "artifacts"),
+                "workspace_root": str(tmp / "workspaces"),
+                "release_root": str(tmp / "releases"),
+            },
+            "database": {"dsn_file": str(tmp / "secrets" / "postgres.dsn")},
+            "windows": {
+                "ssh_host": "windows-m3",
+                "endpoint_port": 9765,
+                "token_file": str(tmp / "token"),
+                "instance": {
+                    "task_name": "description-e2e-endpoint",
+                    "package_root": "C:/description-e2e/packages",
+                    "output_root": "C:/description-e2e/results",
+                    "state_root": "C:/description-e2e/state",
+                },
+            },
+            "auth": {
+                "feishu_secret_file": str(tmp / "secrets" / "feishu.json"),
+                "tenant_keys": ["tenant-key"],
+                "admin_open_ids": [],
+            },
+            "targets": {"m3.0": {"repository_slug": "owner/model-repository", "base": "main"}},
+            "specifications": {"record_roots": [str(tmp / "specifications")]},
+        }
+        (tree / "platform.json").write_text(json.dumps(config), encoding="utf-8")
+        (tree / "release.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "solidworks-to-urdf.release/v1",
+                    "pipeline_id": "solidworks-to-urdf",
+                    "version": "1.4.0",
+                    "source_commit": "c" * 40,
+                    "source_sha256": "a" * 64,
+                    "artifacts": {wheel.name: hashlib.sha256(wheel.read_bytes()).hexdigest()},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (tree / "endpoint-identity.json").write_text(
+            json.dumps(
+                {
+                    "install_id": "ep-7",
+                    "config_digest": "d" * 64,
+                    "release": {
+                        "version": "1.4.0",
+                        "source_commit": "c" * 40,
+                        "source_sha256": "a" * 64,
+                        "role": "native",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
 
         bindir = tmp / "bin"
         bindir.mkdir()
@@ -796,7 +875,7 @@ class InstallOrderingTests(unittest.TestCase):
             '  *) echo "unexpected systemctl call: $*" >&2; exit 1 ;;\n'
             "esac\n",
         )
-        pgbin = tmp / "pg" / "root" / "usr" / "lib" / "postgresql" / "14" / "bin"
+        pgbin = tmp / "state" / "airflow-pg" / "root" / "usr" / "lib" / "postgresql" / "14" / "bin"
         pgbin.mkdir(parents=True)
         client_libraries = (
             '[ "${LD_LIBRARY_PATH%%:*}" = "$PG_CLIENT_LIB" ] || '
@@ -825,16 +904,6 @@ class InstallOrderingTests(unittest.TestCase):
         )
         write_stub(bindir / "sleep", '#!/usr/bin/env bash\necho "sleep" >> "$ORDER_LOG"\nexit 0\n')
 
-        state = tmp / "state"
-        env = base_env(
-            state,
-            POSTGRES_ROOT=str(tmp / "pg"),
-            PIPELINE_WHEEL=str(tmp / "wheel.whl"),
-            ENDPOINT_TOKEN_FILE=str(tmp / "token"),
-            SOLIDWORKS_HANDOFF_ROOT=str(tmp / "handoffs"),
-        )
-        env_file = tmp / "operator.env"
-        env_file.write_text("".join(f"{key}={value}\n" for key, value in env.items()), encoding="utf-8")
         order = tmp / "order.log"
         control_env = {
             "PATH": f"{bindir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
@@ -846,20 +915,32 @@ class InstallOrderingTests(unittest.TestCase):
             "PSQL_QUERY_RC": str(psql_query_rc),
             "CREATEDB_RC": str(createdb_rc),
             "START_RC": str(start_rc),
-            "PG_CLIENT_LIB": str(tmp / "pg" / "root" / "usr" / "lib" / "x86_64-linux-gnu"),
+            "PG_CLIENT_LIB": str(tmp / "state" / "airflow-pg" / "root" / "usr" / "lib" / "x86_64-linux-gnu"),
             "LD_LIBRARY_PATH": "/unrelated/vendor",
         }
-        return release, env_file, control_env, order
+        return release, control_env, order
 
-    def _install(self, release: Path, env_file: Path, control_env: dict[str, str]):
+    def _install(self, release: Path, control_env: dict[str, str]):
+        tree = release.parent
         return run(
-            ["bash", str(release / "operator" / "operatorctl.sh"), "install", "--env-file", str(env_file)], control_env
+            [
+                "bash",
+                str(release / "operator" / "operatorctl.sh"),
+                "install",
+                "--config",
+                str(tree / "platform.json"),
+                "--install-id",
+                "gen-1",
+                "--endpoint-identity",
+                str(tree / "endpoint-identity.json"),
+            ],
+            control_env,
         )
 
     def test_fresh_install_creates_then_uses_the_managed_unit_before_migration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            release, env_file, control_env, order = self._prepare(Path(tmp), fresh=True, ready_after=2)
-            result = self._install(release, env_file, control_env)
+            release, control_env, order = self._prepare(Path(tmp), fresh=True, ready_after=2)
+            result = self._install(release, control_env)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             lines = order.read_text(encoding="utf-8").splitlines()
             self.assertLess(
@@ -885,11 +966,25 @@ class InstallOrderingTests(unittest.TestCase):
                 ],
                 systemctl_lines,
             )
+            record = json.loads((Path(tmp) / "state" / "install-record.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["install_id"], "gen-1")
+            self.assertEqual(
+                record["services"],
+                [
+                    "description-postgres",
+                    "description-solidworks-tunnel",
+                    "description-airflow-dag-processor",
+                    "description-airflow-scheduler",
+                    "description-airflow-api-server",
+                    "description-portal",
+                    "description-operator-proxy",
+                ],
+            )
 
     def test_stopped_reinstall_starts_the_managed_unit_before_migration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            release, env_file, control_env, order = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
-            result = self._install(release, env_file, control_env)
+            release, control_env, order = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            result = self._install(release, control_env)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             lines = order.read_text(encoding="utf-8").splitlines()
             self.assertNotIn("install_postgres", lines)
@@ -901,8 +996,8 @@ class InstallOrderingTests(unittest.TestCase):
 
     def test_not_ready_postgres_fails_before_migration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            release, env_file, control_env, order = self._prepare(Path(tmp), fresh=True, ready_after=0)
-            result = self._install(release, env_file, control_env)
+            release, control_env, order = self._prepare(Path(tmp), fresh=True, ready_after=0)
+            result = self._install(release, control_env)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("PostgreSQL did not become ready", result.stderr)
             lines = order.read_text(encoding="utf-8").splitlines()
@@ -914,8 +1009,8 @@ class InstallOrderingTests(unittest.TestCase):
 
     def test_database_service_failure_exits_before_migration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            release, env_file, control_env, order = self._prepare(Path(tmp), fresh=False, ready_after=1, start_rc=1)
-            result = self._install(release, env_file, control_env)
+            release, control_env, order = self._prepare(Path(tmp), fresh=False, ready_after=1, start_rc=1)
+            result = self._install(release, control_env)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("description-postgres.service failed to start", result.stderr)
             lines = order.read_text(encoding="utf-8").splitlines()
@@ -926,10 +1021,8 @@ class InstallOrderingTests(unittest.TestCase):
 
     def test_database_query_failure_exits_before_migration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            release, env_file, control_env, order = self._prepare(
-                Path(tmp), fresh=False, ready_after=1, psql_query_rc=1
-            )
-            result = self._install(release, env_file, control_env)
+            release, control_env, order = self._prepare(Path(tmp), fresh=False, ready_after=1, psql_query_rc=1)
+            result = self._install(release, control_env)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("could not query pg_database", result.stderr)
             lines = order.read_text(encoding="utf-8").splitlines()
@@ -938,10 +1031,10 @@ class InstallOrderingTests(unittest.TestCase):
 
     def test_database_creation_failure_exits_before_migration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            release, env_file, control_env, order = self._prepare(
+            release, control_env, order = self._prepare(
                 Path(tmp), fresh=True, ready_after=1, db_exists=False, createdb_rc=1
             )
-            result = self._install(release, env_file, control_env)
+            result = self._install(release, control_env)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("could not create the airflow_meta database", result.stderr)
             lines = order.read_text(encoding="utf-8").splitlines()

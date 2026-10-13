@@ -36,7 +36,7 @@ ALL_VERBS = (
     "promote",
     "rollback",
 )
-UNBRIDGED_VERBS = tuple(verb for verb in ALL_VERBS if verb != "validate")
+UNBRIDGED_VERBS = tuple(verb for verb in ALL_VERBS if verb not in {"validate", "install"})
 
 
 def run(args: list[str]) -> subprocess.CompletedProcess:
@@ -96,6 +96,16 @@ class LifecycleSkeletonTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("configuration valid", result.stdout)
 
+    def test_install_over_config_requires_its_bound_inputs(self):
+        missing_identity = run(["install", "--config", str(self.config)])
+        self.assertEqual(missing_identity.returncode, 1)
+        self.assertIn("--endpoint-identity", missing_identity.stderr)
+        identity = self.root / "endpoint-identity.json"
+        identity.write_text("{}", encoding="utf-8")
+        missing_release = run(["install", "--config", str(self.config), "--endpoint-identity", str(identity)])
+        self.assertEqual(missing_release.returncode, 1)
+        self.assertIn("release manifest", missing_release.stderr)
+
     def test_every_other_verb_fails_closed_after_the_config_gate(self):
         for verb in UNBRIDGED_VERBS:
             with self.subTest(verb):
@@ -120,10 +130,10 @@ class LifecycleSkeletonTests(unittest.TestCase):
         self.assertEqual(run([]).returncode, 2)
         self.assertEqual(run(["frobnicate", "--config", str(self.config)]).returncode, 2)
         self.assertEqual(run(["validate"]).returncode, 2)
-        self.assertEqual(
-            run(["validate", "--config", str(self.config), "--env-file", str(self.config)]).returncode, 2
-        )
+        self.assertEqual(run(["validate", "--config", str(self.config), "--env-file", str(self.config)]).returncode, 2)
         self.assertEqual(run(["drain", "--env-file", str(self.config)]).returncode, 2)
+        self.assertEqual(run(["install", "--env-file", str(self.config)]).returncode, 2)
+        self.assertEqual(run(["status", "--config", str(self.config), "--install-id", "x"]).returncode, 2)
         missing = run(["install", "--config", str(self.root / "missing.json")])
         self.assertEqual(missing.returncode, 1)
         self.assertIn("config file not found", missing.stderr)
