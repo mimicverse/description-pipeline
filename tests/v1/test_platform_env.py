@@ -350,8 +350,8 @@ from description_pipeline import io
 print(io.parse_data(b'{{"a": 1}}', pathlib.Path("x.json"))["a"])
 try:
     io.parse_data(b"a: 1", pathlib.Path("x.yaml"))
-except ModuleNotFoundError:
-    print("yaml-required")
+except io.PipelineError as error:
+    print(f"yaml-required: {{error}}")
 """
         completed = subprocess.run(
             [sys.executable, "-I", "-S", "-c", script, str(self.wheel)],
@@ -364,7 +364,11 @@ except ModuleNotFoundError:
         self.assertEqual(schema, platform_config.SNAPSHOT_SCHEMA)
         self.assertEqual(yaml_loaded, "False", "the closure must load without PyYAML")
         self.assertEqual(parsed, "1")
-        self.assertEqual(yaml_required, "yaml-required", "the YAML read path still requires PyYAML")
+        self.assertIn(
+            "the YAML parser (PyYAML) is required to read this input",
+            yaml_required,
+            "the YAML read path still requires PyYAML, reported as a PipelineError",
+        )
 
 
 if __name__ == "__main__":

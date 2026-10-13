@@ -141,7 +141,10 @@ def _load_yaml(text: str) -> Any:
     interface_records) loads in bootstrap interpreters without ambient packages:
     PyYAML is required only when a capture actually carries a YAML document.
     """
-    import yaml  # noqa: PLC0415  (deferred on purpose: the bootstrap closure must import without PyYAML)
+    try:
+        import yaml  # noqa: PLC0415  (deferred on purpose: the bootstrap closure must import without PyYAML)
+    except ModuleNotFoundError as error:
+        raise PipelineError(f"the YAML parser (PyYAML) is required to read this input ({error.name})") from error
 
     class UniqueLoader(yaml.SafeLoader):
         def construct_mapping(self, node, deep=False):
