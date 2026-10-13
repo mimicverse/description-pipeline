@@ -49,7 +49,7 @@ def build_sealed_delivery(root: Path) -> tuple[str, dict]:
         policy={"schema_version": CHECK_POLICY_SCHEMA, "digest": check_policy_digest()},
     )
     manifest = read_delivery_manifest(root)
-    artifacts = {record["path"]: record["sha256"] for record in manifest["subject"]["files"]}
+    artifacts = [dict(record) for record in manifest["subject"]["files"]]
     return manifest["subject"]["digest"], artifacts
 
 
@@ -310,7 +310,7 @@ class PlatformStoreTests(unittest.TestCase):
             "passed": False,
             "subject_sha256": self.subject,
             "handoff_sha256": HANDOFF,
-            "artifacts": dict(self.artifacts),
+            "artifacts": [dict(record) for record in self.artifacts],
         }
         payload.update(overrides)
         return payload
@@ -325,7 +325,7 @@ class PlatformStoreTests(unittest.TestCase):
             "passed": True,
             "subject_sha256": self.subject,
             "handoff_sha256": HANDOFF,
-            "artifacts": dict(self.artifacts),
+            "artifacts": [dict(record) for record in self.artifacts],
             "quality": self.qualified_quality(),
         }
         payload.update(overrides)
@@ -518,7 +518,7 @@ class PlatformStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(PlatformStoreError, "no checkpoint reference"):
             self._confirm_generate(checkpoint_uri=None)
         with self.assertRaisesRegex(PlatformStoreError, "artifact inventory"):
-            self._confirm_generate(receipt=self.generate_receipt(artifacts={}))
+            self._confirm_generate(receipt=self.generate_receipt(artifacts=[]))
         self.store.confirm_stage(run_id="r-1", stage="generate", state="running")
         self._confirm_generate()
         with self.assertRaisesRegex(PlatformStoreError, "already terminal"):
@@ -554,11 +554,30 @@ class PlatformStoreTests(unittest.TestCase):
                 receipt=self.generate_receipt(),
             )
         with self.assertRaisesRegex(PlatformStoreError, "artifact inventory"):
-            self._confirm_generate(receipt=self.generate_receipt(artifacts={"model/robot.json": "f" * 64}))
+            self._confirm_generate(
+                receipt=self.generate_receipt(
+                    artifacts=[{"path": "model/robot.json", "bytes": 1, "sha256": "f" * 64}]
+                )
+            )
         with self.assertRaisesRegex(PlatformStoreError, "does not match the receipt"):
             self._confirm_generate(receipt=self.generate_receipt(subject_sha256="f" * 64))
         self._confirm_generate()
         self.rebuilt.assert_called_with(self.delivery)
+
+    def test_the_receipt_inventory_must_mirror_the_sealed_records_verbatim(self) -> None:
+        self._running_run()
+        tampered = [dict(record) for record in self.artifacts]
+        tampered[0]["bytes"] = tampered[0]["bytes"] + 1
+        with self.assertRaisesRegex(PlatformStoreError, "artifact inventory"):
+            self._confirm_generate(receipt=self.generate_receipt(artifacts=tampered))
+        extra = [dict(record) for record in self.artifacts[:1]] + [
+            {"path": "meshes/extra.stl", "bytes": 1, "sha256": "e" * 64}
+        ]
+        with self.assertRaisesRegex(PlatformStoreError, "artifact inventory"):
+            self._confirm_generate(receipt=self.generate_receipt(artifacts=extra))
+        records = [dict(record) for record in self.artifacts]
+        self._confirm_generate(receipt=self.generate_receipt(artifacts=list(reversed(records))))
+        self.assertEqual(self.world.stages[("r-1", "generate")][0], "completed")
 
     def test_the_quality_inventory_binds_the_rebuilt_definition(self) -> None:
         self._running_run()

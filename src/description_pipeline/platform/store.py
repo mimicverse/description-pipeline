@@ -633,10 +633,12 @@ class PlatformStore:
         The receipt's URI and inventory are self-reported; the bytes are not.
         The resolver (deploy-side sealed storage) locates the sealed delivery
         root, ``read_delivery_manifest`` re-binds every subject record and the
-        subject digest, the receipt's artifact inventory must carry the same
-        file digests, and the definition the quality inventory binds to is
-        rebuilt from that very sealed tree (never from platform records) - so
-        a syntactic URI or an invented inventory can never mint a completion.
+        subject digest, the receipt's artifact inventory must carry the
+        delivery's subject records verbatim (``{path, bytes, sha256}``,
+        order-normalized per record), and the definition the quality inventory
+        binds to is rebuilt from that very sealed tree (never from platform
+        records) - so a syntactic URI or an invented inventory can never mint
+        a completion.
         """
 
         if self._sealed is None:
@@ -646,10 +648,15 @@ class PlatformStore:
         subject = manifest.get("subject") or {}
         if subject.get("digest") != receipt.get("subject_sha256"):
             raise PlatformStoreError("The sealed delivery subject does not match the receipt")
-        artifacts = receipt.get("artifacts") or {}
-        for record in subject.get("files") or []:
-            name = record.get("path") if isinstance(record, dict) else None
-            if name is None or artifacts.get(name) != record.get("sha256"):
+        records = subject.get("files") or []
+        artifacts = receipt.get("artifacts")
+        if not isinstance(artifacts, list) or not isinstance(records, list) or len(artifacts) != len(records):
+            raise PlatformStoreError("The receipt's artifact inventory does not bind the sealed delivery")
+        stamped = {record.get("path"): record for record in records if isinstance(record, dict)}
+        if len(stamped) != len(records):
+            raise PlatformStoreError("The sealed delivery does not carry a complete record set")
+        for record in artifacts:
+            if not isinstance(record, dict) or stamped.get(record.get("path")) != record:
                 raise PlatformStoreError("The receipt's artifact inventory does not bind the sealed delivery")
         from ..verification.solidworks_urdf import rebuilt_definition
 
@@ -803,7 +810,7 @@ def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str, checkpoint_
         raise PlatformStoreError("The sealed receipt does not carry the stage's confirmed outcome")
     if not isinstance(checkpoint_uri, str) or not checkpoint_uri:
         raise PlatformStoreError("An unsealed stage completion is refused: no checkpoint reference")
-    if not isinstance(receipt.get("artifacts"), dict) or not receipt["artifacts"]:
+    if not isinstance(receipt.get("artifacts"), list) or not receipt["artifacts"]:
         raise PlatformStoreError("The sealed receipt lacks its artifact inventory")
     subject = receipt.get("subject_sha256")
     if not _is_sha256(subject):
