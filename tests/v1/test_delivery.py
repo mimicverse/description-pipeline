@@ -68,7 +68,7 @@ class DeliveryTests(unittest.TestCase):
         (self.root / "reports/quality.json").write_text('{"passed": true}')
         (self.root / "input/source.json").write_text("{}")
         self.contract = {"schema_version": CONTRACT["schema_version"], "digest": HEX}
-        self.policy = {"schema_version": CHECK_POLICY_SCHEMA, "digest": OTHER_HEX}
+        self.policy = {"schema_version": CHECK_POLICY_SCHEMA, "digest": ir.check_policy_digest()}
         write_delivery_manifest(self.root, contract=self.contract, policy=self.policy)
 
     def test_subject_binds_assets_and_excludes_manifest_and_quality_report(self):

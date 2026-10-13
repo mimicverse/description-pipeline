@@ -29,6 +29,7 @@ from .io import PipelineError, artifact_path_parts, digest
 from .schemas import (
     CACHE_IMPORT_CONFIRMATION_SCHEMA,
     CACHE_RELEASE_RECEIPT_SCHEMA,
+    CHECK_POLICY_SCHEMA,
     CONFIG_SNAPSHOT_SCHEMA,
     DELIVERY_MANIFEST_SCHEMA,
     HEALTH_SCHEMA,
@@ -37,7 +38,7 @@ from .schemas import (
     RESOURCE_POLICY_SCHEMA,
     SOURCE_RECORD_SCHEMA,
 )
-from .stages import CONTRACT, STAGE_IDS
+from .stages import CONTRACT, FIXED_REQUIRED_CHECKS, STAGE_IDS
 
 #: Every machine schema version this release knows: the single-owner schema ids
 #: plus the stage contract.  Unknown versions are refused wherever a record
@@ -144,11 +145,6 @@ def _utc(value, code: str, where: str) -> str:
     return value
 
 
-def _known_schema(value, code: str, where: str) -> str:
-    _require(isinstance(value, str) and value in KNOWN_SCHEMA_VERSIONS, code, {"where": where})
-    return value
-
-
 def _reject_secrets(record, *, code: str) -> None:
     stack = [("", record)]
     while stack:
@@ -231,7 +227,13 @@ def validate_call_binding(binding) -> dict:
     _hex64(binding["params_sha256"], code, "binding.params_sha256")
     validate_release_identity(binding["release"], code=code)
     _exact_keys(binding["contract"], {"schema_version", "digest"}, code, "binding.contract")
-    _known_schema(binding["contract"]["schema_version"], code, "binding.contract.schema_version")
+    # Family-bound: the call contract must be the stage-contract family of this
+    # release; other known schema ids (health, source, ...) are wrong families.
+    _require(
+        binding["contract"]["schema_version"] == CONTRACT["schema_version"],
+        code,
+        {"where": "binding.contract.schema_version", "expected": CONTRACT["schema_version"]},
+    )
     _hex64(binding["contract"]["digest"], code, "binding.contract.digest")
     return binding
 
@@ -302,6 +304,61 @@ def resource_policy_v1_digest() -> str:
     """Stable digest of the canonical instance (requests and ``/health`` compare it)."""
 
     return resource_policy_digest(RESOURCE_POLICY_V1)
+
+
+#: Canonical check-strategy policy (single source for generation, verification and
+#: publication/manifest): the fixed gate inventory plus the declarative per-object
+#: expansion rules.  Consumers expand the same object; digests bind to it.
+CHECK_POLICY_EXPANSIONS = (
+    {"family": "physics.expected_mass", "selector": "expectation:expected_mass_kg"},
+    {"family": "geometry.expected_extent", "selector": "expectation:expected_extent_m"},
+    {"family": "inertia.{body}", "selector": "source.bodies[*].name"},
+    {"family": "geometry.{body}", "selector": "source.bodies[*].name"},
+    {"family": "joints.{joint}", "selector": "source.joints[*].name"},
+    {"family": "shafts.{joint}", "selector": "source.joints[*].name", "when": "type != fixed"},
+    {"family": "frames.{frame}", "selector": "source.frames[*].name"},
+)
+CHECK_POLICY_V1 = {
+    "schema_version": CHECK_POLICY_SCHEMA,
+    "fixed_checks": sorted(FIXED_REQUIRED_CHECKS),
+    "dynamic_expansions": [dict(rule) for rule in CHECK_POLICY_EXPANSIONS],
+}
+
+
+def validate_check_policy(policy) -> dict:
+    """Shape of the frozen check strategy (fixed gates + expansion rules)."""
+
+    code = "check_policy_invalid"
+    _exact_keys(policy, {"schema_version", "fixed_checks", "dynamic_expansions"}, code, "policy")
+    _require(policy["schema_version"] == CHECK_POLICY_SCHEMA, code, {"where": "schema_version"})
+    fixed = policy["fixed_checks"]
+    _require(
+        isinstance(fixed, list)
+        and fixed
+        and all(isinstance(name, str) and name for name in fixed)
+        and len(set(fixed)) == len(fixed),
+        code,
+        {"where": "fixed_checks"},
+    )
+    expansions = policy["dynamic_expansions"]
+    _require(isinstance(expansions, list) and expansions, code, {"where": "dynamic_expansions"})
+    for index, rule in enumerate(expansions):
+        where = f"dynamic_expansions[{index}]"
+        _require(isinstance(rule, dict) and set(rule) <= {"family", "selector", "when"}, code, {"where": where})
+        for key in ("family", "selector"):
+            _require(isinstance(rule.get(key), str) and rule[key], code, {"where": f"{where}.{key}"})
+        if "when" in rule:
+            _require(isinstance(rule["when"], str) and rule["when"], code, {"where": f"{where}.when"})
+    return policy
+
+
+validate_check_policy(CHECK_POLICY_V1)
+
+
+def check_policy_digest() -> str:
+    """Stable digest of the canonical check policy (manifests and reports bind it)."""
+
+    return digest(validate_check_policy(CHECK_POLICY_V1))
 
 
 def validate_health(payload) -> dict:
@@ -467,7 +524,11 @@ def validate_cache_release_request(request) -> dict:
     _exact_keys(request["binding"], {"release", "contract"}, code, "binding")
     validate_release_identity(request["binding"]["release"], code=code)
     _exact_keys(request["binding"]["contract"], {"schema_version", "digest"}, code, "binding.contract")
-    _known_schema(request["binding"]["contract"]["schema_version"], code, "binding.contract.schema_version")
+    _require(
+        request["binding"]["contract"]["schema_version"] == CONTRACT["schema_version"],
+        code,
+        {"where": "binding.contract.schema_version", "expected": CONTRACT["schema_version"]},
+    )
     _hex64(request["binding"]["contract"]["digest"], code, "binding.contract.digest")
     import_block = validate_cache_import_block(request["import"])
     _require(
@@ -999,8 +1060,17 @@ def validate_delivery_manifest(manifest) -> dict:
     )
     _hex64(manifest["contract"]["digest"], code, "contract.digest")
     _exact_keys(manifest["policy"], {"schema_version", "digest"}, code, "policy")
-    _known_schema(manifest["policy"]["schema_version"], code, "policy.schema_version")
+    _require(
+        manifest["policy"]["schema_version"] == CHECK_POLICY_SCHEMA,
+        code,
+        {"where": "policy.schema_version", "expected": CHECK_POLICY_SCHEMA},
+    )
     _hex64(manifest["policy"]["digest"], code, "policy.digest")
+    _require(
+        manifest["policy"]["digest"] == check_policy_digest(),
+        "delivery_manifest_policy_mismatch",
+        {"rule": "the manifest must reference this release's canonical check policy"},
+    )
     return manifest
 
 

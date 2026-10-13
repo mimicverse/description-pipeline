@@ -28,7 +28,8 @@ from ..sources.snapshot import verify_snapshot
 from ..sources.solidworks.input import inspect_package
 from ..sources.solidworks.revision import NATIVE_SUFFIXES
 from ..sources.solidworks.revision import package_inventory, read_revision
-from ..stages import FIXED_REQUIRED_CHECKS, required_rows_complete
+from ..interface_records import CHECK_POLICY_V1
+from ..stages import required_rows_complete
 from .consumer import load as load_consumer
 
 QUALITY_SCHEMA = "solidworks-to-urdf.quality/v1"
@@ -130,23 +131,36 @@ class _Gates:
 
 
 def required_checks(definition=None):
-    """Required independent gates, including every declared body, joint and frame."""
-    identifiers = set(FIXED_REQUIRED_CHECKS)
-    expectations = (definition or {}).get("checks") or {}
-    for key, identifier in (
-        ("expected_mass_kg", "physics.expected_mass"),
-        ("expected_extent_m", "geometry.expected_extent"),
-    ):
-        if key in expectations:
-            identifiers.add(identifier)
-    source = (definition or {}).get("source") or {}
-    for body in source.get("bodies", []):
-        identifiers.update(("inertia." + body["name"], "geometry." + body["name"]))
-    for joint in source.get("joints", []):
-        identifiers.add("joints." + joint["name"])
-        if joint["type"] != "fixed":
-            identifiers.add("shafts." + joint["name"])
-    identifiers.update("frames." + frame["name"] for frame in source.get("frames", []))
+    """Required independent gates expanded from the canonical check policy.
+
+    The expansion rules are data in ``interface_records.CHECK_POLICY_V1``; this
+    evaluator applies them to the sealed definition so generation, verification
+    and publication all expand the same single-source policy.
+    """
+
+    definition = definition or {}
+    identifiers = set(CHECK_POLICY_V1["fixed_checks"])
+    expectations = definition.get("checks") or {}
+    source = definition.get("source") or {}
+    for rule in CHECK_POLICY_V1["dynamic_expansions"]:
+        selector, family = rule["selector"], rule["family"]
+        if selector == "expectation:expected_mass_kg":
+            if "expected_mass_kg" in expectations:
+                identifiers.add(family)
+        elif selector == "expectation:expected_extent_m":
+            if "expected_extent_m" in expectations:
+                identifiers.add(family)
+        elif selector == "source.bodies[*].name":
+            identifiers.update(family.format(body=body["name"]) for body in source.get("bodies", []))
+        elif selector == "source.joints[*].name":
+            for joint in source.get("joints", []):
+                if rule.get("when") == "type != fixed" and joint["type"] == "fixed":
+                    continue
+                identifiers.add(family.format(joint=joint["name"]))
+        elif selector == "source.frames[*].name":
+            identifiers.update(family.format(frame=frame["name"]) for frame in source.get("frames", []))
+        else:
+            raise PipelineError(f"Unknown check-policy selector: {selector}")
     return sorted(identifiers)
 
 
@@ -847,9 +861,7 @@ def _qualified_surface_only(root, occurrence: str) -> bool:
     warnings = record.get("warnings")
     if not isinstance(warnings, list):
         return False
-    qualification = (
-        "cad_authored_effective_instance; not geometry-derived, not independently physically qualified"
-    )
+    qualification = "cad_authored_effective_instance; not geometry-derived, not independently physically qualified"
     qualified = False
     for item in warnings:
         if (
@@ -979,9 +991,7 @@ def _geometry(root, body, node, model_link, geometry, components, body_pose, urd
             _same_pose(origin, native_pose)
         _same_pose(_pose(shape["xyz"], shape["rpy"]), native_pose)
         _require(
-            stats.volume > 1e-15
-            or occurrence in exclusions
-            or _qualified_surface_only(root, occurrence),
+            stats.volume > 1e-15 or occurrence in exclusions or _qualified_surface_only(root, occurrence),
             "Zero-volume geometry needs a documented exclusion",
         )
         points = stl.vertices(original)
@@ -1161,10 +1171,7 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
     gates.add("geometry.coverage", lambda: _geometry_coverage(geometry_rows, components))
     points, used = [], []
     # ``checks`` is optional; omission means no documented exclusions.
-    exclusions = {
-        row["component"]
-        for row in (definition.get("checks") or {}).get("documented_exclusions", [])
-    }
+    exclusions = {row["component"] for row in (definition.get("checks") or {}).get("documented_exclusions", [])}
     for body in source["bodies"]:
         name = body["name"]
         gates.add("inertia." + name, lambda n=name: _link_physics(links[n], model_links[n]))

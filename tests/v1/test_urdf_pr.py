@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from description_pipeline.delivery import write_delivery_manifest, subject_digest
+from description_pipeline.interface_records import check_policy_digest
 from description_pipeline.io import digest
 from description_pipeline.repository import urdf_pr
 from description_pipeline.schemas import CHECK_POLICY_SCHEMA, SOURCE_RECORD_SCHEMA
@@ -51,7 +52,7 @@ class Fixture:
         write_delivery_manifest(
             self.bundle,
             contract={"schema_version": CONTRACT["schema_version"], "digest": "a" * 64},
-            policy={"schema_version": CHECK_POLICY_SCHEMA, "digest": "b" * 64},
+            policy={"schema_version": CHECK_POLICY_SCHEMA, "digest": check_policy_digest()},
         )
 
     def seal(self, revision_id: str, parent: str | None, *, cad: str = "part-1\n", fresh: bool = False) -> None:

@@ -254,7 +254,7 @@ def manifest() -> dict:
         "schema_version": DELIVERY_MANIFEST_SCHEMA,
         "subject": {"files": files, "digest": digest(mapping)},
         "contract": {"schema_version": CONTRACT["schema_version"], "digest": HEX},
-        "policy": {"schema_version": CHECK_POLICY_SCHEMA, "digest": OTHER_HEX},
+        "policy": {"schema_version": CHECK_POLICY_SCHEMA, "digest": ir.check_policy_digest()},
     }
 
 
@@ -576,6 +576,22 @@ class InterfaceRecordTests(unittest.TestCase):
             ir.resource_policy_v1_digest(), "e38f696ec0fe8668313e55dff852d1832800e5f7fd1806457b244d1cb416b4a6"
         )
 
+    def test_check_policy_is_the_single_source_for_required_gates(self) -> None:
+        from description_pipeline.stages import FIXED_REQUIRED_CHECKS
+        from description_pipeline.verification.solidworks_urdf import required_checks
+
+        ir.validate_check_policy(ir.CHECK_POLICY_V1)
+        self.assertEqual(ir.CHECK_POLICY_V1["fixed_checks"], sorted(FIXED_REQUIRED_CHECKS))
+        self.assertEqual(set(required_checks()), set(FIXED_REQUIRED_CHECKS))
+        # Pinned digest: generation, verification and the manifest consume this object.
+        self.assertEqual(ir.check_policy_digest(), "d1215dfa45ea0cab2ce43623168399c9018e6e6d2cfe422e09aabc0606f97702")
+        bad = copy.deepcopy(ir.CHECK_POLICY_V1)
+        bad.pop("fixed_checks")
+        self.reject("check_policy_invalid", lambda: ir.validate_check_policy(bad))
+        bad = copy.deepcopy(ir.CHECK_POLICY_V1)
+        bad["dynamic_expansions"][0]["unknown"] = True
+        self.reject("check_policy_invalid", lambda: ir.validate_check_policy(bad))
+
     def test_health_ready_is_single_semantics(self) -> None:
         ir.validate_health(health(True))
         ir.validate_health(health(False))
@@ -639,6 +655,10 @@ class InterfaceRecordTests(unittest.TestCase):
         ir.validate_cache_release_request(cache_request())
         bad = cache_request()
         bad["binding"]["contract"]["schema_version"] = "unknown.contract/v99"
+        self.reject("cache_release_invalid", lambda: ir.validate_cache_release_request(bad))
+        bad = cache_request()
+        # A known but wrong-family schema id must be refused as well.
+        bad["binding"]["contract"]["schema_version"] = HEALTH_SCHEMA
         self.reject("cache_release_invalid", lambda: ir.validate_cache_release_request(bad))
         bad = cache_request()
         bad["operation_id"] = bad["import"]["production"]["operation_id"]
@@ -859,6 +879,12 @@ class InterfaceRecordTests(unittest.TestCase):
         bad = copy.deepcopy(manifest_value)
         bad["policy"]["schema_version"] = "unknown.policy/v99"
         self.reject("delivery_manifest_invalid", lambda: ir.validate_delivery_manifest(bad))
+        bad = copy.deepcopy(manifest_value)
+        bad["policy"]["schema_version"] = HEALTH_SCHEMA
+        self.reject("delivery_manifest_invalid", lambda: ir.validate_delivery_manifest(bad))
+        bad = copy.deepcopy(manifest_value)
+        bad["policy"]["digest"] = OTHER_HEX
+        self.reject("delivery_manifest_policy_mismatch", lambda: ir.validate_delivery_manifest(bad))
         bad = copy.deepcopy(manifest_value)
         bad["subject"]["digest"] = OTHER_HEX
         self.reject("delivery_manifest_subject_mismatch", lambda: ir.validate_delivery_manifest(bad))

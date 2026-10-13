@@ -51,7 +51,10 @@ class ContractConvergenceTests(unittest.TestCase):
         self.assertLessEqual(FIXED_REQUIRED_CHECKS, set(report_view._INDEPENDENT_LABELS_ZH))
 
     def test_required_check_inventory_is_single_sourced(self) -> None:
+        from description_pipeline.interface_records import CHECK_POLICY_V1
+
         self.assertEqual(set(solidworks_urdf.required_checks()), set(FIXED_REQUIRED_CHECKS))
+        self.assertEqual(CHECK_POLICY_V1["fixed_checks"], sorted(FIXED_REQUIRED_CHECKS))
         definition = {
             "checks": {"expected_mass_kg": [0.5, 1.0], "expected_extent_m": [0.1, 1.0]},
             "source": {"bodies": [{"name": "base_link"}], "joints": [{"name": "waist_pitch", "type": "revolute"}]},
