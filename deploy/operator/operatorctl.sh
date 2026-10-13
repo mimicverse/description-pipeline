@@ -96,12 +96,13 @@ install_from_config() {
 load_active_env() {
   STATE_ROOT="$(python3 "$HERE/platform_config.py" resolve --config "$CONFIG_FILE" | \
     python3 -c 'import json,sys; print(json.load(sys.stdin)["storage"]["state_root"])')" || exit $?
-  local record="$STATE_ROOT/install-record.json"
-  [ -f "$record" ] || die "not installed: $record is missing (run install first)"
-  local active
-  active="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["install_id"])' "$record")"
-  ENV_FILE="$STATE_ROOT/derived/$active/operator.env"
-  [ -f "$ENV_FILE" ] || die "derived environment missing for generation $active; run install"
+  # The operational entry verifies the complete install record, the snapshot digest and the
+  # current-config binding before anything else (one gate, injected by install_record.py).
+  ACTIVE_ID="$(python3 "$HERE/install_record.py" verify-active --config "$CONFIG_FILE" \
+    --state-root "$STATE_ROOT" | sed -n 's/^install_id=//p')" || exit $?
+  [ -n "$ACTIVE_ID" ] || die "active install record did not declare a generation"
+  ENV_FILE="$STATE_ROOT/derived/$ACTIVE_ID/operator.env"
+  [ -f "$ENV_FILE" ] || die "derived environment missing for generation $ACTIVE_ID; run install"
 }
 
 [ -n "$CONFIG_FILE" ] || usage
@@ -302,28 +303,37 @@ case "$ACTION" in
     load_installed
     AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/airflow" dags pause solidworks_to_urdf \
       || die "could not close the DAG admission"
-    # In-flight executions continue; unresolved outcomes are resolved by the reconcile verb
-    # (not bridged yet), so drain reports the run store verbatim instead of guessing states.
-    python3 - "$PIPELINE_STORE_ROOT" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-root = Path(sys.argv[1])
-rows = []
-for meta_path in sorted(root.glob("*/meta.json")):
-    try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as error:
-        raise SystemExit(f"drain: cannot read {meta_path}: {error}")
-    rows.append({"run_id": meta_path.parent.name, "state": str(meta.get("state") or "unknown")})
-inflight = [row for row in rows if row["state"] not in {"published", "failed", "cancelled"}]
-print(json.dumps({"admission": "closed", "in_flight": inflight, "runs": rows}))
-PY
+    # In-flight executions continue; drain completes only when no unresolved/unknown outcomes
+    # remain (their closure is the reconcile bridge's job). The projection comes from the single
+    # PostgreSQL authority through the platform layer - service control never scans artifacts.
+    if ! "$AIRFLOW_VENV/bin/python" -m description_pipeline.orchestration.lifecycle_state report \
+        --require-no-unresolved; then
+      echo "drain: unresolved or unknown outcomes remain; reconcile must close them before drain completes" >&2
+      exit 1
+    fi
     echo "drain: admission closed; in-flight executions continue"
     ;;
   stop)
     load_installed
+    # stop only when drained and settled: active, unresolved or unknown runs block it, and the
+    # admission must already be closed by drain. The projection is the platform layer's, backed
+    # by the single PostgreSQL authority.
+    "$AIRFLOW_VENV/bin/python" -m description_pipeline.orchestration.lifecycle_state report \
+      --require-settled >/dev/null || die "stop refused: runs are active, unresolved or unknown; run drain first"
+    if ! AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" - <<'PY'
+# admission-closed-gate: drain closes the DAG admission before stop may run.
+import sys
+
+from airflow.models.dag import DagModel
+from airflow.utils.session import create_session
+
+with create_session() as session:
+    dag = session.get(DagModel, "solidworks_to_urdf")
+    sys.exit(0 if dag is not None and dag.is_paused is True else 1)
+PY
+    then
+      die "stop refused: admission is open; run drain first"
+    fi
     drift_check || true
     systemctl --user disable --now description-operator-proxy.service description-portal.service || true
     ADMISSION_RC=0

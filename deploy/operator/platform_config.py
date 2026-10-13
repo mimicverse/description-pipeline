@@ -307,7 +307,7 @@ _SECRET_KEYS = frozenset(
 )
 
 
-def _reject_secret_keys(document, where: str) -> None:
+def reject_secret_keys(document, where: str) -> None:
     """Secret-like keys are refused anywhere; file references (``*_file``) stay allowed."""
 
     stack = [document]
@@ -333,7 +333,7 @@ def validate_snapshot_document(document) -> dict:
     snapshot_keys = {"schema_version", "install_id", "generated_at", "resolved", "sources"}
     require_keys(document, allowed=snapshot_keys, required=snapshot_keys, where="snapshot document")
     require(document["schema_version"] == SNAPSHOT_SCHEMA, f"snapshot schema_version must be {SNAPSHOT_SCHEMA}")
-    _reject_secret_keys(document, "snapshot document")
+    reject_secret_keys(document, "snapshot document")
     text(document["install_id"], "snapshot install_id")
     generated_at = text(document["generated_at"], "snapshot generated_at")
     require(bool(_RFC3339_UTC.match(generated_at)), f"snapshot generated_at must be RFC3339 UTC: {generated_at!r}")

@@ -74,10 +74,33 @@ def platform_fixture(
     state = tmp / "state"
     secrets = tmp / "secrets"
     secrets.mkdir(exist_ok=True)
+    generated = subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-sha256",
+            "-nodes",
+            "-days",
+            "1",
+            "-subj",
+            f"/CN={host}",
+            "-addext",
+            f"subjectAltName=DNS:{host}",
+            "-keyout",
+            str(secrets / "tls.key"),
+            "-out",
+            str(secrets / "tls.crt"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if generated.returncode != 0:
+        raise AssertionError(generated.stderr)
     for name in ("tls.crt", "tls.key"):
-        path = secrets / name
-        path.write_text("x", encoding="utf-8")
-        path.chmod(0o600)
+        (secrets / name).chmod(0o600)
     feishu = secrets / "feishu.json"
     feishu.write_text('{"app_id": "cli_test", "app_secret": "s"}\n', encoding="utf-8")
     feishu.chmod(0o600)
@@ -171,9 +194,48 @@ def platform_fixture(
         key, _, value = line.partition("=")
         if key:
             env[key] = value
-    record = state / "install-record.json"
-    record.write_text(json.dumps({"install_id": install_id}), encoding="utf-8")
-    record.chmod(0o600)
+    identity_path = tmp / "endpoint-identity.json"
+    identity_path.write_text(
+        json.dumps(
+            {
+                "install_id": "ep-1",
+                "config_digest": "d" * 64,
+                "release": {
+                    "version": release_document["version"],
+                    "source_commit": release_document["source_commit"],
+                    "source_sha256": release_document["source_sha256"],
+                    "role": "native",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    dag_path = tmp / "solidworks_to_urdf.py"
+    dag_path.write_text("# dag fixture\n", encoding="utf-8")
+    built = run(
+        [
+            sys.executable,
+            str(OPERATOR / "install_record.py"),
+            "build",
+            "--state-root",
+            str(state),
+            "--install-id",
+            install_id,
+            "--snapshot",
+            snapshot,
+            "--release-file",
+            str(release_path),
+            "--endpoint-identity",
+            str(identity_path),
+            "--services",
+            "description-postgres,description-airflow-scheduler,description-operator-proxy",
+            "--dag",
+            str(dag_path),
+        ],
+        {},
+    )
+    if built.returncode != 0:
+        raise AssertionError(built.stderr)
     return config_path, Path(env_path), env
 
 
@@ -565,14 +627,31 @@ class LifecycleTests(unittest.TestCase):
         )
         write_stub(
             venv / "python",
-            '#!/bin/bash\necho "airflow admission check" >> "$ORDER_LOG"\n'
-            'count=$(cat "$REGISTER_COUNT" 2>/dev/null || echo 0)\n'
-            'if [ "$count" -lt "$REGISTER_AFTER" ]; then\n'
-            '  echo $((count + 1)) > "$REGISTER_COUNT"; exit 1\n'
-            'fi\n[ "$(cat "$ADMISSION")" = "false" ]\n',
+            "#!/bin/bash\n"
+            'case "$*" in\n'
+            '  "-m description_pipeline.orchestration.lifecycle_state"*)\n'
+            '    if [ -n "$PROJECTION_FILE" ] && [ -f "$PROJECTION_FILE" ]; then cat "$PROJECTION_FILE"; fi\n'
+            '    exit "${PROJECTION_RC:-0}" ;;\n'
+            "esac\n"
+            'script="$(cat)"\n'
+            'case "$script" in\n'
+            "  *admission-closed-gate*)\n"
+            '    [ "$(cat "$ADMISSION" 2>/dev/null)" = "true" ] ;;\n'
+            "  *)\n"
+            '    echo "airflow admission check" >> "$ORDER_LOG"\n'
+            '    count=$(cat "$REGISTER_COUNT" 2>/dev/null || echo 0)\n'
+            '    if [ "$count" -lt "$REGISTER_AFTER" ]; then\n'
+            '      echo $((count + 1)) > "$REGISTER_COUNT"; exit 1\n'
+            "    fi\n"
+            '    [ "$(cat "$ADMISSION")" = "false" ] ;;\n'
+            "esac\n",
         )
         admission, order = tmp / "admission", tmp / "order.log"
         admission.write_text("true")
+        projection = tmp / "projection.json"
+        projection.write_text(
+            json.dumps({"in_flight": [], "unresolved": [], "unknown": [], "settled": True}), encoding="utf-8"
+        )
         env = {
             "PATH": f"{bindir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
             "XDG_CONFIG_HOME": str(config_home),
@@ -582,6 +661,7 @@ class LifecycleTests(unittest.TestCase):
             "REGISTER_AFTER": str(register_after),
             "UNPAUSE_RC": str(unpause_rc),
             "PAUSE_RC": str(pause_rc),
+            "PROJECTION_FILE": str(projection),
         }
         return config_path, env, admission, order
 
@@ -608,21 +688,108 @@ class LifecycleTests(unittest.TestCase):
             self.assertNotIn("description-portal.service", order.read_text())
             self.assertNotIn("description-operator-proxy.service", order.read_text())
 
-    def test_stop_closes_ingress_and_stops_services_even_when_pause_fails(self) -> None:
-        for pause_rc in (0, 9):
-            with self.subTest(pause_rc=pause_rc), tempfile.TemporaryDirectory() as tmp:
-                config_path, env, admission, order = self._admission_fixture(Path(tmp), pause_rc=pause_rc)
-                admission.write_text("false")
-                result = run(["bash", str(CONTROL), "stop", "--config", str(config_path)], env)
-                self.assertEqual(result.returncode, pause_rc, result.stdout + result.stderr)
-                self.assertEqual(admission.read_text().strip(), "true" if pause_rc == 0 else "false")
-                lines = order.read_text().splitlines()
-                self.assertEqual(
-                    lines[0],
-                    "systemctl --user disable --now description-operator-proxy.service description-portal.service",
-                )
-                pause = lines.index("airflow dags pause solidworks_to_urdf")
-                self.assertLess(pause, lines.index("systemctl --user disable --now description-airflow-scheduler"))
+    def _project(self, env: dict, data: dict, rc: int) -> None:
+        Path(env["PROJECTION_FILE"]).write_text(json.dumps(data), encoding="utf-8")
+        env["PROJECTION_RC"] = str(rc)
+
+    def test_stop_requires_closed_admission_and_settled_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            admission.write_text("false")
+            result = run(["bash", str(CONTROL), "stop", "--config", str(config_path)], env)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("run drain first", result.stderr)
+            self.assertFalse(order.exists())
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            self._project(
+                env,
+                {
+                    "in_flight": [{"run_id": "run-active", "state": "running"}],
+                    "unresolved": [],
+                    "unknown": [],
+                    "settled": False,
+                },
+                1,
+            )
+            result = run(["bash", str(CONTROL), "stop", "--config", str(config_path)], env)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("stop refused", result.stderr)
+            self.assertFalse(order.exists())
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            self._project(
+                env,
+                {
+                    "in_flight": [],
+                    "unresolved": [{"run_id": "run-unresolved", "state": "unresolved"}],
+                    "unknown": [],
+                    "settled": False,
+                },
+                1,
+            )
+            result = run(["bash", str(CONTROL), "stop", "--config", str(config_path)], env)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("stop refused", result.stderr)
+            self.assertFalse(order.exists())
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            result = run(["bash", str(CONTROL), "stop", "--config", str(config_path)], env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            lines = order.read_text().splitlines()
+            self.assertEqual(
+                lines[0],
+                "systemctl --user disable --now description-operator-proxy.service description-portal.service",
+            )
+            pause = lines.index("airflow dags pause solidworks_to_urdf")
+            self.assertLess(pause, lines.index("systemctl --user disable --now description-airflow-scheduler"))
+            self.assertEqual(admission.read_text().strip(), "true")
+
+    def test_drain_closes_admission_and_requires_resolved_outcomes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            admission.write_text("false")
+            result = run(["bash", str(CONTROL), "drain", "--config", str(config_path)], env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(admission.read_text().strip(), "true")
+            self.assertIn("airflow dags pause solidworks_to_urdf", order.read_text())
+            self.assertIn('"settled": true', result.stdout)
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, env, admission, order = self._admission_fixture(Path(tmp), pause_rc=9)
+            result = run(["bash", str(CONTROL), "drain", "--config", str(config_path)], env)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("could not close the DAG admission", result.stderr)
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            self._project(
+                env,
+                {
+                    "in_flight": [],
+                    "unresolved": [{"run_id": "run-unresolved", "state": "unresolved"}],
+                    "unknown": [],
+                    "settled": False,
+                },
+                1,
+            )
+            result = run(["bash", str(CONTROL), "drain", "--config", str(config_path)], env)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("reconcile must close them", result.stderr)
+            self.assertIn('"unresolved"', result.stdout)
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            self._project(
+                env,
+                {
+                    "in_flight": [{"run_id": "run-active", "state": "running"}],
+                    "unresolved": [],
+                    "unknown": [],
+                    "settled": False,
+                },
+                0,
+            )
+            result = run(["bash", str(CONTROL), "drain", "--config", str(config_path)], env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn('"run_id": "run-active"', result.stdout)
 
     def test_units_render_and_static_health_passes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -695,6 +862,42 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertNotIn("DRIFT", result.stdout)
             self.assertEqual(before, {path: digest(path) for path in before})
+
+    def test_operational_entry_requires_the_complete_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, state, config_home, target = self._render_units(Path(tmp))
+            (state / "install-record.json").write_text(json.dumps({"install_id": "gen-1"}), encoding="utf-8")
+            before = {path: digest(path) for path in target.glob("*.service")}
+            result = run(
+                ["bash", str(CONTROL), "status", "--config", str(config_path)], {"XDG_CONFIG_HOME": str(config_home)}
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("install record", result.stderr)
+            self.assertEqual(before, {path: digest(path) for path in target.glob("*.service")})
+
+    def test_operational_entry_rejects_config_change_and_snapshot_tamper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, _, config_home, _ = self._render_units(Path(tmp))
+            document = json.loads(config_path.read_text(encoding="utf-8"))
+            document["targets"]["m3.0"]["base"] = "changed-base"
+            config_path.write_text(json.dumps(document), encoding="utf-8")
+            result = run(
+                ["bash", str(CONTROL), "status", "--config", str(config_path)], {"XDG_CONFIG_HOME": str(config_home)}
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("does not match the active snapshot", result.stderr)
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, state, config_home, _ = self._render_units(Path(tmp))
+            record = json.loads((state / "install-record.json").read_text(encoding="utf-8"))
+            snapshot_path = Path(record["snapshot"]["path"])
+            snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            snapshot["resolved"]["targets"]["m3.0"]["base"] = "tampered-base"
+            snapshot_path.write_text(json.dumps(snapshot), encoding="utf-8")
+            result = run(
+                ["bash", str(CONTROL), "status", "--config", str(config_path)], {"XDG_CONFIG_HOME": str(config_home)}
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("snapshot digest mismatch", result.stderr)
 
     def test_toolchain_pins_are_current(self) -> None:
         toolchain = (OPERATOR / "scripts" / "install_toolchain.sh").read_text(encoding="utf-8")
