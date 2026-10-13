@@ -8,11 +8,12 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from ..io import PipelineError, confined
+from ..geometry.stl import MESH_PART_TRIANGLES_MAX
 from ..model import Robot
 
 #: Consumers reject a single display mesh above this many triangles, so larger
 #: native meshes are delivered as deterministic, lossless parts.
-MESH_PART_TRIANGLE_LIMIT = 199_999
+MESH_PART_TRIANGLE_LIMIT = MESH_PART_TRIANGLES_MAX
 _STL_HEADER_BYTES = 80
 _STL_PREFIX_BYTES = 84
 _STL_TRIANGLE_BYTES = 50

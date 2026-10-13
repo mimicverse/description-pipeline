@@ -1230,8 +1230,8 @@ class FreezeTests(unittest.TestCase):
                 backend, config = self._two_component_backend()
                 original = backend.export_component_meshes
 
-                def changed_result(destinations, original=original, change=change):
-                    entries = original(destinations)
+                def changed_result(destinations, on_activity=None, original=original, change=change):
+                    entries = original(destinations, on_activity=on_activity)
                     name = next(iter(entries))
                     if change == "omit":
                         entries.pop(name)
@@ -1339,6 +1339,46 @@ class FreezeTests(unittest.TestCase):
         self.assertIn("192.0.2.10:8765", payload)
         self.assertEqual(json.loads(payload)["detail"]["attempts"], 3)
         self.assertTrue((failure / "partial" / "partial.txt").is_file())
+
+    def test_capture_progress_reaches_the_activity_callback(self) -> None:
+        """Freeze notes must flow with honest counts and never change the snapshot."""
+
+        records: list[dict] = []
+        freeze(self.config, self.destination, backend=self.backend, on_activity=records.append)
+        self.assertTrue(records)
+        self.assertTrue(all(item["phase"] == "capture" for item in records))
+        actions = [item["action"] for item in records]
+        for action in (
+            "start",
+            "closure",
+            "readings",
+            "mass_closure",
+            "geometry",
+            "verify_sources",
+            "window_close",
+            "window_reopen",
+            "window_read",
+            "release",
+            "seal",
+        ):
+            self.assertIn(action, actions)
+        self.assertIn("instance_reads", actions)  # the backend's own records travel through publish()
+        self.assertIn("mesh_export", actions)
+        last_completed: dict[str, int] = {}
+        for item in records:
+            if "completed" not in item:
+                continue
+            key = str(item["action"])
+            self.assertGreaterEqual(item["completed"], last_completed.get(key, 0))
+            self.assertLessEqual(item["completed"], item["total"])
+            last_completed[key] = item["completed"]
+
+        def exploded(_record):
+            raise RuntimeError("collector exploded")
+
+        again = self.tmp / "snapshot-boom"
+        freeze(self.config, again, backend=self.backend, on_activity=exploded)
+        self.assertTrue((again / "manifest.json").is_file())
 
 
 if __name__ == "__main__":

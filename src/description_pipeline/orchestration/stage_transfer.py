@@ -29,6 +29,7 @@ from ..io import PipelineError, artifact_path_parts, canonical, confined, digest
 from ..runtime import RUNTIME_VERSIONS, required_packages
 from ..sources.snapshot import verify_snapshot
 from ..sources.solidworks.revision import package_inventory
+from ..schemas import TOOL_SCHEMA
 from ..stages import CONTRACT, CONTRACT_FILE_SHA256, CONTRACT_SHA256, STAGE_IDS, VIEW_SCHEMA, stage_view
 
 CAPTURE_ARCHIVE = "native-evidence.zip"
@@ -52,7 +53,7 @@ TEAM_REPORTS = ("reports/structural-team.md", "reports/structural-team.json")
 #: Known mutable receipts stamped by the endpoint; sealing ignores them, never transfers them.
 _LIVE_REPORTS = ("reports/stages.json", "reports/run.json")
 
-_TOOL_SCHEMA = "solidworks-to-urdf.tool/v1"
+_TOOL_SCHEMA = TOOL_SCHEMA
 _STAGE_DEFINITIONS = {stage["id"]: stage for stage in CONTRACT["stages"]}
 _READ_CHUNK = 1024 * 1024
 

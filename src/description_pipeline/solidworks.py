@@ -23,7 +23,7 @@ from .delivery import BUNDLE_SCHEMA, PIPELINE_ID, subject_inventory
 from .io import PipelineError, acquire_process_lock, digest, file_digest, inventory, read_data, write_json
 
 from .runtime import RUNTIME_VERSIONS, native_readiness, required_packages, runtime_role
-from .stages import STAGE_IDS, stage_view
+from .stages import PORTABLE_STAGES, STAGE_IDS, stage_view
 
 
 @contextmanager
@@ -132,7 +132,7 @@ def _install(staging: Path, target: Path) -> None:
 #: The portable stage set; a receipt renders a report only when its executed
 #: scope declares at least one of these stages (the Windows capture boundary
 #: receipts carry no portable scope, so the native host renders nothing).
-_PORTABLE_SCOPE = frozenset(STAGE_IDS[3:])
+_PORTABLE_SCOPE = frozenset(PORTABLE_STAGES)
 
 
 def _stamp(root: Path, receipt: dict) -> None:
@@ -267,6 +267,7 @@ def run(
     backend=None,
     run_id: str | None = None,
     on_event=None,
+    on_activity=None,
     prior_events=None,
     expected_inputs=None,
     handoff_sha256=None,
@@ -290,6 +291,8 @@ def run(
     the endpoint always uses the native SolidWorks backend. Capture or quality
     failure preserves a previous delivery. Submission failure keeps the new
     verified delivery and any publication receipt for retry without CAD.
+    ``on_activity`` optionally observes best-effort capture progress records for
+    the live-activity view; progress can never change a run.
     """
 
     package = Path(package)
@@ -344,6 +347,7 @@ def run(
                     staging,
                     backend=backend,
                     on_event=event,
+                    on_activity=on_activity,
                     expected_inputs=expected_inputs,
                     handoff_sha256=handoff_sha256,
                 )

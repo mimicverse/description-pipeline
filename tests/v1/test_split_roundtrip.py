@@ -85,7 +85,7 @@ class AxisFixtureBackend(support.FixtureCadBackend):
             record["face_index"] = reference["face_index"]
         return record
 
-    def export_component_meshes(self, destinations, progress=None):
+    def export_component_meshes(self, destinations, on_activity=None):
         """Mirror the native exporter response: body counts plus tessellation accounting.
 
         The real native reader reports, per component, the native body counts and
@@ -95,7 +95,7 @@ class AxisFixtureBackend(support.FixtureCadBackend):
         tessellate, with no omitted faces.
         """
 
-        entries = super().export_component_meshes(destinations, progress=progress)
+        entries = super().export_component_meshes(destinations, on_activity=on_activity)
         for info in entries.values():
             info["bodies"] = {"solid": 1, "sheet": 0}
             info["tessellation"] = {"faces": 6, "no_facets_faces": []}

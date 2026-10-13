@@ -21,8 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from ...io import PipelineError, confined, digest, file_digest, inventory, read_data
-
-INPUT_SCHEMA = "solidworks-to-urdf.input/v1"
+from ...schemas import INPUT_SCHEMA
 INSPECTION_SCHEMA = "solidworks-to-urdf.input-inspection/v1"
 ROBOT_FILE = "robot.yaml"
 CONFIG_SUFFIXES = (".yaml", ".yml")

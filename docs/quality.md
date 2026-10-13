@@ -77,7 +77,7 @@ Implementation paths below are relative to `src/description_pipeline/`.
 | Native definition | Independently reconstruct membership, adjacency, motion, names, frames and limits from native observations; required gate `source.native_discovery` | `verification/native_discovery.py` |
 | Declared native facts | Exporter declaration ingested at discovery and independently re-decoded at verification; declared membership, topology, frames, axes and limits reconciled with native observations and with the generated source (`discovery.declarations`); contradictions fail closed | `sources/solidworks/exporter.py`, `verification/v14_declarations.py`, `verification/native_declarations.py` |
 | Native source | Native SolidWorks evidence, qualified API/build, matching collection identity and environment | `verification/solidworks_urdf.py` |
-| Dependency closure | No unresolved reference: the full uploaded folder is staged, the native engine resolves its references, and the closure seals only when every engine-reported binding lies inside the staged root and matches the upload index — or is an engine-materialized import admitted only through the sealed owner/occurrence evidence matched to its staged source by native identity (never by temporary path or file name); a missing or outside-stage reference fails the run after resolution (closure admission over reported bindings, not an OS sandbox); original CAD belongs to the sealed selection; collected-copy hashes and configuration agree | `verification/solidworks_urdf.py` |
+| Dependency closure | No unresolved reference: closure is admitted only from the engine's resolved bindings inside the staged root ([design](design.md#2-how-the-system-works)); original CAD belongs to the sealed selection; collected-copy hashes and configuration agree | `verification/solidworks_urdf.py` |
 | Occurrence coverage | Every selected native occurrence belongs to exactly one body, matching the native declarations and independently proven rigid attachments; unassigned occurrences remain explicit warnings with their measured mass accounted separately. Missing explicit material assignments retain the measured CAD mass/centre-of-mass/inertia without claiming verified material; identity survives normalization | `verification/solidworks_urdf.py` |
 | Coordinates | Finite SI homogeneous transforms, orthonormal right-handed bases, CAD-derived body/joint/reference frames | `verification/solidworks_urdf.py` |
 | Shaft alignment | Numeric shaft line from the independently re-read reference axis or cylindrical interface, stable native identity, origin on shaft and axis collinearity | `verification/solidworks_urdf.py` |
@@ -323,3 +323,12 @@ strictly. No physical accuracy is claimed; complete physical source records
 remain subject to independent checks. The
 [per-item responsibility table](mechanical-handoff-spec.md#111-自动检查与工程师确认)
 separates automatic coverage from engineer-confirmed physical meaning.
+
+Both discovery regimes are supported by design and selected by the same shared
+predicate in the producer and the verifier
+([design](design.md#2-how-the-system-works)): when the sealed record carries the
+saved exporter declaration (the `exporter` block exists and its state is not a
+proven `absent`), verification re-decodes that declaration and reconciles it with
+the native observations; when the declaration is proven absent, verification runs
+the mate-inference suite instead. Mate-mode real-CAD acceptance is tracked to the
+M3.0 externalized rerun at RC.
