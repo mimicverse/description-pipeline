@@ -95,6 +95,12 @@ def collection(root) -> dict:
     return block(root, "collection")
 
 
+def effective_instances(root) -> dict:
+    """The verbatim effective-instance record (schema/warnings/readings keys intact)."""
+
+    return block(root, "effective_instances")
+
+
 def geometry(root):
     return block(root, "geometry")
 

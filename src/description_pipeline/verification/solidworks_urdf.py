@@ -21,11 +21,9 @@ import numpy as np
 
 from ..delivery import PIPELINE_ID, read_delivery_manifest, read_source_record, subject_digest
 from ..geometry import stl
-from ..io import PipelineError, confined, file_digest, inventory, read_data
+from ..io import PipelineError, confined, digest, file_digest, inventory, read_data
 from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, TOOL_SCHEMA
-from ..sources.solidworks.input import inspect_package
 from ..sources.solidworks.revision import NATIVE_SUFFIXES
-from ..sources.solidworks.revision import package_inventory, read_revision
 from ..interface_records import CHECK_POLICY_V1
 from ..stages import required_rows_complete
 from . import evidence_tree as ev
@@ -189,53 +187,70 @@ def require_qualified_report(report):
 
 
 def _input(root, diagnostics=None):
-    """Bind the archived input; an absent publication seal is a readiness warning, not a failure.
+    """Bind the frozen input and the author definition carried by the discovery record.
 
-    A supplied cad-revision.json stays strictly validated (malformed or tampered metadata
-    fails).  When the seal is absent the delivery is only acceptable while the authored
-    administrative identity is incomplete; engineering evidence is bound to the archived
-    native record and the captured package inventory instead.
+    The CAD/PDM revision label is optional raw metadata (a missing value stays
+    missing, as a readiness diagnostic); engineering evidence binds to the
+    discovery record, the frozen handoff record and the archived originals under
+    ``input/cad``.
     """
 
-    from .native_discovery import REVISION_FILE
-
     diagnostics = [] if diagnostics is None else diagnostics
-    report = inspect_package(root / "input")
-    _require(report.get("passed") is True, str(report.get("errors")))
-    definition = report["input"]
-    saved = read_data(confined(root, "reports/input.json"))
+    discovery_record = ev.discovery(root)
+    derived = discovery_record.get("derived")
     _require(
-        saved.get("passed") is True and saved.get("input") == definition,
-        "Input report does not bind the author definition",
+        isinstance(derived, dict) and derived.get("bodies") is not None,
+        "Discovery record carries no derived definition",
     )
-    seal = root / "input" / REVISION_FILE
-    _require(not seal.is_symlink(), "The revision manifest cannot be a symlink")
-    if seal.is_file():
-        revision = read_revision(root / "input", hardware_id=definition.get("hardware_id"))
-        _require(saved.get("cad_revision") == revision, "Input report has another CAD revision")
-    else:
-        from .native_discovery import DISCOVERY_FILE, publication_metadata_state
+    source = read_source_record(root)
+    handoff = ev.handoff(root)
+    identity = source["identity"]
+    _require(
+        handoff.get("main_assembly") == identity["main_assembly"],
+        "Handoff and source record disagree on the main assembly",
+    )
+    _require(
+        handoff.get("configuration") == identity["configuration"],
+        "Handoff and source record disagree on the configuration",
+    )
+    robot_name = discovery_record.get("robot_name")
+    _require(isinstance(robot_name, str) and robot_name, "Discovery record carries no robot name")
+    declared = ev.declared_masses(root)
+    recorded = (handoff.get("input_receipt") or {}).get("inventory")
+    if isinstance(recorded, dict) and recorded:
+        archived = inventory(root / "input/cad")
+        missing = [name for name, checksum in recorded.items() if archived.get(name) != checksum]
+        _require(not missing, f"Archived input differs from the frozen handoff inventory: {missing[:5]}")
+    revision = source["metadata"].get("revision")
+    if not isinstance(revision, str) or not revision:
+        from .native_discovery import publication_metadata_state
 
-        payload = read_data(confined(root / "input", DISCOVERY_FILE))
-        authored = publication_metadata_state(payload.get("raw") or {}, str(payload.get("namespace") or "dp"))
-        _require(
-            authored["missing"],
-            "Missing generated cad-revision.json for complete authored publication metadata",
+        authored = publication_metadata_state(
+            discovery_record.get("raw") or {}, str(discovery_record.get("namespace") or "dp")
         )
         diagnostics.append(
             {
-                "code": "input.cad_revision_not_sealed",
+                "code": "input.cad_revision_absent",
                 "blocking": False,
-                "message": (
-                    "cad-revision.json is absent while authored publication metadata is incomplete; "
-                    "engineering checks bind the archived native evidence instead"
-                ),
-                "detail": {"hardware_id": definition.get("hardware_id"), "missing": list(authored["missing"])},
+                "message": "the CAD revision label is absent; the raw value stays missing",
+                "detail": {"hardware_id": identity["hardware_id"], "missing": list(authored.get("missing") or [])},
             }
         )
-    files = package_inventory(root / "input")
-    _require(saved.get("package_files") == files, "Archived input differs from the captured package")
-    return definition
+    return {
+        "schema_version": discovery_record.get("schema_version"),
+        "hardware_id": identity["hardware_id"],
+        "source": {
+            "assembly": identity["main_assembly"],
+            "configuration": identity["configuration"],
+            "robot_name": robot_name,
+            "bodies": derived["bodies"],
+            "joints": derived.get("joints") or [],
+            "frames": derived.get("frames") or [],
+            "documented_masses": declared.get("items") or {},
+            "mass_evidence": declared.get("evidence") or {},
+        },
+        "checks": derived.get("checks") or {},
+    }
 
 
 def _native(root):
@@ -525,9 +540,9 @@ def _handoff_native_hashes(root: Path) -> set[str]:
     """
 
     payload = ev.discovery(root)
-    native = payload.get("native_files") if isinstance(payload, dict) else None
-    _require(isinstance(native, dict) and bool(native), "The archived native file inventory is missing")
-    frozen = {str(name): str(checksum) for name, checksum in native.items()}
+    native = payload.get("files") if isinstance(payload, dict) else None
+    _require(isinstance(native, list) and bool(native), "The archived native file inventory is missing")
+    frozen = {str(row["path"]): str(row["sha256"]) for row in native}
     for relative, checksum in sorted(frozen.items()):
         path = confined(root / "input/cad", relative)
         _require(path.is_file(), f"A frozen native file is missing from the archived input: {relative}")
@@ -535,11 +550,8 @@ def _handoff_native_hashes(root: Path) -> set[str]:
             file_digest(path) == checksum,
             f"A frozen native file differs from its recorded bytes: {relative}",
         )
-    canonical = hashlib.sha256(
-        (json.dumps(frozen, sort_keys=True, ensure_ascii=False, allow_nan=False, indent=2) + "\n").encode()
-    ).hexdigest()
     _require(
-        canonical == payload.get("native_inventory_sha256"),
+        digest(native) == payload.get("native_inventory_sha256"),
         "The native inventory digest does not match the discovery record",
     )
     raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
@@ -590,8 +602,6 @@ def _native_receipts_evidence(root, receipts):
     schema, byte digests and release binding are re-checked here, and the parsed
     bytes are the evidence (never a re-serialized copy).
     """
-
-    import hashlib
 
     names = ("native_tool_bytes", "native_stages_bytes", "transfer_manifest_bytes")
     _require(isinstance(receipts, dict), "Native receipts must be supplied as an object")
@@ -873,7 +883,7 @@ def _qualified_surface_only(root, occurrence: str) -> bool:
     """
 
     try:
-        record = read_data(confined(root / "evidence", "raw/effective_instances.json"))
+        record = ev.effective_instances(root)
         mass_properties = ev.mass_properties(root)
     except (PipelineError, OSError, ValueError):
         return False
