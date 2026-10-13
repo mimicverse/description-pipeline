@@ -333,10 +333,21 @@ class DagTests(unittest.TestCase):
         parent_dag_run_id = "portal-parent-20261009"
         parent_run_id = native_run_id(parent_dag_run_id)
         upload = {"3.0 总装1008.SLDASM": "a" * 64, "parts/零件.SLDPRT": "b" * 64}
+        parent_job = {
+            "request": {
+                "run_id": parent_run_id,
+                "upload_files": upload,
+                "upload_sha256": digest(upload),
+                "main_assembly": "3.0 总装1008.SLDASM",
+            }
+        }
         submitted = {}
 
         class Stub:
             def get_job(self, run_id):
+                if run_id == parent_run_id:
+                    # resolve_handoff reads the retained parent selection first.
+                    return parent_job
                 raise module.EndpointNotFound("child job is not created yet")
 
             def start_staging_job(self, **kwargs):
