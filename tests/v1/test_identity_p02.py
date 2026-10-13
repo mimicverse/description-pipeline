@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from description_pipeline.orchestration import portal, uploads
-from description_pipeline.orchestration.airflow_client import EndpointProtocolError, _linux_targets
+from description_pipeline.orchestration.airflow_client import (
+    EndpointConfig,
+    EndpointProtocolError,
+    _linux_targets,
+    submission_identity,
+)
 from description_pipeline.orchestration.discovery_transfer import _GENERATED_MEMBERS
+from description_pipeline.repository import urdf_pr
 from description_pipeline.sources.solidworks import discovery
 
 DIGEST = "a" * 64
@@ -59,30 +67,51 @@ class SuggestionTests(unittest.TestCase):
 
 
 class PortalConfigTargetsTests(unittest.TestCase):
+    @staticmethod
+    def _write_config(root: Path, *, targets: dict, repositories: dict) -> Path:
+        token = root / "endpoint.token"
+        token.write_text("t" * 40, encoding="utf-8")
+        config = root / "portal.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "airflow": {"url": "http://127.0.0.1:8791"},
+                    "endpoint": {"url": "http://127.0.0.1:18765", "token_file": str(token)},
+                    "pipeline": {
+                        "store_root": str(root / "runs"),
+                        "repositories": repositories,
+                        "targets": targets,
+                        "discovery": {},
+                    },
+                    "portal": {"host": "127.0.0.1", "port": 8780},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return config
+
     def test_loader_reads_and_validates_targets(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            token = root / "endpoint.token"
-            token.write_text("t" * 40, encoding="utf-8")
-            config = root / "portal.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "airflow": {"url": "http://127.0.0.1:8791"},
-                        "endpoint": {"url": "http://127.0.0.1:18765", "token_file": str(token)},
-                        "pipeline": {
-                            "store_root": str(root / "runs"),
-                            "repositories": {"mimicverse/description": str(root / "models")},
-                            "targets": {"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
-                            "discovery": {},
-                        },
-                        "portal": {"host": "127.0.0.1", "port": 8780},
-                    }
-                ),
-                encoding="utf-8",
+            config = self._write_config(
+                root,
+                targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
+                repositories={"mimicverse/description": str(root / "models")},
             )
             loaded = portal.load_portal_config(config)
             self.assertEqual(loaded.pipeline_targets["m3.0"]["base"], "main")
+
+    def test_loader_rejects_a_target_with_an_unconfigured_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self._write_config(
+                root,
+                targets={"m3.0": {"repository_slug": "someone/else", "base": "main"}},
+                repositories={"mimicverse/description": str(root / "models")},
+            )
+            with self.assertRaises(portal.AirflowApiError) as caught:
+                portal.load_portal_config(config)
+            self.assertIn("unconfigured repository", str(caught.exception))
 
 
 class IdentitySynthesisTests(unittest.TestCase):
@@ -128,6 +157,17 @@ class IdentitySynthesisTests(unittest.TestCase):
         self.assertTrue(findings["discovery.identity_conflict"].get("blocking", True))
         self.assertEqual(identity["hardware_id"], "m3.0")
         self.assertEqual(sources["hardware_id"], "cad")
+
+    def test_malformed_submission_hardware_blocks(self) -> None:
+        submission = discovery.SubmissionIdentity(
+            hardware_id="1bad id", as_of="20261013", inventory_digest=DIGEST
+        )
+        identity, sources, findings = self._identity({}, submission)
+        self.assertIn("discovery.identity_invalid", findings)
+        self.assertTrue(findings["discovery.identity_invalid"].get("blocking", True))
+        self.assertEqual(identity["hardware_id"], "1bad id")
+        self.assertEqual(sources["hardware_id"], "submission")
+        self.assertIsNone(identity["revision"])
 
     def test_derived_revision_parent_owner_and_control(self) -> None:
         submission = discovery.SubmissionIdentity(
@@ -192,3 +232,62 @@ class UploadFieldTests(unittest.TestCase):
             payload = b"x" * (uploads.MAX_CHANGE_SUMMARY_BYTES + 1)
             with self.assertRaises(uploads.UploadRejected):
                 receiver._on_part_data(payload, 0, len(payload))
+
+
+class SubmissionIdentityHelperTests(unittest.TestCase):
+    @staticmethod
+    def _config() -> EndpointConfig:
+        return EndpointConfig(
+            "http://127.0.0.1:18765",
+            "t" * 32,
+            repositories={"mimicverse/description": Path("/srv/models/arm")},
+            targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
+        )
+
+    def test_unconfigured_target_fails_closed(self) -> None:
+        with self.assertRaises(EndpointProtocolError) as caught:
+            submission_identity(target_hardware="ghost", config=self._config(), as_of="20261013")
+        self.assertIn("not a configured publication target", str(caught.exception))
+
+    def test_absent_target_returns_none(self) -> None:
+        self.assertIsNone(submission_identity(target_hardware="", config=self._config(), as_of="20261013"))
+
+    def test_payload_carries_owner_summary_and_parent(self) -> None:
+        payload = submission_identity(
+            target_hardware="m3.0",
+            change_summary="one line",
+            principal="cli_app:tenant-a:ou_worker",
+            config=self._config(),
+            as_of="20261013",
+            published_revision=lambda repository, hardware: {"revision": "m3.0-20261001-deadbeef"},
+        )
+        self.assertEqual(payload["hardware_id"], "m3.0")
+        self.assertEqual(payload["owner"], "cli_app:tenant-a:ou_worker")
+        self.assertEqual(payload["change_summary"], "one line")
+        self.assertEqual(payload["parent_revision"], "m3.0-20261001-deadbeef")
+        self.assertEqual(payload["as_of"], "20261013")
+
+    def test_reader_failure_is_best_effort_with_a_warning(self) -> None:
+        warnings: list[str] = []
+
+        def boom(repository, hardware):
+            raise subprocess.TimeoutExpired("git fetch", 60)
+
+        payload = submission_identity(
+            target_hardware="m3.0",
+            config=self._config(),
+            as_of="20261013",
+            published_revision=boom,
+            warn=warnings.append,
+        )
+        self.assertIsNone(payload["parent_revision"])
+        self.assertEqual(len(warnings), 1)
+
+
+class PublishedRevisionTimeoutTests(unittest.TestCase):
+    def test_fetch_timeout_reports_unavailable(self) -> None:
+        with (
+            patch.object(urdf_pr, "_validate_ref"),
+            patch.object(urdf_pr.subprocess, "run", side_effect=subprocess.TimeoutExpired("git", 60)),
+        ):
+            self.assertIsNone(urdf_pr.published_revision(Path("/srv/models/arm"), "m3.0"))

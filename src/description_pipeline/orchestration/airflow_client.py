@@ -268,6 +268,52 @@ def validate_main_assembly(value: object) -> str:
     return value
 
 
+def submission_identity(
+    *,
+    target_hardware,
+    change_summary=None,
+    principal=None,
+    config: EndpointConfig,
+    as_of: str,
+    published_revision=None,
+    warn=None,
+) -> dict | None:
+    """Build the validated submission identity carried beside the endpoint request.
+
+    Returns ``None`` when no target was selected (today's deferred behavior).
+    An unconfigured target fails closed; the previous published revision is read
+    best-effort through the supplied reader (any failure only warns and leaves
+    ``parent_revision`` absent).
+    """
+
+    target = str(target_hardware or "").strip()
+    summary = str(change_summary or "").strip()
+    if not target:
+        return None
+    routing = config.targets.get(target)
+    if routing is None:
+        raise EndpointProtocolError(f"target_hardware {target!r} is not a configured publication target")
+    parent = None
+    repository = config.repositories.get(str(routing["repository_slug"]))
+    if repository is not None and published_revision is not None:
+        try:
+            previous = published_revision(repository, target)
+        except Exception as error:  # noqa: BLE001 - identity derivation stays best-effort
+            if warn is not None:
+                warn(f"previous revision unavailable for {target}: {error}")
+        else:
+            if isinstance(previous, dict) and isinstance(previous.get("revision"), str):
+                parent = previous["revision"]
+    owner = principal if isinstance(principal, str) and principal.strip() else None
+    return {
+        "hardware_id": target,
+        "owner": owner,
+        "change_summary": summary or None,
+        "parent_revision": parent,
+        "as_of": as_of,
+    }
+
+
 def validate_artifact_name(value: str) -> str:
     return _validate_relative_path(value, "artifact name")
 

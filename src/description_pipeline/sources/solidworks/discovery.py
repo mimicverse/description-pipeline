@@ -3536,8 +3536,18 @@ def _identity(
                 "hardware identity is not recorded in the CAD records and the submission selected no "
                 "configured target; publication readiness requires it",
             )
-    elif _IDENTITY_ID.fullmatch(hardware) is None:
+    else:
         sources["hardware_id"] = "cad"
+        if sub_hardware is not None and sub_hardware != hardware:
+            findings.append(
+                _finding(
+                    "discovery.identity_conflict",
+                    "assembly",
+                    "the submitted hardware identity differs from the CAD-carried identity; publication stays blocked",
+                    {"cad": hardware, "submission": sub_hardware},
+                )
+            )
+    if hardware is not None and _IDENTITY_ID.fullmatch(hardware) is None:
         findings.append(
             _finding(
                 "discovery.identity_invalid",
@@ -3546,18 +3556,6 @@ def _identity(
                 {"value": hardware},
             )
         )
-    elif sub_hardware is not None and sub_hardware != hardware:
-        sources["hardware_id"] = "cad"
-        findings.append(
-            _finding(
-                "discovery.identity_conflict",
-                "assembly",
-                "the submitted hardware identity differs from the CAD-carried identity; publication stays blocked",
-                {"cad": hardware, "submission": sub_hardware},
-            )
-        )
-    else:
-        sources["hardware_id"] = "cad"
     revision = _identity_value(record, namespace, "revision")
     revision = str(revision).strip() if _text(revision) else None
     if revision is not None:

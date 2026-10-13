@@ -16,6 +16,7 @@ Guarantees:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -67,6 +68,10 @@ REQUIRED_FILES = (
 REQUIRED_DIRS = ("evidence", "meshes")
 REVIEW_BRANCH = "work/solidworks/{hardware}"
 PUBLISHER_MARKER = "Urdf-Publisher: description-pipeline"
+log = logging.getLogger(__name__)
+
+#: Bound on the best-effort fetch that resolves a previous published revision.
+PUBLISHED_REVISION_FETCH_TIMEOUT_SECONDS = 60
 
 
 class PrError(RuntimeError):
@@ -171,7 +176,18 @@ def published_revision(repository: Path, hardware: str) -> dict | None:
 
     branch = REVIEW_BRANCH.format(hardware=hardware)
     _validate_ref(repository, branch, branch=True)
-    _git(repository, "fetch", "--quiet", "origin", branch, check=False)
+    try:
+        subprocess.run(
+            ["git", "-C", str(repository), "fetch", "--quiet", "origin", branch],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=PUBLISHED_REVISION_FETCH_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning("published revision fetch timed out for %s; continuing without a parent revision", branch)
+        return None
     show = _git(repository, "show", f"refs/remotes/origin/{branch}:input/cad-revision.json", check=False)
     if show.returncode != 0 or not show.stdout.strip():
         return None

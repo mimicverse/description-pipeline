@@ -37,6 +37,7 @@ from description_pipeline.orchestration.airflow_client import (
     drive_staging,
     native_run_id,
     resolved_routing,
+    submission_identity,
     validate_main_assembly,
 )
 from description_pipeline.orchestration.linux_runner import fetch_capture as fetch_native_capture
@@ -206,28 +207,20 @@ def _submission_identity(context) -> dict | None:
             log.info("submission change summary ignored without a configured target identity")
         return None
     config = config_from_airflow_connection(CONN_ID)
-    routing = config.targets.get(target)
-    if routing is None:
-        raise AirflowFailException(f"target_hardware {target!r} is not a configured publication target")
-    parent = None
-    repository = config.repositories.get(str(routing["repository_slug"]))
-    if repository is not None:
-        from description_pipeline.repository.urdf_pr import published_revision
+    from description_pipeline.repository.urdf_pr import published_revision
 
-        try:
-            previous = published_revision(repository, target)
-        except (OSError, PipelineError, ValueError) as error:
-            log.warning("previous revision unavailable for %s: %s", target, error)
-        else:
-            if isinstance(previous, dict) and isinstance(previous.get("revision"), str):
-                parent = previous["revision"]
-    return {
-        "hardware_id": target,
-        "owner": principal or None,
-        "change_summary": summary or None,
-        "parent_revision": parent,
-        "as_of": datetime.now(UTC).strftime("%Y%m%d"),
-    }
+    try:
+        return submission_identity(
+            target_hardware=target,
+            change_summary=summary,
+            principal=principal,
+            config=config,
+            as_of=datetime.now(UTC).strftime("%Y%m%d"),
+            published_revision=published_revision,
+            warn=lambda message: log.warning("%s", message),
+        )
+    except EndpointProtocolError as error:
+        raise AirflowFailException(str(error)) from error
 
 
 def _param_selection(context) -> str | None:
