@@ -167,11 +167,15 @@ class LinuxStore:
         if subject_digest(directory) != subject:
             raise PipelineError("The recorded checkpoint bytes no longer match its receipt")
         if stage == "verify":
-            report = require_qualified_report(read_data(directory / "reports/quality.json"))
+            report = require_qualified_report(
+                read_data(directory / "reports/quality.json"), rebuilt_definition(directory)
+            )
             if report.get("subject_sha256") != subject:
                 raise PipelineError("The verified quality report is bound to another subject")
         if stage == "publish":
-            report = require_qualified_report(read_data(directory / "reports/quality.json"))
+            report = require_qualified_report(
+                read_data(directory / "reports/quality.json"), rebuilt_definition(directory)
+            )
             if report.get("subject_sha256") != subject:
                 raise PipelineError("The published quality report is bound to another subject")
             submission = receipt.get("submission")

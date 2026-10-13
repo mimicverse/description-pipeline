@@ -13,6 +13,7 @@ import tempfile
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest import mock
 
 from description_pipeline.delivery import read_delivery_manifest, write_delivery_manifest
 from description_pipeline.interface_records import CHECK_POLICY_SCHEMA, CHECK_POLICY_V1, check_policy_digest
@@ -25,6 +26,8 @@ from description_pipeline.platform.store import (
 )
 from description_pipeline.runtime import tool_record
 from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
+from description_pipeline.verification import solidworks_urdf
+from description_pipeline.verification.solidworks_urdf import required_checks
 
 NOW = datetime(2026, 10, 14, 10, 0, tzinfo=UTC)
 HANDOFF = "b" * 64
@@ -221,13 +224,18 @@ class PlatformStoreTests(unittest.TestCase):
         self.delivery = Path(self.directory.name) / "sealed"
         self.delivery.mkdir()
         self.subject, self.artifacts = build_sealed_delivery(self.delivery)
+        self.definition = {"source": {"bodies": [{"name": "base_link"}]}, "checks": {}}
+        self.rebuilt = mock.Mock(return_value=self.definition)
+        definition_patch = mock.patch.object(solidworks_urdf, "rebuilt_definition", new=self.rebuilt)
+        definition_patch.start()
+        self.addCleanup(definition_patch.stop)
         self.world = FakeWorld()
         self.store = PlatformStore(self.world.connect, sealed=lambda uri: self.delivery)
 
     # ------------------------------------------------------------- fixtures
 
     def qualified_quality(self, **overrides) -> dict:
-        expected = sorted(set(CHECK_POLICY_V1["fixed_checks"]))
+        expected = required_checks(self.definition)
         payload = {
             "passed": True,
             "subject_sha256": self.subject,
@@ -236,6 +244,15 @@ class PlatformStoreTests(unittest.TestCase):
         }
         payload.update(overrides)
         return payload
+
+    def fixed_only_quality(self) -> dict:
+        fixed = sorted(set(CHECK_POLICY_V1["fixed_checks"]))
+        return {
+            "passed": True,
+            "subject_sha256": self.subject,
+            "checks": [{"id": name, "state": "passed", "passed": True, "details": {}} for name in fixed],
+            "required_checks": fixed,
+        }
 
     def generate_receipt(self, **overrides) -> dict:
         payload = {
@@ -405,7 +422,7 @@ class PlatformStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(PlatformStoreError, "requires the completed 'verify' stage"):
             self._publish_registration()
         self.world.stages[("r-1", "verify")] = ("completed", {"run_id": "r-1", "stage": "verify"}, CHECKPOINT)
-        with self.assertRaisesRegex(PlatformStoreError, "sealed receipt"):
+        with self.assertRaisesRegex(PlatformStoreError, "sealed"):
             self._publish_registration()
         self.world.stages[("r-1", "verify")] = ("completed", self.verify_receipt(), CHECKPOINT)
         self.assertEqual(self._publish_registration().stage, "publish")
@@ -430,13 +447,17 @@ class PlatformStoreTests(unittest.TestCase):
         self._running_run()
         with self.assertRaisesRegex(PlatformStoreError, "state must be one of"):
             self.store.confirm_stage(run_id="r-1", stage="generate", state="generated")
-        with self.assertRaisesRegex(PlatformStoreError, "schema"):
+        with self.assertRaisesRegex(PlatformStoreError, "sealed delivery subject"):
             self.store.confirm_stage(
                 run_id="r-1",
                 stage="verify",
                 state="completed",
                 checkpoint_uri=CHECKPOINT,
                 receipt={"run_id": "r-1", "stage": "verify", "state": "verified"},
+            )
+        with self.assertRaisesRegex(PlatformStoreError, "schema"):
+            self.store.confirm_stage(
+                run_id="r-1", stage="generate", state="failed", receipt={"run_id": "r-1", "stage": "generate"}
             )
         with self.assertRaisesRegex(PlatformStoreError, "confirmed receipt state"):
             self._confirm_generate(receipt=self.generate_receipt(state="failed"))
@@ -467,6 +488,7 @@ class PlatformStoreTests(unittest.TestCase):
 
     def test_a_completion_needs_the_real_sealed_bytes(self) -> None:
         self._running_run()
+        self.rebuilt.reset_mock()
         unconfigured = PlatformStore(self.world.connect)
         with self.assertRaisesRegex(PlatformStoreError, "Sealed storage is not configured"):
             unconfigured.confirm_stage(
@@ -490,6 +512,29 @@ class PlatformStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(PlatformStoreError, "does not match the receipt"):
             self._confirm_generate(receipt=self.generate_receipt(subject_sha256="f" * 64))
         self._confirm_generate()
+        self.rebuilt.assert_called_with(self.delivery)
+
+    def test_the_quality_inventory_binds_the_rebuilt_definition(self) -> None:
+        self._running_run()
+        # The report's own required list is never the authority: a fixed-only
+        # subset is refused because the sealed tree rebuilds more gates.
+        with self.assertRaisesRegex(PlatformStoreError, "required checks"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="verify",
+                state="completed",
+                checkpoint_uri=CHECKPOINT,
+                receipt=self.verify_receipt(quality=self.fixed_only_quality()),
+            )
+        self.rebuilt.assert_called_with(self.delivery)
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="verify",
+            state="completed",
+            checkpoint_uri=CHECKPOINT,
+            receipt=self.verify_receipt(),
+        )
+        self.assertEqual(self.world.stages[("r-1", "verify")][0], "completed")
 
     def test_unresolved_is_confirmed_only_by_evidenced_reconciliation(self) -> None:
         self._running_run(from_stage="generate")

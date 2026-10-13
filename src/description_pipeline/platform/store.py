@@ -333,7 +333,7 @@ class PlatformStore:
                 return _matching_operation(row, run_id=run_id, stage=stage, kind=kind, params_digest=params_digest)
             if stage not in STAGE_IDS:
                 raise PlatformStoreError(f"The stage must be one of {tuple(STAGE_IDS)}: {stage!r}")
-            _require_successor(connection, run_id=run_id, kind=kind, stage=stage)
+            _require_successor(self, connection, run_id=run_id, kind=kind, stage=stage)
             return self._insert_operation(
                 connection,
                 run_id=run_id,
@@ -411,9 +411,17 @@ class PlatformStore:
             raise PlatformStoreError("Reconciliation evidence must be a non-empty record")
         if reconcile is not None and state not in {"completed", "failed", "cancelled"}:
             raise PlatformStoreError("A reconciliation confirms a definite outcome; unresolved is not an outcome")
-        _sealed_receipt(receipt, run_id=run_id, stage=stage, state=state, checkpoint_uri=checkpoint_uri)
+        definition = None
         if state == "completed" and stage in CONFIRMED_STAGE_STATES:
-            self._verify_sealed(checkpoint_uri, receipt)
+            definition = self._verify_sealed(checkpoint_uri, receipt)
+        _sealed_receipt(
+            receipt,
+            run_id=run_id,
+            stage=stage,
+            state=state,
+            checkpoint_uri=checkpoint_uri,
+            definition=definition,
+        )
         with self._transaction() as connection:
             cursor = connection.cursor()
             cursor.execute(_LOCK_RUN, (run_id,))
@@ -500,15 +508,16 @@ class PlatformStore:
         sequence = row[0] if row else 1
         cursor.execute(_INSERT_EVENT, (run_id, sequence, kind, stage, operation_id, _json(payload)))
 
-    def _verify_sealed(self, checkpoint_uri, receipt) -> None:
+    def _verify_sealed(self, checkpoint_uri, receipt) -> dict:
         """Rebind the real sealed delivery before any registration.
 
         The receipt's URI and inventory are self-reported; the bytes are not.
         The resolver (deploy-side sealed storage) locates the sealed delivery
         root, ``read_delivery_manifest`` re-binds every subject record and the
-        subject digest, and the receipt's artifact inventory must carry the
-        same file digests - so a syntactic URI or an invented inventory can
-        never mint a completion.
+        subject digest, the receipt's artifact inventory must carry the same
+        file digests, and the definition the quality inventory binds to is
+        rebuilt from that very sealed tree (never from platform records) - so
+        a syntactic URI or an invented inventory can never mint a completion.
         """
 
         if self._sealed is None:
@@ -523,6 +532,12 @@ class PlatformStore:
             name = record.get("path") if isinstance(record, dict) else None
             if name is None or artifacts.get(name) != record.get("sha256"):
                 raise PlatformStoreError("The receipt's artifact inventory does not bind the sealed delivery")
+        from ..verification.solidworks_urdf import rebuilt_definition
+
+        definition = rebuilt_definition(root)
+        if not isinstance(definition, dict) or not isinstance(definition.get("source"), dict):
+            raise PlatformStoreError("The sealed delivery does not rebuild a definition inventory")
+        return definition
 
     def confirmed_stage(self, run_id: str, stage: str) -> dict | None:
         """The platform-authority reuse query: the sealed receipt of a confirmed stage, or refusal.
@@ -543,7 +558,15 @@ class PlatformStore:
         if row is None or row[0] != "completed":
             return None
         receipt = row[1]
-        _sealed_receipt(receipt, run_id=run_id, stage=stage, state="completed", checkpoint_uri=row[2])
+        definition = self._verify_sealed(row[2], receipt)
+        _sealed_receipt(
+            receipt,
+            run_id=run_id,
+            stage=stage,
+            state="completed",
+            checkpoint_uri=row[2],
+            definition=definition,
+        )
         return receipt
 
     # ------------------------------------------------------------- read side
@@ -575,7 +598,7 @@ def _is_sha256(value) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
 
 
-def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str, checkpoint_uri) -> None:
+def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str, checkpoint_uri, definition) -> None:
     """The one sealed-receipt validator shared by the stage write and reuse paths.
 
     A terminal confirmation must bind its receipt completely, and the reuse
@@ -627,7 +650,7 @@ def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str, checkpoint_
         from ..verification.solidworks_urdf import require_qualified_report
 
         try:
-            quality = require_qualified_report(receipt.get("quality"))
+            quality = require_qualified_report(receipt.get("quality"), definition)
         except PipelineError as error:
             raise PlatformStoreError(str(error)) from error
         if quality.get("subject_sha256") != subject:
@@ -644,7 +667,7 @@ def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str, checkpoint_
             raise PlatformStoreError("The sealed publication receipt has no confirmed submission")
 
 
-def _require_successor(connection, *, run_id: str, kind: str, stage: str) -> None:
+def _require_successor(self, connection, *, run_id: str, kind: str, stage: str) -> None:
     """The successor must be a legal transition of the admitted run.
 
     The run row is locked; non-terminal kinds need a running run (queued or
@@ -683,8 +706,16 @@ def _require_successor(connection, *, run_id: str, kind: str, stage: str) -> Non
             raise PlatformStoreError(
                 f"The {stage!r} operation requires the completed {predecessor!r} stage of this run"
             )
+        definition = None
+        if predecessor in CONFIRMED_STAGE_STATES:
+            definition = self._verify_sealed(predecessor_row[2], predecessor_row[1])
         _sealed_receipt(
-            predecessor_row[1], run_id=run_id, stage=predecessor, state="completed", checkpoint_uri=predecessor_row[2]
+            predecessor_row[1],
+            run_id=run_id,
+            stage=predecessor,
+            state="completed",
+            checkpoint_uri=predecessor_row[2],
+            definition=definition,
         )
 
 
