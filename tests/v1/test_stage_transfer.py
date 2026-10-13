@@ -535,13 +535,17 @@ class StageTransferTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "missing"):
             admit(self.base / "absent.zip", self.base / "out-absent")
 
-    def test_live_receipts_are_ignored_at_seal_and_never_transferred(self) -> None:
+    def test_live_receipts_are_ignored_at_seal_and_stray_receipts_are_refused(self) -> None:
         write_json(self.root / "reports/stages.json", stage_view())
-        write_json(self.root / "reports/run.json", {"run_id": RUN_ID})
         manifest = seal(self.root, self.archive)
         self.assertNotIn("reports/stages.json", manifest["files"])
-        self.assertNotIn("reports/run.json", manifest["files"])
         self.assertIn("reports/native-stages.json", manifest["files"])
+
+        # A stray legacy receipt is an unknown member now: the closed payload
+        # inventory refuses it instead of silently ignoring it.
+        write_json(self.root / "reports/run.json", {"run_id": RUN_ID})
+        with self.assertRaisesRegex(PipelineError, "outside the transfer payload"):
+            seal(self.root, self.base / "stray-receipt.zip")
 
         broken = self.base / "live.zip"
         repack(self.archive, broken, {"reports/run.json": b"{}"})

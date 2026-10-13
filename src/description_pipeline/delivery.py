@@ -39,12 +39,11 @@ STAMPED_EXTRA = ("reports", "transfer-manifest.json", ".gitattributes", "README.
 
 
 def stamped_output(path: Path) -> bool:
-    """True when a directory is absent, empty, or shaped like a pipeline output.
+    """True when a directory is shaped like a pipeline output (read-only format check).
 
-    Replacing a directory never clobbers unrelated data: a target with any
-    entry outside the stamped shape (or without its reports directory) is
-    refused.  Ownership itself lives in the platform run store; this predicate
-    is the structural guard only.
+    This predicate never grants write permission: a directory's name or shape
+    does not prove who owns its content.  It only validates the format of bytes
+    this pipeline already produced.
     """
 
     path = Path(path)
@@ -57,6 +56,24 @@ def stamped_output(path: Path) -> bool:
         return True
     allowed = set(SUBJECT_DIRECTORIES) | set(SUBJECT_FILES) | {"manifest.json"} | set(STAMPED_EXTRA)
     return "reports" in entries and entries <= allowed and (path / "reports").is_dir()
+
+
+def writable_output(path: Path) -> bool:
+    """True when a pipeline install may write here: the path is absent or empty.
+
+    Any existing content belongs to someone - a user directory that happens to
+    look like a delivery must never be replaced (that is a data-loss bug, not a
+    naming problem).  Reuse of a registered immutable checkpoint is the run
+    store's job (it returns the recorded receipt instead); retries write into
+    fresh unique directories.
+    """
+
+    path = Path(path)
+    if not path.exists():
+        return True
+    if path.is_symlink() or path.is_junction() or not path.is_dir():
+        return False
+    return not any(path.iterdir())
 
 
 def _reject_root_links(root: Path) -> None:

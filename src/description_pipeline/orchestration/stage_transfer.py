@@ -53,8 +53,10 @@ _REQUIRED_REPORTS = ("input/handoff.json", "reports/native-tool.json", "reports/
 #: payload so the Linux side can always hand them to the structural team, and the portable
 #: pipeline re-creates its own copy in a delivery.
 TEAM_REPORTS = ("reports/structural-team.md", "reports/structural-team.json")
-#: Known mutable receipts stamped by the endpoint; sealing ignores them, never transfers them.
-_LIVE_REPORTS = ("reports/stages.json", "reports/run.json")
+#: The live stage view is ignored at seal: Linux re-renders it after admission.
+#: A stray receipt (for example a legacy reports/run.json) is not ignored - the
+#: closed payload inventory below refuses unknown members instead.
+_LIVE_REPORTS = ("reports/stages.json",)
 
 _TOOL_SCHEMA = TOOL_SCHEMA
 _STAGE_DEFINITIONS = {stage["id"]: stage for stage in CONTRACT["stages"]}

@@ -19,7 +19,7 @@ from datetime import datetime, UTC
 from pathlib import Path
 
 from . import __version__
-from .delivery import BUNDLE_SCHEMA, PIPELINE_ID, stamped_output, subject_inventory
+from .delivery import BUNDLE_SCHEMA, PIPELINE_ID, subject_inventory, writable_output
 from .io import PipelineError, acquire_process_lock, digest, file_digest, inventory, read_data, write_json
 
 from .runtime import RUNTIME_VERSIONS, native_readiness, required_packages, runtime_role
@@ -165,8 +165,8 @@ def _stage_receipt(stage: str, run_id, prior_events, *, resume, handoff_sha256) 
 def _install(staging: Path, target: Path) -> None:
     """Replace only a marked pipeline output; roll back a failed directory swap."""
 
-    if not stamped_output(target):
-        raise PipelineError(f"Refusing to replace a directory not owned by this pipeline: {target}")
+    if not writable_output(target):
+        raise PipelineError(f"Output must be absent or empty: {target}")
     backup = Path(tempfile.mkdtemp(prefix=f".{target.name}-previous-", dir=target.parent))
     backup.rmdir()
     moved = False
@@ -214,7 +214,7 @@ def _check(root: Path) -> dict:
 def _keep_diagnostic(staging: Path, output: Path, receipt: dict) -> Path:
     _stamp(staging, receipt)
     failed = output.with_name(output.name + ".failed")
-    if not stamped_output(failed):
+    if not writable_output(failed):
         failed = Path(tempfile.mkdtemp(prefix=output.name + ".failed-", dir=output.parent))
         failed.rmdir()
     _install(staging, failed)
@@ -330,8 +330,8 @@ def capture(
     if output.resolve().is_relative_to(package) or package.is_relative_to(output.resolve()):
         raise PipelineError("Input and output directories must be separate")
     with output_lock(output) as output:
-        if not stamped_output(output):
-            raise PipelineError(f"Output contains unrelated files: {output}")
+        if not writable_output(output):
+            raise PipelineError(f"Output must be absent or empty: {output}")
         staging = Path(tempfile.mkdtemp(prefix=f".{output.name}-capture-", dir=output.parent))
         receipt = _stage_receipt("capture", run_id, prior_events, resume=resume, handoff_sha256=handoff_sha256)
         event = _event_sink(receipt, on_event)
@@ -384,8 +384,8 @@ def generate(
     if output.resolve().is_relative_to(seed_dir.resolve()) or seed_dir.resolve().is_relative_to(output.resolve()):
         raise PipelineError("Stage checkpoints and output must be separate")
     with output_lock(output) as output:
-        if not stamped_output(output):
-            raise PipelineError(f"Output contains unrelated files: {output}")
+        if not writable_output(output):
+            raise PipelineError(f"Output must be absent or empty: {output}")
         staging = Path(tempfile.mkdtemp(prefix=f".{output.name}-generate-", dir=output.parent))
         receipt = _stage_receipt("generate", run_id, prior_events, resume=resume, handoff_sha256=handoff_sha256)
         event = _event_sink(receipt, on_event)
@@ -430,8 +430,8 @@ def verify(
     if output.resolve().is_relative_to(seed_dir.resolve()) or seed_dir.resolve().is_relative_to(output.resolve()):
         raise PipelineError("Stage checkpoints and output must be separate")
     with output_lock(output) as output:
-        if not stamped_output(output):
-            raise PipelineError(f"Output contains unrelated files: {output}")
+        if not writable_output(output):
+            raise PipelineError(f"Output must be absent or empty: {output}")
         staging = Path(tempfile.mkdtemp(prefix=f".{output.name}-verify-", dir=output.parent))
         receipt = _stage_receipt("verify", run_id, prior_events, resume=resume, handoff_sha256=handoff_sha256)
         event = _event_sink(receipt, on_event)
@@ -492,8 +492,8 @@ def publish(
     if output.resolve().is_relative_to(repository.resolve()) or repository.resolve().is_relative_to(output.resolve()):
         raise PipelineError("Build output and the model repository must be separate directories")
     with output_lock(output) as output:
-        if not stamped_output(output):
-            raise PipelineError(f"Output contains unrelated files: {output}")
+        if not writable_output(output):
+            raise PipelineError(f"Output must be absent or empty: {output}")
         staging = Path(tempfile.mkdtemp(prefix=f".{output.name}-publish-", dir=output.parent))
         receipt = _stage_receipt("publish", run_id, prior_events, resume=resume, handoff_sha256=handoff_sha256)
         event = _event_sink(receipt, on_event)
@@ -552,8 +552,8 @@ def rebuild(
     if digest(source_files) != previous["subject_sha256"]:
         raise PipelineError("Frozen delivery changed after verification")
     with output_lock(output) as output:
-        if not stamped_output(output):
-            raise PipelineError(f"Output contains unrelated files: {output}")
+        if not writable_output(output):
+            raise PipelineError(f"Output must be absent or empty: {output}")
         staging = Path(tempfile.mkdtemp(prefix=f".{output.name}-rebuild-", dir=output.parent))
         receipt = {
             "schema_version": BUNDLE_SCHEMA,

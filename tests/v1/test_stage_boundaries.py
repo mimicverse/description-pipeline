@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 from description_pipeline import solidworks, steps
 from description_pipeline.delivery import subject_inventory
-from description_pipeline.io import digest, file_digest
+from description_pipeline.io import PipelineError, digest, file_digest
 from description_pipeline.orchestration import stage_transfer as transfer
 from description_pipeline.stages import CONTRACT
 
@@ -223,8 +223,66 @@ class StageBoundaryTests(unittest.TestCase):
         self.assertTrue((self.output / "input" / "robot.yaml").is_file())
         self.assertTrue((self.output / "reports/stages.json").is_file())
         self.assertFalse((self.output / "reports" / "quality.json").exists())
-        self.assertEqual(result["state"], "generated")
-        self.assertIs(result["passed"], False)
+
+    def test_a_non_empty_output_is_refused_and_left_untouched(self) -> None:
+        user = self.root / "user-space"
+        (user / "reports").mkdir(parents=True)
+        (user / "input").mkdir()
+        notes = user / "reports/user-notes.md"
+        notes.write_text("keep me\n", encoding="utf-8")
+        private = user / "input/private-cad-note.txt"
+        private.write_text("keep me too\n", encoding="utf-8")
+        readme = user / "README.md"
+        readme.write_text("unrelated\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(PipelineError, "absent or empty"):
+            solidworks.capture(self.package, user, backend=object(), run_id="b6a1f2c3-4d5e-6f70-8192-a3b4c5d6e7f8")
+        # The exact production chain: the Windows default runner calls capture().
+        from description_pipeline.orchestration import windows as windows_module
+
+        with self.assertRaisesRegex(PipelineError, "absent or empty"):
+            windows_module._default_runner(
+                self.package,
+                user,
+                backend=object(),
+                run_id="b6a1f2c3-4d5e-6f70-8192-a3b4c5d6e7f9",
+            )
+        self.assertEqual("keep me\n", notes.read_text(encoding="utf-8"))
+        self.assertEqual("keep me too\n", private.read_text(encoding="utf-8"))
+        self.assertEqual("unrelated\n", readme.read_text(encoding="utf-8"))
+
+    def test_a_sealed_checkpoint_is_never_overwritten(self) -> None:
+        seed = make_seed(self.root)
+        calls = {"generate": 0}
+
+        def fake_generate(staging, definition, input_report, on_event=None):
+            calls["generate"] += 1
+            return "a" * 64
+
+        with (
+            patch.object(steps, "generate_model", side_effect=fake_generate),
+            patch.object(steps, "inspect_prepared_input", return_value=REPLAYED_INSPECTION),
+            patch(
+                "description_pipeline.sources.solidworks.input.resolve_package",
+                return_value={"hardware_id": "arm"},
+            ),
+        ):
+            first = solidworks.generate(seed, self.output)
+            before = {
+                path.relative_to(self.output).as_posix(): path.read_bytes()
+                for path in sorted(self.output.rglob("*"))
+                if path.is_file()
+            }
+            with self.assertRaisesRegex(PipelineError, "absent or empty"):
+                solidworks.generate(seed, self.output)
+        self.assertEqual(first["state"], "generated")
+        self.assertEqual(calls["generate"], 1)
+        after = {
+            path.relative_to(self.output).as_posix(): path.read_bytes()
+            for path in sorted(self.output.rglob("*"))
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
 
     def test_verify_reruns_the_checker_on_the_seeded_subject(self) -> None:
         seed = make_seed(self.root)

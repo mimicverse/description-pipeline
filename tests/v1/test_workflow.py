@@ -13,7 +13,6 @@ from unittest.mock import patch
 
 from description_pipeline import solidworks, steps
 from description_pipeline.cli import main
-from description_pipeline.delivery import BUNDLE_SCHEMA, PIPELINE_ID
 from description_pipeline.io import PipelineError, digest, file_digest, inventory, read_data, write_json
 from description_pipeline.sources.solidworks.revision import package_inventory, seal_revision
 from description_pipeline.stages import stage_view
@@ -176,16 +175,13 @@ class WorkflowTests(unittest.TestCase):
         listing = sorted(path.relative_to(diagnostic).as_posix() for path in diagnostic.rglob("*"))
         self.assertTrue((diagnostic / "input/handoff.json").is_file(), listing)
 
-    def test_failed_input_does_not_replace_existing_owned_output(self):
+    def test_a_non_empty_output_is_never_replaced(self):
         self.output.mkdir()
-        (self.output / "reports").mkdir()
         marker = self.output / "README.md"
         marker.write_text("Existing output bytes")
-        solidworks._stamp(self.output, {"schema_version": BUNDLE_SCHEMA, "pipeline_id": PIPELINE_ID})
-        result = solidworks.capture(self.package, self.output)
-        self.assertFalse(result["passed"])
+        with self.assertRaisesRegex(PipelineError, "absent or empty"):
+            solidworks.capture(self.package, self.output)
         self.assertEqual("Existing output bytes", marker.read_text())
-        self.assertTrue(solidworks.stamped_output(self.output))
 
     def test_native_preflight_failure_blocks_capture_and_retains_diagnostics(self):
         self.seal()
@@ -303,7 +299,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_rebuild_records_only_executed_steps_without_claiming_native_replay(self):
         from .protocol_support import protocol_events
-        from description_pipeline.delivery import subject_digest
+        from description_pipeline.delivery import stamped_output, subject_digest
 
         self.seal()
         bundle = self.root / "frozen"
@@ -373,7 +369,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(view["execution_scope"], ["generate", "verify"])
         self.assertEqual([row["id"] for row in view["stages"] if row["state"] == "completed"], ["generate", "verify"])
         self.assertTrue(all(row["state"] == "not_run" for row in view["stages"] if not row["in_scope"]))
-        self.assertTrue(solidworks.stamped_output(self.output))
+        self.assertTrue(stamped_output(self.output))
 
     def test_rebuild_refuses_a_frozen_delivery_that_changed_after_verification(self):
         bundle = self.root / "frozen"

@@ -203,6 +203,30 @@ class LinuxSplitTests(unittest.TestCase):
             )
         )
 
+    def test_a_registered_checkpoint_is_returned_without_rerunning_the_stage(self) -> None:
+        self.admit()
+
+        def fake_generate(seed_dir, output, **kwargs):
+            Path(output).mkdir(parents=True, exist_ok=True)
+            return {
+                "state": "generated",
+                "passed": False,
+                "subject_sha256": "a" * 64,
+                "events": [{"stage": "generate", "state": "completed", "at": "2026-10-10T00:00:00+00:00"}],
+            }
+
+        with (
+            mock.patch.object(linux_runner.solidworks, "generate", side_effect=fake_generate),
+            mock.patch.object(linux_runner, "tool_record", return_value=portable_record(self.tool)),
+        ):
+            first = linux_runner.run_portable_stage(self.store, self.run_id, "generate")
+        with mock.patch.object(
+            linux_runner.solidworks, "generate", side_effect=AssertionError("registered checkpoints are immutable")
+        ):
+            again = linux_runner.run_portable_stage(self.store, self.run_id, "generate")
+        self.assertEqual(first["state"], "generated")
+        self.assertEqual(again, first)
+
     def test_preview_and_artifacts_are_bound_to_the_verified_bytes(self) -> None:
         from description_pipeline.delivery import subject_digest
         from description_pipeline.orchestration import linux_store as store_module
