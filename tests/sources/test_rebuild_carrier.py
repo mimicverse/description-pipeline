@@ -16,7 +16,12 @@ from pathlib import Path
 import yaml
 
 from description_pipeline.sources.solidworks.discovery import DiscoverySettings, prepare_native_package
-from description_pipeline.verification.native_discovery import _Failure, rebuild_joint_facts, rebuild_rigid_bodies
+from description_pipeline.verification.native_discovery import (
+    _Failure,
+    rebuild_interface_frames,
+    rebuild_joint_facts,
+    rebuild_rigid_bodies,
+)
 
 from . import test_solidworks_discovery_oracle as oracle_fixtures
 
@@ -92,6 +97,61 @@ class RebuildCarrierTests(unittest.TestCase):
                 expected = sorted(source["joints"], key=lambda joint: joint["name"])
                 actual = sorted(rebuilt, key=lambda joint: joint["name"])
                 self.assertEqual(expected, actual)
+
+    @staticmethod
+    def _interface_record() -> dict:
+        record = copy.deepcopy(oracle_fixtures.native_record())
+        twin = copy.deepcopy(record["datums"][1])
+        twin["name"] = "TCP_tool_mount"
+        twin["owner"] = "arm-1"
+        record["datums"].append(twin)
+        return record
+
+    def test_interface_frame_rebuild_matches_the_saved_carrier(self) -> None:
+        payload, source, _output = self._prepared(self._interface_record())
+        self.assertEqual(
+            source["frames"],
+            [
+                {
+                    "id": "tool_mount",
+                    "name": "tool_mount",
+                    "parent": "arm_link",
+                    "coordinate_system": "TCP_tool_mount",
+                }
+            ],
+        )
+        self.assertEqual(source["frames"], rebuild_interface_frames(payload))
+        for record in (
+            oracle_fixtures.native_record(),
+            oracle_fixtures.OracleSemanticsTests._lock_record(with_point=True),
+        ):
+            payload, source, _output = self._prepared(record)
+            self.assertEqual([], source["frames"])
+            self.assertEqual([], rebuild_interface_frames(payload))
+
+    def test_interface_frame_rebuild_fails_closed(self) -> None:
+        base = oracle_fixtures.native_record()
+        twin = base["datums"][1]
+
+        def with_datum(name: str, owner: str) -> dict:
+            record = copy.deepcopy(base)
+            datum = copy.deepcopy(twin)
+            datum["name"], datum["owner"] = name, owner
+            record["datums"].append(datum)
+            return record
+
+        duplicate = with_datum("TCP_tool_mount", "arm-1")
+        duplicate["datums"].append(copy.deepcopy(duplicate["datums"][-1]))
+        cases = (
+            ("duplicate frame name", duplicate),
+            ("non snake suffix", with_datum("TCP_Tool-Mount", "arm-1")),
+            ("unowned datum", with_datum("TCP_orphan", "ghost-1")),
+            ("body name collision", with_datum("TCP_base_link", "arm-1")),
+            ("ownerless without a base", with_datum("TCP_top_mount", "")),
+        )
+        for label, record in cases:
+            with self.subTest(case=label), self.assertRaises(_Failure):
+                rebuild_interface_frames(record)
 
     def test_missing_or_ambiguous_frame_datum_fails_closed(self) -> None:
         payload, _source, _output = self._prepared(oracle_fixtures.native_record())

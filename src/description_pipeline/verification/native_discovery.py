@@ -1652,6 +1652,102 @@ def rebuild_rigid_bodies(record: dict) -> list[dict]:
     return bodies
 
 
+def rebuild_interface_frames(record: dict) -> list[dict]:
+    """Rebuild the interface-frame carrier from the raw capture alone (IF-17, in memory).
+
+    ``record`` is the raw native capture (or a payload carrying it under ``raw``).
+    The reconstruction mirrors the producer's interface rule on the verification
+    side: every recognised datum (``CS_``/``TCP_``/``SCS_`` prefix) that is not a
+    body's own link datum becomes a frame parented to the rigid body whose cluster
+    owns it; the frozen top assembly's ownerless datums bind only to the proven
+    base body; the frame name is the datum suffix after the first underscore and
+    must already be exact snake_case.  A recognised interface that cannot be
+    attributed, a duplicate frame name or a body-name collision refuses instead of
+    guessing, and the saved derived carrier is never read.
+    """
+
+    raw = record["raw"] if isinstance(record.get("raw"), dict) else record
+    bodies = rebuild_rigid_bodies(raw)
+    by_material, _by_component = _cluster_bindings(raw)
+    full_of_body: dict[str, frozenset[str]] = {}
+    for body in bodies:
+        material = frozenset(str(value) for value in body["components"])
+        full_of_body[str(body["name"])] = by_material.get(material, material)
+    body_of_component = {
+        str(component): str(body["name"]) for body in bodies for component in full_of_body[str(body["name"])]
+    }
+    named = [body for body in bodies if str(body["frame"]["coordinate_system"]) == "CS_base_link"]
+    _require(
+        len(named) == 1,
+        "discovery.interface_frame_rebuild",
+        "the rebuilt carrier has no unique CS_base_link body",
+        {"datums": [str(body["frame"]["coordinate_system"]) for body in named]},
+    )
+    root = named[0]
+    attached = _frame_attached_members(raw)
+    base = root if attached and full_of_body[str(root["name"])] == attached else None
+    # Link datums: every cluster member paired with the body's own CS_ frame datum
+    # (the producer excludes the whole member scope, not only the datum's owner).
+    link_datums = {
+        (str(component), str(body["frame"]["coordinate_system"]))
+        for body in bodies
+        for component in full_of_body[str(body["name"])]
+    }
+    if base is not None:
+        base_datum = str(base["frame"]["coordinate_system"])
+        owned = any(
+            isinstance(datum, dict)
+            and str(datum.get("name")) == base_datum
+            and str(datum.get("owner") or "") in full_of_body[str(base["name"])]
+            for datum in raw.get("datums") or []
+        )
+        if not owned:
+            link_datums.add(("", base_datum))
+    body_names = {str(body["name"]) for body in bodies}
+    frames: list[dict] = []
+    seen: dict[str, str] = {}
+    for datum in raw.get("datums") or []:
+        if not isinstance(datum, dict):
+            continue
+        name = str(datum.get("name") or "")
+        if not name.startswith(INTERFACE_PREFIXES):
+            continue
+        owner = str(datum.get("owner") or "")
+        if (owner, name) in link_datums:
+            continue
+        body_name = body_of_component.get(owner)
+        if body_name is None and base is not None and owner == "":
+            body_name = str(base["name"])
+        _require(
+            body_name is not None,
+            "discovery.interface_frame_rebuild",
+            "recognised interface datum is not owned by any rebuilt body",
+            {"datum": name, "owner": owner},
+        )
+        _prefix, _separator, suffix = name.partition("_")
+        _require(
+            _SNAKE.fullmatch(suffix) is not None,
+            "discovery.interface_frame_rebuild",
+            "interface datum suffix must already be exact snake_case",
+            {"datum": name},
+        )
+        _require(
+            suffix not in seen,
+            "discovery.interface_frame_rebuild",
+            "two interface datums derive the same frame name",
+            {"name": suffix, "other": seen.get(suffix)},
+        )
+        _require(
+            suffix not in body_names,
+            "discovery.interface_frame_rebuild",
+            "an interface frame collides with a body name under the shared name contract",
+            {"name": suffix},
+        )
+        seen[suffix] = name
+        frames.append({"id": suffix, "name": suffix, "parent": body_name, "coordinate_system": name})
+    return frames
+
+
 def rebuild_joint_facts(record: dict, package: Path) -> list[dict]:
     """Rebuild the movable-joint carrier from the raw capture alone (IF-17, in memory).
 
