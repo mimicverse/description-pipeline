@@ -333,9 +333,7 @@ def _dependencies(root, definition):
         == {ntpath.normcase(str(path)) for path in original},
         "The copied graph does not cover the captured original files",
     )
-    from .native_discovery import DISCOVERY_FILE  # noqa: PLC0415 - mirrors _handoff_native_hashes
-
-    record = read_data(confined(root / "input", DISCOVERY_FILE))
+    record = ev.discovery(root)
     selected = ((record.get("raw") or {}).get("source_selection") or {}).get("files") or {}
     for name, checksum in sorted(selected.items()):
         suffix = ntpath.normcase(str(name).replace("/", "\\"))
@@ -406,9 +404,7 @@ def _stale_stored_reference_skips(root: Path, closure: dict) -> int:
         return 0
     skips = closure["stale_stored_references"]
     _require(isinstance(skips, list), "Stored-reference skip record is malformed")
-    from .native_discovery import DISCOVERY_FILE  # noqa: PLC0415 - mirrors _handoff_native_hashes
-
-    record = read_data(confined(root / "input", DISCOVERY_FILE))
+    record = ev.discovery(root)
     manifest = (record.get("raw") or {}).get("source_selection") or {}
     sealed = manifest.get("closure") or {}
     files = manifest.get("files") or {}
@@ -1071,7 +1067,7 @@ def evaluate_bundle(root: Path, *, native_receipts=None) -> dict:
     gates = _Gates()
     subject = gates.add("bundle.subject", lambda: {"sha256": subject_digest(root)})
     definition = gates.add("input.valid", lambda: _input(root, diagnostics))
-    gates.add("source.native_discovery", lambda: _native_discovery(root / "input", diagnostics))
+    gates.add("source.native_discovery", lambda: _native_discovery(root, diagnostics))
     gates.add("tool.identity", lambda: _tool(root, native_receipts))
     manifest = gates.add("source.integrity", lambda: read_delivery_manifest(root))
     if manifest is not None:

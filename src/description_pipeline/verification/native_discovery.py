@@ -41,13 +41,12 @@ from pathlib import Path, PurePosixPath
 
 import yaml
 
-from ..schemas import CAD_REVISION_SCHEMA, INPUT_SCHEMA, exporter_declaration_present
+from ..delivery import read_delivery_manifest, read_source_record
+from ..io import digest
+from ..schemas import exporter_declaration_present
 
 VERIFICATION_SCHEMA = "solidworks-to-urdf.native-discovery-verification/v1"
 DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v1"
-ROBOT_FILE = "robot.yaml"
-REVISION_FILE = "cad-revision.json"
-DISCOVERY_FILE = "discovery/native-discovery.json"
 
 SUPPORTED_MATES = {
     "coincident",
@@ -1642,7 +1641,9 @@ def _close(left, right, tolerance: float = 1e-9) -> bool:
 
 
 def _record_value(package: Path, entry: dict, key: str):
-    target = package / str(entry.get("package_file") or "")
+    relative = str(entry.get("package_file") or "")
+    candidates = [package / relative, package / "input/records" / relative]
+    target = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
     _require(
         target.is_file(), "discovery.record", "embedded record file is missing", {"file": entry.get("package_file")}
     )
@@ -1747,82 +1748,69 @@ def verify_discovery(package: Path) -> dict:
             errors.append({"code": "discovery.internal", "message": str(error), "detail": {}})
         return checks[-1]
 
-    robot_path = package / ROBOT_FILE
-    revision_path = package / REVISION_FILE
-    record_path = package / DISCOVERY_FILE
+    record_path = package / "evidence/discovery.json"
+    source_path = package / "input/source.json"
+    originals_root = package / "input/cad"
 
     def binding():
-        _require(robot_path.is_file(), "discovery.file", "robot.yaml is missing")
         _require(record_path.is_file(), "discovery.file", "the discovery record is missing")
-        robot = _read_yaml(robot_path)
-        provenance = robot.get("provenance")
-        _require(isinstance(provenance, dict), "discovery.binding", "robot.yaml carries no native-discovery provenance")
-        _require(
-            provenance.get("generator") == "native-discovery",
-            "discovery.binding",
-            "provenance.generator is not native-discovery",
-        )
-        for key in ("generator_version", "contract", "run_id"):
-            _require(
-                isinstance(provenance.get(key), str) and provenance[key].strip(),
-                "discovery.binding",
-                f"provenance.{key} is missing",
-            )
-        for key in ("discovery_sha256", "native_inventory_sha256"):
-            _require(
-                isinstance(provenance.get(key), str) and _HEX.match(provenance[key]),
-                "discovery.binding",
-                f"provenance.{key} is not a digest",
-            )
         payload_bytes = record_path.read_bytes()
-        _require(
-            hashlib.sha256(payload_bytes).hexdigest() == provenance["discovery_sha256"],
-            "discovery.binding",
-            "the discovery record does not match provenance.discovery_sha256",
-        )
         payload = json.loads(payload_bytes.decode("utf-8"))
         _require(payload.get("schema_version") == DISCOVERY_SCHEMA, "discovery.binding", "unexpected discovery schema")
+        files = payload.get("files")
         _require(
-            payload.get("contract") == provenance.get("contract"),
+            isinstance(files, list) and files and all(isinstance(row, dict) for row in files),
             "discovery.binding",
-            "record contract differs from provenance",
+            "record carries no file inventory",
         )
         _require(
-            payload.get("run_id") == provenance.get("run_id"),
+            digest(files) == payload.get("native_inventory_sha256"),
             "discovery.binding",
-            "record run_id differs from provenance",
+            "the native inventory digest does not match the file records",
         )
-        native_files = payload.get("native_files")
+        manifest = read_delivery_manifest(package)
+        entry = next(
+            (row for row in manifest["subject"]["files"] if row.get("path") == "evidence/discovery.json"), None
+        )
         _require(
-            isinstance(native_files, dict) and native_files,
+            entry is not None and entry.get("sha256") == hashlib.sha256(payload_bytes).hexdigest(),
             "discovery.binding",
-            "record carries no native file inventory",
+            "the discovery record does not match the delivery manifest subject",
         )
-        # The inventory digest mirrors the pipeline's canonical JSON encoding
-        # (sorted keys, UTF-8, two-space indent, trailing newline).
-        canonical = hashlib.sha256(
-            (json.dumps(native_files, sort_keys=True, ensure_ascii=False, allow_nan=False, indent=2) + "\n").encode()
-        ).hexdigest()
-        _require(
-            canonical == provenance["native_inventory_sha256"],
-            "discovery.binding",
-            "the native inventory digest does not match provenance",
-        )
-        _require(robot.get("schema_version") == INPUT_SCHEMA, "discovery.binding", "robot.yaml schema changed")
+        source = read_source_record(package)
+        derived = payload.get("derived")
+        _require(isinstance(derived, dict), "discovery.binding", "record carries no derived definition")
+        identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
+        robot = {
+            "schema_version": payload.get("schema_version"),
+            "hardware_id": identity.get("hardware_id") or source["selection"]["hardware_id"],
+            "robot_name": payload.get("robot_name"),
+            "source": {
+                "assembly": source["selection"]["main_assembly"],
+                "configuration": source["selection"]["configuration"],
+                "robot_name": payload.get("robot_name"),
+                "bodies": derived.get("bodies") or [],
+                "joints": derived.get("joints") or [],
+                "frames": derived.get("frames") or [],
+            },
+            "checks": derived.get("checks") or {},
+        }
         state["robot"] = robot
         state["payload"] = payload
-        state["provenance"] = provenance
         return {
-            "discovery_sha256": provenance["discovery_sha256"],
-            "native_inventory_sha256": provenance["native_inventory_sha256"],
-            "run_id": provenance["run_id"],
-            "contract": provenance.get("contract"),
+            "native_inventory_sha256": payload.get("native_inventory_sha256"),
+            "run_id": payload.get("run_id"),
+            "contract": payload.get("contract"),
         }
 
     def files():
         payload = state["payload"]
-        inventory = _digest_files(package)
-        native = payload["native_files"]
+        inventory = _digest_files(originals_root)
+        native = {
+            str(row["path"]): str(row["sha256"])
+            for row in payload.get("files") or []
+            if isinstance(row, dict) and isinstance(row.get("path"), str)
+        }
         for relative, checksum in sorted(native.items()):
             _require(
                 relative in inventory,
@@ -1872,7 +1860,11 @@ def verify_discovery(package: Path) -> dict:
 
         payload = state["payload"]
         raw = payload.get("raw") or {}
-        native = payload.get("native_files") or {}
+        native = {
+            str(row["path"]): str(row["sha256"])
+            for row in payload.get("files") or []
+            if isinstance(row, dict) and isinstance(row.get("path"), str)
+        }
         raw_files = raw.get("files") or {}
         carrier = raw.get("source_selection")
         closure = carrier.get("closure") if isinstance(carrier, dict) else None
@@ -2053,57 +2045,22 @@ def verify_discovery(package: Path) -> dict:
         }
 
     def revision():
-        robot = state["robot"]
-        _require(not revision_path.is_symlink(), "discovery.revision", "cad-revision.json must be a regular file")
-        _require(revision_path.is_file(), "discovery.revision", "cad-revision.json is missing")
-        revision = _read_json(revision_path)
-        fields = {
-            "schema_version",
-            "hardware_id",
-            "revision",
-            "parent_revision",
-            "owner",
-            "change_summary",
-            "control",
-            "cad_files",
-        }
-        _require(
-            isinstance(revision, dict)
-            and not set(revision) - fields
-            and revision.get("schema_version") == CAD_REVISION_SCHEMA,
-            "discovery.revision",
-            "the supplied revision manifest is malformed",
-        )
+        _require(source_path.is_file(), "discovery.revision", "the archived source record is missing")
+        source = read_source_record(package)
+        metadata = source.get("metadata") or {}
         authored = state.get("authored_identity")
-        _require(
-            authored is not None and not authored["missing"],
-            "discovery.revision",
-            "the revision manifest lacks complete native author metadata",
-        )
-        for key in ("hardware_id", "revision", "parent_revision", "owner", "change_summary", "control"):
+        if isinstance(authored, dict) and not authored.get("missing"):
+            declared = metadata.get("revision")
             _require(
-                revision.get(key) == authored[key],
+                declared in (None, authored.get("revision")),
                 "discovery.revision",
                 "revision metadata differs from native author metadata",
-                {"field": key},
+                {"field": "revision"},
             )
-        _require(
-            revision.get("hardware_id") == robot.get("hardware_id"),
-            "discovery.revision",
-            "revision hardware_id differs from robot.yaml",
-        )
-        inventory = _digest_files(package)
-        observed = {
-            name: checksum
-            for name, checksum in inventory.items()
-            if Path(name).suffix.lower() in {".sldasm", ".sldprt"}
+        return {
+            "revision": metadata.get("revision"),
+            "label_source": (source.get("selection") or {}).get("hardware_source"),
         }
-        _require(
-            revision.get("cad_files") == observed,
-            "discovery.revision",
-            "the revision does not seal the package CAD bytes",
-        )
-        return {"cad_files": len(observed)}
 
     def budgets():
         robot = state["robot"]
@@ -3156,17 +3113,16 @@ def verify_discovery(package: Path) -> dict:
         for identifier, callback in dependent:
             if identifier == "discovery.revision":
                 authored = state.get("authored_identity") or {}
-                if not revision_path.exists() and not revision_path.is_symlink() and authored.get("missing"):
-                    # Native file/provenance checks still bind every captured byte. The
-                    # absent publication seal is a readiness warning, never a passed check.
+                declared = (read_source_record(package).get("metadata") or {}).get("revision")
+                if not declared:
+                    # The CAD revision label is optional raw metadata; its absence is a
+                    # readiness warning, never a passed check.
                     diagnostics.append(
                         {
-                            "code": "discovery.revision_not_sealed",
+                            "code": "discovery.revision_absent",
                             "blocking": False,
-                            "message": (
-                                "cad-revision.json is absent while authored publication metadata is incomplete"
-                            ),
-                            "detail": {"state": "not_sealed", "missing": list(authored.get("missing") or [])},
+                            "message": "the CAD revision label is absent; the raw value stays missing",
+                            "detail": {"state": "absent", "missing": list(authored.get("missing") or [])},
                         }
                     )
                     continue
