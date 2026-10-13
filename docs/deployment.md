@@ -145,6 +145,8 @@ bash deploy/operator/operatorctl.sh health --config /srv/description/platform.js
 
 生命周期命令为 `validate / install / start / drain / stop / status / health / reconcile / stage / promote / rollback`，统一读取同一配置及安装记录。`drain` 关闭新提交和 DAG 准入，保留在途执行；返回全部活动、未确认与发布中操作。`stop` 仅在已排空且状态已知时停止全部管理服务，禁止通过杀进程代替排空。
 
+维护查询账户只获准读取准入与生命周期视图，无平台写入权或 Airflow schema 访问权。关闭与重开准入经平台受控事务入口执行，使用明确的写入授权；只读凭据不能执行这些变更。维护查询采用[架构定义的一致快照](design.md#持久化与一致性)，缺绑定、未知状态或权威不可读时拒绝停止和切换。
+
 平台编排在启动与有界退避重试时对账，维护人员也可调用 `reconcile`。对账查询调度意图、阶段收据、Windows 操作及远端 Git/PR，确认已发生结果后登记或安全继续；不能重复未知副作用。未决状态未消除时，排空不算完成。
 
 `stage` 负责两端候选：从校验档案建立独立 Linux/Windows 安装目录和配置，核验身份、角色依赖、DAG、存储 schema 与原生就绪，不改变活动指针或启动第二个 CAD 资源域。
