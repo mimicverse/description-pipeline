@@ -7,7 +7,7 @@ import struct
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-from ..io import PipelineError, confined
+from ..io import PipelineError, confined, format_number
 from ..geometry.stl import MESH_PART_TRIANGLES_MAX
 from ..model import Robot
 
@@ -20,7 +20,7 @@ _STL_TRIANGLE_BYTES = 50
 
 
 def _numbers(values) -> str:
-    return " ".join(format(float(value), ".17g") for value in values)
+    return " ".join(format_number(value) for value in values)
 
 
 def _origin(parent: ET.Element, data: dict) -> None:
