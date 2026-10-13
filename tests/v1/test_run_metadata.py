@@ -16,6 +16,7 @@ from tests.v1.test_portal import (
     ADMIN_TOKEN,
     AIRFLOW_TOKEN,
     FEISHU_NAME,
+    FakePlatformStore,
     MockAirflow,
     PortalClient,
     VIEWER_TOKEN,
@@ -37,6 +38,7 @@ class RunMetadataTests(unittest.TestCase):
         self.airflow = MockAirflow()
         self.airflow.__enter__()
         self.addCleanup(self.airflow.__exit__, None, None, None)
+        self.platform = FakePlatformStore()
         self.upload_root = Path(tempfile.mkdtemp(prefix="portal-upload-"))
         self.addCleanup(shutil.rmtree, self.upload_root, ignore_errors=True)
         self.endpoint_server = MockEndpoint()
@@ -55,6 +57,7 @@ class RunMetadataTests(unittest.TestCase):
             endpoint=endpoint or (lambda: self.endpoint),
             static_dir=self.static_dir,
             upload_root=self.upload_root,
+            platform_store=self.platform,
         )
         server = make_server(
             "127.0.0.1", 0, PortalApp(config), server_class=_ThreadingWSGIServer, handler_class=_QuietHandler

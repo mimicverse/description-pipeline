@@ -509,7 +509,7 @@ def _seal_tree(root: Path) -> None:
 
 
 def _remove_tree(root: Path) -> None:
-    """Remove one staging tree even after sealing; never used on finalized uploads."""
+    """Remove one staging tree even after sealing (staging cleanup and refused intake)."""
     if not root.exists():
         return
     for current, _directories, files in os.walk(root):
@@ -520,3 +520,14 @@ def _remove_tree(root: Path) -> None:
             except OSError:
                 continue
     shutil.rmtree(root, ignore_errors=True)
+
+
+def drop_received_folder(root: Path) -> None:
+    """Remove a received intake folder that was refused before admission.
+
+    ``receive_folder`` seals a finalized folder read-only; ordinary rejections
+    never leave one behind, but a folder received and then refused by the
+    platform admission gate must not linger.
+    """
+
+    _remove_tree(Path(root))

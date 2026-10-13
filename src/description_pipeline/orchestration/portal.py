@@ -7,6 +7,9 @@ The portal is a dependency-free WSGI application:
   value is kept in a portal session, never echoed to the browser;
 * the portal triggers the ``solidworks_to_urdf`` DAG with ``handoff_path`` and ``main_assembly``,
   and reports the Airflow stage progress, native findings and the published pull request;
+* every submission is admitted in the platform store first (request, run and the initial
+  dispatch intent in one short transaction) and is refused while the admission window is
+  closed or the platform store is unreachable;
 * the Windows endpoint bearer token also stays server-side; the portal proxies the delivery
   preview and only serves URDF/mesh artifacts whose bytes match the digest-bound preview;
 * the bundled viewer renders the actual verified URDF with joint and limit controls.
@@ -53,7 +56,8 @@ from .airflow_client import (
     validate_artifact_name,
     verified_result,
 )
-from ..io import PipelineError
+from ..io import PipelineError, digest
+from ..platform.store import AdmissionClosedError, PlatformStore, PlatformStoreError
 from ..ports import PORTAL_HTTP_PORT
 from .linux_store import LinuxStore
 from .stage_transfer import TEAM_REPORTS
@@ -79,6 +83,7 @@ from .uploads import (
     MAX_TOTAL_BYTES,
     UploadGate,
     UploadRejected,
+    drop_received_folder,
     receive_folder,
 )
 
@@ -377,6 +382,10 @@ class PortalConfig:
     pipeline_repositories: dict[str, Path] | None = None
     #: Configured publication targets used by the upload selector and conf validation.
     pipeline_targets: dict[str, dict] | None = None
+    #: The platform admission store; injected in tests, derived from the deploy
+    #: environment (``PLATFORM_SERVICE_DSN``) otherwise.  Submissions are refused
+    #: while the store cannot be reached - never silently ungated.
+    platform_store: PlatformStore | None = None
 
 
 _CONFIG_KEYS = {
@@ -772,6 +781,20 @@ class PortalApp:
         self.run_metadata = RunMetadataStore(
             config.upload_root / ".run-metadata.json" if config.upload_root is not None else None
         )
+        self._platform_store = config.platform_store
+        self._platform_lock = threading.Lock()
+
+    def _platform(self) -> PlatformStore:
+        """The admission store: the injected one, or the deploy-environment store.
+
+        Built lazily so a portal process without the deploy environment still
+        starts; its first submission then refuses instead of running ungated.
+        """
+
+        with self._platform_lock:
+            if self._platform_store is None:
+                self._platform_store = PlatformStore.from_environment(os.environ)
+            return self._platform_store
 
     # ------------------------------------------------------------------ WSGI
     def __call__(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
@@ -1092,6 +1115,22 @@ class PortalApp:
                 {"error": "Airflow 暂时不可用，请稍后重试"},
                 self.config,
             )
+        try:
+            admission = self._platform().admission()
+        except PlatformStoreError:
+            return _json_response(
+                start_response,
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "平台服务暂不可用，请稍后重试"},
+                self.config,
+            )
+        if admission.state != "open":
+            return _json_response(
+                start_response,
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "平台准入窗口已关闭，暂不接待新的运行提交"},
+                self.config,
+            )
         dag_run_id = f"portal-{datetime.now(UTC):%Y%m%dT%H%M%S}-{secrets.token_hex(4)}"
         try:
             receipt = receive_folder(
@@ -1114,6 +1153,43 @@ class PortalApp:
         if receipt.target_hardware is not None and receipt.target_hardware not in (self.config.pipeline_targets or {}):
             raise PortalError(HTTPStatus.BAD_REQUEST, "发布目标不在平台配置中，请重新选择后再提交")
         handoff_path = str(self.config.upload_root / dag_run_id / receipt.folder)
+        try:
+            self._platform().admit_run(
+                request_id=f"portal-{dag_run_id}",
+                run_id=dag_run_id,
+                principal=session.principal or session.user or "",
+                target_hardware=receipt.target_hardware or "",
+                main_assembly=receipt.main_assembly or "",
+                dispatch={
+                    "stage": "capture",
+                    "operation_key": f"portal-{dag_run_id}/capture:0",
+                    "params_digest": digest(
+                        {
+                            "handoff_path": handoff_path,
+                            "main_assembly": receipt.main_assembly,
+                            "target_hardware": receipt.target_hardware,
+                        }
+                    ),
+                    "dag_id": self.config.dag_id,
+                    "dag_run_id": dag_run_id,
+                },
+            )
+        except AdmissionClosedError:
+            drop_received_folder(self.config.upload_root / dag_run_id)
+            return _json_response(
+                start_response,
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "平台准入窗口已关闭，本次提交未接纳", "dag_run_id": dag_run_id},
+                self.config,
+            )
+        except PlatformStoreError:
+            drop_received_folder(self.config.upload_root / dag_run_id)
+            return _json_response(
+                start_response,
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "平台服务暂不可用，本次提交未接纳", "dag_run_id": dag_run_id},
+                self.config,
+            )
         with self._lock:
             self._runs[dag_run_id] = PortalRun(
                 dag_run_id=dag_run_id,
