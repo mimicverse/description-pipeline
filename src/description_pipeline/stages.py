@@ -42,6 +42,12 @@ VIEW_SCHEMA = "solidworks-to-urdf.stages/v1"
 #: stages (discover, capture) are native-driven and stay out of this set.
 PORTABLE_STAGES = tuple(stage for stage, hosts in HOST_BY_STAGE.items() if hosts == ("linux",))
 
+#: Portable stages after the native boundary that produce the delivery and its
+#: rendered reports.  A receipt renders a report only when its executed scope
+#: declares at least one of these stages; the native freeze/discover/capture
+#: boundary receipts stay raw-evidence-only.
+DELIVERY_STAGES = ("generate", "verify", "publish")
+
 #: Fixed definition-independent required checks every quality report must carry;
 #: ``verification.solidworks_urdf.required_checks`` adds the dynamic per-object gates.
 FIXED_REQUIRED_CHECKS = frozenset(
