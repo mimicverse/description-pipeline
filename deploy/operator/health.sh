@@ -15,7 +15,7 @@ report() {
 }
 
 if [ ! -f "$OPERATOR_STATE/resolved.env" ]; then
-  report FAIL "missing $OPERATOR_STATE/resolved.env (run operatorctl.sh install --env-file FILE)"
+  report FAIL "missing $OPERATOR_STATE/resolved.env (run operatorctl.sh install --config FILE)"
   exit 1
 fi
 # shellcheck disable=SC1090
