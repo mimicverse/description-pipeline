@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import ntpath
 import os
 import shlex
@@ -199,6 +200,21 @@ def _load_yaml(text: str) -> Any:
         raise PipelineError(str(error)) from error
 
 
+def _parse_constant(name: str) -> Any:
+    """Reject the non-finite JSON constants in the single foundation reader."""
+
+    raise PipelineError(f"the JSON document carries the non-finite constant {name}")
+
+
+def _parse_float(text: str) -> float:
+    """Parse one JSON number, refusing values that overflow binary64 to non-finite."""
+
+    value = float(text)
+    if not math.isfinite(value):
+        raise PipelineError(f"the JSON number {text} is not finite")
+    return value
+
+
 def parse_data(content: bytes, path: Path) -> Any:
     """Parse one captured byte sequence, retaining its filename for diagnostics."""
     try:
@@ -206,7 +222,12 @@ def parse_data(content: bytes, path: Path) -> Any:
         text = content.decode("utf-8-sig")
         if path.suffix in {".yaml", ".yml"}:
             return _load_yaml(text)
-        return json.loads(text, object_pairs_hook=_unique_mapping)
+        return json.loads(
+            text,
+            object_pairs_hook=_unique_mapping,
+            parse_constant=_parse_constant,
+            parse_float=_parse_float,
+        )
     except (PipelineError, json.JSONDecodeError, UnicodeDecodeError) as error:
         raise PipelineError(f"Invalid input {path}: {error}") from error
 

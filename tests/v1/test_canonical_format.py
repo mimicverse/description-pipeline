@@ -40,6 +40,19 @@ class CanonicalEncodingTests(unittest.TestCase):
             path.write_bytes(b'{"a": 1}')
             self.assertEqual(read_data(path), {"a": 1})
 
+    def test_parse_rejects_non_finite_tokens_and_overflow(self) -> None:
+        cases = (b'{"v": NaN}', b'{"v": Infinity}', b'{"v": -Infinity}', b'{"v": 1e999}', b'{"v": -1e999}')
+        for payload in cases:
+            with (
+                self.subTest(payload=payload),
+                TemporaryDirectory() as temporary,
+                self.assertRaises(PipelineError) as raised,
+            ):
+                path = Path(temporary) / "record.json"
+                path.write_bytes(payload)
+                read_data(path)
+            self.assertIn(str(path), str(raised.exception))
+
 
 class NumericWriteFormatTests(unittest.TestCase):
     def test_shortest_round_trip_values(self) -> None:
