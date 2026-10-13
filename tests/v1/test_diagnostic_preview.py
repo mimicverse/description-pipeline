@@ -141,6 +141,11 @@ class DiagnosticPreviewTests(unittest.TestCase):
             failed / "reports/tool.json",
             {"pipeline_id": "solidworks-to-urdf", "schema_version": "solidworks-to-urdf.tool/v1"},
         )
+        # The frozen subject carries the tool record at the delivery root.
+        write_json(
+            failed / "tool.json",
+            {"pipeline_id": "solidworks-to-urdf", "schema_version": "solidworks-to-urdf.tool/v1"},
+        )
         subject = subject_digest(failed)
         report = {"passed": passed, "subject_sha256": subject, "checks": FAILING_CHECKS}
         write_json(failed / "reports/quality.json", report)

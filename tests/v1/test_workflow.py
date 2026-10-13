@@ -318,6 +318,7 @@ class WorkflowTests(unittest.TestCase):
             (bundle / name).mkdir()
         (bundle / "README.md").write_text("Synthetic driver fixture")
         write_json(bundle / "reports/tool.json", {})
+        write_json(bundle / "tool.json", {})
         source_subject = subject_digest(bundle)
 
         def generate(staging, definition, report, *, on_event):
@@ -356,6 +357,7 @@ class WorkflowTests(unittest.TestCase):
         (bundle / "README.md").write_text("Synthetic driver fixture")
         write_json(bundle / "reports/input.json", {"synthetic": True})
         write_json(bundle / "reports/tool.json", {})
+        write_json(bundle / "tool.json", {})
         with (
             patch.object(solidworks, "_check", return_value={"passed": True, "subject_sha256": "0" * 64}),
             self.assertRaisesRegex(PipelineError, "changed after verification"),
@@ -383,6 +385,7 @@ class WorkflowTests(unittest.TestCase):
         (bundle / "README.md").write_text("Synthetic driver fixture")
         write_json(bundle / "reports/input.json", {"synthetic": True})
         write_json(bundle / "reports/tool.json", {})
+        write_json(bundle / "tool.json", {})
         source_subject = subject_digest(bundle)
         real_copytree = shutil.copytree
         copies = []

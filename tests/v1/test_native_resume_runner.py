@@ -39,6 +39,8 @@ def make_seed(root: Path, *, reports: bool = True) -> Path:
             encoding="utf-8",
         )
         (seed / "reports" / "tool.json").write_text("{}\n", encoding="utf-8")
+    # The frozen subject binds the tool record at the delivery root.
+    (seed / "tool.json").write_text("{}\n", encoding="utf-8")
     return seed
 
 

@@ -215,6 +215,7 @@ class LinuxSplitTests(unittest.TestCase):
         for name in ("model", "meshes", "urdf"):
             (verify / name).mkdir(exist_ok=True)
         (verify / "reports/tool.json").write_text("{}\n", encoding="utf-8")
+        (verify / "tool.json").write_text("{}\n", encoding="utf-8")
         (verify / "README.md").write_text("fixture\n", encoding="utf-8")
         (verify / "urdf/robot.urdf").write_text("<robot/>\n", encoding="utf-8")
         subject = subject_digest(verify)
