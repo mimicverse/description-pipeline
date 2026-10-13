@@ -89,6 +89,12 @@ def link_group_mass_properties(root) -> dict:
     return block(root, "link_group_mass_properties")
 
 
+def collection(root) -> dict:
+    """The verbatim collection block (kind/evidence_class/identity/limits/environment)."""
+
+    return block(root, "collection")
+
+
 def geometry(root):
     return block(root, "geometry")
 

@@ -17,6 +17,7 @@ import numpy as np
 from ..io import PipelineError, confined, read_data
 from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, LINK_GROUP_MASS_SCHEMA, MASS_CLOSURE_REPORT_SCHEMA
 from ..sources.solidworks import verify as oracle
+from . import evidence_tree as ev
 
 MASS_RTOL = 1e-6
 MASS_CLOSURE_ATOL = 1e-12
@@ -105,7 +106,7 @@ def _require_measured_reading(measured: dict, row: dict, reference: dict, name: 
 def _unassigned_mass_rows(evidence_root: Path, source: dict) -> list[dict]:
     """The measured masses of native leaves that no selected body claims."""
 
-    scene = read_data(confined(evidence_root, "raw/scene_raw.json"))
+    scene = ev.scene(evidence_root)
     rows_scene = scene.get("components") if isinstance(scene, dict) else None
     _require(isinstance(rows_scene, list), "The raw scene carries no component inventory")
     _require(
@@ -114,7 +115,7 @@ def _unassigned_mass_rows(evidence_root: Path, source: dict) -> list[dict]:
     )
     leaves = [str(row["name"]) for row in rows_scene]
     _require(len(set(leaves)) == len(leaves), "The raw scene component inventory carries duplicate names")
-    payload = read_data(confined(evidence_root, "raw/mass_closure.json"))
+    payload = ev.mass_closure(evidence_root)
     context = payload.get("component_context") if isinstance(payload, dict) else None
     instances = context.get("instances") if isinstance(context, dict) else None
     _require(isinstance(instances, list), "Unassigned accounting awaits the recorded component context")
@@ -125,9 +126,7 @@ def _unassigned_mass_rows(evidence_root: Path, source: dict) -> list[dict]:
     named = [(str(row["name"]), row) for row in instances]
     _require(len({name for name, _row in named}) == len(named), "The component context carries duplicate instances")
     by_name = dict(named)
-    selected = {
-        str(component) for body in source.get("bodies") or [] for component in body.get("components") or []
-    }
+    selected = {str(component) for body in source.get("bodies") or [] for component in body.get("components") or []}
     rows = []
     for name in sorted(set(leaves) - selected):
         row = by_name.get(name)
@@ -145,7 +144,7 @@ def _link_direct_record(evidence_root: Path) -> dict:
     """The sealed direct link group readout record (one supported schema)."""
 
     try:
-        payload = read_data(confined(evidence_root, "raw/link_group_mass_properties.json"))
+        payload = ev.link_group_mass_properties(evidence_root)
     except (OSError, PipelineError) as error:
         raise PipelineError(f"The link group mass record is unreadable: {error}") from error
     _require(
@@ -193,8 +192,10 @@ def _direct_link_sum(record: dict, source: dict) -> tuple[float, np.ndarray, np.
         com = np.array(oracle._finite_vector(read.get("com_m"), name + " link group COM"), dtype=float)
         tensor = oracle._raw_tensor(
             name,
-            {"inertia": read.get("inertia_tensor_about_com"),
-             "reference": {"product_convention": "solidworks_standard"}},
+            {
+                "inertia": read.get("inertia_tensor_about_com"),
+                "reference": {"product_convention": "solidworks_standard"},
+            },
         )
         _require(np.isfinite(tensor).all(), name + ": nonfinite link group tensor")
         entries.append((mass, com, tensor))
@@ -225,7 +226,7 @@ def verify_urdf_mass_equality(bundle_root: Path, source: dict | None = None) -> 
 
     root = Path(bundle_root)
     try:
-        payload = read_data(confined(root / "evidence", "raw/mass_closure.json"))
+        payload = ev.mass_closure(root)
     except (OSError, PipelineError) as error:
         raise PipelineError(f"Whole-CAD mass evidence is unreadable: {error}") from error
     _require(
@@ -355,9 +356,9 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
 
     root = Path(evidence_root)
     try:
-        raw = read_data(confined(root, "raw/scene_raw.json"))
-        masses = read_data(confined(root, "raw/mass_properties.json"))
-        datums = read_data(confined(root, "raw/coordinate_systems.json"))
+        raw = ev.scene(root)
+        masses = ev.mass_properties(root)
+        datums = ev.datums(root)
         _require(masses == raw["mass_properties"] and datums == raw["coordinate_systems"], "Raw reading files disagree")
         _require(isinstance(masses, dict) and bool(masses), "No component mass readings")
     except (OSError, ValueError, TypeError, KeyError) as error:
@@ -368,7 +369,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
     declared = source.get("documented_masses") or {}
 
     def authority():
-        recorded = read_data(confined(root, "raw/declared_masses.json"))
+        recorded = ev.declared_masses(root)
         _require(
             recorded["items"] == declared and recorded["evidence"] == source.get("mass_evidence"),
             "Captured mass decisions differ from author inputs",
@@ -536,8 +537,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
             "Sealed capture identity carries no assembly",
         )
         _require(
-            isinstance(record, dict)
-            and record.get("schema_version") == EFFECTIVE_INSTANCES_SCHEMA,
+            isinstance(record, dict) and record.get("schema_version") == EFFECTIVE_INSTANCES_SCHEMA,
             "Effective instance schema changed",
         )
         _require(
@@ -555,7 +555,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
         notes = raw.get("notes") if isinstance(raw.get("notes"), dict) else {}
         mirrored = notes.get("effective_instances") if isinstance(notes.get("effective_instances"), dict) else {}
         _require(mirrored == readings, "Effective instance readings differ from the captured scene notes")
-        closure = read_data(confined(root, "raw/mass_closure.json"))
+        closure = ev.mass_closure(root)
         context = closure.get("component_context") if isinstance(closure, dict) else None
         _require(isinstance(context, dict), "Effective instances need the component context")
         instances = {str(row["name"]): row for row in context.get("instances") or [] if isinstance(row, dict)}
@@ -582,9 +582,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
                 name + ": component context effective reading differs from the sealed record",
             )
         flag_keys = {"OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia"}
-        qualification = (
-            "cad_authored_effective_instance; not geometry-derived, not independently physically qualified"
-        )
+        qualification = "cad_authored_effective_instance; not geometry-derived, not independently physically qualified"
         capture_document = raw.get("document")
         _require(isinstance(capture_document, str) and capture_document, "Captured scene names no document")
         expected_pairs = sorted(
@@ -660,13 +658,10 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
             )
             _require(entry.get("overrides") == flags, name + ": warning flags differ from the sealed reading")
             expected_basis = (
-                INSTANCE_MEASUREMENT_BASIS
-                if code == INSTANCE_MEASUREMENT_CODE
-                else "cad_authored_effective_instance"
+                INSTANCE_MEASUREMENT_BASIS if code == INSTANCE_MEASUREMENT_CODE else "cad_authored_effective_instance"
             )
             _require(
-                reference.get("effective_instance") is True
-                and reference.get("measurement_basis") == expected_basis,
+                reference.get("effective_instance") is True and reference.get("measurement_basis") == expected_basis,
                 name + ": effective basis marker changed",
             )
             _require(
@@ -885,8 +880,10 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
                 oracle._finite_vector(read.get("com_m"), name + " link group COM")
                 tensor = oracle._raw_tensor(
                     name,
-                    {"inertia": read.get("inertia_tensor_about_com"),
-                     "reference": {"product_convention": "solidworks_standard"}},
+                    {
+                        "inertia": read.get("inertia_tensor_about_com"),
+                        "reference": {"product_convention": "solidworks_standard"},
+                    },
                 )
                 _require(np.isfinite(tensor).all(), name + ": nonfinite link group tensor")
                 overrides = read.get("overrides")
@@ -958,13 +955,10 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
             recombination_delta = float(np.max(np.abs(expected_tensor - recombination_tensor)))
             partition_audit[name] = {
                 "mass_delta_kg": expected_mass - float(world["mass"]),
-                "com_delta_m": [
-                    float(a) - float(b) for a, b in zip(expected_com, recombination_com, strict=True)
-                ],
+                "com_delta_m": [float(a) - float(b) for a, b in zip(expected_com, recombination_com, strict=True)],
                 "com_delta_norm_m": float(np.linalg.norm(np.subtract(expected_com, recombination_com))),
                 "tensor_delta_max_abs": recombination_delta,
-                "tensor_rel": recombination_delta
-                / max(float(np.max(np.abs(recombination_tensor))), 1e-20),
+                "tensor_rel": recombination_delta / max(float(np.max(np.abs(recombination_tensor))), 1e-20),
             }
             details = {
                 "mass_kg": expected_mass,
@@ -991,14 +985,13 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
     )
 
     def closure():
-        payload = read_data(confined(root, "raw/mass_closure.json"))
+        payload = ev.mass_closure(root)
         report_path = Path(root).parent / "reports" / "mass-closure.json"
         report = None
         if report_path.is_file():
             report = read_data(report_path)
             _require(
-                isinstance(report, dict)
-                and report.get("schema_version") == MASS_CLOSURE_REPORT_SCHEMA,
+                isinstance(report, dict) and report.get("schema_version") == MASS_CLOSURE_REPORT_SCHEMA,
                 "Mass closure report schema changed",
             )
             _require(
@@ -1018,13 +1011,9 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
         entries = oracle.load_effective_instances(root)
         entry_names = sorted({name for name, _code in entries})
         overridden = {
-            str(row["name"]): row
-            for row in context["instances"]
-            if any((row.get("overrides") or {}).values())
+            str(row["name"]): row for row in context["instances"] if any((row.get("overrides") or {}).values())
         }
-        instances_by_name = {
-            str(row["name"]): row for row in context["instances"] if isinstance(row, dict)
-        }
+        instances_by_name = {str(row["name"]): row for row in context["instances"] if isinstance(row, dict)}
         divergent = sorted(_instance_measurement_required(masses, instances_by_name))
         _require(
             entry_names == sorted(set(overridden) | set(divergent)),
@@ -1068,13 +1057,9 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
         reconciliation = {
             "recombination": {
                 "mass_delta_kg": float(top[0]) - float(expected_recombination[0]),
-                "com_delta_m": [
-                    float(a) - float(b) for a, b in zip(top[1], expected_recombination[1], strict=True)
-                ],
+                "com_delta_m": [float(a) - float(b) for a, b in zip(top[1], expected_recombination[1], strict=True)],
                 "com_delta_norm_m": float(np.linalg.norm(np.subtract(top[1], expected_recombination[1]))),
-                "tensor_delta_max_abs_kg_m2": float(
-                    np.max(np.abs(np.subtract(top[2], expected_recombination[2])))
-                ),
+                "tensor_delta_max_abs_kg_m2": float(np.max(np.abs(np.subtract(top[2], expected_recombination[2])))),
                 "tensor_scale_kg_m2": float(max(np.max(np.abs(expected_recombination[2])), 1e-20)),
             },
             "direct_sum": {
@@ -1310,14 +1295,10 @@ def _derive_closure(native: dict, raw_scene: dict, masses: dict, source: dict) -
     if len({name for name, _entry in parsed}) != len(parsed):
         raise ValueError("the native component context carries duplicate instance rows")
     masses_by_name = {
-        name: float((payload or {}).get("mass") or 0.0)
-        for name, payload in masses.items()
-        if isinstance(payload, dict)
+        name: float((payload or {}).get("mass") or 0.0) for name, payload in masses.items() if isinstance(payload, dict)
     }
     basis_by_node = {
-        name: sum(
-            mass for leaf, mass in masses_by_name.items() if leaf == name or leaf.startswith(name + "/")
-        )
+        name: sum(mass for leaf, mass in masses_by_name.items() if leaf == name or leaf.startswith(name + "/"))
         for name, _row in parsed
     }
     instances = {}
@@ -1341,9 +1322,7 @@ def _derive_closure(native: dict, raw_scene: dict, masses: dict, source: dict) -
         "inertia": sum(1 for _name, row in parsed if (row.get("overrides") or {}).get("OverrideMomentsOfInertia")),
         "any": sum(1 for _name, row in parsed if any((row.get("overrides") or {}).values())),
         "top_level_overridden": sum(1 for row in top_rows if any((row.get("overrides") or {}).values())),
-        "examples": [
-            name for name, row in parsed if (row.get("overrides") or {}).get("OverrideMass")
-        ][:50],
+        "examples": [name for name, row in parsed if (row.get("overrides") or {}).get("OverrideMass")][:50],
     }
     leaf_payload = (
         None
@@ -1384,9 +1363,7 @@ def _derive_closure(native: dict, raw_scene: dict, masses: dict, source: dict) -
         "unassigned_mass_kg": unassigned_mass,
         "unassigned": unassigned,
         "accounting_delta_kg": None if native_mass is None else native_mass - full_mass,
-        "whole_mass_qualified": (
-            not unassigned and native_mass is not None and abs(native_mass - full_mass) <= 1e-12
-        ),
+        "whole_mass_qualified": (not unassigned and native_mass is not None and abs(native_mass - full_mass) <= 1e-12),
     }
     return {
         "leaf_total": leaf_payload,
@@ -1411,9 +1388,7 @@ def _derive_closure(native: dict, raw_scene: dict, masses: dict, source: dict) -
             "leaf_documents_covered": len(covered_documents),
             "leaf_documents_uncovered": sorted(set(leaves) - covered_documents)[:50],
         },
-        "instances": {
-            name: {"name": name, **instances[name]} for name, _row in parsed
-        },
+        "instances": {name: {"name": name, **instances[name]} for name, _row in parsed},
         "selection": selection,
     }
 

@@ -75,6 +75,13 @@ class EvidenceTreeTests(unittest.TestCase):
             "declared_masses": {"items": {}, "evidence": {}},
             "dependency_closure": {"declared_unresolved": [], "configuration": "Default"},
             "link_group_mass_properties": {"a": {"mass": 1}},
+            "collection": {
+                "kind": "solidworks",
+                "evidence_class": "cad",
+                "identity": source_record()["identity"],
+                "limits": {"native_cad": True},
+                "environment": {"solidworks": {"revision": "34.0"}},
+            },
         }
         (self.root / "evidence/capture.json").write_text(json.dumps(capture))
         write_delivery_manifest(
@@ -101,6 +108,7 @@ class EvidenceTreeTests(unittest.TestCase):
         self.assertEqual(ev.declared_masses(self.root)["items"], {})
         self.assertEqual(ev.dependency_closure(self.root)["configuration"], "Default")
         self.assertEqual(ev.link_group_mass_properties(self.root)["a"]["mass"], 1)
+        self.assertEqual(ev.collection(self.root)["limits"]["native_cad"], True)
         # Both root conventions resolve the same tree.
         self.assertEqual(ev.scene(self.root / "evidence"), ev.scene(self.root))
 

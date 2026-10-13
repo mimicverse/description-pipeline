@@ -18,18 +18,17 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 import numpy as np
-import yaml
 
-from ..delivery import PIPELINE_ID, subject_digest
+from ..delivery import PIPELINE_ID, read_delivery_manifest, read_source_record, subject_digest
 from ..geometry import stl
 from ..io import PipelineError, confined, file_digest, inventory, read_data
 from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, TOOL_SCHEMA
-from ..sources.snapshot import verify_snapshot
 from ..sources.solidworks.input import inspect_package
 from ..sources.solidworks.revision import NATIVE_SUFFIXES
 from ..sources.solidworks.revision import package_inventory, read_revision
 from ..interface_records import CHECK_POLICY_V1
 from ..stages import required_rows_complete
+from . import evidence_tree as ev
 from .consumer import load as load_consumer
 
 QUALITY_SCHEMA = "solidworks-to-urdf.quality/v1"
@@ -239,19 +238,20 @@ def _input(root, diagnostics=None):
     return definition
 
 
-def _native(root, manifest):
+def _native(root):
+    source = read_source_record(root)
+    collection = ev.collection(root)
     _require(
-        manifest["kind"] == "solidworks" and manifest["evidence_class"] == "cad",
+        collection.get("kind") == "solidworks" and collection.get("evidence_class") == "cad",
         "A release requires native SolidWorks evidence",
     )
-    collection = read_data(confined(root / "evidence", "evidence/collection.json"))
-    _require(collection["identity"] == manifest["identity"], "Collection and snapshot identities differ")
-    environment = read_data(confined(root / "evidence", "evidence/environment.json"))
-    _require(environment == collection["environment"], "Environment evidence differs")
+    _require(collection.get("identity") == source["identity"], "Collection and archived source identities differ")
+    environment = ev.runtime(root)
+    _require(environment == collection.get("environment"), "Environment evidence differs")
     revision = str(environment["solidworks"]["revision"])
     _require(revision.split(".")[0] == "34", "Native inertia API qualification currently covers SolidWorks 34 only")
-    _require(collection["limits"]["native_cad"] is True, "Native capture was not recorded")
-    return {"solidworks_revision": revision, "configuration": manifest["identity"]["configuration"]}
+    _require((collection.get("limits") or {}).get("native_cad") is True, "Native capture was not recorded")
+    return {"solidworks_revision": revision, "configuration": source["selection"]["configuration"]}
 
 
 def _native_discovery(package, diagnostics=None):
@@ -296,19 +296,19 @@ def _native_discovery(package, diagnostics=None):
 
 
 def _dependencies(root, definition):
-    closure = read_data(confined(root / "evidence", "raw/dependency_closure.json"))
+    closure = ev.dependency_closure(root)
     _require(not closure["declared_unresolved"], "Unresolved CAD references")
     stale_skips = _stale_stored_reference_skips(root, closure)
     _require(closure["configuration"] == definition["source"]["configuration"], "Captured another configuration")
     original = closure["original_files"]
     _require(bool(original) and bool(closure["mapping"]), "Missing dependency mapping")
-    actual = {"source/" + name: checksum for name, checksum in inventory(root / "evidence/source").items()}
+    actual = {"source/" + name: checksum for name, checksum in inventory(root / "input/cad").items()}
     _require(actual == closure["copy_files"], "Collected CAD changed")
-    original_hashes = _handoff_native_hashes(root / "input")
+    original_hashes = _handoff_native_hashes(root)
     _require(set(original.values()) <= original_hashes, "Capture used CAD outside the mechanical handoff")
     top = [row for row in closure["mapping"] if row["instance"] == "top_level"]
     _require(len(top) == 1, "Missing unique top assembly mapping")
-    expected = file_digest(confined(root / "input", definition["source"]["assembly"]))
+    expected = file_digest(confined(root / "input/cad", definition["source"]["assembly"]))
     _require(top[0]["source_sha256"] == expected, "Captured another top assembly revision")
     for row in closure["mapping"]:
         _require(original.get(row["source"]) == row["source_sha256"], "Source mapping hash differs")
@@ -515,42 +515,32 @@ def _stale_stored_reference_skips(root: Path, closure: dict) -> int:
     return len(skips)
 
 
-def _handoff_native_hashes(input_root: Path) -> set[str]:
-    """Hashes of the frozen handoff bytes, strictly from the proven native inventory.
+def _handoff_native_hashes(root: Path) -> set[str]:
+    """Hashes of the frozen handoff bytes, from the sealed discovery record.
 
-    Every named native file must still match its recorded bytes in the archived input,
-    and the inventory digest and discovery-record digest must match robot.yaml
-    provenance. The raw record and a supplied publication seal may only confirm a
-    matching subset of that inventory; they never widen the allowed dependency sources.
+    The discovery record carries its own provenance; its byte binding is the
+    delivery manifest subject entry (re-checked by ``read_delivery_manifest``),
+    and ``native_inventory_sha256`` is a top-level digest over the inventory.
+    The raw record may only confirm a matching subset of that inventory.
     """
 
-    from .native_discovery import DISCOVERY_FILE, REVISION_FILE
-
-    record_path = input_root / DISCOVERY_FILE
-    payload = read_data(confined(input_root, DISCOVERY_FILE))
+    payload = ev.discovery(root)
     native = payload.get("native_files") if isinstance(payload, dict) else None
     _require(isinstance(native, dict) and bool(native), "The archived native file inventory is missing")
     frozen = {str(name): str(checksum) for name, checksum in native.items()}
     for relative, checksum in sorted(frozen.items()):
-        path = confined(input_root, relative)
+        path = confined(root / "input/cad", relative)
         _require(path.is_file(), f"A frozen native file is missing from the archived input: {relative}")
         _require(
             file_digest(path) == checksum,
             f"A frozen native file differs from its recorded bytes: {relative}",
         )
-    robot = yaml.safe_load((input_root / "robot.yaml").read_text(encoding="utf-8"))
-    provenance = robot.get("provenance") if isinstance(robot, dict) else None
-    _require(isinstance(provenance, dict), "Archived robot.yaml carries no provenance")
     canonical = hashlib.sha256(
         (json.dumps(frozen, sort_keys=True, ensure_ascii=False, allow_nan=False, indent=2) + "\n").encode()
     ).hexdigest()
     _require(
-        canonical == provenance.get("native_inventory_sha256"),
-        "The native inventory digest does not match provenance",
-    )
-    _require(
-        hashlib.sha256(record_path.read_bytes()).hexdigest() == provenance.get("discovery_sha256"),
-        "The archived discovery record does not match provenance",
+        canonical == payload.get("native_inventory_sha256"),
+        "The native inventory digest does not match the discovery record",
     )
     raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
     raw_files = {str(name): str(checksum) for name, checksum in (raw.get("files") or {}).items()}
@@ -559,15 +549,6 @@ def _handoff_native_hashes(input_root: Path) -> set[str]:
         "Raw-recorded documents are not a matching subset of the frozen native inventory: "
         f"{sorted(set(raw_files) - set(frozen))}",
     )
-    seal = input_root / REVISION_FILE
-    _require(not seal.is_symlink(), "The revision manifest cannot be a symlink")
-    if seal.is_file():
-        cad_files = {str(name): str(checksum) for name, checksum in read_revision(input_root)["cad_files"].items()}
-        _require(
-            cad_files.items() <= frozen.items(),
-            "The revision seal is not a matching subset of the frozen native inventory: "
-            f"{sorted(set(cad_files) - set(frozen))}",
-        )
     return set(frozen.values())
 
 
@@ -893,7 +874,7 @@ def _qualified_surface_only(root, occurrence: str) -> bool:
 
     try:
         record = read_data(confined(root / "evidence", "raw/effective_instances.json"))
-        mass_properties = read_data(confined(root / "evidence", "raw/mass_properties.json"))
+        mass_properties = ev.mass_properties(root)
     except (PipelineError, OSError, ValueError):
         return False
     if not isinstance(record, dict) or record.get("schema_version") != EFFECTIVE_INSTANCES_SCHEMA:
@@ -1082,11 +1063,11 @@ def evaluate_bundle(root: Path, *, native_receipts=None) -> dict:
     definition = gates.add("input.valid", lambda: _input(root, diagnostics))
     gates.add("source.native_discovery", lambda: _native_discovery(root / "input", diagnostics))
     gates.add("tool.identity", lambda: _tool(root, native_receipts))
-    manifest = gates.add("source.integrity", lambda: verify_snapshot(root / "evidence"))
+    manifest = gates.add("source.integrity", lambda: read_delivery_manifest(root))
     if manifest is not None:
-        gates.add("source.native", lambda: _native(root, manifest))
+        gates.add("source.native", lambda: _native(root))
     model = gates.add("model.schema", lambda: _model(root))
-    raw = gates.add("source.raw", lambda: read_data(confined(root / "evidence", "raw/scene_raw.json")))
+    raw = gates.add("source.raw", lambda: ev.scene(root))
     gates.add("physics.mass_closure_equality", lambda: _mass_closure_equality(root, definition))
     if definition is not None:
         gates.add("source.dependencies", lambda: _dependencies(root, definition))
@@ -1172,9 +1153,7 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
     gates.add("physics.independent", lambda: _physics(root, source, model, verify_physics))
     datums = gates.add(
         "frames.native",
-        lambda: {
-            name: _cad_pose(value) for name, value in read_data(root / "evidence/raw/coordinate_systems.json").items()
-        },
+        lambda: {name: _cad_pose(value) for name, value in ev.datums(root).items()},
     )
     components = gates.add(
         "frames.components", lambda: {row["name"]: _cad_pose(row["transform"]) for row in raw["components"]}
@@ -1199,11 +1178,7 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
     joints = {node.attrib["name"]: node for node in document.findall("joint")}
     model_links = {link["name"]: link for link in model["links"]}
     model_joints = {joint["name"]: joint for joint in model["joints"]}
-    axes = (
-        read_data(root / "evidence/raw/axis_references.json")
-        if (root / "evidence/raw/axis_references.json").is_file()
-        else []
-    )
+    axes = ev.axes(root)
     axis_map = {row["joint"]: row for row in axes}
     for authored in source["joints"]:
         name = authored["name"]
@@ -1217,7 +1192,7 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
             )
     for frame in source.get("frames", []):
         gates.add("frames." + frame["name"], lambda f=frame: _frame(f, model, joints, links, datums, body_datums))
-    geometry_rows = read_data(confined(root / "evidence", "raw/geometry.json"))
+    geometry_rows = ev.geometry(root)
     geometry = {row["component"]: row for row in geometry_rows}
     gates.add("geometry.coverage", lambda: _geometry_coverage(geometry_rows, components))
     points, used = [], []
