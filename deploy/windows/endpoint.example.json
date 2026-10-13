@@ -1,0 +1,12 @@
+{
+  "schema_version": "solidworks-to-urdf.endpoint/v1",
+  "package_root": "C:/description-v1-review/packages",
+  "output_root": "C:/description-v1-review/endpoint-deliveries",
+  "state_root": "C:/description-v1-review/endpoint-state",
+  "token_file": "C:/description-v1-review/endpoint-secrets/endpoint.token",
+  "host": "127.0.0.1",
+  "port": 8765,
+  "targets": {
+    "m3.0": {"repository_slug": "mimicverse/description", "base": "main"}
+  }
+}
