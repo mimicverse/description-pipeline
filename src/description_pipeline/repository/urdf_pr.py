@@ -25,48 +25,39 @@ import tempfile
 import time
 from pathlib import Path
 
-from ..delivery import MASS_CLOSURE_REPORT, SUBJECT_FILES, subject_digest
-from ..io import PipelineError, acquire_process_lock, confined, file_digest, read_data
-from ..sources.solidworks import revision as cad_revision
+from ..delivery import check_layout, read_delivery_manifest, read_source_record, subject_digest
+from ..interface_records import validate_source_record
+from ..io import PipelineError, acquire_process_lock, confined, file_digest
 from ..stages import record_check
 
-#: ``transfer-manifest.json`` is the sealed native provenance sidecar; it is copied whenever the
-#: bundle carries it (neutral local fixtures may not).
-DELIVERY_PATHS = ("README.md", "transfer-manifest.json", "input", "evidence", "model", "urdf", "meshes", "reports")
+#: The target delivery tree (contracts §交付格式与摘要): manifest.json is the
+#: subject manifest, tool.json carries the tool identity, reports/ holds only the
+#: quality report; all other files travel inside their subject directories.
+DELIVERY_PATHS = ("manifest.json", "input", "evidence", "model", "urdf", "meshes", "tool.json", "reports")
 GOVERNED_PATHS = (*DELIVERY_PATHS, ".gitattributes")
 BYTE_ATTRIBUTES = ("text", "filter", "working-tree-encoding")
+_DIRECTORY_PATHS = {"input", "evidence", "model", "urdf", "meshes", "reports"}
 GIT_ATTRIBUTES = (
     "# Preserve verified delivery bytes in Git and on checkout.\n"
     + "".join(
-        f"/{name}{'/**' if name not in {'README.md', '.gitattributes', 'transfer-manifest.json'} else ''} "
-        "-text -filter -working-tree-encoding\n"
+        f"/{name}{'/**' if name in _DIRECTORY_PATHS else ''} -text -filter -working-tree-encoding\n"
         for name in GOVERNED_PATHS
     )
 ).encode("ascii")
-#: Immutable native provenance reports travel with the delivery whenever present.
-#: ``mass-closure.json`` is bound by ``delivery.subject_inventory`` whenever it
-#: exists, so it must travel too; dropping it here changed the staged subject
-#: and failed publish reverification (native19, 1.3.12).
-#: Reports copied into a publication branch.  Subject-bound report files derive
-#: from ``delivery`` so the two lists cannot drift (VER-11, native19 incident).
-REPORTS_FILES = (
-    *(Path(name).name for name in SUBJECT_FILES if name.startswith("reports/")),
-    "quality.json",
-    "native-tool.json",
-    "native-stages.json",
-    Path(MASS_CLOSURE_REPORT).name,
-    "structural-team.md",
-    "structural-team.json",
-)
+#: Reports copied into a publication branch: only the deterministic quality
+#: report stays outside the subject; every other receipt lives in platform run
+#: storage (contracts §交付格式与摘要).
+REPORTS_FILES = ("quality.json",)
 REQUIRED_FILES = (
-    "README.md",
-    "input/robot.yaml",
+    "manifest.json",
+    "input/handoff.json",
+    "input/source.json",
     "model/robot.json",
     "urdf/robot.urdf",
-    "reports/input.json",
-    "reports/tool.json",
+    "tool.json",
+    "reports/quality.json",
 )
-REQUIRED_DIRS = ("evidence", "meshes")
+REQUIRED_DIRS = ("input", "evidence", "model", "urdf", "meshes")
 REVIEW_BRANCH = "work/solidworks/{hardware}"
 PUBLISHER_MARKER = "Urdf-Publisher: description-pipeline"
 log = logging.getLogger(__name__)
@@ -128,6 +119,32 @@ def _gh(repository: Path, *args: str) -> str:
     return result.stdout
 
 
+def _identity_of(source: dict) -> dict:
+    """Publication identity adapter over the frozen ``input/source.json`` record."""
+
+    return {
+        "hardware_id": source["selection"]["hardware_id"],
+        "revision": source["metadata"]["revision"],
+        "source_revision_id": source["source_revision_id"],
+    }
+
+
+def _check_successor(previous: dict, current: dict) -> None:
+    """Guard the review branch against reusing a CAD revision for changed content.
+
+    Hardware identity must match; the same revision label is only allowed when
+    the content identity is identical.  The retired ``cad-revision.json`` seal
+    also required a new label to name its parent; that rule awaits the frozen
+    ``parent_revision`` field of ``input/source.json`` (field questioned to the
+    coordinator, not invented here).
+    """
+
+    if previous["hardware_id"] != current["hardware_id"]:
+        raise PrError("cad_revision_conflict", "CAD hardware identity changed across the review branch")
+    if previous["revision"] == current["revision"] and previous["source_revision_id"] != current["source_revision_id"]:
+        raise PrError("cad_revision_conflict", "CAD revision reused for different content; create a new revision")
+
+
 def _validate(bundle: Path) -> tuple[str, dict, dict]:
     for name in REQUIRED_FILES:
         if not (bundle / name).is_file():
@@ -145,34 +162,44 @@ def _validate(bundle: Path) -> tuple[str, dict, dict]:
             if key in seen and seen[key] != rel:
                 raise PrError("duplicate_path", {"first": seen[key], "second": rel})
             seen[key] = rel
-    manifest = read_data(bundle / "input/robot.yaml")
-    if not isinstance(manifest, dict) or not manifest.get("hardware_id"):
-        raise PrError("robot_yaml_invalid", "hardware_id is required")
-    hardware = _slug_hardware(str(manifest["hardware_id"]))
     try:
-        current = cad_revision.read_revision(bundle / "input", hardware_id=manifest["hardware_id"])
+        check_layout(bundle)
     except PipelineError as error:
-        raise PrError("cad_revision_invalid", str(error)) from error
+        raise PrError("bundle_layout", str(error)) from error
+    try:
+        manifest = read_delivery_manifest(bundle)
+        source = read_source_record(bundle)
+    except PipelineError as error:
+        raise PrError("bundle_records_invalid", str(error)) from error
+    hardware = _slug_hardware(str(source["selection"]["hardware_id"]))
+    current = _identity_of(source)
+    if not isinstance(current["revision"], str) or not current["revision"]:
+        raise PrError("source_revision_missing", "input/source.json requires the CAD revision label")
     return hardware, manifest, current
 
 
 def _previous_revision(worktree: Path, hardware: str) -> dict | None:
-    if not (worktree / "input/cad-revision.json").exists():
+    if not (worktree / "input/source.json").is_file():
         return None
     try:
-        return cad_revision.read_revision(worktree / "input")
+        source = read_source_record(worktree)
     except PipelineError as error:
-        raise PrError("previous_cad_revision_invalid", str(error)) from error
+        raise PrError("previous_source_invalid", str(error)) from error
+    current = _identity_of(source)
+    if not current["revision"]:
+        return None
+    return current
 
 
 def published_revision(repository: Path, hardware: str) -> dict | None:
-    """Read the published cad-revision.json of one hardware review branch (read-only).
+    """Read the published input/source.json of one hardware review branch (read-only).
 
     Best-effort identity resolution for the submission lane: it fetches the
-    deterministic review branch and reads the manifest from the fetched commit,
-    never creating a worktree.  Any unavailability returns ``None`` so the
-    caller keeps ``parent_revision`` absent; publication's own
-    ``check_successor`` remains the deciding gate.
+    deterministic review branch and reads the identity from the fetched commit
+    (``FETCH_HEAD``, so a local refspec never changes the baseline), never
+    creating a worktree.  Any unavailability returns ``None`` so the caller
+    keeps ``parent_revision`` absent; publication's own guard remains the
+    deciding gate.
     """
 
     branch = REVIEW_BRANCH.format(hardware=hardware)
@@ -189,21 +216,21 @@ def published_revision(repository: Path, hardware: str) -> dict | None:
     except subprocess.TimeoutExpired:
         log.warning("published revision fetch timed out for %s; continuing without a parent revision", branch)
         return None
-    show = _git(repository, "show", f"refs/remotes/origin/{branch}:input/cad-revision.json", check=False)
+    show = _git(repository, "show", "FETCH_HEAD:input/source.json", check=False)
     if show.returncode != 0 or not show.stdout.strip():
         return None
     try:
         payload = json.loads(show.stdout)
     except json.JSONDecodeError:
         return None
-    if (
-        not isinstance(payload, dict)
-        or payload.get("hardware_id") != hardware
-        or not isinstance(payload.get("revision"), str)
-        or not payload["revision"].strip()
-    ):
+    try:
+        payload = validate_source_record(payload)
+    except PipelineError:
         return None
-    return payload
+    identity = _identity_of(payload)
+    if identity["hardware_id"] != hardware or not isinstance(identity["revision"], str) or not identity["revision"]:
+        return None
+    return identity
 
 
 def _validate_ref(repository: Path, name: str, *, branch: bool) -> None:
@@ -556,10 +583,7 @@ def submit_bundle(
             _prepare_worktree(repository, worktree, base_sha, head_sha)
             previous = _previous_revision(worktree, hardware)
             if previous is not None:
-                try:
-                    cad_revision.check_successor(previous, current_revision)
-                except PipelineError as error:
-                    raise PrError("cad_revision_conflict", str(error)) from error
+                _check_successor(previous, current_revision)
             commit, noop = _stage_commit(
                 bundle, worktree, subject, message or f"feat({hardware}): publish SolidWorks-to-URDF bundle"
             )

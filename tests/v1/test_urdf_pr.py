@@ -10,9 +10,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from description_pipeline.delivery import subject_digest, subject_inventory
+from description_pipeline.delivery import write_delivery_manifest, subject_digest
+from description_pipeline.io import digest
 from description_pipeline.repository import urdf_pr
-from description_pipeline.sources.solidworks import revision as cad_revision
+from description_pipeline.schemas import SOURCE_RECORD_SCHEMA
+from description_pipeline.stages import CONTRACT
 
 BRANCH = "work/solidworks/m3.0"
 
@@ -45,39 +47,69 @@ class Fixture:
         self.write_bundle("one\n")
         self.seal("r1", None, cad="part-1\n")
 
+    def write_manifest(self) -> None:
+        write_delivery_manifest(
+            self.bundle,
+            contract={"schema_version": CONTRACT["schema_version"], "digest": "a" * 64},
+            policy={"schema_version": "solidworks-to-urdf.quality-policy/v1", "digest": "b" * 64},
+        )
+
     def seal(self, revision_id: str, parent: str | None, *, cad: str = "part-1\n", fresh: bool = False) -> None:
+        """Write the frozen input/source.json content identity for one revision."""
+
         inputs = self.bundle / "input"
         inputs.mkdir(parents=True, exist_ok=True)
         (inputs / "M3.0.SLDASM").write_text(cad, encoding="utf-8")
         if fresh:
-            (inputs / "cad-revision.json").unlink(missing_ok=True)
-        cad_revision.seal_revision(
-            inputs,
-            hardware_id="m3.0",
-            revision=revision_id,
-            owner="t",
-            system="handoff",
-            reference="local-handoff",
-            summary="t",
-            parent_revision=parent,
+            (inputs / "source.json").unlink(missing_ok=True)
+        identity = {
+            "kind": "source-revision",
+            "handoff_digest": digest(cad),
+            "main_assembly": "M3.0.SLDASM",
+            "configuration": "Default",
+            "hardware_id": "m3.0",
+            "records": [],
+        }
+        source = {
+            "schema_version": SOURCE_RECORD_SCHEMA,
+            "source_revision_id": digest(identity),
+            "identity": identity,
+            "selection": {
+                "main_assembly": "M3.0.SLDASM",
+                "configuration": "Default",
+                "hardware_id": "m3.0",
+                "hardware_source": "cad",
+            },
+            "metadata": {
+                "revision": revision_id,
+                "owner": "t",
+                "control": {"system": "handoff", "reference": "local-handoff"},
+                "change_summary": "t",
+                "change_summary_source": "submission",
+            },
+        }
+        (inputs / "source.json").write_text(
+            json.dumps(source, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8"
         )
+        self.write_manifest()
 
     def write_bundle(self, evidence: str, extra: dict[str, str] | None = None) -> None:
         files = {
-            "README.md": "# m3.0\n",
-            "input/robot.yaml": "hardware_id: m3.0\n",
-            "evidence/raw.json": evidence,
+            "input/handoff.json": "{}\n",
+            "evidence/discovery.json": evidence,
             "model/robot.json": "{}\n",
             "urdf/robot.urdf": "<robot name='m3.0'/>\n",
             "meshes/part.stl": "solid\n",
-            "reports/input.json": "{}\n",
-            "reports/tool.json": "{}\n",
+            "tool.json": "{}\n",
+            "reports/quality.json": "{}\n",
         }
         files.update(extra or {})
         for rel, text in files.items():
             path = self.bundle / rel
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text, encoding="utf-8")
+        if (self.bundle / "input/source.json").is_file():
+            self.write_manifest()
 
     def remote_head(self, branch: str = BRANCH) -> str:
         out = run("git", "ls-remote", str(self.remote), f"refs/heads/{branch}").strip()
@@ -201,41 +233,34 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(len([c for c in self.gh_calls if c[:2] == ("pr", "create")]), 1)
         self.assertGreaterEqual(len(self.rest_payloads), 2)
 
-    def test_mass_closure_receipt_travels_into_the_worktree_and_publishes(self) -> None:
+    def test_extra_reports_receipts_are_refused(self) -> None:
+        """Only reports/quality.json may sit outside the subject; old receipts move to run storage."""
         self.fx.write_bundle("one\n", extra={"reports/mass-closure.json": "{}\n"})
         result = self.submit()
-        self.assertIn(result["state"], {"published", "updated"})
-        self.assertEqual(result["subject"], subject_digest(self.fx.bundle))
-        run("git", "fetch", "--quiet", "origin", BRANCH, cwd=self.fx.repo)
-        tree = run("git", "ls-tree", "-r", "--name-only", "FETCH_HEAD", cwd=self.fx.repo).splitlines()
-        self.assertIn("reports/mass-closure.json", tree)
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error"], "bundle_layout")
+        self.assertEqual(self.fx.remote_head(), "")
 
-    def test_every_subject_bound_reports_receipt_is_copied_into_the_worktree(self) -> None:
-        self.fx.write_bundle(
-            "one\n",
-            extra={
-                "reports/mass-closure.json": "{}\n",
-                "reports/native-tool.json": "{}\n",
-                "reports/native-stages.json": "{}\n",
-                "transfer-manifest.json": "{}\n",
-            },
+    def test_only_the_quality_report_travels_outside_the_subject(self) -> None:
+        self.fx.write_bundle("one\n")
+        result = self.submit()
+        self.assertIn(result["state"], {"published", "updated"})
+        self.assertEqual(
+            sorted(path for path in self.fx.remote_tree() if path.startswith("reports/")), ["reports/quality.json"]
         )
-        bundle_subject = subject_digest(self.fx.bundle)
-        bound = sorted(name for name in subject_inventory(self.fx.bundle) if name.startswith("reports/"))
-        self.assertIn("reports/mass-closure.json", bound)
         worktree = Path(tempfile.mkdtemp(dir=self.fx.tmp))
         urdf_pr._copy_governed(self.fx.bundle, worktree)
-        for name in bound:
-            self.assertTrue((worktree / name).is_file(), name)
-        self.assertEqual(subject_digest(worktree), bundle_subject)
+        copied = sorted(
+            path.relative_to(worktree).as_posix() for path in (worktree / "reports").rglob("*") if path.is_file()
+        )
+        self.assertEqual(copied, ["reports/quality.json"])
+        self.assertEqual(subject_digest(worktree), subject_digest(self.fx.bundle))
 
-    def test_a_dropped_subject_bound_receipt_breaks_reverification(self) -> None:
-        self.fx.write_bundle("one\n", extra={"reports/mass-closure.json": "{}\n"})
-        legacy = tuple(name for name in urdf_pr.REPORTS_FILES if name != "mass-closure.json")
-        with mock.patch.object(urdf_pr, "REPORTS_FILES", legacy):
-            result = self.submit()
-        self.assertEqual(result["state"], "failed")
-        self.assertEqual(result["error"], "reverification_failed")
+    def test_missing_quality_report_is_refused(self) -> None:
+        (self.fx.bundle / "reports/quality.json").unlink()
+        result = self.submit()
+        self.assertEqual(result["error"], "bundle_incomplete")
+        self.assertEqual(self.fx.remote_head(), "")
 
     def test_original_record_bytes_survive_git_and_fresh_checkout(self):
         name = "input/records/specification.txt"
@@ -243,6 +268,7 @@ class PublishTests(unittest.TestCase):
         path = self.fx.bundle / name
         path.parent.mkdir(parents=True)
         path.write_bytes(payload)
+        self.fx.write_manifest()
         for setting in ("true", "false", "input"):
             with self.subTest(core_autocrlf=setting):
                 run("git", "config", "core.autocrlf", setting, cwd=self.fx.repo)
@@ -291,23 +317,21 @@ class PublishTests(unittest.TestCase):
         attributes = self.fx.repo / ".git/info/attributes"
         for rule in ("text=auto", "filter=external", "working-tree-encoding=UTF-16"):
             with self.subTest(attribute=rule):
-                attributes.write_text(f"README.md {rule}\n", encoding="ascii")
+                attributes.write_text(f"tool.json {rule}\n", encoding="ascii")
                 result = self.submit()
                 self.assertEqual(result["error"], "git_attributes_conflict")
-                self.assertEqual(result["detail"]["file"], "README.md")
+                self.assertEqual(result["detail"]["file"], "tool.json")
                 self.assertEqual(result["detail"]["attribute"], rule.split("=", 1)[0])
                 self.assertEqual(self.fx.remote_head(), "")
 
-    def test_bundle_cannot_replace_generated_git_policy(self):
+    def test_bundle_cannot_carry_its_own_git_policy(self):
         self.fx.write_bundle("one\n", extra={".gitattributes": "* text\n"})
-        events = []
-        result = self.submit(on_event=events.append)
-        self.assertEqual(result["state"], "published")
-        run("git", "fetch", "--quiet", "origin", BRANCH, cwd=self.fx.repo)
-        actual = subprocess.check_output(["git", "show", "FETCH_HEAD:.gitattributes"], cwd=self.fx.repo)
-        self.assertEqual(actual, urdf_pr.GIT_ATTRIBUTES)
-        boundary = next(event["check"] for event in events if event.get("check", {}).get("id") == "publication.git")
-        self.assertEqual(len(boundary["details"]["git_attributes_sha256"]), 64)
+        result = self.submit()
+        # The generated policy is publisher-owned metadata: the bundle can neither
+        # carry nor replace it, and unregistered files are refused outright.
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error"], "bundle_layout")
+        self.assertEqual(self.fx.remote_head(), "")
 
     def test_native_filenames_with_unicode_and_spaces_publish_unchanged(self):
         name = "input/结构 零件.SLDPRT"
@@ -415,27 +439,19 @@ class PublishTests(unittest.TestCase):
         self.assertTrue(result["subject"])
         self.assertIn("retry", result)
 
-    def test_ungoverned_files_never_reach_the_branch(self) -> None:
-        self.fx.write_bundle("four\n", extra={"secret.txt": "shh\n", "config/extra.json": "{}\n"})
+    def test_unregistered_files_are_refused_not_smuggled(self) -> None:
+        self.fx.write_bundle("four\n", extra={"secret.txt": "shh\n"})
         result = self.submit()
-        self.assertIn(result["state"], {"published", "updated"})
-        tree = self.fx.remote_tree()
-        self.assertNotIn("secret.txt", tree)
-        self.assertNotIn("config/extra.json", tree)
-        self.assertIn("urdf/robot.urdf", tree)
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error"], "bundle_layout")
+        self.assertEqual(self.fx.remote_head(), "")
 
-    def test_local_receipts_ignored_and_do_not_cause_commits(self) -> None:
-        self.fx.write_bundle("one\n", extra={"reports/run.json": '{"run": 1}\n', "reports/pr.json": '{"pr": 1}\n'})
-        first = self.submit()
-        tree = self.fx.remote_tree()
-        self.assertIn("reports/quality.json", tree)
-        self.assertNotIn("reports/run.json", tree)
-        self.assertNotIn("reports/pr.json", tree)
-        self.fx.write_bundle("one\n", extra={"reports/run.json": '{"run": 2}\n', "reports/pr.json": '{"pr": 2}\n'})
-        second = self.submit()
-        self.assertEqual(second["state"], "noop")
-        self.assertEqual(second["commit"], first["commit"])
-        self.assertEqual(self.fx.remote_head(), first["commit"])
+    def test_local_receipts_are_refused_under_reports(self) -> None:
+        self.fx.write_bundle("one\n", extra={"reports/run.json": '{"run": 1}\n'})
+        result = self.submit()
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error"], "bundle_layout")
+        self.assertEqual(self.fx.remote_head(), "")
 
     def test_base_advance_with_identical_bundle_pushes_merge(self) -> None:
         first = self.submit()
@@ -458,8 +474,8 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(self.fx.remote_head(), "")
 
     def test_case_duplicate_paths_rejected(self) -> None:
-        (self.fx.bundle / "readme.md").write_text("dup\n", encoding="utf-8")
-        if (self.fx.bundle / "readme.md").samefile(self.fx.bundle / "README.md"):
+        (self.fx.bundle / "Tool.json").write_text("dup\n", encoding="utf-8")
+        if (self.fx.bundle / "Tool.json").samefile(self.fx.bundle / "tool.json"):
             self.skipTest("Case-distinct files require a case-sensitive filesystem")
         self.assertEqual(self.submit()["error"], "duplicate_path")
         self.assertEqual(self.fx.remote_head(), "")
@@ -478,7 +494,7 @@ class PublishTests(unittest.TestCase):
         result = self.submit()
         self.assertIn(result["state"], {"published", "updated"})
         self.assertTrue((outside / "keep.txt").is_file())
-        self.assertIn("input/robot.yaml", self.fx.remote_tree())
+        self.assertIn("input/source.json", self.fx.remote_tree())
 
     def test_commit_hook_tamper_blocks_push(self) -> None:
         hook = self.fx.repo / ".git" / "hooks" / "pre-commit"
@@ -516,27 +532,19 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(result["error"], "cad_revision_conflict")
         self.assertEqual(self.fx.remote_head(), first["commit"])
 
-    def test_new_revision_with_correct_parent_allowed(self) -> None:
+    def test_new_revision_label_is_allowed(self) -> None:
         first = self.submit()
         self.fx.seal("r2", "r1", cad="part-2\n", fresh=True)
         self.fx.write_bundle("two\n")
         second = self.submit()
         self.assertEqual(second["state"], "updated")
         run("git", "fetch", "--quiet", "origin", BRANCH, cwd=self.fx.repo)
-        manifest = json.loads(run("git", "show", "FETCH_HEAD:input/cad-revision.json", cwd=self.fx.repo))
-        self.assertEqual(manifest["revision"], "r2")
-        self.assertEqual(manifest["parent_revision"], "r1")
+        source = json.loads(run("git", "show", "FETCH_HEAD:input/source.json", cwd=self.fx.repo))
+        self.assertEqual(source["metadata"]["revision"], "r2")
         self.assertTrue(self.fx.is_ancestor(first["commit"], second["commit"]))
-
-    def test_missing_or_wrong_parent_rejected(self) -> None:
-        first = self.submit()
-        self.fx.seal("r2", None, cad="part-2-missing\n", fresh=True)
-        self.fx.write_bundle("two\n")
-        self.assertEqual(self.submit()["error"], "cad_revision_conflict")
-        self.assertEqual(self.fx.remote_head(), first["commit"])
-        self.fx.seal("r2", "r0", cad="part-2-wrong\n", fresh=True)
-        self.assertEqual(self.submit()["error"], "cad_revision_conflict")
-        self.assertEqual(self.fx.remote_head(), first["commit"])
+        # The retired cad-revision.json parent-link rule awaits the frozen
+        # parent_revision field of input/source.json (field questioned to the
+        # coordinator); hardware identity and the same-label/content guard remain.
 
 
 if __name__ == "__main__":
