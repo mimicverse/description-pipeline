@@ -281,8 +281,14 @@ def build_install_record(
     endpoint: dict,
     services: list[str],
     dag_file: Path,
+    previous: dict | None = None,
+    journal: list | None = None,
 ) -> dict:
-    """Assemble a record that passes the frozen IF-16 validator (parity-tested)."""
+    """Assemble a record that passes the frozen IF-16 validator (parity-tested).
+
+    ``previous`` is the rollback binding of the generation this record replaces and ``journal``
+    carries the switch steps already taken; both are written once, at the pointer switch.
+    """
 
     require(bool(_INSTALL_ID.match(install_id)), f"install_id is malformed: {install_id!r}")
     require(bool(_RFC3339_UTC.match(timestamp)), f"timestamp must be RFC3339 UTC: {timestamp!r}")
@@ -327,6 +333,26 @@ def build_install_record(
     dag_file = Path(dag_file)
     require(dag_file.is_file(), f"dag file not found: {dag_file}")
     dag_digest = hashlib.sha256(dag_file.read_bytes()).hexdigest()
+    steps = []
+    for index, row in enumerate(journal or []):
+        require(
+            isinstance(row, dict) and set(row) == {"verb", "step", "status", "at", "evidence"},
+            f"journal step {index} is malformed",
+        )
+        require(row["verb"] in {"promote", "rollback"}, f"journal step {index} verb is malformed")
+        require(row["status"] in {"completed", "failed", "unknown"}, f"journal step {index} status is malformed")
+        _text(row["step"], f"journal step {index} name")
+        require(
+            isinstance(row["at"], str) and bool(row["at"]),
+            f"journal step {index} timestamp is malformed",
+        )
+        require(
+            isinstance(row["evidence"], list)
+            and bool(row["evidence"])
+            and all(isinstance(item, str) and item for item in row["evidence"]),
+            f"journal step {index} evidence is malformed",
+        )
+        steps.append({"seq": index + 1, **row})
     return {
         "schema_version": INSTALL_RECORD_SCHEMA,
         "install_id": install_id,
@@ -353,9 +379,44 @@ def build_install_record(
                 "release": dict(windows_release),
             },
         },
-        "previous": None,
-        "journal": [],
+        "previous": previous,
+        "journal": steps,
     }
+
+
+def previous_from_record(record: dict, record_path: Path) -> dict:
+    """The rollback binding a new generation records about the one it replaces."""
+
+    return {
+        "release": {key: record["release"][key] for key in ("version", "source_commit", "source_sha256")},
+        "config": {"path": record["snapshot"]["path"], "digest": record["snapshot"]["digest"]},
+        "record": str(Path(record_path)),
+    }
+
+
+def repoint_active(state_root: Path, record_path: Path) -> dict:
+    """Atomically point ``install-record.json`` at an existing generation file (rollback).
+
+    The record is validated by the canonical package validator first; the generation files
+    themselves are never rewritten.
+    """
+
+    state_root, record_path = Path(state_root), Path(record_path)
+    require(record_path.is_file(), f"rollback record not found: {record_path}")
+    try:
+        document = json.loads(record_path.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, ValueError) as error:
+        die(f"cannot parse rollback record {record_path}: {error}")
+    try:
+        _canonical_records().validate_install_record(document)
+    except Exception as error:
+        die(f"rollback record invalid: {error}")
+    active = state_root / "install-record.json"
+    active.parent.mkdir(parents=True, exist_ok=True)
+    temporary = active.with_suffix(".repoint.tmp")
+    temporary.write_bytes(record_path.read_bytes())
+    os.replace(temporary, active)
+    return document
 
 
 def write_install_record(record: dict, state_root: Path, owner) -> tuple[Path, Path]:
@@ -393,6 +454,8 @@ def main(argv: list[str] | None = None) -> int:
     build.add_argument("--dag", type=Path, required=True)
     build.add_argument("--wheel", type=Path, default=None, help="the installed wheel (contract owner source)")
     build.add_argument("--tree", type=Path, default=None, help="deployment tree for wheel discovery")
+    build.add_argument("--previous-record", type=Path, default=None, help="the generation this record replaces")
+    build.add_argument("--journal", type=Path, default=None, help="the switch steps taken before the pointer switch")
     check = subparsers.add_parser("check")
     check.add_argument("--release-file", type=Path, required=True)
     check.add_argument("--endpoint-identity", type=Path, required=True)
@@ -401,10 +464,17 @@ def main(argv: list[str] | None = None) -> int:
     verify = subparsers.add_parser("verify-active")
     verify.add_argument("--config", type=Path, required=True)
     verify.add_argument("--state-root", type=Path, required=True)
+    repoint = subparsers.add_parser("repoint")
+    repoint.add_argument("--state-root", type=Path, required=True)
+    repoint.add_argument("--record", type=Path, required=True, help="the generation file to activate (rollback)")
     args = parser.parse_args(argv)
 
     if args.action == "verify-active":
         record = verify_active_generation(args.config, args.state_root)
+        print(f"install_id={record['install_id']}")
+        return 0
+    if args.action == "repoint":
+        record = repoint_active(args.state_root, args.record)
         print(f"install_id={record['install_id']}")
         return 0
     if args.action == "check":
@@ -431,6 +501,15 @@ def main(argv: list[str] | None = None) -> int:
         endpoint=endpoint,
         services=services,
         dag_file=args.dag,
+        previous=(
+            previous_from_record(
+                _load_json(args.previous_record, "previous record"),
+                Path(args.previous_record).resolve(),
+            )
+            if args.previous_record is not None
+            else None
+        ),
+        journal=(_load_json(args.journal, "journal file") if args.journal is not None else None),
     )
     bound_wheel = wheel_binding(release, wheel=args.wheel, tree_root=args.tree)
     contract = load_contract_owner(extract_contract_closure(bound_wheel))

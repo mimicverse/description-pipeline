@@ -564,6 +564,50 @@ class InstallRecordTests(unittest.TestCase):
         source = (OPERATOR / "install_record.py").read_text(encoding="utf-8")
         self.assertNotIn("description-v1-endpoint", source)
 
+    def test_promote_binding_carries_previous_and_repoint_activates_it(self):
+        from description_pipeline import interface_records as ir
+
+        record = build_record(self.root)
+        state_root = self.root / "state"
+        owner = contract_owner(self.root)
+        generation, _ = install_record.write_install_record(record, state_root, owner)
+        release = install_record.release_identity(
+            json.loads((self.root / "distribution" / "release.json").read_text(encoding="utf-8"))
+        )
+        endpoint = install_record.endpoint_identity(
+            json.loads((self.root / "endpoint-identity.json").read_text(encoding="utf-8"))
+        )
+        snapshot = json.loads((state_root / "snapshots" / "gen-1.json").read_text(encoding="utf-8"))
+        snapshot["install_id"] = "gen-2"
+        second_snapshot = state_root / "snapshots" / "gen-2.json"
+        second_snapshot.write_text(json.dumps(snapshot), encoding="utf-8")
+        promoted = install_record.build_install_record(
+            install_id="gen-2",
+            timestamp=TIMESTAMP,
+            snapshot_path=second_snapshot,
+            release=release,
+            endpoint=endpoint,
+            services=list(SERVICES),
+            dag_file=self.root / "solidworks_to_urdf.py",
+            previous=install_record.previous_from_record(record, generation),
+            journal=[
+                {
+                    "verb": "promote",
+                    "step": "close-admission",
+                    "status": "completed",
+                    "at": TIMESTAMP,
+                    "evidence": ["promotions/gen-2/receipt.json"],
+                }
+            ],
+        )
+        ir.validate_install_record(promoted, previous_required=True)
+        self.assertEqual(promoted["previous"]["record"], str(generation))
+        self.assertEqual(promoted["journal"][0]["seq"], 1)
+        restored = install_record.repoint_active(state_root, generation)
+        self.assertEqual(restored["install_id"], "gen-1")
+        active = json.loads((state_root / "install-record.json").read_text(encoding="utf-8"))
+        self.assertEqual(active["install_id"], "gen-1")
+
     def test_verify_active_consumes_the_canonical_validator(self):
         with tempfile.TemporaryDirectory(prefix="verify-active-") as temporary:
             root = Path(temporary)

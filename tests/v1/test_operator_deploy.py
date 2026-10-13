@@ -1149,7 +1149,7 @@ class InstallOrderingTests(unittest.TestCase):
         (release / "airflow" / "dags").mkdir()
         (release / "operator" / "operatorctl.sh").write_bytes(CONTROL.read_bytes())
         (release / "operator" / "render_operator.py").write_bytes(RENDER.read_bytes())
-        for module in ("platform_config.py", "platform_env.py", "install_record.py"):
+        for module in ("platform_config.py", "platform_env.py", "install_record.py", "promotion.py"):
             (release / "operator" / module).write_bytes((OPERATOR / module).read_bytes())
         (release / "airflow" / "dags" / "solidworks_to_urdf.py").write_text("# dag fixture\n", encoding="utf-8")
         for template in ("nginx.conf.template", "portal.json.template"):
@@ -1179,7 +1179,10 @@ class InstallOrderingTests(unittest.TestCase):
         (release / "airflow" / "scripts" / "add_connection.py").write_text("# stub\n", encoding="utf-8")
 
         (tmp / "releases" / "airflow-venv-gen-1" / "bin").mkdir(parents=True)
-        write_stub(tmp / "releases" / "airflow-venv-gen-1" / "bin" / "python", "#!/usr/bin/env bash\nexit 0\n")
+        write_stub(
+            tmp / "releases" / "airflow-venv-gen-1" / "bin" / "python",
+            "#!/usr/bin/env bash\ncase \"$*\" in\n  *install_record.py*) exec python3 \"$@\" ;;\nesac\nexit 0\n",
+        )
         (tmp / "token").write_text("test-token\n", encoding="utf-8")
         (tmp / "token").chmod(0o600)
         secrets = tmp / "secrets"
@@ -1229,6 +1232,8 @@ class InstallOrderingTests(unittest.TestCase):
             "specifications": {"record_roots": [str(tmp / "specifications")]},
         }
         (tree / "platform.json").write_text(json.dumps(config), encoding="utf-8")
+        windows_archive = tree / "description-1.4.0-windows-cp312-x86_64.zip"
+        windows_archive.write_bytes(b"windows-archive")
         (tree / "release.json").write_text(
             json.dumps(
                 {
@@ -1237,7 +1242,10 @@ class InstallOrderingTests(unittest.TestCase):
                     "version": "1.4.0",
                     "source_commit": "c" * 40,
                     "source_sha256": "a" * 64,
-                    "artifacts": {wheel.name: hashlib.sha256(wheel.read_bytes()).hexdigest()},
+                    "artifacts": {
+                        wheel.name: hashlib.sha256(wheel.read_bytes()).hexdigest(),
+                        windows_archive.name: hashlib.sha256(windows_archive.read_bytes()).hexdigest(),
+                    },
                 }
             ),
             encoding="utf-8",
@@ -1309,6 +1317,11 @@ class InstallOrderingTests(unittest.TestCase):
             "#!/usr/bin/env bash\n" + client_libraries + 'echo "createdb" >> "$ORDER_LOG"\nexit "${CREATEDB_RC:-0}"\n',
         )
         write_stub(bindir / "sleep", '#!/usr/bin/env bash\necho "sleep" >> "$ORDER_LOG"\nexit 0\n')
+        write_stub(bindir / "scp", '#!/usr/bin/env bash\necho "scp $*" >> "$ORDER_LOG"\nexit 0\n')
+        write_stub(
+            bindir / "ssh",
+            '#!/usr/bin/env bash\necho "ssh $*" >> "$ORDER_LOG"\necho "windows lifecycle ok"\nexit 0\n',
+        )
 
         order = tmp / "order.log"
         control_env = {
@@ -1405,6 +1418,61 @@ class InstallOrderingTests(unittest.TestCase):
                 lines.index("systemctl --user start description-postgres.service"), lines.index("pg_isready 1")
             )
             self.assertLess(lines.index("psql_db_query"), lines.index("airflow_install"))
+
+    def test_stage_builds_both_candidate_generations_without_switching(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, order = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            result = self._install(release, control_env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            tree = release.parent
+            staged = run(
+                [
+                    "bash",
+                    str(release / "operator" / "operatorctl.sh"),
+                    "stage",
+                    "--config",
+                    str(tree / "platform.json"),
+                    "--install-id",
+                    "gen-2",
+                ],
+                control_env,
+            )
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            state = Path(tmp) / "state"
+            active = json.loads((state / "install-record.json").read_text(encoding="utf-8"))
+            self.assertEqual(active["install_id"], "gen-1", "stage must not switch the active generation")
+            self.assertTrue((state / "snapshots" / "gen-2.json").is_file())
+            self.assertTrue((state / "derived" / "gen-2" / "operator.env").is_file())
+            receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                [row["step"] for row in receipt["steps"]], ["linux-generation", "windows-generation"]
+            )
+            self.assertEqual({row["status"] for row in receipt["steps"]}, {"completed"})
+            binding = json.loads(
+                (state / "promotions" / "gen-2" / "windows-binding.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(binding["task_name"], "description-e2e-endpoint")
+            self.assertEqual(binding["state_root"], "C:/description-e2e/state")
+            lines = order.read_text(encoding="utf-8").splitlines()
+            self.assertTrue(any(line.startswith("scp ") for line in lines), lines[-10:])
+            self.assertTrue(any(line.startswith("ssh ") for line in lines), lines[-10:])
+            self.assertNotIn("platform close_admission", lines)
+            journalled = run(
+                [
+                    "python3",
+                    str(release / "operator" / "promotion.py"),
+                    "journal",
+                    "--state-root",
+                    str(state),
+                    "--install-id",
+                    "gen-2",
+                    "--verb",
+                    "promote",
+                ],
+                {},
+            )
+            self.assertEqual(journalled.returncode, 0, journalled.stderr)
+            self.assertEqual(len(json.loads(journalled.stdout)), 2)
 
     def test_not_ready_postgres_fails_before_migration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

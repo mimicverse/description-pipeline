@@ -32,11 +32,15 @@ function Write-Receipt([string]$path, [hashtable]$payload) {
   if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent | Out-Null }
   Emit $payload | Set-Content -LiteralPath $path -Encoding UTF8
 }
-function Config-Path([string]$instanceDir) { Join-Path $instanceDir 'endpoint.json' }
 function Runtime-Python([string]$instanceDir) { Join-Path $instanceDir 'runtime\Scripts\python.exe' }
 function Runtime-Launcher([string]$instanceDir) { Join-Path $instanceDir 'runtime\Scripts\description.exe' }
-function Health-Probe([object]$binding) {
-  $config = Read-Json (Config-Path $binding.instance_dir)
+function Action-Config([object]$task) {
+  $match = [regex]::Match([string]$task.Actions[0].Arguments, 'serve --config\s+"?([^"]+)"?')
+  if (-not $match.Success) { Die 'task_ambiguous' 'the instance task does not run serve --config' }
+  $match.Groups[1].Value
+}
+function Health-Probe([string]$configPath) {
+  $config = Read-Json $configPath
   $token = (Get-Content -LiteralPath $config.token_file -Raw).Trim()
   $deadline = (Get-Date).AddSeconds(30)
   do {
@@ -49,12 +53,13 @@ function Health-Probe([object]$binding) {
 }
 
 $binding = Read-Json $Binding
-foreach ($field in ('task_name','instance_dir','package_root','output_root','state_root',
-                    'token_file','port','archive','version','source_commit','source_sha256')) {
+foreach ($field in ('task_name','state_root','archive','version','source_commit','source_sha256')) {
   if (-not $binding.$field) { Die 'binding_incomplete' "the binding misses $field" }
 }
+$task = Get-ScheduledTask -TaskName $binding.task_name -ErrorAction SilentlyContinue
 if ($Verb -eq 'health') {
-  Emit @{passed=$true; verb='health'; health=(Health-Probe $binding)}
+  if (-not $task) { Die 'task_missing' 'the instance task is not registered' }
+  Emit @{passed=$true; verb='health'; health=(Health-Probe (Action-Config $task))}
   exit 0
 }
 
@@ -79,10 +84,6 @@ if ($Verb -eq 'stage') {
   if ($identity.tool.version -ne $binding.version -or $identity.tool.source_sha256 -ne $binding.source_sha256 -or $identity.tool.release.source_commit -ne $binding.source_commit -or -not $identity.doctor.passed) {
     Die 'identity_mismatch' 'the staged runtime identity differs from the release manifest'
   }
-  $config = @{schema_version='solidworks-to-urdf.endpoint/v1'; package_root=$binding.package_root;
-              output_root=$binding.output_root; state_root=$binding.state_root;
-              token_file=$binding.token_file; host='127.0.0.1'; port=$binding.port}
-  $config | ConvertTo-Json | Set-Content -LiteralPath (Config-Path $StageDir) -Encoding UTF8
   Write-Receipt (Join-Path $StageDir 'stage-receipt.json') @{
     passed=$true; verb='stage'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
     version=$binding.version; source_commit=$binding.source_commit; source_sha256=$binding.source_sha256}
@@ -90,7 +91,6 @@ if ($Verb -eq 'stage') {
   exit 0
 }
 
-$task = Get-ScheduledTask -TaskName $binding.task_name -ErrorAction SilentlyContinue
 $promotions = Join-Path $binding.state_root 'instance-promotions'
 
 if ($Verb -eq 'promote') {
@@ -99,18 +99,18 @@ if ($Verb -eq 'promote') {
   if (-not (Test-Path -LiteralPath $receiptPath)) { Die 'stage_receipt_missing' 'the generation has no completed stage receipt' }
   if (-not $task) { Die 'task_missing' 'the instance task is not registered; install the instance before promoting' }
   if (@($task.Actions).Count -ne 1) { Die 'task_ambiguous' 'the instance task must carry exactly one action' }
+  $configPath = Action-Config $task
   New-Item -ItemType Directory -Path $promotions -ErrorAction SilentlyContinue | Out-Null
   $previous = Join-Path $promotions ('previous-' + (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ'))
   New-Item -ItemType Directory -Path $previous | Out-Null
   Export-ScheduledTask -TaskName $binding.task_name | Set-Content -LiteralPath (Join-Path $previous 'task.xml') -Encoding UTF8
-  Copy-Item -LiteralPath (Config-Path $binding.instance_dir) -Destination (Join-Path $previous 'endpoint-before.json')
-  Copy-Item -LiteralPath (Config-Path $StageDir) -Destination (Config-Path $binding.instance_dir) -Force
+  Copy-Item -LiteralPath $configPath -Destination (Join-Path $previous 'endpoint-before.json')
   $action = New-ScheduledTaskAction -Execute (Runtime-Launcher $StageDir) `
-    -Argument ('serve --config "' + (Config-Path $binding.instance_dir) + '"') -WorkingDirectory $binding.instance_dir
+    -Argument ('serve --config "' + $configPath + '"') -WorkingDirectory $binding.state_root
   Set-ScheduledTask -TaskName $binding.task_name -Action $action | Out-Null
   try {
     Start-ScheduledTask -TaskName $binding.task_name
-    $health = Health-Probe $binding
+    $health = Health-Probe $configPath
     Write-Receipt (Join-Path $promotions 'last-promotion.json') @{
       passed=$true; verb='promote'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
       previous=$previous; health=$health}
@@ -131,10 +131,11 @@ if ($Verb -eq 'rollback') {
   if (-not (Test-Path -LiteralPath $record)) { Die 'no_promotion_receipt' 'no recorded promotion exists to roll back' }
   $last = Read-Json $record
   if (-not $task) { Die 'task_missing' 'the instance task is not registered' }
+  $configPath = Action-Config $task
   Register-ScheduledTask -TaskName $binding.task_name -Xml (Get-Content -LiteralPath (Join-Path $last.previous 'task.xml') -Raw) -Force | Out-Null
-  Copy-Item -LiteralPath (Join-Path $last.previous 'endpoint-before.json') -Destination (Config-Path $binding.instance_dir) -Force
+  Copy-Item -LiteralPath (Join-Path $last.previous 'endpoint-before.json') -Destination $configPath -Force
   Start-ScheduledTask -TaskName $binding.task_name
-  $health = Health-Probe $binding
+  $health = Health-Probe $configPath
   Write-Receipt (Join-Path $promotions 'last-rollback.json') @{
     passed=$true; verb='rollback'; at=(Get-Date).ToUniversalTime().ToString('o');
     restored_from=$last.generation; previous=$last.previous; health=$health}

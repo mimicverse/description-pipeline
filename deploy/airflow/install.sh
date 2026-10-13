@@ -10,6 +10,10 @@
 #
 # Rerunning is safe: the existing Fernet key and [api_auth] jwt_secret in
 # $AIRFLOW_HOME/airflow.cfg are preserved (see render_config.py).
+#
+#   install.sh --stage:  build and verify the generation's runtime only (venv, hash-locked
+#                        dependencies, doctor); no configuration switch and no migration -
+#                        the stage half of the promote protocol.  Other arguments are ignored.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -59,6 +63,11 @@ fi
 # pip check excludes optional dependencies. Exercise the Linux verifier before
 # installing configuration or migrating the service database.
 "$AIRFLOW_VENV/bin/description" doctor
+
+if [ "${1:-}" = "--stage" ]; then
+  echo "Airflow runtime staged (no configuration switch, no migration): $("$AIRFLOW_VENV/bin/airflow" version)"
+  exit 0
+fi
 
 # Atomic 0600 config; preserves previously generated Fernet/JWT secrets on rerun.
 AIRFLOW_DB_URL="$AIRFLOW_DB_URL" AIRFLOW_API_PORT="$AIRFLOW_API_PORT" "$AIRFLOW_VENV/bin/python" "$HERE/render_config.py" \

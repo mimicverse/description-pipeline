@@ -221,6 +221,57 @@ print(f"admission={view.state} revision={view.revision}")
 PY
 }
 
+# The Windows end of the unified stage/promote/rollback protocol.  One binding file rendered
+# here from platform.json + release.json travels with the single lifecycle script over the
+# authenticated SSH channel; the script's stdout is kept as the step evidence under the
+# promotion receipt directory.
+instance_lifecycle() {
+  local verb="$1" generation="$2"
+  local dir="$OPERATOR_STATE/promotions/$generation"
+  local binding="$dir/windows-binding.json" output="$dir/windows-$verb.out"
+  mkdir -p "$dir"
+  python3 - "$CONFIG_FILE" "$RELEASE_FILE" "$binding" <<'PY' || return 1
+import json, sys
+from pathlib import Path
+
+config_path, release_path, out = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+instance = json.loads(config_path.read_text(encoding="utf-8"))["windows"]["instance"]
+release = json.loads(release_path.read_text(encoding="utf-8"))
+archives = sorted(name for name in release["artifacts"] if name.endswith(".zip"))
+if len(archives) != 1:
+    raise SystemExit("operatorctl: the release manifest must name exactly one Windows archive")
+out.write_text(
+    json.dumps(
+        {
+            "task_name": instance["task_name"],
+            "state_root": instance["state_root"],
+            "archive": str(release_path.parent / archives[0]),
+            "version": release["version"],
+            "source_commit": release["source_commit"],
+            "source_sha256": release["source_sha256"],
+        },
+        indent=2,
+    )
+    + "\n",
+    encoding="utf-8",
+)
+PY
+  local remote
+  remote="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state_root"])' "$binding")"
+  remote="$remote/lifecycle/$generation"
+  scp -q -o BatchMode=yes "$binding" "$HERE/../windows/instance-lifecycle.ps1" \
+    "$SOLIDWORKS_SSH_HOST:$remote/" \
+    || { echo "instance_lifecycle: could not transfer the lifecycle inputs to $SOLIDWORKS_SSH_HOST" >&2; return 1; }
+  local stage_argument=""
+  case "$verb" in
+    stage|promote) stage_argument=" -StageDir \"$remote/generation\"" ;;
+  esac
+  ssh -o BatchMode=yes "$SOLIDWORKS_SSH_HOST" \
+    "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"$remote/instance-lifecycle.ps1\" -Verb $verb -Binding \"$remote/windows-binding.json\"$stage_argument" \
+    > "$output" || { echo "instance_lifecycle: $verb failed; see $output" >&2; return 1; }
+  echo "$output"
+}
+
 load_installed() {
   OPERATOR_STATE_DIR="$(sed -n 's/^OPERATOR_STATE=//p' "$ENV_FILE" | head -1)"
   [ -n "$OPERATOR_STATE_DIR" ] || die "OPERATOR_STATE is not set in $ENV_FILE"
@@ -272,7 +323,10 @@ drift_check() {
 }
 
 [ -n "$CONFIG_FILE" ] || usage
-if [ -n "$INSTALL_ID$WHEEL_FILE$ENDPOINT_IDENTITY$RELEASE_FILE" ] && [ "$ACTION" != "install" ]; then usage; fi
+if [ -n "$INSTALL_ID$WHEEL_FILE$ENDPOINT_IDENTITY$RELEASE_FILE" ] && [ "$ACTION" != "install" ] \
+   && [ "$ACTION" != "stage" ] && [ "$ACTION" != "promote" ] && [ "$ACTION" != "rollback" ]; then
+  usage
+fi
 [ -f "$CONFIG_FILE" ] || die "config file not found: $CONFIG_FILE"
 # Every verb passes the same static config gate first; the install record and its derived
 # per-generation environment stay the single authority for the operational verbs.
@@ -299,9 +353,10 @@ case "$ACTION" in
     load_active_env ;;
   drain|stop|status|health)
     load_active_env ;;
+  stage|promote|rollback)
+    load_active_env ;;
   *)
-    echo "operatorctl: '$ACTION' is recognized but its --config bridge is not implemented in this increment" >&2
-    exit 3 ;;
+    usage ;;
 esac
 
 case "$ACTION" in
@@ -481,6 +536,51 @@ SQL
     HEALTH_RC=$?
     [ "$DRIFT_RC" = "0" ] || exit 1
     exit "$HEALTH_RC"
+    ;;
+  stage)
+    [ -n "$RELEASE_FILE" ] || RELEASE_FILE="$HERE/../../release.json"
+    [ -f "$RELEASE_FILE" ] || die "release manifest not found: $RELEASE_FILE"
+    [ -n "$INSTALL_ID" ] || die "stage requires --install-id naming the candidate generation"
+    CANDIDATE_ID="$INSTALL_ID"
+    RECEIPT_DIR="$OPERATOR_STATE/promotions/$CANDIDATE_ID"
+    # The Linux generation is built from the same validated files as production - a new
+    # snapshot, its derived environment and the generation's own runtime - with no pointer,
+    # unit or admission change.
+    SNAPSHOT_PATH="$(python3 "$HERE/platform_config.py" render --config "$CONFIG_FILE" \
+      --install-id "$CANDIDATE_ID" --wheel "$PIPELINE_WHEEL" | sed -n 's/^snapshot=//p')" || exit $?
+    [ -f "$SNAPSHOT_PATH" ] || die "candidate snapshot was not written"
+    CANDIDATE_ENV="$(python3 "$HERE/platform_env.py" emit --snapshot "$SNAPSHOT_PATH" \
+      --install-id "$CANDIDATE_ID" --tree "$HERE/../.." --release-file "$RELEASE_FILE" \
+      --wheel "$PIPELINE_WHEEL" | sed -n 's/^env=//p')" || exit $?
+    [ -f "$CANDIDATE_ENV" ] || die "candidate derived environment was not written"
+    python3 "$HERE/promotion.py" init --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
+      --from "$STATE_ROOT/install-record.json" --to "$SNAPSHOT_PATH" \
+      --plan "linux-generation,windows-generation,close-admission,drain,backup,stop-services,windows-switch,switch-pointer,start-services,verify,open-admission,rollback-windows,rollback-linux" \
+      >/dev/null
+    set -a
+    # shellcheck disable=SC1090
+    source "$CANDIDATE_ENV"
+    set +a
+    if bash "$AIRFLOW_HERE/install.sh" --stage > "$RECEIPT_DIR/linux-generation.out" 2>&1; then
+      python3 "$HERE/promotion.py" step --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
+        --verb promote --step linux-generation --status completed \
+        --evidence "$SNAPSHOT_PATH" --evidence "$CANDIDATE_ENV" --evidence "$RECEIPT_DIR/linux-generation.out" \
+        >/dev/null
+    else
+      python3 "$HERE/promotion.py" step --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
+        --verb promote --step linux-generation --status failed \
+        --evidence "$RECEIPT_DIR/linux-generation.out" >/dev/null
+      die "the candidate runtime failed to stage; the active generation is unchanged"
+    fi
+    if ! WINDOWS_STAGE="$(instance_lifecycle stage "$CANDIDATE_ID")"; then
+      python3 "$HERE/promotion.py" step --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
+        --verb promote --step windows-generation --status failed \
+        --evidence "$RECEIPT_DIR/windows-stage.out" >/dev/null
+      die "the Windows candidate stage failed; the active generation is unchanged"
+    fi
+    python3 "$HERE/promotion.py" step --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
+      --verb promote --step windows-generation --status completed --evidence "$WINDOWS_STAGE" >/dev/null
+    echo "stage complete: $CANDIDATE_ID (active pointer and admission unchanged)"
     ;;
   *) usage ;;
 esac
