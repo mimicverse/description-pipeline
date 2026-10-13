@@ -8,6 +8,7 @@ StartLimitIntervalSec=0
 Type=simple
 Environment=OPERATOR_STATE=@OPERATOR_STATE@
 Environment=AIRFLOW_HOME=@AIRFLOW_HOME@
+EnvironmentFile=@ENV_FILE@
 ExecStart=@PORTAL_COMMAND@
 UMask=0077
 Restart=on-failure

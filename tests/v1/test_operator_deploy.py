@@ -1106,6 +1106,18 @@ class LifecycleTests(unittest.TestCase):
             self.assertIn("DRIFT unit missing from render: description-operator-proxy.service", failed.stdout)
             self.assertIn("provided TLS certificate or key is missing", failed.stderr)
 
+    def test_portal_unit_injects_the_derived_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, state, _, target = self._render_units(Path(tmp))
+            env_path = state / "derived" / "gen-1" / "operator.env"
+            unit = (target / "description-portal.service").read_text(encoding="utf-8")
+            self.assertIn(f"EnvironmentFile={env_path}", unit)
+            # The portal consumes the platform store through the derived DSN (A's U1 slice).
+            self.assertIn(
+                "PLATFORM_SERVICE_DSN=postgresql://platform_service@/airflow_meta",
+                env_path.read_text(encoding="utf-8"),
+            )
+
     def test_api_server_unit_loads_the_optional_feishu_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             _, state, _, target = self._render_units(Path(tmp))
