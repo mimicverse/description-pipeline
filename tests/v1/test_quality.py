@@ -19,6 +19,7 @@ from description_pipeline.sources.solidworks import verify as oracle
 from description_pipeline.sources.solidworks.scene import closure_delta
 from description_pipeline.verification import solidworks_urdf as quality
 from description_pipeline.verification.solidworks_physics import verify_physics, verify_urdf_mass_equality
+from tests.sources import support
 
 
 class PhysicsTests(unittest.TestCase):
@@ -44,10 +45,10 @@ class PhysicsTests(unittest.TestCase):
                 }
             ],
         }
-        # The capture session seals its own assembly identity (absolute native
-        # path); the archived definition keeps the package-relative name.
+        # The frozen tree carries one capture identity: the collection block's
+        # identity, bound to the archived source record (package-relative names).
         self.captured_identity = {
-            "assembly": "C:\\endpoint\\prepared\\robot.SLDASM",
+            "assembly": "robot.SLDASM",
             "configuration": "Default",
         }
         material = {
@@ -214,13 +215,47 @@ class PhysicsTests(unittest.TestCase):
 
     def write(self):
         self.raw["mass_properties"] = copy.deepcopy(self.masses)
-        write_json(self.root / "raw/scene_raw.json", self.raw)
-        write_json(self.root / "raw/mass_properties.json", self.masses)
-        write_json(self.root / "raw/coordinate_systems.json", self.raw["coordinate_systems"])
-        write_json(self.root / "raw/link_group_mass_properties.json", self.link_direct)
-        write_json(self.root / "raw/declared_masses.json", {"items": {}, "evidence": None})
         native = self._native_closure()
-        write_json(self.root / "raw/mass_closure.json", native)
+        source = support.default_source_record(
+            main_assembly=self.captured_identity["assembly"],
+            configuration=self.captured_identity["configuration"],
+            revision=None,
+        )
+        capture = {
+            "scene": copy.deepcopy(self.raw),
+            "components": [
+                {"name": name, "mass_properties": copy.deepcopy(reading)}
+                for name, reading in self.masses.items()
+            ],
+            "datums": [
+                {"name": name, "matrix": copy.deepcopy(matrix)}
+                for name, matrix in self.raw["coordinate_systems"].items()
+            ],
+            "link_group_mass_properties": copy.deepcopy(self.link_direct),
+            "declared_masses": {"items": {}, "evidence": None},
+            "mass_closure": native,
+            "collection": {
+                "kind": "solidworks",
+                "evidence_class": "cad",
+                "identity": copy.deepcopy(source["identity"]),
+                "limits": {"native_cad": True},
+                "environment": {"solidworks": {"revision": "34.0"}},
+            },
+        }
+        capture.update(getattr(self, "extra_capture_blocks", {}))
+        previous_path = support.capture_file_for(self.root)
+        if previous_path.is_file():
+            # The recording helpers seal material/effective blocks directly into
+            # the capture file; a later write refreshes the derived blocks but
+            # must not drop those recorded records.
+            previous = json.loads(previous_path.read_text(encoding="utf-8"))
+            for name, value in previous.items():
+                capture.setdefault(name, value)
+        support.write_target_delivery(
+            self.bundle,
+            capture=capture,
+            source=source,
+        )
         write_json(
             self.bundle / "reports/mass-closure.json",
             {
@@ -229,7 +264,15 @@ class PhysicsTests(unittest.TestCase):
                 "derived": self._derived_closure(),
             },
         )
-        write_json(self.root / "manifest.json", {"identity": copy.deepcopy(self.captured_identity)})
+
+    def block(self, name):
+        return support.load_capture_block(self.root, name)
+
+    def store_block(self, name, value) -> None:
+        support.store_capture_block(self.root, name, value)
+
+    def delete_block(self, name) -> None:
+        support.delete_capture_block(self.root, name)
 
     def _native_closure(self):
         """The split native record: observations only, no derived math."""
@@ -471,9 +514,8 @@ class PhysicsTests(unittest.TestCase):
 
     def test_link_direct_record_is_required_and_schema_bound(self):
         self._record_clean_provenance()
-        path = self.root / "raw/link_group_mass_properties.json"
         original = copy.deepcopy(self.link_direct)
-        path.unlink()
+        self.delete_block("link_group_mass_properties")
         checks = {check["id"]: check for check in verify_physics(self.root, self.source, self.model)}
         self.assertFalse(checks["physics.link_direct_record"]["passed"])
         self.assertFalse(checks["physics.link.base_link"]["passed"])
@@ -545,8 +587,8 @@ class PhysicsTests(unittest.TestCase):
     def _record_clean_provenance(self) -> None:
         """The canonical records a current CAD capture seals with every material verified."""
 
-        write_json(
-            self.root / "raw/material_provenance.json",
+        self.store_block(
+            "material_provenance",
             {
                 "schema_version": "solidworks-to-urdf.material-provenance/v1",
                 "assembly": self.captured_identity["assembly"],
@@ -556,8 +598,8 @@ class PhysicsTests(unittest.TestCase):
                 "warnings": [],
             },
         )
-        write_json(
-            self.root / "raw/effective_instances.json",
+        self.store_block(
+            "effective_instances",
             {
                 "schema_version": "solidworks-to-urdf.effective-instances/v1",
                 "assembly": self.captured_identity["assembly"],
@@ -597,8 +639,8 @@ class PhysicsTests(unittest.TestCase):
         self._mark_unverified_material()
         reference = self.masses["a"]["reference"]
         assignment = reference["material_assignment"]
-        write_json(
-            self.root / "raw/material_provenance.json",
+        self.store_block(
+            "material_provenance",
             {
                 "schema_version": "solidworks-to-urdf.material-provenance/v1",
                 "assembly": self.captured_identity["assembly"],
@@ -643,15 +685,15 @@ class PhysicsTests(unittest.TestCase):
 
     def test_material_provenance_record_is_required_even_without_warnings(self):
         self._record_clean_provenance()
-        (self.root / "raw/material_provenance.json").unlink()
+        self.delete_block("material_provenance")
         self.assertIn("physics.material_provenance", self.failures())
 
     def test_material_provenance_record_is_required_and_bound_to_the_readings(self):
         def load() -> dict:
-            return json.loads((self.root / "raw/material_provenance.json").read_text())
+            return self.block("material_provenance")
 
         def store(payload: dict) -> None:
-            write_json(self.root / "raw/material_provenance.json", payload)
+            self.store_block("material_provenance", payload)
 
         def warning(payload: dict) -> dict:
             return payload["warnings"][0]
@@ -661,7 +703,7 @@ class PhysicsTests(unittest.TestCase):
 
         def deletion_after_sealing() -> None:
             self._record_unverified_material()
-            (self.root / "raw/material_provenance.json").unlink()
+            self.delete_block("material_provenance")
 
         def empty_warnings() -> None:
             self._record_unverified_material()
@@ -931,8 +973,8 @@ class PhysicsTests(unittest.TestCase):
                                "measurement_basis": sealed_reference["measurement_basis"]},
             },
         ]
-        write_json(
-            self.root / "raw/effective_instances.json",
+        self.store_block(
+            "effective_instances",
             {
                 "schema_version": "solidworks-to-urdf.effective-instances/v1",
                 "assembly": self.captured_identity["assembly"],
@@ -1015,13 +1057,13 @@ class PhysicsTests(unittest.TestCase):
 
     def test_effective_instance_evidence_is_required_and_bound(self):
         def load() -> dict:
-            return json.loads((self.root / "raw/effective_instances.json").read_text())
+            return self.block("effective_instances")
 
         def store(payload: dict) -> None:
-            write_json(self.root / "raw/effective_instances.json", payload)
+            self.store_block("effective_instances", payload)
 
         def removed_record() -> None:
-            (self.root / "raw/effective_instances.json").unlink()
+            self.delete_block("effective_instances")
 
         def changed_flags() -> None:
             payload = load()
@@ -1221,8 +1263,7 @@ class PhysicsTests(unittest.TestCase):
         }
         self.link_direct = self._link_direct_payload()
         self._record_clean_provenance()
-        record_path = self.root / "raw/effective_instances.json"
-        payload = json.loads(record_path.read_text())
+        payload = self.block("effective_instances")
         payload["readings"]["a"] = copy.deepcopy(singleton)
         payload["warnings"] = [
             {
@@ -1256,7 +1297,7 @@ class PhysicsTests(unittest.TestCase):
                 "part_measurement": copy.deepcopy(singleton["part_measurement"]),
             }
         ]
-        write_json(record_path, payload)
+        self.store_block("effective_instances", payload)
         self.write()
 
     def test_instance_measurement_is_accepted_and_bound(self):
@@ -1267,10 +1308,10 @@ class PhysicsTests(unittest.TestCase):
 
     def test_instance_measurement_evidence_is_required_and_bound(self):
         def load() -> dict:
-            return json.loads((self.root / "raw/effective_instances.json").read_text())
+            return self.block("effective_instances")
 
         def store(payload: dict) -> None:
-            write_json(self.root / "raw/effective_instances.json", payload)
+            self.store_block("effective_instances", payload)
 
         def removed_entry() -> None:
             payload = load()
@@ -1348,7 +1389,7 @@ class StructuralQualityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_json(
-                root / "reports/tool.json",
+                root / "tool.json",
                 {
                     "schema_version": "solidworks-to-urdf.tool/v1",
                     "pipeline_id": "solidworks-to-urdf",
@@ -1480,10 +1521,15 @@ class UrdfMassEqualityTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
-        (self.root / "urdf").mkdir()
-        (self.root / "evidence/raw").mkdir(parents=True)
+        support.write_target_delivery(self.root, capture={})
         self.masses = [1.0, 2.0]
         self.write()
+
+    def store_block(self, name, value) -> None:
+        support.store_capture_block(self.root, name, value)
+
+    def delete_block(self, name) -> None:
+        support.delete_capture_block(self.root, name)
 
     def write(self, whole=3.0, status="recorded", mode="full", top=True, write_closure=True):
         body = "".join(
@@ -1494,14 +1540,13 @@ class UrdfMassEqualityTests(unittest.TestCase):
             for index, mass in enumerate(self.masses)
         )
         (self.root / "urdf/robot.urdf").write_text(f'<robot name="unit">{body}</robot>', encoding="utf-8")
-        closure = self.root / "evidence/raw/mass_closure.json"
         if write_closure:
             payload = {"status": status, "mode": mode}
             if top:
                 payload["top_level"] = {"mass": whole}
-            write_json(closure, payload)
-        elif closure.exists():
-            closure.unlink()
+            self.store_block("mass_closure", payload)
+        else:
+            self.delete_block("mass_closure")
 
     def test_exact_whole_cad_mass_passes(self):
         details = verify_urdf_mass_equality(self.root)
@@ -1561,9 +1606,9 @@ class UrdfMassEqualityTests(unittest.TestCase):
     def _accounting(self, urdf_masses, whole, context, scene_names, bodies):
         self.masses = list(urdf_masses)
         self.write(whole=whole)
-        write_json(self.root / "evidence/raw/scene_raw.json", {"components": [{"name": name} for name in scene_names]})
-        write_json(
-            self.root / "evidence/raw/mass_closure.json",
+        self.store_block("scene", {"components": [{"name": name} for name in scene_names]})
+        self.store_block(
+            "mass_closure",
             {
                 "status": "recorded",
                 "mode": "full",
@@ -1928,7 +1973,6 @@ class SurfaceOnlyGeometryExemptionTests(unittest.TestCase):
 
     def _delivery(self, tmp, *, qualified=True):
         root = Path(tmp)
-        (root / "evidence/raw").mkdir(parents=True, exist_ok=True)
         occurrence = "pcb-1"
         record = {
             "schema_version": "solidworks-to-urdf.effective-instances/v1",
@@ -1952,15 +1996,20 @@ class SurfaceOnlyGeometryExemptionTests(unittest.TestCase):
                 else []
             ),
         }
-        write_json(root / "evidence/raw/effective_instances.json", record)
-        write_json(
-            root / "evidence/raw/mass_properties.json",
-            {
-                occurrence: {
-                    "mode": "effective_instance",
-                    "state": "effective_instance",
-                    "reference": {"solid_bodies": 0, "sheet_bodies": 2350},
-                }
+        support.write_target_delivery(
+            root,
+            capture={
+                "effective_instances": record,
+                "components": [
+                    {
+                        "name": occurrence,
+                        "mass_properties": {
+                            "mode": "effective_instance",
+                            "state": "effective_instance",
+                            "reference": {"solid_bodies": 0, "sheet_bodies": 2350},
+                        },
+                    }
+                ],
             },
         )
         return root
@@ -1970,17 +2019,17 @@ class SurfaceOnlyGeometryExemptionTests(unittest.TestCase):
             root = self._delivery(tmp)
             self.assertTrue(quality._qualified_surface_only(root, "pcb-1"))
             self.assertFalse(quality._qualified_surface_only(root, "other-1"))
-            record = json.loads((root / "evidence/raw/effective_instances.json").read_text(encoding="utf-8"))
+            record = support.load_capture_block(root, "effective_instances")
             record["warnings"][0]["solid_bodies"] = False
-            write_json(root / "evidence/raw/effective_instances.json", record)
+            support.store_capture_block(root, "effective_instances", record)
             self.assertFalse(quality._qualified_surface_only(root, "pcb-1"))
-            mass = json.loads((root / "evidence/raw/mass_properties.json").read_text(encoding="utf-8"))
-            mass["pcb-1"]["reference"]["solid_bodies"] = False
-            write_json(root / "evidence/raw/mass_properties.json", mass)
+            rows = support.load_capture_block(root, "components")
+            rows[0]["mass_properties"]["reference"]["solid_bodies"] = False
+            support.store_capture_block(root, "components", rows)
             self.assertFalse(quality._qualified_surface_only(root, "pcb-1"))
-            mass["pcb-1"]["reference"]["solid_bodies"] = 0
-            mass["pcb-1"]["mode"] = "document"
-            write_json(root / "evidence/raw/mass_properties.json", mass)
+            rows[0]["mass_properties"]["reference"]["solid_bodies"] = 0
+            rows[0]["mass_properties"]["mode"] = "document"
+            support.store_capture_block(root, "components", rows)
             self.assertFalse(quality._qualified_surface_only(root, "pcb-1"))
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

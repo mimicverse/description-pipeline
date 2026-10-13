@@ -214,7 +214,7 @@ def verify_urdf_mass_equality(bundle_root: Path, source: dict | None = None) -> 
 
     The actual delivered URDF XML inertial mass sum, plus the independently
     measured mass of every native occurrence that no selected body claims,
-    must equal the bound ``evidence/raw/mass_closure.json`` whole-assembly
+    must equal the bound ``mass_closure`` capture block's whole-assembly
     mass with an absolute tolerance of 1e-12 kg and no relative tolerance.
     Accounting unassigned occurrences this way records ``whole_mass_qualified``
     false together with an exact per-component warning; the readings
@@ -342,6 +342,29 @@ def _compare(actual, expected, label, *, com_atol=COM_ATOL_M, tensor_rtol=TENSOR
     )
 
 
+def _capture_identity(root):
+    """The sealed capture identity: the collection block bound to the source record.
+
+    The frozen tree carries the capture identity once, as the collection block's
+    identity, and ``input/source.json`` is its binding authority: the two must
+    name the same source revision.  The old evidence snapshot's ``manifest.json``
+    identity is no longer a read point.
+    """
+
+    collection = ev.collection(root)
+    identity = collection.get("identity")
+    _require(isinstance(identity, dict), "Capture collection identity is missing")
+    _require(
+        identity == ev.source(root).get("identity"),
+        "Collection and archived source identities differ",
+    )
+    _require(
+        isinstance(identity.get("main_assembly"), str) and bool(identity["main_assembly"]),
+        "Capture identity carries no main assembly",
+    )
+    return identity
+
+
 def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]:
     checks = []
 
@@ -419,11 +442,14 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
     gate("physics.authority", authority)
 
     def material_provenance():
-        path = root / "raw/material_provenance.json"
+        try:
+            record = ev.material_provenance(root)
+        except PipelineError:
+            record = None
         if source.get("material_source") != "cad":
             # Only CAD-sourced masses depend on material provenance; documented
             # tables carry their own bound evidence.
-            return {"recorded": path.is_file(), "unverified_material": []}
+            return {"recorded": record is not None, "unverified_material": []}
         affected = sorted(
             name
             for name, item in masses.items()
@@ -431,8 +457,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
             and isinstance(item["reference"].get("material_assignment"), dict)
             and "unverified_reason" in item["reference"]["material_assignment"]
         )
-        _require(path.is_file(), "Material provenance record is missing from the CAD capture")
-        record = read_data(path)
+        _require(record is not None, "Material provenance record is missing from the CAD capture")
         _require(isinstance(record, dict), "Material provenance record is not an object")
         _require(
             record.get("schema_version") == "solidworks-to-urdf.material-provenance/v1",
@@ -443,24 +468,16 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
             "Material provenance does not describe this capture's material source",
         )
         _require(record.get("measured_source") == "cad_api", "Material provenance measured source changed")
-        # The record quotes the assembly path of the capture session; the archived
-        # definition names the same assembly package-relative. The sealed snapshot
-        # identity (manifest, kept equal to the collection identity) is the
-        # legitimate binding, never the relative archive path.
-        sealed = read_data(confined(root, "manifest.json"))
-        identity = sealed.get("identity") if isinstance(sealed, dict) else None
-        _require(isinstance(identity, dict), "Sealed capture identity is missing")
+        # The frozen tree carries the capture identity once (collection block,
+        # bound to the archived source record); the record must belong to it.
+        identity = _capture_identity(root)
         _require(
-            isinstance(identity.get("assembly"), str) and bool(identity["assembly"]),
-            "Sealed capture identity carries no assembly",
+            record.get("assembly") == identity["main_assembly"],
+            "Material provenance assembly differs from the capture identity",
         )
         _require(
-            record.get("assembly") == identity["assembly"],
-            "Material provenance assembly differs from the sealed capture identity",
-        )
-        _require(
-            record.get("configuration") == str(source.get("configuration") or ""),
-            "Material provenance configuration differs from the captured input",
+            record.get("configuration") == str(identity.get("configuration") or ""),
+            "Material provenance configuration differs from the capture identity",
         )
         warnings = record.get("warnings")
         _require(isinstance(warnings, list), "Material provenance warnings must be a list")
@@ -525,28 +542,25 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
     gate("physics.material_provenance", material_provenance)
 
     def effective_instances():
-        path = root / "raw/effective_instances.json"
+        try:
+            record = ev.effective_instances(root)
+        except PipelineError:
+            record = None
         if source.get("material_source") != "cad":
-            return {"recorded": path.is_file(), "effective": []}
-        _require(path.is_file(), "Effective instance record is missing from the CAD capture")
-        record = read_data(path)
-        sealed = read_data(confined(root, "manifest.json"))
-        identity = sealed.get("identity") if isinstance(sealed, dict) else None
-        _require(
-            isinstance(identity, dict) and isinstance(identity.get("assembly"), str) and identity["assembly"],
-            "Sealed capture identity carries no assembly",
-        )
+            return {"recorded": record is not None, "effective": []}
+        _require(record is not None, "Effective instance record is missing from the CAD capture")
+        identity = _capture_identity(root)
         _require(
             isinstance(record, dict) and record.get("schema_version") == EFFECTIVE_INSTANCES_SCHEMA,
             "Effective instance schema changed",
         )
         _require(
-            record.get("assembly") == identity["assembly"],
+            record.get("assembly") == identity["main_assembly"],
             "Effective instance record belongs to another assembly",
         )
         _require(
-            record.get("configuration") == str(source.get("configuration") or ""),
-            "Effective instance record configuration differs from the captured input",
+            record.get("configuration") == str(identity.get("configuration") or ""),
+            "Effective instance record configuration differs from the capture identity",
         )
         readings = record.get("readings")
         _require(isinstance(readings, dict), "Effective instance readings must be an object")

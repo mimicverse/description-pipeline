@@ -884,3 +884,15 @@ def store_capture_block(root: Path, name: str, value) -> None:
     capture[name] = value
     write_json(path, capture)
     seal_delivery(path.parent.parent)
+
+
+def delete_capture_block(root: Path, name: str) -> None:
+    """Remove one capture block and re-seal the manifest."""
+
+    from description_pipeline.io import read_data, write_json
+
+    path = capture_file_for(root)
+    capture = read_data(path)
+    capture.pop(name, None)
+    write_json(path, capture)
+    seal_delivery(path.parent.parent)
