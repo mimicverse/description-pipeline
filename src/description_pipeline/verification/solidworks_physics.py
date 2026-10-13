@@ -29,7 +29,7 @@ COM_ATOL_M = 5e-5
 #: and the same intrinsic difference carries the inertia tensor to 2.232e-3
 #: relative (rebuilt scale 9.7e-3 kg m^2), so the closure reconciliation also
 #: carries its own tensor bound.  Every other comparison (link COM/inertia,
-#: readings, reported effective closure) keeps COM_ATOL_M / TENSOR_RTOL.
+#: readings, the reported effective closure) keeps COM_ATOL_M / TENSOR_RTOL.
 CLOSURE_COM_ATOL_M = 1e-3
 CLOSURE_TENSOR_RTOL = 1e-2
 TENSOR_RTOL = 1e-4
