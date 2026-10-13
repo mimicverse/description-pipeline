@@ -289,6 +289,7 @@ class ConfigurationPrimitiveTests(unittest.TestCase):
         child = types.SimpleNamespace(
             Name2="arm-1",
             IsSuppressed=False,
+            GetSuppression2=lambda: 2,
             GetChildren=Mock(spec=lambda: None, return_value=[]),
             GetPathName=Mock(spec=lambda: None, return_value="C:/captures/arm.SLDPRT"),
         )
@@ -337,6 +338,34 @@ class ConfigurationPrimitiveTests(unittest.TestCase):
             _ = document.GetPathName
         self.assertEqual(document.late, ["GetPathName"])
 
+    def test_flagless_instance_difference_retains_both_native_measurements(self):
+        backend, _document, _configuration_view = self._backend()
+        part = {
+            "mass": 1.0, "com": [0.1, 0.2, 0.3],
+            "inertia": [[0.001, 0, 0], [0, 0.001, 0], [0, 0, 0.001]],
+            "reference": {"scope": "part_document", "used_api": "IMassProperty2.GetMomentOfInertia(0)",
+                          "product_convention": "solidworks_standard"},
+        }
+        backend._part_mass_properties = {"arm-1": part}
+        result = backend.assembly_component_mass_properties("C:/captures/robot.SLDASM")
+        self.assertEqual(result["errors"], [])
+        reading = result["instances"][0]["effective"]
+        self.assertEqual(reading["mass"], 1.5)
+        self.assertEqual(reading["part_measurement"]["mass_kg"], 1.0)
+        self.assertEqual(reading["reference"]["measurement_basis"], "cad_assembly_instance_measurement")
+        self.assertFalse(any(reading["reference"]["overrides"].values()))
+        self.assertEqual(backend.effective_instance_readings()["arm-1"], reading)
+        self.assertEqual(part["mass"], 1.0)
+
+    def test_equal_flagless_instance_does_not_create_a_difference_record(self):
+        backend, _document, _configuration_view = self._backend()
+        backend._part_mass_properties = {
+            "arm-1": {"mass": 1.5, "reference": {"scope": "part_document"}}
+        }
+        result = backend.assembly_component_mass_properties("C:/captures/robot.SLDASM")
+        self.assertEqual(result["errors"], [])
+        self.assertNotIn("effective", result["instances"][0])
+
     def test_part_mass_reader_uses_captured_primitives_after_recalculation(self):
         body = object()
         inner = types.SimpleNamespace(
@@ -364,16 +393,88 @@ class ConfigurationPrimitiveTests(unittest.TestCase):
         self.assertEqual(result["reference"]["configuration"], "Default")
         self.assertEqual(result["reference"]["material_assignment"]["configuration"], "Default")
 
+    def test_strict_part_mass_reader_keeps_the_measured_values_for_a_missing_material(self):
+        body = object()
+        inner = types.SimpleNamespace(
+            GetType=Mock(spec=lambda: None, return_value=1),
+            ConfigurationManager=None,
+            GetPathName=Mock(spec=lambda: None, return_value="C:/captures/base.SLDPRT"),
+            GetTitle=Mock(spec=lambda: None, return_value="base"),
+        )
+        configuration = _Revocable(_Configuration(root=None))
+        inner.ConfigurationManager = types.SimpleNamespace(ActiveConfiguration=configuration)
+        document = _Revocable(inner)
+        mass_property = _MassProperty(document, configuration)
+        inner.Extension = _Extension(mass_property)
+        backend = SolidWorksBackend()
+        assignment = {
+            "schema_version": "swbridge.material-assignment/v1",
+            "configuration": "默认",
+            "part": {"name": "", "database": ""},
+            "body_count": 1,
+            "bodies": [
+                {
+                    "index": 0,
+                    "name": "拉伸-薄壁2",
+                    "material": {"name": "", "database": ""},
+                    "effective_source": "part",
+                }
+            ],
+        }
+        error = native.CadError(
+            "cad_material_provenance_missing",
+            "Every solid requires an explicit physical material; default density is not evidence",
+            {"missing_body_indices": [0], "material_assignment": assignment},
+        )
+        with (
+            patch.object(native, "_part_bodies", return_value=[body]),
+            patch.object(native, "_material_assignments_document", side_effect=error),
+        ):
+            result = backend._mass_properties_document(document, require_material=True)
+        record = result["reference"]["material_assignment"]
+        self.assertEqual(record["unverified_reason"], "cad_material_provenance_missing")
+        self.assertEqual(record["missing_body_indices"], [0])
+        self.assertEqual(record["material_assignment"]["bodies"][0]["name"], "拉伸-薄壁2")
+        # 测量值照常读出：默认密度不是证据，但读数本身不被猜测值替换。
+        self.assertEqual(result["mass"], 1.5)
+        self.assertEqual(result["reference"]["density_kg_m3"], 7900.0)
+        self.assertEqual(result["reference"]["configuration"], "Default")
+
+    def test_strict_part_mass_reader_still_refuses_an_unreadable_material(self):
+        body = object()
+        inner = types.SimpleNamespace(
+            GetType=Mock(spec=lambda: None, return_value=1),
+            ConfigurationManager=None,
+            GetPathName=Mock(spec=lambda: None, return_value="C:/captures/base.SLDPRT"),
+            GetTitle=Mock(spec=lambda: None, return_value="base"),
+        )
+        configuration = _Revocable(_Configuration(root=None))
+        inner.ConfigurationManager = types.SimpleNamespace(ActiveConfiguration=configuration)
+        document = _Revocable(inner)
+        mass_property = _MassProperty(document, configuration)
+        inner.Extension = _Extension(mass_property)
+        backend = SolidWorksBackend()
+        error = native.CadError("cad_material_read_failed", "Cannot verify physical material assignment")
+        with (
+            patch.object(native, "_part_bodies", return_value=[body]),
+            patch.object(native, "_material_assignments_document", side_effect=error),
+            self.assertRaises(native.CadError) as raised,
+        ):
+            backend._mass_properties_document(document, require_material=True)
+        self.assertEqual(raised.exception.code, "cad_material_read_failed")
+
     def test_unreadable_component_path_keeps_other_rows_and_records_the_error(self):
         ok_child = types.SimpleNamespace(
             Name2="ok-1",
             IsSuppressed=False,
+            GetSuppression2=lambda: 2,
             GetChildren=Mock(spec=lambda: None, return_value=[]),
             GetPathName=Mock(spec=lambda: None, return_value="C:/captures/ok.SLDPRT"),
         )
         bad_child = types.SimpleNamespace(
             Name2="bad-2",
             IsSuppressed=False,
+            GetSuppression2=lambda: 2,
             GetChildren=Mock(spec=lambda: None, return_value=[]),
             GetPathName=Mock(spec=lambda: None, side_effect=RuntimeError("RPC_S_UNKNOWN_IF")),
         )
@@ -621,7 +722,11 @@ class ReturnViewRegistryTests(unittest.TestCase):
         self.assertNotIn('"IsLightweight"', source)
         self.assertIn('state["lightweight"] = None', source)
         self.assertIn('state["unsupported"] = ["lightweight"]', source)
-        self.assertIn("lightweight:{path_name}:unsupported_declared", source)
+        # The per-component lightweight member is now declared by the supported
+        # GetSuppression2 state; the retired unsupported-declared note is gone and
+        # the state-based mass note reports an unmeasured lightweight occurrence.
+        self.assertNotIn("unsupported_declared", source)
+        self.assertIn("lightweight_state_", source)
 
     def test_document_state_reports_unsupported_lightweight_without_probing(self):
         doc = types.SimpleNamespace(

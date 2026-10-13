@@ -29,7 +29,14 @@ def rotation_z(angle: float):
 
 def component(name: str, transform=None) -> dict:
     matrix = transform or IDENTITY
-    return {"name2": name, "document": f"{name}.SLDPRT", "transform": [value for row in matrix for value in row]}
+    return {
+        "name2": name,
+        "document": f"{name}.SLDPRT",
+        "transform": [value for row in matrix for value in row],
+        "suppressed": False,
+        "lightweight": False,
+        "suppression_state": 2,
+    }
 
 
 def localized(kind: str, *, frame: str = "component-local", **geometry) -> dict:

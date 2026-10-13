@@ -13,6 +13,17 @@ One operator workflow: **SolidWorks folder → Airflow → verified URDF → rev
 SolidWorks defines geometry, assembly relationships, motion and datums. Versioned
 component records in the platform's controlled library supply physical and drive
 specifications. CAD references identify their approved versions.
+
+When the main assembly carries the saved native URDF exporter declaration,
+discovery ingests it as explicit declared evidence: link membership by persistent
+component IDs, and joint names, types, origins, axes and named frames. Authored
+limits are preserved verbatim; zero or degenerate values are kept for capture and
+generation, flagged as stage warnings, and never qualify motion. Stored meshes,
+inertias and non-customized joint origins are derived content and are regenerated
+from native CAD, never adopted. Independent verification re-decodes the sealed
+payload. Mates that restrict declared motion in the saved pose remain diagnostics;
+invalid declarations, unresolved references and inconsistent native geometry fail.
+
 Each fact has one effective definition and a recorded source; conflicting or
 ambiguous definitions stop derivation. Mechanical engineers maintain these inputs;
 the pipeline generates definitions, models, meshes and reports within the
@@ -38,8 +49,8 @@ Generated-input inspection is the input check of `capture`.
 | # | Stage | Input | Input QC | Output | Output QC |
 |---|---|---|---|---|---|
 | 1 | `freeze` — Freeze inputs | Saved SolidWorks folder | Admitted path, regular files and native package | Frozen handoff, file inventory and digest | Exact file inventory and handoff digest |
-| 2 | `discover` — Discover structure | Frozen handoff and versioned component records | Unchanged handoff and controlled discovery settings | Native observations and findings; Derived definition and structural revision | Unambiguous identity, bodies, motion, names and references; Native evidence, original files, revision and routing agree |
-| 3 | `capture` — Capture evidence | Prepared definition, saved CAD and native runtime | Derived definition, structural revision and archive integrity; Native Windows, COM and SolidWorks prerequisites | Collected CAD, raw measurements, native meshes and manifest | Complete snapshot with capture and saved-state guards; Original handoff unchanged after capture |
+| 2 | `discover` — Discover structure | Frozen handoff and explicitly referenced component records | Unchanged handoff and controlled discovery settings | Native observations and findings; Derived definition; structural revision when metadata is complete | Resolvable model definition with explicit inspection warnings; Native evidence and original files agree; publication readiness recorded |
+| 3 | `capture` — Capture evidence | Prepared definition, saved CAD and native runtime | Derived definition, native provenance and archive integrity; Native Windows, COM and SolidWorks prerequisites | Collected CAD, raw measurements, native meshes and manifest | Complete snapshot with capture and saved-state guards; Original handoff unchanged after capture |
 | 4 | `generate` — Generate URDF | Frozen native evidence | Snapshot integrity before consumption | Canonical model; URDF and local meshes; Tool identity and file subject | Valid canonical schema and complete hashed delivery |
 | 5 | `verify` — Independent verification | Original evidence and actual generated files | Generated file subject unchanged | Deterministic per-object quality report | All required native, physical, frame, geometry and consumer checks; Saved report equals independent recomputation |
 | 6 | `publish` — Publish review PR | Verified delivery and configured model repository | Reverified delivery, clean repository and deterministic review branch | Candidate commit and PR receipt | Copied, staged and committed bytes match the verified subject; Remote commit, PR head/base and subject agree |
@@ -47,12 +58,26 @@ Generated-input inspection is the input check of `capture`.
 
 Each boundary records its actual check result before the next step consumes its
 output. Missing checks remain `not_run`; a failure blocks downstream work.
+Live activity is separate from these checks: the worker records its current
+operation, object and known item counts with timestamps and a bounded history.
+The operator page displays these observations without inferring progress from
+polling, inventing a completion percentage or changing qualification results.
 Each receipt declares its `execution_scope`: Windows covers freeze, discover and
-capture; Linux covers generate, verify and publish. The complete Airflow run
+capture, including reading and sealing the raw native record and the saved
+exporter declaration; it runs no structure derivation, URDF generation, MuJoCo
+verification or Git operations. Linux derives the prepared definition and covers
+generate, verify and publish, including an independent re-decode of the sealed
+declaration. The complete Airflow run
 combines both receipts, while maintenance commands cover only the stages they execute
 ([operations](operations.md#6-independent-review-and-recovery)); unexecuted
 native stages are reported as out of scope, never as qualified.
-[Quality](quality.md) defines the independent gates and tolerances.
+[Quality](quality.md) defines the independent gates and tolerances. Exact selected-set accounting — native-selected plus independently measured unassigned mass closing to the whole within 1e-12 kg — is distinct from full-assembly coverage qualification: the authoritative declared model governs coverage and may leave an explicit unassigned occurrence warning.
+Link mass properties follow the native one-shot direct read over each body's
+full selected component set (the selection the independent verifier recomputes
+and requires verbatim); the model binds to that record by the exact
+assembly→link transform, the per-instance recombination remains a recorded
+audit, and the assembly closure compares the sum of the direct link reads with
+the whole-assembly reading.
 [The mechanical specification](mechanical-handoff-spec.md#111-自动检查与工程师确认)
 defines the remaining external engineering facts. Passed automatic checks are
 accepted without repeated manual review. After verification, the page shows only
@@ -85,18 +110,43 @@ execution. Transport retries reconnect to the same UUID and frozen inputs. A
 terminal native failure or source correction requires a new run. Frozen evidence
 can be rebuilt on Linux without reopening CAD.
 
-Airflow sends freeze, discovery and capture to the serialized Windows worker,
-then runs generation, independent verification and publication on Linux.
-Windows returns a sealed capture bundle; Linux checks its complete inventory,
-file hashes, selected assembly, run identity and native tool identity before use.
-Native completion is an intermediate state, not a verified model.
+Airflow stages the complete uploaded folder to the serialized Windows worker,
+which resolves the main assembly's references inside that staging, reads the raw
+native record and later captures the sealed engineering. Linux
+admits the record against the sealed selection, derives the prepared definition
+from the frozen selected bytes alone and returns only the generated text
+definition; no CAD is re-transferred. Windows then returns a sealed capture
+bundle, including the saved exporter declaration payload and its PID resolution
+rows when present; Linux checks its complete inventory, file hashes, selected
+assembly, run identity and native tool identity before use. Native completion is
+an intermediate state, not a verified model: an extracted declaration is
+evidence to reconcile, extraction warnings (uncovered occurrences, unusable
+ranges or drives) stay visible. Saved-pose mate restrictions do not override the
+declared kinematics. Administrative metadata (hardware ID, revision, owner,
+control record) is a publication-readiness requirement: when it is absent,
+measurement and inspection continue, the raw record keeps the absence, and no
+value and no neutral technical name is promoted to authored identity.
+
+The whole uploaded native folder is staged provisionally, then the native
+engine itself resolves the main assembly's references; the pipeline seals the
+dependency closure only when every engine-reported binding lies inside the
+staged root and matches the uploaded index — or is an engine-materialized import
+admitted only through the sealed closure's owner/occurrence evidence matched to
+its staged source by native identity, never by temporary path or file name. A
+missing or outside-stage reference fails the run after resolution, before
+capture. This is a closure-admission rule over reported bindings, not an
+operating-system sandbox and not a pre-geometry read gate.
 
 Both hosts use the same tool source release and record their own runtime
 requirements. Windows checks SolidWorks and COM readiness. Linux checks MuJoCo
 and loads the actual generated URDF in isolation. Git credentials and model
 checkouts stay on Linux. Each stage's results, checks and execution host appear
 in the operator view; the final receipt binds both hosts' evidence. The Linux
-store supplies model previews, downloads and publication results.
+store supplies model previews, downloads and publication results. Previews are
+explicit about status: a verified delivery is served as verified, while a
+retained failed-verification checkpoint is served only as an explicitly
+unverified diagnostic preview that never asserts verification and never
+authorizes publication.
 
 When a folder contains more than one saved `.SLDASM`, the page always lists their
 relative paths and requires the operator to choose the main assembly before the run

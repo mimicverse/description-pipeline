@@ -113,6 +113,7 @@ pipeline_ok = (
     bool(pipeline["repositories"])
     and extra.get("repositories") == pipeline["repositories"]
     and extra.get("store_root") == pipeline["store_root"]
+    and extra.get("discovery") == pipeline.get("discovery", {})
     and Path(pipeline["store_root"]).is_dir()
 )
 raise SystemExit(0 if host_ok and token_ok and roots_ok and pipeline_ok else 1)

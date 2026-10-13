@@ -40,12 +40,12 @@
     },
     {
       "id": "discover",
-      "host": "native",
+      "host": "native+portable",
       "name": "Discover structure",
       "name_zh": "解析结构",
       "inputs": [
         {
-          "label": "Frozen handoff and versioned component records",
+          "label": "Frozen handoff and explicitly referenced component records",
           "path": "handoff/",
           "class": "frozen"
         }
@@ -63,7 +63,7 @@
           "class": "frozen"
         },
         {
-          "label": "Derived definition and structural revision",
+          "label": "Derived definition; structural revision when metadata is complete",
           "path": "input/robot.yaml + input/cad-revision.json",
           "class": "derived"
         }
@@ -71,11 +71,11 @@
       "output_qc": [
         {
           "id": "discovery.definition",
-          "label": "Unambiguous identity, bodies, motion, names and references"
+          "label": "Resolvable model definition with explicit inspection warnings"
         },
         {
           "id": "discovery.binding",
-          "label": "Native evidence, original files, revision and routing agree"
+          "label": "Native evidence and original files agree; publication readiness recorded"
         }
       ],
       "evidence": [
@@ -99,7 +99,7 @@
       "input_qc": [
         {
           "id": "input.valid",
-          "label": "Derived definition, structural revision and archive integrity"
+          "label": "Derived definition, native provenance and archive integrity"
         },
         {
           "id": "runtime.ready",

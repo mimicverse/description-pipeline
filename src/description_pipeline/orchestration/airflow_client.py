@@ -2,18 +2,18 @@
 
 The endpoint contract is fixed and carries no shell or local paths:
 
-* ``POST /v1/handoffs/resolve`` with ``{handoff_path}`` resolves one operator-supplied folder to
-  the managed package and its complete-package digest; an absolute POSIX path is archived locally
-  and sent to ``POST /v1/handoffs/import`` (``application/zip``) only when it is link-free and
-  inside the platform ``handoff_roots`` allowlist from the Airflow connection;
-* ``POST /v1/jobs`` with ``{run_id, package, handoff_sha256}`` starts one run (idempotent per
-  run_id; a different payload for the same run_id is HTTP 409); an optional ``main_assembly``
-  names the delivered assembly explicitly. Hardware, revision and repository routing resolve
-  inside the serialized Windows job after CAD discovery;
-* ``GET /v1/jobs/<uuid>`` returns status/events/result/error and, for native runs, the routing the
-  job resolved after discovery;
-* ``GET /v1/jobs/<uuid>/preview`` and ``GET /v1/jobs/<uuid>/artifacts/<name>`` expose the verified
-  delivery for the operator portal;
+* ``POST /v1/jobs`` with ``{run_id, upload_files, upload_sha256, main_assembly}`` starts one
+  staging job (idempotent per run_id; a different payload for the same run_id is HTTP 409);
+  an optional ``resume={parent_run, from_stage}`` inherits a parent's sealed dependency closure
+  for a linked native rerun;
+* ``POST /v1/jobs/<uuid>/files`` admits the one full indexed-folder archive (``application/zip``);
+  the endpoint stages it provisionally, then resolves, verifies and seals the native dependency
+  closure server-side;
+* ``GET /v1/jobs/<uuid>`` returns status/events/result/error plus the selection block and, once
+  sealed, the manifest; ``awaiting_definition`` exposes the raw-record artifact, and
+  ``POST /v1/jobs/<uuid>/definition`` submits the sealed capture request carrying
+  ``X-Prepared-SHA256``; ``POST /v1/jobs/<uuid>/abort`` reports one local derivation failure;
+* ``GET /v1/jobs/<uuid>/artifacts/<name>`` streams one bound raw-record or native capture artifact;
 * ``GET /health`` exposes only ``pipeline_id`` and readiness.
 
 Plaintext HTTP is allowed only for loopback hosts; anything remote requires TLS.
@@ -40,9 +40,10 @@ from urllib import parse as urlparse
 from urllib import request as urlrequest
 
 from ..delivery import PIPELINE_ID
-from ..io import PipelineError, artifact_path_parts
-from ..sources.solidworks.handoff import HANDOFF_SCHEMA
+from ..io import PipelineError, artifact_path_parts, digest
+from ..sources.solidworks.selection import validate_file_index
 from ..stages import STAGE_IDS
+from .selection_client import prepare_staging_archive
 from .stage_transfer import CAPTURE_ARCHIVE, MAX_TRANSFER_BYTES
 
 JOB_SCHEMA = "solidworks-to-urdf.job/v1"
@@ -50,7 +51,13 @@ NATIVE_RUN_NAMESPACE = "solidworks_to_urdf"
 EVENT_KEYS = ("stage", "state", "at")
 #: ``native_complete`` means the Windows half finished and the sealed capture archive
 #: is ready for the Linux generate/verify/publish half; it is never final success.
-RUN_STATES = {"queued", "running", "native_complete", "passed", "failed"}
+#: ``awaiting_definition`` is the nonterminal hand-off where the native raw record
+#: is available and the generated definition ZIP is still to be submitted.
+RUN_STATES = {"queued", "selecting", "running", "awaiting_definition", "native_complete", "passed", "failed"}
+#: Staging transport states of a ``selecting`` job (frozen contract).
+SELECTION_STATES = ("awaiting_files", "reading", "sealed")
+#: The fixed artifact name of the native raw-record bundle (mirrors discovery_transfer).
+NATIVE_RECORD_ARCHIVE = "raw-record.zip"
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _PULL_URL = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/pull/[1-9]\d*\Z")
@@ -59,6 +66,45 @@ _HARDWARE_ID = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
 SUBMISSION_STATES = {"published", "updated", "noop"}
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _validate_activity_block(activity, label: str) -> None:
+    if activity is None:
+        return
+    if not isinstance(activity, dict):
+        raise EndpointProtocolError(f"job {label} must be an object when present")
+    if activity.get("phase") not in STAGE_IDS or not isinstance(activity.get("action"), str):
+        raise EndpointProtocolError(f"job {label} must carry a stage phase and an action")
+    for field in ("at", "started_at", "updated_at"):
+        if not isinstance(activity.get(field), str):
+            raise EndpointProtocolError(f"job {label} must carry {field}")
+    completed, total = activity.get("completed"), activity.get("total")
+    if (completed is not None or total is not None) and (
+        type(completed) is not int or type(total) is not int or completed < 0 or total < completed
+    ):
+        raise EndpointProtocolError(f"job {label} counts must be a non-negative completed/total pair")
+
+
+def _validate_activity(job: dict) -> None:
+    """The optional live-activity blocks must be shape-correct when present.
+
+    Activity is observation, so the blocks are optional; when an endpoint sends
+    them, the portal must be able to trust their shape before rendering.
+    """
+
+    _validate_activity_block(job.get("activity"), "activity")
+    _validate_activity_block(job.get("activity_final"), "activity_final")
+    history = job.get("activity_history")
+    if history is not None and not isinstance(history, list):
+        raise EndpointProtocolError("job activity_history must be a list when present")
+    if isinstance(history, list):
+        for entry in history:
+            if (
+                not isinstance(entry, dict)
+                or not isinstance(entry.get("at"), str)
+                or not isinstance(entry.get("code"), str)
+            ):
+                raise EndpointProtocolError("activity history entries must carry at and code")
 
 
 class EndpointError(RuntimeError):
@@ -92,6 +138,41 @@ class JobFailed(EndpointError):
 
 class ResultNotPublishable(EndpointError):
     """A passed job whose result is missing quality or PR evidence."""
+
+
+def _error_payload(error: urlerror.HTTPError) -> dict:
+    """The server's structured refusal body, when the endpoint provides one."""
+    try:
+        raw = error.read(64 * 1024)
+    except OSError:
+        return {}
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _http_refusal(error: urlerror.HTTPError, *, context: str | None = None) -> EndpointError:
+    """One request refusal that keeps the server's structured body for callers."""
+    payload = _error_payload(error)
+    if error.code in {401, 403}:
+        failure: EndpointError = EndpointAuthError(f"endpoint rejected the bearer token ({error.code})")
+    elif error.code == 404:
+        failure = EndpointNotFound(context or "endpoint has no record of the requested resource")
+    elif error.code == 409:
+        failure = EndpointConflict(f"request conflict ({error.code})")
+    else:
+        failure = EndpointError(f"endpoint returned HTTP {error.code}")
+    message = payload.get("error")
+    if isinstance(message, str) and message:
+        failure.args = (f"{failure.args[0]}: {message}",)
+    failure.status = error.code
+    failure.payload = payload
+    failure.code = payload.get("error_code") if isinstance(payload.get("error_code"), str) else None
+    for field in ("error_code", "reason", "reason_zh", "earliest_required", "active_run_id", "detail"):
+        setattr(failure, field, payload.get(field))
+    return failure
 
 
 def validate_run_id(value: str) -> str:
@@ -187,10 +268,6 @@ def validate_main_assembly(value: object) -> str:
     return value
 
 
-def validate_package(value: str) -> str:
-    return _validate_relative_path(value, "package")
-
-
 def validate_artifact_name(value: str) -> str:
     return _validate_relative_path(value, "artifact name")
 
@@ -199,10 +276,6 @@ def _validate_digest(value: str, field: str) -> str:
     if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
         raise EndpointProtocolError(f"{field} must be a lowercase SHA-256 digest")
     return value
-
-
-def validate_handoff_sha(value: str) -> str:
-    return _validate_digest(value, "handoff_sha256")
 
 
 def validate_sha256(value: str) -> str:
@@ -246,6 +319,8 @@ class EndpointConfig:
     #: Linux-side routing: model-repository slug to local checkout, and the attempt store.
     repositories: dict[str, Path] = dataclass_field(default_factory=dict)
     store_root: Path | None = None
+    #: Linux-side derivation controls: controlled-record roots and the frozen-name registry.
+    discovery: dict = dataclass_field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "base_url", _validate_base_url(self.base_url))
@@ -256,6 +331,7 @@ class EndpointConfig:
         object.__setattr__(self, "handoff_roots", _handoff_roots(self.handoff_roots))
         object.__setattr__(self, "repositories", _linux_repositories(self.repositories))
         object.__setattr__(self, "store_root", _linux_store_root(self.store_root))
+        object.__setattr__(self, "discovery", _linux_discovery(self.discovery))
 
 
 def _handoff_roots(values) -> tuple[Path, ...]:
@@ -300,6 +376,42 @@ def _linux_store_root(value) -> Path | None:
     return candidate
 
 
+def _discovery_path(value, label: str) -> Path:
+    if not isinstance(value, (str, Path)) or not str(value):
+        raise EndpointProtocolError(f"discovery {label} must be an absolute path")
+    candidate = Path(str(value))
+    if not candidate.is_absolute():
+        raise EndpointProtocolError(f"discovery {label} must be an absolute path")
+    if candidate.is_symlink() or candidate.is_junction():
+        raise EndpointProtocolError(f"discovery {label} must not be a link")
+    return candidate
+
+
+def _linux_discovery(values) -> dict:
+    """Validate the Linux derivation settings: controlled-record roots and the registry."""
+    if values in (None, "", {}):
+        return {}
+    if not isinstance(values, dict) or not set(values) <= {"record_roots", "frozen_names_file"}:
+        raise EndpointProtocolError("discovery must carry only record_roots and frozen_names_file")
+    settings: dict = {}
+    roots = values.get("record_roots", ())
+    if not isinstance(roots, (list, tuple)):
+        raise EndpointProtocolError("discovery record_roots must be a list of absolute directories")
+    checked = []
+    for value in roots:
+        candidate = _discovery_path(value, "record root")
+        if not candidate.is_dir():
+            raise EndpointProtocolError(f"discovery record root is not a directory: {candidate}")
+        checked.append(candidate)
+    settings["record_roots"] = tuple(checked)
+    if "frozen_names_file" in values:
+        registry = _discovery_path(values["frozen_names_file"], "frozen-name registry")
+        if not registry.is_file():
+            raise EndpointProtocolError(f"discovery frozen-name registry is not a file: {registry}")
+        settings["frozen_names_file"] = registry
+    return settings
+
+
 def config_from_airflow_connection(conn_id: str, *, timeout: float = 30.0) -> EndpointConfig:
     """Build the endpoint config from an Airflow connection (host/port/password/extra)."""
     from airflow.hooks.base import BaseHook
@@ -319,35 +431,185 @@ def config_from_airflow_connection(conn_id: str, *, timeout: float = 30.0) -> En
         handoff_roots=extra.get("handoff_roots") or (),
         repositories=extra.get("repositories") or {},
         store_root=extra.get("store_root"),
+        discovery=extra.get("discovery") or {},
     )
 
 
-@dataclass(frozen=True)
-class HandoffResolution:
-    """One operator path resolved to the mechanical handoff the endpoint will run.
+@dataclass(frozen=True, slots=True)
+class SelectionSnapshot:
+    """Validated selection block of one endpoint job snapshot."""
 
-    The resolution carries only the managed package and its handoff digest; hardware, revision and
-    repository routing are resolved inside the serialized Windows job after CAD discovery.
-    """
+    state: str
+    reader_sha256: str
+    upload_sha256: str
+    staged_files: dict[str, str]
+    manifest: dict | None = None
 
-    package: str
-    handoff_sha256: str
 
-    @classmethod
-    def from_payload(cls, payload: dict) -> HandoffResolution:
-        if not isinstance(payload, dict):
-            raise EndpointProtocolError("handoff resolution is not a JSON object")
-        expected = {"schema_version", "pipeline_id", "package", "handoff_sha256"}
-        if set(payload) != expected:
-            raise EndpointProtocolError(f"handoff resolution must carry exactly {sorted(expected)}")
-        if payload.get("schema_version") != HANDOFF_SCHEMA:
-            raise EndpointProtocolError(f"unexpected handoff schema: {payload.get('schema_version')!r}")
-        if payload.get("pipeline_id") != PIPELINE_ID:
-            raise EndpointProtocolError(f"unexpected pipeline_id: {payload.get('pipeline_id')!r}")
-        return cls(
-            package=validate_package(payload.get("package")),
-            handoff_sha256=validate_handoff_sha(payload.get("handoff_sha256")),
-        )
+def _selection_files(value: object, label: str) -> dict[str, str]:
+    if not isinstance(value, dict) or any(not isinstance(name, str) for name in value):
+        raise EndpointProtocolError(f"selection {label} must be a path->sha256 object")
+    files: dict[str, str] = {}
+    for name, checksum in value.items():
+        try:
+            parts = artifact_path_parts(name)
+        except PipelineError as error:
+            raise EndpointProtocolError(f"selection {label} has an inadmissible path: {name!r}") from error
+        if "/".join(parts) != name:
+            raise EndpointProtocolError(f"selection {label} has a noncanonical path: {name!r}")
+        if not isinstance(checksum, str) or _SHA256.fullmatch(checksum) is None:
+            raise EndpointProtocolError(f"selection {label} entry {name!r} has no lowercase sha256")
+        files[name] = checksum
+    return files
+
+
+def _selection_block(
+    job: dict, *, upload_files: dict[str, str] | None = None, initial: bool = False
+) -> SelectionSnapshot:
+    """Parse and validate one job's staging block against the frozen contract."""
+
+    tool = job.get("native_tool")
+    if not isinstance(tool, dict):
+        raise EndpointProtocolError("selection job carries no native tool record")
+    reader = validate_sha256(tool.get("source_sha256"))
+    block = job.get("selection")
+    if not isinstance(block, dict):
+        raise EndpointProtocolError("staging job carries no selection block")
+    state = block.get("state")
+    if state not in SELECTION_STATES:
+        raise EndpointProtocolError(f"unexpected staging state: {state!r}")
+    expected_keys = {"state", "reader_sha256", "upload_sha256", "staged_files"}
+    if "manifest" in block:
+        expected_keys.add("manifest")
+    if set(block) != expected_keys:
+        raise EndpointProtocolError("the staging block carries unexpected fields")
+    if validate_sha256(block.get("reader_sha256")) != reader:
+        raise EndpointProtocolError("staging reader identity differs from the native tool record")
+    upload_sha256 = validate_sha256(block.get("upload_sha256"))
+    staged = _selection_files(block.get("staged_files"), "staged_files")
+    manifest = block.get("manifest")
+    if manifest is not None and (not isinstance(manifest, dict) or not manifest):
+        raise EndpointProtocolError("selection manifest must be a non-empty object")
+    if state == "sealed" and manifest is None:
+        raise EndpointProtocolError("a sealed selection must carry its manifest")
+    if upload_files is not None:
+        if upload_sha256 != digest(upload_files):
+            raise EndpointProtocolError("staging upload digest differs from the upload index")
+        for name, checksum in staged.items():
+            if upload_files.get(name) != checksum:
+                raise EndpointProtocolError(f"staging names a file outside the upload index: {name!r}")
+        if state == "sealed" and staged != dict(upload_files):
+            raise EndpointProtocolError("a sealed staging must hold the full upload index")
+    if state == "awaiting_files" and (staged or manifest is not None):
+        raise EndpointProtocolError("an awaiting staging carries no staged bytes")
+    if initial and (state != "awaiting_files" or staged or manifest is not None):
+        raise EndpointProtocolError("staging must start from an empty awaiting stage")
+    return SelectionSnapshot(
+        state=state,
+        reader_sha256=reader,
+        upload_sha256=upload_sha256,
+        staged_files=staged,
+        manifest=manifest,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class AwaitingDefinition:
+    """Validated ``awaiting_definition`` snapshot: raw-record receipt and sealed selection."""
+
+    record_name: str
+    record_sha256: str
+    record_size: int
+    record_manifest: dict
+    native_tool: dict
+    selection: SelectionSnapshot
+
+
+def _native_record_block(record: object) -> dict:
+    """The flat raw-record artifact receipt the frozen transport contract declares."""
+
+    expected = {"name", "sha256", "size", "manifest_sha256", "manifest"}
+    if not isinstance(record, dict) or set(record) != expected:
+        raise EndpointProtocolError("native_record must carry exactly name, sha256, size, manifest_sha256 and manifest")
+    name = validate_artifact_name(record.get("name"))
+    if name != NATIVE_RECORD_ARCHIVE:
+        raise EndpointProtocolError("native_record name differs from the transport contract")
+    checksum = validate_sha256(record.get("sha256"))
+    manifest_sha256 = validate_sha256(record.get("manifest_sha256"))
+    size = record.get("size")
+    if type(size) is not int or size <= 0 or size > MAX_TRANSFER_BYTES:
+        raise EndpointProtocolError("native_record size must be a positive integer within the transfer bound")
+    manifest = record.get("manifest")
+    if not isinstance(manifest, dict) or not manifest:
+        raise EndpointProtocolError("native_record carries no bundle manifest")
+    if digest(manifest) != manifest_sha256:
+        raise EndpointProtocolError("native_record manifest does not match its recorded digest")
+    return {
+        "name": name,
+        "sha256": checksum,
+        "size": size,
+        "manifest_sha256": manifest_sha256,
+        "manifest": manifest,
+    }
+
+
+def _record_block(record: AwaitingDefinition | dict) -> dict:
+    """The validated flat raw-record receipt, from either carrier form."""
+
+    if isinstance(record, AwaitingDefinition):
+        record = {
+            "name": record.record_name,
+            "sha256": record.record_sha256,
+            "size": record.record_size,
+            "manifest_sha256": digest(record.record_manifest),
+            "manifest": record.record_manifest,
+        }
+    return _native_record_block(record)
+
+
+def _validate_failure_diagnostics(job: dict) -> dict | None:
+    """The hash-bound raw failure-diagnostics receipt of one job, or None when absent."""
+
+    value = job.get("failure_diagnostics")
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"path", "sha256"} or value.get("path") != "diagnostic.json":
+        raise EndpointProtocolError("failure_diagnostics must name diagnostic.json with its sha256")
+    return {"path": "diagnostic.json", "sha256": validate_sha256(value.get("sha256"))}
+
+
+def _sealed_diagnostic_member(relative: object) -> str | None:
+    """One allowlisted sealed member name, or None when it is unsafe or unknown."""
+
+    from ..structural_report import is_sealed_diagnostic_member
+
+    if not isinstance(relative, str) or not relative or "\\" in relative or relative.startswith("/"):
+        return None
+    if any(part in {"", ".", ".."} for part in relative.split("/")):
+        return None
+    return relative if is_sealed_diagnostic_member(relative) else None
+
+
+def _awaiting_definition(job: dict, *, upload_files: dict[str, str] | None = None) -> AwaitingDefinition:
+    """Parse and validate one job's definition hand-off against the frozen contract."""
+
+    if not isinstance(job, dict) or job.get("status") != "awaiting_definition":
+        raise EndpointProtocolError("the job does not await a definition")
+    record = _native_record_block(job.get("native_record"))
+    tool = job.get("native_tool")
+    if not isinstance(tool, dict) or not tool:
+        raise EndpointProtocolError("definition job carries no native tool record")
+    selection = _selection_block(job, upload_files=upload_files)
+    if selection.state != "sealed" or selection.manifest is None:
+        raise EndpointProtocolError("the definition job carries no sealed selection manifest")
+    return AwaitingDefinition(
+        record_name=record["name"],
+        record_sha256=record["sha256"],
+        record_size=record["size"],
+        record_manifest=record["manifest"],
+        native_tool=tool,
+        selection=selection,
+    )
 
 
 class WindowsEndpoint:
@@ -371,13 +633,7 @@ class WindowsEndpoint:
             with self._opener(request, timeout=self.config.timeout) as response:
                 data = json.loads(response.read().decode("utf-8") or "{}")
         except urlerror.HTTPError as error:
-            if error.code in {401, 403}:
-                raise EndpointAuthError(f"endpoint rejected the bearer token ({error.code})") from error
-            if error.code == 404:
-                raise EndpointNotFound("endpoint has no record of the requested resource") from error
-            if error.code == 409:
-                raise EndpointConflict(f"run_id already bound to a different request ({error.code})") from error
-            raise EndpointError(f"endpoint returned HTTP {error.code}") from error
+            raise _http_refusal(error) from error
         except urlerror.URLError as error:
             raise EndpointError(f"endpoint unreachable: {error.reason}") from error
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -401,7 +657,9 @@ class WindowsEndpoint:
             )
         )
 
-    def _request_stream(self, method: str, path: str, source: Any, *, size: int) -> dict:
+    def _request_stream(
+        self, method: str, path: str, source: Any, *, size: int, headers: dict[str, str] | None = None
+    ) -> dict:
         """Stream one file body with a fixed Content-Length (no chunked upload)."""
         return self._exchange(
             urlrequest.Request(
@@ -413,6 +671,7 @@ class WindowsEndpoint:
                     "Content-Type": "application/zip",
                     "Accept": "application/json",
                     "Content-Length": str(size),
+                    **(headers or {}),
                 },
             )
         )
@@ -430,32 +689,6 @@ class WindowsEndpoint:
         except (ImportError, PipelineError, TypeError, ValueError, OSError) as error:
             raise EndpointProtocolError(str(error)) from error
 
-    def resolve_handoff(self, handoff_path: str) -> HandoffResolution:
-        """Resolve one operator path; an authorized absolute POSIX folder is ZIP-imported first."""
-        path = validate_handoff_path(handoff_path)
-        if os.name == "posix" and PurePosixPath(path).is_absolute():
-            return self._import_handoff(self._authorized_handoff_dir(path))
-        return HandoffResolution.from_payload(self._request("POST", "/v1/handoffs/resolve", {"handoff_path": path}))
-
-    def _import_handoff(self, source: Path) -> HandoffResolution:
-        from ..sources.solidworks.handoff import prepare_archive
-
-        if not source.is_dir():
-            raise EndpointProtocolError(f"handoff_path is not a directory: {source}")
-        with tempfile.TemporaryDirectory(prefix="handoff-import-") as tmp:
-            archive = Path(tmp) / "handoff.zip"
-            identity = prepare_archive(source, archive)
-            size = archive.stat().st_size
-            if size <= 0:
-                raise EndpointProtocolError("handoff archive is empty")
-            with archive.open("rb") as handle:
-                payload = self._request_stream("POST", "/v1/handoffs/import", handle, size=size)
-        resolved = HandoffResolution.from_payload(payload)
-        expected = str((identity or {}).get("handoff_sha256") or "")
-        if resolved.handoff_sha256 != expected:
-            raise EndpointProtocolError("endpoint stored a different handoff digest than the uploaded archive")
-        return resolved
-
     def health(self) -> dict:
         payload = self._request("GET", "/health")
         if payload.get("pipeline_id") != PIPELINE_ID:
@@ -464,39 +697,289 @@ class WindowsEndpoint:
             raise EndpointProtocolError("health response must include readiness")
         return payload
 
-    def start_job(
+    def authorized_intake_dir(self, handoff_path: str) -> Path:
+        """The local sealed intake folder for one operator path, inside ``handoff_roots``."""
+
+        return self._authorized_handoff_dir(validate_handoff_path(handoff_path))
+
+    def start_staging_job(
         self,
         *,
         run_id: str,
-        resolution: HandoffResolution,
+        upload_files: dict[str, str],
+        main_assembly: str,
         resume: dict | None = None,
-        main_assembly: str | None = None,
     ) -> dict:
-        """Start one native run with exactly the resolved package and its handoff digest.
+        """Start one staging job: a fresh full-folder stage, or a linked rerun inheriting a sealed parent."""
 
-        ``resume`` links the new job to a terminal parent (``parent_run`` native UUID and the
-        canonical ``from_stage``); the endpoint revalidates the parent, its checkpoints and
-        the retained upload before accepting it.  ``main_assembly`` names the delivered
-        assembly explicitly; the endpoint verifies it against the frozen handoff.
-        """
-        if not isinstance(resolution, HandoffResolution):
-            raise EndpointProtocolError("start_job requires a resolved handoff")
+        validated = validate_file_index(upload_files)
+        main = validate_main_assembly(main_assembly)
+        if main not in validated:
+            raise EndpointProtocolError("the main assembly is not part of the upload index")
         payload = {
             "run_id": validate_run_id(run_id),
-            "package": resolution.package,
-            "handoff_sha256": resolution.handoff_sha256,
+            "upload_files": dict(validated),
+            "upload_sha256": digest(validated),
+            "main_assembly": main,
         }
         if resume is not None:
             payload["resume"] = validate_resume(resume, run_id=payload["run_id"])
-        if main_assembly is not None:
-            payload["main_assembly"] = validate_main_assembly(main_assembly)
         response = self._request("POST", "/v1/jobs", payload)
-        if response.get("run_id") != payload["run_id"]:
-            raise EndpointProtocolError("endpoint returned a different run_id")
+        if response.get("run_id") != payload["run_id"] or response.get("request") != payload:
+            raise EndpointProtocolError("endpoint accepted a different staging request")
         if response.get("status") not in RUN_STATES:
             raise EndpointProtocolError(f"unexpected job status: {response.get('status')!r}")
-        if response.get("request") != payload:
-            raise EndpointProtocolError("Endpoint accepted a different mechanical handoff")
+        snapshot = _selection_block(response, upload_files=validated, initial=resume is None)
+        if resume is None:
+            return response
+        if snapshot.state != "sealed" or snapshot.manifest is None:
+            raise EndpointProtocolError("a linked rerun must inherit the parent's sealed closure")
+        if snapshot.manifest.get("main_assembly") != main:
+            raise EndpointProtocolError("the inherited closure is bound to a different main assembly")
+        sealed_files = snapshot.manifest.get("files")
+        if not isinstance(sealed_files, dict) or not sealed_files:
+            raise EndpointProtocolError("the inherited closure carries no resolved files")
+        for name, checksum in sealed_files.items():
+            if validated.get(name) != checksum:
+                raise EndpointProtocolError(f"the inherited closure names a file outside the upload index: {name!r}")
+        return response
+
+    def staging_snapshot(self, run_id: str, *, upload_files: dict[str, str] | None = None) -> SelectionSnapshot:
+        """Fetch and validate the staging block; never trusts a partial contract."""
+
+        job = self.get_job(run_id)
+        validated = None if upload_files is None else validate_file_index(upload_files)
+        return _selection_block(job, upload_files=validated)
+
+    def stage_folder_archive(self, run_id: str, archive: Path, *, upload_files: dict[str, str]) -> dict:
+        """Push the one exact full-index folder archive; the endpoint stages it before resolving."""
+
+        validated = validate_file_index(upload_files)
+        archive = Path(archive)
+        size = archive.stat().st_size
+        if not 0 < size <= MAX_TRANSFER_BYTES:
+            raise EndpointProtocolError("staging archive has an invalid size")
+        with archive.open("rb") as handle:
+            response = self._request_stream(
+                "POST",
+                f"/v1/jobs/{validate_run_id(run_id)}/files",
+                handle,
+                size=size,
+            )
+        snapshot = _selection_block(response, upload_files=validated)
+        if snapshot.staged_files != validated:
+            raise EndpointProtocolError("endpoint did not stage the full indexed folder")
+        return response
+
+    def definition_snapshot(self, run_id: str, *, upload_files: dict[str, str] | None = None) -> AwaitingDefinition:
+        """Fetch and validate the definition hand-off; never trusts a partial contract."""
+
+        job = self.get_job(run_id)
+        validated = None if upload_files is None else validate_file_index(upload_files)
+        return _awaiting_definition(job, upload_files=validated)
+
+    def stream_native_record(
+        self, run_id: str, record: AwaitingDefinition | dict, destination: Path, *, limit: int = MAX_TRANSFER_BYTES
+    ) -> Path:
+        """Stream the raw-record artifact to disk, requiring its exact size and digest."""
+
+        metadata = _record_block(record)
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+            raise EndpointProtocolError("record size limit must be a positive integer")
+        if metadata["size"] > limit:
+            raise EndpointProtocolError("native record exceeds the configured size limit")
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        hasher = hashlib.sha256()
+        total = 0
+        with (
+            self.open_artifact(run_id, metadata["name"]) as response,
+            tempfile.NamedTemporaryFile(prefix=".native-record-", dir=destination.parent, delete=False) as handle,
+        ):
+            temporary = Path(handle.name)
+            try:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > limit:
+                        raise EndpointProtocolError("native record exceeds the configured size limit")
+                    hasher.update(chunk)
+                    handle.write(chunk)
+            except BaseException:
+                with suppress(OSError):
+                    temporary.unlink()
+                raise
+        if total != metadata["size"] or hasher.hexdigest() != metadata["sha256"]:
+            with suppress(OSError):
+                temporary.unlink()
+            raise EndpointProtocolError("native record does not match its recorded size or digest")
+        os.replace(temporary, destination)
+        return destination
+
+    def post_definition_archive(self, run_id: str, archive: Path, *, prepared_sha256: str) -> dict:
+        """Submit the sealed capture request; the endpoint rebuilds the prepared package."""
+
+        prepared = validate_sha256(prepared_sha256)
+        archive = Path(archive)
+        size = archive.stat().st_size
+        if not 0 < size <= MAX_TRANSFER_BYTES:
+            raise EndpointProtocolError("definition archive has an invalid size")
+        with archive.open("rb") as handle:
+            response = self._request_stream(
+                "POST",
+                f"/v1/jobs/{validate_run_id(run_id)}/definition",
+                handle,
+                size=size,
+                headers={"X-Prepared-SHA256": prepared},
+            )
+        if not isinstance(response, dict):
+            raise EndpointProtocolError("definition acknowledgement must be a job object")
+        if response.get("run_id", run_id) != run_id:
+            raise EndpointProtocolError("endpoint acknowledged a different definition run")
+        if "status" in response and response["status"] not in RUN_STATES:
+            raise EndpointProtocolError(f"unexpected job status: {response.get('status')!r}")
+        return response
+
+    def download_failure_diagnostics(
+        self, run_id: str, job: dict, destination: Path, *, limit: int = MAX_TRANSFER_BYTES
+    ) -> dict:
+        """Stream the hash-bound raw failure diagnostics of one failed job.
+
+        The bundle carries the exact sealed receipt and supporting evidence files
+        the Linux side renders the structural-team report from; the native host
+        never writes the report itself.  ``limit`` bounds the whole bundle,
+        manifest included.
+        """
+
+        from ..structural_report import DIAGNOSTIC_SCHEMA
+
+        receipt = _validate_failure_diagnostics(job)
+        if receipt is None:
+            raise EndpointNotFound("this run carries no failure diagnostics")
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+            raise EndpointProtocolError("diagnostics size limit must be a positive integer")
+        canonical = validate_run_id(run_id)
+        destination = Path(destination)
+        destination.mkdir(parents=True, exist_ok=True)
+        manifest_bytes = self._read_artifact(
+            canonical, receipt["path"], receipt["sha256"], limit=min(limit, 1 << 22)
+        )
+        try:
+            manifest = json.loads(manifest_bytes)
+        except ValueError as error:
+            raise EndpointProtocolError("failure diagnostics manifest is not JSON") from error
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("schema") != DIAGNOSTIC_SCHEMA
+            or manifest.get("run_id") != canonical
+        ):
+            raise EndpointProtocolError("failure diagnostics manifest is invalid")
+        receipt_entry = manifest.get("receipt")
+        if not isinstance(receipt_entry, dict) or receipt_entry.get("path") != "receipt.json":
+            raise EndpointProtocolError("failure diagnostics carry no receipt entry")
+        files = manifest.get("files")
+        if not isinstance(files, dict):
+            raise EndpointProtocolError("failure diagnostics carry no file list")
+        members: dict[str, str] = {"receipt.json": validate_sha256(receipt_entry.get("sha256"))}
+        for relative, checksum in files.items():
+            safe = _sealed_diagnostic_member(relative)
+            if safe is None:
+                raise EndpointProtocolError(f"failure diagnostics name an unsafe or unknown member: {relative!r}")
+            members[f"evidence/{safe}"] = validate_sha256(checksum)
+        budget = limit - len(manifest_bytes)
+        if budget < 0:
+            raise EndpointProtocolError("failure diagnostics exceed the configured size limit")
+        written: dict[str, str] = {}
+        for name, expected in members.items():
+            target = destination / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            self._download_artifact(canonical, name, target, expected, limit=budget)
+            size = target.stat().st_size
+            budget -= size
+            if budget < 0:
+                raise EndpointProtocolError("failure diagnostics exceed the configured size limit")
+            written[name] = str(target)
+        try:
+            sealed_receipt = json.loads((destination / "receipt.json").read_bytes())
+        except ValueError as error:
+            raise EndpointProtocolError("failure diagnostics receipt is not JSON") from error
+        if not isinstance(sealed_receipt, dict) or sealed_receipt.get("run_id") != canonical:
+            raise EndpointProtocolError("failure diagnostics receipt belongs to a different run")
+        (destination / "diagnostic.json").write_bytes(manifest_bytes)
+        written["diagnostic.json"] = str(destination / "diagnostic.json")
+        return written
+
+    def _read_artifact(self, run_id: str, name: str, expected_sha256: str, *, limit: int) -> bytes:
+        """Read one bounded artifact and require its recorded digest."""
+
+        hasher = hashlib.sha256()
+        total = 0
+        chunks: list[bytes] = []
+        with self.open_artifact(run_id, name) as response:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit:
+                    raise EndpointProtocolError(f"artifact {name!r} exceeds the configured size limit")
+                hasher.update(chunk)
+                chunks.append(chunk)
+        if hasher.hexdigest() != expected_sha256:
+            raise EndpointProtocolError(f"artifact {name!r} does not match its recorded digest")
+        return b"".join(chunks)
+
+    def _download_artifact(self, run_id: str, name: str, target: Path, expected_sha256: str, *, limit: int) -> None:
+        """Stream one bounded artifact to disk under its recorded digest."""
+
+        hasher = hashlib.sha256()
+        total = 0
+        with (
+            self.open_artifact(run_id, name) as response,
+            tempfile.NamedTemporaryFile(prefix=f".{target.name}-", dir=target.parent, delete=False) as handle,
+        ):
+            temporary = Path(handle.name)
+            try:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > limit:
+                        raise EndpointProtocolError(f"artifact {name!r} exceeds the configured size limit")
+                    hasher.update(chunk)
+                    handle.write(chunk)
+            except BaseException:
+                with suppress(OSError):
+                    temporary.unlink()
+                raise
+        if hasher.hexdigest() != expected_sha256:
+            with suppress(OSError):
+                temporary.unlink()
+            raise EndpointProtocolError(f"artifact {name!r} does not match its recorded digest")
+        os.replace(temporary, target)
+
+    def abort_job(self, run_id: str, *, error: str, error_code: str, detail: dict | None = None) -> dict:
+        """Abort one awaiting-definition job after a local derivation failure; never hangs the endpoint."""
+
+        for field, value in (("error", error), ("error_code", error_code)):
+            if not isinstance(value, str) or not value.strip():
+                raise EndpointProtocolError(f"abort {field} must be a non-empty string")
+        if detail is not None and not isinstance(detail, dict):
+            raise EndpointProtocolError("abort detail must be an object of diagnostic fields")
+        response = self._request(
+            "POST",
+            f"/v1/jobs/{validate_run_id(run_id)}/abort",
+            {"error": error, "error_code": error_code, "detail": dict(detail) if detail else {}},
+        )
+        if not isinstance(response, dict):
+            raise EndpointProtocolError("abort acknowledgement must be a job object")
+        if response.get("run_id", run_id) != run_id:
+            raise EndpointProtocolError("endpoint acknowledged a different abort run")
+        if "status" in response and response["status"] not in RUN_STATES:
+            raise EndpointProtocolError(f"unexpected job status: {response.get('status')!r}")
         return response
 
     def rerun_plan(self, run_id: str) -> dict:
@@ -553,30 +1036,8 @@ class WindowsEndpoint:
         for event in job["events"]:
             if not isinstance(event, dict) or any(key not in event for key in EVENT_KEYS):
                 raise EndpointProtocolError("Events must carry stage, state and timestamp")
+        _validate_activity(job)
         return job
-
-    def get_preview(self, run_id: str) -> dict:
-        """Preview metadata of one passed, bound delivery (operator portal entry point)."""
-        canonical = validate_run_id(run_id)
-        preview = self._request("GET", f"/v1/jobs/{canonical}/preview")
-        if preview.get("pipeline_id") != PIPELINE_ID:
-            raise EndpointProtocolError(f"unexpected pipeline_id: {preview.get('pipeline_id')!r}")
-        if preview.get("run_id") != canonical:
-            raise EndpointProtocolError("preview returned a different run_id")
-        subject = preview.get("subject_sha256")
-        if not isinstance(subject, str) or _SHA256.fullmatch(subject) is None:
-            raise EndpointProtocolError("preview must carry the subject_sha256 digest")
-        urdf = validate_artifact_name(preview.get("urdf"))
-        files = preview.get("files")
-        if not isinstance(files, dict) or not files:
-            raise EndpointProtocolError("preview must list the delivered files")
-        for name, digest in files.items():
-            validate_artifact_name(name)
-            if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
-                raise EndpointProtocolError("preview file digests must be lowercase SHA-256")
-        if urdf not in files:
-            raise EndpointProtocolError("preview urdf must be one of the delivered files")
-        return preview
 
     def open_artifact(self, run_id: str, name: str) -> Any:
         """Open one verified delivery artifact for streaming; the caller closes the response."""
@@ -591,11 +1052,7 @@ class WindowsEndpoint:
         try:
             return self._opener(request, timeout=self.config.timeout)
         except urlerror.HTTPError as error:
-            if error.code in {401, 403}:
-                raise EndpointAuthError(f"endpoint rejected the bearer token ({error.code})") from error
-            if error.code == 404:
-                raise EndpointNotFound(f"artifact {artifact!r} is not part of run {canonical}") from error
-            raise EndpointError(f"endpoint returned HTTP {error.code}") from error
+            raise _http_refusal(error, context=f"artifact {artifact!r} is not part of run {canonical}") from error
         except urlerror.URLError as error:
             raise EndpointError(f"endpoint unreachable: {error.reason}") from error
 
@@ -638,33 +1095,6 @@ class WindowsEndpoint:
         os.replace(temporary, destination)
         return destination
 
-    def read_artifact(self, run_id: str, name: str, *, sha256: str, limit: int = 64 * 1024 * 1024) -> bytes:
-        """Read one artifact into memory and require its exact digest before returning it."""
-        expected = validate_sha256(sha256)
-        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
-            raise EndpointProtocolError("artifact size limit must be a positive integer")
-        with self.open_artifact(run_id, name) as response:
-            declared = response.headers.get("Content-Length")
-            if declared is not None:
-                try:
-                    size = int(declared)
-                except (TypeError, ValueError) as error:
-                    raise EndpointProtocolError("artifact Content-Length is not an integer") from error
-                if size < 0 or size > limit:
-                    raise EndpointProtocolError(f"artifact exceeds the {limit}-byte limit")
-            data = bytearray()
-            while True:
-                chunk = response.read(65536)
-                if not chunk:
-                    break
-                data.extend(chunk)
-                if len(data) > limit:
-                    raise EndpointProtocolError(f"artifact exceeds the {limit}-byte limit")
-        digest = hashlib.sha256(bytes(data)).hexdigest()
-        if digest != expected:
-            raise EndpointProtocolError(f"artifact {name!r} does not match the preview digest")
-        return bytes(data)
-
     def wait(self, run_id: str, *, interval: float = 2.0, timeout: float = 600.0) -> dict:
         """Bounded polling; returns the job dict at the native terminal boundary.
 
@@ -682,6 +1112,67 @@ class WindowsEndpoint:
             if self._clock() >= deadline:
                 raise EndpointError(f"job {run_id} did not finish within {timeout:.0f}s")
             self._sleep(interval)
+
+
+def _require_closure(upload_files: dict[str, str], main_assembly: str, snapshot: SelectionSnapshot) -> dict:
+    """The sealed closure manifest must bind to the local intake it was staged from."""
+
+    manifest = snapshot.manifest
+    if not isinstance(manifest, dict):
+        raise EndpointProtocolError("a sealed staging carries no closure manifest")
+    if manifest.get("upload_sha256") != digest(upload_files):
+        raise EndpointProtocolError("the closure manifest does not bind the upload index digest")
+    if manifest.get("main_assembly") != main_assembly:
+        raise EndpointProtocolError("the closure manifest is bound to a different main assembly")
+    files = manifest.get("files")
+    if not isinstance(files, dict) or not files:
+        raise EndpointProtocolError("the closure manifest carries no resolved files")
+    for name, checksum in files.items():
+        if upload_files.get(name) != checksum:
+            raise EndpointProtocolError(f"the closure manifest names a file outside the upload index: {name!r}")
+    if manifest.get("handoff_sha256") != digest(files):
+        raise EndpointProtocolError("the closure manifest does not bind its resolved closure digest")
+    return manifest
+
+
+def drive_staging(
+    endpoint: WindowsEndpoint,
+    *,
+    run_id: str,
+    upload_files: dict[str, str],
+    main_assembly: str,
+    intake_dir: Path,
+    batch_dir: Path,
+) -> dict:
+    """One bounded staging step: push the exact indexed folder once, wait, or verify the closure.
+
+    The archive carries every indexed name with the exact recorded bytes; a lost
+    acknowledgement is retried logically with the same member set and hashes, and
+    the endpoint seals the native closure itself - the client never plans rounds,
+    seals or transfers anything beyond the one full indexed folder.
+    """
+
+    validated = validate_file_index(upload_files)
+    snapshot = endpoint.staging_snapshot(run_id, upload_files=validated)
+    if snapshot.state == "awaiting_files":
+        batch_dir = Path(batch_dir)
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        archive = batch_dir / f"staging-{digest(validated)}.zip"
+        try:
+            metadata = prepare_staging_archive(Path(intake_dir), archive, validated)
+            if metadata["files"] != validated:
+                raise EndpointProtocolError("the prepared staging archive differs from the upload index")
+            response = endpoint.stage_folder_archive(run_id, archive, upload_files=validated)
+        finally:
+            archive.unlink(missing_ok=True)
+        staged = _selection_block(response, upload_files=validated)
+        if staged.state not in {"reading", "sealed"} or staged.staged_files != validated:
+            raise EndpointProtocolError("endpoint did not stage the full indexed folder")
+        return {"action": "staged", "state": staged.state, "sealed": staged.state == "sealed"}
+    if snapshot.state == "reading":
+        return {"action": "wait", "state": "reading", "sealed": False}
+    manifest = _require_closure(validated, main_assembly, snapshot)
+    return {"action": "sealed", "state": "sealed", "sealed": True, "manifest": manifest}
 
 
 def verified_result(result: dict | None) -> dict:

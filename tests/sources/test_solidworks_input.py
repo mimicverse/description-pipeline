@@ -18,13 +18,15 @@ import yaml
 
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
-from description_pipeline.io import PipelineError, file_digest, inventory  # noqa: E402
+from description_pipeline.io import PipelineError, digest, file_digest, inventory, write_json  # noqa: E402
 from description_pipeline.sources.solidworks.input import (  # noqa: E402
     INSPECTION_SCHEMA,
     INPUT_SCHEMA,
     ROBOT_FILE,
+    _selection_matches_acquisition,
     inspect_package,
     load_package,
+    native_source_closure,
 )
 
 SPEC_TEXT = """M3 demo documentation export (fixture)
@@ -515,6 +517,62 @@ class InputPackageTests(unittest.TestCase):
 
                 self._assert_code(self._package(mutate), "input.joint_axis_reference_invalid")
 
+    def test_named_native_axis_keeps_its_exact_occurrence_scope(self):
+        for owner in ("", "upper-1", "drive-1/shaft-2"):
+            with self.subTest(owner=owner):
+                reference = {"kind": "reference_axis", "component": owner, "feature_name": "shaft_axis"}
+
+                def mutate(document, reference=reference):
+                    document["source"]["joints"][0]["axis_reference"] = reference
+
+                loaded = load_package(self._package(mutate))
+                self.assertEqual(loaded["source"]["joints"][0]["axis_reference"], reference)
+
+    def test_named_axis_refuses_missing_scope_and_mixed_geometry_selectors(self):
+        valid = {"kind": "reference_axis", "component": "", "feature_name": "shaft_axis"}
+        malformed = [
+            {key: value for key, value in valid.items() if key != "component"},
+            {**valid, "component": None},
+            {**valid, "component": " \t "},
+            {**valid, "feature_name": ""},
+            {**valid, "feature_name": "shaft\naxis"},
+            {**valid, "face_index": 0},
+            {**valid, "body_type": "solid"},
+            {**valid, "kind": "plane"},
+            {**valid, "kind": {}},
+        ]
+        for reference in malformed:
+            with self.subTest(reference=reference):
+
+                def mutate(document, reference=reference):
+                    document["source"]["joints"][0]["axis_reference"] = reference
+
+                self._assert_code(self._package(mutate), "input.joint_axis_reference_invalid")
+
+    def test_named_axis_preserves_zero_limits_with_explicit_warnings(self):
+        def mutate(document):
+            joint = document["source"]["joints"][0]
+            joint["axis_reference"] = {
+                "kind": "reference_axis",
+                "component": "",
+                "feature_name": "shaft_axis",
+            }
+            joint["limits"] = {"lower": 0, "upper": 0, "effort": 0, "velocity": 0}
+
+        root = self._package(mutate)
+        report = inspect_package(root)
+        self.assertTrue(report["passed"], report["errors"])
+        warnings = [row for row in report["warnings"] if row["code"].startswith("input.joint_")]
+        self.assertEqual(len(warnings), 3)
+        self.assertEqual(
+            {row["detail"]["qualification_blocker"] for row in warnings},
+            {"usable_joint_drive", "usable_joint_range"},
+        )
+        self.assertEqual(
+            load_package(root)["source"]["joints"][0]["limits"],
+            {"lower": 0, "upper": 0, "effort": 0, "velocity": 0},
+        )
+
     def test_joint_axis_and_limits_are_strict_si(self):
         def axis(document):
             document["source"]["joints"][0]["axis"] = [0.0, 0.0, 2.0]
@@ -522,7 +580,7 @@ class InputPackageTests(unittest.TestCase):
         self._assert_code(self._package(axis), "input.joint_axis_invalid")
 
         def effort(document):
-            document["source"]["joints"][0]["limits"]["effort"] = 0.0
+            document["source"]["joints"][0]["limits"]["effort"] = -1.0
 
         self._assert_code(self._package(effort), "input.joint_limits_invalid")
 
@@ -701,21 +759,46 @@ class InputPackageTests(unittest.TestCase):
 
         self._assert_code(self._package(negative), "input.checks_invalid")
 
-        def missing(document):
-            document.pop("checks")
-
-        self._assert_code(self._package(missing), "input.checks_invalid")
-
         def unknown(document):
             document["checks"]["expected_mass"] = [0.5, 1.0]
 
         self._assert_code(self._package(unknown), "input.checks_invalid")
 
-    def test_joint_limits_must_be_strictly_ordered(self):
+    def test_design_targets_are_optional_without_invented_ranges(self):
+        for supplied in (None, {}, {"expected_mass_kg": [0.5, 2.0]}):
+            with self.subTest(checks=supplied):
+
+                def optional(document, supplied=supplied):
+                    if supplied is None:
+                        document.pop("checks")
+                    else:
+                        document["checks"] = supplied
+
+                report = inspect_package(self._package(optional))
+                self.assertTrue(report["passed"], report["errors"])
+                targets = report["resolved"]["checks"]
+                self.assertNotIn("expected_extent_m", targets)
+                if not supplied:
+                    self.assertNotIn("expected_mass_kg", targets)
+                else:
+                    self.assertEqual(targets["expected_mass_kg"], supplied["expected_mass_kg"])
+
+    def test_explicit_invalid_design_targets_still_fail(self):
+        for key in ("expected_mass_kg", "expected_extent_m"):
+            with self.subTest(target=key):
+
+                def invalid(document, key=key):
+                    document["checks"] = {key: None}
+
+                self._assert_code(self._package(invalid), "input.checks_invalid")
+
+    def test_nonzero_equal_bounds_are_retained_for_inspection(self):
         def equal_bounds(document):
             document["source"]["joints"][0]["limits"]["lower"] = 1.5
 
-        self._assert_code(self._package(equal_bounds), "input.joint_limits_invalid")
+        report = inspect_package(self._package(equal_bounds))
+        self.assertTrue(report["passed"], report["errors"])
+        self.assertIn("input.joint_limits_degenerate", [row["code"] for row in report["warnings"]])
 
     def test_malformed_keys_and_overflowing_numbers_are_findings(self):
         def non_string_key(document):
@@ -772,5 +855,103 @@ class InputPackageTests(unittest.TestCase):
         self.assertIn("input.provider_invalid", str(error))
 
 
+class SelectionAcquisitionContractTests(unittest.TestCase):
+    """Strict identity between the sealed selection and both acquired inventories."""
+
+    def _inputs(self):
+        selected = {
+            "robot.SLDASM": "a" * 64,
+            "arm.SLDPRT": "b" * 64,
+            "NP-F550.step": "c" * 64,
+        }
+        record = {"native_files": dict(selected)}
+        raw = {"files": dict(selected)}
+        manifest = {"files": dict(selected), "excluded_files": {"decoy.SLDPRT": "d" * 64}}
+        return record, raw, manifest
+
+    def test_full_inventories_match_the_sealed_selection(self):
+        _selection_matches_acquisition(*self._inputs())
+
+    def test_missing_or_mutated_retained_source_is_refused(self):
+        cases = {
+            "raw_missing": lambda record, raw, manifest: raw["files"].pop("NP-F550.step"),
+            "raw_mutated": lambda record, raw, manifest: raw["files"].update({"NP-F550.step": "e" * 64}),
+            "acquired_missing": lambda record, raw, manifest: record["native_files"].pop("NP-F550.step"),
+            "acquired_mutated": lambda record, raw, manifest: record["native_files"].update({"NP-F550.step": "e" * 64}),
+            "raw_extra": lambda record, raw, manifest: raw["files"].update({"extra.step": "e" * 64}),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(case=label):
+                record, raw, manifest = self._inputs()
+                mutate(record, raw, manifest)
+                with self.assertRaises(PipelineError):
+                    _selection_matches_acquisition(record, raw, manifest)
+
+    def test_overlapping_inventories_are_refused(self):
+        record, raw, manifest = self._inputs()
+        manifest["excluded_files"]["robot.SLDASM"] = "a" * 64
+        with self.assertRaises(PipelineError):
+            _selection_matches_acquisition(record, raw, manifest)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class NativeSourceClosureTests(unittest.TestCase):
+    def setUp(self):
+        from .selection_support import sealed_selection
+
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.main = "cad/robot.SLDASM"
+        (self.root / "cad").mkdir()
+        (self.root / self.main).write_bytes(b"synthetic native bytes")
+        files = {self.main: file_digest(self.root / self.main)}
+        self.manifest = sealed_selection(files, self.main, stage_root="C:\\original-stage")
+        self.record = {
+            "schema_version": "solidworks-to-urdf.native-discovery/v1",
+            "contract": "native-discovery/v1",
+            "run_id": "closure-test",
+            "native_files": files,
+            "handoff_sha256": digest(files),
+            "identity": {"hardware_id": "fixture", "main_assembly": self.main},
+            "raw": {"files": files, "source_selection": self.manifest},
+        }
+        self.definition = {
+            "hardware_id": "fixture",
+            "source": {"assembly": self.main},
+            "provenance": {
+                "generator": "native-discovery",
+                "contract": "native-discovery/v1",
+                "run_id": "closure-test",
+                "native_inventory_sha256": digest(files),
+            },
+        }
+        self.seal()
+
+    def seal(self):
+        path = self.root / "discovery/native-discovery.json"
+        write_json(path, self.record)
+        self.definition["provenance"]["discovery_sha256"] = file_digest(path)
+
+    def test_relocated_capture_retains_the_bound_stage_evidence(self):
+        closure = native_source_closure(self.root, self.definition)
+        self.assertEqual(closure, self.manifest["closure"])
+        closure["main_assembly"] = "mutated"
+        self.assertEqual(self.manifest["closure"]["main_assembly"], self.main)
+
+    def test_resealed_missing_or_changed_manifest_refuses_capture(self):
+        for forged in (None, {**self.manifest, "main_assembly": "foreign.SLDASM"}):
+            with self.subTest(manifest=forged):
+                self.record["raw"]["source_selection"] = forged
+                self.seal()
+                with self.assertRaises(PipelineError):
+                    native_source_closure(self.root, self.definition)
+
+    def test_native_inventory_must_equal_selected_inventory(self):
+        self.record["raw"]["files"] = {**self.record["native_files"], "foreign.SLDPRT": "aa" * 32}
+        self.seal()
+        with self.assertRaises(PipelineError):
+            native_source_closure(self.root, self.definition)

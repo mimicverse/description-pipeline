@@ -1,225 +1,145 @@
-"""Native admission and queue controls; fake CAD never grants qualification."""
+"""Native admission and queue controls; fake native legs never grant qualification."""
 
 from __future__ import annotations
 
-import shutil
+import copy
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
 
-from description_pipeline.io import digest, file_digest, write_json
-from description_pipeline.orchestration.windows import Jobs, RequestError
-from description_pipeline.sources.solidworks.revision import package_inventory
-from .endpoint_support import EndpointFixture
+from description_pipeline.io import PipelineError
+from description_pipeline.orchestration.windows import RequestError
+from description_pipeline.sources.solidworks.errors import CadError
+from .endpoint_support import MAIN, PART, EndpointFixture
 
 
 class NativeEndpointTests(EndpointFixture, unittest.TestCase):
-    def test_outside_source_root_is_rejected_before_any_file_copy(self):
-        jobs = self.jobs()
-        # This parent contains both CAD and service credentials. Admission must
-        # not sweep it into a delivery merely because an assembly exists below it.
-        with patch("description_pipeline.orchestration.windows.freeze_handoff") as freeze:
-            with self.assertRaisesRegex(ValueError, "outside the configured"):
-                jobs.resolve_handoff({"handoff_path": str(self.root)})
-            freeze.assert_not_called()
+    def test_upload_identity_and_selection_are_admitted_before_any_native_work(self):
+        jobs = self.jobs(lambda *args, **kwargs: self.fail("an inadmissible request must not run"))
+        for mutation in (
+            {"upload_sha256": "0" * 64},
+            {"main_assembly": "cad/absent.SLDASM"},
+            {"main_assembly": PART},
+            {"upload_files": {MAIN: "0" * 64}},
+        ):
+            with self.subTest(mutation=sorted(mutation)), self.assertRaises(PipelineError):
+                jobs.create({**self.request(), **mutation})
+        created = jobs.create(self.request())[0]
+        self.assertEqual("awaiting_files", created["selection"]["state"])
+        self.assertEqual({}, created["selection"]["staged_files"])
+        self.assertEqual(self.upload_sha, created["selection"]["upload_sha256"])
+        self.assertEqual([], self.reader_log)
 
-    def test_nested_source_uses_the_same_identity_for_absolute_and_relative_paths(self):
-        nested = self.source / "新版结构"
-        nested.mkdir()
-        (nested / "总装.SLDASM").write_bytes(b"Synthetic nested assembly")
-        jobs = self.jobs()
-        absolute = jobs.resolve_handoff({"handoff_path": str(nested)})
-        relative = jobs.resolve_handoff({"handoff_path": "新版结构"})
-        self.assertEqual(absolute, relative)
+    def test_staging_observes_the_full_folder_once_then_seals(self):
+        jobs = self.jobs(lambda *args, **kwargs: {"passed": False, "error": "expected"})
+        request = self.request()
+        jobs.create(request)
+        sealed = self.stage_and_seal(jobs, request["run_id"])
+        observed = [entry for entry in self.reader_log if entry[0] == "observe"]
+        self.assertEqual(1, len(observed))
+        self.assertEqual(MAIN, observed[0][3])
+        self.assertEqual("sealed", sealed["selection"]["state"])
+        self.assertEqual(sealed["selection"]["manifest"], self.expected_manifest())
 
-    def test_folder_submission_discovers_routes_and_is_idempotent(self):
-        calls = []
+    def test_changed_staged_bytes_or_record_identity_block_capture(self):
+        for mutation in ("staged", "record"):
+            with self.subTest(mutation=mutation):
+                config = self.config_for(mutation)
+                calls: list = []
 
-        def runner(package, output, **kwargs):
-            calls.append(package)
-            self.assertEqual("capture", kwargs["stop_after"])
-            self.assertTrue((package / "robot.yaml").is_file())
-            return self.capture_transfer_result(output, run_id=kwargs["run_id"], on_event=kwargs["on_event"])
+                def native_reader(frozen, settings, on_activity=None, mutation=mutation):
+                    record = copy.deepcopy(self.record)
+                    if mutation == "record":
+                        record["identity"]["main_assembly"] = "cad/other.SLDASM"
+                    return record
 
-        jobs = self.jobs(runner=runner)
-        request = self.request(jobs)
-        self.assertTrue(jobs.create(request)[1])
-        jobs.queue.join()
-        job, created = jobs.create(request)
-        self.assertFalse(created)
-        self.assertEqual("native_complete", job["status"])
-        self.assertEqual("arm", job["hardware_id"])
-        self.assertEqual("a/b", job["repository_slug"])
-        self.assertEqual(set(job["capture_archive"]), {"name", "sha256", "size", "manifest_sha256"})
-        self.assertEqual(1, len(calls))
-        self.assertFalse((self.source / "robot.yaml").exists())
-        with self.assertRaises(RequestError) as error:
-            jobs.create({**request, "handoff_sha256": "f" * 64})
-        self.assertEqual(409, error.exception.status)
+                jobs = self.jobs(
+                    lambda *args, calls=calls, **kwargs: calls.append(args),
+                    config=config,
+                    native_reader=native_reader,
+                )
+                request = self.request()
+                jobs.create(request)
+                self.stage_and_seal(jobs, request["run_id"])
+                finished = self.wait_state_any_status(jobs, request["run_id"], {"awaiting_definition"})
+                if finished["status"] != "failed":
+                    if mutation == "staged":
+                        # Derive a valid request from the intact staging first; only then change
+                        # the server-side staged bytes, so the endpoint's definition admission —
+                        # never the local derivation — makes the deterministic refusal.
+                        self.complete_definition(jobs, request["run_id"], submit=False)
+                        staged = jobs._source_dir(jobs.jobs[request["run_id"]]) / PART
+                        staged.write_bytes(b"changed after sealing\n")
+                        with self.assertRaisesRegex(PipelineError, "Transferred files differ"):
+                            jobs.submit_definition(
+                                request["run_id"],
+                                self.last_definition["archive"],
+                                self.last_definition["prepared_sha256"],
+                            )
+                        # The refused exchange can never reach capture; terminate it the way the
+                        # pipeline records a dead definition exchange.
+                        finished = jobs.abort(
+                            request["run_id"],
+                            {
+                                "error": "the endpoint refused the changed staged source",
+                                "error_code": "definition_refused_after_staged_change",
+                                "detail": {"staged": PART},
+                            },
+                        )
+                    else:
+                        self.complete_definition(jobs, request["run_id"])
+                        finished = self.await_terminal(jobs, request["run_id"])
+                self.assertEqual("failed", finished["status"])
+                self.assertEqual([], calls)
 
-    def test_blocking_discovery_retains_objects_and_never_calls_runner(self):
-        calls = []
-
-        def prepare(*args, **kwargs):
-            return SimpleNamespace(
-                passed=False,
-                hardware_id="",
-                revision="",
-                discovery_sha256="d" * 64,
-                findings=({"code": "discovery.rigid_group_ambiguous", "object": "component:arm", "blocking": True},),
+    def test_blocking_native_reader_retains_objects_and_never_calls_runner(self):
+        def native_reader(frozen, settings, on_activity=None):
+            raise CadError(
+                "cad_discovery_blocked",
+                "Discovery is ambiguous",
+                detail={"object": "component:arm", "blocking": True},
             )
 
-        jobs = self.jobs(preparer=prepare, runner=lambda *args, **kwargs: calls.append(args))
-        request = self.request(jobs)
+        calls: list = []
+        jobs = self.jobs(lambda *args, **kwargs: calls.append(args), native_reader=native_reader)
+        request = self.request()
         jobs.create(request)
-        jobs.queue.join()
-        job = jobs.snapshot(request["run_id"])
-        self.assertEqual("failed", job["status"])
-        self.assertEqual("component:arm", job["discovery"]["findings"][0]["object"])
+        finished = self.run_to_terminal(jobs, request["run_id"])
+        self.assertEqual("failed", finished["status"])
+        self.assertEqual("cad_discovery_blocked", finished["error_code"])
+        self.assertEqual("component:arm", finished["detail"]["object"])
         self.assertEqual([], calls)
 
-    def test_changed_native_bytes_or_discovery_identity_block_execution(self):
-        for mutation in ("source", "digest", "hardware"):
-            with self.subTest(mutation=mutation):
-                # Each case owns a separate state root and prepared directory.
-                config = {**self.config, "state_root": self.root / ("state-" + mutation)}
-                calls = []
-
-                def prepare(source, output, run_id, mutation=mutation, **kwargs):
-                    result = self.prepare(source, output, run_id, **kwargs)
-                    if mutation == "source":
-                        (source / "总装.SLDASM").write_bytes(b"Changed during discovery")
-                    elif mutation == "digest":
-                        result.handoff_sha256 = "f" * 64
-                    else:
-                        result.hardware_id = "unknown"
-                    return result
-
-                def runner(*args, calls=calls, **kwargs):
-                    calls.append(args)
-
-                jobs = Jobs(config, native_preparer=prepare, runner=runner)
-                try:
-                    request = self.request(jobs)
-                    jobs.create(request)
-                    jobs.queue.join()
-                    self.assertEqual("failed", jobs.snapshot(request["run_id"])["status"])
-                    self.assertEqual([], calls)
-                finally:
-                    jobs.close()
-                # Restore the synthetic frozen store for the next independent case.
-                shutil.rmtree(self.packages / "imports")
-
     def test_native_job_without_a_sealed_transfer_is_never_qualified(self):
-        jobs = self.jobs(runner=lambda *args, **kwargs: {"passed": True, "subject_sha256": "a" * 64})
-        request = self.request(jobs)
+        jobs = self.jobs(lambda *args, **kwargs: {"passed": True, "subject_sha256": "a" * 64})
+        request = self.request()
         jobs.create(request)
-        jobs.queue.join()
-        job = jobs.snapshot(request["run_id"])
-        self.assertEqual("failed", job["status"])
-        self.assertIn("sealed capture transfer", job["error"])
+        finished = self.run_to_terminal(jobs, request["run_id"])
+        self.assertEqual("failed", finished["status"])
+        self.assertIn("sealed capture transfer", finished["error"])
 
-    def test_request_without_selection_seals_with_the_discovered_assembly(self):
-        seen = []
-
-        def runner(package, output, **kwargs):
-            seen.append(kwargs["main_assembly"])
-            return self.capture_transfer_result(output, run_id=kwargs["run_id"], on_event=kwargs["on_event"])
-
-        jobs = self.jobs(runner=runner)
-        request = self.request(jobs)
-        self.assertNotIn("main_assembly", request)
-        jobs.create(request)
-        jobs.queue.join()
-        job = jobs.snapshot(request["run_id"])
-        self.assertEqual("native_complete", job["status"])
-        self.assertEqual("总装.SLDASM", job["main_assembly"])
-        self.assertEqual(["总装.SLDASM"], seen)
-        # The operator request binding stays exactly as submitted.
-        self.assertEqual(request, job["request"])
-
-    def test_explicit_selection_is_unchanged_by_discovery(self):
-        seen = []
-
-        def prepare(source, output, run_id, **kwargs):
-            result = self.prepare(source, output, run_id, **kwargs)
-            write_json(
-                result.discovery_path,
-                {"synthetic_control": True, "identity": {"main_assembly": "OTHER.SLDASM"}},
-            )
-            result.discovery_sha256 = file_digest(result.discovery_path)
-            result.prepared_sha256 = digest(package_inventory(result.package))
-            return result
-
-        def runner(package, output, **kwargs):
-            seen.append(kwargs["main_assembly"])
-            return self.capture_transfer_result(output, run_id=kwargs["run_id"], on_event=kwargs["on_event"])
-
-        jobs = self.jobs(runner=runner, preparer=prepare)
-        request = {**self.request(jobs), "main_assembly": "总装.SLDASM"}
-        jobs.create(request)
-        jobs.queue.join()
-        job = jobs.snapshot(request["run_id"])
-        self.assertEqual("native_complete", job["status"])
-        self.assertEqual("总装.SLDASM", job["main_assembly"])
-        self.assertEqual("总装.SLDASM", job["request"]["main_assembly"])
-        self.assertEqual(["总装.SLDASM"], seen)
-
-    def test_linked_rerun_uses_the_effective_parent_selection(self):
-        seen = []
+    def test_explicit_selection_is_unchanged_by_derivation(self):
+        seen: list = []
 
         def runner(package, output, **kwargs):
             seen.append(kwargs.get("main_assembly"))
-            return self.capture_transfer_result(output, run_id=kwargs["run_id"], on_event=kwargs["on_event"])
+            return self.capture_transfer_result(output, run_id=kwargs["run_id"], on_event=kwargs.get("on_event"))
 
-        jobs = self.jobs(runner=runner)
-        parent = self.request(jobs)
-        jobs.create(parent)
-        jobs.queue.join()
-        parent_job = jobs.snapshot(parent["run_id"])
-        self.assertEqual("native_complete", parent_job["status"])
-        self.assertEqual("总装.SLDASM", parent_job["main_assembly"])
-        self.assertNotIn("main_assembly", parent_job["request"])
-
-        def linked(**extra):
-            base = self.request(jobs)
-            return {
-                **base,
-                **extra,
-                "resume": {"parent_run": parent["run_id"], "from_stage": "capture"},
-            }
-
-        accepted = {"accepted": True}
-        with patch("description_pipeline.orchestration.windows.start_plan", return_value=accepted):
-            with self.assertRaises(RequestError) as refused:
-                jobs.create(linked(main_assembly="OTHER.SLDASM"))
-            self.assertEqual(409, refused.exception.status)
-            inherited = linked()
-            jobs.create(inherited)
-            jobs.queue.join()
-            explicit = linked(main_assembly="总装.SLDASM")
-            jobs.create(explicit)
-            jobs.queue.join()
-
-        inherited_job = jobs.snapshot(inherited["run_id"])
-        self.assertEqual("native_complete", inherited_job["status"])
-        self.assertEqual("总装.SLDASM", inherited_job["main_assembly"])
-        self.assertNotIn("main_assembly", inherited_job["request"])
-        explicit_job = jobs.snapshot(explicit["run_id"])
-        self.assertEqual("native_complete", explicit_job["status"])
-        self.assertEqual("总装.SLDASM", explicit_job["main_assembly"])
-        self.assertEqual("总装.SLDASM", explicit_job["request"]["main_assembly"])
-        self.assertEqual(["总装.SLDASM", "总装.SLDASM", "总装.SLDASM"], seen)
+        jobs = self.jobs(runner)
+        request = self.request()
+        jobs.create(request)
+        finished = self.run_to_terminal(jobs, request["run_id"])
+        self.assertEqual("native_complete", finished["status"], finished.get("error"))
+        self.assertEqual([MAIN], seen)
+        self.assertEqual(request, finished["request"])
+        self.assertEqual(MAIN, finished["main_assembly"])
 
     def test_sealed_transfer_artifacts_are_hash_bound_and_state_gated(self):
         jobs = self.jobs()
-        request = self.request(jobs)
+        request = self.request()
         jobs.create(request)
-        jobs.queue.join()
-        job = jobs.snapshot(request["run_id"])
-        self.assertEqual("native_complete", job["status"])
+        finished = self.run_to_terminal(jobs, request["run_id"])
+        self.assertEqual("native_complete", finished["status"], finished.get("error"))
         output = self.config["output_root"] / request["run_id"]
-        archive = job["capture_archive"]
+        archive = finished["capture_archive"]
         stream, size = jobs.artifact(request["run_id"], "native-evidence.zip")
         with stream:
             self.assertEqual(size, len(stream.read()))
@@ -233,4 +153,15 @@ class NativeEndpointTests(EndpointFixture, unittest.TestCase):
         with self.assertRaises(RequestError) as tampered:
             jobs.artifact(request["run_id"], "native-evidence.zip")
         self.assertEqual(409, tampered.exception.status)
-        self.assertEqual(archive["sha256"], job["capture_archive"]["sha256"])
+        self.assertEqual(archive["sha256"], finished["capture_archive"]["sha256"])
+
+    def test_selection_artifacts_are_not_served_before_a_sealed_transfer(self):
+        jobs = self.jobs()
+        request = self.request()
+        jobs.create(request)
+        with self.assertRaises(RequestError):
+            jobs.artifact(request["run_id"], "native-evidence.zip")
+
+
+if __name__ == "__main__":
+    unittest.main()

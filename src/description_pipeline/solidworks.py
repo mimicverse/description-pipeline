@@ -101,6 +101,10 @@ def _seed_resume(staging: Path, seed_dir: Path | None, resume_from: str) -> None
             target = staging / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
+    if resume_from == "verify" and (seed / "reports/mass-closure.json").is_file():
+        target = staging / "reports/mass-closure.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(seed / "reports/mass-closure.json", target)
 
 
 def _install(staging: Path, target: Path) -> None:
@@ -125,7 +129,22 @@ def _install(staging: Path, target: Path) -> None:
             shutil.rmtree(backup)
 
 
+#: The portable stage set; a receipt renders a report only when its executed
+#: scope declares at least one of these stages (the Windows capture boundary
+#: receipts carry no portable scope, so the native host renders nothing).
+_PORTABLE_SCOPE = frozenset(STAGE_IDS[3:])
+
+
 def _stamp(root: Path, receipt: dict) -> None:
+    # The native host renders no report: only a receipt whose executed scope
+    # includes a portable stage (generate/verify/publish) renders one, and the
+    # Linux portable stages re-create the structural-team report from this same
+    # receipt inside their own delivery.
+    scope = receipt.get("execution_scope")
+    if isinstance(scope, (list, tuple)) and any(stage in _PORTABLE_SCOPE for stage in scope):
+        from .structural_report import write_structural_report
+
+        receipt["structural_report"] = write_structural_report(root, receipt, evidence_root=root)
     receipt["artifacts"] = inventory(root, exclude=("reports/run.json", "reports/stages.json"))
     write_json(root / "reports/stages.json", stage_view(receipt))
     receipt["stage_report"] = {"path": "reports/stages.json", "sha256": file_digest(root / "reports/stages.json")}
@@ -328,7 +347,7 @@ def run(
                     expected_inputs=expected_inputs,
                     handoff_sha256=handoff_sha256,
                 )
-                receipt["cad_revision"] = input_report["cad_revision"]["revision"]
+                receipt["cad_revision"] = (input_report["cad_revision"] or {}).get("revision")
                 if stop_after == "capture":
                     return _finish_native_capture(
                         staging,
@@ -360,7 +379,7 @@ def run(
                 # The equality checks above already bound the replay to the frozen report and
                 # its inventory rows, so no inventory check is skipped.
                 definition = resolve_package(replayed)
-                receipt["cad_revision"] = input_report["cad_revision"]["revision"]
+                receipt["cad_revision"] = (input_report["cad_revision"] or {}).get("revision")
             if resume_from in (None, "capture", "generate"):
                 generated_subject = generate_model(staging, definition, input_report, on_event=event)
             else:
@@ -566,8 +585,10 @@ def doctor() -> dict:
         except Exception as error:
             results.append(
                 {
-                    "id": "consumer.urdf", "passed": False,
-                    "message": str(error), "details": getattr(error, "details", {}),
+                    "id": "consumer.urdf",
+                    "passed": False,
+                    "message": str(error),
+                    "details": getattr(error, "details", {}),
                 }
             )
     result = {

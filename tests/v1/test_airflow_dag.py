@@ -13,6 +13,8 @@ from unittest.mock import patch
 
 from tests.v1._airflow_env import pinned_airflow_home
 
+from description_pipeline.io import digest
+
 ROOT = Path(__file__).resolve().parents[2]
 DAG_DIR = ROOT / "deploy/airflow/dags"
 #: Absolute and outside the checkout, fixed before Airflow is imported.
@@ -107,9 +109,16 @@ class DagTests(unittest.TestCase):
         from tests.v1.protocol_support import protocol_events
 
         module = self._module()
-        request = {"run_id": "protocol-control", "package": "control", "handoff_sha256": "b" * 64, "conn_id": "test"}
+        upload = {"a.SLDASM": "a" * 64}
+        request = {
+            "run_id": "protocol-control",
+            "upload_files": upload,
+            "upload_sha256": digest(upload),
+            "main_assembly": "a.SLDASM",
+            "conn_id": "test",
+        }
         job = {
-            "request": {key: request[key] for key in ("run_id", "package", "handoff_sha256")},
+            "request": {key: request[key] for key in ("run_id", "upload_files", "upload_sha256", "main_assembly")},
             "run_id": request["run_id"],
             "status": "running",
             "events": protocol_events(stages=("freeze",)),
@@ -146,9 +155,16 @@ class DagTests(unittest.TestCase):
         from tests.v1.protocol_support import protocol_events
 
         module = self._module()
-        request = {"run_id": "protocol-control", "package": "control", "handoff_sha256": "b" * 64, "conn_id": "test"}
+        upload = {"a.SLDASM": "a" * 64}
+        request = {
+            "run_id": "protocol-control",
+            "upload_files": upload,
+            "upload_sha256": digest(upload),
+            "main_assembly": "a.SLDASM",
+            "conn_id": "test",
+        }
         job = {
-            "request": {key: request[key] for key in ("run_id", "package", "handoff_sha256")},
+            "request": {key: request[key] for key in ("run_id", "upload_files", "upload_sha256", "main_assembly")},
             "run_id": request["run_id"],
             "status": "passed",
             "events": protocol_events(subject="c" * 64),
@@ -175,10 +191,12 @@ class DagTests(unittest.TestCase):
                     "password": "test-token",
                 }
             )
+            upload = {"assembly.SLDASM": "a" * 64}
             request = {
                 "run_id": module.native_run_id("dag-run-native-half"),
-                "package": "handoff/m3.0",
-                "handoff_sha256": "b" * 64,
+                "upload_files": upload,
+                "upload_sha256": digest(upload),
+                "main_assembly": "assembly.SLDASM",
                 "conn_id": "solidworks_windows",
             }
             with patch.dict(os.environ, {"AIRFLOW_CONN_SOLIDWORKS_WINDOWS": connection}):
@@ -198,7 +216,12 @@ class DagTests(unittest.TestCase):
             job = next(iter(server.jobs.values()))
             self.assertEqual(
                 job["request"],
-                {"run_id": request["run_id"], "package": "handoff/m3.0", "handoff_sha256": "b" * 64},
+                {
+                    "run_id": request["run_id"],
+                    "upload_files": upload,
+                    "upload_sha256": digest(upload),
+                    "main_assembly": "assembly.SLDASM",
+                },
             )
             self.assertEqual(job["hardware_id"], "m3.0")
             self.assertEqual(job["repository_slug"], "example/m3.0")
@@ -256,12 +279,13 @@ class DagTests(unittest.TestCase):
                     "password": "test-token",
                 }
             )
+            upload = {"3.0 总装1008.SLDASM": "a" * 64}
             request = {
                 "run_id": module.native_run_id("dag-run-selection"),
-                "package": "handoff/m3.0",
-                "handoff_sha256": "b" * 64,
-                "conn_id": "solidworks_windows",
+                "upload_files": upload,
+                "upload_sha256": digest(upload),
                 "main_assembly": "3.0 总装1008.SLDASM",
+                "conn_id": "solidworks_windows",
             }
             with patch.dict(os.environ, {"AIRFLOW_CONN_SOLIDWORKS_WINDOWS": connection}):
                 started = dag.task_dict["start_job"].python_callable(request)
@@ -272,75 +296,77 @@ class DagTests(unittest.TestCase):
                 job["request"],
                 {
                     "run_id": request["run_id"],
-                    "package": "handoff/m3.0",
-                    "handoff_sha256": "b" * 64,
+                    "upload_files": upload,
+                    "upload_sha256": digest(upload),
                     "main_assembly": "3.0 总装1008.SLDASM",
                 },
             )
 
-    def test_linked_dag_run_derives_the_retained_upload_from_the_parent_job(self) -> None:
-        from tests.v1.test_airflow_client import JOB_SCHEMA, MockEndpoint, PIPELINE_ID
-        from description_pipeline.orchestration.airflow_client import native_run_id
-
+    def test_linked_run_reuses_the_parent_selection_payload(self) -> None:
         from types import SimpleNamespace
+
+        from airflow.sdk.exceptions import AirflowFailException
+        from description_pipeline.io import digest
+        from description_pipeline.orchestration.airflow_client import native_run_id
 
         module = self._module()
         dag = module.dag
         parent_dag_run_id = "portal-parent-20261009"
         parent_run_id = native_run_id(parent_dag_run_id)
-        with MockEndpoint() as server:
-            server.jobs[parent_run_id] = {
-                "schema_version": JOB_SCHEMA,
-                "pipeline_id": PIPELINE_ID,
+        upload = {"3.0 总装1008.SLDASM": "a" * 64, "parts/零件.SLDPRT": "b" * 64}
+        parent_job = {
+            "request": {
                 "run_id": parent_run_id,
-                "status": "failed",
-                "events": [{"stage": "freeze", "state": "completed", "at": "t0"}],
-                "result": None,
-                "error": "verification failed",
-                "pokes": 0,
-                "request": {
-                    "run_id": parent_run_id,
-                    "package": "handoff/m3.0",
-                    "handoff_sha256": "b" * 64,
-                    "main_assembly": "3.0 总装1008.SLDASM",
-                },
+                "upload_files": upload,
+                "upload_sha256": digest(upload),
+                "main_assembly": "3.0 总装1008.SLDASM",
             }
-            connection = json.dumps(
-                {
-                    "conn_type": "http",
-                    "host": "127.0.0.1",
-                    "port": server.server.server_address[1],
-                    "password": "test-token",
-                }
+        }
+        submitted = {}
+
+        class Stub:
+            def get_job(self, run_id):
+                return parent_job
+
+            def start_staging_job(self, **kwargs):
+                submitted.update(kwargs)
+                return {"run_id": kwargs["run_id"], "status": "queued"}
+
+        context = {
+            "dag_run": SimpleNamespace(
+                conf={"parent_dag_run_id": parent_dag_run_id, "resume_from": "capture"},
+                run_id="portal-child-1",
+            ),
+            "params": {"handoff_path": "", "main_assembly": ""},
+        }
+        with patch.object(module, "_endpoint", return_value=Stub()):
+            request = dag.task_dict["resolve_handoff"].python_callable(**context)
+            self.assertEqual(request["upload_files"], upload)
+            self.assertEqual(request["upload_sha256"], digest(upload))
+            self.assertEqual(request["main_assembly"], "3.0 总装1008.SLDASM")
+            self.assertEqual(request["resume"], {"parent_run": parent_run_id, "from_stage": "capture"})
+            started = dag.task_dict["start_job"].python_callable(request)
+        self.assertEqual(started["status"], "queued")
+        self.assertEqual(
+            submitted,
+            {
+                "run_id": request["run_id"],
+                "upload_files": upload,
+                "main_assembly": "3.0 总装1008.SLDASM",
+                "resume": {"parent_run": parent_run_id, "from_stage": "capture"},
+            },
+        )
+        with patch.object(module, "_endpoint", return_value=Stub()), self.assertRaises(AirflowFailException):
+            dag.task_dict["resolve_handoff"].python_callable(
+                **{**context, "params": {"handoff_path": "", "main_assembly": "other.SLDASM"}}
             )
-            context = {
-                "dag_run": SimpleNamespace(
-                    conf={"parent_dag_run_id": parent_dag_run_id, "resume_from": "capture"},
-                    run_id="portal-child-1",
-                ),
-                "params": {"handoff_path": "", "main_assembly": ""},
-            }
-            with patch.dict(os.environ, {"AIRFLOW_CONN_SOLIDWORKS_WINDOWS": connection}):
-                request = dag.task_dict["resolve_handoff"].python_callable(**context)
-                self.assertEqual(request["package"], "handoff/m3.0")
-                self.assertEqual(request["handoff_sha256"], "b" * 64)
-                self.assertEqual(request["main_assembly"], "3.0 总装1008.SLDASM")
-                self.assertEqual(request["resume"], {"parent_run": parent_run_id, "from_stage": "capture"})
-                started = dag.task_dict["start_job"].python_callable(request)
-                polled = False
-                for _ in range(8):
-                    if module._poke(started):
-                        polled = True
-                        break
-                self.assertTrue(polled)
-            self.assertEqual(server.resolved_paths, [])
-            children = [job for job in server.jobs.values() if job["run_id"] != parent_run_id]
-            self.assertEqual(len(children), 1)
-            child = children[0]
-            self.assertEqual(child["request"]["package"], "handoff/m3.0")
-            self.assertEqual(child["request"]["handoff_sha256"], "b" * 64)
-            self.assertEqual(child["request"]["main_assembly"], "3.0 总装1008.SLDASM")
-            self.assertEqual(child["request"]["resume"], {"parent_run": parent_run_id, "from_stage": "capture"})
+
+        class LegacyStub:
+            def get_job(self, run_id):
+                return {"request": {"run_id": parent_run_id, "package": "handoff/m3.0"}}
+
+        with patch.object(module, "_endpoint", return_value=LegacyStub()), self.assertRaises(AirflowFailException):
+            dag.task_dict["resolve_handoff"].python_callable(**context)
 
 
 if __name__ == "__main__":

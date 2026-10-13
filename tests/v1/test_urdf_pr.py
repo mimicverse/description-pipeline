@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from description_pipeline.delivery import subject_digest
+from description_pipeline.delivery import subject_digest, subject_inventory
 from description_pipeline.repository import urdf_pr
 from description_pipeline.sources.solidworks import revision as cad_revision
 
@@ -200,6 +200,42 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(self.fx.remote_head(), second["commit"])
         self.assertEqual(len([c for c in self.gh_calls if c[:2] == ("pr", "create")]), 1)
         self.assertGreaterEqual(len(self.rest_payloads), 2)
+
+    def test_mass_closure_receipt_travels_into_the_worktree_and_publishes(self) -> None:
+        self.fx.write_bundle("one\n", extra={"reports/mass-closure.json": "{}\n"})
+        result = self.submit()
+        self.assertIn(result["state"], {"published", "updated"})
+        self.assertEqual(result["subject"], subject_digest(self.fx.bundle))
+        run("git", "fetch", "--quiet", "origin", BRANCH, cwd=self.fx.repo)
+        tree = run("git", "ls-tree", "-r", "--name-only", "FETCH_HEAD", cwd=self.fx.repo).splitlines()
+        self.assertIn("reports/mass-closure.json", tree)
+
+    def test_every_subject_bound_reports_receipt_is_copied_into_the_worktree(self) -> None:
+        self.fx.write_bundle(
+            "one\n",
+            extra={
+                "reports/mass-closure.json": "{}\n",
+                "reports/native-tool.json": "{}\n",
+                "reports/native-stages.json": "{}\n",
+                "transfer-manifest.json": "{}\n",
+            },
+        )
+        bundle_subject = subject_digest(self.fx.bundle)
+        bound = sorted(name for name in subject_inventory(self.fx.bundle) if name.startswith("reports/"))
+        self.assertIn("reports/mass-closure.json", bound)
+        worktree = Path(tempfile.mkdtemp(dir=self.fx.tmp))
+        urdf_pr._copy_governed(self.fx.bundle, worktree)
+        for name in bound:
+            self.assertTrue((worktree / name).is_file(), name)
+        self.assertEqual(subject_digest(worktree), bundle_subject)
+
+    def test_a_dropped_subject_bound_receipt_breaks_reverification(self) -> None:
+        self.fx.write_bundle("one\n", extra={"reports/mass-closure.json": "{}\n"})
+        legacy = tuple(name for name in urdf_pr.REPORTS_FILES if name != "mass-closure.json")
+        with mock.patch.object(urdf_pr, "REPORTS_FILES", legacy):
+            result = self.submit()
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error"], "reverification_failed")
 
     def test_original_record_bytes_survive_git_and_fresh_checkout(self):
         name = "input/records/specification.txt"

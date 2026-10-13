@@ -13,13 +13,14 @@ freeze can prove it read the same bytes.
 
 from __future__ import annotations
 
+import copy
 import math
 import re
 import time
 from pathlib import Path
 from typing import Any
 
-from ...io import PipelineError, confined, digest, inventory, read_data
+from ...io import PipelineError, confined, digest, file_digest, inventory, read_data
 
 INPUT_SCHEMA = "solidworks-to-urdf.input/v1"
 INSPECTION_SCHEMA = "solidworks-to-urdf.input-inspection/v1"
@@ -78,6 +79,92 @@ def _is_id(value: Any) -> bool:
 
 def _is_text(value: Any) -> bool:
     return isinstance(value, str) and value.strip() != "" and _CONTROL_RE.search(value) is None
+
+
+def native_metadata(package: Path, definition: dict) -> dict:
+    """Read absent administrative facts only from a byte-bound native acquisition.
+
+    This checks provenance, not engineering qualification. The independent
+    verifier separately reconstructs the authored values and model semantics.
+    """
+    marker = definition.get("provenance")
+    if not isinstance(marker, dict) or marker.get("generator") != "native-discovery":
+        raise PipelineError("Missing native acquisition provenance")
+    path = confined(package, "discovery/native-discovery.json")
+    if file_digest(path) != marker.get("discovery_sha256"):
+        raise PipelineError("Native discovery bytes differ from the generated definition")
+    record = read_data(path)
+    if (
+        not isinstance(record, dict)
+        or record.get("schema_version") != "solidworks-to-urdf.native-discovery/v1"
+        or record.get("contract") != "native-discovery/v1"
+        or record.get("contract") != marker.get("contract")
+        or not _is_text(marker.get("run_id"))
+        or record.get("run_id") != marker["run_id"]
+    ):
+        raise PipelineError("Native discovery identity differs from its provenance")
+    files = record.get("native_files")
+    if (
+        not isinstance(files, dict)
+        or not files
+        or digest(files) != marker.get("native_inventory_sha256")
+        or digest(files) != record.get("handoff_sha256")
+    ):
+        raise PipelineError("Native acquisition lacks its frozen handoff inventory")
+    for relative, checksum in files.items():
+        if not isinstance(relative, str) or file_digest(confined(package, relative)) != checksum:
+            raise PipelineError("Native acquisition files differ from the frozen handoff")
+    identity = record.get("identity")
+    source = definition.get("source") or {}
+    if (
+        not isinstance(identity, dict)
+        or identity.get("hardware_id") != definition.get("hardware_id")
+        or identity.get("main_assembly") != source.get("assembly")
+        or source.get("assembly") not in files
+    ):
+        raise PipelineError("Generated identity differs from native discovery")
+    return identity
+
+
+def _selection_matches_acquisition(record: dict, raw: dict, manifest: dict) -> None:
+    """The sealed selection must equal both the acquired and the raw file inventories.
+
+    ``record['native_files']`` is the acquired full package inventory and ``raw['files']``
+    the native record's file map; with the producer recording every validated in-stage
+    author source in both, the two must agree byte-for-byte with the sealed selection,
+    so a missing or mutated retained source refuses here.
+    """
+
+    selected = manifest.get("files")
+    excluded = manifest.get("excluded_files")
+    if not isinstance(selected, dict) or not isinstance(excluded, dict) or set(selected) & set(excluded):
+        raise PipelineError("Native source selection has invalid file inventories")
+    if selected != record.get("native_files") or selected != raw.get("files"):
+        raise PipelineError("Native source selection differs from the acquired CAD inventory")
+
+
+def native_source_closure(package: Path, definition: dict) -> dict:
+    """Bind capture policy to the sealed native acquisition, never authored YAML.
+
+    The prepared package may be relocated, while the closure retains the original
+    staging paths as evidence. Capture must resolve current occurrences against
+    these byte-bound native document identities.
+    """
+    from .selection import verify_selection
+
+    native_metadata(package, definition)
+    record = read_data(confined(package, "discovery/native-discovery.json"))
+    raw = record.get("raw") or {}
+    manifest = raw.get("source_selection")
+    if not isinstance(manifest, dict):
+        raise PipelineError("Native acquisition lacks its sealed source selection")
+    selected = manifest.get("files")
+    excluded = manifest.get("excluded_files")
+    _selection_matches_acquisition(record, raw, manifest)
+    if manifest.get("main_assembly") != definition["source"].get("assembly"):
+        raise PipelineError("Native source selection names another main assembly")
+    verify_selection(manifest, {**excluded, **selected}, selected, reader_sha256=manifest.get("reader_sha256"))
+    return copy.deepcopy(manifest["closure"])
 
 
 def _as_mapping(value: Any, report: _Report, code: str, where: str) -> dict[str, Any] | None:
@@ -672,14 +759,36 @@ def _validate_source(
             continue
         reference = joint.get("axis_reference")
         if not isinstance(reference, dict):
-            # Free text carries no numeric evidence; a moving joint must name
-            # the native component/face that the capture resolves.
             report.error(
                 "input.joint_axis_reference_invalid",
                 f"{where}.axis_reference must be a structured native selector "
-                "(component + face_index) for a movable joint",
+                "for a saved reference axis or cylindrical face",
                 {"joint": name, "axis_reference": reference},
             )
+        elif reference.get("kind") == "reference_axis":
+            # A saved reference axis is native line evidence in its own right.
+            # The empty occurrence names the top assembly, never an inferred part.
+            _unknown_keys(
+                reference,
+                {"kind", "component", "feature_name", "note"},
+                report,
+                "input.joint_axis_reference_invalid",
+                f"{where}.axis_reference",
+            )
+            component = reference.get("component")
+            if not isinstance(component, str) or (component != "" and not _is_text(component)):
+                report.error(
+                    "input.joint_axis_reference_invalid",
+                    f"{where}.axis_reference.component must be an occurrence name "
+                    "or an empty string for the top assembly",
+                    {"joint": name, "component": component},
+                )
+            if not _is_text(reference.get("feature_name")):
+                report.error(
+                    "input.joint_axis_reference_invalid",
+                    f"{where}.axis_reference.feature_name must name a saved reference axis",
+                    {"joint": name, "feature_name": reference.get("feature_name")},
+                )
         else:
             if isinstance(reference, dict):
                 _unknown_keys(
@@ -746,11 +855,17 @@ def _validate_source(
         effort = limits.get("effort")
         velocity = limits.get("velocity")
         for key, value in (("effort", effort), ("velocity", velocity)):
-            if not _is_number(value) or float(value) <= 0.0:
+            if not _is_number(value) or float(value) < 0.0:
                 report.error(
                     "input.joint_limits_invalid",
-                    f"{where}.limits.{key} must be finite and positive",
+                    f"{where}.limits.{key} must be finite and nonnegative",
                     {key: value},
+                )
+            elif float(value) == 0.0:
+                report.warn(
+                    "input.joint_drive_unspecified",
+                    f"{where}.limits.{key} is zero; retained for inspection, not qualified for motion",
+                    {"joint": name, key: value, "qualification_blocker": "usable_joint_drive"},
                 )
         if joint_type in ("revolute", "prismatic"):
             lower, upper = limits.get("lower"), limits.get("upper")
@@ -767,10 +882,15 @@ def _validate_source(
                     {"lower": lower, "upper": upper},
                 )
             elif float(lower) == float(upper):
-                report.error(
-                    "input.joint_limits_invalid",
-                    f"{where}.limits.lower must be strictly below .upper",
-                    {"lower": lower, "upper": upper},
+                report.warn(
+                    "input.joint_limits_degenerate",
+                    f"{where}.limits has zero width; retained for inspection, not a usable motion range",
+                    {
+                        "joint": name,
+                        "lower": lower,
+                        "upper": upper,
+                        "qualification_blocker": "usable_joint_range",
+                    },
                 )
         elif joint_type == "continuous":
             if "lower" in limits or "upper" in limits:
@@ -898,8 +1018,14 @@ def _validate_checks(
         "input.checks_invalid",
         "checks",
     )
-    mass_range = _range2(mapping.get("expected_mass_kg"), report, "input.checks_invalid", "checks.expected_mass_kg")
-    extent_range = _range2(mapping.get("expected_extent_m"), report, "input.checks_invalid", "checks.expected_extent_m")
+    # Design targets are optional assertions, separate from the mandatory
+    # comparison of the delivered geometry and physics with native CAD evidence.
+    # An absent target must not be manufactured from the measured CAD value.
+    ranges = {
+        key: _range2(mapping[key], report, "input.checks_invalid", f"checks.{key}")
+        for key in ("expected_mass_kg", "expected_extent_m")
+        if key in mapping
+    }
     exclusions: dict[str, dict[str, Any]] = {}
     raw_exclusions = mapping.get("documented_exclusions") or []
     if not isinstance(raw_exclusions, list):
@@ -939,8 +1065,7 @@ def _validate_checks(
             "evidence": evidence,
         }
     return {
-        "expected_mass_kg": list(mass_range) if mass_range is not None else None,
-        "expected_extent_m": list(extent_range) if extent_range is not None else None,
+        **{key: list(value) for key, value in ranges.items() if value is not None},
         "documented_exclusions": exclusions,
     }, exclusions
 
@@ -1054,7 +1179,18 @@ def inspect_package(path: Path) -> dict[str, Any]:
                 f"schema_version must be exactly {INPUT_SCHEMA!r}",
                 {"value": data.get("schema_version")},
             )
-        if not _is_id(data.get("hardware_id")):
+        if data.get("hardware_id") is None:
+            try:
+                native_metadata(root, data)
+            except (PipelineError, OSError, ValueError, TypeError) as error:
+                report.error("input.hardware_id_invalid", str(error), {"value": None})
+            else:
+                report.warn(
+                    "input.hardware_id_missing",
+                    "CAD supplies no hardware identity; inspection is allowed, publication is not",
+                    {"publication_blocker": "hardware_id"},
+                )
+        elif not _is_id(data.get("hardware_id")):
             report.error(
                 "input.hardware_id_invalid",
                 "hardware_id must be an ASCII identifier",
@@ -1064,7 +1200,7 @@ def inspect_package(path: Path) -> dict[str, Any]:
         if source is not None:
             resolved, source_mapping = _validate_source(source, root=root, hashes=hashes, report=report)
             checks, exclusions = _validate_checks(
-                data.get("checks"),
+                data.get("checks", {}),
                 root=root,
                 hashes=hashes,
                 owned_components=set(resolved.get("owned_components") or []),

@@ -18,6 +18,7 @@ from .errors import ConfigError
 from .jsonio import read_json
 
 SCENE_SCHEMA = "description.scene/v1"
+LINK_GROUP_SCHEMA = "solidworks-to-urdf.link-group-mass-properties/v1"
 
 Matrix3 = tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]
 Vector3 = tuple[float, float, float]
@@ -40,6 +41,15 @@ def _translation_from_row_major(values: Sequence[float]) -> Vector3:
 
 def identity_matrix() -> Matrix3:
     return ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+
+
+#: Row-major identity placement for readings already expressed in assembly axes.
+IDENTITY_PLACEMENT = (
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0,
+    0.0, 0.0, 0.0, 1.0,
+)
 
 
 def _transpose(matrix: Matrix3) -> Matrix3:
@@ -92,7 +102,7 @@ def combine_mass_properties(entries: Sequence[dict[str, Any]]) -> dict[str, Any]
     """Combine per-part mass properties about the combined COM (parallel axis).
 
     The canonical layer owns the authoritative combination; this source-side
-    result exists so a snapshot carries usable semantics, and its provenance
+    result derives usable semantics from the snapshot, and its provenance
     points at the raw per-part readings it came from.
     """
 
@@ -183,14 +193,25 @@ class _PartReading:
         self.mass = float(mass["mass"])
         self.cad_mass_kg = float(mass.get("cad_mass_kg", mass["mass"]))
         self.mass_scale = float(mass.get("scale", 1.0))
-        part_com = tuple(float(value) for value in mass["com"])
         reference = mass.get("reference") or {}
-        part_inertia = tensor_from_raw(mass["inertia"], reference, where=f"component {name}")
+        raw_inertia = tensor_from_raw(mass["inertia"], reference, where=f"component {name}")
         self.product_convention = "solidworks_standard"
-        # part frame -> assembly frame
-        assembly_com = _matvec(self.rotation, part_com)  # type: ignore[arg-type]
-        self.assembly_com = tuple(assembly_com[i] + self.translation[i] for i in range(3))
-        self.assembly_inertia = _rotate_inertia(self.rotation, part_inertia)
+        if str(reference.get("scope") or "part_document") == "assembly_component_group":
+            # Effective CAD-authored instance measurement (sheet-only fallback
+            # or overridden instance): the CoM and tensor are recorded about
+            # the CoM in assembly document coordinates and are used verbatim
+            # in the assembly frame.  No part coordinates are invented and
+            # nothing is rescaled; the independent verifier derives the same
+            # assembly-frame values from the raw row and the recorded
+            # placement.
+            self.assembly_com = tuple(float(value) for value in mass["com"])
+            self.assembly_inertia = raw_inertia
+        else:
+            part_com = tuple(float(value) for value in mass["com"])
+            # part frame -> assembly frame
+            assembly_com = _matvec(self.rotation, part_com)  # type: ignore[arg-type]
+            self.assembly_com = tuple(assembly_com[i] + self.translation[i] for i in range(3))
+            self.assembly_inertia = _rotate_inertia(self.rotation, raw_inertia)
         # assembly frame -> link frame
         link_rotation_t = _transpose(link)
         relative = tuple(self.assembly_com[i] - self.link_translation[i] for i in range(3))
@@ -303,9 +324,10 @@ def material_unverified(payload: Any) -> bool:
 
     真实采集会写 ``reference.material_assignment``：材料齐全时是逐实体材料读数，
     没有材料时带 ``unverified_reason``（如 ``cad_material_provenance_missing``）。
-    SolidWorks 的默认密度会给出一个"看起来正常"的 CAD 质量，所以这类组件的质量
-    只有在 ``documented_table`` 里被显式声明过才可用。夹具/历史读数完全没有这一段时
-    这里返回 False：无法证伪就不擅自判失败，但仍由下文的声明覆盖规则约束。
+    SolidWorks 的默认密度会给出一个"看起来正常"的 CAD 质量，所以这类读数不能当作
+    已验证质量：cad 模式下 build_scene 保留原值并记录非阻塞警告，documented_table
+    模式下质量必须由声明表覆盖。夹具/历史读数完全没有这一段时这里返回 False：
+    无法证伪就不擅自判失败，但仍由下文的声明覆盖规则约束。
     """
 
     reference = payload.get("reference") if isinstance(payload, dict) else None
@@ -313,13 +335,15 @@ def material_unverified(payload: Any) -> bool:
     return isinstance(assignment, dict) and bool(assignment.get("unverified_reason"))
 
 
-def check_mass_contract(cfg: dict[str, Any], included: Iterable[str], masses: dict[str, Any]) -> None:
+def check_mass_contract(cfg: dict[str, Any], included: Iterable[str], masses: dict[str, Any]) -> list[str]:
     """质量来源的模式合同（生成侧，基于实际纳入的组件）。
 
     * ``documented_table``：每个被纳入的组件都必须有声明质量；缺一个即拒绝，
       不能让某个组件悄悄落回 CAD 的默认密度占位值。
     * 任何模式：声明表里出现未被纳入的组件（拼错/改名）即拒绝——静默忽略等于质量没生效。
-    * ``cad``：质量只能来自**已验证材料**的读数；原始读数明确记录了材料未验证时拒绝。
+    * ``cad``：材料未验证属于**可警告缺陷**：读数与几何原样保留（不猜密度、不替换
+      数值），组件名返回给调用方记录成非阻塞警告；独立校验据此要求"使用未验证读数
+      必须留下警告记录"。
     """
 
     documented = dict(cfg.get("documented_masses") or {})
@@ -338,14 +362,118 @@ def check_mass_contract(cfg: dict[str, Any], included: Iterable[str], masses: di
                 "documented_table requires a mass for every included component",
                 {"missing": missing[:20]},
             )
-        return
-    unverified = sorted(name for name in included_set if material_unverified(masses.get(name)))
-    if unverified:
+        return []
+    return sorted(name for name in included_set if material_unverified(masses.get(name)))
+
+
+def _material_warnings(unverified: Sequence[str], masses: dict[str, Any]) -> list[dict[str, Any]]:
+    """非阻塞警告：CAD 质量来自未经验证的材料（默认密度不是证据）。
+
+    读数保持原样——不猜密度、不替换数值；警告只保证下游无法把默认密度误当证据，
+    每个组件的原因逐字来自原始读数。
+    """
+
+    reasons = sorted(
+        {
+            str(
+                (((masses.get(name) or {}).get("reference") or {}).get("material_assignment") or {}).get(
+                    "unverified_reason"
+                )
+                or ""
+            )
+            for name in unverified
+        }
+        - {""}
+    )
+    return [
+        {
+            "code": "cad_material_provenance_missing",
+            "message": (
+                "CAD mass was measured from solids without an explicit physical material; "
+                "the document's default density is not evidence, and the values are kept "
+                "exactly as measured"
+            ),
+            "components": [str(name) for name in unverified],
+            "unverified_reasons": reasons,
+            "blocking": False,
+        }
+    ]
+
+
+def _tensor_delta(actual: Matrix3, reference: Matrix3) -> tuple[float, float]:
+    worst = 0.0
+    scale = 0.0
+    for row in range(3):
+        for column in range(3):
+            worst = max(worst, abs(float(actual[row][column]) - float(reference[row][column])))
+            scale = max(scale, abs(float(reference[row][column])))
+    return worst, worst / max(scale, 1e-30)
+
+
+def _direct_link_reads(
+    raw_scene: Any, bodies: Sequence[dict[str, Any]]
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """Validate the recorded direct link group reads; read 1 is authoritative."""
+
+    record = getattr(raw_scene, "link_group_mass_properties", None)
+    if not isinstance(record, dict) or record.get("schema_version") != LINK_GROUP_SCHEMA:
         raise ConfigError(
-            "CAD mass came from an unverified material (default density is not evidence); "
-            "assign materials or declare documented masses",
-            {"unverified_material": unverified[:20], "material_source": mode},
+            "the capture carries no direct link group mass properties record",
+            {"required": "raw/link_group_mass_properties.json", "schema": LINK_GROUP_SCHEMA},
         )
+    links = record.get("links")
+    expected = {str(body.get("name") or body.get("id") or "") for body in bodies}
+    if not isinstance(links, dict) or set(links) != expected:
+        raise ConfigError(
+            "the link group record does not cover exactly the configured bodies",
+            {"expected": sorted(expected), "recorded": sorted(links or [])},
+        )
+    meta = {
+        "assembly": str(record.get("assembly") or ""),
+        "configuration": str(record.get("configuration") or ""),
+        "used_api": str(record.get("used_api") or ""),
+        "selection_rule": str(record.get("selection_rule") or ""),
+    }
+    reads: dict[str, dict[str, Any]] = {}
+    for name in sorted(expected):
+        entry = links[name]
+        selection = entry.get("selection") if isinstance(entry, dict) else None
+        rows = entry.get("reads") if isinstance(entry, dict) else None
+        if (
+            not isinstance(selection, list)
+            or not selection
+            or any(not isinstance(item, str) or not item for item in selection)
+        ):
+            raise ConfigError("a link group selection is malformed", {"body": name})
+        if not isinstance(rows, list) or len(rows) != 2:
+            raise ConfigError("a link group record must carry two reads", {"body": name})
+        read = rows[0]
+        if not isinstance(read, dict):
+            raise ConfigError("a direct link read is malformed", {"body": name})
+        mass = read.get("mass_kg")
+        com = read.get("com_m")
+        tensor = read.get("inertia_tensor_about_com")
+        if type(mass) not in (int, float) or not math.isfinite(float(mass)) or float(mass) <= 0.0:
+            raise ConfigError("a direct link read has an invalid mass", {"body": name})
+        if (
+            not isinstance(com, list)
+            or len(com) != 3
+            or any(type(value) not in (int, float) or not math.isfinite(float(value)) for value in com)
+        ):
+            raise ConfigError("a direct link read has an invalid COM", {"body": name})
+        if (
+            not isinstance(tensor, list)
+            or len(tensor) != 3
+            or any(
+                not isinstance(row, list)
+                or len(row) != 3
+                or any(type(value) not in (int, float) or not math.isfinite(float(value)) for value in row)
+                for row in tensor
+            )
+        ):
+            raise ConfigError("a direct link read has an invalid inertia tensor", {"body": name})
+        reads[name] = {"selection": list(selection), "read": read}
+    return meta, reads
 
 
 def build_scene(
@@ -353,7 +481,7 @@ def build_scene(
     raw_scene: Any,
     geometry_entries: Sequence[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Assemble ``scene.json`` from the CAD readings and the source definition."""
+    """Assemble the portable scene from sealed CAD readings and source definition."""
 
     placements = {component.name: list(component.transform) for component in raw_scene.components}
     masses = {name: dict(payload) for name, payload in (raw_scene.mass_properties or {}).items()}
@@ -363,9 +491,13 @@ def build_scene(
         raise ConfigError("native discovery must define the rigid bodies")
 
     # 质量模式合同用**实际读数**复核（配置层只能查到声明层）：documented_table 必须覆盖
-    # 每个被纳入的组件；任何模式都不允许把"未验证材料"的 CAD 质量当作可用读数。
+    # 每个被纳入的组件；cad 模式下"材料未验证"的读数保留原值，但必须带警告记录。
     included = {str(item) for body in bodies for item in (body.get("components") or [])}
-    check_mass_contract(cfg, included, masses)
+    unverified_material = check_mass_contract(cfg, included, masses)
+    # The direct one-shot link reads are the authoritative link inertials.  The
+    # recombination below stays only as an audit block; a capture without the
+    # record fails closed (one supported schema, no fallback path).
+    direct_meta, direct_links = _direct_link_reads(raw_scene, bodies)
 
     links: list[dict[str, Any]] = []
     link_frames: dict[str, tuple[Matrix3, Vector3, str | None]] = {}
@@ -397,11 +529,73 @@ def build_scene(
                     "component has no CAD mass properties; capture materials or declare the body mass explicitly",
                     {"body": body_id, "component": component},
                 )
-            # scene.json holds what CAD read.  Declared masses are applied later,
+            # This initial scene holds what CAD read. Declared masses are applied later,
             # by load_scene, and only there do they become "used" values.
+            contextual = ((getattr(raw_scene, "notes", None) or {}).get("effective_instances") or {}).get(component)
+            if (
+                isinstance(contextual, dict)
+                and (contextual.get("reference") or {}).get("measurement_basis") == "cad_assembly_instance_measurement"
+            ):
+                payload = contextual
             payload = dict(payload, mass_source="cad")
             readings.append(_PartReading(component, placements[component], payload, link_rotation, link_translation))
-        combined = combine_mass_properties([reading.mass_entry() for reading in readings])
+        captured_effective = (getattr(raw_scene, "notes", None) or {}).get("effective_instances") or {}
+        effective_instances = {
+            str(instance): dict(reading)
+            for instance, reading in captured_effective.items()
+            if isinstance(reading, dict)
+        }
+        all_leaves = {str(component.name) for component in (raw_scene.components or [])}
+        member_set = set(components)
+        candidates = []
+        for instance, reading in sorted(effective_instances.items()):
+            if str(reading.get("document_type") or "") != "assembly":
+                continue
+            full_descendants = {
+                leaf for leaf in all_leaves if leaf == instance or leaf.startswith(instance + "/")
+            }
+            local = full_descendants & member_set
+            if not local or full_descendants != local:
+                # A parent substitutes only when its ENTIRE descendant leaf
+                # set lies in this rigid body; otherwise the leaf readings
+                # stay and the closure records the explicit blocker.
+                continue
+            candidates.append((instance, local, reading))
+        top_most = [
+            (instance, local, reading)
+            for instance, local, reading in candidates
+            if not any(
+                other != instance and (instance == other or instance.startswith(other + "/"))
+                for other, _local, _reading in candidates
+            )
+        ]
+        covered: set[str] = set()
+        entries = []
+        for instance, local, reading in top_most:
+            covered |= local
+            # The shallowest overridden ancestor is recorded in assembly document
+            # axes (scope assembly_component_group), so it must enter the link
+            # frame exactly like a leaf reading: with an identity placement. Using
+            # the component's own transform here would map assembly coordinates a
+            # second time and displace the delivered COM of every rotating link.
+            substituted = _PartReading(
+                str(instance), IDENTITY_PLACEMENT, reading, link_rotation, link_translation
+            )
+            entries.append(substituted.mass_entry())
+        entries.extend(reading.mass_entry() for reading in readings if reading.name not in covered)
+        combined = combine_mass_properties(entries)
+        direct = direct_links[name]
+        read = direct["read"]
+        link_rotation_t = _transpose(link_rotation)
+        direct_mass = float(read["mass_kg"])
+        direct_com_link = _matvec(
+            link_rotation_t,
+            tuple(float(value) - link_translation[index] for index, value in enumerate(read["com_m"])),
+        )
+        direct_inertia_link = _rotate_inertia(
+            link_rotation_t, [[float(value) for value in row] for row in read["inertia_tensor_about_com"]]
+        )
+        tensor_delta_max_abs, tensor_rel = _tensor_delta(combined["inertia"], direct_inertia_link)
         visuals = []
         for reading in readings:
             entry = geometry_by_component.get(reading.name)
@@ -421,10 +615,10 @@ def build_scene(
                 "id": body_id,
                 "name": name,
                 "inertial": {
-                    "mass": combined["mass"],
-                    "xyz": list(combined["com"]),
+                    "mass": direct_mass,
+                    "xyz": list(direct_com_link),
                     "rpy": [0.0, 0.0, 0.0],
-                    "inertia": _inertia6(combined["inertia"]),
+                    "inertia": _inertia6(direct_inertia_link),
                 },
                 "visuals": visuals,
                 "collisions": [],
@@ -444,9 +638,41 @@ def build_scene(
                     "combination": "parallel_axis_from_part_readings",
                     "link_frame": "cad_coordinate_system:" + body["frame"]["coordinate_system"],
                     "kinematics": "native_derived",
+                    "mass_properties": {
+                        "direct": {
+                            "selection": direct["selection"],
+                            "selection_rule": direct_meta["selection_rule"],
+                            "used_api": direct_meta["used_api"],
+                            "source": "raw/link_group_mass_properties.json",
+                        },
+                        "recombination": {
+                            "mass_kg": float(combined["mass"]),
+                            "com_link_m": [float(value) for value in combined["com"]],
+                            "inertia_link": _inertia6(combined["inertia"]),
+                        },
+                        "direct_vs_recombination": {
+                            "mass_delta_kg": float(combined["mass"]) - direct_mass,
+                            "com_delta_m": math.dist(
+                                [float(value) for value in combined["com"]],
+                                [float(value) for value in direct_com_link],
+                            ),
+                            "tensor_delta_max_abs": tensor_delta_max_abs,
+                            "tensor_rel": tensor_rel,
+                        },
+                    },
                 },
             }
         )
+        used_context = {
+            component for component in components if component not in covered
+            and ((effective_instances.get(component) or {}).get("reference") or {}).get("measurement_basis")
+            == "cad_assembly_instance_measurement"
+        }
+        effective_names = {instance for instance, _local, _reading in top_most} | used_context
+        if effective_names:
+            links[-1]["provenance"]["effective_instances"] = sorted(effective_names)
+            links[-1]["provenance"]["instance_measurements"] = "raw/effective_instances.json"
+            links[-1]["provenance"]["combination"] = "parallel_axis_from_cad_part_and_instance_readings"
 
     joint_entries = _build_joints(cfg, {link["name"] for link in links}, link_frames)
     frames = _build_frames(cfg, {link["name"] for link in links}, raw_scene, link_frames)
@@ -465,6 +691,21 @@ def build_scene(
                 "rpy": [float(value) for value in rpy_from_matrix(rotation_root)],
                 "source": f"cad_coordinate_system:{reference}",
             }
+    scene_provenance: dict[str, Any] = {
+        "provider": "solidworks",
+        "assembly": cfg.get("assembly"),
+        "configuration": cfg.get("configuration"),
+        "bodies_source": "native_derived",
+        "coordinate_systems_read": sorted((raw_scene.coordinate_systems or {}).keys()),
+        # every native entity that a consumer must account for; the common
+        # layer checks that the links below cover exactly this set
+        "expected_entities": sorted(included),
+        "native_entities": sorted(placements),
+        "unassigned_entities": sorted(set(placements) - included),
+        "world_from_root": world_from_root,
+    }
+    if unverified_material:
+        scene_provenance["warnings"] = _material_warnings(unverified_material, masses)
     return {
         "schema_version": SCENE_SCHEMA,
         "name": cfg.get("robot_name", "robot"),
@@ -477,17 +718,7 @@ def build_scene(
         "constraints": list(cfg.get("constraints") or []),
         "control": dict(cfg.get("control") or {}),
         "contact_excludes": list(cfg.get("contact_excludes") or []),
-        "provenance": {
-            "provider": "solidworks",
-            "assembly": cfg.get("assembly"),
-            "configuration": cfg.get("configuration"),
-            "bodies_source": "native_derived",
-            "coordinate_systems_read": sorted((raw_scene.coordinate_systems or {}).keys()),
-            # every native entity that a consumer must account for; the common
-            # layer checks that the links below cover exactly this set
-            "expected_entities": sorted(placements),
-            "world_from_root": world_from_root,
-        },
+        "provenance": scene_provenance,
     }
 
 
@@ -630,7 +861,7 @@ def _build_frames(
 
 
 def load_scene(snapshot_root: Path) -> dict[str, Any]:
-    """Read a frozen snapshot and return its scene, after verifying the snapshot.
+    """Verify a frozen snapshot and derive its scene on the portable host.
 
     The snapshot itself stays raw.  Declared author decisions - currently the
     documented mass table - are applied *here*: every applied value is recorded
@@ -642,10 +873,9 @@ def load_scene(snapshot_root: Path) -> dict[str, Any]:
 
     root = Path(snapshot_root).resolve()
     manifest = verify_snapshot(root)
-    scene_path = root / str(manifest.get("scene") or "scene.json")
-    if not scene_path.is_file():
-        raise ConfigError("snapshot has no scene.json", {"snapshot": str(root)})
-    scene = read_json(scene_path)
+    from .captured import derive_scene
+
+    scene = derive_scene(root, manifest)
     if not isinstance(scene, dict) or scene.get("schema_version") != SCENE_SCHEMA:
         raise ConfigError("unexpected scene schema", {"snapshot": str(root)})
     if scene.get("units") != "SI":

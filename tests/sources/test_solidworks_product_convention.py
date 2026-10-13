@@ -189,21 +189,24 @@ class ProductConventionTests(unittest.TestCase):
 
     def test_native_reading_without_a_convention_is_refused(self) -> None:
         self.backend.components[0]["mass"] = self._benchmark_payload("base-1", convention=None)
+        snapshot = self._freeze("no-convention")
         with self.assertRaises(ConfigError) as raised:
-            self._freeze("no-convention")
+            load_scene(snapshot)
         self.assertIn("product_convention", str(raised.exception))
 
     def test_fixture_readings_also_require_an_explicit_convention(self) -> None:
         payload = support.mass_payload(1.2, inertia=BENCHMARK["base-1"]["tensor"].tolist())
         payload["reference"].pop("product_convention")
         self.backend.components[0]["mass"] = payload
+        snapshot = self._freeze("no-convention")
         with self.assertRaises(ConfigError):
-            self._freeze("no-convention")
+            load_scene(snapshot)
 
     def test_positive_product_convention_is_rejected(self) -> None:
         self.backend.components[0]["mass"] = self._benchmark_payload("base-1", convention="solidworks_positive")
+        snapshot = self._freeze("unsupported-convention")
         with self.assertRaises(ConfigError):
-            self._freeze("unsupported-convention")
+            load_scene(snapshot)
 
     # --- 独立校验端 ---------------------------------------------------
 
@@ -232,8 +235,9 @@ class ProductConventionTests(unittest.TestCase):
 
     def test_unsupported_convention_is_refused(self) -> None:
         self.backend.components[0]["mass"] = self._benchmark_payload("base-1", convention="ansys_tensor")
+        snapshot = self._freeze("unsupported")
         with self.assertRaises(ConfigError) as raised:
-            self._freeze("unsupported")
+            load_scene(snapshot)
         self.assertIn("product_convention", str(raised.exception))
 
 

@@ -7,6 +7,7 @@ portable role).  The control fixture is explicitly NOT native CAD qualification.
 
 from __future__ import annotations
 
+import copy
 import json
 import shutil
 import tempfile
@@ -22,6 +23,7 @@ from description_pipeline.orchestration import linux_runner
 from description_pipeline.orchestration.linux_store import LinuxStore
 from description_pipeline.sources.solidworks.discovery import prepare_native_package
 from description_pipeline.sources.solidworks.revision import package_inventory
+from description_pipeline.sources.solidworks.selection import seal_closure_selection
 
 from tests.sources import support
 from tests.sources.test_solidworks_discovery import FakeBackend, record as native_record
@@ -29,8 +31,42 @@ from .test_linux_split import portable_record
 from .test_stage_transfer import native_tool
 
 
+def capture_record() -> dict:
+    """The shared discovery fixture sealed with this assembly's occurrence identities.
+
+    The capture proves occurrence coverage by exact ``(owner document, instance)``
+    identity between the admitted closure and the re-opened session.  The shared
+    fixture spells closure instances as canonical document names, so re-seal it
+    with the Name2-style instances the fixture session reports.
+    """
+
+    record = copy.deepcopy(native_record())
+    selection = record["source_selection"]
+    instances = {"cad/base.SLDPRT": "base-1", "cad/arm.SLDPRT": "arm-1"}
+    for edge in selection["closure"]["documents"]["cad/robot.SLDASM"]["resolved_edges"]:
+        edge["instance"] = instances[edge["resolved"].replace("\\", "/")]
+    files = {**selection["excluded_files"], **selection["files"]}
+    record["source_selection"] = seal_closure_selection(
+        files,
+        selection["main_assembly"],
+        selection["closure"],
+        reader_sha256=selection["reader_sha256"],
+    )
+    return record
+
+
 class AxisFixtureBackend(support.FixtureCadBackend):
     """Fixture backend that can resolve the authored joint axis selector."""
+
+    def assembly_mass_properties(self, path):
+        from description_pipeline.sources.solidworks.errors import CadError
+
+        raise CadError("cad_mass_property_unavailable", "Control fixture has no native whole-assembly reading")
+
+    def assembly_component_mass_properties(self, path):
+        from description_pipeline.sources.solidworks.errors import CadError
+
+        raise CadError("cad_component_context_unavailable", "Control fixture has no native instance context")
 
     def capture_axis_reference(self, reference):
         record = {
@@ -48,6 +84,22 @@ class AxisFixtureBackend(support.FixtureCadBackend):
         if isinstance(reference.get("face_index"), int) and not isinstance(reference.get("face_index"), bool):
             record["face_index"] = reference["face_index"]
         return record
+
+    def export_component_meshes(self, destinations, progress=None):
+        """Mirror the native exporter response: body counts plus tessellation accounting.
+
+        The real native reader reports, per component, the native body counts and
+        the display-tessellation accounting (total faces and any facetless sheet
+        faces) beside the exported mesh identity.  The control fixture reports
+        the canonical cube stand-in: one solid body whose six faces all
+        tessellate, with no omitted faces.
+        """
+
+        entries = super().export_component_meshes(destinations, progress=progress)
+        for info in entries.values():
+            info["bodies"] = {"solid": 1, "sheet": 0}
+            info["tessellation"] = {"faces": 6, "no_facets_faces": []}
+        return entries
 
 
 class SplitRoundtripTests(unittest.TestCase):
@@ -71,7 +123,7 @@ class SplitRoundtripTests(unittest.TestCase):
             json.dumps({"robot": {"expected_mass_kg": [0.28, 0.32], "expected_extent_m": [0.35, 0.5]}}),
             encoding="utf-8",
         )
-        self.discovery_backend = FakeBackend(native_record())
+        self.discovery_backend = FakeBackend(capture_record())
         self.capture_output = self.root / "capture-delivery"
         self.delivery_output = self.root / "portable-delivery"
         self.prepared = self.root / "prepared"

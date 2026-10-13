@@ -9,8 +9,8 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-from ...io import PipelineError, _filesystem_path, artifact_path_parts, confined, digest
-from .revision import package_inventory
+from ...io import PipelineError, _filesystem_path, artifact_path_parts, confined, digest, inventory
+from .revision import NATIVE_SUFFIXES, package_inventory
 
 HANDOFF_SCHEMA = "solidworks-to-urdf.handoff/v1"
 MAX_HANDOFF_BYTES = 16 * 1024**3
@@ -141,15 +141,31 @@ def prepare_archive(source: Path, archive: Path) -> dict:
     return identity
 
 
+def _native_lock_member(name: str) -> bool:
+    """The exact ``~$*`` native-lock predicate of ``package_inventory``."""
+
+    path = Path(name)
+    return path.name.startswith("~$") and path.suffix.lower() in NATIVE_SUFFIXES
+
+
 def import_archive(archive: Path, store: Path) -> tuple[Path, dict]:
-    """Extract only regular, portable files; validate before installing a package."""
+    """Extract only regular, portable files, validate in place, install atomically.
+
+    The extracted tree is probed as the package itself and renamed into the
+    content-addressed store: one extraction and no second whole-package copy.
+    SolidWorks lock transients are skipped at extraction; the raw physical
+    inventory then has to equal the bound inventory exactly, so any other
+    unexpected path fails closed.  Immutable target, identical-bytes reuse and
+    concurrent-install tolerance are unchanged.
+    """
     if Path(archive).stat().st_size > MAX_HANDOFF_BYTES:
         raise PipelineError("Mechanical handoff transport exceeds the 16 GiB limit")
     store = _directory(Path(store), exists=False)
     store.mkdir(parents=True, exist_ok=True)
     store = _directory(store)
     with tempfile.TemporaryDirectory(prefix=".upload-", dir=store) as temporary:
-        package = Path(temporary)
+        package = Path(temporary) / "package"
+        package.mkdir()
         try:
             with zipfile.ZipFile(archive) as incoming:
                 members = incoming.infolist()
@@ -170,10 +186,32 @@ def import_archive(archive: Path, store: Path) -> tuple[Path, dict]:
                     if member.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
                         raise PipelineError("Unsupported handoff ZIP compression")
                 for member in members:
-                    target = Path(_filesystem_path(confined(package, member.filename, exists=False)))
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    with incoming.open(member) as original, target.open("xb") as output:
+                    if _native_lock_member(member.filename):
+                        # SolidWorks locks are never handoff content: skipping them
+                        # here keeps the installed package exactly the bound inventory.
+                        continue
+                    member_path = Path(_filesystem_path(confined(package, member.filename, exists=False)))
+                    member_path.parent.mkdir(parents=True, exist_ok=True)
+                    with incoming.open(member) as original, member_path.open("xb") as output:
                         shutil.copyfileobj(original, output, length=1024 * 1024)
         except (zipfile.BadZipFile, EOFError, RuntimeError) as error:
             raise PipelineError(f"Invalid handoff ZIP: {error}") from error
-        return freeze_handoff(package, store)
+        identity = describe_handoff(package)
+        # The raw physical inventory must equal the bound inventory: any path that
+        # appeared beyond the identity fails closed instead of being deleted.
+        if inventory(package) != identity["files"]:
+            raise PipelineError("Mechanical handoff changed during import; no native job was started")
+        target = store / identity["handoff_sha256"]
+        if target.exists():
+            if describe_handoff(target) != identity:
+                raise PipelineError(
+                    "Managed handoff inventory was modified; retain its diagnostics and repair the store"
+                )
+            return target, identity
+        try:
+            os.rename(package, target)
+        except OSError:
+            # Another import may have installed these same bytes concurrently.
+            if not target.is_dir() or describe_handoff(target) != identity:
+                raise
+    return target, identity

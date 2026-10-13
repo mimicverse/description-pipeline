@@ -23,8 +23,8 @@ from description_pipeline.sources.solidworks.discovery import prepare_native_pac
 from description_pipeline.sources.solidworks.revision import package_inventory
 
 from tests.sources import support
-from tests.sources.test_solidworks_discovery import FakeBackend, record as native_record
-from tests.v1.test_split_roundtrip import AxisFixtureBackend
+from tests.sources.test_solidworks_discovery import FakeBackend
+from tests.v1.test_split_roundtrip import AxisFixtureBackend, capture_record
 
 #: The release-only gates a control fixture can never satisfy; any other failure is a defect.
 CONTROL_LIMITS = frozenset(
@@ -115,7 +115,7 @@ def build_fixture_capture(root: Path, *, run_id: str, main_assembly: str = "cad/
         main_assembly=main_assembly,
         configuration={"record_roots": [str(records)]},
         targets={"nd_fixture": {"repository_slug": "example/m3.0", "base": "feature/m3.0"}},
-        preparer=lambda *args, **kwargs: prepare_native_package(*args, backend=FakeBackend(native_record()), **kwargs),
+        preparer=lambda *args, **kwargs: prepare_native_package(*args, backend=FakeBackend(capture_record()), **kwargs),
         on_event=record,
     )
     backend = AxisFixtureBackend(

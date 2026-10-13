@@ -32,19 +32,17 @@ class StageTests(unittest.TestCase):
     def test_stage_contract_declares_the_execution_host_per_stage(self):
         expected = {
             "freeze": "native",
-            "discover": "native",
+            "discover": "native+portable",
             "capture": "native",
             "generate": "portable",
             "verify": "portable",
             "publish": "portable",
         }
-        self.assertEqual(HOST_IDS, ("native", "portable"))
+        self.assertEqual(HOST_IDS, ("native", "portable", "native+portable"))
         self.assertEqual({stage["id"]: stage["host"] for stage in CONTRACT["stages"]}, expected)
         view = stage_view()
         self.assertEqual({stage["id"]: stage["host"] for stage in view["stages"]}, expected)
-        self.assertEqual(
-            {stage["id"]: stage["host"] for stage in compact_view(view)["stages"]}, expected
-        )
+        self.assertEqual({stage["id"]: stage["host"] for stage in compact_view(view)["stages"]}, expected)
         self.assertEqual(stage_host("generate"), "portable")
         with self.assertRaises(PipelineError):
             stage_host("wait_for_job")

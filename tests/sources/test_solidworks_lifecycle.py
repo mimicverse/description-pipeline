@@ -6,12 +6,16 @@ import os
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from . import _paths  # noqa: F401
+from description_pipeline.sources.solidworks import isolation  # noqa: E402
 from description_pipeline.sources.solidworks.errors import BridgeError, CadError, EnvironmentError_  # noqa: E402
 from description_pipeline.sources.solidworks.executor import ComExecutor  # noqa: E402
-from description_pipeline.sources.solidworks.isolation import CadSession  # noqa: E402
+from description_pipeline.sources.solidworks.isolation import (  # noqa: E402
+    CadSession,
+    terminate_remnant_processes,
+)
 from description_pipeline.sources.solidworks.native import (  # noqa: E402
     SolidWorksBackend,
     _read_only_document,
@@ -264,6 +268,34 @@ class SessionTests(unittest.TestCase):
         binder.assert_called_once_with(42)
         session.close()
 
+    def test_startup_timeout_terminates_the_started_process(self):
+        process = SimpleNamespace(pid=42, executable="test.exe", alive=lambda: True, close=Mock())
+        app = SimpleNamespace(Visible=True, CommandInProgress=False, StartupProcessCompleted=False)
+        binder = Mock(return_value=app)
+        session = CadSession(process=process, binder=binder, startup_timeout=0)
+
+        with self.assertRaises(EnvironmentError_) as caught:
+            session.connect(threading.Event())
+        self.assertEqual(caught.exception.code, "cad_startup_failed")
+        self.assertEqual(caught.exception.detail["pid"], 42)
+        process.close.assert_called_once()
+        self.assertFalse(session.closed)
+
+    def test_startup_timeout_cleanup_failure_does_not_mask_the_timeout(self):
+        process = SimpleNamespace(
+            pid=42,
+            executable="test.exe",
+            alive=lambda: True,
+            close=Mock(side_effect=OSError("still running")),
+        )
+        app = SimpleNamespace(Visible=True, CommandInProgress=False, StartupProcessCompleted=False)
+        session = CadSession(process=process, binder=Mock(return_value=app), startup_timeout=0)
+
+        with self.assertRaises(EnvironmentError_) as caught:
+            session.connect(threading.Event())
+        self.assertEqual(caught.exception.code, "cad_startup_failed")
+        process.close.assert_called_once()
+
     def test_startup_read_failure_is_preserved_and_never_retried(self):
         failure = RuntimeError("RPC_S_UNKNOWN_IF")
 
@@ -515,3 +547,52 @@ class SessionTests(unittest.TestCase):
         sessions[0].close.assert_called_once()
         sessions[1].close.assert_called_once()
         self.assertEqual(backend._sessions, {})
+
+
+class RemnantSweepTests(unittest.TestCase):
+    """The pre-start sweep kills only same-executable leftovers."""
+
+    EXE = "/opt/SLDPRT/SLDWORKS.exe"
+
+    def test_same_executable_leftovers_are_terminated_with_one_settle(self):
+        killed = []
+        slept = []
+        table = [(11, self.EXE), (22, "/opt/other/other.exe"), (33, self.EXE)]
+        with patch.object(isolation, "_TRACKED_PIDS", set()):
+            result = terminate_remnant_processes(
+                self.EXE,
+                process_table=lambda: table,
+                terminate_pid=killed.append,
+                sleep=slept.append,
+            )
+        self.assertEqual(result, [11, 33])
+        self.assertEqual(killed, [11, 33])
+        self.assertEqual(slept, [isolation.REMNANT_SETTLE_SECONDS])
+
+    def test_tracked_and_excluded_pids_are_never_swept(self):
+        killed = []
+        slept = []
+        table = [(11, self.EXE), (33, self.EXE)]
+        with patch.object(isolation, "_TRACKED_PIDS", {11}):
+            result = terminate_remnant_processes(
+                self.EXE,
+                exclude_pids={33},
+                process_table=lambda: table,
+                terminate_pid=killed.append,
+                sleep=slept.append,
+            )
+        self.assertEqual(result, [])
+        self.assertEqual(killed, [])
+        self.assertEqual(slept, [])
+
+    def test_no_leftovers_leave_the_settle_untouched(self):
+        slept = []
+        with patch.object(isolation, "_TRACKED_PIDS", set()):
+            result = terminate_remnant_processes(
+                self.EXE,
+                process_table=list,
+                terminate_pid=Mock(),
+                sleep=slept.append,
+            )
+        self.assertEqual(result, [])
+        self.assertEqual(slept, [])

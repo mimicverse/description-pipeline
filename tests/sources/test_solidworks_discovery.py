@@ -9,6 +9,7 @@ independent verifier that re-derives every claim from the bound record.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import shutil
 import tempfile
@@ -25,15 +26,20 @@ from description_pipeline.sources.solidworks.discovery import (  # noqa: E402
     CONTRACT,
     DISCOVERY_SCHEMA,
     DiscoverySettings,
+    _budgets,
     _clusters,
     _component_frames,
+    _identity,
     _mate_rows,
     _unit,
+    derive_native_package,
     prepare_native_package,
 )
 from description_pipeline.sources.solidworks.errors import CadError  # noqa: E402
 from description_pipeline.sources.solidworks.native import _merge_property_scopes  # noqa: E402
 from description_pipeline.verification.native_discovery import verify_discovery  # noqa: E402
+
+from .selection_support import sealed_selection  # noqa: E402
 from description_pipeline.verification.solidworks_urdf import _native_discovery  # noqa: E402
 
 IDENTITY = [
@@ -154,6 +160,19 @@ def _grounding_mates() -> list[dict]:
 def record() -> dict:
     """Two rigid bodies and one hinge: concentric shaft plus a coincident plane."""
 
+    files = {
+        name: hashlib.sha256(f"placeholder {name}\n".encode()).hexdigest()
+        for name in ("cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT")
+    }
+    source_selection = sealed_selection(
+        files,
+        "cad/robot.SLDASM",
+        edges={
+            "cad/robot.SLDASM": ["cad/base.SLDPRT", "cad/arm.SLDPRT"],
+            "cad/base.SLDPRT": [],
+            "cad/arm.SLDPRT": [],
+        },
+    )
     return {
         "schema_version": DISCOVERY_SCHEMA,
         "contract": CONTRACT,
@@ -176,6 +195,8 @@ def record() -> dict:
                 "configuration": "Default",
                 "fixed": True,
                 "suppressed": False,
+                "lightweight": False,
+                "suppression_state": 2,
                 "transform": copy.deepcopy(IDENTITY),
             },
             {
@@ -185,6 +206,8 @@ def record() -> dict:
                 "configuration": "Default",
                 "fixed": False,
                 "suppressed": False,
+                "lightweight": False,
+                "suppression_state": 2,
                 "transform": copy.deepcopy(IDENTITY),
             },
         ],
@@ -253,7 +276,8 @@ def record() -> dict:
                 }
             },
         },
-        "files": {},
+        "files": files,
+        "source_selection": source_selection,
     }
 
 
@@ -261,7 +285,7 @@ class FakeBackend:
     def __init__(self, payload: dict):
         self.payload = payload
 
-    def discover_native(self, frozen_source: Path, settings: dict) -> dict:
+    def discover_native(self, frozen_source: Path, settings: dict, *, on_activity=None) -> dict:
         return copy.deepcopy(self.payload)
 
 
@@ -311,6 +335,45 @@ class DiscoveryTests(unittest.TestCase):
     def _codes(self, result) -> list[str]:
         self.assertFalse(result.passed)
         return [finding["code"] for finding in result.findings]
+
+    def test_native_preparation_forwards_the_guarded_activity_sink(self):
+        class ActivityBackend:
+            def __init__(self):
+                self.sink = None
+
+            def discover_native(self, frozen_source, settings, *, on_activity=None):
+                self.sink = on_activity
+                if on_activity is not None:
+                    on_activity({"phase": "discover", "action": "read_components", "completed": 1, "total": 2})
+                return copy.deepcopy(record())
+
+        source, records = self._native()
+        received = []
+
+        def observer(item):
+            received.append(item)
+            raise RuntimeError("observer failures must never propagate")
+
+        backend = ActivityBackend()
+        prepare_native_package(
+            source,
+            self.tmp / "prepared-activity",
+            run_id="run-1",
+            backend=backend,
+            settings=DiscoverySettings(record_roots=(records,)),
+            on_activity=observer,
+        )
+        self.assertEqual(received[0]["action"], "read_components")
+
+        plain = ActivityBackend()
+        prepare_native_package(
+            source,
+            self.tmp / "prepared-no-activity",
+            run_id="run-1",
+            backend=plain,
+            settings=DiscoverySettings(record_roots=(records,)),
+        )
+        self.assertIsNone(plain.sink)
 
     # ----------------------------------------------------------------- positive
 
@@ -711,9 +774,7 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual((joints[0]["parent"], joints[0]["child"]), ("base_link", "arm_link"))
         # The grounding mates add no joint and never rewrite the raw evidence.
         raw = json.loads((output / "discovery" / "native-discovery.json").read_text(encoding="utf-8"))["raw"]
-        self.assertEqual(
-            [datum["name"] for datum in raw["datums"]], ["CS_base_link", "CS_arm_link", "SCS_tool_flange"]
-        )
+        self.assertEqual([datum["name"] for datum in raw["datums"]], ["CS_base_link", "CS_arm_link", "SCS_tool_flange"])
         self.assertEqual([datum["owner"] for datum in raw["datums"]], ["", "arm-1", ""])
         frame_entity = next(
             entity
@@ -979,13 +1040,138 @@ class DiscoveryTests(unittest.TestCase):
 
     # ----------------------------------------------------------------- blocking
 
-    def test_missing_identity_blocks_the_package(self):
+    def test_missing_identity_defers_to_publication_readiness(self):
         result, _source, output = self._prepare(mutate=lambda payload: payload["identity"].pop("hardware_id"))
-        codes = self._codes(result)
-        self.assertIn("discovery.identity_missing", codes)
-        self.assertFalse((output / "robot.yaml").exists())
+        self.assertTrue(result.passed, result.findings)
+        finding = next(item for item in result.findings if item["code"] == "discovery.identity_missing")
+        self.assertFalse(finding["blocking"])
+        self.assertEqual(finding["detail"]["publication_blocker"], "hardware_id")
+        self.assertEqual(result.revision_sha256, "")
+        self.assertFalse((output / "cad-revision.json").exists())
+        self.assertTrue((output / "robot.yaml").is_file())
         self.assertTrue((output / "discovery/native-discovery.json").is_file())
         self.assertTrue((output / "discovery/findings.json").is_file())
+        payload = json.loads(result.discovery_path.read_text())
+        self.assertIsNone(payload["identity"]["hardware_id"])
+        self.assertIsNone(result.source["hardware_id"])
+
+    def test_each_absent_administrative_field_defers_publication(self):
+        complete = {
+            "identity": {
+                "hardware_id": "wire_test",
+                "revision": "r1",
+                "owner": "owner",
+                "change_summary": "summary",
+                "control": {"system": "handoff", "reference": "ref"},
+                "robot_name": "wire_test",
+            },
+            "properties": {"document": {}},
+        }
+        for field, code, blocker in (
+            ("hardware_id", "discovery.identity_missing", "hardware_id"),
+            ("revision", "discovery.revision_missing", "revision"),
+            ("owner", "discovery.owner_missing", "owner"),
+            ("change_summary", "discovery.summary_missing", "change_summary"),
+            ("control", "discovery.control_missing", "control"),
+        ):
+            with self.subTest(field=field):
+                record = copy.deepcopy(complete)
+                record["identity"].pop(field)
+                findings: list[dict] = []
+                identity = _identity(
+                    record,
+                    DiscoverySettings(),
+                    findings,
+                    configuration="Default",
+                    assembly="robot.SLDASM",
+                    native_files={"robot.SLDASM": "0" * 64},
+                )
+                item = next(finding for finding in findings if finding["code"] == code)
+                self.assertFalse(item["blocking"])
+                self.assertEqual(item["detail"]["publication_blocker"], blocker)
+                self.assertFalse([finding for finding in findings if finding["blocking"]])
+                if field == "control":
+                    self.assertIsNone(identity["control"])
+                else:
+                    self.assertIsNone(identity[field])
+        record = copy.deepcopy(complete)
+        record["identity"].pop("robot_name")
+        findings = []
+        identity = _identity(
+            record,
+            DiscoverySettings(),
+            findings,
+            configuration="Default",
+            assembly="robot.SLDASM",
+            native_files={"robot.SLDASM": "0" * 64},
+        )
+        item = next(finding for finding in findings if finding["code"] == "discovery.robot_name_missing")
+        self.assertFalse(item["blocking"])
+        self.assertEqual(item["detail"], {"technical_name": "wire_test", "authored": False})
+        self.assertIsNone(identity["robot_name"])
+        self.assertEqual(identity["robot_name_technical"], "wire_test")
+        self.assertFalse([finding for finding in findings if finding["blocking"]])
+
+    def test_absent_identity_fields_use_a_technical_robot_name(self):
+        findings: list[dict] = []
+        identity = _identity(
+            {"identity": {}, "properties": {"document": {}}},
+            DiscoverySettings(),
+            findings,
+            configuration="Default",
+            assembly="robot.SLDASM",
+            native_files={"robot.SLDASM": "0" * 64},
+        )
+        self.assertIsNone(identity["robot_name"])
+        self.assertEqual(identity["robot_name_technical"], "robot")
+        item = next(finding for finding in findings if finding["code"] == "discovery.robot_name_missing")
+        self.assertEqual(item["detail"], {"technical_name": "robot", "authored": False})
+        findings = []
+        identity = _identity(
+            {"identity": {"hardware_id": "Wrist_Drive-2"}, "properties": {"document": {}}},
+            DiscoverySettings(),
+            findings,
+            configuration="Default",
+            assembly="robot.SLDASM",
+            native_files={"robot.SLDASM": "0" * 64},
+        )
+        self.assertIsNone(identity["robot_name"])
+        self.assertEqual(identity["robot_name_technical"], "wrist_drive_2")
+
+    def test_malformed_supplied_identity_still_blocks(self):
+        complete = {
+            "identity": {
+                "hardware_id": "wire_test",
+                "revision": "r1",
+                "owner": "owner",
+                "change_summary": "summary",
+                "control": {"system": "handoff", "reference": "ref"},
+                "robot_name": "wire_test",
+            },
+            "properties": {"document": {}},
+        }
+        for field, value, code in (
+            ("hardware_id", "1bad", "discovery.identity_invalid"),
+            ("revision", "bad rev", "discovery.revision_invalid"),
+            ("owner", "bad\x01owner", "discovery.owner_invalid"),
+            ("change_summary", "\x7f", "discovery.summary_invalid"),
+            ("robot_name", "Bad Name", "discovery.robot_name_invalid"),
+            ("control", {"system": "svn", "reference": "ref"}, "discovery.control_invalid"),
+            ("control", {"system": "git", "reference": "branch-main"}, "discovery.control_invalid"),
+        ):
+            with self.subTest(field=field, value=value):
+                record = copy.deepcopy(complete)
+                record["identity"][field] = value
+                findings: list[dict] = []
+                _identity(
+                    record,
+                    DiscoverySettings(),
+                    findings,
+                    configuration="Default",
+                    assembly="robot.SLDASM",
+                    native_files={"robot.SLDASM": "0" * 64},
+                )
+                self.assertIn(code, [finding["code"] for finding in findings if finding["blocking"]])
 
     def test_unknown_mate_type_blocks_instead_of_going_rigid(self):
         result, _source, output = self._prepare(
@@ -1037,11 +1223,49 @@ class DiscoveryTests(unittest.TestCase):
         result, _source, _output = self._prepare(mutate=mutate)
         self.assertIn("discovery.joint_axis_selector_missing", self._codes(result))
 
-    def test_missing_design_budget_record_blocks(self):
-        result, _source, _output = self._prepare(
-            mutate=lambda payload: payload["properties"]["document"].pop("dp.design_budget_record")
-        )
-        self.assertIn("discovery.design_budget_missing", self._codes(result))
+    def test_unspecified_design_budget_adds_no_ranges_and_no_blocker(self):
+        payload = record()
+        payload["properties"]["document"].pop("dp.design_budget_record")
+        findings = []
+        with mock.patch("description_pipeline.sources.solidworks.discovery._resolve_record") as resolve:
+            checks, evidence = _budgets(payload, DiscoverySettings(), findings)
+        resolve.assert_not_called()
+        self.assertEqual(checks, {})
+        self.assertIsNone(evidence)
+        self.assertEqual([item["code"] for item in findings], ["discovery.design_budget_unspecified"])
+        self.assertFalse(findings[0]["blocking"])
+
+    def test_unspecified_budget_does_not_replace_missing_inferred_joint_drive(self):
+        def mutate(payload):
+            payload["properties"]["document"].pop("dp.design_budget_record")
+            payload["properties"]["mates"]["shoulder_pitch_joint__coaxial"].pop("dp.joint.drive_record")
+
+        result, _source, output = self._prepare(mutate=mutate)
+        blockers = {item["code"] for item in result.findings if item["blocking"]}
+        self.assertEqual(blockers, {"discovery.joint_drive_missing", "discovery.tree_disconnected"})
+        budget = next(item for item in result.findings if item["code"] == "discovery.design_budget_unspecified")
+        self.assertFalse(budget["blocking"])
+        payload = json.loads((output / "discovery/native-discovery.json").read_text())
+        self.assertNotIn("budget", payload)
+
+    def test_explicit_missing_design_budget_record_still_blocks(self):
+        def mutate(payload):
+            payload["properties"]["document"]["dp.design_budget_record"] = "missing-budget.json#robot"
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        self.assertIn("discovery.record_missing", self._codes(result))
+        self.assertNotIn("discovery.design_budget_unspecified", {item["code"] for item in result.findings})
+
+    def test_explicit_invalid_budget_reference_is_not_treated_as_unspecified(self):
+        for reference in (False, 42, [], {}):
+            payload = record()
+            payload["properties"]["document"]["dp.design_budget_record"] = reference
+            findings = []
+            checks, evidence = _budgets(payload, DiscoverySettings(), findings)
+            self.assertIsNone(checks)
+            self.assertIsNone(evidence)
+            self.assertEqual([item["code"] for item in findings], ["discovery.design_budget_invalid"])
+            self.assertTrue(findings[0]["blocking"])
 
     def test_nonfinite_controlled_budget_retains_serializable_blocking_findings(self):
         def mutate(_payload):
@@ -1564,9 +1788,7 @@ class DiscoveryTests(unittest.TestCase):
         ):
             rows, findings = run(broken)
             self.assertIsNone(rows)
-            self.assertTrue(
-                any(item["code"] == "discovery.mate_entities_unsupported" for item in findings), findings
-            )
+            self.assertTrue(any(item["code"] == "discovery.mate_entities_unsupported" for item in findings), findings)
 
     def test_coincident_circle_with_plane_locks_alignment_and_position(self):
         frames = _component_frames(record(), [])
@@ -1859,6 +2081,256 @@ class MateReaderTests(unittest.TestCase):
         from description_pipeline.sources.solidworks.native import _mate_specific
 
         self.assertIsNone(_mate_specific(FakeMateFeature("RefPlane"), strict=False))
+
+
+class SuppressionStateTests(unittest.TestCase):
+    """The documented raw GetSuppression2 state is required, admitted and coherent."""
+
+    def test_valid_record_states_pass_the_verifier_gate(self) -> None:
+        from description_pipeline.verification.native_discovery import _require_suppression_states
+
+        _require_suppression_states(record())
+
+    def test_shape_checks_are_not_vacuous(self) -> None:
+        from description_pipeline.verification.native_discovery import _Failure, _require_suppression_states
+
+        for label, value in (
+            ("no_components", {"components": None}),
+            ("missing_components", {}),
+            ("non_dict_entry", {"components": [None]}),
+        ):
+            with self.subTest(case=label), self.assertRaises(_Failure):
+                _require_suppression_states(value)
+        # An empty component list is allowed by the existing graph check.
+        _require_suppression_states({"components": []})
+
+    def test_verifier_refuses_invalid_or_incoherent_states(self) -> None:
+        from description_pipeline.verification.native_discovery import _Failure, _require_suppression_states
+
+        for label, state, suppressed in (
+            ("state5", 5, None),
+            ("missing", None, None),
+            ("boolean", True, None),
+            ("unknown", 7, None),
+            ("incoherent-suppressed", 2, True),
+            ("incoherent-lightweight", 2, None),
+        ):
+            with self.subTest(case=label):
+                payload = record()
+                component = payload["components"][0]
+                if label == "missing":
+                    component.pop("suppression_state")
+                else:
+                    component["suppression_state"] = state
+                if suppressed is not None:
+                    component["suppressed"] = suppressed
+                if label == "incoherent-lightweight":
+                    component["lightweight"] = True
+                with self.assertRaises(_Failure):
+                    _require_suppression_states(payload)
+
+    def test_verifier_refuses_a_lightweight_occurrence_for_measurement(self) -> None:
+        from description_pipeline.verification.native_discovery import _Failure, _require_suppression_states
+
+        for state in (1, 4):
+            with self.subTest(state=state):
+                payload = record()
+                payload["components"][0].update(suppression_state=state, suppressed=False, lightweight=True)
+                with self.assertRaises(_Failure):
+                    _require_suppression_states(payload)
+
+
+class DerivationSplitTests(unittest.TestCase):
+    """The pure derivation runs without any native module or CAD session."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="sw-derive-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _scene(self) -> tuple[Path, Path]:
+        root = self.tmp / "native"
+        for name in ("cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT"):
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f"placeholder {name}\n".encode())
+        records = self.tmp / "records"
+        path = records / "joints" / "arm.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"limits": {"lower": -1.5, "upper": 1.5}, "drive": {"effort": 6.0, "velocity": 2.0}}),
+            encoding="utf-8",
+        )
+        (records / "budget.json").write_text(
+            json.dumps({"robot": {"expected_mass_kg": [0.28, 0.32], "expected_extent_m": [0.35, 0.5]}}),
+            encoding="utf-8",
+        )
+        return root, records
+
+    def test_derivation_matches_preparation_without_native_readiness(self) -> None:
+        source, records = self._scene()
+        payload = record()
+        settings = DiscoverySettings(record_roots=(records,))
+        prepared = prepare_native_package(
+            source, self.tmp / "prepared", run_id="run-1", backend=FakeBackend(payload), settings=settings
+        )
+        with mock.patch(
+            "description_pipeline.runtime.native_readiness",
+            side_effect=AssertionError("derivation must not consult the native runtime"),
+        ):
+            derived = derive_native_package(source, self.tmp / "derived", "run-1", payload, settings=settings)
+        self.assertEqual(inventory(self.tmp / "prepared"), inventory(self.tmp / "derived"))
+        self.assertEqual(prepared.prepared_sha256, derived.prepared_sha256)
+        self.assertEqual(prepared.discovery_sha256, derived.discovery_sha256)
+        self.assertEqual([f["code"] for f in prepared.findings], [f["code"] for f in derived.findings])
+        self.assertEqual(prepared.passed, derived.passed)
+        self.assertEqual(
+            (self.tmp / "prepared" / "robot.yaml").read_bytes(),
+            (self.tmp / "derived" / "robot.yaml").read_bytes(),
+        )
+
+    def test_derivation_refuses_a_selected_main_outside_the_record(self) -> None:
+        source, records = self._scene()
+        settings = DiscoverySettings(record_roots=(records,), main_assembly="other.SLDASM")
+        with self.assertRaisesRegex(PipelineError, "did not open the selected main assembly"):
+            derive_native_package(source, self.tmp / "derived", "run-1", record(), settings=settings)
+
+    def test_derivation_refuses_a_changed_frozen_file(self) -> None:
+        source, records = self._scene()
+        (source / "cad/robot.SLDASM").unlink()
+        with self.assertRaisesRegex(PipelineError, "file binding does not match"):
+            derive_native_package(
+                source,
+                self.tmp / "derived",
+                "run-1",
+                record(),
+                settings=DiscoverySettings(record_roots=(records,)),
+            )
+
+    def test_derivation_binds_the_payload_to_the_frozen_bytes_it_reads(self) -> None:
+        # The steps-level guard (frozen inventory unchanged before/during discovery)
+        # stays the refusal for a changed input; derivation itself still binds the
+        # payload to the bytes present, never to a stale record value.
+        source, records = self._scene()
+        result = derive_native_package(
+            source, self.tmp / "derived", "run-1", record(), settings=DiscoverySettings(record_roots=(records,))
+        )
+        payload = json.loads((self.tmp / "derived/discovery/native-discovery.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload["native_files"], inventory(source))
+        self.assertEqual(result.handoff_sha256, digest(inventory(source)))
+
+    def test_derivation_refuses_record_files_that_do_not_bind_the_frozen_bytes(self) -> None:
+        source, records = self._scene()
+        settings = DiscoverySettings(record_roots=(records,))
+        mutations = (
+            ({"files": {}}, "carries no bound file inventory"),
+            (
+                {"files": {**record()["files"], "cad/base.SLDPRT": "f" * 64}},
+                "file binding does not match",
+            ),
+            (
+                {"files": {key: value for key, value in record()["files"].items() if key != "cad/robot.SLDASM"}},
+                "recorded main assembly is not bound",
+            ),
+            (
+                {"files": {**record()["files"], "cad/unknown.SLDPRT": "e" * 64}},
+                "file binding does not match",
+            ),
+        )
+        for index, (patch, message) in enumerate(mutations):
+            payload = record()
+            payload.update(patch)
+            output = self.tmp / f"derived-refused-{index}"
+            with self.subTest(patch=patch), self.assertRaisesRegex(PipelineError, message):
+                derive_native_package(source, output, "run-1", payload, settings=settings)
+            # every refused attempt must leave its output untouched
+            self.assertFalse(output.exists() and any(output.iterdir()))
+
+    def test_derivation_refuses_a_configuration_that_differs_from_the_record(self) -> None:
+        source, records = self._scene()
+        settings = DiscoverySettings(record_roots=(records,))
+        with self.assertRaisesRegex(PipelineError, "requested configuration does not match"):
+            derive_native_package(
+                source,
+                self.tmp / "derived-other-config",
+                "run-1",
+                record(),
+                settings=settings,
+                configuration="Other",
+            )
+        matching = derive_native_package(
+            source,
+            self.tmp / "derived-matching-config",
+            "run-1",
+            record(),
+            settings=settings,
+            configuration="Default",
+        )
+        self.assertTrue(matching.passed, matching.findings)
+
+    def test_derivation_refuses_an_explicit_configuration_without_a_recorded_one(self) -> None:
+        source, records = self._scene()
+        payload = record()
+        payload["identity"]["delivery_configuration"] = None
+        payload.pop("saved_configuration", None)
+        with self.assertRaisesRegex(PipelineError, "carries no usable configuration"):
+            derive_native_package(
+                source,
+                self.tmp / "derived-unbound-config",
+                "run-1",
+                payload,
+                settings=DiscoverySettings(record_roots=(records,)),
+                configuration="Default",
+            )
+
+    def test_derivation_refuses_a_declared_configuration_that_contradicts_the_saved_one(self) -> None:
+        source, records = self._scene()
+        payload = record()
+        payload["identity"]["delivery_configuration"] = "Other"
+        payload["saved_configuration"] = "Default"
+        with self.assertRaisesRegex(PipelineError, "disagrees with the saved assembly configuration"):
+            derive_native_package(
+                source,
+                self.tmp / "derived-conflicting-config",
+                "run-1",
+                payload,
+                settings=DiscoverySettings(record_roots=(records,)),
+            )
+
+    def test_preparation_refuses_authored_files_before_any_native_read(self) -> None:
+        source, records = self._scene()
+        (source / "robot.yaml").write_text("schema_version: x\n", encoding="utf-8")
+
+        class ExplodingBackend:
+            def discover_native(self, *args, **kwargs):  # pragma: no cover - must never run
+                raise AssertionError("the native backend must not be invoked for a preflight refusal")
+
+        with self.assertRaisesRegex(PipelineError, "authored package files"):
+            prepare_native_package(
+                source,
+                self.tmp / "prepared",
+                "run-1",
+                backend=ExplodingBackend(),
+                settings=DiscoverySettings(record_roots=(records,)),
+            )
+
+    def test_preparation_refuses_a_nonempty_output_before_any_native_read(self) -> None:
+        source, records = self._scene()
+        output = self.tmp / "prepared"
+        output.mkdir()
+        (output / "leftover.txt").write_text("x", encoding="utf-8")
+
+        class ExplodingBackend:
+            def discover_native(self, *args, **kwargs):  # pragma: no cover - must never run
+                raise AssertionError("the native backend must not be invoked for a preflight refusal")
+
+        with self.assertRaisesRegex(PipelineError, "prepared output directory must be empty"):
+            prepare_native_package(
+                source,
+                output,
+                "run-1",
+                backend=ExplodingBackend(),
+                settings=DiscoverySettings(record_roots=(records,)),
+            )
 
 
 if __name__ == "__main__":

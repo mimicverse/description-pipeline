@@ -26,8 +26,6 @@ from description_pipeline.orchestration.airflow_client import (
     EndpointConflict,
     EndpointError,
     EndpointProtocolError,
-    HandoffResolution,
-    HANDOFF_SCHEMA,
     JOB_SCHEMA,
     JobFailed,
     PIPELINE_ID,
@@ -38,10 +36,11 @@ from description_pipeline.orchestration.airflow_client import (
     native_run_id,
     resolved_routing,
     validate_artifact_name,
-    validate_package,
     validate_run_id,
     verified_result,
 )
+from description_pipeline.sources.solidworks.handoff import HANDOFF_SCHEMA
+from description_pipeline.io import digest
 from description_pipeline.orchestration.stage_transfer import CAPTURE_ARCHIVE
 
 TOKEN = "test-token"
@@ -92,10 +91,14 @@ NATIVE_HANDOFF = {
 }
 
 
-def native_resolution(**overrides) -> HandoffResolution:
-    values = {"package": "handoff/m3.0", "handoff_sha256": "b" * 64}
-    values.update(overrides)
-    return HandoffResolution(**values)
+SELECTION_FILES = {"assembly.SLDASM": "c" * 64, "part.SLDPRT": "e" * 64}
+READER_SHA256 = "d" * 64
+
+
+def start_staging(endpoint, run_id: str = RUN_ID, **overrides) -> dict:
+    payload = {"run_id": run_id, "upload_files": SELECTION_FILES, "main_assembly": "assembly.SLDASM"}
+    payload.update(overrides)
+    return endpoint.start_staging_job(**payload)
 
 
 class MockEndpoint:
@@ -370,6 +373,29 @@ class MockEndpoint:
                     "pokes": 0,
                     "request": payload,
                 }
+                if "upload_files" in payload:
+                    upload = dict(payload["upload_files"])
+                    job["native_tool"] = {"source_sha256": READER_SHA256, "role": "native"}
+                    if "resume" in payload:
+                        job["selection"] = {
+                            "state": "sealed",
+                            "reader_sha256": READER_SHA256,
+                            "upload_sha256": payload["upload_sha256"],
+                            "staged_files": upload,
+                            "manifest": {
+                                "main_assembly": payload["main_assembly"],
+                                "files": upload,
+                                "upload_sha256": payload["upload_sha256"],
+                                "handoff_sha256": digest(upload),
+                            },
+                        }
+                    else:
+                        job["selection"] = {
+                            "state": "awaiting_files",
+                            "reader_sha256": READER_SHA256,
+                            "upload_sha256": payload["upload_sha256"],
+                            "staged_files": {},
+                        }
                 outer.jobs[run_id] = job
                 self._send(202, {k: v for k, v in job.items() if k != "pokes"})
 
@@ -404,30 +430,29 @@ class ClientTests(unittest.TestCase):
     def test_start_is_idempotent_and_conflicts_on_mismatch(self) -> None:
         with MockEndpoint() as server:
             endpoint = self.endpoint(server)
-            first = endpoint.start_job(run_id=RUN_ID, resolution=native_resolution())
-            second = endpoint.start_job(run_id=RUN_ID, resolution=native_resolution())
+            first = start_staging(endpoint)
+            second = start_staging(endpoint)
             self.assertEqual(first["run_id"], second["run_id"])
             self.assertEqual(len(server.jobs), 1)
             with self.assertRaises(EndpointConflict):
-                endpoint.start_job(run_id=RUN_ID, resolution=native_resolution(handoff_sha256="c" * 64))
+                start_staging(endpoint, upload_files={"assembly.SLDASM": "9" * 64})
 
-    def test_native_job_binds_only_package_and_digest(self) -> None:
+    def test_native_job_binds_only_index_digest_and_main(self) -> None:
+        from description_pipeline.io import digest
+
         with MockEndpoint() as server:
             endpoint = self.endpoint(server)
-            resolved = endpoint.resolve_handoff("handoff/m3.0")
-            self.assertEqual(set(vars(resolved)), {"package", "handoff_sha256"})
-            job = endpoint.start_job(run_id=RUN_ID, resolution=resolved)
-            self.assertEqual(job["request"], {"run_id": RUN_ID, "package": "handoff/m3.0", "handoff_sha256": "b" * 64})
-            self.assertNotIn("repository_slug", job)
-            with self.assertRaises(EndpointProtocolError):
-                resolved_routing(job)
+            job = start_staging(endpoint)
+            self.assertEqual(job["request"]["upload_sha256"], digest(SELECTION_FILES))
+            self.assertEqual(job["request"]["main_assembly"], "assembly.SLDASM")
+            self.assertNotIn("package", job["request"])
             with self.assertRaises(EndpointConflict):
-                endpoint.start_job(run_id=RUN_ID, resolution=native_resolution(handoff_sha256="c" * 64))
+                start_staging(endpoint, upload_files={"assembly.SLDASM": "9" * 64})
 
     def test_native_job_resolves_routing_after_cad_discovery(self) -> None:
         with MockEndpoint() as server:
             endpoint = self.endpoint(server)
-            endpoint.start_job(run_id=RUN_ID, resolution=endpoint.resolve_handoff("handoff/m3.0"))
+            start_staging(endpoint)
             routing = resolved_routing(endpoint.get_job(RUN_ID))
             self.assertEqual(routing["hardware_id"], "m3.0")
             self.assertEqual(routing["repository_slug"], "example/m3.0")
@@ -439,37 +464,10 @@ class ClientTests(unittest.TestCase):
                 expected_base=routing["repository_base"],
             )
 
-    def test_resolve_handoff_uses_resolver_for_managed_paths(self) -> None:
-        with MockEndpoint() as server:
-            endpoint = self.endpoint(server)
-            resolved = endpoint.resolve_handoff("handoff/m3.0")
-            self.assertEqual(resolved.package, "handoff/m3.0")
-            self.assertEqual(resolved.handoff_sha256, "b" * 64)
-            endpoint.resolve_handoff(r"C:\handoffs\m3.0")
-            self.assertEqual(server.resolved_paths, ["handoff/m3.0", r"C:\handoffs\m3.0"])
-            self.assertEqual(server.imports, [])
-
-    def test_native_resolution_fails_closed_on_bad_payload(self) -> None:
-        for bad in (
-            {k: v for k, v in NATIVE_HANDOFF.items() if k != "handoff_sha256"},
-            {k: v for k, v in NATIVE_HANDOFF.items() if k != "package"},
-            {**NATIVE_HANDOFF, "schema_version": "solidworks-to-urdf.handoff/v2"},
-            {**NATIVE_HANDOFF, "pipeline_id": "other-pipeline"},
-            {**NATIVE_HANDOFF, "kind": "native"},
-            {**NATIVE_HANDOFF, "package": "../escape"},
-            {**NATIVE_HANDOFF, "handoff_sha256": "nope"},
-        ):
-            with (
-                self.subTest(bad=bad),
-                MockEndpoint(handoff_response=bad) as server,
-                self.assertRaises(EndpointProtocolError),
-            ):
-                self.endpoint(server).resolve_handoff("handoff/m3.0")
-
     def test_get_job_accepts_unresolved_routing_but_rejects_empty_values(self) -> None:
         with MockEndpoint() as server:
             endpoint = self.endpoint(server)
-            endpoint.start_job(run_id=RUN_ID, resolution=endpoint.resolve_handoff("handoff/m3.0"))
+            start_staging(endpoint)
             self.assertNotIn("repository_slug", server.jobs[RUN_ID])
             endpoint.get_job(RUN_ID)
             server.jobs[RUN_ID]["repository_slug"] = " "
@@ -488,86 +486,13 @@ class ClientTests(unittest.TestCase):
             server.jobs[RUN_ID]["hardware_id"] = "M3.0"
             self.assertEqual(resolved_routing(server.jobs[RUN_ID])["hardware_id"], "M3.0")
 
-    def test_read_artifact_verifies_digest_and_limit(self) -> None:
-        urdf = b"<robot name='fixture'/>"
-        stl = b"solid base"
-        preview = {
-            "pipeline_id": PIPELINE_ID,
-            "run_id": RUN_ID,
-            "subject_sha256": SHA,
-            "urdf": "urdf/robot.urdf",
-            "files": {
-                "urdf/robot.urdf": hashlib.sha256(urdf).hexdigest(),
-                "meshes/base.stl": hashlib.sha256(stl).hexdigest(),
-            },
-        }
-        with MockEndpoint(preview_payload=preview) as server:
-            endpoint = self.endpoint(server)
-            endpoint.start_job(run_id=RUN_ID, resolution=native_resolution())
-            endpoint.wait(RUN_ID, interval=0.05, timeout=5)
-            served = endpoint.get_preview(RUN_ID)
-            self.assertEqual(
-                endpoint.read_artifact(RUN_ID, "urdf/robot.urdf", sha256=served["files"]["urdf/robot.urdf"]),
-                urdf,
-            )
-            self.assertEqual(
-                endpoint.read_artifact(RUN_ID, "meshes/base.stl", sha256=served["files"]["meshes/base.stl"]),
-                stl,
-            )
-            with self.assertRaises(EndpointProtocolError):
-                endpoint.read_artifact(RUN_ID, "urdf/robot.urdf", sha256="c" * 64)
-            with self.assertRaises(EndpointProtocolError):
-                endpoint.read_artifact(RUN_ID, "urdf/robot.urdf", sha256=SHA, limit=4)
-
-    def _stub_archive(self, digest: str = "b" * 64):
-        from description_pipeline.sources.solidworks import handoff as handoffs_module
-
-        self.archived_sources: list[Path] = []
-
-        def prepare_archive(source: Path, archive: Path) -> dict:
-            self.assertTrue(Path(source).is_dir(), source)
-            self.archived_sources.append(Path(source).resolve())
-            Path(archive).write_bytes(b"PK\x03\x04stub-archive")
-            return {"handoff_sha256": digest, "files": {"cad-revision.json": "x"}}
-
-        return mock.patch.object(handoffs_module, "prepare_archive", prepare_archive)
-
-    def test_absolute_posix_path_is_zipped_and_imported(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "handoffs"
-            source = root / "handoff"
-            source.mkdir(parents=True)
-            (source / "cad-revision.json").write_text("{}", encoding="utf-8")
-            with MockEndpoint() as server, self._stub_archive():
-                resolved = self.endpoint(server, roots=[root]).resolve_handoff(str(source))
-            self.assertEqual(resolved.handoff_sha256, "b" * 64)
-            self.assertEqual(self.archived_sources, [source.resolve()])
-            self.assertEqual(server.resolved_paths, [])
-            self.assertEqual(len(server.imports), 1)
-            upload = server.imports[0]
-            self.assertEqual(upload["bytes"], b"PK\x03\x04stub-archive")
-            self.assertEqual(upload["content_type"], "application/zip")
-            self.assertEqual(upload["content_length"], str(upload["size"]))
-
-    def test_import_digest_mismatch_fails_closed(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "handoffs"
-            source = root / "handoff"
-            source.mkdir(parents=True)
-            with (
-                MockEndpoint() as server,
-                self._stub_archive(digest="c" * 64),
-                self.assertRaises(EndpointProtocolError),
-            ):
-                self.endpoint(server, roots=[root]).resolve_handoff(str(source))
-
     def test_absolute_handoff_requires_configured_roots(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "handoff"
             source.mkdir()
             with MockEndpoint() as server:
                 with self.assertRaises(EndpointProtocolError):
-                    self.endpoint(server).resolve_handoff(str(source))
+                    self.endpoint(server).authorized_intake_dir(str(source))
                 self.assertEqual(server.hits, 0)
                 self.assertEqual(server.imports, [])
 
@@ -579,21 +504,9 @@ class ClientTests(unittest.TestCase):
             outside.mkdir()
             with MockEndpoint() as server:
                 with self.assertRaises(EndpointProtocolError):
-                    self.endpoint(server, roots=[root]).resolve_handoff(str(outside))
+                    self.endpoint(server, roots=[root]).authorized_intake_dir(str(outside))
                 self.assertEqual(server.hits, 0)
                 self.assertEqual(server.imports, [])
-
-    def test_nested_folder_inside_root_is_archived(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "handoffs"
-            nested = root / "team-a" / "robot-cell"
-            nested.mkdir(parents=True)
-            (nested / "part.SLDPRT").write_text("solid", encoding="utf-8")
-            with MockEndpoint() as server, self._stub_archive():
-                resolved = self.endpoint(server, roots=[root]).resolve_handoff(str(nested))
-                self.assertEqual(resolved.handoff_sha256, "b" * 64)
-                self.assertEqual(self.archived_sources, [nested.resolve()])
-                self.assertEqual(len(server.imports), 1)
 
     def test_linked_handoff_paths_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -604,7 +517,7 @@ class ClientTests(unittest.TestCase):
             (root / "linked").symlink_to(outside, target_is_directory=True)
             with MockEndpoint() as server:
                 with self.assertRaises(EndpointProtocolError):
-                    self.endpoint(server, roots=[root]).resolve_handoff(str(root / "linked" / "cell"))
+                    self.endpoint(server, roots=[root]).authorized_intake_dir(str(root / "linked" / "cell"))
                 self.assertEqual(server.hits, 0)
                 with self.assertRaises(EndpointProtocolError):
                     self.endpoint(server, roots=[root / "linked"])
@@ -614,10 +527,43 @@ class ClientTests(unittest.TestCase):
             with self.subTest(roots=roots), self.assertRaises(EndpointProtocolError):
                 EndpointConfig(base_url="http://127.0.0.1", token=TOKEN, handoff_roots=roots)
 
+    def test_discovery_settings_are_validated_and_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            records = root / "records"
+            records.mkdir()
+            registry = root / "names.json"
+            registry.write_text("{}", encoding="utf-8")
+            config = EndpointConfig(
+                base_url="http://127.0.0.1",
+                token=TOKEN,
+                discovery={"record_roots": [str(records)], "frozen_names_file": str(registry)},
+            )
+            self.assertEqual(config.discovery["record_roots"], (records,))
+            self.assertEqual(config.discovery["frozen_names_file"], registry)
+            for bad in (
+                {"record_roots": ["relative/root"]},
+                {"record_roots": [str(root / "missing")]},
+                {"frozen_names_file": str(records)},
+                {"record_roots": "records"},
+                {"unknown": []},
+                "records",
+            ):
+                with self.subTest(bad=str(bad)), self.assertRaises(EndpointProtocolError):
+                    EndpointConfig(base_url="http://127.0.0.1", token=TOKEN, discovery=bad)
+            link = root / "linked"
+            link.symlink_to(records, target_is_directory=True)
+            with self.assertRaises(EndpointProtocolError):
+                EndpointConfig(base_url="http://127.0.0.1", token=TOKEN, discovery={"record_roots": [str(link)]})
+
     def test_connection_extra_supplies_handoff_roots(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "handoffs"
             root.mkdir()
+            records = Path(tmp) / "records"
+            records.mkdir()
+            registry = Path(tmp) / "names.json"
+            registry.write_text("{}", encoding="utf-8")
 
             class FakeConnection:
                 host = "127.0.0.1"
@@ -625,7 +571,11 @@ class ClientTests(unittest.TestCase):
                 password = "token"
 
                 def __init__(self) -> None:
-                    self.extra_dejson = {"timeout": 5, "handoff_roots": [str(root)]}
+                    self.extra_dejson = {
+                        "timeout": 5,
+                        "handoff_roots": [str(root)],
+                        "discovery": {"record_roots": [str(records)], "frozen_names_file": str(registry)},
+                    }
 
             class FakeBaseHook:
                 @staticmethod
@@ -642,6 +592,8 @@ class ClientTests(unittest.TestCase):
                 config = config_from_airflow_connection("solidworks_windows")
             self.assertEqual(config.handoff_roots, (root.resolve(),))
             self.assertEqual(config.base_url, "http://127.0.0.1:18765")
+            self.assertEqual(config.discovery["record_roots"], (records,))
+            self.assertEqual(config.discovery["frozen_names_file"], registry)
 
     def test_capture_archive_receipt_is_validated_exactly(self) -> None:
         from description_pipeline.orchestration.airflow_client import capture_archive_metadata
@@ -778,37 +730,10 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(EndpointProtocolError):
             native_run_id("")
 
-    def test_preview_requires_a_passed_delivery(self) -> None:
-        with MockEndpoint() as server:
-            endpoint = self.endpoint(server)
-            with self.assertRaises(EndpointError):
-                endpoint.get_preview(RUN_ID)
-            endpoint.start_job(run_id=RUN_ID, resolution=native_resolution())
-            endpoint.wait(RUN_ID, interval=0.05, timeout=5)
-            preview = endpoint.get_preview(RUN_ID)
-            self.assertEqual(preview["run_id"], RUN_ID)
-            self.assertEqual(preview["urdf"], "urdf/robot.urdf")
-            self.assertIn(preview["urdf"], preview["files"])
-
-    def test_preview_fails_closed_on_bad_payload(self) -> None:
-        for bad in (
-            {**PREVIEW, "pipeline_id": "other"},
-            {**PREVIEW, "subject_sha256": "nope"},
-            {**PREVIEW, "urdf": "../escape.urdf"},
-            {**PREVIEW, "files": {"urdf/robot.urdf": "nope"}},
-            {**PREVIEW, "files": {"meshes/base.stl": "d" * 64}},
-        ):
-            with self.subTest(bad=bad), MockEndpoint(preview_payload=bad) as server:
-                endpoint = self.endpoint(server)
-                endpoint.start_job(run_id=RUN_ID, resolution=native_resolution())
-                endpoint.wait(RUN_ID, interval=0.05, timeout=5)
-                with self.assertRaises(EndpointProtocolError):
-                    endpoint.get_preview(RUN_ID)
-
     def test_open_artifact_streams_verified_bytes(self) -> None:
         with MockEndpoint() as server:
             endpoint = self.endpoint(server)
-            endpoint.start_job(run_id=RUN_ID, resolution=native_resolution())
+            start_staging(endpoint)
             endpoint.wait(RUN_ID, interval=0.05, timeout=5)
             with endpoint.open_artifact(RUN_ID, "urdf/robot.urdf") as response:
                 self.assertEqual(response.read(), b"<robot name='fixture'/>")
@@ -834,7 +759,7 @@ class ClientTests(unittest.TestCase):
     def test_wait_passes_and_fails_closed_on_result(self) -> None:
         with MockEndpoint() as server:
             endpoint = self.endpoint(server)
-            endpoint.start_job(run_id=RUN_ID, resolution=native_resolution())
+            start_staging(endpoint)
             job = endpoint.wait(RUN_ID, interval=0.05, timeout=5)
             self.assertEqual(job["status"], "passed")
             self.assertEqual(
@@ -878,7 +803,7 @@ class ClientTests(unittest.TestCase):
                     check_result(bad, expected_slug="example/m3.0", expected_base="feature/m3.0")
         with MockEndpoint(omit_quality=True) as server:
             endpoint = self.endpoint(server)
-            endpoint.start_job(run_id=RUN_ID, resolution=native_resolution())
+            start_staging(endpoint)
             with self.assertRaises(ResultNotPublishable):
                 check_result(
                     endpoint.wait(RUN_ID, interval=0.05, timeout=5)["result"],
@@ -891,7 +816,7 @@ class ClientTests(unittest.TestCase):
 
         with MockEndpoint(native_complete=True) as server:
             endpoint = self.endpoint(server)
-            endpoint.start_job(run_id=RUN_ID, resolution=native_resolution())
+            start_staging(endpoint)
             job = endpoint.wait(RUN_ID, interval=0.05, timeout=5)
             self.assertEqual(job["status"], "native_complete")
             archive = capture_archive_metadata(job)
@@ -954,14 +879,14 @@ class ClientTests(unittest.TestCase):
     def test_failed_job_raises(self) -> None:
         with MockEndpoint(fail_job=True) as server:
             endpoint = self.endpoint(server)
-            endpoint.start_job(run_id=RUN_ID, resolution=native_resolution())
+            start_staging(endpoint)
             with self.assertRaises(JobFailed):
                 endpoint.wait(RUN_ID, interval=0.05, timeout=5)
 
     def test_invalid_event_contract_is_refused(self) -> None:
         with MockEndpoint(invalid_events=True) as server:
             endpoint = self.endpoint(server)
-            endpoint.start_job(run_id=RUN_ID, resolution=native_resolution())
+            start_staging(endpoint)
             with self.assertRaises(EndpointProtocolError):
                 endpoint.get_job(RUN_ID)
 
@@ -969,18 +894,9 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(EndpointProtocolError):
             EndpointConfig(base_url="http://example.com", token=TOKEN)
         with self.assertRaises(EndpointProtocolError):
-            validate_package("/etc/passwd")
-        with self.assertRaises(EndpointProtocolError):
-            validate_package("a/../../b")
-        with self.assertRaises(EndpointProtocolError):
             validate_run_id("not-a-uuid")
         with self.assertRaises(EndpointProtocolError):
             validate_run_id(RUN_ID.upper())
-        for bad in ("pkg/./x", "pkg//x", "pkg/", "/abs", "CON/x"):
-            with self.assertRaises(EndpointProtocolError):
-                validate_package(bad)
-        self.assertEqual(validate_package("手臂 r1/cad"), "手臂 r1/cad")
-        self.assertEqual(validate_package(".hidden/x"), ".hidden/x")
         self.assertEqual(validate_artifact_name("urdf/robot.urdf"), "urdf/robot.urdf")
         with self.assertRaises(EndpointProtocolError):
             validate_artifact_name("../escape.urdf")
@@ -992,50 +908,159 @@ class ClientTests(unittest.TestCase):
                 endpoint.health()
             self.assertEqual(target.hits, 0)
 
-    def test_start_rejects_a_different_echoed_handoff(self) -> None:
+    def test_refusal_bodies_reach_callers(self) -> None:
+        body = {
+            "error": "selection is bound to another run",
+            "error_code": "already_active",
+            "active_run_id": RUN_ID,
+            "earliest_required": "2026-10-11T00:00:00Z",
+            "detail": {"stage": "capture"},
+        }
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args) -> None:
+                return
+
+            def do_POST(self) -> None:
+                encoded = json.dumps(body).encode()
+                self.send_response(409)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        endpoint = WindowsEndpoint(EndpointConfig(base_url=f"http://127.0.0.1:{server.server_port}", token=TOKEN))
+        with self.assertRaises(EndpointConflict) as caught:
+            start_staging(endpoint)
+        failure = caught.exception
+        self.assertEqual(failure.status, 409)
+        self.assertEqual(failure.code, "already_active")
+        self.assertEqual(failure.error_code, "already_active")
+        self.assertEqual(failure.active_run_id, RUN_ID)
+        self.assertEqual(failure.earliest_required, "2026-10-11T00:00:00Z")
+        self.assertEqual(failure.detail, {"stage": "capture"})
+        self.assertIn("request conflict (409)", str(failure))
+        self.assertIn("selection is bound to another run", str(failure))
+
+    def test_failure_diagnostics_downloads_hash_bound_members(self) -> None:
+        from description_pipeline.orchestration.airflow_client import (
+            EndpointNotFound,
+            _validate_failure_diagnostics,
+        )
+
+        receipt = json.dumps({"run_id": RUN_ID, "error": "boom", "main_assembly": "robot.SLDASM"}).encode()
+        evidence = b'{"findings": []}'
+        manifest = json.dumps(
+            {
+                "schema": "solidworks-to-urdf.failure-diagnostics/v1",
+                "run_id": RUN_ID,
+                "receipt": {"path": "receipt.json", "sha256": hashlib.sha256(receipt).hexdigest()},
+                "files": {"input/discovery/findings.json": hashlib.sha256(evidence).hexdigest()},
+                "partial": True,
+                "partial_files": ["evidence/raw/material_provenance.json"],
+            }
+        ).encode()
+        with MockEndpoint() as server:
+            server.artifacts["diagnostic.json"] = manifest
+            server.artifacts["receipt.json"] = receipt
+            server.artifacts["evidence/input/discovery/findings.json"] = evidence
+            endpoint = self.endpoint(server)
+            job = {"failure_diagnostics": {"path": "diagnostic.json", "sha256": hashlib.sha256(manifest).hexdigest()}}
+            with tempfile.TemporaryDirectory() as tmp:
+                written = endpoint.download_failure_diagnostics(RUN_ID, job, Path(tmp))
+                self.assertEqual(Path(written["receipt.json"]).read_bytes(), receipt)
+                self.assertEqual(Path(written["evidence/input/discovery/findings.json"]).read_bytes(), evidence)
+                self.assertEqual(Path(written["diagnostic.json"]).read_bytes(), manifest)
+                tampered = {"failure_diagnostics": {"path": "diagnostic.json", "sha256": "0" * 64}}
+                with self.assertRaises(EndpointProtocolError):
+                    endpoint.download_failure_diagnostics(RUN_ID, tampered, Path(tmp) / "tampered")
+                with self.assertRaises(EndpointNotFound):
+                    endpoint.download_failure_diagnostics(RUN_ID, {}, Path(tmp) / "absent")
+                with self.assertRaises(EndpointProtocolError):
+                    endpoint.download_failure_diagnostics(RUN_ID, job, Path(tmp) / "tiny", limit=8)
+        with self.assertRaises(EndpointProtocolError):
+            _validate_failure_diagnostics(
+                {"failure_diagnostics": {"path": "other.json", "sha256": "0" * 64}}
+            )
+
+    def test_failure_diagnostics_refuses_cross_run_receipt_and_unknown_members(self) -> None:
+        foreign = b'{"run_id": "not-this-run", "error": "boom"}'
+        manifest = json.dumps(
+            {
+                "schema": "solidworks-to-urdf.failure-diagnostics/v1",
+                "run_id": RUN_ID,
+                "receipt": {"path": "receipt.json", "sha256": hashlib.sha256(foreign).hexdigest()},
+                "files": {},
+            }
+        ).encode()
+        with MockEndpoint() as server:
+            server.artifacts["diagnostic.json"] = manifest
+            server.artifacts["receipt.json"] = foreign
+            endpoint = self.endpoint(server)
+            job = {"failure_diagnostics": {"path": "diagnostic.json", "sha256": hashlib.sha256(manifest).hexdigest()}}
+            with tempfile.TemporaryDirectory() as tmp, self.assertRaises(EndpointProtocolError):
+                endpoint.download_failure_diagnostics(RUN_ID, job, Path(tmp))
+
+        unknown = json.dumps(
+            {
+                "schema": "solidworks-to-urdf.failure-diagnostics/v1",
+                "run_id": RUN_ID,
+                "receipt": {"path": "receipt.json", "sha256": hashlib.sha256(foreign).hexdigest()},
+                "files": {"notes/extra.json": "0" * 64},
+            }
+        ).encode()
+        with MockEndpoint() as server:
+            server.artifacts["diagnostic.json"] = unknown
+            endpoint = self.endpoint(server)
+            job = {"failure_diagnostics": {"path": "diagnostic.json", "sha256": hashlib.sha256(unknown).hexdigest()}}
+            with tempfile.TemporaryDirectory() as tmp, self.assertRaises(EndpointProtocolError):
+                endpoint.download_failure_diagnostics(RUN_ID, job, Path(tmp))
+
+    def test_start_rejects_a_different_echoed_request(self) -> None:
         response = {
             "run_id": RUN_ID,
             "status": "queued",
-            "request": {"run_id": RUN_ID, "package": "other/r1", "handoff_sha256": "c" * 64},
+            "request": {
+                "run_id": RUN_ID,
+                "upload_files": SELECTION_FILES,
+                "upload_sha256": "0" * 64,
+                "main_assembly": "assembly.SLDASM",
+            },
         }
         endpoint = WindowsEndpoint(
             EndpointConfig(base_url="http://127.0.0.1", token=TOKEN),
             opener=lambda *_args, **_kwargs: io.BytesIO(json.dumps(response).encode()),
         )
-        with self.assertRaisesRegex(EndpointProtocolError, "different mechanical handoff"):
-            endpoint.start_job(run_id=RUN_ID, resolution=native_resolution())
+        with self.assertRaisesRegex(EndpointProtocolError, "different staging request"):
+            start_staging(endpoint)
 
     def test_linked_start_forwards_resume_and_rerun_plan_round_trips(self) -> None:
         from description_pipeline.stages import STAGE_IDS
 
         with MockEndpoint() as server:
             endpoint = self.endpoint(server)
-            endpoint.start_job(run_id=PARENT_ID, resolution=native_resolution())
+            start_staging(endpoint, run_id=PARENT_ID)
             plan = endpoint.rerun_plan(PARENT_ID)
             self.assertEqual(plan["run_id"], PARENT_ID)
             self.assertEqual([row["stage"] for row in plan["stage_reruns"]], list(STAGE_IDS))
-            child = endpoint.start_job(
-                run_id=RUN_ID,
-                resolution=native_resolution(),
-                resume={"parent_run": PARENT_ID, "from_stage": "verify"},
-            )
+            child = start_staging(endpoint, resume={"parent_run": PARENT_ID, "from_stage": "verify"})
             self.assertEqual(child["request"]["resume"], {"parent_run": PARENT_ID, "from_stage": "verify"})
             with self.assertRaises(EndpointConflict):
-                endpoint.start_job(
-                    run_id=RUN_ID,
-                    resolution=native_resolution(),
-                    resume={"parent_run": PARENT_ID, "from_stage": "generate"},
-                )
+                start_staging(endpoint, resume={"parent_run": PARENT_ID, "from_stage": "generate"})
 
     def test_linked_bindings_and_plans_are_validated_before_they_are_trusted(self) -> None:
         with MockEndpoint() as server:
             endpoint = self.endpoint(server)
-            endpoint.start_job(run_id=PARENT_ID, resolution=native_resolution())
+            start_staging(endpoint, run_id=PARENT_ID)
             broken = rerun_plan_payload(PARENT_ID)
             broken["stage_reruns"] = broken["stage_reruns"][:-1]
             with MockEndpoint(rerun_payload=broken) as bad_server:
                 bad = self.endpoint(bad_server)
-                bad.start_job(run_id=PARENT_ID, resolution=native_resolution())
+                start_staging(bad, run_id=PARENT_ID)
                 with self.assertRaises(EndpointProtocolError):
                     bad.rerun_plan(PARENT_ID)
             for resume in (
@@ -1045,7 +1070,7 @@ class ClientTests(unittest.TestCase):
                 {"parent_run": RUN_ID, "from_stage": "verify"},
             ):
                 with self.subTest(resume=str(resume)), self.assertRaises(EndpointProtocolError):
-                    endpoint.start_job(run_id=RUN_ID, resolution=native_resolution(), resume=resume)
+                    start_staging(endpoint, resume=resume)
 
     def test_invalid_url_timeout_and_redirect_fail_closed(self) -> None:
         for address in ("http://127.0.0.1:invalid", "http://127.0.0.1?token=x", "http://127.0.0.1#fragment"):

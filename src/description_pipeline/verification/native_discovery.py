@@ -7,7 +7,7 @@ It runs without Windows or SolidWorks: everything it needs (the raw record, the
 embedded controlled records and the generated contract files) is inside the
 package.
 
-Only three facts are taken from the package as *claims*: ``robot.yaml``, the
+Only three facts are taken from the package as *claims*: ``robot.yaml``, a supplied
 ``cad-revision.json`` seal and the discovery payload itself.  The payload is
 bound by digest to the package's provenance block; every derived value is
 recomputed here before it is accepted.
@@ -18,8 +18,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import ntpath
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import yaml
 
@@ -44,6 +45,8 @@ SUPPORTED_MATES = {
 
 AXIS_OFFSET_TOL_M = 5e-5
 TOL = 1e-6
+#: The documented native property that may carry a concentric rotation lock.
+LOCK_ROTATION_API = "IConcentricMateFeatureData.LockRotation"
 #: Conflict tolerances of the delivery contract: 0.05 mm and 0.05 degrees.
 _CONFLICT_POS_TOL_M = 5e-5
 _CONFLICT_ANGLE_EPS = 1.0 - math.cos(math.radians(0.05))
@@ -80,6 +83,87 @@ def _read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _authored_identity(raw: dict, namespace: str) -> dict:
+    """Read optional authored metadata without inventing a publication identity."""
+    identity = raw.get("identity")
+    properties = (raw.get("properties") or {}).get("document") or {}
+    _require(identity is None or isinstance(identity, dict), "discovery.identity", "raw identity is not an object")
+    _require(isinstance(properties, dict), "discovery.identity", "document properties are not an object")
+    identity = identity or {}
+    control = identity.get("control")
+    _require(
+        control is None or (isinstance(control, dict) and not set(control) - {"system", "reference"}),
+        "discovery.identity",
+        "authored control metadata is malformed",
+    )
+
+    def value(key):
+        direct = (control or {}).get(key.split(".")[1]) if key.startswith("control.") else identity.get(key)
+        stored = properties.get(namespace + "." + key)
+        normalized = []
+        for candidate in (direct, stored):
+            if candidate is None:
+                continue
+            _require(
+                isinstance(candidate, str)
+                and bool(candidate.strip())
+                and not any(ord(char) < 32 or ord(char) == 127 for char in candidate),
+                "discovery.identity",
+                "supplied metadata must be non-empty text",
+                {"field": key},
+            )
+            normalized.append(candidate.strip())
+        _require(
+            len(set(normalized)) <= 1,
+            "discovery.identity",
+            "native metadata readings disagree",
+            {"field": key},
+        )
+        return normalized[0] if normalized else None
+
+    fields = ("hardware_id", "revision", "parent_revision", "owner", "change_summary", "robot_name")
+    authored = {key: value(key) for key in fields}
+    for key in ("hardware_id", "revision", "parent_revision"):
+        _require(
+            authored[key] is None or _ID.fullmatch(authored[key]),
+            "discovery.identity",
+            "supplied metadata is not an ASCII identifier",
+            {"field": key},
+        )
+    _require(
+        authored["parent_revision"] is None or authored["parent_revision"] != authored["revision"],
+        "discovery.identity",
+        "a revision cannot name itself as its parent",
+    )
+    _require(
+        authored["robot_name"] is None or _SNAKE.fullmatch(authored["robot_name"]),
+        "discovery.identity",
+        "authored robot name is not snake_case",
+    )
+    system, reference = value("control.system"), value("control.reference")
+    _require(
+        system is None or system in {"git", "pdm", "handoff"},
+        "discovery.identity",
+        "supplied control system is unsupported",
+    )
+    _require(
+        system != "git" or reference is None or re.search(r"\b[0-9a-f]{40}(?:[0-9a-f]{24})?\b", reference),
+        "discovery.identity",
+        "Git control reference lacks a full commit hash",
+    )
+    authored["control"] = {"system": system, "reference": reference} if system and reference else None
+    authored["missing"] = [
+        key for key in ("hardware_id", "revision", "owner", "change_summary", "control") if authored[key] is None
+    ]
+    return authored
+
+
+def publication_metadata_state(raw: dict, namespace: str) -> dict:
+    """Authored publication metadata exactly as the verifier reads it (single contract)."""
+
+    return _authored_identity(raw, namespace)
+
+
 def _digest_files(root: Path) -> dict[str, str]:
     files: dict[str, str] = {}
     for path in sorted(root.rglob("*")):
@@ -105,6 +189,35 @@ def _names(mate: dict) -> list[str]:
         if name and name not in out:
             out.append(name)
     return out
+
+
+def _nested_self_frame_entity(mate: dict) -> dict | None:
+    """The scope's own frame entity inside a well-formed nested self-frame relation.
+
+    A mate whose scope is ``S`` may carry exactly two raw recorded entities: one
+    assembly-frame entity with ``component == S`` (S's own reference geometry, expressed
+    in S's own space) and one ordinary endpoint whose occurrence lives inside S's subtree
+    (``S/...``).  In the parent record the occurrence ``S`` supplies the transform into
+    parent coordinates, so the relation is an ordinary in-scope pair -- it never takes
+    part in the frozen top attachment and never grounds anything.  A malformed raw list
+    (non-dict entries or a wrong length) or an endpoint outside the scope subtree is not
+    this relation and stays unsupported.
+    """
+
+    raw = mate.get("entities")
+    if not isinstance(raw, list) or len(raw) != 2 or not all(isinstance(item, dict) for item in raw):
+        return None
+    scope = mate.get("scope")
+    if not isinstance(scope, str) or scope == "":
+        return None
+    flagged = [entity for entity in raw if entity.get("assembly_frame") is True]
+    if len(flagged) != 1 or flagged[0].get("component") != scope:
+        return None
+    endpoint = next(entity for entity in raw if entity is not flagged[0])
+    component = endpoint.get("component")
+    if not isinstance(component, str) or not component.startswith(scope + "/"):
+        return None
+    return flagged[0]
 
 
 def _number(value) -> float | None:
@@ -228,7 +341,292 @@ def _frame_for(entity: dict, frames):
     return frames.get(component) if isinstance(component, str) else None
 
 
+def _cached_materialization_reason(
+    component: dict,
+    provenance: dict,
+    slots: list[dict],
+    used: set[int],
+    carrier: object,
+    native: dict,
+) -> str | None:
+    """Exact sealed-carrier evidence for one cached native materialization.
+
+    The selection session and the discovery session are different native sessions, so
+    their session temp roots differ and the two materialization paths can never be
+    compared directly.  The stable identity is the ultimate native owner (with its
+    frozen bytes), the scoped occurrence, the defining anchor and the recorded
+    configuration, while each materialization path must be structurally a session
+    temp document under its own recorded owned temp root.  Nothing is guessed from
+    names or suffixes, and a present external file is never downgraded.
+    """
+
+    if not isinstance(carrier, dict) or not isinstance(carrier.get("closure"), dict):
+        return "the sealed selection carrier is absent"
+    owner = provenance.get("owner")
+    owner_sha = provenance.get("owner_sha256")
+    occurrence = provenance.get("occurrence")
+    anchor = provenance.get("defining_anchor")
+    materialization = (
+        provenance.get("materialization_path")
+        or provenance.get("materialization")
+        or provenance.get("native_document_path")
+    )
+    temp_root = provenance.get("session_temp_root")
+    author = provenance.get("author_imported_path")
+    virtual = provenance.get("is_virtual")
+    if not (isinstance(owner, str) and owner.strip()):
+        return "the cached materialization evidence names no ultimate owner"
+    if not (isinstance(occurrence, str) and occurrence.strip()):
+        return "the cached materialization evidence names no occurrence"
+    if anchor is not None and not isinstance(anchor, str):
+        return "the cached materialization defining anchor is unreadable"
+    if not isinstance(owner_sha, str) or _HEX.match(owner_sha) is None:
+        return "the cached materialization owner bytes are unproven"
+    if not (isinstance(materialization, str) and ntpath.isabs(materialization)):
+        return "the cached materialization evidence carries no absolute session materialization"
+    if not _session_temp_path(materialization, temp_root):
+        if not (isinstance(temp_root, str) and ntpath.isabs(temp_root)):
+            return "the cached materialization evidence carries no owned session temp root"
+        parts = materialization.replace("\\", "/").split("/")
+        if not any(part.casefold() == "ic~~" for part in parts if part):
+            return "the recorded materialization is not a session temp materialization"
+        return "the session materialization is outside its recorded owned session temp root"
+    if author is not None and not isinstance(author, str):
+        return "the cached materialization author metadata is unreadable"
+    if type(virtual) is not bool:
+        return "the cached materialization virtual state is unread"
+    files = carrier.get("files")
+    if not isinstance(files, dict) or files.get(owner) != owner_sha or native.get(owner) != owner_sha:
+        return "the cached materialization owner bytes are not bound to the sealed selection"
+
+    def folded(value: object) -> str:
+        return str(value or "").replace("\\", "/").casefold()
+
+    matches = []
+    for index, slot in enumerate(slots):
+        if index in used:
+            continue
+        slot_owner = slot.get("owner") if isinstance(slot.get("owner"), str) and slot.get("owner") else None
+        slot_owner = slot_owner or slot.get("document")
+        if slot_owner is None or folded(slot_owner) != folded(owner):
+            continue
+        if str(slot.get("instance") or "") != occurrence:
+            continue
+        if slot.get("owner_anchor") != anchor:
+            continue
+        if slot.get("owner_sha256") != owner_sha:
+            continue
+        slot_configuration = slot.get("configuration")
+        if slot_configuration is not None and component.get("configuration") != slot_configuration:
+            continue
+        if not _session_temp_path(slot.get("materialization"), slot.get("session_temp_root")):
+            continue
+        if provenance.get("author_imported_in_source_root") is True:
+            # In-root author sources are re-resolved by the engine to whichever root
+            # holds the bytes, so the absolute author path is relocation-dependent on
+            # each side.  Match the recorded root-relative name and the sealed bytes,
+            # with each side's containment proven independently.
+            relative = provenance.get("author_imported_relative")
+            source_root = provenance.get("source_root")
+            bound = slot.get("bound_source")
+            stage_root = carrier["closure"].get("stage_root")
+            if not (
+                slot.get("author_metadata_in_stage") is True
+                and isinstance(relative, str)
+                and relative.strip()
+                and isinstance(source_root, str)
+                and ntpath.isabs(source_root)
+                and isinstance(author, str)
+                and ntpath.isabs(author)
+                and _owned_relative_match(author, source_root, relative)
+                and isinstance(bound, str)
+                and bound.strip()
+                and isinstance(stage_root, str)
+                and ntpath.isabs(stage_root)
+                and _owned_relative_match(slot.get("author_imported_path"), stage_root, bound)
+                and bound.replace("\\", "/").casefold() == relative.replace("\\", "/").casefold()
+            ):
+                continue
+            sealed, recorded = files.get(bound), native.get(relative)
+            if not (isinstance(sealed, str) and sealed and sealed == recorded):
+                continue
+        else:
+            slot_author = slot.get("author_imported_path")
+            if (slot_author is None) != (author is None):
+                continue
+            if slot_author is not None and ntpath.normcase(slot_author) != ntpath.normcase(author):
+                continue
+        slot_state = slot.get("suppression_state")
+        if isinstance(slot_state, int) and slot_state != component.get("suppression_state"):
+            continue
+        if "is_virtual" in slot and slot.get("is_virtual") is not virtual:
+            continue
+        matches.append(index)
+    if not matches:
+        return "no sealed cached materialization matches this occurrence exactly"
+    if len(matches) > 1:
+        return "the sealed carrier records ambiguous cached materializations for this occurrence"
+    used.add(matches[0])
+    return None
+
+
+def _session_temp_path(value: object, root: object) -> bool:
+    """True when ``value`` is an absolute session temp document under ``root``."""
+
+    if not (isinstance(value, str) and ntpath.isabs(value)):
+        return False
+    if not (isinstance(root, str) and ntpath.isabs(root)):
+        return False
+    if not any(part.casefold() == "ic~~" for part in value.replace("\\", "/").split("/") if part):
+        return False
+    try:
+        relative = ntpath.relpath(value, root)
+    except ValueError:
+        return False
+    return relative != ".." and not relative.startswith("..\\") and not ntpath.isabs(relative)
+
+
+def _owned_relative_match(value: object, root: object, relative: str) -> bool:
+    """True when ``value`` is inside ``root`` at exactly the ``relative`` location."""
+
+    if not (isinstance(value, str) and isinstance(root, str) and isinstance(relative, str)):
+        return False
+    try:
+        computed = ntpath.relpath(value, root)
+    except ValueError:
+        return False
+    if computed == ".." or computed.startswith("..\\") or ntpath.isabs(computed):
+        return False
+    return computed.replace("\\", "/").casefold() == relative.replace("\\", "/").casefold()
+
+
+def _require_suppression_states(record: dict) -> None:
+    """Every component must carry the documented raw suppression state.
+
+    The raw ``GetSuppression2`` integer is authoritative: 0 suppressed, 1
+    lightweight, 2 fully resolved, 3 resolved, 4 fully lightweight.  State 5
+    (internal-ID mismatch), missing, boolean, undocumented and incoherent
+    values are refused, and a lightweight occurrence (1/4) cannot be
+    independently measured, so it is refused instead of being counted as
+    suppressed.  Both emitted flags are required booleans that must agree with
+    the state; the legacy raw ``IsSuppressed`` boolean is never consulted.
+    """
+
+    _require(
+        isinstance(record, dict),
+        "discovery.suppression_state",
+        "the raw record is not an object",
+        {"record": type(record).__name__},
+    )
+    components = record.get("components")
+    _require(
+        isinstance(components, list),
+        "discovery.suppression_state",
+        "the raw record carries no component list",
+        {"components": type(components).__name__},
+    )
+    for item in components:
+        _require(
+            isinstance(item, dict),
+            "discovery.suppression_state",
+            "a raw component entry is not an object",
+            {"entry": repr(item)[:200]},
+        )
+        name = str(item.get("name2") or "?")
+        state = item.get("suppression_state")
+        _require(
+            type(state) is int and state in {0, 1, 2, 3, 4},
+            "discovery.suppression_state",
+            "a component does not carry the documented raw suppression state (integer 0..4)",
+            {"component": name, "suppression_state": state},
+        )
+        suppressed = item.get("suppressed")
+        lightweight = item.get("lightweight")
+        _require(
+            type(suppressed) is bool and type(lightweight) is bool,
+            "discovery.suppression_state",
+            "a component must carry boolean suppressed and lightweight flags",
+            {"component": name, "suppressed": suppressed, "lightweight": lightweight},
+        )
+        _require(
+            suppressed == (state == 0) and lightweight == (state in {1, 4}),
+            "discovery.suppression_state",
+            "the emitted suppression flags do not agree with the raw suppression state",
+            {
+                "component": name,
+                "suppression_state": state,
+                "suppressed": suppressed,
+                "lightweight": lightweight,
+            },
+        )
+        if state in {1, 4}:
+            _require(
+                False,
+                "discovery.suppression_lightweight",
+                "a lightweight component cannot be independently measured; the native capture must fully load it",
+                {"component": name, "suppression_state": state},
+            )
+
+
+def _require_source_selection(payload: dict) -> None:
+    """Independently recompute the sealed source selection carried by the raw record.
+
+    The proof is mandatory: the one supported native capture carries
+    ``raw.source_selection``, and a bundle without it is not verifiable.  The manifest
+    must recompute exactly, every selected source must be bound by the raw native file
+    inventory with a matching hash, and the raw main choice must agree.
+    """
+
+    from ..sources.solidworks.selection import verify_selection
+
+    raw = payload.get("raw") if isinstance(payload, dict) else None
+    if not isinstance(raw, dict):
+        raise _Failure(
+            "discovery.selection",
+            "the native capture carries no raw record with the sealed source selection",
+            None,
+        )
+    manifest = raw.get("source_selection")
+    if manifest is None:
+        raise _Failure(
+            "discovery.selection",
+            "raw.source_selection is required: a capture without the sealed closure proof is not verifiable",
+            None,
+        )
+    if not isinstance(manifest, dict) or manifest.get("scope") != "native_staged_folder_closure":
+        raise _Failure(
+            "discovery.selection",
+            "raw.source_selection is not a sealed closure selection manifest",
+            None,
+        )
+    files = manifest.get("files")
+    excluded = manifest.get("excluded_files")
+    if not isinstance(files, dict) or not isinstance(excluded, dict):
+        raise _Failure("discovery.selection", "sealed selection carries no file inventories", None)
+    upload = {**excluded, **files}
+    try:
+        verify_selection(manifest, upload, files, reader_sha256=manifest.get("reader_sha256"))
+    except Exception as error:  # noqa: BLE001 - reported as a structured verifier failure
+        raise _Failure("discovery.selection", f"sealed selection does not recompute: {error}", None) from error
+    native_files = raw.get("files")
+    if not isinstance(native_files, dict) or not native_files:
+        raise _Failure("discovery.selection", "the raw record carries no native file inventory", None)
+    for name, checksum in files.items():
+        if native_files.get(name) != checksum:
+            raise _Failure(
+                "discovery.selection",
+                f"selected source {name!r} is not bound by the raw record",
+                {"document": name},
+            )
+    raw_selection = raw.get("selection")
+    if isinstance(raw_selection, dict):
+        chosen = raw_selection.get("main_assembly")
+        if chosen is not None and str(chosen).replace("\\", "/") != manifest.get("main_assembly"):
+            raise _Failure("discovery.selection", "the raw main choice differs from the sealed selection", None)
+
+
 def _frames(record: dict) -> dict[str, list[list[float]] | None]:
+    _require_suppression_states(record)
     frames: dict[str, list[list[float]] | None] = {}
     for item in record.get("components") or []:
         if not isinstance(item, dict):
@@ -447,12 +845,7 @@ def _geometry_agrees(kind: str, recorded: dict, localized: dict) -> bool:
         if abs(abs(_dot(recorded_normal, localized_normal)) - 1.0) > _CONFLICT_ANGLE_EPS:
             return False
         return (
-            abs(
-                sum(
-                    (localized_point[index] - recorded_point[index]) * recorded_normal[index]
-                    for index in range(3)
-                )
-            )
+            abs(sum((localized_point[index] - recorded_point[index]) * recorded_normal[index] for index in range(3)))
             <= _CONFLICT_POS_TOL_M
         )
     if kind == "line":
@@ -500,9 +893,7 @@ def _localized_values(geometry):
         if isinstance(values, (str, bytes)) or not hasattr(values, "__iter__"):
             return None
         items = list(values)
-        if len(items) != 3 or any(
-            not isinstance(item, (int, float)) or isinstance(item, bool) for item in items
-        ):
+        if len(items) != 3 or any(not isinstance(item, (int, float)) or isinstance(item, bool) for item in items):
             return None
         numbers = [float(item) for item in items]
         if not all(math.isfinite(item) for item in numbers):
@@ -526,9 +917,7 @@ def _localized_values(geometry):
         values["point"] = point
         return values
     if kind == "line":
-        point, direction = strict_triple(geometry.get("point") or ()), strict_unit(
-            geometry.get("direction") or ()
-        )
+        point, direction = strict_triple(geometry.get("point") or ()), strict_unit(geometry.get("direction") or ())
     elif kind == "plane":
         point, direction = strict_triple(geometry.get("point") or ()), strict_unit(geometry.get("normal") or ())
     else:  # cylinder
@@ -536,9 +925,7 @@ def _localized_values(geometry):
         if not isinstance(radius, (int, float)) or isinstance(radius, bool) or not math.isfinite(float(radius)):
             return None
         values["radius"] = float(radius)
-        point, direction = strict_triple(geometry.get("point") or ()), strict_unit(
-            geometry.get("direction") or ()
-        )
+        point, direction = strict_triple(geometry.get("point") or ()), strict_unit(geometry.get("direction") or ())
     if point is None or direction is None:
         return None
     values["point"], values["direction"] = point, direction
@@ -596,8 +983,7 @@ def _geometry(entity: dict, frames):
         if recorded_kind == "point":
             stored = _finite_triple(entity.get("point") or ())
             if stored is None or any(
-                abs(left - right) > _CONFLICT_POS_TOL_M
-                for left, right in zip(stored, values["point"], strict=True)
+                abs(left - right) > _CONFLICT_POS_TOL_M for left, right in zip(stored, values["point"], strict=True)
             ):
                 return None, None
             return point, None
@@ -651,6 +1037,11 @@ def _rows_for(mate: dict, frames) -> dict | None:
     if kind not in SUPPORTED_MATES:
         return None
     entities = _entities(mate)
+    nested = _nested_self_frame_entity(mate)
+    if nested is not None:
+        # The scope's own frame entity resolves through the scope occurrence transform,
+        # exactly like the same relation written as an ordinary in-scope pair.
+        entities = [{**entity, "assembly_frame": False} if entity is nested else entity for entity in entities]
     if len(entities) < 2:
         return None
     first, second = entities[0], entities[1]
@@ -670,10 +1061,41 @@ def _rows_for(mate: dict, frames) -> dict | None:
         rows = [_translation_row(axis, point) for axis in axes] + [_rotation_row(axis) for axis in axes]
         return {"rows": rows, "limits": limits, "axis": None, "point": point}
     if kind == "concentric":
-        if not _axis_entity(first) or not _axis_entity(second):
-            return None
+        # Generic point-on-axis form: one bare recorded point (no direction of its own)
+        # against one axis entity (cylindrical face or circular edge).  The point carries
+        # only its position, so a generic entity parameter is never promoted into a fake
+        # axis, and only the axis entity may define the line.  Solved-state consistency is
+        # required before the two point-on-line rows are emitted.
         left_point, left_axis = _geometry(first, frames)
         right_point, right_axis = _geometry(second, frames)
+        point_candidates = [
+            point
+            for entity, point, _axis in ((first, left_point, left_axis), (second, right_point, right_axis))
+            if _kind(entity) == "point" and point is not None
+        ]
+        axis_candidates = [
+            (point, axis)
+            for entity, point, axis in ((first, left_point, left_axis), (second, right_point, right_axis))
+            if _axis_entity(entity) and point is not None and axis is not None
+        ]
+        if len(point_candidates) == 1 and len(axis_candidates) == 1:
+            point_point = point_candidates[0]
+            axis_point, axis_direction = axis_candidates[0]
+            delta = [point_point[index] - axis_point[index] for index in range(3)]
+            along = _dot(delta, axis_direction)
+            radial = [delta[index] - along * axis_direction[index] for index in range(3)]
+            if math.sqrt(_dot(radial, radial)) > AXIS_OFFSET_TOL_M:
+                return None
+            plane = _plane_basis(axis_direction)
+            if len(plane) != 2:
+                return None
+            # Point-on-line rows live at the recorded point P: [n, P x n] for two
+            # independent directions n orthogonal to the axis.  The point evidences
+            # neither a shaft/joint identity nor a ground binding.
+            rows = [_translation_row(direction, point_point) for direction in plane]
+            return {"rows": rows, "limits": limits, "axis": None, "point": None}
+        if not _axis_entity(first) or not _axis_entity(second):
+            return None
         if (
             left_point is None
             or right_point is None
@@ -695,6 +1117,11 @@ def _rows_for(mate: dict, frames) -> dict | None:
         rows = [_translation_row(direction, left_point) for direction in plane] + [
             _rotation_row(direction) for direction in plane
         ]
+        # The documented concentric rotation lock removes the spin only: one axial
+        # rotation row, and only from an exact native boolean true.  A missing,
+        # false or non-boolean value leaves the revolute freedom intact.
+        if mate.get("lock_rotation") is True and mate.get("lock_rotation_api") == LOCK_ROTATION_API:
+            rows.append(_rotation_row(left_axis))
         # Circle axes reconstruct the constraint but never evidence the shaft: the
         # independent interface gate must keep requiring a real cylindrical entity.
         shaft = None
@@ -707,12 +1134,7 @@ def _rows_for(mate: dict, frames) -> dict | None:
     if kind == "coincident":
         left_point, left_axis = _geometry(first, frames)
         right_point, right_axis = _geometry(second, frames)
-        if (
-            left_axis is not None
-            and right_axis is not None
-            and _kind(first) == "plane"
-            and _kind(second) == "plane"
-        ):
+        if left_axis is not None and right_axis is not None and _kind(first) == "plane" and _kind(second) == "plane":
             if abs(abs(_dot(left_axis, right_axis)) - 1.0) > TOL:
                 return None
             normal = left_axis if _dot(left_axis, right_axis) >= 0 else [-value for value in left_axis]
@@ -759,6 +1181,7 @@ def _rows_for(mate: dict, frames) -> dict | None:
                 return None
             rows = [_translation_row(normal, circle_point)] + [_rotation_row(direction) for direction in plane]
             return {"rows": rows, "limits": limits, "axis": None, "point": circle_point}
+
         def line_plane_rows(line_entity: dict, plane_entity: dict):
             # A line coincident with a plane lies in that plane: the recorded solved state
             # must already show the direction perpendicular to the normal and the line's
@@ -769,15 +1192,11 @@ def _rows_for(mate: dict, frames) -> dict | None:
                 return None
             if abs(_dot(line_direction, plane_normal)) > TOL:
                 return None
-            separation = abs(
-                sum((line_point[index] - plane_point[index]) * plane_normal[index] for index in range(3))
-            )
+            separation = abs(sum((line_point[index] - plane_point[index]) * plane_normal[index] for index in range(3)))
             if separation > AXIS_OFFSET_TOL_M:
                 return None
             pivot = _unit_vector(_cross(line_direction, plane_normal))
-            rows = ([_rotation_row(pivot)] if pivot is not None else []) + [
-                _translation_row(plane_normal, line_point)
-            ]
+            rows = ([_rotation_row(pivot)] if pivot is not None else []) + [_translation_row(plane_normal, line_point)]
             return {"rows": rows, "limits": limits, "axis": None, "point": line_point}
 
         if _kind(first) == "line" and _kind(second) == "plane":
@@ -790,19 +1209,9 @@ def _rows_for(mate: dict, frames) -> dict | None:
         # Only the explicit plane-plus-vertex form remains: the face side must be a
         # recorded plane and the other side an explicit point.  A missing entity, a
         # cylinder, a circle, or any unrelated geometry is never treated as a vertex.
-        if (
-            _kind(first) == "plane"
-            and left_axis is not None
-            and _kind(second) == "point"
-            and right_point is not None
-        ):
+        if _kind(first) == "plane" and left_axis is not None and _kind(second) == "point" and right_point is not None:
             normal, point = left_axis, right_point
-        elif (
-            _kind(second) == "plane"
-            and right_axis is not None
-            and _kind(first) == "point"
-            and left_point is not None
-        ):
+        elif _kind(second) == "plane" and right_axis is not None and _kind(first) == "point" and left_point is not None:
             normal, point = right_axis, left_point
         else:
             return None
@@ -906,6 +1315,7 @@ def _find(nodes: list[str], parent: dict[str, str], node: str) -> str:
 
 
 def _independent_clusters(record: dict):
+    _require_suppression_states(record)
     components = {
         str(item.get("name2")): item
         for item in record.get("components") or []
@@ -1015,17 +1425,27 @@ def _frame_attachment(record: dict) -> dict:
     and every occurrence endpoint must belong to exactly one rigid cluster; that
     cluster is the only claim the frame attachment can carry.  Nested, incomplete or
     ambiguous attachments are recorded as problems, never guessed.
+
+    A nested self-frame mate (scope ``S`` with its own flagged entity ``component == S``)
+    is an ordinary in-scope pair: it is not part of this aggregate.  Problems on such
+    nested relations -- or on any mate that is not a well-formed top-scope attachment --
+    are scope-isolated diagnostics: they are reported, but only top-scope problems veto
+    the frozen-top attachment.
     """
 
     problems: list[dict] = []
+    top_problems: list[dict] = []
+    scope_problems: list[dict] = []
     seen = 0
     attached: list[str] = []
     rows_all: list[list[float]] = []
     known = _components_by_name(record)
     frames = _frames(record)
 
-    def problem(message: str, detail: dict | None = None) -> None:
-        problems.append({"code": "discovery.frame_attachment", "message": message, "detail": detail or {}})
+    def problem(target: list[dict], message: str, detail: dict | None = None) -> None:
+        item = {"code": "discovery.frame_attachment", "message": message, "detail": detail or {}}
+        problems.append(item)
+        target.append(item)
 
     for index, mate in enumerate(record.get("mates") or []):
         if not isinstance(mate, dict) or mate.get("suppressed"):
@@ -1034,13 +1454,26 @@ def _frame_attachment(record: dict) -> dict:
         flagged = [entity for entity in entities if entity.get("assembly_frame") is True]
         if not flagged:
             continue
-        seen += 1
         name = str(mate.get("name") or index)
         scope = mate.get("scope")
+        nested = _nested_self_frame_entity(mate)
+        if nested is not None:
+            others = [entity for entity in entities if entity is not nested]
+            endpoint = others[0].get("component") if len(others) == 1 else None
+            if scope not in known or not isinstance(endpoint, str) or endpoint not in known:
+                problem(
+                    scope_problems,
+                    "a frame-attached mate outside the frozen top assembly is not supported",
+                    {"mate": name, "scope": scope, "endpoint": endpoint, "entities": len(entities)},
+                )
+            continue
+        seen += 1
         if scope != "":
             # Missing, null or numeric scopes are as unsupported as a nested one: the
-            # frozen top scope must be exactly the empty string.
+            # frozen top scope must be exactly the empty string.  Scope-isolated: this
+            # never vetoes the frozen-top aggregate.
             problem(
+                scope_problems,
                 "a frame-attached mate outside the frozen top assembly is not supported",
                 {"mate": name, "scope": scope},
             )
@@ -1055,6 +1488,7 @@ def _frame_attachment(record: dict) -> dict:
             or len(others) != 1
         ):
             problem(
+                top_problems,
                 "a frame-attached mate must carry exactly one frame entity and one occurrence entity",
                 {"mate": name, "entities": len(entities)},
             )
@@ -1062,12 +1496,14 @@ def _frame_attachment(record: dict) -> dict:
         for entity in flagged:
             if entity.get("component") != "":
                 problem(
+                    top_problems,
                     "a frame entity must carry the frozen top-scope identity",
                     {"mate": name, "component": entity.get("component")},
                 )
         rows = _rows_for(mate, frames)
         if rows is None:
             problem(
+                top_problems,
                 "a frame-attached mate cannot be reconstructed from its recorded entities",
                 {"mate": name, "type": mate.get("type")},
             )
@@ -1076,32 +1512,50 @@ def _frame_attachment(record: dict) -> dict:
         for entity in others:
             component = entity.get("component")
             if not isinstance(component, str) or not component:
-                problem("a frame-attached mate names an unknown occurrence", {"mate": name, "component": component})
+                problem(
+                    top_problems,
+                    "a frame-attached mate names an unknown occurrence",
+                    {"mate": name, "component": component},
+                )
                 continue
             attached.append(component)
-    if problems:
-        return {"mates": seen, "components": sorted(set(attached)), "members": None, "rank": None, "problems": problems}
+    result = {
+        "mates": seen,
+        "components": sorted(set(attached)),
+        "members": None,
+        "rank": None,
+        "problems": problems,
+        "top_problems": top_problems,
+        "scope_problems": scope_problems,
+    }
+    if top_problems:
+        return result
     if not seen:
-        return {"mates": 0, "components": [], "members": None, "rank": None, "problems": []}
+        result["mates"] = 0
+        result["components"] = []
+        return result
     unknown = sorted(name for name in set(attached) if name not in known)
     if unknown:
-        problem("a frame-attached mate names an unknown occurrence", {"components": unknown})
+        problem(top_problems, "a frame-attached mate names an unknown occurrence", {"components": unknown})
     members, _pairs = _independent_clusters(record)
     cluster_of = {name: key for key, group in members.items() for name in group}
     keys = sorted({cluster_of[name] for name in set(attached) if name in cluster_of})
     if len(keys) != 1:
         problem(
+            top_problems,
             "frame-attached components must belong to exactly one rigid cluster",
             {"components": sorted(set(attached)), "clusters": [sorted(members[key]) for key in keys]},
         )
     rank = len(_span(rows_all))
     if rank != 6:
         problem(
+            top_problems,
             "the aggregate frame attachment does not reach full rank; the attachment is incomplete",
             {"rank": rank},
         )
     full = frozenset(members[keys[0]]) if len(keys) == 1 else None
-    return {"mates": seen, "components": sorted(set(attached)), "members": full, "rank": rank, "problems": problems}
+    result.update({"members": full, "rank": rank})
+    return result
 
 
 def _frame_attached_members(record: dict) -> frozenset[str]:
@@ -1113,7 +1567,7 @@ def _frame_attached_members(record: dict) -> frozenset[str]:
     """
 
     result = _frame_attachment(record)
-    if result["problems"] or result["members"] is None:
+    if result["top_problems"] or result["members"] is None:
         return frozenset()
     members = frozenset(result["members"])
     if _owned_datum(record, "CS_base_link", _datum_owners(members, members)) is None:
@@ -1245,6 +1699,7 @@ def verify_discovery(package: Path) -> dict:
     package = Path(package)
     checks: list[dict] = []
     errors: list[dict] = []
+    diagnostics: list[dict] = []
     state: dict = {}
 
     def check(identifier, callback):
@@ -1336,11 +1791,6 @@ def verify_discovery(package: Path) -> dict:
             "the native inventory digest does not match provenance",
         )
         _require(robot.get("schema_version") == INPUT_SCHEMA, "discovery.binding", "robot.yaml schema changed")
-        _require(
-            _ID.match(str(robot.get("hardware_id") or "")),
-            "discovery.binding",
-            "hardware_id is not an ASCII identifier",
-        )
         state["robot"] = robot
         state["payload"] = payload
         state["provenance"] = provenance
@@ -1386,10 +1836,239 @@ def verify_discovery(package: Path) -> dict:
             )
         return {"native_files": len(native), "cad_files": len(observed)}
 
+    def imported_sources():
+        """Every recorded imported occurrence must bind to a frozen native source.
+
+        Two classes are accepted.  A resolved native imported document whose
+        GetImportedPath names the captured document inside the frozen root binds
+        directly.  A cached native materialization (a session temp document whose author
+        path is metadata) is accepted only through the mandatory sealed selection
+        carrier: exact owner, owner bytes, occurrence identity, session-temp
+        materialization inside the owned session temp area, author metadata and current
+        native suppression/virtual readings must all match one recorded cached
+        materialization, and every recorded cached materialization must be proven by a
+        current occurrence.  Nothing is guessed from raw paths, names or suffixes, and a
+        present external file is never downgraded; everything else yields a precise
+        discovery.imported_source_unbound failure.
+        """
+
+        payload = state["payload"]
+        raw = payload.get("raw") or {}
+        native = payload.get("native_files") or {}
+        raw_files = raw.get("files") or {}
+        carrier = raw.get("source_selection")
+        closure = carrier.get("closure") if isinstance(carrier, dict) else None
+        cached_slots: list[dict] = []
+        if isinstance(closure, dict) and isinstance(closure.get("imports"), list):
+            cached_slots = [
+                item
+                for item in closure["imports"]
+                if isinstance(item, dict) and item.get("state") == "cached_materialization"
+            ]
+        cached_used: set[int] = set()
+        unbound: list[dict] = []
+        observed = 0
+        for component in raw.get("components") or []:
+            if not isinstance(component, dict):
+                continue
+            provenance = component.get("source_provenance")
+            if provenance is None:
+                continue
+            observed += 1
+            document = component.get("document")
+            observation = component.get("solver_observation")
+            context = observation.get("context") if isinstance(observation, dict) else None
+            entry = {
+                "occurrence": str(component.get("name2") or ""),
+                "document": document,
+                "containing_document": context.get("document") if isinstance(context, dict) else None,
+                "native_path": provenance.get("native_document_path") if isinstance(provenance, dict) else None,
+                "imported_path": provenance.get("imported_path") if isinstance(provenance, dict) else None,
+            }
+            if not isinstance(provenance, dict):
+                unbound.append({**entry, "state": None, "reason": "imported provenance is not an object"})
+                continue
+            if provenance.get("state") == "cached_materialization":
+                reason = _cached_materialization_reason(
+                    component, provenance, cached_slots, cached_used, carrier, native
+                )
+                if reason is not None:
+                    unbound.append(
+                        {**entry, "state": provenance.get("state"), "reason": reason, "error": provenance.get("error")}
+                    )
+                continue
+            reason = None
+            if provenance.get("state") != "resolved":
+                reason = f"imported source state is {provenance.get('state') or 'unread'}"
+            elif provenance.get("kind") != "native_imported_document":
+                reason = "imported provenance is not a native imported document"
+            elif (
+                provenance.get("used_api")
+                != "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual"
+            ):
+                reason = "imported provenance used an unexpected native API"
+            elif provenance.get("document") != document:
+                reason = "imported provenance document differs from the occurrence document"
+            elif (
+                not isinstance(document, str)
+                or not document
+                or PurePosixPath(document).is_absolute()
+                or PurePosixPath(document).as_posix() != document
+                or ".." in PurePosixPath(document).parts
+                or "\\" in document
+                or ":" in document
+            ):
+                reason = "the occurrence document is not a canonical confined package path"
+            elif provenance.get("is_virtual") is not False:
+                reason = (
+                    "virtual imported documents are outside the handoff contract"
+                    if provenance.get("is_virtual") is True
+                    else "the imported virtual state is unread"
+                )
+            else:
+                sha = provenance.get("sha256")
+                recorded = raw_files.get(document)
+                if not (
+                    isinstance(sha, str)
+                    and _HEX.match(sha)
+                    and native.get(document) == sha
+                    and (recorded is None or recorded == sha)
+                ):
+                    reason = "imported bytes are not bound to the frozen native inventory"
+                else:
+                    origin, root = provenance.get("imported_path"), provenance.get("source_root")
+                    if not (
+                        isinstance(origin, str)
+                        and ntpath.isabs(origin)
+                        and isinstance(root, str)
+                        and ntpath.isabs(root)
+                    ):
+                        reason = "the imported-source confinement evidence is incomplete"
+                    else:
+                        try:
+                            relative = ntpath.relpath(origin, root)
+                        except ValueError:
+                            reason = "imported path and frozen root are on different drives"
+                        else:
+                            if (
+                                relative == ".."
+                                or relative.startswith("..\\")
+                                or ntpath.normcase(relative) != ntpath.normcase(document.replace("/", "\\"))
+                            ):
+                                reason = "GetImportedPath does not name the captured source inside the frozen root"
+            if reason is not None:
+                unbound.append(
+                    {
+                        **entry,
+                        "state": provenance.get("state"),
+                        "reason": reason,
+                        "error": provenance.get("error"),
+                    }
+                )
+        if unbound:
+            _require(
+                False,
+                "discovery.imported_source_unbound",
+                "recorded imported occurrences are not bound to frozen native sources",
+                {
+                    "unbound": len(unbound),
+                    "observations": observed,
+                    "occurrences": [item["occurrence"] for item in unbound],
+                    "imported_paths": sorted({str(item["imported_path"]) for item in unbound if item["imported_path"]}),
+                    "samples": unbound[:20],
+                },
+            )
+        unmatched = [index for index in range(len(cached_slots)) if index not in cached_used]
+        if unmatched:
+            _require(
+                False,
+                "discovery.imported_source_unbound",
+                "the sealed carrier records cached materializations that no current occurrence proves",
+                {
+                    "unmatched": [cached_slots[index] for index in unmatched[:20]],
+                    "unmatched_count": len(unmatched),
+                },
+            )
+        return {"imported_occurrences": observed, "cached_materializations": len(cached_used)}
+
+    def identity():
+        payload, robot = state["payload"], state["robot"]
+        authored = _authored_identity(payload.get("raw") or {}, str(payload.get("namespace") or "dp"))
+        state["authored_identity"] = authored
+        claimed = payload.get("identity")
+        _require(isinstance(claimed, dict), "discovery.identity", "generated identity claims are absent")
+        for key in ("hardware_id", "revision", "parent_revision", "owner", "change_summary", "control"):
+            _require(
+                claimed.get(key) == authored[key],
+                "discovery.identity",
+                "generated metadata differs from native evidence",
+                {"field": key},
+            )
+        _require(
+            robot.get("hardware_id") == authored["hardware_id"],
+            "discovery.identity",
+            "robot.yaml hardware_id differs from authored native metadata",
+        )
+        technical_name = authored["robot_name"]
+        label_source = "authored_robot_name"
+        if technical_name is None:
+            label_source = "hardware_id" if authored["hardware_id"] is not None else "technical_default"
+            technical_name = re.sub(r"[^0-9A-Za-z]+", "_", authored["hardware_id"] or "robot").strip("_").lower()
+        _require(
+            (robot.get("source") or {}).get("robot_name") == technical_name,
+            "discovery.identity",
+            "generated robot label differs from its recorded naming source",
+        )
+        if authored["missing"]:
+            diagnostics.append(
+                {
+                    "code": "discovery.publication_metadata_incomplete",
+                    "blocking": False,
+                    "message": "engineering evidence is inspectable; authored publication metadata is incomplete",
+                    "detail": {"missing": authored["missing"]},
+                }
+            )
+        return {
+            "missing_publication_fields": authored["missing"],
+            "technical_label": technical_name,
+            "label_source": label_source,
+        }
+
     def revision():
         robot = state["robot"]
+        _require(not revision_path.is_symlink(), "discovery.revision", "cad-revision.json must be a regular file")
         _require(revision_path.is_file(), "discovery.revision", "cad-revision.json is missing")
         revision = _read_json(revision_path)
+        fields = {
+            "schema_version",
+            "hardware_id",
+            "revision",
+            "parent_revision",
+            "owner",
+            "change_summary",
+            "control",
+            "cad_files",
+        }
+        _require(
+            isinstance(revision, dict)
+            and not set(revision) - fields
+            and revision.get("schema_version") == "solidworks-to-urdf.cad-revision/v1",
+            "discovery.revision",
+            "the supplied revision manifest is malformed",
+        )
+        authored = state.get("authored_identity")
+        _require(
+            authored is not None and not authored["missing"],
+            "discovery.revision",
+            "the revision manifest lacks complete native author metadata",
+        )
+        for key in ("hardware_id", "revision", "parent_revision", "owner", "change_summary", "control"):
+            _require(
+                revision.get(key) == authored[key],
+                "discovery.revision",
+                "revision metadata differs from native author metadata",
+                {"field": key},
+            )
         _require(
             revision.get("hardware_id") == robot.get("hardware_id"),
             "discovery.revision",
@@ -1427,6 +2106,10 @@ def verify_discovery(package: Path) -> dict:
             _require(
                 isinstance(item, (list, tuple))
                 and isinstance(declared, (list, tuple))
+                and len(item) == len(declared) == 2
+                and all(_number(number) is not None for number in (*item, *declared))
+                and 0 <= item[0] < item[1]
+                and 0 <= declared[0] < declared[1]
                 and _close([float(declared[0]), float(declared[1])], [float(item[0]), float(item[1])], 1e-12),
                 "discovery.budgets",
                 f"the {key} capture window differs from the design budget record",
@@ -2136,7 +2819,11 @@ def verify_discovery(package: Path) -> dict:
                 entry = _find_record_entry(payload, reference_record)
                 value = _record_value(package, entry["entry"], entry["key"])
                 _require(
-                    _close([limits.get("lower"), limits.get("upper")], [value.get("lower"), value.get("upper")], 1e-12),
+                    _close(
+                        [limits.get("lower"), limits.get("upper")],
+                        [value.get("lower"), value.get("upper")],
+                        1e-12,
+                    ),
                     "discovery.joints",
                     "the joint limits differ from the controlled record",
                     {"joint": joint.get("name")},
@@ -2366,9 +3053,38 @@ def verify_discovery(package: Path) -> dict:
             )
         return {"frames": len(expected), "jcs_aliases": jcs_seen}
 
+    def declarations():
+        from .native_declarations import verify_declarations
+
+        report = verify_declarations(state["payload"]["raw"], state["robot"].get("source"))
+        _require(
+            report["passed"],
+            "discovery.declarations",
+            "independent native declaration verification failed",
+            {"failures": report["errors"], "checks": report["checks"], "diagnostics": report["diagnostics"]},
+        )
+        return {
+            "bodies": len(report["members"]),
+            "joints": len((state["robot"].get("source") or {}).get("joints") or []),
+            "checks": report["checks"],
+            "rigid_completion": report["completion"],
+            "diagnostics": report["diagnostics"],
+        }
+
     bound = check("discovery.binding", binding)
+
+    def suppression():
+        return _require_suppression_states((state.get("payload") or {}).get("raw") or {})
+
+    def source_selection():
+        return _require_source_selection(state.get("payload") or {})
+
     dependent = (
+        ("discovery.suppression_state", suppression),
+        ("discovery.selection", source_selection),
         ("discovery.files", files),
+        ("discovery.imported_sources", imported_sources),
+        ("discovery.identity", identity),
         ("discovery.revision", revision),
         ("discovery.budgets", budgets),
         ("discovery.graph", graph),
@@ -2380,8 +3096,55 @@ def verify_discovery(package: Path) -> dict:
         ("discovery.tree", tree),
         ("discovery.frames", frames),
     )
+    raw_block = (state.get("payload") or {}).get("raw")
+    raw_block = raw_block if isinstance(raw_block, dict) else None
+    if bound["passed"] and raw_block is not None and "exporter" in raw_block:
+        # Explicit native declarations do not require incomplete mate inference to
+        # rediscover memberships or impose unrelated CS_/dp.* naming conventions.
+        # Capture/file/mass binding remains mandatory. A declaration carries no
+        # external design budget; never invent nominal mass or extent ranges.
+        dependent = (
+            ("discovery.suppression_state", suppression),
+            ("discovery.selection", source_selection),
+            ("discovery.files", files),
+            ("discovery.imported_sources", imported_sources),
+            ("discovery.identity", identity),
+            ("discovery.revision", revision),
+            ("discovery.budgets", budgets),
+            ("discovery.masses", masses),
+            ("discovery.declarations", declarations),
+        )
+    if bound["passed"]:
+        payload = state["payload"]
+        raw_block = payload.get("raw")
+        raw_block = raw_block if isinstance(raw_block, dict) else {}
+        document_properties = (raw_block.get("properties") or {}).get("document") or {}
+        budget_reference = str(payload.get("namespace") or "dp") + ".design_budget_record"
+        expectations = state["robot"].get("checks") or {}
+        if (
+            "budget" not in payload
+            and budget_reference not in document_properties
+            and not any(key in expectations for key in ("expected_mass_kg", "expected_extent_m"))
+        ):
+            dependent = tuple(item for item in dependent if item[0] != "discovery.budgets")
     if bound["passed"]:
         for identifier, callback in dependent:
+            if identifier == "discovery.revision":
+                authored = state.get("authored_identity") or {}
+                if not revision_path.exists() and not revision_path.is_symlink() and authored.get("missing"):
+                    # Native file/provenance checks still bind every captured byte. The
+                    # absent publication seal is a readiness warning, never a passed check.
+                    diagnostics.append(
+                        {
+                            "code": "discovery.revision_not_sealed",
+                            "blocking": False,
+                            "message": (
+                                "cad-revision.json is absent while authored publication metadata is incomplete"
+                            ),
+                            "detail": {"state": "not_sealed", "missing": list(authored.get("missing") or [])},
+                        }
+                    )
+                    continue
             check(identifier, callback)
     else:
         for identifier, _callback in dependent:
@@ -2398,14 +3161,25 @@ def verify_discovery(package: Path) -> dict:
         "passed": passed,
         "checks": checks,
         "errors": errors,
+        "diagnostics": diagnostics,
     }
     if checks and checks[0]["passed"]:
         report["discovery_sha256"] = checks[0]["details"].get("discovery_sha256")
         report["bodies"] = next(
-            (item["details"].get("bodies") for item in checks if item["id"] == "discovery.bodies"), None
+            (
+                item["details"].get("bodies")
+                for item in checks
+                if item["id"] in {"discovery.bodies", "discovery.declarations"}
+            ),
+            None,
         )
         report["joints"] = next(
-            (item["details"].get("joints") for item in checks if item["id"] == "discovery.joints"), None
+            (
+                item["details"].get("joints")
+                for item in checks
+                if item["id"] in {"discovery.joints", "discovery.declarations"}
+            ),
+            None,
         )
     return report
 

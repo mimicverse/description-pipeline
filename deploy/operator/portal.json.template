@@ -8,7 +8,8 @@
   },
   "pipeline": {
     "store_root": "@PIPELINE_STORE_ROOT@",
-    "repositories": @MODEL_REPOSITORIES_JSON@
+    "repositories": @MODEL_REPOSITORIES_JSON@,
+    "discovery": @DISCOVERY_SETTINGS_JSON@
   },
   "portal": {
     "host": "@OPERATOR_UPSTREAM_HOST@",

@@ -73,7 +73,9 @@ class Robot:
                     raise PipelineError(f"Joint axis must be normalized explicitly: {joint['name']}")
                 if joint["type"] in {"revolute", "prismatic"}:
                     limits = joint.get("limits", {})
-                    if "lower" not in limits or "upper" not in limits or limits["lower"] >= limits["upper"]:
+                    # Preserve a declared zero-width range for inspection.
+                    # Usable motion is a separate independent qualification gate.
+                    if "lower" not in limits or "upper" not in limits or limits["lower"] > limits["upper"]:
                         raise PipelineError(f"Missing or invalid position limits: {joint['name']}")
         roots = set(links) - children
         if len(roots) != 1:

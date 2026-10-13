@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
-from description_pipeline.sources.solidworks.errors import BridgeError, ConfigError  # noqa: E402
+from description_pipeline.sources.solidworks.errors import BridgeError, CadError, ConfigError  # noqa: E402
 from description_pipeline.sources.solidworks.freeze import (  # noqa: E402
     _relative_document_name,
     _source_inputs,
@@ -81,16 +81,280 @@ class FreezeTests(unittest.TestCase):
     def tearDown(self) -> None:
         support.cleanup(self.tmp)
 
+    def test_source_config_carries_the_sealed_native_closure(self) -> None:
+        from description_pipeline.sources.solidworks.freeze import validate_source_config
+
+        closure = {
+            "schema_version": "solidworks-to-urdf.native-closure/v1",
+            "graph": {"robot.SLDASM": {"sha256": "0" * 64, "references": ["arm.SLDPRT"]}},
+            "imports": [
+                {
+                    "instance": "HD-1910-C001-20260902.stp-2",
+                    "state": "cached_materialization",
+                    "materialization": r"C:\Temp\swx1\IC~~\HD.stp.SLDASM",
+                }
+            ],
+            "suppressed": [],
+        }
+        validated = validate_source_config(json.loads(json.dumps({**self.config, "closure": closure})))
+        self.assertEqual(validated["closure"], closure)
+        for bad in ("nope", {"schema_version": "other"}, {"graph": 3}):
+            with self.assertRaises(ConfigError):
+                validate_source_config(json.loads(json.dumps({**self.config, "closure": bad})))
+
+    def test_freeze_retains_the_closure_carrier_evidence(self) -> None:
+        config = json.loads(json.dumps(self.config))
+        config["closure"] = {
+            "schema_version": "solidworks-to-urdf.native-closure/v1",
+            "graph": {},
+            "documents": {
+                "robot.SLDASM": {
+                    "resolved_edges": [
+                        {"instance": "base-1", "resolved": "base.SLDPRT"},
+                        {"instance": "arm-1", "resolved": "arm.SLDPRT"},
+                    ]
+                }
+            },
+            "imports": [],
+            "suppressed": [],
+        }
+        freeze(config, self.destination, backend=self.backend)
+        payload = json.loads((self.destination / "raw" / "dependency_closure.json").read_text(encoding="utf-8"))
+        self.assertTrue(payload["materializations_verified"])
+        self.assertEqual(payload["materialization_keys"], [])
+        self.assertEqual(payload["stale_source_links"], [])
+        self.assertIn("suppressed_skipped", payload)
+        self.assertIn("session_temp_dependencies", payload)
+
+    def test_freeze_records_the_direct_link_group_read(self) -> None:
+        freeze(self.config, self.destination, backend=self.backend)
+        record = json.loads(
+            (self.destination / "raw" / "link_group_mass_properties.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(record["schema_version"], "solidworks-to-urdf.link-group-mass-properties/v1")
+        self.assertEqual(record["selection_rule"], "top_most_providers+uncovered_leaves")
+        self.assertEqual(record["readout_window"], "pristine-reopen")
+        self.assertEqual(sorted(record["links"]), ["arm_link", "base_link"])
+        base = record["links"]["base_link"]
+        self.assertEqual(base["selection"], ["base-1"])
+        self.assertEqual(len(base["reads"]), 2)
+        self.assertAlmostEqual(base["reads"][0]["mass_kg"], 1.0, places=12)
+        self.assertEqual(
+            base["reproducibility"], {"mass_delta_kg": 0.0, "com_delta_norm_m": 0.0, "tensor_delta_max_abs": 0.0}
+        )
+        scene = load_scene(self.destination)
+        link = next(row for row in scene["links"] if row["name"] == "base_link")
+        self.assertAlmostEqual(link["inertial"]["mass"], 1.0, places=12)
+        self.assertEqual(link["provenance"]["mass_properties"]["direct"]["selection"], ["base-1"])
+        self.assertAlmostEqual(
+            link["provenance"]["mass_properties"]["direct_vs_recombination"]["mass_delta_kg"], 0.0, places=12
+        )
+
+    def test_freeze_reads_link_groups_in_the_pristine_reopen_window(self) -> None:
+        freeze(self.config, self.destination, backend=self.backend)
+        order = self.backend.order
+        window_close = order.index("close_all_documents")
+        reopen = order.index("open_document")
+        read = order.index("link_group_read")
+        self.assertLess(order.index("collect_scene"), window_close)
+        self.assertLess(order.index("verify_sources"), window_close)
+        self.assertLess(window_close, reopen)
+        self.assertLess(reopen, read)
+        # Between the reopen and the direct reads nothing else may run, and
+        # after the reads only the closing close-all follows: no other CAD mass
+        # read can touch the reopened document.
+        self.assertEqual(order[reopen + 1 : read], [])
+        self.assertEqual(order[read + 1 :], ["close_all_documents"])
+
+    def test_freeze_fails_closed_when_the_window_payload_echo_differs(self) -> None:
+        self.backend.link_group_selection_override = {"base_link": ["arm-1"]}
+        with self.assertRaises(BridgeError) as caught:
+            freeze(self.config, self.destination, backend=self.backend)
+        self.assertEqual(caught.exception.code, "cad_link_group_payload_invalid")
+
+    def test_freeze_fails_closed_when_documents_cannot_close(self) -> None:
+        self.backend.close_refuses = True
+        with self.assertRaises(CadError) as caught:
+            freeze(self.config, self.destination, backend=self.backend)
+        self.assertEqual(caught.exception.code, "cad_close_failed")
+
+    def test_freeze_fails_closed_without_a_window_capable_backend(self) -> None:
+        self.backend.close_all_documents = None
+        with self.assertRaises(BridgeError) as caught:
+            freeze(self.config, self.destination, backend=self.backend)
+        self.assertEqual(caught.exception.code, "cad_pristine_readout_unavailable")
+
+    def test_freeze_binds_the_pristine_top_and_marks_both_records(self) -> None:
+        reading = {
+            "mass": 2.5,
+            "com": [0.001, -0.002, 0.003],
+            "inertia": [[1e-6, 0.0, 0.0], [0.0, 2e-6, 0.0], [0.0, 0.0, 3e-6]],
+            "reference": {
+                "used_api": "IMassProperty2.GetMomentOfInertia(0)",
+                "scope": "assembly_document",
+                "axes": "assembly_document_axes",
+                "reference_point": "center_of_mass",
+                "use_system_units": True,
+                "product_convention": "solidworks_standard",
+                "overrides": {
+                    "OverrideMass": False,
+                    "OverrideCenterOfMass": False,
+                    "OverrideMomentsOfInertia": False,
+                },
+            },
+        }
+        self.backend.assembly_mass_properties = lambda _path: reading
+        freeze(self.config, self.destination, backend=self.backend)
+        closure = json.loads((self.destination / "raw" / "mass_closure.json").read_text(encoding="utf-8"))
+        self.assertEqual(closure["status"], "recorded")
+        self.assertEqual(closure["top_level"]["mass"], 2.5)
+        self.assertEqual(closure["top_level"]["com"], [0.001, -0.002, 0.003])
+        self.assertEqual(closure["top_level"]["reference"]["readout_window"], "pristine-reopen")
+        record = json.loads(
+            (self.destination / "raw" / "link_group_mass_properties.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(record["readout_window"], "pristine-reopen")
+        # The direct reads ran after the reopen, never on the walked session.
+        order = self.backend.order
+        self.assertLess(order.index("open_document"), order.index("link_group_read"))
+
+    def test_freeze_records_evidence_covered_stale_stored_references(self) -> None:
+        config = json.loads(json.dumps(self.config))
+        config["closure"] = {
+            "schema_version": "solidworks-to-urdf.native-closure/v1",
+            "graph": {
+                "robot.SLDASM": {"sha256": "0" * 64, "references": ["base.SLDPRT", "arm.SLDPRT"]},
+                "base.SLDPRT": {"sha256": "0" * 64, "references": []},
+                "arm.SLDPRT": {"sha256": "0" * 64, "references": []},
+            },
+            "documents": {
+                "robot.SLDASM": {
+                    "resolved_edges": [
+                        {"instance": "base-1", "resolved": "base.SLDPRT"},
+                        {"instance": "arm-1", "resolved": "arm.SLDPRT"},
+                    ],
+                    "stored_references": [],
+                }
+            },
+            "imports": [],
+            "suppressed": [],
+        }
+        stale_path = str(self.tmp / "CopyDesignTemp" / "lowerbody.SLDASM")
+        real_collect = self.backend.collect_dependencies
+
+        def collect_with_stale(path, destination, **kwargs):
+            payload = real_collect(path, destination, **kwargs)
+            payload["skipped_stale"] = [
+                {"document": "robot.SLDASM", "location": stale_path, "resolved_path": stale_path, "exists": False}
+            ]
+            return payload
+
+        self.backend.collect_dependencies = collect_with_stale  # type: ignore[method-assign]
+        real_resolve = self.backend.resolve_dependencies
+
+        def resolve_with_stale(path):
+            return [*real_resolve(path), {"path": stale_path, "exists": False, "type": ".sldasm"}]
+
+        self.backend.resolve_dependencies = resolve_with_stale  # type: ignore[method-assign]
+        freeze(config, self.destination, backend=self.backend)
+        payload = json.loads((self.destination / "raw" / "dependency_closure.json").read_text(encoding="utf-8"))
+        stale = payload["stale_stored_references"]
+        self.assertEqual(len(stale), 1)
+        self.assertEqual(stale[0]["resolved_path"], stale_path)
+        self.assertEqual(stale[0]["location"], stale_path)
+
+    def test_freeze_refuses_uncovered_materializations(self) -> None:
+        config = json.loads(json.dumps(self.config))
+        config["closure"] = {
+            "schema_version": "solidworks-to-urdf.native-closure/v1",
+            "graph": {},
+            "documents": {
+                "robot.SLDASM": {
+                    "resolved_edges": [{"instance": "base-1", "resolved": "base.SLDPRT"}]
+                }
+            },
+            "imports": [
+                {
+                    "instance": "ghost-import-1",
+                    "state": "cached_materialization",
+                    "materialization": r"C:\Temp\swx1\IC~~\X.step.SLDASM",
+                }
+            ],
+            "suppressed": [],
+        }
+        with self.assertRaises(BridgeError) as raised:
+            freeze(config, self.destination, backend=self.backend)
+        self.assertEqual(raised.exception.code, "dependency_materialization_uncovered")
+
     def test_freeze_produces_a_verified_snapshot(self) -> None:
         manifest = freeze(self.config, self.destination, backend=self.backend, worker_version="test-worker")
         self.assertEqual(manifest["kind"], "solidworks")
         # the fixture backend must never be published as native CAD evidence
         self.assertEqual(manifest["evidence_class"], "fixture")
         self.assertTrue((self.destination / "manifest.json").is_file())
-        self.assertTrue((self.destination / "scene.json").is_file())
-        self.assertIn("scene.json", manifest["files"])
+        self.assertFalse((self.destination / "scene.json").exists())
+        self.assertEqual(manifest["scene"], "raw/scene_raw.json")
+        self.assertEqual(manifest["source_config"], "raw/source_config.json")
+        self.assertIn("raw/source_config.json", manifest["files"])
         self.assertIn("raw/scene_raw.json", manifest["files"])
         self.assertTrue(any(name.startswith("geometry/") for name in manifest["files"]))
+
+    def test_capture_never_builds_a_scene_and_linux_derivation_keeps_snapshot_immutable(self) -> None:
+        from description_pipeline.io import inventory
+
+        with (
+            patch(
+                "description_pipeline.sources.solidworks.scene.build_scene",
+                side_effect=AssertionError("scene construction is portable work"),
+            ),
+            patch(
+                "description_pipeline.sources.solidworks.closure.derive_mass_closure",
+                side_effect=AssertionError("closure comparison is portable work"),
+            ),
+        ):
+            freeze(self.config, self.destination, backend=self.backend)
+        before = inventory(self.destination)
+        scene = load_scene(self.destination)
+        self.assertEqual(scene["schema_version"], "description.scene/v1")
+        self.assertEqual(inventory(self.destination), before)
+        self.assertNotIn("scene.json", before)
+
+    def test_resealed_source_configuration_cannot_change_capture_identity(self) -> None:
+        from description_pipeline.io import write_json
+        from description_pipeline.sources.snapshot import verify_snapshot, write_manifest
+
+        manifest = freeze(self.config, self.destination, backend=self.backend)
+        path = self.destination / "raw/source_config.json"
+        config = json.loads(path.read_text(encoding="utf-8"))
+        config["assembly"] = "another-assembly.SLDASM"
+        write_json(path, config)
+        write_manifest(
+            self.destination,
+            kind="solidworks",
+            identity=manifest["identity"],
+            evidence_class=manifest["evidence_class"],
+        )
+        verify_snapshot(self.destination)
+        with self.assertRaisesRegex(ValueError, "names another assembly"):
+            load_scene(self.destination)
+
+    def test_resealed_duplicate_native_readings_cannot_disagree(self) -> None:
+        from description_pipeline.io import write_json
+        from description_pipeline.sources.snapshot import write_manifest
+
+        manifest = freeze(self.config, self.destination, backend=self.backend)
+        path = self.destination / "raw/mass_properties.json"
+        masses = json.loads(path.read_text(encoding="utf-8"))
+        masses["base-1"]["mass"] *= 2
+        write_json(path, masses)
+        write_manifest(
+            self.destination,
+            kind="solidworks",
+            identity=manifest["identity"],
+            evidence_class=manifest["evidence_class"],
+        )
+        with self.assertRaisesRegex(ValueError, "dedicated raw records"):
+            load_scene(self.destination)
 
     def test_nested_unicode_instance_names_fit_native_filesystem_limits(self) -> None:
         from description_pipeline.sources.solidworks.freeze import _export_geometry
@@ -174,7 +438,7 @@ class FreezeTests(unittest.TestCase):
 
         self.assertEqual(manifest["kind"], "solidworks")
         self.assertTrue((self.destination / "manifest.json").is_file())
-        self.assertTrue((self.destination / "scene.json").is_file())
+        self.assertTrue((self.destination / "raw/scene_raw.json").is_file())
 
     def test_non_empty_destination_is_refused(self) -> None:
         self.destination.mkdir(parents=True)
@@ -296,7 +560,7 @@ class FreezeTests(unittest.TestCase):
             dependencies=self.parts,
         )
 
-        def broken_pack(path, destination_dir):
+        def broken_pack(path, destination_dir, **kwargs):
             payload = support.FixtureCadBackend.collect_dependencies(backend, path, destination_dir)
             payload["top_level"] = str(self.tmp / "not-collected.SLDASM")
             return payload
@@ -359,14 +623,15 @@ class FreezeTests(unittest.TestCase):
         config = json.loads(json.dumps(self.config))
         config["joints"][0]["xyz"] = [0.0, 0.0, 0.2]
 
+        freeze(config, self.destination, backend=self.backend)
         with self.assertRaises(ConfigError) as raised:
-            freeze(config, self.destination, backend=self.backend)
+            load_scene(self.destination)
 
         self.assertEqual(raised.exception.code, "invalid_config")
 
     def test_tampered_snapshot_is_rejected(self) -> None:
         freeze(self.config, self.destination, backend=self.backend)
-        target = self.destination / "scene.json"
+        target = self.destination / "raw/scene_raw.json"
         payload = json.loads(target.read_text(encoding="utf-8"))
         payload["name"] = "tampered"
         target.write_text(json.dumps(payload), encoding="utf-8")
@@ -450,7 +715,7 @@ class FreezeTests(unittest.TestCase):
         original_lock.write_bytes(b"user session")
         collect = backend.collect_dependencies
 
-        def collect_with_locks(path, destination):
+        def collect_with_locks(path, destination, **kwargs):
             result = collect(path, destination)
             (Path(destination) / "~$base.SLDPRT").write_bytes(b"capture session")
             (Path(destination) / "~$notes.txt").write_bytes(b"not a native lock")
@@ -1204,10 +1469,10 @@ class DocumentedMassTests(unittest.TestCase):
 
     def test_documented_mass_is_applied_at_load_time_and_records_raw_used(self) -> None:
         freeze(self.config, self.tmp / "snapshot", backend=self.backend)
-        raw_scene = json.loads((self.tmp / "snapshot" / "scene.json").read_text(encoding="utf-8"))
+        raw_scene = json.loads((self.tmp / "snapshot" / "raw/scene_raw.json").read_text(encoding="utf-8"))
         # the snapshot keeps the CAD reading: nothing is replaced on disk
-        self.assertAlmostEqual(raw_scene["links"][0]["inertial"]["mass"], 1.0, places=9)
-        self.assertEqual(raw_scene["links"][0]["provenance"]["mass"], "raw/mass_properties.json")
+        self.assertAlmostEqual(raw_scene["mass_properties"]["base-1"]["mass"], 1.0, places=9)
+        self.assertFalse((self.tmp / "snapshot" / "scene.json").exists())
 
         scene = load_scene(self.tmp / "snapshot")
         link = scene["links"][0]

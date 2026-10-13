@@ -16,8 +16,9 @@ import zipfile
 from packaging.utils import canonicalize_name
 
 from .. import solidworks
-from ..io import PipelineError, file_digest, read_data
+from ..io import PipelineError, digest, file_digest, read_data
 from ..runtime import RUNTIME_VERSIONS, required_packages, tool_record
+from ..sources.solidworks.selection import validate_file_index, verify_selection
 from ..stages import STAGE_IDS
 from .airflow_client import capture_archive_metadata, validate_run_id
 from .linux_store import PORTABLE_STAGES, LinuxStore
@@ -74,7 +75,9 @@ def _revalidate_capture(store: LinuxStore, run_id: str) -> None:
 
 
 def _failure_receipt(store: LinuxStore, run_id: str, stage: str, error: Exception) -> dict:
-    return {
+    from ..structural_report import write_structural_report
+
+    receipt = {
         "run_id": run_id,
         "state": "failed",
         "passed": False,
@@ -84,6 +87,8 @@ def _failure_receipt(store: LinuxStore, run_id: str, stage: str, error: Exceptio
         "detail": getattr(error, "detail", None) or getattr(error, "details", None),
         "events": store.events(run_id),
     }
+    receipt["structural_report"] = write_structural_report(store.run_dir(run_id), receipt)
+    return receipt
 
 
 def run_portable_stage(
@@ -129,9 +134,16 @@ def run_portable_stage(
                     run_id,
                     source_run_id=owner,
                     resume_from=boundary,
-                    **{key: meta.get(key) for key in (
-                        "handoff_sha256", "main_assembly", "native_tool", "repository_slug", "repository_base"
-                    )},
+                    **{
+                        key: meta.get(key)
+                        for key in (
+                            "handoff_sha256",
+                            "main_assembly",
+                            "native_tool",
+                            "repository_slug",
+                            "repository_base",
+                        )
+                    },
                 )
                 resume = {"parent_run": owner, "from_stage": boundary}
             else:
@@ -180,15 +192,66 @@ def _seed_reuse(store: LinuxStore, run_id: str, owner: str, stage: str) -> None:
     """
     prefix = set(STAGE_IDS[: STAGE_IDS.index(stage)])
     seeded = [
-        {**event, "reuse": {
-            "parent_run": owner,
-            "source_run": (event.get("reuse") or {}).get("source_run", owner),
-            "reused": True,
-        }}
+        {
+            **event,
+            "reuse": {
+                "parent_run": owner,
+                "source_run": (event.get("reuse") or {}).get("source_run", owner),
+                "reused": True,
+            },
+        }
         for event in store.events(owner)
         if isinstance(event, dict) and event.get("stage") in prefix
     ]
     store.append_events(run_id, seeded)
+
+
+def _capture_selection(job: dict, run_id: str, native_tool: dict) -> dict:
+    """Bind the capture to the selected closure, distinct from the full upload."""
+    request = job.get("request") if isinstance(job.get("request"), dict) else {}
+    if job.get("run_id") != run_id or request.get("run_id") != run_id:
+        raise PipelineError("The native capture belongs to another requested run")
+    if job.get("native_tool") != native_tool:
+        raise PipelineError("The native capture tool differs from the selection reader")
+    upload = validate_file_index(request.get("upload_files"))
+    if request.get("upload_sha256") != digest(upload):
+        raise PipelineError("The native capture upload index differs from its digest")
+    selection = job.get("selection")
+    if not isinstance(selection, dict) or selection.get("state") != "sealed":
+        raise PipelineError("The native capture requires a sealed source selection")
+    manifest = verify_selection(
+        selection.get("manifest"),
+        upload,
+        job.get("package_files"),
+        reader_sha256=native_tool.get("source_sha256"),
+    )
+    if (
+        selection.get("staged_files") != upload
+        or selection.get("reader_sha256") != manifest["reader_sha256"]
+        or selection.get("upload_sha256") != manifest["upload_sha256"]
+        or job.get("handoff_sha256") != manifest["handoff_sha256"]
+        or request.get("main_assembly") != manifest["main_assembly"]
+        or job.get("main_assembly") != manifest["main_assembly"]
+    ):
+        raise PipelineError("The native capture differs from its sealed source selection")
+    return {
+        "upload_files": upload,
+        "upload_sha256": manifest["upload_sha256"],
+        "selection_sha256": manifest["selection_sha256"],
+        "selected_files": manifest["files"],
+        "selection": manifest,
+    }
+
+
+def _check_selected_capture(store: LinuxStore, run_id: str, selection: dict) -> None:
+    """Require the archived native files to be the selected bytes."""
+    capture = store.capture_dir(run_id)
+    record = read_data(capture / "input/discovery/native-discovery.json")
+    if record.get("native_files") != selection["files"]:
+        raise PipelineError("The capture native inventory differs from the sealed selection")
+    for name, checksum in selection["files"].items():
+        if file_digest(capture / "input" / name) != checksum:
+            raise PipelineError(f"The captured source differs from the selected bytes: {name}")
 
 
 def fetch_capture(store: LinuxStore, endpoint, run_id: str, job: dict) -> dict:
@@ -198,11 +261,10 @@ def fetch_capture(store: LinuxStore, endpoint, run_id: str, job: dict) -> dict:
     native_tool = result.get("native_tool")
     if not isinstance(native_tool, dict) or not native_tool:
         raise PipelineError("The native job carries no tool record; the transfer cannot be verified")
-    request = job.get("request") if isinstance(job.get("request"), dict) else {}
-    handoff = request.get("handoff_sha256")
-    if not isinstance(handoff, str) or not handoff:
-        raise PipelineError("The native job carries no frozen handoff digest")
-    main_assembly = job.get("main_assembly") or request.get("main_assembly")
+    selection_binding = _capture_selection(job, run_id, native_tool)
+    selection = selection_binding["selection"]
+    handoff = selection["handoff_sha256"]
+    main_assembly = selection["main_assembly"]
     archive = capture_archive_metadata(job)
     meta = store.meta(run_id)
     if (
@@ -217,6 +279,10 @@ def fetch_capture(store: LinuxStore, endpoint, run_id: str, job: dict) -> dict:
         if file_digest(store.capture_dir(run_id) / CAPTURE_MANIFEST) != archive["manifest_sha256"]:
             raise PipelineError("The admitted capture differs from the native manifest receipt")
         _revalidate_capture(store, run_id)
+        _check_selected_capture(store, run_id, selection)
+        if any(meta.get(key) not in (None, value) for key, value in selection_binding.items()):
+            raise PipelineError("The admitted capture selection differs from its recorded admission")
+        store.update_meta(run_id, **selection_binding)
         return {
             "run_id": run_id,
             "store_root": str(store.root),
@@ -249,6 +315,7 @@ def fetch_capture(store: LinuxStore, endpoint, run_id: str, job: dict) -> dict:
         expected_main_assembly=main_assembly,
         expected_native_tool=native_tool,
     )
+    _check_selected_capture(store, run_id, selection)
     slug = job.get("repository_slug")
     base = job.get("repository_base")
     hardware = revision = None
@@ -264,6 +331,7 @@ def fetch_capture(store: LinuxStore, endpoint, run_id: str, job: dict) -> dict:
         repository_base=base,
         hardware_id=hardware if isinstance(hardware, str) and hardware else None,
         revision=revision if isinstance(revision, str) and revision else None,
+        **selection_binding,
     )
     return {
         "run_id": run_id,

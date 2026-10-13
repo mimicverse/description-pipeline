@@ -101,9 +101,18 @@ class SplitWorkflowTests(unittest.TestCase):
 
     def test_native_completion_only_unblocks_capture_transfer(self):
         module = self.module()
-        request = {"run_id": "protocol-control", "package": "control", "handoff_sha256": "b" * 64, "conn_id": "test"}
+        from description_pipeline.io import digest
+
+        upload = {"a.SLDASM": "a" * 64}
+        request = {
+            "run_id": "protocol-control",
+            "upload_files": upload,
+            "upload_sha256": digest(upload),
+            "main_assembly": "a.SLDASM",
+            "conn_id": "test",
+        }
         job = {
-            "request": {key: request[key] for key in ("run_id", "package", "handoff_sha256")},
+            "request": {key: request[key] for key in ("run_id", "upload_files", "upload_sha256", "main_assembly")},
             "run_id": request["run_id"],
             "status": "native_complete",
             "events": protocol_events(stages=("freeze", "discover", "capture")),
@@ -122,14 +131,20 @@ class SplitWorkflowTests(unittest.TestCase):
         run_id = "7c9b44b3-0b9c-5ffe-9f4f-4bbdafb4a865"
         subject = "a" * 64
         request = {
-            "run_id": run_id, "package": "control", "handoff_sha256": "b" * 64,
-            "conn_id": "test", "linux_owned": True,
+            "run_id": run_id,
+            "package": "control",
+            "handoff_sha256": "b" * 64,
+            "conn_id": "test",
+            "linux_owned": True,
         }
         with tempfile.TemporaryDirectory() as tmp:
             store = LinuxStore(Path(tmp))
             store.update_meta(
-                run_id, state="published", subject_sha256=subject,
-                repository_slug="example/robot", repository_base="feature/robot",
+                run_id,
+                state="published",
+                subject_sha256=subject,
+                repository_slug="example/robot",
+                repository_base="feature/robot",
             )
             capture = store.capture_dir(run_id)
             write_json(capture / "input/robot.yaml", {"hardware_id": "robot"})
@@ -145,12 +160,19 @@ class SplitWorkflowTests(unittest.TestCase):
             ):
                 for state in ("published", "updated", "noop"):
                     with self.subTest(state=state):
-                        write_json(output / "reports/pr.json", {
-                            "state": state, "passed": True, "subject_sha256": subject,
-                            "url": "https://github.com/example/robot/pull/1", "commit": "c" * 40,
-                            "base": "feature/robot", "repository_slug": "example/robot",
-                            "branch": "work/solidworks/robot",
-                        })
+                        write_json(
+                            output / "reports/pr.json",
+                            {
+                                "state": state,
+                                "passed": True,
+                                "subject_sha256": subject,
+                                "url": "https://github.com/example/robot/pull/1",
+                                "commit": "c" * 40,
+                                "base": "feature/robot",
+                                "repository_slug": "example/robot",
+                                "branch": "work/solidworks/robot",
+                            },
+                        )
                         result = confirm({"request": request})
                         self.assertEqual(result["pipeline_id"], PIPELINE_ID)
                         self.assertEqual(result["submission"]["state"], state)

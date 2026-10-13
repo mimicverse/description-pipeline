@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from itertools import pairwise
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from description_pipeline.geometry.stl import read as read_stl
 from description_pipeline.sources.solidworks.errors import CadError
@@ -169,6 +169,7 @@ class _Feature:
         first_sub=None,
         next_sub=None,
         next_feature=None,
+        definition=None,
     ):
         self.Name = name
         self._type_name = type_name
@@ -178,6 +179,7 @@ class _Feature:
         self._first_sub = first_sub
         self._next_sub = next_sub
         self._next_feature = next_feature
+        self._definition = definition
 
     def _value(self, provider):
         return provider() if callable(provider) else provider
@@ -203,6 +205,9 @@ class _Feature:
     def GetNextFeature(self):
         return self._value(self._next_feature)
 
+    def GetDefinition(self):
+        return self._value(self._definition)
+
 
 class _Component:
     def __init__(
@@ -213,6 +218,7 @@ class _Component:
         children=(),
         doc=None,
         suppressed=False,
+        suppression=None,
         transform=SW_IDENTITY,
         configuration="Default",
         is_root=False,
@@ -224,7 +230,9 @@ class _Component:
         # component needs a real document; a missing API must be explicit.
         self._doc = doc if doc is not None else _Doc(self._path)
         self._transform = tuple(transform)
-        self.IsSuppressed = suppressed
+        #: ``swComponentSuppressionState_e`` raw state (0 suppressed, 1 lightweight,
+        #: 2 fully resolved, 3 resolved, 4 fully lightweight, 5 internal-ID mismatch).
+        self._suppression = suppression if suppression is not None else (0 if suppressed else 2)
         self.IsFixed = False
         # The read-only root-signature probe on the frozen production assembly
         # (2026-10-10) shows IsRoot as a native boolean: True on the root
@@ -234,6 +242,19 @@ class _Component:
 
     def GetPathName(self):
         return self._path
+
+    @property
+    def IsSuppressed(self):
+        return self._suppression == 0
+
+    @IsSuppressed.setter
+    def IsSuppressed(self, value):
+        # Booleans keep the documented coherence; non-boolean values are stored
+        # verbatim so tests can simulate an unreadable native state.
+        self._suppression = (0 if value else 2) if isinstance(value, bool) else value
+
+    def GetSuppression2(self):
+        return self._suppression
 
     def GetTotalTransform(self, _resolved):
         return types.SimpleNamespace(ArrayData=list(self._transform))
@@ -522,6 +543,8 @@ def _com_stubs():
     pythoncom.VT_BSTR = 8
     pythoncom.VT_BOOL = 11
     pythoncom.VT_I4 = 3
+    pythoncom.VT_DISPATCH = 9
+    pythoncom.VT_ARRAY = 0x2000
     pythoncom.COINIT_APARTMENTTHREADED = 2
     pythoncom.CoInitializeEx = lambda *_args, **_kwargs: None
     pythoncom.CoUninitialize = lambda: None
@@ -545,13 +568,18 @@ def _com_stubs():
 
 def _read(root: Path, app: _App, settings=None) -> dict:
     backend = SolidWorksBackend(session_factory=lambda: _Session(app))
+    resolved = {"main_assembly": "robot.SLDASM"} if settings is None else settings
     with _com_stubs():
-        return backend.discover_native(root, settings if settings is not None else {})
+        return backend.discover_native(root, resolved)
 
 
-def _mate(name, mate_type, entities, *, lower=0.0, upper=0.0, count=None, suppressed=False, error_code=0):
+def _mate(
+    name, mate_type, entities, *, lower=0.0, upper=0.0, count=None, suppressed=False, error_code=0, definition=None
+):
     specific = _MateSpecific(mate_type, entities, lower=lower, upper=upper, count=count)
-    return _Feature(name, f"Mate{mate_type}", specific=specific, suppressed=suppressed, error_code=error_code)
+    return _Feature(
+        name, f"Mate{mate_type}", specific=specific, suppressed=suppressed, error_code=error_code, definition=definition
+    )
 
 
 def _single_mate_scene(root: Path, make_feature):
@@ -617,6 +645,57 @@ class MateRecordTests(unittest.TestCase):
             self.assertIs(mates["locked_seat"]["suppressed"], True)
             self.assertEqual(mates["broken_solve"]["type"], "coincident")
             self.assertEqual(mates["broken_solve"]["error_code"], 3)
+
+    def test_concentric_mate_records_the_native_lock_rotation_flag(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            cylinder_entity = _MateEntity(
+                component, "Cylinder1", _Cylinder((0.0, 0.0, 0.0), (0.0, 0.0, 2.0), 0.02)
+            )
+            locked = _mate(
+                "locked_spin", 1, [cylinder_entity], definition=types.SimpleNamespace(LockRotation=True)
+            )
+            free = _mate(
+                "free_spin", 1, [cylinder_entity], definition=types.SimpleNamespace(LockRotation=False)
+            )
+            no_definition = _mate("no_definition", 1, [cylinder_entity])
+            unrelated = _mate(
+                "seat", 0, [cylinder_entity], definition=types.SimpleNamespace(LockRotation=True)
+            )
+            locked._next_sub = free
+            free._next_sub = no_definition
+            no_definition._next_sub = unrelated
+            group = _Feature("MateGroup", "MateGroup", first_sub=locked)
+            assembly = _write(root, "robot.SLDASM")
+            doc = _Doc(assembly, first_feature=group, children=[component])
+
+            record = _read(root, _App({assembly: doc}))
+
+            mates = {mate["name"]: mate for mate in record["mates"]}
+            self.assertEqual(mates["locked_spin"]["type"], "concentric")
+            self.assertIs(mates["locked_spin"]["lock_rotation"], True)
+            self.assertEqual(
+                mates["locked_spin"]["lock_rotation_api"], "IConcentricMateFeatureData.LockRotation"
+            )
+            self.assertIs(mates["free_spin"]["lock_rotation"], False)
+            self.assertEqual(
+                mates["free_spin"]["lock_rotation_api"], "IConcentricMateFeatureData.LockRotation"
+            )
+            self.assertIsNone(mates["no_definition"]["lock_rotation"])
+            self.assertNotIn("lock_rotation_api", mates["no_definition"])
+            self.assertNotIn("lock_rotation", mates["seat"])
+            self.assertIn(
+                "mate_lock_rotation:locked_spin:read:IConcentricMateFeatureData.LockRotation", record["notes"]
+            )
+            self.assertIn(
+                "mate_lock_rotation:free_spin:read:IConcentricMateFeatureData.LockRotation", record["notes"]
+            )
+            self.assertTrue(
+                any(str(note).startswith("mate_lock_rotation:no_definition") for note in record["notes"]),
+                record["notes"],
+            )
 
     def test_two_level_occurrence_context_scopes_nested_mate(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -854,7 +933,7 @@ class ProducerContextTests(unittest.TestCase):
             record = _read(root, _App({assembly: main_doc, sub_path: sub_doc}))
 
             main_datum = next(datum for datum in record["datums"] if datum["owner"] == "")
-            self.assertEqual(set(main_datum), {"name", "owner", "array", "configuration"})
+            self.assertEqual(set(main_datum), {"name", "owner", "array", "configuration", "references"})
             self.assertEqual(main_datum["name"], "CS_main")
             self.assertEqual(main_datum["configuration"], "Robot")
             datums = [datum for datum in record["datums"] if datum["owner"] == "sub-1/arm-1"]
@@ -1420,6 +1499,174 @@ class CaptureSceneTests(unittest.TestCase):
             self.assertGreater(shared.generation, 0)
             self.assertEqual(expired_reads, [])
             backend.verify_sources_unchanged()
+
+    def test_leaf_mass_failure_names_the_occurrence_and_recorded_body_counts(self):
+        """A failed leaf mass read keeps its classification and gains context.
+
+        Regression for the native7 ``cad_empty_model`` capture failure that
+        carried ``detail: null``: the next capture must name the occurrence,
+        its document, the referenced configuration and the already-recorded
+        native solid/sheet counts without re-probing or skipping anything.
+        """
+
+        class FailingBackend(_CaptureBackend):
+            def _body_count(self, holder, body_type, component):
+                return len(holder.GetBodies2(body_type))
+
+            def _mass_properties_document(self, doc, require_material=True):
+                raise CadError("cad_empty_model", "part has no solid bodies", {"marker": "kept"})
+
+            def assembly_group_mass_properties(self, path, names, *, allow_overrides=False):
+                raise CadError("cad_group_unavailable", "no assembly context here")
+
+        class SheetOnlyComponent(_Component):
+            def GetBodies2(self, body_type):
+                return [] if body_type == 0 else [object()]
+
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            part = _write(root, "empty.SLDPRT")
+            shared = _Doc(part, configuration="Default", configuration_children={"Default": []})
+            component = SheetOnlyComponent("sub-1/empty-1", part, doc=shared, configuration="Default")
+            assembly = _write(root, "robot.SLDASM")
+            main = _Doc(assembly, doc_type=2, children=[component])
+            backend = FailingBackend(session_factory=lambda: _Session(_App({assembly: main, part: shared})))
+            with self.assertRaises(CadError) as caught:
+                backend.collect_scene(str(assembly), [])
+        error = caught.exception
+        self.assertEqual(error.code, "cad_empty_model")
+        self.assertEqual(error.message, "part has no solid bodies")
+        self.assertEqual(error.detail["marker"], "kept")
+        self.assertEqual(error.detail["component"], "sub-1/empty-1")
+        self.assertEqual(error.detail["document"], str(part))
+        self.assertEqual(error.detail["referenced_configuration"], "Default")
+        self.assertEqual(error.detail["bodies"], {"solid": 0, "sheet": 1})
+        self.assertEqual(error.detail["phase"], "leaf_mass_read")
+        self.assertEqual(error.detail["fallback_error"], "cad_group_unavailable")
+
+    def test_sheet_only_fallback_records_the_effective_instance_row(self):
+        class FallbackBackend(_CaptureBackend):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.group_calls = []
+
+            def _body_count(self, holder, body_type, component):
+                return len(holder.GetBodies2(body_type))
+
+            def _mass_properties_document(self, doc, require_material=True):
+                raise CadError("cad_empty_model", "part has no solid bodies")
+
+            def assembly_group_mass_properties(self, path, names, *, allow_overrides=False):
+                self.group_calls.append((str(path), tuple(names), allow_overrides))
+                flags = {
+                    "OverrideMass": True,
+                    "OverrideCenterOfMass": True,
+                    "OverrideMomentsOfInertia": True,
+                }
+                return {
+                    "assembly": str(path),
+                    "configuration": "Default",
+                    "group": list(names),
+                    "members": {names[0]: flags},
+                    "mass": 0.026,
+                    "com": [0.0, 0.0, 0.05],
+                    "inertia": [[1e-6, 1e-8, 0.0], [1e-8, 1.2e-6, 0.0], [0.0, 0.0, 2e-6]],
+                    "reference": {
+                        "used_api": "IMassProperty2.GetMomentOfInertia(0)",
+                        "selection_api": "IMassProperty2 (SelectedItems = component instance)",
+                        "override_api": "IMassProperty2.GetOverrideOptions (same selection)",
+                        "scope": "assembly_component_group",
+                        "convention_basis": "analytic_fixture_v2_20261006",
+                        "product_convention": "solidworks_standard",
+                        "reference_point": "center_of_mass",
+                        "axes": "assembly_document_axes",
+                        "use_system_units": True,
+                        "effective_instance": True,
+                        "measurement_basis": "cad_authored_effective_instance",
+                        "volume_m3": 3.3e-6,
+                        "density_kg_m3": 7878.0,
+                    },
+                }
+
+        class SheetOnlyComponent(_Component):
+            def GetBodies2(self, body_type):
+                return [] if body_type == 0 else [object()] * 2350
+
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            part = _write(root, "EasyEDA PCB Model~Nz70.SLDPRT")
+            shared = _Doc(part, configuration="Default", configuration_children={"Default": []})
+            component = SheetOnlyComponent("part-sheet", part, doc=shared, configuration="Default")
+            assembly = _write(root, "robot.SLDASM")
+            main = _Doc(assembly, doc_type=2, children=[component])
+            backend = FallbackBackend(session_factory=lambda: _Session(_App({assembly: main, part: shared})))
+            scene = backend.collect_scene(str(assembly), [])
+        row = scene.mass_properties["part-sheet"]
+        self.assertEqual(row["mode"], "effective_instance")
+        self.assertEqual(row["state"], "sheet_only")
+        self.assertEqual(row["measurement_basis"], "cad_authored_effective_instance")
+        self.assertEqual(row["mass"], 0.026)
+        self.assertEqual(row["com"], [0.0, 0.0, 0.05])
+        reference = row["reference"]
+        self.assertEqual(reference["used_api"], "IMassProperty2.GetMomentOfInertia(0)")
+        self.assertEqual(reference["selection_api"], "IMassProperty2 (SelectedItems = component instance)")
+        self.assertEqual(reference["override_api"], "IMassProperty2.GetOverrideOptions (same selection)")
+        self.assertEqual(reference["scope"], "assembly_component_group")
+        self.assertEqual(reference["axes"], "assembly_document_axes")
+        self.assertEqual(reference["selected_components"], ["part-sheet"])
+        self.assertEqual(reference["part_document"], str(part))
+        self.assertEqual(reference["assembly_document"], str(assembly))
+        self.assertEqual(reference["assembly_configuration"], "Default")
+        self.assertEqual(reference["configuration"], "Default")
+        self.assertEqual(reference["fallback_error_code"], "cad_empty_model")
+        self.assertEqual(reference["fallback_reason"], "cad_part_document_mass_unavailable")
+        self.assertEqual(reference["solid_bodies"], 0)
+        self.assertEqual(reference["sheet_bodies"], 2350)
+        self.assertEqual(
+            reference["overrides"],
+            {"OverrideMass": True, "OverrideCenterOfMass": True, "OverrideMomentsOfInertia": True},
+        )
+        self.assertEqual(reference["volume_m3"], 3.3e-6)
+        self.assertEqual(reference["density_kg_m3"], 7878.0)
+        self.assertEqual(scene.notes["effective_instance:part-sheet"], "cad_authored_effective_instance")
+        self.assertEqual(backend.group_calls, [(str(assembly), ("part-sheet",), True)])
+
+    def test_no_bodies_at_all_still_fails_without_a_fallback(self):
+        class NoBodyBackend(_CaptureBackend):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.group_calls = 0
+
+            def _body_count(self, holder, body_type, component):
+                return len(holder.GetBodies2(body_type))
+
+            def _mass_properties_document(self, doc, require_material=True):
+                raise CadError("cad_empty_model", "part has no solid bodies")
+
+            def assembly_group_mass_properties(self, path, names, *, allow_overrides=False):
+                self.group_calls += 1
+                raise AssertionError("no fallback may be attempted without sheet bodies")
+
+        class EmptyComponent(_Component):
+            def GetBodies2(self, body_type):
+                return []
+
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            part = _write(root, "empty.SLDPRT")
+            shared = _Doc(part, configuration="Default", configuration_children={"Default": []})
+            component = EmptyComponent("part-empty", part, doc=shared, configuration="Default")
+            assembly = _write(root, "robot.SLDASM")
+            main = _Doc(assembly, doc_type=2, children=[component])
+            backend = NoBodyBackend(session_factory=lambda: _Session(_App({assembly: main, part: shared})))
+            with self.assertRaises(CadError) as caught:
+                backend.collect_scene(str(assembly), [])
+        error = caught.exception
+        self.assertEqual(error.code, "cad_empty_model")
+        self.assertEqual(error.detail["component"], "part-empty")
+        self.assertEqual(error.detail["bodies"], {"solid": 0, "sheet": 0})
+        self.assertNotIn("fallback_error", error.detail)
+        self.assertEqual(backend.group_calls, 0)
 
     def test_geometry_phase_does_not_release_and_reacquire_parents_between_occurrences(self):
         from contextlib import contextmanager
@@ -2140,13 +2387,11 @@ class PropertyContractTests(unittest.TestCase):
         # exact six-argument vendor signature with ResolvedFlag False.
         self.assertEqual(record["identity"]["hardware_id"], "m3.0")
         self.assertEqual(record["identity"]["revision"], "r1")
-        # Root selection probes the candidate marker once; the record then reads
-        # the identity again from the same six-argument by-ref contract.
+        # The record reads the identity once from the same six-argument by-ref
+        # contract; selection never probes document properties.
         self.assertEqual(
             manager.get6_calls,
             [
-                ("dp.hardware_id", False),
-                ("dp.revision", False),
                 ("dp.hardware_id", False),
                 ("dp.revision", False),
             ],
@@ -2267,9 +2512,9 @@ class PropertyContractTests(unittest.TestCase):
 
 
 class MainAssemblySelectionTests(unittest.TestCase):
-    """Root selection: declared identity first, otherwise a unique graph root."""
+    """Explicit selection or a sole frozen assembly; ambiguity never opens CAD."""
 
-    def _delivery_scene(self, root: Path, name: str, *, marker: bool):
+    def _delivery_scene(self, root: Path, name: str):
         stem = name.split(".", 1)[0]
         base = _write(root, f"{stem}-base.SLDPRT")
         component = _Component("base-1", base)
@@ -2280,51 +2525,48 @@ class MainAssemblySelectionTests(unittest.TestCase):
         )
         group = _Feature("MateGroup", "MateGroup", first_sub=seat)
         assembly = _write(root, name)
-        properties = {"dp.hardware_id": "m3.0", "dp.delivery_configuration": "Default"} if marker else {}
+        properties = {"dp.hardware_id": "m3.0", "dp.delivery_configuration": "Default"}
         doc = _Doc(assembly, first_feature=group, children=[component], properties=properties)
         return assembly, doc
 
-    def test_declared_marker_wins_over_broken_unreferenced_assembly(self) -> None:
+    @staticmethod
+    def _unreachable_session_backend() -> SolidWorksBackend:
+        def _raise():  # pragma: no cover - the session must never be requested
+            raise AssertionError("a CAD session must not be started")
+
+        return SolidWorksBackend(session_factory=_raise)
+
+    def test_sole_assembly_is_accepted_without_a_selection(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            assembly, doc = self._delivery_scene(root, "robot.SLDASM", marker=True)
-            spare = _write(root, "spare.SLDASM")
-            app = _App(
-                {assembly: doc, spare: _Doc(spare, doc_type=2)},
-                open_errors={spare: 2},
-                not_preopened={spare},
-            )
+            assembly, doc = self._delivery_scene(root, "robot.SLDASM")
 
-            record = _read(root, app)
+            record = _read(root, _App({assembly: doc}), {})
 
             self.assertEqual(record["identity"]["main_assembly"], "robot.SLDASM")
             self.assertEqual(record["identity"]["hardware_id"], "m3.0")
-            self.assertEqual(record["identity"]["delivery_configuration"], "Default")
+            self.assertEqual({"mode": "sole_candidate", "main_assembly": "robot.SLDASM"}, record["selection"])
 
-    def test_unmarked_multiple_roots_fail_with_actionable_ambiguity(self) -> None:
+    def test_several_assemblies_require_a_selection_before_any_session(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            first = _write(root, "aaa.SLDASM")
-            second = _write(root, "zzz.SLDASM")
-            app = _App({first: _Doc(first, doc_type=2), second: _Doc(second, doc_type=2)})
+            _write(root, "aaa.SLDASM")
+            _write(root, "zzz.SLDASM")
 
             with self.assertRaises(CadError) as caught:
-                _read(root, app)
+                self._unreachable_session_backend().discover_native(root, {})
 
             error = caught.exception
             self.assertEqual(error.code, "native_discovery_main_assembly_ambiguous")
-            self.assertEqual(
-                sorted(os.path.basename(entry) for entry in error.detail["unreferenced"]),
-                ["aaa.SLDASM", "zzz.SLDASM"],
-            )
-            self.assertIn("dp.hardware_id", error.message)
+            self.assertEqual(error.detail["candidates"], ["aaa.SLDASM", "zzz.SLDASM"])
+            self.assertIn("select the delivered main assembly", error.message)
 
-    def test_two_marked_assemblies_fail_as_ambiguous(self) -> None:
+    def test_declared_markers_do_not_select_a_main_assembly(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
+            marker = {"dp.hardware_id": "m3.0", "dp.delivery_configuration": "Default"}
             first = _write(root, "first.SLDASM")
             second = _write(root, "second.SLDASM")
-            marker = {"dp.hardware_id": "m3.0", "dp.delivery_configuration": "Default"}
             app = _App(
                 {
                     first: _Doc(first, doc_type=2, properties=dict(marker)),
@@ -2333,14 +2575,21 @@ class MainAssemblySelectionTests(unittest.TestCase):
             )
 
             with self.assertRaises(CadError) as caught:
-                _read(root, app)
+                _read(root, app, {})
 
             error = caught.exception
             self.assertEqual(error.code, "native_discovery_main_assembly_ambiguous")
-            self.assertEqual(
-                sorted(os.path.basename(entry) for entry in error.detail["marked"]),
-                ["first.SLDASM", "second.SLDASM"],
-            )
+            self.assertEqual(error.detail["candidates"], ["first.SLDASM", "second.SLDASM"])
+
+    def test_no_assembly_fails_before_any_session(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write(root, "base.SLDPRT")
+
+            with self.assertRaises(CadError) as caught:
+                self._unreachable_session_backend().discover_native(root, {})
+
+            self.assertEqual(caught.exception.code, "native_discovery_assembly_missing")
 
     def test_marked_main_must_pass_the_strict_open_with_diagnostics(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -2415,15 +2664,6 @@ class MainAssemblySelectionTests(unittest.TestCase):
             self.assertEqual(caught.exception.detail["errors"], 2)
             self.assertNotIn("unresolved_references", caught.exception.detail)
 
-    def test_single_unmarked_assembly_is_still_selected(self) -> None:
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            assembly, doc = self._delivery_scene(root, "robot.SLDASM", marker=False)
-
-            record = _read(root, _App({assembly: doc}))
-
-            self.assertEqual(record["identity"]["main_assembly"], "robot.SLDASM")
-
     def test_unreadable_open_status_blocks_the_selected_root(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2462,49 +2702,6 @@ class MainAssemblySelectionTests(unittest.TestCase):
             error = caught.exception
             self.assertEqual(error.code, "cad_document_open_failed")
             self.assertEqual(error.detail["errors"], 2)
-
-    def test_partial_candidate_graph_blocks_unique_root_selection(self) -> None:
-        class _UnreadableGraph(_Doc):
-            def GetComponents(self, _ignored):
-                raise RuntimeError("graph unreadable")
-
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            first = _write(root, "aaa.SLDASM")
-            second = _write(root, "zzz.SLDASM")
-            app = _App({first: _Doc(first, doc_type=2), second: _UnreadableGraph(second, doc_type=2)})
-
-            with self.assertRaises(CadError) as caught:
-                _read(root, app)
-
-            error = caught.exception
-            self.assertEqual(error.code, "native_discovery_main_assembly_ambiguous")
-            self.assertEqual(
-                [os.path.basename(entry) for entry in error.detail["incomplete_graph"]],
-                ["zzz.SLDASM"],
-            )
-
-    def test_unreadable_identity_blocks_a_declared_main_selection(self) -> None:
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            assembly, doc = self._delivery_scene(root, "robot.SLDASM", marker=True)
-            extra = _write(root, "extra.SLDASM")
-            extra_doc = _Doc(
-                extra,
-                doc_type=2,
-                scope_managers={"": _PropertyManager({}, get_names_error=RuntimeError("no scope"))},
-            )
-            app = _App({assembly: doc, extra: extra_doc})
-
-            with self.assertRaises(CadError) as caught:
-                _read(root, app)
-
-            error = caught.exception
-            self.assertEqual(error.code, "native_discovery_main_assembly_ambiguous")
-            self.assertEqual(
-                [os.path.basename(entry) for entry in error.detail["unreadable_identity"]],
-                ["extra.SLDASM"],
-            )
 
 
 class EntityGeometryTests(unittest.TestCase):
@@ -2797,8 +2994,9 @@ class ExplicitSelectionTests(unittest.TestCase):
             root = Path(tmp)
             app, _assembly, _decoy = self._scene(root)
             with self.assertRaises(CadError) as caught:
-                _read(root, app)
+                _read(root, app, {})
             self.assertEqual("native_discovery_main_assembly_ambiguous", caught.exception.code)
+            self.assertEqual(caught.exception.detail["candidates"], ["decoy.SLDASM", "robot.SLDASM"])
 
     def test_invalid_and_missing_selections_fail_before_any_session(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -3366,6 +3564,594 @@ class MateEntityReferenceTests(unittest.TestCase):
                 frame_reference["geometry"],
                 {"kind": "plane", "point": [0.0, 0.0, 0.0], "normal": [0.0, 0.0, 1.0], "frame": "component-local"},
             )
+
+
+class ComponentSuppressionStateTests(unittest.TestCase):
+    """Raw ``swComponentSuppressionState_e``: emitted, coherent, fail-closed on mismatch."""
+
+    def test_helper_reads_each_documented_state_once_and_refuses_the_rest(self):
+        from description_pipeline.sources.solidworks.native import _component_state
+
+        reads = []
+        for state in (0, 1, 2, 3, 4):
+            component = types.SimpleNamespace(GetSuppression2=lambda s=state: (reads.append(s), s)[1])
+            self.assertEqual(_component_state(component), state)
+        self.assertEqual(reads, [0, 1, 2, 3, 4])
+        with self.assertRaises(CadError) as caught:
+            _component_state(types.SimpleNamespace(GetSuppression2=lambda: 5, IsSuppressed=lambda: False))
+        self.assertEqual(caught.exception.code, "cad_component_internal_id_mismatch")
+        self.assertEqual(caught.exception.detail["enum"], "swComponentInternalIdMismatch")
+        self.assertEqual(caught.exception.detail["state"], 5)
+        unreadable = (
+            types.SimpleNamespace(),
+            types.SimpleNamespace(GetSuppression2=lambda: "3"),
+            types.SimpleNamespace(GetSuppression2=lambda: True),
+            types.SimpleNamespace(GetSuppression2=_raiser(RuntimeError("unavailable"))),
+        )
+        for bad in unreadable:
+            with self.subTest(state=repr(bad)):
+                with self.assertRaises(CadError) as caught:
+                    _component_state(bad)
+                self.assertEqual(caught.exception.code, "cad_component_state_unreadable")
+        with self.assertRaises(CadError) as caught:
+            _component_state(types.SimpleNamespace(GetSuppression2=lambda: 7))
+        self.assertEqual(caught.exception.code, "cad_component_state_unsupported")
+        self.assertEqual(caught.exception.detail["state"], 7)
+
+    def test_inspect_copy_refuses_a_mismatched_binding_that_is_not_suppressed(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            bad = _Component("arm-1", _write(root, "arm.SLDPRT"), suppression=5)
+            assembly = _write(root, "robot.SLDASM")
+            documents = {assembly: _Doc(assembly, doc_type=2, children=[bad])}
+            backend = SolidWorksBackend(session_factory=lambda: _Session(_App(documents)))
+            self.assertFalse(bad.IsSuppressed)
+            with self.assertRaises(CadError) as caught:
+                backend.inspect_copy(str(assembly))
+            self.assertEqual(caught.exception.code, "cad_component_internal_id_mismatch")
+
+    def test_inspect_copy_emits_raw_state_with_coherent_flags(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            resolved = _Component("arm-1", _write(root, "arm.SLDPRT"), suppression=3)
+            shim = _Component("shim-1", _write(root, "shim.SLDPRT"), suppression=0)
+            assembly = _write(root, "robot.SLDASM")
+            documents = {assembly: _Doc(assembly, doc_type=2, children=[resolved, shim])}
+            backend = SolidWorksBackend(session_factory=lambda: _Session(_App(documents)))
+            result = backend.inspect_copy(str(assembly))
+            by_name = {item["name"]: item for item in result["instances"]}
+            self.assertEqual((by_name["arm-1"]["suppression_state"], by_name["arm-1"]["suppressed"]), (3, False))
+            self.assertEqual((by_name["shim-1"]["suppression_state"], by_name["shim-1"]["suppressed"]), (0, True))
+
+    def test_collect_scene_refuses_a_mismatched_binding(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            bad = _Component("arm-1", _write(root, "arm.SLDPRT"), suppression=5)
+            assembly = _write(root, "robot.SLDASM")
+            documents = {assembly: _Doc(assembly, doc_type=2, children=[bad])}
+            backend = _CaptureBackend(session_factory=lambda: _Session(_App(documents)))
+            with self.assertRaises(CadError) as caught:
+                backend.collect_scene(str(assembly), [])
+            self.assertEqual(caught.exception.code, "cad_component_internal_id_mismatch")
+
+    def test_measurement_paths_refuse_lightweight_occurrences(self):
+        from description_pipeline.sources.solidworks.native import _measured_component_state
+
+        for state in (1, 4):
+            with self.subTest(state=state):
+                with self.assertRaises(CadError) as caught:
+                    _measured_component_state(types.SimpleNamespace(GetSuppression2=lambda s=state: s))
+                self.assertEqual(caught.exception.code, "cad_component_lightweight_unresolved")
+                self.assertEqual(caught.exception.detail["state"], state)
+        for state in (0, 2, 3):
+            with self.subTest(state=state):
+                component = types.SimpleNamespace(GetSuppression2=lambda s=state: s)
+                self.assertEqual(_measured_component_state(component), state)
+        for state in (1, 4):
+            with self.subTest(scene_state=state), TemporaryDirectory() as tmp, _com_stubs():
+                root = Path(tmp)
+                light = _Component("arm-1", _write(root, "arm.SLDPRT"), suppression=state)
+                assembly = _write(root, "robot.SLDASM")
+                documents = {assembly: _Doc(assembly, doc_type=2, children=[light])}
+                backend = _CaptureBackend(session_factory=lambda documents=documents: _Session(_App(documents)))
+                with self.assertRaises(CadError) as caught:
+                    backend.collect_scene(str(assembly), [])
+                self.assertEqual(caught.exception.code, "cad_component_lightweight_unresolved")
+
+    def test_geometry_capture_refuses_a_lightweight_occurrence_after_discovery(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            light = _Component("arm-1", _write(root, "arm.SLDPRT"), suppression=1)
+            assembly = _write(root, "robot.SLDASM")
+            documents = {assembly: _Doc(assembly, doc_type=2, children=[light])}
+            backend = _CaptureBackend(session_factory=lambda: _Session(_App(documents)))
+            with _com_stubs():
+                record = backend.discover_native(root, {"main_assembly": "robot.SLDASM"})
+                entry = next(item for item in record["components"] if item["name2"] == "arm-1")
+                self.assertEqual((entry["suppression_state"], entry["lightweight"]), (1, True))
+                with self.assertRaises(CadError) as caught:
+                    backend.collect_scene(str(assembly), [])
+            self.assertEqual(caught.exception.code, "cad_component_lightweight_unresolved")
+
+    def test_discover_native_refuses_mismatch_and_emits_raw_state_otherwise(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bad = _Component("arm-1", _write(root, "arm.SLDPRT"), suppression=5)
+            assembly = _write(root, "robot.SLDASM")
+            with self.assertRaises(CadError) as caught:
+                _read(root, _App({assembly: _Doc(assembly, doc_type=2, children=[bad])}))
+            self.assertEqual(caught.exception.code, "cad_component_internal_id_mismatch")
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            resolved = _Component("arm-1", _write(root, "arm.SLDPRT"), suppression=2)
+            lightweight = _Component("arm-2", _write(root, "arm2.SLDPRT"), suppression=1)
+            assembly = _write(root, "robot.SLDASM")
+            record = _read(root, _App({assembly: _Doc(assembly, doc_type=2, children=[resolved, lightweight])}))
+            by_name = {item["name2"]: item for item in record["components"]}
+
+            def triple(name):
+                item = by_name[name]
+                return (item["suppression_state"], item["suppressed"], item["lightweight"])
+
+            self.assertEqual(triple("arm-1"), (2, False, False))
+            self.assertEqual(triple("arm-2"), (1, False, True))
+
+    def test_unreadable_child_transform_blocks_descent_without_fabrication(self):
+        """An unreadable occurrence transform must not become an empty parent frame.
+
+        Regression for the empty-parent-transform defect: the occurrence keeps its
+        empty transform (a blocking finding downstream) and its recorded note, the
+        subtree is skipped instead of composing against an empty matrix, and
+        siblings still record their own placements.
+        """
+
+        class UnreadableTransformComponent(_Component):
+            def GetTotalTransform(self, _presentation):
+                return None
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            leaf = _Component("leaf-1", _write(root, "leaf.SLDPRT"))
+            sub_path = _write(root, "sub.SLDASM")
+            sub_doc = _Doc(sub_path, doc_type=2, children=[leaf])
+            broken = UnreadableTransformComponent("sub-1", sub_path, children=[leaf], doc=sub_doc)
+            sibling = _Component("arm-1", _write(root, "arm.SLDPRT"))
+            assembly = _write(root, "robot.SLDASM")
+            record = _read(root, _App({assembly: _Doc(assembly, doc_type=2, children=[broken, sibling])}))
+            by_name = {item["name2"]: item for item in record["components"]}
+            self.assertEqual(by_name["sub-1"]["transform"], [])
+            self.assertNotIn("sub-1/leaf-1", by_name)
+            self.assertEqual(len(by_name["arm-1"]["transform"]), 16)
+            notes = record["notes"]
+            self.assertTrue(
+                any(note.startswith("transform:sub-1:") and "GetTotalTransform(False)" in note for note in notes),
+                notes,
+            )
+            self.assertIn("transform:sub-1:subtree_skipped_unreadable_parent", notes)
+
+
+class ComponentSourceDocumentTests(unittest.TestCase):
+    """Raw import readings for the discovery walk (no selection carrier)."""
+
+    def setUp(self) -> None:
+        import tempfile
+
+        self.tmp = Path(tempfile.mkdtemp(prefix="sw-source-doc-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True))
+        self.source_root = self.tmp / "stage"
+        self.source_root.mkdir()
+        self.materialization = self.tmp / "swx1" / "IC~~" / "X.step.SLDPRT"
+        self.materialization.parent.mkdir(parents=True)
+        self.materialization.write_bytes(b"temp")
+
+    def component(self, path, *, imported, virtual=False):
+        component = _Component("X.step-1", str(path))
+        component.GetImportedPath = lambda: imported
+        component.IsVirtual = virtual
+        return component
+
+    def test_session_materialization_is_classified_with_raw_fields(self) -> None:
+        from description_pipeline.sources.solidworks.native import _component_source_document
+
+        result = _component_source_document(
+            self.component(self.materialization, imported=r"D:\author\X.stp"),
+            self.source_root,
+        )
+        self.assertIsNone(result["document"])
+        provenance = result["source_provenance"]
+        self.assertEqual(provenance["state"], "cached_materialization")
+        self.assertEqual(provenance["kind"], "native_import_materialization")
+        self.assertEqual(provenance["materialization_path"], str(self.materialization))
+        self.assertEqual(provenance["session_temp_root"], str(self.materialization.parent.parent))
+        self.assertEqual(provenance["author_imported_path"], r"D:\author\X.stp")
+        self.assertIs(provenance["is_virtual"], False)
+
+    def test_ic_marker_outside_session_temp_is_unread_not_cached(self) -> None:
+        from description_pipeline.sources.solidworks.native import _component_source_document
+
+        outside = r"C:\Users\Mi\Documents\IC~~\X.step.SLDPRT"
+        result = _component_source_document(
+            self.component(outside, imported=r"C:\Users\Mi\Desktop\X.stp"), self.source_root
+        )
+        provenance = result["source_provenance"]
+        self.assertEqual(provenance["state"], "unread")
+        self.assertEqual(provenance["materialization_path"], outside)
+        self.assertNotIn("kind", provenance)
+
+    def test_virtual_flag_alone_requires_a_materialization_path(self) -> None:
+        from description_pipeline.sources.solidworks.native import _component_source_document
+
+        result = _component_source_document(
+            self.component(r"C:\elsewhere\X.SLDPRT", imported=r"D:\author\X.stp", virtual=True),
+            self.source_root,
+        )
+        # A virtual reading with an out-of-temp path is not a session
+        # materialization; it stays unread with the readings recorded verbatim.
+        provenance = result["source_provenance"]
+        self.assertEqual(provenance["state"], "unread")
+        self.assertIs(provenance["is_virtual"], True)
+
+    def test_in_stage_author_source_does_not_override_the_cached_class(self) -> None:
+        from description_pipeline.sources.solidworks.native import _component_source_document
+
+        (self.source_root / "NP-F550.step").write_bytes(b"np-bytes")
+        result = _component_source_document(
+            self.component(self.materialization, imported=str(self.source_root / "NP-F550.step")),
+            self.source_root,
+        )
+        provenance = result["source_provenance"]
+        # The engine-resolved document is a structural session materialization,
+        # so the class stays cached on both sides; the in-stage author source is
+        # validated metadata (retained as a selection-level bound edge).
+        self.assertEqual(provenance["state"], "cached_materialization")
+        self.assertIsNone(result["document"])
+        self.assertTrue(provenance["author_imported_in_source_root"])
+        self.assertEqual(provenance["author_imported_relative"], "NP-F550.step")
+
+
+class MaterializationSessionOwnershipTests(unittest.TestCase):
+    """Cached import capture routes the materialization to its owning session."""
+
+    def setUp(self) -> None:
+        import tempfile
+
+        self.tmp = Path(tempfile.mkdtemp(prefix="sw-materialization-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True))
+        self.materialization = self.tmp / "swx4242" / "IC~~" / "NP-F550.step.SLDPRT"
+        self.materialization.parent.mkdir(parents=True)
+        self.materialization.write_bytes(b"materialized")
+
+    class Session:
+        def __init__(self, app=None, closed=False):
+            self.app = app
+            self.closed = closed
+
+        def current_application(self):
+            return self.app
+
+        def identity(self):
+            return {
+                "pid": 1,
+                "executable": "fake",
+                "ownership": "windows_job",
+                "state": "closed" if self.closed else "active",
+            }
+
+        def close(self):
+            self.closed = True
+
+        def terminate(self):
+            self.closed = True
+
+    @staticmethod
+    def _doc(path):
+        return types.SimpleNamespace(IsOpenedReadOnly=True, GetPathName=lambda: str(path))
+
+    def test_collected_copy_owns_the_materialization_without_creating_a_source(self) -> None:
+        from description_pipeline.sources.solidworks import native as N
+
+        app = types.SimpleNamespace(GetOpenDocumentByName=lambda path: self._doc(path))
+        backend = N.SolidWorksBackend()
+        backend._sessions = {"source": self.Session(closed=True), "copy": self.Session(app=app)}
+        self.assertEqual(backend._role_for_path(self.materialization), "copy")
+        key = backend._record_source_document(self.materialization, "Default")
+        self.assertEqual(key[0], "copy")
+        doc = backend._document_by_path(str(self.materialization))
+        self.assertEqual(doc.GetPathName(), str(self.materialization))
+        # The retired source session is never revived and no new session exists.
+        self.assertEqual(sorted(backend._sessions), ["copy", "source"])
+        self.assertTrue(backend._sessions["source"].closed)
+
+    def test_walk_role_wins_when_explicitly_contextual(self) -> None:
+        from description_pipeline.sources.solidworks import native as N
+
+        backend = N.SolidWorksBackend()
+        backend._sessions = {"source": self.Session(app=object()), "copy": self.Session(app=object())}
+        backend._local.role = "copy"
+        self.assertEqual(backend._role_for_path(self.materialization), "copy")
+
+    def test_ambiguity_and_missing_owner_refuse_precisely(self) -> None:
+        from description_pipeline.sources.solidworks import native as N
+        from description_pipeline.sources.solidworks.errors import CadError
+
+        backend = N.SolidWorksBackend()
+        backend._sessions = {"source": self.Session(app=object()), "copy": self.Session(app=object())}
+        with self.assertRaises(CadError) as caught:
+            backend._role_for_path(self.materialization)
+        self.assertEqual(caught.exception.code, "cad_materialization_session_ambiguous")
+
+        backend2 = N.SolidWorksBackend()
+        backend2._sessions = {"source": self.Session(closed=True)}
+        with self.assertRaises(CadError) as caught:
+            backend2._role_for_path(self.materialization)
+        self.assertEqual(caught.exception.code, "cad_materialization_session_ambiguous")
+
+        backend3 = N.SolidWorksBackend()
+        backend3._role_for_path = lambda path: "ghost"  # type: ignore[method-assign]
+        with self.assertRaises(CadError) as caught:
+            backend3._record_source_document(self.materialization, "Default")
+        self.assertEqual(caught.exception.code, "cad_materialization_session_unavailable")
+
+
+class _LinkMassProperty:
+    """Fake IMassProperty2 for the direct link group reader."""
+
+    def __init__(self, state, reads):
+        self.UseSystemUnits = None
+        self.IncludeHiddenBodiesOrComponents = None
+        self.SelectedItems = None
+        self.Mass = 0.0
+        self.Volume = 0.001
+        self.Density = 1.0
+        self.CenterOfMass = [0.0, 0.0, 0.0]
+        self._state = state
+        self._reads = reads
+        self._overrides = {"OverrideMass": False, "OverrideCenterOfMass": False, "OverrideMomentsOfInertia": False}
+        self._tensor = [[1e-6, 0.0, 0.0], [0.0, 1e-6, 0.0], [0.0, 0.0, 1e-6]]
+
+    def Recalculate(self):
+        names = tuple(component.Name2 for component in self.SelectedItems.value)
+        self._state.append(names)
+        seen = sum(1 for entry in self._state if entry == names)
+        payload = self._reads[names][seen - 1]
+        self.Mass = float(payload["mass_kg"])
+        self.CenterOfMass = [float(value) for value in payload["com_m"]]
+        self._tensor = [[float(value) for value in row] for row in payload["inertia_tensor_about_com"]]
+        self._overrides = dict(payload.get("overrides") or self._overrides)
+
+    def GetOverrideOptions(self):
+        return types.SimpleNamespace(**self._overrides)
+
+    def GetMomentOfInertia(self, kind):
+        if kind == 0:
+            return [value for row in self._tensor for value in row]
+        raise RuntimeError("about-origin read unavailable")
+
+
+class LinkGroupMassPropertiesTests(unittest.TestCase):
+    """The direct one-shot reader: exact paths, two fresh reads, fail closed."""
+
+    def _read(self, mass, com=(0.1, 0.2, 0.3), tensor=None, overrides=None):
+        return {
+            "mass_kg": mass,
+            "com_m": list(com),
+            "inertia_tensor_about_com": tensor or [[1e-6, 0.0, 0.0], [0.0, 2e-6, 0.0], [0.0, 0.0, 3e-6]],
+            "overrides": overrides
+            or {"OverrideMass": False, "OverrideCenterOfMass": False, "OverrideMomentsOfInertia": False},
+        }
+
+    @contextmanager
+    def _backend(self, reads, *, doc_type=2, extra_components=()):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            part = _write(root, "part.SLDPRT")
+            nested = _Component("sub-1", part, children=[_Component("sub-1/b-1", part)])
+            components = [nested, _Component("c-1", part), *extra_components]
+            assembly = _write(root, "robot.SLDASM")
+            doc = _Doc(assembly, doc_type=doc_type, children=components)
+            state: list = []
+            doc.Extension.CreateMassProperty2 = lambda: _LinkMassProperty(state, reads)
+            backend = _CaptureBackend(session_factory=lambda: _Session(_App({assembly: doc})))
+            yield backend, assembly, state
+
+    def test_reads_each_body_twice_with_the_exact_sorted_selection(self):
+        reads = {("c-1", "sub-1"): [self._read(2.0), self._read(2.0)]}
+        with self._backend(reads) as (backend, assembly, state):
+            payload = backend.link_group_mass_properties(str(assembly), {"body": ["sub-1", "c-1"]})
+        self.assertEqual(payload["used_api"], "IMassProperty2 (SelectedItems = component set)")
+        self.assertEqual(payload["selection_rule"], "top_most_providers+uncovered_leaves")
+        self.assertEqual(payload["assembly"], str(assembly))
+        row = payload["links"]["body"]
+        self.assertEqual(row["selection"], ["c-1", "sub-1"])
+        self.assertEqual(len(row["reads"]), 2)
+        self.assertEqual(
+            row["reproducibility"], {"mass_delta_kg": 0.0, "com_delta_norm_m": 0.0, "tensor_delta_max_abs": 0.0}
+        )
+        self.assertEqual(row["reads"][0]["mass_kg"], 2.0)
+        self.assertEqual(row["reads"][0]["volume_m3"], 0.001)
+        self.assertEqual(row["reads"][0]["density_kg_m3"], 1.0)
+        self.assertEqual(
+            row["reads"][0]["overrides"],
+            {"OverrideMass": False, "OverrideCenterOfMass": False, "OverrideMomentsOfInertia": False},
+        )
+        self.assertEqual(state, [("c-1", "sub-1"), ("c-1", "sub-1")])
+
+    def test_reproducibility_records_the_repeat_deltas(self):
+        first = self._read(2.0, (0.1, 0.2, 0.3))
+        second = self._read(2.001, (0.1, 0.2, 0.31), [[1.1e-6, 0.0, 0.0], [0.0, 2e-6, 0.0], [0.0, 0.0, 3e-6]])
+        with self._backend({("c-1", "sub-1"): [first, second]}) as (backend, assembly, _state):
+            payload = backend.link_group_mass_properties(str(assembly), {"body": ["c-1", "sub-1"]})
+        row = payload["links"]["body"]
+        self.assertAlmostEqual(row["reproducibility"]["mass_delta_kg"], 0.001, places=12)
+        self.assertAlmostEqual(row["reproducibility"]["com_delta_norm_m"], 0.01, places=12)
+        self.assertAlmostEqual(row["reproducibility"]["tensor_delta_max_abs"], 1e-7, places=15)
+
+    def test_missing_path_fails_closed_before_any_read(self):
+        with self._backend({}) as (backend, assembly, state):
+            with self.assertRaises(CadError) as caught:
+                backend.link_group_mass_properties(str(assembly), {"body": ["ghost-1"]})
+            self.assertEqual(caught.exception.code, "cad_missing_component")
+            self.assertEqual(caught.exception.detail["missing"], ["ghost-1"])
+            self.assertEqual(caught.exception.detail["link"], "body")
+            self.assertEqual(state, [])
+
+    def test_empty_and_duplicate_selections_fail(self):
+        with self._backend({}) as (backend, assembly, _state):
+            with self.assertRaises(CadError) as caught:
+                backend.link_group_mass_properties(str(assembly), {"body": []})
+            self.assertEqual(caught.exception.code, "cad_empty_selection")
+            with self.assertRaises(CadError) as caught:
+                backend.link_group_mass_properties(str(assembly), {})
+            self.assertEqual(caught.exception.code, "cad_empty_selection")
+            with self.assertRaises(CadError) as caught:
+                backend.link_group_mass_properties(str(assembly), {"body": ["c-1", "c-1"]})
+            self.assertEqual(caught.exception.code, "cad_duplicate_selection")
+
+    def test_single_instance_object_override_is_recorded_and_repeats(self):
+        overrides = {"OverrideMass": True, "OverrideCenterOfMass": False, "OverrideMomentsOfInertia": False}
+        reads = {("c-1",): [self._read(2.0, overrides=overrides), self._read(2.0, overrides=overrides)]}
+        with self._backend(reads) as (backend, assembly, state):
+            payload = backend.link_group_mass_properties(str(assembly), {"body": ["c-1"]})
+        self.assertEqual(state, [("c-1",), ("c-1",)])
+        row = payload["links"]["body"]
+        self.assertEqual(row["selection"], ["c-1"])
+        self.assertEqual(len(row["reads"]), 2)
+        for read in row["reads"]:
+            self.assertEqual(read["overrides"], overrides)
+        self.assertEqual(row["reproducibility"]["com_delta_norm_m"], 0.0)
+
+    def test_multi_instance_object_override_is_recorded_verbatim(self):
+        overrides = {"OverrideMass": True, "OverrideCenterOfMass": True, "OverrideMomentsOfInertia": False}
+        reads = {("c-1", "sub-1"): [self._read(2.0, overrides=overrides), self._read(2.0, overrides=overrides)]}
+        with self._backend(reads) as (backend, assembly, _state):
+            payload = backend.link_group_mass_properties(str(assembly), {"body": ["c-1", "sub-1"]})
+        row = payload["links"]["body"]
+        self.assertEqual([read["overrides"] for read in row["reads"]], [overrides, overrides])
+
+    def test_whole_assembly_override_refusal_is_unchanged(self):
+        overrides = {"OverrideMass": True, "OverrideCenterOfMass": False, "OverrideMomentsOfInertia": False}
+        reads = {("robot",): [self._read(2.0, overrides=overrides), self._read(2.0, overrides=overrides)]}
+        with self._backend(reads) as (backend, assembly, _state), self.assertRaises(CadError) as caught:
+            backend.assembly_mass_properties(str(assembly))
+        self.assertEqual(caught.exception.code, "cad_mass_override")
+        self.assertTrue(caught.exception.detail["OverrideMass"])
+
+    def test_a_part_document_is_refused(self):
+        with self._backend({}, doc_type=1) as (backend, assembly, _state):
+            with self.assertRaises(CadError) as caught:
+                backend.link_group_mass_properties(str(assembly), {"body": ["c-1"]})
+            self.assertEqual(caught.exception.code, "cad_not_assembly")
+
+
+class CloseAllDocumentsTests(unittest.TestCase):
+    """The pristine readout window's close-all helper fails closed on leftovers."""
+
+    def _backend(self, app):
+        return SolidWorksBackend(session_factory=lambda: _Session(app))
+
+    def _fast_settle(self):
+        return (
+            patch("description_pipeline.sources.solidworks.native.CLOSE_ALL_SETTLE_ATTEMPTS", 2),
+            patch("description_pipeline.sources.solidworks.native.CLOSE_ALL_SETTLE_DELAY_S", 0.0),
+        )
+
+    def test_close_all_documents_closes_without_saving_dirty_documents(self):
+        calls = []
+        app = _App({})
+
+        def close(confirm):
+            calls.append(confirm)
+            return True
+
+        def documents():
+            # The real capture's read-write copy only releases with the
+            # close-without-save flag; a False call leaves it open.
+            if calls and calls[-1] is True:
+                return []
+            return [types.SimpleNamespace(GetTitle=lambda: "dirty", GetPathName=lambda: "C:/dirty.SLDASM")]
+
+        app.CloseAllDocuments = close
+        app.GetDocuments = documents
+        attempts, delay = self._fast_settle()
+        with _com_stubs(), attempts, delay:
+            self.assertEqual(self._backend(app).close_all_documents(), {"closed": True})
+        self.assertEqual(calls, [True])
+
+    def test_close_all_documents_settles_before_concluding_leftovers(self):
+        state = {"enumerations": 0}
+        app = _App({})
+        app.CloseAllDocuments = lambda confirm: True
+
+        def documents():
+            state["enumerations"] += 1
+            if state["enumerations"] == 1:
+                return [types.SimpleNamespace(GetTitle=lambda: "slow", GetPathName=lambda: "C:/slow.SLDASM")]
+            return []
+
+        app.GetDocuments = documents
+        attempts, delay = self._fast_settle()
+        with _com_stubs(), attempts, delay:
+            self.assertEqual(self._backend(app).close_all_documents(), {"closed": True})
+        self.assertEqual(state["enumerations"], 2)
+
+    def test_close_all_documents_force_closes_remaining_documents_once(self):
+        closed = []
+        state = {"settled": False}
+        app = _App({})
+        app.CloseAllDocuments = lambda confirm: True
+
+        def documents():
+            if state["settled"]:
+                return []
+            return [types.SimpleNamespace(GetTitle=lambda: "stuck", GetPathName=lambda: "C:/stuck.SLDASM")]
+
+        def close_doc(name):
+            closed.append(name)
+            state["settled"] = True
+            return 1
+
+        app.GetDocuments = documents
+        app.CloseDoc = close_doc
+        attempts, delay = self._fast_settle()
+        with _com_stubs(), attempts, delay:
+            self.assertEqual(self._backend(app).close_all_documents(), {"closed": True})
+        self.assertEqual(closed, ["stuck"])
+
+    def test_close_all_documents_persistent_leftover_fails_closed(self):
+        closed = []
+        calls = []
+        app = _App({})
+        app.CloseAllDocuments = lambda confirm: calls.append(confirm) or True
+        app.GetDocuments = lambda: [
+            types.SimpleNamespace(GetTitle=lambda: "left", GetPathName=lambda: "C:/left.SLDASM")
+        ]
+        app.CloseDoc = lambda name: closed.append(name) or 0
+        attempts, delay = self._fast_settle()
+        with _com_stubs(), attempts, delay, self.assertRaises(CadError) as caught:
+            self._backend(app).close_all_documents()
+        self.assertEqual(caught.exception.code, "cad_close_failed")
+        self.assertEqual(caught.exception.detail["open"], ["C:/left.SLDASM"])
+        self.assertEqual(caught.exception.detail["count"], 1)
+        self.assertEqual(calls, [True])
+        self.assertEqual(closed, ["left"])
+
+    def test_close_all_documents_reports_success(self):
+        app = _App({})
+        app.CloseAllDocuments = lambda confirm: True
+        app.GetDocuments = list
+        with _com_stubs():
+            self.assertEqual(self._backend(app).close_all_documents(), {"closed": True})
+
+    def test_close_all_documents_failure_is_fail_closed(self):
+        def refuse(_confirm):
+            raise RuntimeError("server busy")
+
+        app = _App({})
+        app.CloseAllDocuments = refuse
+        app.GetDocuments = list
+        with _com_stubs(), self.assertRaises(CadError) as caught:
+            self._backend(app).close_all_documents()
+        self.assertEqual(caught.exception.code, "cad_close_failed")
 
 
 if __name__ == "__main__":

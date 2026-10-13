@@ -44,6 +44,12 @@ def subject_inventory(root: Path) -> dict[str, str]:
     for name in SUBJECT_FILES:
         path = confined(root, name)
         files[name] = file_digest(path)
+    # Native deliveries carry a Linux-derived comparison receipt. Neutral test
+    # snapshots have no native mass capture; when present the receipt is part of
+    # the verified subject, so removal or changes invalidate the checkpoint.
+    closure_report = "reports/mass-closure.json"
+    if (root / closure_report).is_file():
+        files[closure_report] = file_digest(confined(root, closure_report))
     present = [name for name in TRANSFER_FILES if (root / name).is_file()]
     if present and len(present) != len(TRANSFER_FILES):
         missing = sorted(set(TRANSFER_FILES) - set(present))

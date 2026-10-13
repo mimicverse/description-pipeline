@@ -19,7 +19,6 @@ import json
 import shutil
 import tempfile
 import unittest
-import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -29,10 +28,11 @@ from description_pipeline import solidworks
 from description_pipeline.io import PipelineError, canonical, file_digest, write_json
 from description_pipeline.orchestration import linux_runner
 from description_pipeline.orchestration.linux_store import STORE_SCHEMA, LinuxStore
-from description_pipeline.orchestration.stage_transfer import CAPTURE_ARCHIVE, CAPTURE_MANIFEST, seal_capture
+from description_pipeline.orchestration.stage_transfer import CAPTURE_MANIFEST, seal_capture
 from description_pipeline.runtime import RUNTIME_VERSIONS, required_packages
 
-from .test_stage_transfer import HANDOFF, MAIN_ASSEMBLY, capture_root, native_tool
+from .test_linux_split import HANDOFF, SELECTED, UPLOAD, capture_job
+from .test_stage_transfer import MAIN_ASSEMBLY, capture_root, native_tool
 
 RUN = "0b1f2c33-1f1e-4b0e-9d6a-2f9a5c7e1d20"
 FRESH = "4c2d3e44-2a2f-4c1f-8e7b-3a0b6d8f2e31"
@@ -77,7 +77,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.store = LinuxStore(self.tmp / "store")
         self.tool = native_tool()
-        source = capture_root(self.tmp, run_id=RUN)
+        source = capture_root(self.tmp, run_id=RUN, handoff=HANDOFF)
         self.archive = self.tmp / "native-evidence.zip"
         seal_capture(
             source,
@@ -168,30 +168,14 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
     # ------------------------------------------------------------ transfer stream
 
     def _job(self, run_id: str, archive: Path, *, declared_sha256: str) -> dict:
-        payload = archive.read_bytes()
-        with zipfile.ZipFile(archive) as sealed:
-            manifest_sha256 = hashlib.sha256(sealed.read(CAPTURE_MANIFEST)).hexdigest()
-        return {
-            "status": "native_complete",
-            "run_id": run_id,
-            "main_assembly": MAIN_ASSEMBLY,
-            "request": {"handoff_sha256": HANDOFF, "main_assembly": MAIN_ASSEMBLY},
-            "result": {
-                "native_complete": True,
-                "native_tool": self.tool,
-                "capture_archive": {
-                    "name": CAPTURE_ARCHIVE,
-                    "sha256": declared_sha256,
-                    "size": len(payload),
-                    "manifest_sha256": manifest_sha256,
-                },
-            },
-        }
+        job = capture_job(run_id, archive, self.tool)
+        job["result"]["capture_archive"]["sha256"] = declared_sha256
+        return job
 
     def test_fetch_capture_enforces_the_declared_archive_digest(self) -> None:
         """The runner must enforce the declared digest independently of its client."""
 
-        source = capture_root(self.tmp / "fresh", run_id=FRESH)
+        source = capture_root(self.tmp / "fresh", run_id=FRESH, handoff=HANDOFF)
         fresh_archive = self.tmp / "fresh.zip"
         seal_capture(
             source,
@@ -207,7 +191,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
             linux_runner.fetch_capture(self.store, endpoint, FRESH, job)
 
     def test_fetch_capture_accepts_matching_bytes(self) -> None:
-        source = capture_root(self.tmp / "fresh-ok", run_id=FRESH)
+        source = capture_root(self.tmp / "fresh-ok", run_id=FRESH, handoff=HANDOFF)
         fresh_archive = self.tmp / "fresh-ok.zip"
         seal_capture(
             source,
@@ -223,6 +207,65 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         result = linux_runner.fetch_capture(self.store, endpoint, FRESH, job)
         self.assertEqual(result["state"], "capture_admitted")
         self.assertEqual((self.store.meta(FRESH) or {}).get("handoff_sha256"), HANDOFF)
+        self.assertNotEqual(job["request"]["upload_sha256"], HANDOFF)
+        self.assertEqual(self.store.meta(FRESH)["upload_files"], UPLOAD)
+        self.assertEqual(self.store.meta(FRESH)["selected_files"], SELECTED)
+        self.assertEqual(self.store.meta(FRESH)["selection_sha256"], job["selection"]["manifest"]["selection_sha256"])
+
+    def test_fetch_refuses_changed_selection_before_downloading(self) -> None:
+        mutations = (
+            lambda job: job["request"].update(upload_sha256="0" * 64),
+            lambda job: job.update(handoff_sha256=job["request"]["upload_sha256"]),
+            lambda job: job["selection"]["manifest"].update(selection_sha256="0" * 64),
+            lambda job: job["request"].update(main_assembly="another.SLDASM"),
+            lambda job: job.update(package_files=UPLOAD),
+            lambda job: job["selection"].update(state="ready"),
+            lambda job: job["request"].update(run_id=FRESH),
+        )
+        for index, mutate in enumerate(mutations):
+            with self.subTest(mutation=index):
+                endpoint = FakeEndpoint(self.archive.read_bytes())
+                job = self._job(RUN, self.archive, declared_sha256=file_digest(self.archive))
+                mutate(job)
+                with self.assertRaises(PipelineError):
+                    linux_runner.fetch_capture(self.store, endpoint, RUN, job)
+                self.assertEqual(endpoint.calls, 0)
+
+    def test_fetch_retry_preserves_the_recorded_selection(self) -> None:
+        endpoint = FakeEndpoint(self.archive.read_bytes())
+        job = self._job(RUN, self.archive, declared_sha256=file_digest(self.archive))
+        linux_runner.fetch_capture(self.store, endpoint, RUN, job)
+        self.store.update_meta(RUN, selection_sha256="0" * 64)
+        with self.assertRaisesRegex(PipelineError, "recorded admission"):
+            linux_runner.fetch_capture(self.store, endpoint, RUN, job)
+        self.assertEqual(endpoint.calls, 0)
+
+    def test_fetch_refuses_a_resealed_capture_with_another_native_inventory(self) -> None:
+        source = capture_root(self.tmp / "foreign-inventory", run_id=FRESH, handoff=HANDOFF)
+        record_path = source / "input/discovery/native-discovery.json"
+        record = json.loads(record_path.read_text())
+        record["native_files"]["stray.SLDPRT"] = "0" * 64
+        write_json(record_path, record)
+        report_path = source / "reports/input.json"
+        report = json.loads(report_path.read_text())
+        report["package_files"]["discovery/native-discovery.json"] = file_digest(record_path)
+        report["input_receipt"]["inventory"] = [
+            {"path": name, "sha256": checksum} for name, checksum in sorted(report["package_files"].items())
+        ]
+        write_json(report_path, report)
+        archive = self.tmp / "foreign-inventory.zip"
+        seal_capture(
+            source,
+            archive,
+            run_id=FRESH,
+            handoff_sha256=HANDOFF,
+            main_assembly=MAIN_ASSEMBLY,
+            native_tool=self.tool,
+        )
+        job = self._job(FRESH, archive, declared_sha256=file_digest(archive))
+        endpoint = FakeEndpoint(archive.read_bytes())
+        with self.assertRaisesRegex(PipelineError, "native inventory differs"):
+            linux_runner.fetch_capture(self.store, endpoint, FRESH, job)
 
     def test_manifest_receipt_mismatch_is_refused_before_import_and_on_retry(self) -> None:
         endpoint = FakeEndpoint(self.archive.read_bytes())

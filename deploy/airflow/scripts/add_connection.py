@@ -42,6 +42,7 @@ def main() -> int:
         token=token,
         store_root=pipeline["store_root"],
         repositories=pipeline["repositories"],
+        discovery=pipeline.get("discovery", {}),
     )
     with Session() as session:
         existing = session.query(Connection).filter(Connection.conn_id == args.conn_id).one_or_none()
@@ -57,6 +58,7 @@ def main() -> int:
                 "handoff_roots": [str(Path(root)) for root in args.handoff_root],
                 "store_root": str(config.store_root),
                 "repositories": {slug: str(path) for slug, path in config.repositories.items()},
+                "discovery": config.discovery,
             }
         )
         session.commit()

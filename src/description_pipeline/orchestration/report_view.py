@@ -76,6 +76,23 @@ _DISCOVERY_CODE_LABELS_ZH = {
     "discovery.root_missing": "未确定根刚体坐标系归属",
     "discovery.inputs": "解析输入（原生文件夹可用）",
     "discovery.main_assembly_ambiguous": "无法唯一确定主装配",
+    # Declared-native-evidence observations: recorded warnings, never passes.
+    "discovery.exporter_unread": "导出器声明未能读取",
+    "discovery.exporter_rigid_attachment": "实例由原生刚性证明归属",
+    "discovery.exporter_membership_uncovered": "存在未归属实例（保留几何与质量）",
+    "discovery.exporter_mate_conflict": "原生配合约束与声明关节运动冲突（已保存姿态）",
+    "discovery.joint_limits_degenerate": "关节行程为等值零范围",
+    "discovery.joint_drive_unspecified": "关节驱动力矩/速度为零",
+    "discovery.jcs_alias": "JCS_ 与刚体基准重合（别名）",
+    "discovery.design_budget_unspecified": "未指定设计预算（可选范围不适用）",
+}
+
+#: Readable names for verifier diagnostics carried on check details (recorded warnings).
+_DIAGNOSTIC_CODE_LABELS_ZH = {
+    "v14.saved_pose_restriction": "已保存姿态限制（诊断）",
+    "v14.mate_inference_unavailable": "配合推导不可用（诊断）",
+    "v14.pose_diagnostics_unread": "已保存姿态诊断尚未读取（诊断）",
+    "v14.membership_unread": "连杆成员关系尚未读取（诊断）",
 }
 
 #: Chinese descriptions for the contract's declared input/output records (by path string).
@@ -92,6 +109,8 @@ _FILE_PATH_LABELS_ZH = {
     "reports/quality.json": "确定性逐对象质量报告",
     "urdf/ + meshes/ + reports/quality.json": "已验证交付与配置的模型仓库",
     "reports/pr.json": "候选提交与评审回执",
+    "reports/structural-team.md": "结构团队报告（可读 Markdown）",
+    "reports/structural-team.json": "结构团队报告（结构化发现与参数）",
 }
 
 _INDEPENDENT_LABELS_ZH = {
@@ -609,12 +628,91 @@ def _failed_summary(label: str, summary: dict | None, details: dict) -> dict:
     return row
 
 
+_WARNING_DETAIL_KEYS = (
+    "limits",
+    "components",
+    "links",
+    "joint",
+    "mate",
+    "scope",
+    "mate_type",
+    "qualification_blocker",
+    "publication_blocker",
+    "missing",
+    "technical_label",
+    "label_source",
+    "mass_kg",
+    "masses",
+)
+_WARNING_RESIDUAL_KEYS = ("max_abs_residual", "max_normalized_residual", "threshold")
+
+
+def _warning_row(stage: dict, item: dict) -> dict:
+    """One recorded non-blocking observation as a warning row (never a pass, never a gate)."""
+
+    code = str(item.get("code") or "")
+    detail = item.get("detail") if isinstance(item.get("detail"), dict) else {}
+    row: dict = {
+        "stage": stage.get("id"),
+        "stage_name_zh": stage.get("name_zh"),
+        "code": code,
+        "label_zh": _DIAGNOSTIC_CODE_LABELS_ZH.get(code, _DISCOVERY_CODE_LABELS_ZH.get(code, code)),
+        "state_zh": "警告",
+        "blocking": False,
+    }
+    object_id = item.get("object") or (f"joint:{detail['joint']}" if detail.get("joint") else None)
+    if object_id:
+        row["object"] = str(object_id)
+    if item.get("message"):
+        row["message"] = str(item.get("message"))
+    for key in _WARNING_DETAIL_KEYS:
+        value = detail.get(key)
+        if value is not None:
+            # Authored zeros (for example an equal zero joint range) stay exact values.
+            row[key] = value
+    residual = {
+        key: detail[key]
+        for key in _WARNING_RESIDUAL_KEYS
+        if isinstance(detail.get(key), (int, float)) and not isinstance(detail.get(key), bool)
+    }
+    if residual:
+        row["residual"] = residual
+    return row
+
+
+def _recorded_warnings(stage: dict, findings: list, rows: list[dict]) -> list[dict]:
+    """Warnings from recorded evidence only: non-blocking findings and check diagnostics."""
+
+    warnings: list[dict] = []
+    if stage.get("id") == "discover":
+        warnings.extend(
+            _warning_row(stage, item)
+            for item in findings
+            if isinstance(item, dict) and item.get("blocking") is False and item.get("code")
+        )
+    for row in rows:
+        details = row.get("raw_details")
+        recorded = details.get("warnings") if isinstance(details, dict) else None
+        if isinstance(recorded, list):
+            warnings.extend(
+                _warning_row(stage, item) for item in recorded if isinstance(item, dict) and item.get("code")
+            )
+        diagnostics = details.get("diagnostics") if isinstance(details, dict) else None
+        if isinstance(diagnostics, list):
+            warnings.extend(
+                _warning_row(stage, item) for item in diagnostics if isinstance(item, dict) and item.get("code")
+            )
+    return warnings
+
+
 def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
     """Readable report projection; pure display mapping over recorded evidence."""
     job = job if isinstance(job, dict) else {}
     view = view if isinstance(view, dict) else stage_view(job)
     result = job.get("result") if isinstance(job.get("result"), dict) else {}
     quality = result.get("quality") if isinstance(result.get("quality"), dict) else {}
+    discovery = job.get("discovery") if isinstance(job.get("discovery"), dict) else {}
+    discovery_findings = discovery.get("findings") if isinstance(discovery.get("findings"), list) else []
     quality_rows = [row for row in (quality.get("checks") or []) if isinstance(row, dict)]
     stages_out: list[dict] = []
     first_failed: dict | None = None
@@ -686,6 +784,7 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
                         "whole_cad_mass_kg": details.get("whole_cad_mass_kg"),
                         "delta_kg": details.get("delta_kg"),
                     }
+        warning_rows = _recorded_warnings(stage, discovery_findings, [*boundary_rows, *independent_rows])
         stage_out = {
             "id": stage.get("id"),
             "name_zh": stage.get("name_zh"),
@@ -697,6 +796,7 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
             "counts": {
                 "boundary": _counts(boundary_rows),
                 "independent": _counts(independent_rows) if independent_rows else None,
+                "warnings": len(warning_rows),
             },
             "boundary": boundary_rows,
             "files": [
@@ -727,6 +827,7 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
             "unsupported": [
                 {"id": item.get("id"), "label": item.get("label")} for item in stage.get("unsupported", [])
             ],
+            **({"warnings": warning_rows} if warning_rows else {}),
             "confirmations": [
                 {
                     key: item.get(key)
@@ -766,6 +867,7 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
         overall_state, headline = "passed", "六个阶段全部完成，独立校验已通过"
     else:
         overall_state, headline = "not_run", "尚无阶段记录"
+    warning_items = [item for stage in stages_out for item in stage.get("warnings") or []]
     report = {
         "schema_version": REPORT_SCHEMA,
         "overall": {
@@ -782,6 +884,13 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
             "handoff_sha256": view.get("handoff_sha256"),
             "expected_mass_window": measured_window,
             "mass_closure": measured_closure,
+        },
+        "warnings": {
+            "total": len(warning_items),
+            "items": warning_items,
+            "note_zh": (
+                "警告为记录、不阻断的观察项：不计为通过，也不作为验收结论；无需逐项人工确认，按对应阶段的检查清单复核。"
+            ),
         },
         "stages": stages_out,
     }

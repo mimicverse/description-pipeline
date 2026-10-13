@@ -95,7 +95,8 @@ def capture_root(base: Path, *, run_id: str = RUN_ID, handoff: str = HANDOFF, ma
     evidence = root / "evidence"
     (evidence / "source").mkdir(parents=True)
     (evidence / "source/base.SLDPRT").write_bytes(b"PART-BYTES")
-    write_json(evidence / "scene.json", {"components": [], "mates": []})
+    write_json(evidence / "raw/scene_raw.json", {"components": [], "mates": []})
+    write_json(evidence / "raw/source_config.json", {})
     (evidence / "evidence").mkdir()
     identity = {"provider": "solidworks", "assembly": str(root / "input" / main), "dependency_digest": "c" * 64}
     write_json(
@@ -120,6 +121,20 @@ def capture_root(base: Path, *, run_id: str = RUN_ID, handoff: str = HANDOFF, ma
     )
     write_json(root / "reports/native-tool.json", native_tool())
     write_json(root / "reports/native-stages.json", stage_view(run_id=run_id, handoff=handoff))
+    # The native capture stamps the structural-team reports beside the sealed payload; they
+    # must travel with the archive so the Linux side can always hand them to the team.
+    write_json(
+        root / "reports/structural-team.json",
+        {
+            "schema_version": "solidworks-to-urdf.structural-report/v1",
+            "run_id": run_id,
+            "state": "native_complete",
+            "main_assembly": main,
+            "summary": {"warnings": 0, "blockers": 0},
+            "findings": [],
+        },
+    )
+    (root / "reports/structural-team.md").write_text("# Structural team report\n\nNo findings.\n", encoding="utf-8")
     return root
 
 
@@ -225,6 +240,9 @@ class StageTransferTests(unittest.TestCase):
         self.assertEqual(admitted, manifest)
         installed = {path.relative_to(destination).as_posix() for path in destination.rglob("*") if path.is_file()}
         self.assertEqual(installed, set(manifest["files"]) | {transfer.CAPTURE_MANIFEST})
+        for name in ("reports/structural-team.md", "reports/structural-team.json"):
+            self.assertIn(name, manifest["files"])
+            self.assertEqual(file_digest(destination / name), file_digest(self.root / name))
         self.assertEqual(
             file_digest(destination / "reports/native-tool.json"),
             manifest["files"]["reports/native-tool.json"],
@@ -232,6 +250,29 @@ class StageTransferTests(unittest.TestCase):
         with zipfile.ZipFile(self.archive) as archive:
             sealed = archive.read(transfer.CAPTURE_MANIFEST)
         self.assertEqual((destination / transfer.CAPTURE_MANIFEST).read_bytes(), sealed)
+
+    def test_regenerated_team_reports_are_tolerated_only_in_deliveries(self) -> None:
+        manifest = seal(self.root, self.archive)
+        destination = self.base / "admitted"
+        admit(self.archive, destination)
+        summary = transfer.verify_transfer(destination)
+        self.assertEqual(summary["files"], manifest["file_count"])
+
+        # The admitted capture stays strict when the sealed report bytes change ...
+        (destination / "reports/structural-team.md").write_text("# regenerated\n", encoding="utf-8")
+        (destination / "reports/structural-team.json").write_text('{"findings": []}\n', encoding="utf-8")
+        with self.assertRaisesRegex(PipelineError, "differs from the transfer manifest"):
+            transfer.verify_transfer(destination)
+        # ... while a delivery may carry its own regenerated copy ...
+        summary = transfer.verify_transfer(destination, regenerated=transfer.TEAM_REPORTS)
+        self.assertEqual(summary["files"], manifest["file_count"])
+        # ... or none at all before the report is stamped.
+        (destination / "reports/structural-team.md").unlink()
+        (destination / "reports/structural-team.json").unlink()
+        summary = transfer.verify_transfer(destination, regenerated=transfer.TEAM_REPORTS)
+        self.assertEqual(summary["files"], manifest["file_count"])
+        with self.assertRaises(PipelineError):
+            transfer.verify_transfer(destination)
 
     def test_sealing_is_deterministic(self) -> None:
         first = self.base / "first.zip"

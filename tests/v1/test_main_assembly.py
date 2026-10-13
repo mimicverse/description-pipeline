@@ -1,4 +1,4 @@
-"""Explicit main-assembly selection: transport format, freeze binding and resume identity.
+"""Explicit main-assembly selection: client format, staged admission and resume identity.
 
 These tests cover the protocol, admission and checkpoint-reuse contracts only;
 they do not qualify native CAD behavior.
@@ -6,10 +6,11 @@ they do not qualify native CAD behavior.
 
 from __future__ import annotations
 
+import hashlib
 import json
-import time
 import unittest
 import uuid
+import zipfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -19,10 +20,11 @@ from description_pipeline.orchestration.airflow_client import (
     validate_main_assembly,
 )
 from description_pipeline.orchestration.windows import RequestError
+from description_pipeline.sources.solidworks.discovery import DISCOVERY_FILE
 from description_pipeline.sources.solidworks.revision import package_inventory
 from description_pipeline.steps import freeze_inputs
 
-from .endpoint_support import EndpointFixture
+from .endpoint_support import MAIN, EndpointFixture, source_bytes
 
 
 class MainAssemblyFormatTests(unittest.TestCase):
@@ -74,132 +76,167 @@ class FreezeSelectionTests(unittest.TestCase):
 
 class MainAssemblyEndpointTests(EndpointFixture, unittest.TestCase):
     def test_malformed_selection_is_refused_at_submit(self):
-        jobs = self.jobs()
+        jobs = self.jobs(lambda *args, **kwargs: self.fail("an inadmissible selection must not run"))
         request = self.request()
-        for bad in ("../top.SLDASM", "top.step", "sub\\top.SLDASM", " top.SLDASM", ""):
+        for bad in ("../cad/robot.SLDASM", "cad/robot.step", "cad\\robot.SLDASM", " cad/robot.SLDASM", ""):
             with self.subTest(bad=bad):
                 with self.assertRaises(RequestError) as error:
                     jobs.create({**request, "run_id": str(uuid.uuid4()), "main_assembly": bad})
                 self.assertEqual(400, error.exception.status)
 
-    def test_selection_binds_freeze_and_discovery_evidence(self):
+    def test_selection_binds_the_job_the_sealed_manifest_and_the_derivation(self):
         jobs = self.jobs()
         request = self.request()
-        selection = "总装.SLDASM"
-        _snapshot, created = jobs.create({**request, "main_assembly": selection})
-        self.assertTrue(created)
-        jobs.queue.join()
-        job = jobs.snapshot(request["run_id"])
-        self.assertEqual("native_complete", job["status"], job.get("error"))
-        self.assertEqual(selection, job["main_assembly"])
-        integrity = next(
-            event["check"] for event in job["events"] if (event.get("check") or {}).get("id") == "handoff.integrity"
+        created, is_new = jobs.create(request)
+        self.assertTrue(is_new)
+        self.assertEqual(MAIN, created["main_assembly"])
+        finished = self.run_to_terminal(jobs, request["run_id"])
+        self.assertEqual("native_complete", finished["status"], finished.get("error"))
+        self.assertEqual(MAIN, finished["main_assembly"])
+        self.assertEqual(MAIN, finished["selection"]["manifest"]["main_assembly"])
+        self.assertEqual(self.upload_files, finished["selection"]["manifest"]["files"])
+        self.assertEqual(MAIN, finished["request"]["main_assembly"])
+        prepared = self.config["state_root"] / "prepared" / request["run_id"]
+        payload = json.loads((prepared / DISCOVERY_FILE).read_text(encoding="utf-8"))
+        self.assertEqual(MAIN, payload["identity"]["main_assembly"])
+        self.assertEqual(MAIN, payload["derivation"]["main_assembly"])
+
+    def test_selection_outside_the_upload_index_never_starts_native_work(self):
+        calls: list = []
+        jobs = self.jobs(
+            lambda *args, **kwargs: calls.append(args),
+            native_reader=lambda frozen, settings, on_activity=None: calls.append((frozen, settings)),
         )
-        self.assertEqual(selection, integrity["details"]["main_assembly"])
-        self.assertEqual(job["package_files"][selection], integrity["details"]["main_assembly_sha256"])
-        inputs = next(
-            event["check"] for event in job["events"] if (event.get("check") or {}).get("id") == "discovery.inputs"
-        )
-        self.assertEqual(selection, inputs["details"]["main_assembly"])
-
-    def test_selection_missing_from_the_frozen_handoff_fails_before_native(self):
-        prepared: list = []
-
-        def preparer(*args, **kwargs):
-            prepared.append(args)
-            raise AssertionError("native discovery must not run for an unbound selection")
-
-        jobs = self.jobs(preparer=preparer)
-        request = self.request()
-        jobs.create({**request, "main_assembly": "other.SLDASM"})
-        jobs.queue.join()
-        job = jobs.snapshot(request["run_id"])
-        self.assertEqual("failed", job["status"])
-        self.assertIn("not part of the frozen handoff", job.get("error") or "")
-        self.assertEqual([], prepared)
-        integrity = [
-            event["check"] for event in job["events"] if (event.get("check") or {}).get("id") == "handoff.integrity"
-        ]
-        self.assertTrue(integrity)
-        self.assertTrue(all(check.get("state") == "failed" for check in integrity))
-        self.assertIn("frozen handoff", str(integrity[-1].get("details")))
+        with self.assertRaises(PipelineError) as error:
+            jobs.create({**self.request(), "main_assembly": "cad/absent.SLDASM"})
+        self.assertEqual("selection_main_invalid", getattr(error.exception, "code", None))
+        self.assertEqual([], calls)
+        self.assertEqual([], self.reader_log)
 
     def test_case_only_variant_is_named_in_the_failure(self):
-        jobs = self.jobs()
-        request = self.request()
-        jobs.create({**request, "main_assembly": "总装.sldasm"})
-        jobs.queue.join()
-        job = jobs.snapshot(request["run_id"])
-        self.assertEqual("failed", job["status"])
-        self.assertIn("case", (job.get("error") or "").lower())
+        jobs = self.jobs(lambda *args, **kwargs: self.fail("an unbound selection must not run"))
+        with self.assertRaises(PipelineError) as error:
+            jobs.create({**self.request(), "main_assembly": "CAD/ROBOT.SLDASM"})
+        self.assertEqual("selection_main_invalid", getattr(error.exception, "code", None))
+        self.assertEqual("CAD/ROBOT.SLDASM", error.exception.detail["path"])
 
 
 class MainAssemblyResumeTests(EndpointFixture, unittest.TestCase):
-    def await_terminal(self, jobs, run_id: str, timeout: float = 15.0) -> dict:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            job = jobs.snapshot(run_id)
-            if job["status"] in {"passed", "failed", "native_complete"}:
-                return job
-            time.sleep(0.01)
-        raise AssertionError(f"{run_id} did not finish")
-
-    def finished_parent(self, selection: str | None):
+    def native_parent(self):
         jobs = self.jobs()
         request = self.request()
-        if selection is not None:
-            request["main_assembly"] = selection
         jobs.create(request)
-        parent = self.await_terminal(jobs, request["run_id"])
-        self.assertEqual("native_complete", parent["status"], parent.get("error"))
+        parent = self.run_to_terminal(jobs, request["run_id"])
+        self.assertEqual(parent["status"], "native_complete", parent.get("error"))
         return jobs, parent
 
     @staticmethod
-    def linked_request(parent: dict, selection: str | None):
+    def linked_request(parent: dict, *, main_assembly: str | None = MAIN) -> dict:
         request = {
             "run_id": str(uuid.uuid4()),
-            "package": parent["request"]["package"],
-            "handoff_sha256": parent["request"]["handoff_sha256"],
+            "upload_files": parent["request"]["upload_files"],
+            "upload_sha256": parent["request"]["upload_sha256"],
             "resume": {"parent_run": parent["run_id"], "from_stage": "capture"},
         }
-        if selection is not None:
-            request["main_assembly"] = selection
+        if main_assembly is not None:
+            request["main_assembly"] = main_assembly
         return request
 
-    def test_resume_accepts_the_same_selection_and_inherits_when_absent(self):
-        parent_jobs, parent = self.finished_parent("总装.SLDASM")
+    def test_resume_accepts_the_same_selection(self):
+        parent_jobs, parent = self.native_parent()
         parent_jobs.close()
-        for selection in ("总装.SLDASM", None):
-            with self.subTest(selection=selection):
-                child_jobs = self.jobs(preparer=lambda *args, **kwargs: self.fail("discovery must not rerun"))
-                request = self.linked_request(parent, selection)
-                child, created = child_jobs.create(request)
-                self.assertTrue(created)
-                self.assertEqual("总装.SLDASM", child["main_assembly"])
-                finished = self.await_terminal(child_jobs, request["run_id"])
-                self.assertEqual("native_complete", finished["status"], finished.get("error"))
-                child_jobs.close()
+        child_jobs = self.jobs(native_reader=lambda *args, **kwargs: self.fail("discovery must not rerun"))
+        request = self.linked_request(parent)
+        child, created = child_jobs.create(request)
+        self.assertTrue(created)
+        self.assertEqual(MAIN, child["main_assembly"])
+        finished = self.await_terminal(child_jobs, request["run_id"])
+        self.assertEqual("native_complete", finished["status"], finished.get("error"))
+        self.assertEqual(MAIN, finished["main_assembly"])
+
+    def test_resume_without_the_selection_is_refused(self):
+        parent_jobs, parent = self.native_parent()
+        parent_jobs.close()
+        jobs = self.jobs(native_reader=lambda *args, **kwargs: self.fail("discovery must not rerun"))
+        with self.assertRaises(RequestError) as error:
+            jobs.create(self.linked_request(parent, main_assembly=None))
+        self.assertEqual(400, error.exception.status)
 
     def test_changed_selection_cannot_reuse_checkpoints(self):
-        parent_jobs, parent = self.finished_parent("总装.SLDASM")
-        parent_jobs.close()
-        jobs = self.jobs()
-        with self.assertRaises(RequestError) as error:
-            jobs.create(self.linked_request(parent, "other.SLDASM"))
-        self.assertEqual(409, error.exception.status)
-        self.assertEqual("selection_changed", error.exception.payload.get("reason"))
+        extra = b"other assembly\n"
+        upload = {**self.upload_files}
+        upload["cad/other.SLDASM"] = hashlib.sha256(extra).hexdigest()
+        self.upload_files = upload
+        self.upload_sha = digest(upload)
+        payloads = {**source_bytes(), "cad/other.SLDASM": extra}
 
-    def test_legacy_parent_cannot_gain_a_selection_on_resume(self):
-        parent_jobs, parent = self.finished_parent(None)
+        def batch_zip(names=None) -> Path:
+            """The exact full-index archive, extended with the second assembly."""
+
+            selected = sorted(payloads) if names is None else list(names)
+            path = self.root / f"upload-{uuid.uuid4().hex}.zip"
+            with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as output:
+                for name in selected:
+                    output.writestr(name, payloads[name])
+            return path
+
+        self.batch_zip = batch_zip
+        parent_jobs, parent = self.native_parent()
         parent_jobs.close()
-        # A run stored before effective selections were recorded carries none; it cannot
-        # acquire one retroactively on resume.
+        jobs = self.jobs(native_reader=lambda *args, **kwargs: self.fail("discovery must not rerun"))
+        with self.assertRaises(RequestError) as error:
+            jobs.create(self.linked_request(parent, main_assembly="cad/other.SLDASM"))
+        self.assertEqual(400, error.exception.status)
+        self.assertIn("exact upload", str(error.exception))
+
+    def test_null_effective_selection_is_refused_before_any_capture(self):
+        calls: list = []
+        parent_jobs, parent = self.native_parent()
+        parent_jobs.close()
         ledger = self.config["state_root"] / "jobs" / (parent["run_id"] + ".json")
         stored = json.loads(ledger.read_text(encoding="utf-8"))
         stored["main_assembly"] = None
         ledger.write_text(json.dumps(stored, ensure_ascii=False), encoding="utf-8")
-        parent["main_assembly"] = None
-        jobs = self.jobs()
+        jobs = self.jobs(
+            lambda *args, **kwargs: calls.append(args),
+            native_reader=lambda *args, **kwargs: self.fail("discovery must not rerun"),
+        )
         with self.assertRaises(RequestError) as error:
-            jobs.create(self.linked_request(parent, "总装.SLDASM"))
-        self.assertEqual("selection_changed", error.exception.payload.get("reason"))
+            jobs.create(self.linked_request(parent))
+        self.assertEqual(400, error.exception.status)
+        self.assertIn("effective main assembly", str(error.exception))
+        self.assertEqual([], calls)
+
+    def test_changed_effective_selection_is_refused_before_any_capture(self):
+        for forge in ("effective", "manifest"):
+            with self.subTest(forge=forge):
+                calls: list = []
+                parent_jobs, parent = self.native_parent()
+                parent_jobs.close()
+                ledger = self.config["state_root"] / "jobs" / (parent["run_id"] + ".json")
+                stored = json.loads(ledger.read_text(encoding="utf-8"))
+                if forge == "effective":
+                    stored["main_assembly"] = "cad/other.SLDASM"
+                else:
+                    stored["selection"]["manifest"]["main_assembly"] = "cad/other.SLDASM"
+                ledger.write_text(json.dumps(stored, ensure_ascii=False), encoding="utf-8")
+                jobs = self.jobs(
+                    lambda *args, calls=calls, **kwargs: calls.append(args),
+                    native_reader=lambda *args, **kwargs: self.fail("discovery must not rerun"),
+                )
+                try:
+                    jobs.create(self.linked_request(parent))
+                except RequestError as error:
+                    # A changed effective selection is refused either by the
+                    # linked-parent guard (400) or by the re-probed plan (409).
+                    self.assertIn(error.status, {400, 409})
+                    if error.status == 400:
+                        self.assertIn("effective main assembly", str(error))
+                else:
+                    self.fail("a mutated parent selection must be refused")
+                self.assertEqual([], calls)
+                jobs.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

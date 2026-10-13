@@ -18,16 +18,13 @@ import shutil
 import contextlib
 from pathlib import Path
 from typing import Any
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 from .errors import BridgeError, ConfigError
+from .native import session_materialization_path
 from .evidence import build_evidence, capture_environment
 from .jsonio import digest_json, sha256_file, write_json
-from .scene import assembly_leaf_total, build_scene, closure_delta
-
-# The pipeline-wide STL reader owns the acceptance standard for meshes; the
-# adapter only writes geometry and then asks that reader what it produced.
-from ...geometry.stl import read as read_stl
+# The native adapter binds exported bytes; full mesh analysis runs on Linux.
 from ...io import inventory
 
 FREEZE_SCHEMA = "description-pipeline.solidworks-freeze/v1"
@@ -40,6 +37,7 @@ SOURCE_KEYS = {
     "assembly",
     "configuration",
     "allowed_roots",
+    "closure",
     "document_suffixes",
     "geometry",
     "coordinate_systems",
@@ -237,6 +235,20 @@ def validate_source_config(config: object) -> dict[str, Any]:
     )
     allowed_roots = config.get("allowed_roots") or []
     _require(isinstance(allowed_roots, list), "source.allowed_roots must be a list of directories")
+    closure = config.get("closure")
+    if closure is not None:
+        # Internal carrier: the sealed native closure travels with the source
+        # config so the freeze stage can bind the admitted resolution (graph
+        # owner documents, cached materializations, suppressed placements)
+        # instead of pre-listing saved author paths.
+        _require(isinstance(closure, dict), "source.closure must be the sealed native closure mapping")
+        _require(
+            closure.get("schema_version") in (None, "solidworks-to-urdf.native-closure/v1"),
+            "source.closure must carry the native closure schema",
+        )
+        for name in ("graph", "documents", "imports", "suppressed"):
+            if name in closure:
+                _require(isinstance(closure[name], (dict, list)), f"source.closure.{name} has the wrong shape")
     geometry = config.get("geometry") or {}
     _require(isinstance(geometry, dict), "source.geometry must be a mapping")
     if geometry.get("enabled"):
@@ -389,6 +401,7 @@ def validate_source_config(config: object) -> dict[str, Any]:
         "assembly": str(assembly),
         "configuration": str(configuration),
         "allowed_roots": [str(root) for root in allowed_roots],
+        "closure": dict(closure) if isinstance(closure, dict) else None,
         "document_suffixes": suffixes,
         "geometry": dict(geometry),
         "coordinate_systems": [str(name) for name in coordinate_systems],
@@ -558,20 +571,67 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
 
     lister = getattr(backend, "list_dependencies", None)
     dependencies = list(lister(cfg["assembly"]) or []) if callable(lister) else []
-    unresolved = [str(entry["path"]) for entry in dependencies if not entry.get("exists", True)]
-    outside = [
-        entry["path"]
-        for entry in dependencies
-        if entry.get("exists", True) and cfg["allowed_roots"] and not _under(str(entry["path"]), cfg["allowed_roots"])
-    ]
-    if outside:
-        raise BridgeError(
-            "dependency_outside_allowed_roots",
-            "the assembly references files outside source.allowed_roots; widen the roots explicitly",
-            {"paths": outside[:20], "count": len(outside)},
-            exit_code=3,
-        )
+    # Suppressed placements are omitted from the sealed closure graph; a stored
+    # reference that only exists because of a suppressed placement must not fail
+    # the capture later.  Paths recorded as suppressed by the closure are
+    # skipped here (and in the collector) and reported as evidence.
+    closure = cfg.get("closure") or {}
+    suppressed_paths = {
+        os.path.normcase(os.path.abspath(str(entry.get("resolved_path"))))
+        for entry in closure.get("suppressed") or []
+        if isinstance(entry, dict) and entry.get("resolved_path")
+    }
+    # Session materializations recorded by the closure walk (imported
+    # occurrences): they are evidence, not snapshot members, and are excluded
+    # from the required file graph by the manifest itself -- never by a path
+    # string heuristic.
+    cached_import_paths = {
+        os.path.normcase(os.path.abspath(str(entry.get("materialization"))))
+        for entry in closure.get("imports") or []
+        if isinstance(entry, dict) and entry.get("materialization")
+    }
+    # Exact-occurrence binding: the closure records which occurrences were
+    # session materializations.  The current session's materialization paths
+    # differ from the selection session's, so the stable key is the exact
+    # (owner, occurrence) pair: the owning document's canonical name, or -- for
+    # occurrences inside a materialization subtree -- the anchoring
+    # materialization occurrence.  Never a name alone, never a path pattern.
+    def _closure_owner_token(item: dict) -> tuple[str, str] | None:
+        anchor = item.get("owner_anchor")
+        if isinstance(anchor, str) and anchor:
+            return ("anchor", anchor)
+        owner = item.get("owner") if isinstance(item.get("owner"), str) and item.get("owner") else item.get("document")
+        if not isinstance(owner, str) or not owner:
+            return None
+        return ("document", owner.replace("\\", "/").casefold())
 
+    materialization_keys: set[tuple[str, str]] = set()
+    for entry in closure.get("imports") or []:
+        if not isinstance(entry, dict) or entry.get("state") != "cached_materialization":
+            continue
+        instance = entry.get("instance")
+        token = _closure_owner_token(entry)
+        if isinstance(instance, str) and instance and token is not None:
+            materialization_keys.add((token, instance))
+    # Stale author source links recorded by the closure (import metadata): the
+    # exact author path may still be listed by the engine, but after the
+    # coverage proof below it is excluded from the required graph and copied
+    # graph as recorded evidence -- never a broad STEP or name rule.
+    # Only genuinely external author links are excluded: an author path that is
+    # itself inside the admitted roots is an ordinary delivered dependency and
+    # is never dropped (e.g. NP-F550.step resolving inside the flat package).
+    def _author_link_is_external(value) -> bool:
+        roots = cfg.get("allowed_roots") or []
+        return bool(roots) and not _under(str(value), roots)
+
+    author_metadata_external = {
+        os.path.normcase(os.path.abspath(str(entry.get("author_imported_path"))))
+        for entry in closure.get("imports") or []
+        if isinstance(entry, dict)
+        and entry.get("state") == "cached_materialization"
+        and entry.get("author_imported_path")
+        and _author_link_is_external(entry.get("author_imported_path"))
+    }
     inspector = getattr(backend, "inspect_copy", None)
     if not callable(inspector):
         raise BridgeError(
@@ -579,12 +639,121 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
             "the backend cannot re-open the copy to verify component coverage",
             exit_code=3,
         )
-    # Bind every saved source file before copying, then recheck after all reads.
     original = dict(inspector(cfg["assembly"]) or {})
+    # Occurrence coverage gate: every current occurrence must be covered by the
+    # admitted closure (a resolved edge, a recorded cached materialization or a
+    # recorded suppressed placement) by exact owner+occurrence identity.  Only
+    # then may session materializations or stale author links be excluded from
+    # the required/copied graph; otherwise nothing is skipped.
+    covered_keys: set[tuple[str, str]] = set()
+    for name, entry in (closure.get("documents") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        token = ("document", str(name).replace("\\", "/").casefold())
+        for edge in entry.get("resolved_edges") or []:
+            if isinstance(edge, dict) and isinstance(edge.get("instance"), str) and edge["instance"]:
+                covered_keys.add((token, edge["instance"]))
+    for item in closure.get("imports") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("instance"), str) or not item["instance"]:
+            continue
+        token = _closure_owner_token(item)
+        if token is not None:
+            covered_keys.add((token, item["instance"]))
+    for item in closure.get("suppressed") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("instance"), str) or not item["instance"]:
+            continue
+        token = _closure_owner_token(item)
+        if token is not None:
+            covered_keys.add((token, item["instance"]))
+
+    def _actual_owner_token(entry: dict) -> tuple[str, str]:
+        anchor = entry.get("defining_anchor")
+        if isinstance(anchor, str) and anchor:
+            return ("anchor", anchor)
+        defining = str(entry.get("defining") or "")
+        for root in cfg.get("allowed_roots") or []:
+            try:
+                relative = Path(defining).resolve().relative_to(Path(str(root)).resolve()).as_posix()
+                return ("document", relative.casefold())
+            except (OSError, ValueError):
+                continue
+        return ("document", os.path.normcase(os.path.abspath(defining)) if defining else "")
+
+    actual_keys = {
+        (_actual_owner_token(entry), str(entry.get("instance") or ""))
+        for entry in original.get("instances") or []
+        if entry.get("instance")
+    }
+    materializations_verified = False
+    if closure:
+        if actual_keys != covered_keys:
+            raise BridgeError(
+                "dependency_materialization_uncovered",
+                "the source occurrence inventory differs from the admitted closure; a session "
+                "materialization can never be dropped without a recorded owner/occurrence",
+                {
+                    "missing_from_closure": sorted(str(item) for item in (actual_keys - covered_keys))[:20],
+                    "missing_from_session": sorted(str(item) for item in (covered_keys - actual_keys))[:20],
+                    "instances": len(actual_keys),
+                },
+                exit_code=3,
+            )
+        materializations_verified = True
+    suppressed_skipped: list[str] = []
+    session_temp_dependencies: list[str] = []
+    stale_source_links: list[str] = []
+    unresolved = []
+    outside = []
+    for entry in dependencies:
+        path = str(entry.get("path") or "")
+        if path and os.path.normcase(os.path.abspath(path)) in suppressed_paths:
+            suppressed_skipped.append(path)
+            continue
+        normalized = os.path.normcase(os.path.abspath(path)) if path else ""
+        if path and materializations_verified and normalized in author_metadata_external:
+            stale_source_links.append(path)
+            continue
+        if path and materializations_verified and session_materialization_path(path):
+            session_temp_dependencies.append(path)
+            continue
+        if not entry.get("exists", True):
+            unresolved.append(path)
+        elif cfg["allowed_roots"] and not _under(path, cfg["allowed_roots"]):
+            outside.append(path)
+    if outside:
+        raise BridgeError(
+            "dependency_outside_allowed_roots",
+            "the assembly references files outside the admitted CAD source roots; "
+            "collect the required references into the controlled assembly delivery",
+            {"paths": outside[:20], "count": len(outside)},
+            exit_code=3,
+        )
+
+    # Bind every saved source file before copying, then recheck after all reads.
     original_files: dict[str, str] = {}
     original_documents = [str(cfg["assembly"])]
-    original_documents.extend(str(entry.get("document") or "") for entry in original.get("instances") or [])
-    original_documents.extend(str(entry.get("path") or "") for entry in dependencies)
+    import_temp_documents: list[str] = []
+    for entry in original.get("instances") or []:
+        document = str(entry.get("document") or "")
+        if not document:
+            continue
+        key = (_actual_owner_token(entry), str(entry.get("instance") or ""))
+        if (
+            key in materialization_keys
+            or os.path.normcase(os.path.abspath(document)) in cached_import_paths
+        ):
+            import_temp_documents.append(document)
+            continue
+        original_documents.append(document)
+    for entry in dependencies:
+        path = str(entry.get("path") or "")
+        if not path or os.path.normcase(os.path.abspath(path)) in suppressed_paths:
+            continue
+        if materializations_verified and session_materialization_path(path):
+            continue
+        if materializations_verified and os.path.normcase(os.path.abspath(path)) in author_metadata_external:
+            continue
+        original_documents.append(path)
     original_states: dict[str, dict[str, Any]] = {}
     unreadable: list[dict[str, Any]] = []
     save_flags: list[str] = []
@@ -624,7 +793,49 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
             "the backend cannot collect dependencies; a verified copy is required to freeze a source",
             exit_code=3,
         )
-    collected = dict(pack(cfg["assembly"], str(source_dir)) or {})
+    # The collector contract is explicit: skipped/author-excluded paths are
+    # always passed, empty when the coverage proof did not authorize a skip.
+    closure_documents: dict[str, dict] = {}
+    for name, entry in (closure.get("documents") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        closure_documents[str(name)] = {
+            "stored_locations": [
+                str(item.get("location"))
+                for item in entry.get("stored_references") or []
+                if isinstance(item, dict) and isinstance(item.get("location"), str)
+            ],
+            "resolved_targets": [
+                str(edge.get("resolved"))
+                for edge in entry.get("resolved_edges") or []
+                if isinstance(edge, dict) and isinstance(edge.get("resolved"), str)
+            ],
+            "resolved_paths": [
+                str(edge.get("resolved_path"))
+                for edge in entry.get("resolved_edges") or []
+                if isinstance(edge, dict) and isinstance(edge.get("resolved_path"), str)
+            ],
+        }
+    collected = dict(
+        pack(
+            cfg["assembly"],
+            str(source_dir),
+            skip_missing=sorted(suppressed_paths),
+            skip_session_temp=materializations_verified,
+            excluded_paths=sorted(author_metadata_external) if materializations_verified else (),
+            required_names=sorted((closure.get("graph") or {}).keys()),
+            admitted_roots=[str(source_dir), *(cfg.get("allowed_roots") or [])],
+            closure_documents=closure_documents,
+            required_paths=sorted(original_files),
+        )
+        or {}
+    )
+    stale_stored: list[dict] = [dict(item) for item in collected.get("skipped_stale") or [] if isinstance(item, dict)]
+    stale_resolved_normalized = {
+        os.path.normcase(os.path.abspath(str(item.get("resolved_path"))))
+        for item in stale_stored
+        if item.get("resolved_path")
+    }
     source_mapping = collected.get("mapping") or {}
     if {os.path.normcase(os.path.abspath(path)) for path in source_mapping} != {
         os.path.normcase(os.path.abspath(path)) for path in original_files
@@ -670,6 +881,23 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
     problems: list[dict[str, Any]] = []
     for entry in entries:
         path = str(entry.get("path") or "")
+        if path and os.path.normcase(os.path.abspath(path)) in suppressed_paths:
+            suppressed_skipped.append(path)
+            continue
+        if path and os.path.normcase(os.path.abspath(path)) in stale_resolved_normalized:
+            # The copy still stores an evidence-covered unused reference; it
+            # was never ingested and is recorded (no name matching involved).
+            if not any(item.get("resolved_path") == path for item in stale_stored):
+                stale_stored.append(
+                    {"document": None, "location": None, "resolved_path": path, "exists": os.path.isfile(path)}
+                )
+            continue
+        if path and materializations_verified and os.path.normcase(os.path.abspath(path)) in author_metadata_external:
+            stale_source_links.append(path)
+            continue
+        if path and materializations_verified and session_materialization_path(path):
+            session_temp_dependencies.append(path)
+            continue
         if not path or not _under(path, [str(source_dir)]):
             problems.append({"path": path, "problem": "outside_snapshot"})
         elif not os.path.isfile(path):
@@ -800,6 +1028,14 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         path = str(entry.get("document") or "")
         if not path:
             continue  # suppressed instances are tracked, not resolved
+        key = (_actual_owner_token(entry), str(entry.get("instance") or ""))
+        if (
+            key in materialization_keys
+            or os.path.normcase(os.path.abspath(path)) in cached_import_paths
+            or (materializations_verified and session_materialization_path(path))
+        ):
+            import_temp_documents.append(path)
+            continue  # session materializations are evidence, not snapshot members
         if not _under(path, [str(source_dir)]):
             outside_copy.append(path)
         elif not os.path.isfile(path):
@@ -861,7 +1097,13 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         mapping[(str(cfg["assembly"]), top)] = "top_level"
     for entry in copy.get("instances") or []:
         path = str(entry.get("document") or "")
-        if not path:
+        key = (_actual_owner_token(entry), str(entry.get("instance") or ""))
+        if (
+            not path
+            or key in materialization_keys
+            or os.path.normcase(os.path.abspath(path)) in cached_import_paths
+            or (materializations_verified and session_materialization_path(path))
+        ):
             continue
         for source_entry in original.get("instances") or []:
             if str(source_entry.get("instance")) == str(entry.get("instance")) and source_entry.get("document"):
@@ -878,6 +1120,17 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         "top_level": top,
         "declared_dependencies": dependencies,
         "declared_unresolved": unresolved,
+        "suppressed_skipped": sorted(set(suppressed_skipped)),
+        "session_temp_dependencies": sorted(set(session_temp_dependencies)),
+        "stale_source_links": sorted(set(stale_source_links)),
+        "stale_stored_references": sorted(
+            stale_stored,
+            key=lambda item: (str(item.get("document")), str(item.get("location")), str(item.get("resolved_path"))),
+        ),
+        "seeded_required_leaves": sorted(collected.get("seeded_required_leaves") or []),
+        "materializations_verified": materializations_verified,
+        "materialization_keys": sorted([token[0], token[1], instance] for token, instance in materialization_keys),
+        "import_temp_documents": sorted(set(import_temp_documents)),
         "resolved_inside_snapshot": len(entries),
         "collected_files": len(collected.get("files") or []),
         "configuration": copy_config,
@@ -1005,24 +1258,15 @@ def _exception_trace(error: BaseException) -> list[dict[str, Any]]:
     return chain
 
 
-def _component_context_record(reading: dict[str, Any], scene: Any, assembly_mass: float | None) -> dict[str, Any]:
-    """Align the assembly context's per-instance readings with the leaf/document basis.
+def _component_context_record(reading: dict[str, Any], assembly_mass: float | None) -> dict[str, Any]:
+    """Native component-context observations, verbatim; no derived math.
 
-    ``document_basis_mass_kg`` is the sum of the existing leaf/document readings under that
-    instance (itself, for a leaf).  Totals use only the disjoint depth-0 rows; nested rows are kept
-    to detect overrides a clean parent would otherwise hide.  ``leaf_documents_covered`` counts
-    exact part-row matches, not ancestors.  Everything here is recorded for comparison only: no
-    total is forced to agree and nothing is distributed into any declared mass.
+    Windows records only what CAD answered: per-instance identity, context
+    mass/volume, override flags, effective readings and their failures.
+    Document basis, deltas, totals, coverage and the effective recombination
+    are rebuilt on Linux (``closure.derive_mass_closure``); there is no
+    compatibility format and no computed field survives here.
     """
-
-    leaves = [
-        (str(component.name), float((scene.mass_properties.get(str(component.name)) or {}).get("mass") or 0.0))
-        for component in scene.components
-    ]
-
-    def document_basis(name: str) -> float:
-        prefix = name + "/"
-        return sum(mass for leaf, mass in leaves if leaf == name or leaf.startswith(prefix))
 
     instances = []
     errors = list(reading.get("errors") or [])
@@ -1061,7 +1305,6 @@ def _component_context_record(reading: dict[str, Any], scene: Any, assembly_mass
         except (KeyError, TypeError, ValueError) as exc:
             errors.append({"name": name, "error": "cad_component_context_invalid", "message": str(exc)[:200]})
             continue
-        basis = document_basis(name)
         instances.append(
             {
                 "name": name,
@@ -1072,41 +1315,15 @@ def _component_context_record(reading: dict[str, Any], scene: Any, assembly_mass
                 "context_mass_kg": mass,
                 "context_volume_m3": volume,
                 "overrides": overrides,
-                "document_basis_mass_kg": basis,
-                "delta_kg": mass - basis,
+                "effective": entry.get("effective"),
+                "effective_error": entry.get("effective_error"),
             }
         )
-    leaf_names = {leaf for leaf, _ in leaves}
-    part_rows = {entry["name"] for entry in instances if entry["document_type"] == "part"}
-    covered = {leaf for leaf in leaf_names if leaf in part_rows}
-    top_level = [entry for entry in instances if entry["depth"] == 0]
-    context_total = sum(entry["context_mass_kg"] for entry in top_level)
-    document_total = sum(entry["document_basis_mass_kg"] or 0.0 for entry in top_level)
-    assembly_kg = None if assembly_mass is None else float(assembly_mass)
     return {
         "schema_version": "description-pipeline.solidworks-component-mass-context/v1",
         "status": "recorded" if not errors else "partial",
-        "assembly_mass_kg": assembly_kg,
+        "assembly_mass_kg": None if assembly_mass is None else float(assembly_mass),
         "instances": instances,
-        "totals": {
-            "context_kg": context_total,
-            "document_kg": document_total,
-            "assembly_kg": assembly_kg,
-            "context_minus_document_kg": context_total - document_total,
-            "context_minus_assembly_kg": None if assembly_kg is None else context_total - assembly_kg,
-        },
-        "overridden": {
-            "top_level_instances": len(top_level),
-            "mass": sum(1 for entry in instances if entry["overrides"].get("OverrideMass")),
-            "com": sum(1 for entry in instances if entry["overrides"].get("OverrideCenterOfMass")),
-            "inertia": sum(1 for entry in instances if entry["overrides"].get("OverrideMomentsOfInertia")),
-            "any": sum(1 for entry in instances if any(entry["overrides"].values())),
-            "top_level_overridden": sum(1 for entry in top_level if any(entry["overrides"].values())),
-            "examples": [entry["name"] for entry in instances if entry["overrides"].get("OverrideMass")][:50],
-        },
-        "leaf_documents": len(leaf_names),
-        "leaf_documents_covered": len(covered),
-        "leaf_documents_uncovered": sorted(leaf_names - covered)[:50],
         "errors": errors,
         "reference": dict(reading.get("reference") or {}),
     }
@@ -1115,7 +1332,6 @@ def _component_context_record(reading: dict[str, Any], scene: Any, assembly_mass
 def _component_mass_context(
     backend: Any,
     cfg: dict[str, Any],
-    scene: Any,
     assembly_mass: float | None,
     document: str | None = None,
 ) -> dict[str, Any] | None:
@@ -1143,7 +1359,7 @@ def _component_mass_context(
             "message": "the backend returned no component mass context object",
         }
     try:
-        return _component_context_record(reading, scene, assembly_mass)
+        return _component_context_record(reading, assembly_mass)
     except Exception as error:  # noqa: BLE001 - an optional probe must never abort a capture
         return {
             "schema_version": "description-pipeline.solidworks-component-mass-context/v1",
@@ -1153,14 +1369,14 @@ def _component_mass_context(
         }
 
 
-def _mass_closure(backend: Any, cfg: dict[str, Any], scene: Any, document: str | None = None) -> dict[str, Any] | None:
-    """The assembly's own reading next to the recombined leaf readings, as capture evidence.
+def _mass_closure(backend: Any, cfg: dict[str, Any], document: str | None = None) -> dict[str, Any] | None:
+    """Native closure observations only: the assembly reading and instance context.
 
-    Capture retains full readings, closure deltas and explicit unavailable/error
-    receipts for diagnosis. The v1 delivery verifier requires full whole-assembly
-    closure and complete component-context evidence; a missing or inconsistent
-    receipt blocks publication. Keeping a failed probe in the snapshot does not
-    qualify the delivery.
+    The Windows boundary records what CAD answered (whole-assembly reading,
+    per-instance context with overrides and effective readings) plus explicit
+    unavailable/error receipts.  All comparison math - leaf totals, deltas,
+    totals, coverage and the effective recombination - lives on Linux
+    (``closure.derive_mass_closure``); no computed field survives here.
     """
 
     closure_reader = getattr(backend, "assembly_mass_properties", None)
@@ -1196,7 +1412,7 @@ def _mass_closure(backend: Any, cfg: dict[str, Any], scene: Any, document: str |
         }
     # The override evidence is required for a pure-CAD claim, so it is collected even when the
     # optional assembly reading failed (or the record would earn cad equivalence by omission).
-    component_context = _component_mass_context(backend, cfg, scene, top_mass, measured)
+    component_context = _component_mass_context(backend, cfg, top_mass, measured)
     if top_level is None or top_mass is None:
         unavailable_record: dict[str, Any] = {
             "schema_version": "description-pipeline.solidworks-mass-closure/v1",
@@ -1209,7 +1425,6 @@ def _mass_closure(backend: Any, cfg: dict[str, Any], scene: Any, document: str |
         if component_context is not None:
             unavailable_record["component_context"] = component_context
         return unavailable_record
-    leaf_total = assembly_leaf_total(scene.components, scene.mass_properties)
     record = {
         "schema_version": "description-pipeline.solidworks-mass-closure/v1",
         "status": "recorded",
@@ -1220,9 +1435,6 @@ def _mass_closure(backend: Any, cfg: dict[str, Any], scene: Any, document: str |
             "inertia": [[float(value) for value in row] for row in top_level["inertia"]],
             "reference": dict(top_level.get("reference") or {}),
         },
-        "leaf_total": leaf_total,
-        "leaf_components": len(list(scene.components)),
-        "delta": closure_delta(top_level, leaf_total),
     }
     if component_context is not None:
         record["component_context"] = component_context
@@ -1262,7 +1474,18 @@ def _capture_readings(
             {"requested": document, "reported": reported, "assembly": cfg["assembly"]},
             exit_code=3,
         )
-    raw = {
+    return scene, _raw_scene_payload(scene, cfg, source_root)
+
+
+def _raw_scene_payload(scene: Any, cfg: dict[str, Any], source_root: Path) -> dict[str, Any]:
+    """The raw/scene_raw.json projection of the captured scene.
+
+    Rebuilt after the component mass context runs, because the effective
+    instance readings are injected into ``scene.notes`` there and the earlier
+    file write cannot see them.
+    """
+
+    return {
         "document": scene.document,
         "source_document": cfg["assembly"],
         "source_root": str(source_root),
@@ -1280,7 +1503,178 @@ def _capture_readings(
         "mass_properties": scene.mass_properties,
         "notes": scene.notes,
     }
-    return scene, raw
+
+
+def _material_provenance_record(scene: Any, cfg: dict[str, Any]) -> dict[str, Any]:
+    """The stable warning record for CAD masses read from unverified materials.
+
+    A pure projection of ``raw/mass_properties.json``: each entry carries the verbatim
+    material assignment the reader produced next to the measured CAD values it came
+    with.  Missing explicit material is a warnable deficiency - capture, model and
+    delivery continue - but no consumer may mistake the document's default density for
+    evidence.  The record is written for every capture, with an empty ``warnings`` list
+    when every included solid carries a verified assignment.
+    """
+
+    warnings: list[dict[str, Any]] = []
+    for name, payload in sorted((scene.mass_properties or {}).items()):
+        reference = payload.get("reference") if isinstance(payload, dict) else None
+        assignment = reference.get("material_assignment") if isinstance(reference, dict) else None
+        if not isinstance(assignment, dict) or not assignment.get("unverified_reason"):
+            continue
+        reference = reference if isinstance(reference, dict) else {}
+        warnings.append(
+            {
+                "code": str(assignment["unverified_reason"]),
+                "message": str(assignment.get("message") or "material assignment is not verified"),
+                "blocking": False,
+                "component": str(name),
+                "document": reference.get("part_document"),
+                "configuration": reference.get("configuration") or assignment.get("configuration"),
+                "missing_body_indices": assignment.get("missing_body_indices"),
+                "material_assignment": assignment,
+                "measured": {
+                    "source": "cad_api",
+                    "scope": reference.get("scope"),
+                    "mass_kg": payload.get("mass"),
+                    "center_of_mass_m": payload.get("com"),
+                    "inertia_kg_m2": payload.get("inertia"),
+                    "volume_m3": reference.get("volume_m3"),
+                    "density_kg_m3": reference.get("density_kg_m3"),
+                },
+            }
+        )
+    return {
+        "schema_version": "solidworks-to-urdf.material-provenance/v1",
+        "assembly": str(cfg.get("assembly") or ""),
+        "configuration": str(cfg.get("configuration") or ""),
+        "material_source": str(cfg.get("material_source") or "cad"),
+        "measured_source": "cad_api",
+        "warnings": warnings,
+    }
+
+
+def _effective_instance_record(
+    scene: Any, cfg: dict[str, Any], readings: dict[str, Any], cache_error: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """The stable record for CAD-authored effective instance measurements.
+
+    A surface-only occurrence whose part document cannot answer mass questions,
+    and any overridden instance, are read through the assembly instance under
+    the ``assembly_component_group`` scope (including CAD-authored overrides).
+    The record is written for EVERY capture - with empty readings/warnings when
+    none was needed - and states plainly that these values are CAD-authored
+    effective data: not geometry-derived and not independently physically
+    qualified.  Nothing is rescaled, substituted or distributed here.
+    """
+
+    readings_payload = {
+        str(name): dict(reading)
+        for name, reading in sorted((readings or {}).items())
+        if isinstance(reading, dict)
+    }
+    warnings: list[dict[str, Any]] = []
+    for name, reading in sorted(readings_payload.items()):
+        reference = dict(reading.get("reference") or {})
+        flags = dict(reference.get("overrides") or {})
+        instance_difference = reference.get("measurement_basis") == "cad_assembly_instance_measurement"
+        if not any(bool(value) for value in flags.values()) and not instance_difference:
+            continue
+        warnings.append(
+            {
+                "code": (
+                    "cad_instance_measurement_differs_from_part"
+                    if instance_difference else "cad_instance_override_effective"
+                ),
+                "blocking": False,
+                "message": (
+                    "the native assembly-instance measurement differs from the part-document measurement; "
+                    "the cause is unproven and both are retained"
+                    if instance_difference else
+                    "the instance carries CAD-authored mass-property overrides; these are effective CAD values, "
+                    "not geometry qualification"
+                ),
+                "component": name,
+                "role": reading.get("role"),
+                "document_type": reading.get("document_type"),
+                "configuration": reference.get("configuration"),
+                "part_document": reference.get("part_document"),
+                "assembly_document": reference.get("assembly_document"),
+                "assembly_configuration": reference.get("assembly_configuration"),
+                "selected_components": reference.get("selected_components"),
+                "overrides": flags,
+                "qualification": (
+                    "cad_assembly_instance_measurement; cause_of_part_difference_unproven; "
+                    "not geometry-derived, not independently physically qualified"
+                    if instance_difference else
+                    "cad_authored_effective_instance; not geometry-derived, not independently physically qualified"
+                ),
+                **({"part_measurement": reading.get("part_measurement")} if instance_difference else {}),
+                "measurement": {
+                    "scope": reference.get("scope"),
+                    "axes": reference.get("axes"),
+                    "used_api": reference.get("used_api"),
+                    "selection_api": reference.get("selection_api"),
+                    "override_api": reference.get("override_api"),
+                    "mass_kg": reading.get("mass"),
+                    "center_of_mass_m": reading.get("com"),
+                    "inertia_kg_m2": reading.get("inertia"),
+                    "volume_m3": reference.get("volume_m3"),
+                    "density_kg_m3": reference.get("density_kg_m3"),
+                },
+            }
+        )
+    for name, payload in sorted((getattr(scene, "mass_properties", None) or {}).items()):
+        if not isinstance(payload, dict) or payload.get("mode") != "effective_instance":
+            continue
+        reference = dict(payload.get("reference") or {})
+        warnings.append(
+            {
+                "code": "cad_surface_only_effective_instance",
+                "blocking": False,
+                "message": (
+                    "the part is surface-only (no solid bodies); its mass properties come from the assembly "
+                    "instance measurement, not from geometric qualification"
+                ),
+                "component": str(name),
+                "document": reference.get("part_document"),
+                "configuration": reference.get("configuration"),
+                "assembly_document": reference.get("assembly_document"),
+                "assembly_configuration": reference.get("assembly_configuration"),
+                "selected_components": reference.get("selected_components"),
+                "part_document_read": "unavailable",
+                "fallback_reason": reference.get("fallback_reason"),
+                "fallback_error_code": reference.get("fallback_error_code"),
+                "solid_bodies": reference.get("solid_bodies"),
+                "sheet_bodies": reference.get("sheet_bodies"),
+                "overrides": dict(reference.get("overrides") or {}),
+                "qualification": (
+                    "cad_authored_effective_instance; not geometry-derived, not independently physically qualified"
+                ),
+                "measurement": {
+                    "state": payload.get("state"),
+                    "measurement_basis": payload.get("measurement_basis"),
+                    "scope": reference.get("scope"),
+                    "axes": reference.get("axes"),
+                    "used_api": reference.get("used_api"),
+                    "selection_api": reference.get("selection_api"),
+                    "override_api": reference.get("override_api"),
+                    "mass_kg": payload.get("mass"),
+                    "center_of_mass_m": payload.get("com"),
+                    "inertia_kg_m2": payload.get("inertia"),
+                    "volume_m3": reference.get("volume_m3"),
+                    "density_kg_m3": reference.get("density_kg_m3"),
+                },
+            }
+        )
+    return {
+        "schema_version": "solidworks-to-urdf.effective-instances/v1",
+        "assembly": str(cfg.get("assembly") or ""),
+        "configuration": str(cfg.get("configuration") or ""),
+        "cache_error": cache_error,
+        "readings": readings_payload,
+        "warnings": warnings,
+    }
 
 
 def _verify_originals_unchanged(closure: dict[str, Any]) -> dict[str, Any]:
@@ -1366,21 +1760,365 @@ def _export_geometry(
                 {"component": component},
                 exit_code=3,
             )
-        stats = read_stl(target)
+        # Raw identity plus the binary-header triangle count only: area, volume,
+        # topology and degeneracy stay with the independent Linux verifier.
+        with target.open("rb") as handle:
+            header = handle.read(84)
+        if len(header) < 84:
+            raise BridgeError(
+                "cad_mesh_invalid",
+                "geometry export produced no binary STL header",
+                {"component": component},
+                exit_code=3,
+            )
+        triangles = int.from_bytes(header[80:84], "little")
+        if triangles <= 0 or target.stat().st_size != 84 + 50 * triangles:
+            raise BridgeError(
+                "cad_mesh_invalid",
+                "geometry export produced an inconsistent mesh size",
+                {"component": component},
+                exit_code=3,
+            )
         exported.append(
             {
                 "component": component,
                 "path": target.relative_to(geometry_dir.parent).as_posix(),
-                "triangles": stats.triangles,
-                "volume_m3": stats.volume,
-                "area_m2": stats.area,
-                "degenerate_triangles": stats.degenerate,
-                "boundary_edges": stats.boundary_edges,
+                "triangles": triangles,
                 "used_api": info.get("used_api"),
+                "bodies": info.get("bodies"),
+                "tessellation": info.get("tessellation") or {"faces": 0, "no_facets_faces": []},
                 "sha256": sha256_file(target),
             }
         )
     return exported
+
+
+LINK_GROUP_SCHEMA = "solidworks-to-urdf.link-group-mass-properties/v1"
+LINK_GROUP_USED_API = "IMassProperty2 (SelectedItems = component set)"
+LINK_GROUP_SELECTION_RULE = "top_most_providers+uncovered_leaves"
+#: Marker for the whole-assembly and direct link reads taken in the reopened,
+#: never-touched readout window (probe v5: close+reopen restores the opened
+#: state bit-identically; any earlier instance read in the session shifts the
+#: direct group reads and the whole-assembly read - probe v4).
+PRISTINE_WINDOW = "pristine-reopen"
+
+
+def _link_group_selections(cfg: dict[str, Any], scene: Any, effective: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Compose each body's selection from the captured scene's per-instance evidence.
+
+    Provider names come from the recorded evidence exactly as the verifier
+    recomputes them (notes effective instances and effective-instance rows);
+    the shared core validates and collapses them.
+    """
+
+    leaves = [str(component.name) for component in (scene.components or [])]
+    provider_names = {str(name) for name in effective}
+    provider_names |= {
+        str(name)
+        for name, row in (getattr(scene, "mass_properties", None) or {}).items()
+        if isinstance(row, dict) and row.get("mode") == "effective_instance"
+    }
+    return _compose_link_selections(cfg, leaves, provider_names)
+
+
+def _compose_link_selections(
+    cfg: dict[str, Any], leaves: Sequence[str], provider_names: set[str]
+) -> dict[str, dict[str, Any]]:
+    """Compose each rigid body's direct-read selection (top-most providers + uncovered leaves).
+
+    Mirrors the verifier's independent recomputation: providers are effective
+    instances (any override flag or a flagless instance measurement) whose whole
+    leaf subtree lies inside one body; a nested provider collapses into the
+    top-most one; every remaining body leaf is selected individually.  Unknown
+    members, duplicated membership, providers that span or only partially cover
+    bodies, and empty selections fail the capture closed.
+    """
+
+    leaves = [str(name) for name in leaves]
+    if len(set(leaves)) != len(leaves):
+        raise BridgeError("link_group_occurrence_duplicate", "the captured scene repeats an occurrence", exit_code=3)
+    leaf_set = set(leaves)
+    bodies = list(cfg.get("bodies") or [])
+    if not bodies:
+        raise BridgeError("link_group_body_missing", "native discovery defines no rigid bodies", exit_code=3)
+    body_of: dict[str, str] = {}
+    for body in bodies:
+        body_name = str(body.get("name") or body.get("id") or "")
+        if not body_name:
+            raise BridgeError("link_group_body_unnamed", "every body needs a name", exit_code=3)
+        for member in body.get("components") or []:
+            member = str(member)
+            if member not in leaf_set:
+                raise BridgeError(
+                    "link_group_member_unknown",
+                    "a body references an unknown occurrence",
+                    {"body": body_name, "component": member},
+                    exit_code=3,
+                )
+            if member in body_of:
+                raise BridgeError(
+                    "link_group_member_duplicate",
+                    "an occurrence belongs to two bodies",
+                    {"component": member, "bodies": [body_of[member], body_name]},
+                    exit_code=3,
+                )
+            body_of[member] = body_name
+    providers: dict[str, set[str]] = {}
+    for provider in sorted(provider_names):
+        subtree = {leaf for leaf in leaves if leaf == provider or leaf.startswith(provider + "/")}
+        if not subtree:
+            raise BridgeError(
+                "link_group_provider_unknown",
+                "an effective instance is not a captured occurrence",
+                {"provider": provider},
+                exit_code=3,
+            )
+        owners = {body_of.get(leaf) for leaf in subtree}
+        named = {owner for owner in owners if owner}
+        if len(named) > 1:
+            raise BridgeError(
+                "link_group_provider_spans_bodies",
+                "an effective instance spans several bodies",
+                {"provider": provider, "bodies": sorted(named), "descendants": sorted(subtree)[:50]},
+                exit_code=3,
+            )
+        if named and len(owners) != 1:
+            raise BridgeError(
+                "link_group_provider_partial",
+                "an effective instance is only partially assigned to a body",
+                {"provider": provider, "body": sorted(named)[0], "descendants": sorted(subtree)[:50]},
+                exit_code=3,
+            )
+        if not named:
+            # Entirely unassigned subtree: it cannot be a provider for any body;
+            # the closure record already accounts for the unassigned mass.
+            continue
+        providers[provider] = subtree
+    selections: dict[str, dict[str, Any]] = {}
+    for body in bodies:
+        body_name = str(body.get("name") or body.get("id") or "")
+        members = {str(item) for item in body.get("components") or []}
+        inner = [provider for provider, subtree in providers.items() if subtree <= members]
+        top_most = [
+            provider
+            for provider in inner
+            if not any(other != provider and provider.startswith(other + "/") for other in inner)
+        ]
+        covered: set[str] = set()
+        for provider in top_most:
+            covered |= providers[provider]
+        uncovered = sorted(members - covered)
+        selection = sorted(top_most) + uncovered
+        if not selection:
+            raise BridgeError(
+                "link_group_empty_selection",
+                "a body has no selectable occurrence",
+                {"body": body_name, "members": sorted(members)},
+                exit_code=3,
+            )
+        selections[body_name] = {"selection": selection, "providers": sorted(top_most), "uncovered_leaves": uncovered}
+    return selections
+
+
+def _link_group_record_from_payload(
+    payload: Any, selections: dict[str, dict[str, Any]], document: str | None
+) -> dict[str, Any]:
+    """Validate one native link group payload against the composed selections."""
+
+    if (
+        not isinstance(payload, dict)
+        or payload.get("used_api") != LINK_GROUP_USED_API
+        or payload.get("selection_rule") != LINK_GROUP_SELECTION_RULE
+    ):
+        raise BridgeError(
+            "cad_link_group_payload_invalid",
+            "the backend returned an unexpected link group payload",
+            exit_code=3,
+        )
+    links = payload.get("links")
+    if not isinstance(links, dict) or set(links) != set(selections):
+        raise BridgeError(
+            "cad_link_group_payload_invalid",
+            "the link group payload does not cover the composed bodies",
+            {"expected": sorted(selections), "received": sorted(links or [])},
+            exit_code=3,
+        )
+    for name, entry in selections.items():
+        row = links[name]
+        reads = row.get("reads") if isinstance(row, dict) else None
+        if not isinstance(row, dict) or row.get("selection") != entry["selection"]:
+            raise BridgeError(
+                "cad_link_group_payload_invalid",
+                "the link group payload echoes another selection",
+                {"body": name},
+                exit_code=3,
+            )
+        if not isinstance(reads, list) or len(reads) != 2:
+            raise BridgeError(
+                "cad_link_group_payload_invalid",
+                "the link group payload must carry two reads",
+                {"body": name},
+                exit_code=3,
+            )
+        for index, read in enumerate(reads):
+            _link_group_read_valid(name, index, read)
+        reproducibility = row.get("reproducibility")
+        if not isinstance(reproducibility, dict) or set(reproducibility) != {
+            "mass_delta_kg",
+            "com_delta_norm_m",
+            "tensor_delta_max_abs",
+        }:
+            raise BridgeError(
+                "cad_link_group_payload_invalid",
+                "the link group payload carries no reproducibility record",
+                {"body": name},
+                exit_code=3,
+            )
+        for key, value in reproducibility.items():
+            if type(value) not in (int, float) or not math.isfinite(float(value)) or float(value) < 0.0:
+                raise BridgeError(
+                    "cad_link_group_payload_invalid",
+                    "the reproducibility record is malformed",
+                    {"body": name, "field": key},
+                    exit_code=3,
+                )
+    assembly = str(payload.get("assembly") or "")
+    if document and not _same_document(assembly, str(document)):
+        raise BridgeError(
+            "capture_source_mismatch",
+            "the link group read names another document",
+            {"requested": str(document), "reported": assembly},
+            exit_code=3,
+        )
+    return {
+        "schema_version": LINK_GROUP_SCHEMA,
+        "assembly": assembly,
+        "configuration": str(payload.get("configuration") or ""),
+        "used_api": LINK_GROUP_USED_API,
+        "selection_rule": LINK_GROUP_SELECTION_RULE,
+        "links": {
+            name: {
+                "selection": list(links[name]["selection"]),
+                "reads": links[name]["reads"],
+                "reproducibility": links[name]["reproducibility"],
+            }
+            for name in selections
+        },
+    }
+
+
+def _link_group_read_valid(body: str, index: int, read: Any) -> None:
+    def invalid(field: str) -> None:
+        raise BridgeError(
+            "cad_link_group_payload_invalid",
+            "a link group read is malformed",
+            {"body": body, "read": index, "field": field},
+            exit_code=3,
+        )
+
+    if not isinstance(read, dict):
+        invalid("read")
+    mass = read.get("mass_kg")
+    if type(mass) not in (int, float) or not math.isfinite(float(mass)) or float(mass) <= 0.0:
+        invalid("mass_kg")
+    com = read.get("com_m")
+    if (
+        not isinstance(com, list)
+        or len(com) != 3
+        or any(type(value) not in (int, float) or not math.isfinite(float(value)) for value in com)
+    ):
+        invalid("com_m")
+    tensor = read.get("inertia_tensor_about_com")
+    if (
+        not isinstance(tensor, list)
+        or len(tensor) != 3
+        or any(
+            not isinstance(row, list)
+            or len(row) != 3
+            or any(type(value) not in (int, float) or not math.isfinite(float(value)) for value in row)
+            for row in tensor
+        )
+    ):
+        invalid("inertia_tensor_about_com")
+    overrides = read.get("overrides")
+    if (
+        not isinstance(overrides, dict)
+        or set(overrides) != {"OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia"}
+        or any(type(value) is not bool for value in overrides.values())
+    ):
+        invalid("overrides")
+
+
+def _top_level_record(reading: dict[str, Any]) -> dict[str, Any]:
+    """The mass_closure ``top_level`` projection of one whole-assembly reading."""
+
+    return {
+        "mass": float(reading["mass"]),
+        "com": [float(value) for value in reading["com"]],
+        "inertia": [[float(value) for value in row] for row in reading["inertia"]],
+        "reference": dict(reading.get("reference") or {}),
+    }
+
+
+def _pristine_readout_window(
+    backend: Any,
+    cfg: dict[str, Any],
+    closure: dict[str, Any],
+    selections: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Whole-assembly and direct link reads in the pristine reopen window.
+
+    Probe v4: any component-instance mass read contaminates the later direct
+    group reads and the whole-assembly read of the same session.  Probe v5:
+    closing the read-only probe session and reopening the same captured copy
+    restores the opened state bit-identically (deltas exactly zero, 61/61
+    documents).  Closing the real capture needs ``CloseAllDocuments(True)``:
+    the collected copy was opened read-write and rebuilt/recalculated, so the
+    dirty documents only release with close-without-save (native16 left 61
+    documents open with False); nothing after this window saves and freeze
+    re-hashes the post-window copy to prove no writes.  This runs after every
+    other CAD-facing step; inside the window only the two readers run, in the
+    v5-proven order (link groups first, whole assembly second), and nothing
+    else touches the reopened document.
+    """
+
+    document = str((closure or {}).get("top_level") or cfg["assembly"])
+    closer = getattr(backend, "close_all_documents", None)
+    opener = getattr(backend, "open_document", None)
+    reader = getattr(backend, "link_group_mass_properties", None)
+    if not callable(closer) or not callable(opener) or not callable(reader):
+        raise BridgeError(
+            "cad_pristine_readout_unavailable",
+            "the backend cannot reopen a pristine readout window",
+            exit_code=3,
+        )
+    closer()
+    prepare = getattr(backend, "prepare_source", None)
+    if callable(prepare):
+        prepare(document, cfg["configuration"])
+    opened = opener(document)
+    if not isinstance(opened, dict) or not _same_document(str(opened.get("path") or ""), document):
+        raise BridgeError(
+            "capture_source_mismatch",
+            "the pristine reopen named another document",
+            {
+                "requested": document,
+                "reported": opened.get("path") if isinstance(opened, dict) else opened,
+            },
+            exit_code=3,
+        )
+    payload = reader(document, {name: entry["selection"] for name, entry in selections.items()})
+    record = _link_group_record_from_payload(payload, selections, document)
+    record["readout_window"] = PRISTINE_WINDOW
+    assembly = getattr(backend, "assembly_mass_properties", None)
+    top_level = None
+    if callable(assembly):
+        try:
+            top_level = assembly(document)
+        except Exception:  # noqa: BLE001 - mirrors _mass_closure's optional whole-assembly reader
+            top_level = None
+    closer()
+    return {"top_level": top_level, "record": record}
 
 
 def _freeze_local(
@@ -1457,12 +2195,40 @@ def _freeze_local(
         write_json(staging / "raw" / "dependency_closure.json", closure)
         write_json(staging / "raw" / "coordinate_systems.json", raw["coordinate_systems"])
         write_json(staging / "raw" / "mass_properties.json", raw["mass_properties"])
+        write_json(
+            staging / "raw" / "material_provenance.json",
+            _material_provenance_record(scene, cfg),
+        )
         axis_references = _capture_axis_references(backend, cfg)
         if axis_references:
             write_json(staging / "raw" / "axis_references.json", axis_references)
-        mass_closure = _mass_closure(backend, cfg, scene, getattr(scene, "document", None))
-        if mass_closure is not None:
-            write_json(staging / "raw" / "mass_closure.json", mass_closure)
+        # Computed here so `component_context` observes exactly the walked
+        # session; `top_level` is replaced by the pristine window reading below.
+        mass_closure = _mass_closure(backend, cfg, getattr(scene, "document", None))
+        # Effective instance readings (overridden instances, sheet-only
+        # fallback) come from the SAME component-context traversal; they are
+        # injected into the scene notes and the raw scene file is rewritten so
+        # notes, canonical record and closure rows carry exactly the same
+        # reading.  The canonical record is written for every capture.
+        backend_readings: dict[str, Any] = {}
+        cache_error: dict[str, Any] | None = None
+        collector = getattr(backend, "effective_instance_readings", None)
+        if callable(collector):
+            try:
+                backend_readings = collector()
+            except Exception as error:  # noqa: BLE001 - preserved as evidence, never fatal
+                cache_error = {
+                    "reason": str(getattr(error, "code", "") or type(error).__name__),
+                    "message": " ".join(str(error).split())[:200],
+                }
+        if cache_error is not None:
+            scene.notes["effective_instances_error"] = cache_error
+        scene.notes["effective_instances"] = backend_readings
+        write_json(staging / "raw" / "scene_raw.json", _raw_scene_payload(scene, cfg, staging / "source"))
+        write_json(
+            staging / "raw" / "effective_instances.json",
+            _effective_instance_record(scene, cfg, backend_readings, cache_error),
+        )
         # Declared author decisions are recorded as declared input, never as CAD
         # readings: freeze keeps the snapshot raw and load_scene applies them.
         write_json(
@@ -1499,8 +2265,33 @@ def _freeze_local(
                 exit_code=3,
             )
 
-        scene_payload = build_scene(cfg, scene, geometry_entries)
-        write_json(staging / "scene.json", scene_payload)
+        # Pristine readout window: every CAD-facing step above may have
+        # contaminated the session's direct group reads (probe v4), so close
+        # all documents and reopen the captured copy; the whole-assembly read
+        # and all direct link-group reads then come from a never-touched window
+        # (probe v5: close+reopen restores the opened state bit-identically).
+        # This is the last CAD activity of the capture; only file-level steps
+        # follow.  The record selections are the late composition of the walked
+        # per-instance evidence and the payload echo must match them exactly.
+        stage = "pristine_readout"
+        selections = _link_group_selections(cfg, scene, backend_readings)
+        window = _pristine_readout_window(backend, cfg, closure, selections)
+        if isinstance(mass_closure, dict) and mass_closure.get("status") == "recorded":
+            if not isinstance(window["top_level"], dict):
+                raise BridgeError(
+                    "cad_pristine_readout_unavailable",
+                    "the reopened window produced no whole-assembly reading",
+                    exit_code=3,
+                )
+            mass_closure["top_level"] = _top_level_record(window["top_level"])
+            mass_closure["top_level"]["reference"]["readout_window"] = PRISTINE_WINDOW
+        if mass_closure is not None:
+            write_json(staging / "raw" / "mass_closure.json", mass_closure)
+        write_json(staging / "raw" / "link_group_mass_properties.json", window["record"])
+
+        # Scene construction is portable work. Seal its exact inputs here;
+        # Linux derives the scene without rewriting this native snapshot.
+        write_json(staging / "raw" / "source_config.json", cfg)
 
         source_inputs = _source_inputs(cfg, closure)
         identity = {

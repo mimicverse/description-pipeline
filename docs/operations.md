@@ -10,8 +10,9 @@ Follow the [mechanical specification](mechanical-handoff-spec.md). Establish
 scope, names, rigid connections, motion, datums, zero, signed directions,
 limits, materials and component identities in the native engineering model.
 
-Resolve drive specifications and independent mass/dimension budgets through
-CAD references to approved, versioned records in the platform's controlled library.
+Resolve drive specifications, and independent mass/dimension budgets when
+supplied, through CAD references to approved, versioned records in the platform's
+controlled library.
 Mechanical engineers maintain these references in SolidWorks; copying a record
 into the submitted folder does not override the library. Responsible engineers confirm
 facts that automatic consistency checks cannot establish, including actual
@@ -129,7 +130,26 @@ publish the review PR. Each step shows its **Input**, **Input QC**, **Output** a
 Failures show the affected object and next action first; file hashes and raw
 evidence are available in collapsed details. Without a verified URDF, the report
 uses the available workspace instead of reserving an empty preview pane.
+Warnings appear beside the stage results and never count as passes; the report
+marks the ones that need engineering attention, informational warnings (for
+example an unspecified optional design budget) create no work, and a completed
+stage can retain warnings. After a failed independent verification the retained
+artifacts stay viewable only as an explicitly unverified diagnostic preview with
+the failing checks and warnings; it never asserts verification and cannot be
+published.
 Generation-input inspection belongs to capture; it is not another operator step.
+
+During native work, the activity card shows the operation reported by the worker,
+the current CAD object, available item counts and the last progress update. Recent
+activity explains the work between boundary checks. A check count such as **1/3**
+means one of three checks passed; it is not a completion percentage. Item counts
+cover only the named operation and do not predict the remaining run time.
+
+Queued work, reported activity and a finished run have distinct states. If no new
+activity arrives, the page shows how old the last update is; successful polling
+does not prove that CAD is advancing, and silence does not prove it has stalled.
+Runs without recorded activity explicitly report that detailed progress is
+unavailable. A failed run retains its last activity and check diagnostics.
 
 A completed step requires its boundary checks to pass. Failed checks retain their
 diagnostics, and later steps show blocked. Checks whose prerequisites failed show
@@ -141,6 +161,12 @@ Unsupported items never become implicit passes.
 The detailed delivery receipt is `reports/stages.json`. Maintainers can also
 inspect native results in Airflow's `wait_for_job` task logs and portable results in
 the generation, verification and publication task logs; see [deployment maintenance](deployment.md#maintenance).
+Every delivered and failed run additionally carries the structural-team report as
+`reports/structural-team.md` (readable findings) and
+`reports/structural-team.json` (structured findings and parameters); it is
+rendered on Linux from the sealed receipt and evidence, the operator page lists
+those two paths, and a failed run keeps the same files under the run's retained
+evidence.
 
 An engineer cannot override a failed automatic check by signing a review.
 Existing approvals may be reused only while the relevant structure,
@@ -152,12 +178,19 @@ effects in the matching PR or controlled record.
 Use the affected CAD object, mate, configuration, property or specification
 reference shown in the result to locate the problem.
 
+Finding counts describe recorded observations, not a count of defective parts.
+One unresolved connection or ownership rule can affect many instances. Review
+the evidence before deciding whether the correction belongs in CAD or the reader;
+an unsupported native pattern is not proof of a mechanical design error.
+
 | Finding | Correction |
 |---|---|
 | Dependency, configuration or saved-state error | Repair and save the native engineering package |
-| Ambiguous body, joint, name or frame | Correct native connections, approved names and reference geometry |
-| Zero, direction, limit or drive disagreement | Correct its mechanical definition or controlled specification |
-| Material, mass or inertia disagreement | Correct material assignments, scope or the documented physical source |
+| Administrative metadata missing (hardware ID, revision, owner, control record) | Publication readiness only: measurement, capture and inspection continue; record the authored facts at their source - never invent values, and a neutral technical name is not identity |
+| Ambiguous body, joint, name or frame | Check native evidence coverage, then correct the reader or the unresolved engineering definition |
+| Zero, direction, limit or drive disagreement | Correct its mechanical definition or controlled specification; authored zero-width ranges and zero drives stay stage warnings until a usable controlled record is supplied - never fill defaults |
+| Unowned occurrence (stage warning) | Bind the occurrence in the declaration or correct the native structure; qualification still requires complete coverage and exact whole-CAD mass equality - never exclude an instance or its mass to clear the warning |
+| Material, mass or inertia disagreement | Missing explicit material assignment alone is a retained warning (CAD-measured values preserved, no verified-material claim); correct the assignment for physical qualification. A material/mass/inertia disagreement with reviewed evidence still blocks - correct scope or the documented physical source |
 | Independent verification disagreement | Trace the native evidence and generation rule; preserve the failed diagnostics |
 | Infrastructure error | Restore the service; continue transport or rerun from the earliest valid engineering step shown |
 | PR error | Restore publication access and rerun from publication using the retained verified delivery |

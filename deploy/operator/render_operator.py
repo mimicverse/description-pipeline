@@ -210,6 +210,7 @@ def ensure_portal_config(state: Path, resolved: dict[str, str]) -> Path:
         rendered = rendered.replace(token, value)
     rendered = rendered.replace('"@PIPELINE_STORE_ROOT@"', json.dumps(resolved["PIPELINE_STORE_ROOT"]))
     rendered = rendered.replace("@MODEL_REPOSITORIES_JSON@", resolved["MODEL_REPOSITORIES_JSON"])
+    rendered = rendered.replace("@DISCOVERY_SETTINGS_JSON@", resolved["DISCOVERY_SETTINGS_JSON"])
     write_private(target, rendered)
     return target
 
@@ -318,6 +319,30 @@ def main() -> int:
             for label, other in [("capture store", store_root), ("handoff intake", handoff_root), *runtime_paths]:
                 if directory.is_relative_to(other) or other.is_relative_to(directory):
                     die(f"Model checkout must not overlap {label}")
+    discovery = {}
+    discovery_file = values.get("DISCOVERY_SETTINGS_FILE", "")
+    if discovery_file:
+        path = private_file(discovery_file, "DISCOVERY_SETTINGS_FILE")
+        try:
+            discovery = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            die(f"DISCOVERY_SETTINGS_FILE is unreadable: {error}")
+        if not isinstance(discovery, dict) or set(discovery) - {"record_roots", "frozen_names_file"}:
+            die("DISCOVERY_SETTINGS_FILE accepts only record_roots and frozen_names_file")
+        records = discovery.get("record_roots", [])
+        if not isinstance(records, list) or any(not isinstance(root, str) for root in records):
+            die("discovery record_roots must be a list of absolute Linux directories")
+        for root in records:
+            directory = private_dir(root, "controlled-record root")
+            if any(parent.is_symlink() for parent in directory.parents):
+                die("Controlled-record roots cannot traverse a symlink")
+        if "frozen_names_file" in discovery:
+            registry = discovery["frozen_names_file"]
+            if not isinstance(registry, str):
+                die("frozen_names_file must be an absolute Linux file path")
+            path = private_dir(registry, "frozen-name registry")
+            if any(parent.is_symlink() for parent in path.parents):
+                die("Frozen-name registry cannot traverse a symlink")
     nginx_bin = values.get("NGINX_BIN", "/usr/sbin/nginx")
     if args.check_paths:
         for path, where in ((Path(values["PIPELINE_WHEEL"]), "PIPELINE_WHEEL"), (Path(nginx_bin), "NGINX_BIN")):
@@ -352,6 +377,7 @@ def main() -> int:
         SOLIDWORKS_HANDOFF_ROOT=str(handoff_root),
         PIPELINE_STORE_ROOT=str(store_root),
         MODEL_REPOSITORIES_JSON=json.dumps(repositories, sort_keys=True),
+        DISCOVERY_SETTINGS_JSON=json.dumps(discovery, sort_keys=True),
         ENDPOINT_TOKEN_FILE=values.get("ENDPOINT_TOKEN_FILE", str(state / "secrets" / "endpoint.token")),
         NGINX_BIN=nginx_bin,
         FEISHU_APP_SECRET_FILE=feishu_secret,
@@ -460,7 +486,6 @@ def main() -> int:
         return 1 if drift else 0
 
     if args.json:
-
         print(json.dumps(dict(sorted(resolved.items())), indent=2))
     else:
         print(f"OPERATOR_URL={resolved['OPERATOR_URL']}")

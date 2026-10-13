@@ -1,7 +1,7 @@
 # Quality specification
 
 Report: `solidworks-to-urdf.quality/v1`. Pipeline ID: `solidworks-to-urdf`.
-All required gates must pass before automatic publication. Missing required evidence is
+All required integrity and selected-model consistency gates must pass before automatic publication. Missing required evidence is
 a failure. There is no public bypass or waiver switch.
 
 Native SolidWorks engineering is the input. Generated YAML is an internal
@@ -19,6 +19,7 @@ frozen evidence and actual files rather than trusting earlier success flags.
 | Step | `not_run`, `running`, `completed`, `failed`, `blocked`; completed requires every boundary check to pass |
 | Automatic check | `passed`, `failed`, `not_run`; missing prerequisites leave a required check unexecuted and prevent qualification |
 | Unsupported check | `unsupported`, with its scope and responsible stage stated; it is never an automatic pass |
+| Stage warning | `warning`: a nonblocking observation with its affected objects and qualification impact. It never substitutes for a required check. An unspecified optional budget needs no manual confirmation. |
 | Engineering review | `not_ready` before automatic verification completes, then `external_review`: only facts outside automatic coverage; the portal does not read or infer approval status from the matching PR or controlled records |
 
 `quality.json` records the required gate inventory and every executed or unexecuted
@@ -30,7 +31,10 @@ Passed automatic checks do not require manual repetition. Failed checks require
 correction, not human override. Applicable approvals of unchanged engineering
 facts can be reused; changed facts and their effects need review.
 Each receipt declares its `execution_scope`: Windows covers the first three
-stages and Linux covers generation, verification and publication. A complete
+stages, including ingestion and derivation of the saved exporter declaration,
+and runs no URDF generation, MuJoCo verification or Git operations; Linux
+covers generation, verification and publication, including an independent
+re-decode of the sealed declaration. A complete
 Airflow run binds both; maintenance runs cover only the stages they execute ([operations](operations.md#6-independent-review-and-recovery));
 unexecuted native stages are shown as out of scope rather than qualified.
 
@@ -41,6 +45,22 @@ native tool identity and native stage receipt. Linux admits this bundle only
 when its closed inventory, every file hash, run ID, handoff digest and selected
 assembly agree with the request. Both hosts must use the same tool source release;
 their dependency records identify their different execution roles.
+
+The sealed native bytes are the captured inputs: readings, configuration and
+meshes travel as captured (`raw/scene_raw.json`, `raw/source_config.json`,
+evidence and mesh files). Scene construction, closure comparison math, mesh
+analysis and the structural-team report all run on Linux; the Windows worker
+only performs the native reads and geometry export plus identity, serialization
+and transfer — it renders no report and stores no derived scene.
+
+When present, the saved exporter declaration payload and its PID resolution rows
+travel with the sealed bundle. The declared structure is derived from the raw
+native record during Linux derivation; Linux verification re-decodes the sealed
+bytes independently and checks the declared topology and native geometry. Saved-pose mate restrictions
+remain diagnostics; conflicting authored operating limits still fail. Authored limits are preserved verbatim: a
+zero-width range or a zero effort/velocity is a stage warning that is kept for
+capture and generation and never qualifies motion. Stored meshes, inertias and
+non-customized origins are regenerated from native CAD and are never adopted.
 
 `reports/native-stages.json` preserves the native receipt. The final
 `reports/stages.json` records the full run. Native completion does not grant
@@ -55,20 +75,21 @@ Implementation paths below are relative to `src/description_pipeline/`.
 |---|---|---|
 | Derived-input contract | Reinspect generated YAML, native provenance, controlled records, inventories and generated revision | `sources/solidworks/input.py`, `revision.py` |
 | Native definition | Independently reconstruct membership, adjacency, motion, names, frames and limits from native observations; required gate `source.native_discovery` | `verification/native_discovery.py` |
+| Declared native facts | Exporter declaration ingested at discovery and independently re-decoded at verification; declared membership, topology, frames, axes and limits reconciled with native observations and with the generated source (`discovery.declarations`); contradictions fail closed | `sources/solidworks/exporter.py`, `verification/v14_declarations.py`, `verification/native_declarations.py` |
 | Native source | Native SolidWorks evidence, qualified API/build, matching collection identity and environment | `verification/solidworks_urdf.py` |
-| Dependency closure | No unresolved reference; original CAD belongs to the handoff; collected-copy hashes and configuration agree | `verification/solidworks_urdf.py` |
-| Occurrence coverage | Every native occurrence belongs to exactly one body; identity survives normalization | `verification/solidworks_urdf.py` |
+| Dependency closure | No unresolved reference: the full uploaded folder is staged, the native engine resolves its references, and the closure seals only when every engine-reported binding lies inside the staged root and matches the upload index — or is an engine-materialized import admitted only through the sealed owner/occurrence evidence matched to its staged source by native identity (never by temporary path or file name); a missing or outside-stage reference fails the run after resolution (closure admission over reported bindings, not an OS sandbox); original CAD belongs to the sealed selection; collected-copy hashes and configuration agree | `verification/solidworks_urdf.py` |
+| Occurrence coverage | Every selected native occurrence belongs to exactly one body, matching the native declarations and independently proven rigid attachments; unassigned occurrences remain explicit warnings with their measured mass accounted separately. Missing explicit material assignments retain the measured CAD mass/centre-of-mass/inertia without claiming verified material; identity survives normalization | `verification/solidworks_urdf.py` |
 | Coordinates | Finite SI homogeneous transforms, orthonormal right-handed bases, CAD-derived body/joint/reference frames | `verification/solidworks_urdf.py` |
-| Shaft alignment | Numeric cylinder line, stable native identity, origin on shaft and axis collinearity | `verification/solidworks_urdf.py` |
+| Shaft alignment | Numeric shaft line from the independently re-read reference axis or cylindrical interface, stable native identity, origin on shaft and axis collinearity | `verification/solidworks_urdf.py` |
 | Names and topology | Unique snake_case names; exactly one `base_link`; connected acyclic tree; input/model/XML entity agreement | `verification/solidworks_urdf.py` |
 | Joint semantics | Exact type, parent/child, signed axis and limits; evidence bound to archived inputs | `verification/solidworks_urdf.py` |
-| Physical authority | Explicit material coverage or complete documented masses; no implicit density or unknown convention | `verification/solidworks_physics.py` |
-| Mass, COM and tensor | Independently rotate/translate raw part readings, apply the parallel-axis theorem and convert to each CAD link datum | `verification/solidworks_physics.py` |
-| Assembly closure | Independent part sum agrees with full whole-assembly mass/COM/tensor and complete component-context readings | `verification/solidworks_physics.py` |
-| Whole-CAD mass equality | Delivered URDF XML inertial mass sum equals the bound full whole-assembly reading; missing or invalid whole evidence fails; masses are never normalized | `verification/solidworks_physics.py` |
+| Physical authority | Native numerical consistency for the recorded CAD values; missing explicit material coverage is warning-level with the measured values preserved and no verified-material claim — real material, density and mass boundaries remain external engineering confirmation; no implicit density or unknown convention is ever evidence | `verification/solidworks_physics.py` |
+| Mass, COM and tensor | The native one-shot `IMassProperty2` read over each body's full selected component set is the authoritative link mass source: the verifier recomputes the selection independently and requires it to equal the sealed record, the recorded two-read pair must repeat (≤1e-9 kg, ≤5e-7 m, ≤1e-6 relative), and the model binds to read 1 by the exact assembly→link transform (mass 1e-12 relative, COM 1e-9 m, tensor 1e-9 relative) | `verification/solidworks_physics.py` |
+| Assembly closure | The sum of the direct link reads plus the independently measured unassigned mass is checked against the full whole-assembly mass (exactly, 1e-12 kg) while the COM/tensor gaps to the whole reading are recorded within the evidence-bounded 1e-3 m / 1e-2 relative; the complete component-context readings stay bound and the per-instance recombination remains a non-blocking partition audit | `verification/solidworks_physics.py` |
+| Native mass accounting | Delivered URDF mass plus independently measured, explicitly unassigned CAD mass equals the bound whole-assembly reading; missing evidence or unexplained gaps fail; incomplete whole coverage remains a warning and masses are never normalized | `verification/solidworks_physics.py` |
 | Inertia validity | Finite positive mass; positive principal inertia; triangle inequality; XML full tensor agrees with raw-verified model | `verification/solidworks_urdf.py` |
-| Geometry | Native mesh coverage, exact file hashes, SI scale, finite nonempty triangles, CAD placement of actual vertices | `verification/solidworks_urdf.py`, `geometry/stl.py` |
-| Physical plausibility | COM within body bounds; inertia within geometry radius bound; total mass and largest whole-robot extent within declared intervals | `verification/solidworks_urdf.py` |
+| Geometry | Native mesh coverage, SI scale, finite nonempty triangles and CAD placement of actual vertices. Meshes above 199999 triangles use ordered lossless parts; the verifier checks every original triangle record, header, count, pose and scale | `verification/solidworks_urdf.py`, `geometry/stl.py` |
+| Physical plausibility | COM within body bounds; inertia within geometry radius bound; total mass and largest whole-robot extent within declared intervals when a design budget is supplied; a missing budget applies no acceptance intervals and is never manufactured from measured values, while an invalid supplied record fails | `verification/solidworks_urdf.py` |
 | Consumer loading | MuJoCo loads delivered URDF and meshes and retains expected bodies and movable joints | `verification/solidworks_urdf.py` |
 | Report binding | Recomputed deterministic report equals the saved report and bound file subject | `delivery.py`, `verification/solidworks_urdf.py` |
 | Publication | Reverify copied output and actual Git blob bytes; revision succession; fast-forward push; exact PR head/base | `repository/urdf_pr.py` |
@@ -99,8 +120,48 @@ not establish the convention.
 
 Each reading declares its scope, axes, COM reference, SI-unit setting and
 override flags. Per-part readings use part-document axes; whole-assembly
-readings use assembly-document axes. Missing declarations or effective
-mass/COM/inertia overrides block publication.
+readings use assembly-document axes. Missing declarations block publication. A
+CAD-authored effective instance — an overridden instance, or a surface-only
+component whose part document cannot answer mass questions — is admitted as a
+non-blocking warning that keeps its exact scope, axes and override flags: a
+parent override replaces its subtree only within one rigid body and is never
+distributed to moving links, the whole mass/COM/inertia closure must still hold
+exactly, and the report states plainly that the value is CAD-authored, not
+geometry-derived and not independently physically qualified.
+A flagless leaf instance whose assembly-context measurement differs from its
+part-document measurement is reported the same way, with both measurements kept
+verbatim and the difference recorded as basis `cad_assembly_instance_measurement`
+with an unproven cause — never rescaled, substituted or silently qualified.
+Each body additionally carries the native one-shot direct read over its full
+selected component set (`evidence/raw/link_group_mass_properties.json`): the
+verifier recomputes that selection set independently (top-most override
+providers plus uncovered leaves), the recorded repeat pair is reproducibility
+evidence, and the delivered link inertial is generated from read 1. The
+per-instance recombination is retained as a recorded, non-blocking partition
+gap so the intrinsic difference between CAD's one selection and partitioned
+reads stays visible instead of being hidden by the switch.
+The derived selection accounting is projected as warnings: every unassigned
+occurrence is reported with its native recorded mass, and the native
+whole-vs-selected mass gap is reported as a gap with its qualification withheld
+— never as missing input bytes or a pipeline failure. Exact selected-set
+accounting is distinct from full-assembly coverage qualification: the generated
+URDF's native-selected mass plus the independently measured unassigned mass must
+close to the whole assembly within 1e-12 kg (no exact-zero comparison, no
+scaling and no invented attachment), while the authoritative declared model
+governs coverage and may legitimately leave an explicit unassigned occurrence
+warning. A residual beyond that tolerance, an unexplained gap, an unreadable
+record, or a selection record outside the schema still fails closed. Reference exports may be used for comparison only. Their meshes, physical
+values and naming aliases are never pipeline inputs; the saved CAD remains the
+source of generated facts.
+A sheet face that the native tessellation returns with zero triangles and zero
+facets while the native record still measures a positive area is reported as the
+non-blocking warning `cad_sheet_face_untessellated` (per component entry,
+naming the component and face), stating the native area measurement as recorded
+and the absence of facets; the report never calls it zero-area, and the
+completeness and usability of the surface geometry remain independently
+unqualified. All other native triangles are retained unchanged; malformed
+geometry metadata and solid geometry errors fail closed, while a sheet face
+without facets is reported as the precise facts above.
 
 Native capture rebuilds the collected read-only assembly in its owned session
 before measurements. This refreshes assembly caches, including mass properties;
@@ -164,6 +225,11 @@ Git storage and checkout, and records its hash in the publication receipt.
 Effective newline, filter or encoding overrides block publication; the native
 subject remains unchanged.
 
+A retained failed-verification checkpoint may be served as an explicitly
+unverified diagnostic preview carrying its failing checks and warnings; it never
+asserts verification and is forbidden from publication. Generation success alone
+is not verification.
+
 ## Scope of acceptance
 
 A pass establishes the listed consistency, physical arithmetic, geometry and
@@ -172,6 +238,34 @@ or degrees of freedom, physical zero or positive motion, real mechanical limits,
 drive capability, material correctness or full-range clearance. Those facts
 require engineering confirmation. Simulation, training and control require
 their own acceptance evidence.
+
+Unassigned rigid ownership, explicit zero parameters and missing explicit
+material assignments are stage warnings so generation can continue; material
+warnings retain the measured CAD mass/centre-of-mass/inertia and never claim
+verified material; exact whole-CAD mass equality and usable motion remain
+strict independent qualification checks, and conflicting comparable authored
+operating limits still fail.
+
+Administrative metadata (hardware ID, revision, owner, control record) is a
+publication-readiness requirement, not a measurement blocker: capture,
+generation and inspection continue when it is absent, the raw record keeps the
+absence, and no revision, owner, hardware ID or neutral technical name is
+invented to fill it.
+
+Stage warnings never substitute for acceptance: they stay visible with their
+objects, and the warned facts (material coverage, usable ranges or drives) are
+not verified until the corresponding independent checks pass; a material
+warning must never be reported as verified material, and numeric evidence that
+is unreadable, non-positive or non-physical still fails closed. Missing
+required evidence remains a failure.
+
+Source integrity is required before evidence can be used. Every imported CAD
+occurrence must bind to a file in the frozen handoff — or, for an
+engine-materialized import, to the sealed closure's owner/occurrence evidence
+matched to that staged source by native identity. A temporary document or
+visible cached geometry without that sealed binding, and any external source,
+remain errors, with the affected occurrences and reference paths retained in
+diagnostics.
 
 Mechanical review owns input meaning and measured authority. v1 exports visual
 meshes and physical properties; collision simplification, contact behavior,
@@ -205,8 +299,11 @@ Both entities require usable geometry; a missing entity cannot supply a
 constraint. Supporting an edge for mate reconstruction does not qualify it as
 the independently reread cylindrical interface required for a joint axis.
 
-Capture requires a rereadable cylindrical interface for each motion axis.
-Named axes alone do not qualify this capture path. Owned `CS_<link>` datums
+Capture requires a rereadable native axis reference for each motion axis: a
+named reference axis bound by the saved declaration's axis name, or a rereadable
+cylindrical interface on the reconstruction path. Serialized axis numbers alone
+never qualify. Explicit declarations retain their exact named frames and signed
+axes. On the inferred path, owned `CS_<link>` datums
 identify body frames and `CS_base_link` the root; an optional JCS must match its
 child body frame and owner. Native `axis_sign` supplies the confirmed positive
 direction. Installation, TCP and sensor datums retain their interface names and
@@ -218,7 +315,11 @@ and engineering annotations. Comparing generated YAML with a model does not
 establish these facts. Controlled physical and drive records must be fixed,
 retrievable and applicable to the engineering revision.
 
-Effective native mass, COM and inertia overrides are rejected. Complete physical
-source records remain subject to independent checks. The
+Effective native mass, COM and inertia overrides are carried as qualified
+warnings, not rejections: their scope, axes and override flags are recorded, a
+parent override replaces its subtree only within one rigid body without
+distribution to moving links, and the whole mass/COM/inertia closure is checked
+strictly. No physical accuracy is claimed; complete physical source records
+remain subject to independent checks. The
 [per-item responsibility table](mechanical-handoff-spec.md#111-自动检查与工程师确认)
 separates automatic coverage from engineer-confirmed physical meaning.

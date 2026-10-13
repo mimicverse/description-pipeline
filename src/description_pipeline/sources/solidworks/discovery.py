@@ -23,8 +23,14 @@ the backend and re-read by the independent verifier:
     (``system``/``reference``), ``delivery_configuration``, ``main_assembly``
     (package-relative), ``robot_name``.
 ``components``
-    ``{name2, document, configuration, fixed, suppressed, lightweight}`` for
-    every component occurrence.
+    ``{name2, document, configuration, fixed, suppressed, lightweight,
+    suppression_state}`` for every component occurrence; ``suppression_state``
+    is the raw documented ``GetSuppression2`` integer (0 suppressed, 1
+    lightweight, 2 fully resolved, 3 resolved, 4 fully lightweight).  State 5
+    (internal-ID mismatch) and any missing, boolean or undocumented value is
+    refused, and both emitted flags are required booleans that must agree with
+    the state (``suppressed == (state == 0)``, ``lightweight == (state in
+    {1, 4})``).
 ``mates``
     ``{name, type, entities: [{component, feature, face_index, cylinder}],
     alignment, limits: {lower, upper, unit}, suppressed}`` with each cylinder
@@ -67,6 +73,7 @@ import yaml
 from ...io import PipelineError, confined, digest, inventory, parse_data
 from .jsonio import write_json
 from .errors import CadError
+from .exporter import ExporterDeclarationError, decode_exporter_v14
 from .revision import package_inventory, seal_revision
 
 DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v1"
@@ -91,6 +98,8 @@ AXIS_OFFSET_TOL_M = 5e-5
 CONTROL_SYSTEMS = ("git", "pdm", "handoff")
 
 _SNAKE = re.compile(r"^[a-z][a-z0-9_]*$")
+_IDENTITY_ID = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
+_GIT_COMMIT = re.compile(r"\b[0-9a-f]{40}(?:[0-9a-f]{24})?\b")
 
 #: Datum name spaces the spec recognises: link frames, tool/sensor interfaces
 #: and joint frames.  A datum is ``<PREFIX>_<snake_case>``: the suffix must be
@@ -102,8 +111,8 @@ JCS_PREFIX = "JCS_"
 _TOL = 1e-6
 
 #: Mate types whose constraint rows this module can reconstruct from recorded
-#: entity geometry.  Everything else blocks with an object finding; a mate type
-#: this table does not support is never turned into a rigid connection.
+#: entity geometry. Unknown types never establish rigid membership; declaration
+#: mode retains their rejection as a diagnostic without vetoing the declared tree.
 SUPPORTED_MATES = (
     "coincident",
     "concentric",
@@ -158,6 +167,12 @@ class PreparedPackage:
 
 def _text(value: Any) -> bool:
     return isinstance(value, str) and value.strip() != ""
+
+
+def _authored_text(value: Any) -> bool:
+    """Non-empty text without control characters, as the revision manifest requires."""
+
+    return isinstance(value, str) and value.strip() != "" and not any(ord(c) < 32 or ord(c) == 127 for c in value)
 
 
 def _snake(value: Any) -> str | None:
@@ -439,8 +454,9 @@ def _same_geometry(kind: str, recorded: dict, localized: dict) -> bool:
 
     if kind == "plane":
         recorded_normal, localized_normal = _unit_vector(recorded.get("normal")), _unit_vector(localized.get("normal"))
-        recorded_point, localized_point = _finite_vector(recorded.get("point"), 3), _finite_vector(
-            localized.get("point"), 3
+        recorded_point, localized_point = (
+            _finite_vector(recorded.get("point"), 3),
+            _finite_vector(localized.get("point"), 3),
         )
         if None in (recorded_normal, localized_normal, recorded_point, localized_point):
             return False
@@ -449,11 +465,13 @@ def _same_geometry(kind: str, recorded: dict, localized: dict) -> bool:
             return False
         return plane_offset(localized_point, recorded_point, recorded_normal) <= AXIS_OFFSET_TOL_M
     if kind in {"line", "cylinder"}:
-        recorded_direction, localized_direction = _unit_vector(recorded.get("direction")), _unit_vector(
-            localized.get("direction")
+        recorded_direction, localized_direction = (
+            _unit_vector(recorded.get("direction")),
+            _unit_vector(localized.get("direction")),
         )
-        recorded_point, localized_point = _finite_vector(recorded.get("point"), 3), _finite_vector(
-            localized.get("point"), 3
+        recorded_point, localized_point = (
+            _finite_vector(recorded.get("point"), 3),
+            _finite_vector(localized.get("point"), 3),
         )
         if None in (recorded_direction, localized_direction, recorded_point, localized_point):
             return False
@@ -530,9 +548,7 @@ def _entity_geometry_view(entity: dict, findings: list[dict], obj: str) -> dict 
     if not isinstance(reference, dict):
         if usable_flat:
             return view
-        findings.append(
-            _finding("discovery.mate_entities_unsupported", obj, "mate entity reference is not an object")
-        )
+        findings.append(_finding("discovery.mate_entities_unsupported", obj, "mate entity reference is not an object"))
         return None
     if reference.get("error") is not None:
         # A failed decode cannot create new evidence; recorded face evidence stays usable.
@@ -676,9 +692,8 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
 
     Entity geometry is recorded in its component frame and transformed here
     with that component's occurrence transform, so translation and rotation
-    are coupled through the real entity points.  ``None`` means the mate is
-    outside the supported scope and is blocked, never guessed: an unknown mate
-    must not become a rigid connection.
+    are coupled through the real entity points. ``None`` means the mate supplies
+    no usable rows: an unknown mate must not become a rigid connection.
     """
 
     kind = str(mate.get("type") or "").strip().lower()
@@ -825,6 +840,23 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
             )
             return None
 
+    def concentric_point_of(entity: dict):
+        """A *pure* point reference for a point-on-axis concentric mate, or ``None``.
+
+        Only a validated point view qualifies — a bare recorded point or a point
+        that already passed the component-local localized-provenance checks.
+        Planes, lines, cylinders and circles never do, so the axis of the relation
+        can only ever come from the other entity's recorded cylinder/circular-edge
+        evidence; the point's own ``EntityParams`` contribute no direction and no
+        radius.  An unusable point frame keeps failing closed through ``point_of``.
+        """
+
+        if any(isinstance(entity.get(shape), dict) for shape in ("plane", "cylinder", "circle", "line")):
+            return None
+        if not isinstance(entity.get("point"), (list, tuple)):
+            return None
+        return point_of(entity)
+
     basis_x = [1.0, 0.0, 0.0]
     basis_y = [0.0, 1.0, 0.0]
     basis_z = [0.0, 0.0, 1.0]
@@ -843,14 +875,39 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
         left = axial_geometry_of(first)
         right = axial_geometry_of(second)
         if left is None or right is None:
+            if (left is None) != (right is None):
+                # One recorded axis plus one pure point reference is a point-on-axis
+                # relation, not an axis alignment: the solved state must already place
+                # the point on the axis, and the relation removes exactly the two
+                # translations perpendicular to the axis.  The constraint rows are the
+                # point's velocity projections applied AT the recorded point, so the
+                # angular moment arms (point x direction) stay in the twist convention
+                # used by this module ([translation, rotation] at the assembly origin)
+                # — a displaced point is never reduced to origin translations.
+                axis_geometry = right if left is None else left
+                point_entity = first if left is None else second
+                point = concentric_point_of(point_entity)
+                if point is not None:
+                    offset = [point[index] - axis_geometry[0][index] for index in range(3)]
+                    along = _dot(offset, axis_geometry[1])
+                    radial = [offset[index] - along * axis_geometry[1][index] for index in range(3)]
+                    radial_gap = math.sqrt(_dot(radial, radial))
+                    if radial_gap > AXIS_OFFSET_TOL_M:
+                        return fail(
+                            "discovery.mate_geometry_mismatch",
+                            "solved concentric point is off the recorded axis",
+                            {"radial_gap_m": radial_gap, "tolerance_m": AXIS_OFFSET_TOL_M},
+                        )
+                    rows = [_translation_row(direction, point) for direction in _orthogonal_basis(axis_geometry[1])]
+                    # No shaft selector and no joint: point-on-axis is a two-row
+                    # relation, never a four-row axis alignment.
+                    return {"rows": rows, "limits": limits, "axis": None, "point": point, "entity": None}
             return fail(
                 "discovery.mate_entities_unsupported",
                 "concentric mate needs two recorded cylinders or circular edges",
             )
         if abs(abs(_dot(left[1], right[1])) - 1.0) > _TOL:
-            return fail(
-                "discovery.mate_geometry_mismatch", "concentric mate axes are not parallel in the solved state"
-            )
+            return fail("discovery.mate_geometry_mismatch", "concentric mate axes are not parallel in the solved state")
         delta = [right[0][index] - left[0][index] for index in range(3)]
         along = _dot(delta, left[1])
         radial = [delta[index] - along * left[1][index] for index in range(3)]
@@ -865,6 +922,11 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
         basis = _orthogonal_basis(axis)
         rows = [_translation_row(direction, left[0]) for direction in basis]
         rows += [_rotation_row(direction) for direction in basis]
+        # The documented concentric rotation lock removes the spin only.
+        # Axial translation remains free until another native mate constrains it.
+        if (mate.get("lock_rotation") is True
+                and mate.get("lock_rotation_api") == "IConcentricMateFeatureData.LockRotation"):
+            rows.append(_rotation_row(axis))
         # Rows may be reconstructed from a circular edge, but shaft evidence is
         # only ever an actual cylindrical face: a circle normal can be flipped
         # against the vendor axis, and a circle carries no cylinder contract.
@@ -927,6 +989,7 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
                 "point": center,
                 "entity": None,
             }
+
         def circle_plane_rows(circle_entity: dict, plane_entity: dict):
             # A circular edge coincident with a plane lies in that plane: the
             # row model locks the same alignment and position as plane-plane.
@@ -936,9 +999,7 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
                 return None
             centre, normal = geometry
             if abs(abs(_dot(normal, plane[1])) - 1.0) > _TOL:
-                return fail(
-                    "discovery.mate_geometry_mismatch", "solved coincident circle and plane are not parallel"
-                )
+                return fail("discovery.mate_geometry_mismatch", "solved coincident circle and plane are not parallel")
             direction = normal if _dot(normal, plane[1]) >= 0 else [-value for value in normal]
             separation = abs(_dot([centre[index] - plane[0][index] for index in range(3)], plane[1]))
             if separation > AXIS_OFFSET_TOL_M:
@@ -967,9 +1028,7 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
             point, direction = line
             normal = plane[1]
             if abs(_dot(direction, normal)) > _TOL:
-                return fail(
-                    "discovery.mate_geometry_mismatch", "solved coincident line and plane are not coplanar"
-                )
+                return fail("discovery.mate_geometry_mismatch", "solved coincident line and plane are not coplanar")
             separation = abs(_dot([point[index] - plane[0][index] for index in range(3)], normal))
             if separation > AXIS_OFFSET_TOL_M:
                 return fail(
@@ -1096,23 +1155,17 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
                 return fail("discovery.mate_entities_unsupported", "parallel mate entities carry no direction")
             direction, normal = line[1], plane[1]
             if abs(_dot(direction, normal)) > _TOL:
-                return fail(
-                    "discovery.mate_geometry_mismatch", "solved parallel line and plane are not parallel"
-                )
+                return fail("discovery.mate_geometry_mismatch", "solved parallel line and plane are not parallel")
             pivot = _unit(_cross(direction, normal))
             if pivot is None:
-                return fail(
-                    "discovery.mate_geometry_mismatch", "solved parallel line and plane are not parallel"
-                )
+                return fail("discovery.mate_geometry_mismatch", "solved parallel line and plane are not parallel")
             return {"rows": [_rotation_row(pivot)], "limits": limits, "axis": None, "point": None, "entity": None}
         plane = plane_of(first)
         other = plane_of(second)
         if plane is None or other is None:
             return fail("discovery.mate_entities_unsupported", "parallel mate entities carry no direction")
         if abs(abs(_dot(plane[1], other[1])) - 1.0) > _TOL:
-            return fail(
-                "discovery.mate_geometry_mismatch", "solved parallel mate does not record parallel directions"
-            )
+            return fail("discovery.mate_geometry_mismatch", "solved parallel mate does not record parallel directions")
         rows = [_rotation_row(direction) for direction in _orthogonal_basis(plane[1])]
         return {"rows": rows, "limits": limits, "axis": None, "point": None, "entity": None}
     directions = []
@@ -1238,54 +1291,106 @@ def _clusters(record: dict, findings: list[dict]) -> _Clusters:
             # rigid cluster; it is never a component pair, invented grounding or
             # a mass.  Only a complete top-scope mate with one identity frame
             # entity and one recorded occurrence can take part.
-            frame_mates.append(obj)
             scope = mate.get("scope")
-            if scope != "":
-                frame_problem(
-                    "a frame-attached mate outside the frozen top assembly is not supported",
-                    {"mate": mate.get("name"), "scope": scope},
-                    obj=obj,
-                )
-                continue
             flagged = [entity for entity in entities if entity.get("assembly_frame") is True]
-            occurrence = [entity for entity in entities if entity.get("assembly_frame") is not True]
-            if not occurrence:
-                frame_problem("a frame-attached mate has no occurrence endpoint", {"mate": mate.get("name")}, obj=obj)
-                continue
-            raw_entities = mate.get("entities")
-            if not isinstance(raw_entities, list) or len(raw_entities) != 2 or len(entities) != 2:
-                frame_problem(
-                    "a frame-attached mate must record exactly one frozen top-frame entity and one occurrence",
-                    {"mate": mate.get("name"), "entities": len(entities), "frame_entities": len(flagged)},
-                    obj=obj,
+            nested_self = scope != "" and len(flagged) == 1 and flagged[0].get("component") == scope
+            if scope == "":
+                frame_mates.append(obj)
+            elif nested_self:
+                # A nested sub-assembly's own frame is a definition-internal relation.
+                # The reader binds its component to the mate's scope, validates that the
+                # scope occurrence and document match at capture time, and localizes the
+                # parameters with inv(F_scope) x F_scope, so the recorded scope-local
+                # geometry is mapped back exactly by the recorded occurrence transform.
+                # It is therefore reconstructed by the ordinary pair machinery below:
+                # it can never ground anything and never vetoes the frozen top aggregate.
+                # The non-frame endpoint must be a recorded occurrence under the mate's
+                # scope: the reader records every in-scope component as ``scope/...``,
+                # so any other name is an unjustified scope cross-link and is rejected
+                # rather than guessed at.
+                others = [entity for entity in entities if entity.get("assembly_frame") is not True]
+                endpoints = [str(entity.get("component") or "") for entity in others]
+                raw_entities = mate.get("entities")
+                if (
+                    not isinstance(raw_entities, list)
+                    or len(raw_entities) != 2
+                    or any(not isinstance(item, dict) for item in raw_entities)
+                    or len(endpoints) != 1
+                    or not endpoints[0]
+                    or not endpoints[0].startswith(scope + "/")
+                    or endpoints[0] not in components
+                    or scope not in components
+                ):
+                    findings.append(
+                        _finding(
+                            "discovery.frame_attachment",
+                            obj,
+                            "a frame-attached mate outside the frozen top assembly is not supported",
+                            {
+                                "mate": mate.get("name"),
+                                "scope": scope,
+                                "components": [str(entity.get("component")) for entity in entities],
+                            },
+                        )
+                    )
+                    continue
+            else:
+                # Ambiguous or foreign frame identity: fail closed with its own finding,
+                # scope-isolated from the frozen top aggregate gate.
+                findings.append(
+                    _finding(
+                        "discovery.frame_attachment",
+                        obj,
+                        "a frame-attached mate outside the frozen top assembly is not supported",
+                        {
+                            "mate": mate.get("name"),
+                            "scope": scope,
+                            "components": [str(entity.get("component")) for entity in entities],
+                        },
+                    )
                 )
                 continue
-            if flagged[0].get("component") != "":
-                frame_problem(
-                    "a frame entity must carry the frozen top-scope identity",
-                    {"mate": mate.get("name"), "component": flagged[0].get("component")},
-                    obj=obj,
-                )
+            if scope == "":
+                occurrence = [entity for entity in entities if entity.get("assembly_frame") is not True]
+                if not occurrence:
+                    frame_problem(
+                        "a frame-attached mate has no occurrence endpoint", {"mate": mate.get("name")}, obj=obj
+                    )
+                    continue
+                raw_entities = mate.get("entities")
+                if not isinstance(raw_entities, list) or len(raw_entities) != 2 or len(entities) != 2:
+                    frame_problem(
+                        "a frame-attached mate must record exactly one frozen top-frame entity and one occurrence",
+                        {"mate": mate.get("name"), "entities": len(entities), "frame_entities": len(flagged)},
+                        obj=obj,
+                    )
+                    continue
+                if flagged[0].get("component") != "":
+                    frame_problem(
+                        "a frame entity must carry the frozen top-scope identity",
+                        {"mate": mate.get("name"), "component": flagged[0].get("component")},
+                        obj=obj,
+                    )
+                    continue
+                component = occurrence[0].get("component")
+                if not isinstance(component, str) or component == "" or component not in components:
+                    frame_problem(
+                        "a frame-attached mate names an unknown occurrence",
+                        {"mate": mate.get("name"), "component": component, "scope": scope},
+                        obj=obj,
+                    )
+                    continue
+                rows = _mate_rows(mate, frames, findings, obj)
+                if rows is None:
+                    frame_problem(
+                        "a frame-attached mate cannot be reconstructed from its recorded entities",
+                        {"mate": mate.get("name"), "type": mate.get("type"), "scope": scope},
+                        obj=obj,
+                    )
+                    continue
+                frame_rows.extend(rows["rows"])
+                frame_endpoints.append(component)
                 continue
-            component = occurrence[0].get("component")
-            if not isinstance(component, str) or component == "" or component not in components:
-                frame_problem(
-                    "a frame-attached mate names an unknown occurrence",
-                    {"mate": mate.get("name"), "component": component, "scope": scope},
-                    obj=obj,
-                )
-                continue
-            rows = _mate_rows(mate, frames, findings, obj)
-            if rows is None:
-                frame_problem(
-                    "a frame-attached mate cannot be reconstructed from its recorded entities",
-                    {"mate": mate.get("name"), "type": mate.get("type"), "scope": scope},
-                    obj=obj,
-                )
-                continue
-            frame_rows.extend(rows["rows"])
-            frame_endpoints.append(component)
-            continue
         rows = _mate_rows(mate, frames, findings, obj)
         for left, right in _mate_pairs(mate):
             if left not in components or right not in components:
@@ -1823,6 +1928,794 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
     return joints
 
 
+def _exporter_declaration(record: dict, identity: dict, findings: list[dict]) -> dict | None:
+    """Bind the raw saved declaration to the same observed assembly/configuration."""
+
+    block = record.get("exporter")
+    if not isinstance(block, dict):
+        findings.append(_finding("discovery.exporter_unread", "assembly", "native exporter evidence is unread"))
+        return None
+    state = block.get("state")
+    if state == "absent":
+        return None
+    if state != "extracted":
+        findings.append(
+            _finding("discovery.exporter_unread", "assembly", "native exporter evidence is unread", block.get("error"))
+        )
+        return None
+    xml = block.get("raw_xml")
+    if not isinstance(xml, str) or hashlib.sha256(xml.encode("utf-8")).hexdigest() != block.get("raw_xml_sha256"):
+        findings.append(
+            _finding(
+                "discovery.exporter_digest_mismatch",
+                "assembly",
+                "saved declaration XML digest does not match its raw text",
+            )
+        )
+        return None
+    if (
+        not _text(block.get("attribute_name"))
+        or block.get("document") != identity.get("main_assembly")
+        or not _text(block.get("configuration"))
+        or block.get("configuration") != record.get("saved_configuration")
+        or block.get("configuration") != identity.get("delivery_configuration")
+    ):
+        findings.append(
+            _finding(
+                "discovery.exporter_binding_mismatch",
+                "assembly",
+                "saved declaration does not bind the observed main document and delivery configuration",
+                {"document": block.get("document"), "configuration": block.get("configuration")},
+            )
+        )
+        return None
+    try:
+        return decode_exporter_v14(xml, block.get("exporter_version"))
+    except ExporterDeclarationError as exc:
+        findings.append(_finding(exc.code, "assembly", str(exc), exc.detail))
+        return None
+
+
+def _exporter_memberships(record: dict, declaration: dict, findings: list[dict]) -> tuple[list[dict], _Clusters]:
+    """Expand exact selected occurrences, retaining independently selected subtrees."""
+
+    components: dict[str, dict] = {}
+    for item in record.get("components") or []:
+        name = item.get("name2") if isinstance(item, dict) else None
+        if not _text(name) or name in components:
+            findings.append(
+                _finding(
+                    "discovery.component_identity_invalid",
+                    f"component:{name}",
+                    "native occurrence names must be nonempty and unique",
+                )
+            )
+            continue
+        components[name] = item
+    active = {
+        name: item
+        for name, item in components.items()
+        if not item.get("suppressed")
+        and not any(
+            name.startswith(parent + "/") and candidate.get("suppressed") for parent, candidate in components.items()
+        )
+    }
+    bindings: dict[str, dict] = {}
+    for binding in (record.get("exporter") or {}).get("pid_bindings") or []:
+        if not isinstance(binding, dict):
+            findings.append(
+                _finding("discovery.exporter_pid_invalid", "assembly", "a native PID binding is not an object")
+            )
+            continue
+        pid = binding.get("pid_hex")
+        name = binding.get("name2")
+        item = active.get(name) if isinstance(name, str) else None
+        if not isinstance(pid, str) or re.fullmatch(r"(?:[0-9a-f]{2})+", pid) is None or pid in bindings:
+            findings.append(
+                _finding(
+                    "discovery.exporter_pid_invalid",
+                    "assembly",
+                    "PID bindings must use unique exact lowercase byte hex",
+                    {"pid_hex": pid},
+                )
+            )
+            continue
+        bindings[pid] = binding
+        if (
+            type(binding.get("error_code")) is not int
+            or binding["error_code"] != 0
+            or item is None
+            or binding.get("document") != item.get("document")
+            or binding.get("configuration") != item.get("configuration")
+        ):
+            findings.append(
+                _finding(
+                    "discovery.exporter_pid_unresolved",
+                    f"component:{name}",
+                    "selected PID did not resolve to the exact active recorded occurrence",
+                    binding,
+                )
+            )
+    selections: dict[str, set[str]] = {}
+    per_link: dict[str, list[str]] = {}
+    for link in declaration["links"]:
+        name = link["name"]
+        selected = []
+        for pid in link["component_pids"]:
+            binding = bindings.get(pid)
+            if binding is None:
+                findings.append(
+                    _finding(
+                        "discovery.exporter_pid_unresolved",
+                        f"body:{name}",
+                        "a selected component PID has no native byte binding",
+                        {"pid_hex": pid},
+                    )
+                )
+                continue
+            occurrence = binding.get("name2")
+            if occurrence in active:
+                selected.append(occurrence)
+                selections.setdefault(occurrence, set()).add(name)
+        per_link[name] = selected
+        if link["incomplete"] is not False:
+            findings.append(
+                _finding(
+                    "discovery.exporter_link_incomplete",
+                    f"body:{name}",
+                    "saved exporter link is incomplete or its completion state is unread",
+                )
+            )
+    for occurrence, owners in selections.items():
+        if len(owners) > 1:
+            findings.append(
+                _finding(
+                    "discovery.exporter_membership_overlap",
+                    f"component:{occurrence}",
+                    "one exact selection is declared by several links",
+                    {"links": sorted(owners)},
+                )
+            )
+
+    def owner_of(occurrence: str) -> str | None:
+        ancestors = [name for name in selections if occurrence == name or occurrence.startswith(name + "/")]
+        if not ancestors:
+            return None
+        selected = max(ancestors, key=len)
+        owners = selections[selected]
+        return next(iter(owners)) if len(owners) == 1 else None
+
+    material = {
+        name for name, item in active.items() if not str(item.get("document") or "").lower().endswith(".sldasm")
+    }
+    assigned = {name: owner_of(name) for name in active}
+    pairs = _exporter_native_pairs(record, findings)
+    rigid = [
+        pair
+        for pair, group in pairs.items()
+        if not group["unresolved"] and group["rank"] == 6 and all(endpoint in active for endpoint in pair)
+    ]
+    rigid_mapping = _union_find(rigid, sorted(active))
+    rigid_members: dict[str, list[str]] = {}
+    for occurrence, root in rigid_mapping.items():
+        rigid_members.setdefault(root, []).append(occurrence)
+    attachments: dict[str, dict] = {}
+    for members in rigid_members.values():
+        owners = {assigned[member] for member in members if assigned[member] is not None}
+        if len(owners) != 1:
+            if len(owners) > 1:
+                findings.append(
+                    _finding(
+                        "discovery.exporter_rigidity_conflict",
+                        "assembly",
+                        "saved-pose native rigidity connects several declared links; their declared memberships "
+                        "remain separate and this group cannot assign unselected occurrences",
+                        {"links": sorted(owners), "components": sorted(members)},
+                        blocking=False,
+                    )
+                )
+            continue
+        owner = next(iter(owners))
+        proof = sorted({mate for pair in rigid if set(pair).issubset(members) for mate in pairs[pair]["mates"]})
+        anchors = sorted(member for member in members if assigned[member] == owner)
+        for member in members:
+            if assigned[member] is None:
+                assigned[member] = owner
+                attachments[member] = {"link": owner, "anchors": anchors, "mates": proof, "rank": 6}
+                findings.append(
+                    _finding(
+                        "discovery.exporter_rigid_attachment",
+                        f"component:{member}",
+                        "native rank-six rigidity attaches this unselected occurrence to exactly one declared link",
+                        attachments[member],
+                        blocking=False,
+                    )
+                )
+    uncovered = sorted(name for name in material if assigned[name] is None)
+    if uncovered:
+        findings.append(
+            _finding(
+                "discovery.exporter_membership_uncovered",
+                "assembly",
+                "active material occurrences remain unassigned; capture retains their CAD geometry and mass, "
+                "but complete material coverage is not qualified",
+                {"components": uncovered, "qualification_blocker": "complete_material_coverage"},
+                blocking=False,
+            )
+        )
+    bodies = []
+    for link in declaration["links"]:
+        name = link["name"]
+        members = sorted(member for member in material if assigned[member] == name)
+        owners = sorted(member for member in active if assigned[member] == name)
+        if not members:
+            findings.append(
+                _finding(
+                    "discovery.exporter_reference_frame_unsupported"
+                    if link["fixed_frame"]
+                    else "discovery.exporter_membership_empty",
+                    f"body:{name}",
+                    "declared link contains no supported material body",
+                    {"selections": per_link[name]},
+                )
+            )
+        main_pid = link["main_component_pid"]
+        main = bindings.get(main_pid) if main_pid is not None else None
+        if main_pid is not None and (main is None or main.get("name2") not in owners):
+            findings.append(
+                _finding(
+                    "discovery.exporter_main_component_mismatch",
+                    f"body:{name}",
+                    "SWMainComponentPID is unresolved or belongs to another declared link",
+                    {"pid_hex": main_pid},
+                )
+            )
+        joint = link["joint"] or {}
+        datum_selector = _exporter_reference(joint.get("coordinate_system"), findings, f"body:{name}")
+        datum = (
+            None
+            if datum_selector is None
+            else _datum(record, datum_selector["feature_name"], [datum_selector["component"]])
+        )
+        if (
+            datum_selector
+            and sum(
+                item.get("name") == datum_selector["feature_name"]
+                for item in record.get("datums") or []
+                if isinstance(item, dict)
+            )
+            != 1
+        ):
+            findings.append(
+                _finding(
+                    "discovery.exporter_frame_ambiguous",
+                    f"body:{name}",
+                    "the current capture contract requires a unique coordinate-system name across occurrence scopes",
+                    datum_selector,
+                )
+            )
+        if datum is None or _finite_vector(datum.get("array"), 16) is None:
+            findings.append(
+                _finding(
+                    "discovery.exporter_frame_missing",
+                    f"body:{name}",
+                    "declared coordinate system does not bind one finite native assembly-frame datum",
+                    {"coordinate_system": joint.get("coordinate_system")},
+                )
+            )
+        if datum_selector and datum_selector["component"] and datum_selector["component"] not in owners:
+            findings.append(
+                _finding(
+                    "discovery.exporter_frame_owner_mismatch",
+                    f"body:{name}",
+                    "declared coordinate system belongs to another link",
+                    datum_selector,
+                )
+            )
+        bodies.append(
+            {
+                "root": name,
+                "name": name,
+                "source": "exporter",
+                "identity": f"exporter:{name}",
+                "components": members,
+                "owners": owners,
+                "selections": per_link[name],
+                "datum": datum_selector["feature_name"] if datum_selector else "",
+                "datum_owner": datum_selector["component"] if datum_selector else None,
+                "declaration": link,
+                "rigid_attachments": {member: attachments[member] for member in members if member in attachments},
+            }
+        )
+    clusters = _Clusters(
+        members={body["name"]: body["owners"] for body in bodies},
+        of={member: owner for member, owner in assigned.items() if owner is not None},
+        pairs=pairs,
+    )
+    return bodies, clusters
+
+
+def _exporter_reference(value: Any, findings: list[dict], obj: str) -> dict | None:
+    """The exporter encodes nested reference scope as 'Feature <exact Name2>'."""
+
+    if not _text(value) or value in ("Automatically Generate", "None"):
+        findings.append(
+            _finding(
+                "discovery.exporter_reference_missing",
+                obj,
+                "saved declaration has no named native reference",
+                {"value": value},
+            )
+        )
+        return None
+    if "<" in value or ">" in value:
+        match = re.fullmatch(r"([^<>]+?) <([^<>]+)>", value)
+        if match is None:
+            findings.append(
+                _finding(
+                    "discovery.exporter_reference_invalid",
+                    obj,
+                    "nested native reference does not contain an exact occurrence scope",
+                    {"value": value},
+                )
+            )
+            return None
+        feature, component = match.groups()
+    else:
+        feature, component = value, ""
+    return {"kind": "reference_axis", "component": component, "feature_name": feature}
+
+
+def _body_datum(record: dict, body: dict) -> dict | None:
+    owners = [body["datum_owner"]] if "datum_owner" in body else body["owners"]
+    return _datum(record, body["datum"], owners)
+
+
+def _exporter_native_pairs(record: dict, findings: list[dict]) -> dict[tuple[str, str], dict]:
+    """Retain usable saved-pose constraints without vetoing the declared tree.
+
+    Incomplete mate evidence is diagnostic in declaration mode. It contributes
+    no constraint rows and leaves its pair unresolved for membership completion.
+    """
+
+    frames = _component_frames(record, findings)
+    pairs: dict[tuple[str, str], dict] = {}
+    for index, mate in enumerate(record.get("mates") or []):
+        if not isinstance(mate, dict) or mate.get("suppressed"):
+            continue
+        name = str(mate.get("name") or index)
+        obj = f"mate:{name}"
+        entities = _mate_entities(mate)
+        endpoints = tuple(sorted(str(entity.get("component")) for entity in entities))
+        detail = {
+            "mate": name,
+            "scope": mate.get("scope"),
+            "mate_type": mate.get("type"),
+            "components": list(endpoints),
+        }
+        if len(entities) != 2 or len(mate.get("entities") or []) != 2:
+            findings.append(
+                _finding(
+                    "discovery.mate_entities_unsupported",
+                    obj,
+                    "native constraint cannot be checked because it does not have exactly two raw endpoints",
+                    detail,
+                    blocking=False,
+                )
+            )
+            continue
+        if any(endpoint not in frames and endpoint != "" for endpoint in endpoints):
+            findings.append(
+                _finding(
+                    "discovery.mate_component_missing",
+                    obj,
+                    "native constraint refers to an unknown occurrence",
+                    detail,
+                    blocking=False,
+                )
+            )
+            continue
+        group = pairs.setdefault(endpoints, {"rows": [], "mates": [], "unresolved": False, "constraints": []})
+        group["mates"].append(name)
+        if type(mate.get("error_code")) is not int or mate["error_code"] != 0:
+            findings.append(
+                _finding(
+                    "discovery.mate_error_state",
+                    obj,
+                    "saved mate reports an error or unreadable solve state",
+                    {**detail, "error_code": mate.get("error_code")},
+                    blocking=False,
+                )
+            )
+            group["unresolved"] = True
+            continue
+        diagnostics: list[dict] = []
+        kind = str(mate.get("type") or "").strip().lower()
+        if kind in SUPPORTED_MATES and kind not in {"lock", "limitangle"}:
+            geometry = [_entity_geometry_view(entity, diagnostics, obj) for entity in entities]
+            if all(entity is not None for entity in geometry) and any(
+                not any(entity.get(shape) is not None for shape in ("point", "plane", "cylinder", "circle", "line"))
+                for entity in geometry
+            ):
+                diagnostics.append(
+                    _finding(
+                        "discovery.mate_entities_unsupported",
+                        obj,
+                        "native constraint lacks recorded geometry for both endpoints",
+                    )
+                )
+        view = None if diagnostics else _mate_rows(mate, frames, diagnostics, obj)
+        for finding in diagnostics:
+            findings.append({**finding, "detail": {**detail, **(finding.get("detail") or {})}, "blocking": False})
+        if view is None or any(finding["blocking"] for finding in diagnostics):
+            group["unresolved"] = True
+        else:
+            group["rows"].extend(view["rows"])
+            group["constraints"].append({**detail, "rows": view["rows"], "limits": view.get("limits")})
+    for group in pairs.values():
+        group["rank"] = _rank(group["rows"])
+    return pairs
+
+
+def _exporter_constraint_checks(
+    declaration: dict, clusters: _Clusters, joints: list[dict], findings: list[dict]
+) -> None:
+    descendants: dict[str, set[str]] = {link["name"]: {link["name"]} for link in declaration["links"]}
+    for link in reversed(declaration["links"]):
+        if link["parent"] is not None:
+            descendants[link["parent"]].update(descendants[link["name"]])
+    for (left, right), group in clusters.pairs.items():
+        owners = [declaration["root"] if component == "" else clusters.of.get(component) for component in (left, right)]
+        if None in owners or owners[0] == owners[1]:
+            continue
+        for joint in joints:
+            if joint["type"] == "fixed":
+                continue
+            child_tree = descendants[joint["child"]]
+            if (owners[0] in child_tree) == (owners[1] in child_tree):
+                continue
+            direction = joint["axis"].get("direction")
+            point = joint["axis"].get("point")
+            if direction is None or point is None:
+                continue
+            twist = (
+                [*direction, 0.0, 0.0, 0.0] if joint["type"] == "prismatic" else [*_cross(point, direction), *direction]
+            )
+            for constraint in group["constraints"]:
+                raw_residuals = [_dot(row, twist) for row in constraint["rows"]]
+                normalized_residuals = [
+                    abs(value) / max(math.hypot(*row), 1e-12)
+                    for value, row in zip(raw_residuals, constraint["rows"], strict=True)
+                ]
+                residual = max(normalized_residuals, default=0.0)
+                detail = {
+                    "joint": joint["name"],
+                    "mate": constraint["mate"],
+                    "scope": constraint["scope"],
+                    "mate_type": constraint["mate_type"],
+                    "components": [left, right],
+                    "links": owners,
+                }
+                if residual > 1e-6:
+                    findings.append(
+                        _finding(
+                            "discovery.exporter_saved_pose_restriction",
+                            f"joint:{joint['name']}",
+                            "native mate restricts the declared joint motion at the saved CAD pose; "
+                            "the saved declaration remains the kinematic authority",
+                            {
+                                **detail,
+                                "rows": constraint["rows"],
+                                "declared_twist": twist,
+                                "raw_residuals": raw_residuals,
+                                "max_abs_residual": max((abs(value) for value in raw_residuals), default=0.0),
+                                "normalized_residuals": normalized_residuals,
+                                "max_normalized_residual": residual,
+                                "threshold": 1e-6,
+                            },
+                            blocking=False,
+                        )
+                    )
+                limits = constraint["limits"]
+                if not isinstance(limits, dict):
+                    continue
+                expected = "m" if joint["type"] == "prismatic" else "rad"
+                declared = joint.get("limits") or {}
+                if limits.get("unit") != expected or any(
+                    limits.get(key) != declared.get(key) for key in ("lower", "upper")
+                ):
+                    findings.append(
+                        _finding(
+                            "discovery.joint_limits_conflict",
+                            f"joint:{joint['name']}",
+                            "native mate position limits disagree with the saved joint declaration",
+                            {**detail, "native": limits, "declared": declared},
+                        )
+                    )
+
+
+def _exporter_axis(record: dict, declared: dict, body: dict, findings: list[dict]) -> tuple[dict, dict | None]:
+    obj = f"joint:{declared['name']}"
+    selector = _exporter_reference(declared.get("axis_name"), findings, obj)
+    axis = {"point": None, "direction": None, "source": "exporter"}
+    if selector is None:
+        return axis, None
+    matches = [
+        item
+        for item in record.get("reference_axes") or []
+        if isinstance(item, dict) and item.get("selector") == selector
+    ]
+    if len(matches) != 1:
+        findings.append(
+            _finding(
+                "discovery.exporter_axis_missing",
+                obj,
+                "declared axis does not bind exactly one native named reference axis",
+                selector,
+            )
+        )
+        return axis, selector
+    native = matches[0]
+    endpoints = _finite_vector(native.get("raw_endpoints_m"), 6)
+    point = _finite_vector(native.get("axis_point_m"), 3)
+    direction = _unit_vector(native.get("axis_direction"))
+    endpoint_direction = _unit([endpoints[i + 3] - endpoints[i] for i in range(3)]) if endpoints else None
+    if (
+        native.get("kind") != "reference_axis"
+        or native.get("component") != selector["component"]
+        or native.get("direction_semantics") != "undirected_axis_line"
+        or not _text(native.get("used_api"))
+        or point is None
+        or direction is None
+        or endpoint_direction is None
+        or abs(abs(_dot(direction, endpoint_direction)) - 1.0) > 1e-8
+        or _axis_offset(point, endpoints[:3], endpoint_direction) > 1e-8
+    ):
+        findings.append(
+            _finding(
+                "discovery.exporter_axis_invalid",
+                obj,
+                "native reference-axis geometry lacks consistent endpoint evidence",
+                selector,
+            )
+        )
+        return axis, selector
+    if native.get("coordinate_frame") == "component_local" and selector["component"]:
+        component = next(
+            (item for item in record.get("components") or [] if item.get("name2") == selector["component"]), None
+        )
+        transform = _finite_vector(component.get("transform"), 16) if component else None
+        if transform is None:
+            findings.append(
+                _finding(
+                    "discovery.exporter_axis_invalid",
+                    obj,
+                    "reference axis has no finite occurrence transform",
+                    selector,
+                )
+            )
+            return axis, selector
+        frame = [transform[index : index + 4] for index in range(0, 16, 4)]
+        point, direction = _point(point, frame), _unit(_vector(direction, frame))
+    elif native.get("coordinate_frame") != "assembly":
+        findings.append(
+            _finding("discovery.exporter_axis_invalid", obj, "reference axis has an invalid coordinate frame", selector)
+        )
+        return axis, selector
+    datum = _body_datum(record, body)
+    transform = _finite_vector(datum.get("array"), 16) if datum else None
+    local = _unit_vector(declared.get("axis"))
+    if local is None or transform is None:
+        findings.append(
+            _finding(
+                "discovery.exporter_axis_invalid",
+                obj,
+                "declared signed axis requires a unit child-frame vector and native child datum",
+            )
+        )
+        return axis, selector
+    frame = [transform[index : index + 4] for index in range(0, 16, 4)]
+    signed = _unit(_vector(local, frame))
+    if signed is None or abs(abs(_dot(signed, direction)) - 1.0) > 1e-8:
+        findings.append(
+            _finding(
+                "discovery.exporter_axis_mismatch",
+                obj,
+                "declared child-frame axis disagrees with the native reference-axis line",
+                {"declared": signed, "native": direction},
+            )
+        )
+    origin = [transform[3], transform[7], transform[11]]
+    offset = _axis_offset(point, origin, direction)
+    if offset > AXIS_OFFSET_TOL_M:
+        findings.append(
+            _finding(
+                "discovery.joint_frame_off_axis",
+                obj,
+                "declared child datum does not lie on the native reference axis",
+                {"offset_m": offset},
+            )
+        )
+    axis.update(point=point, direction=signed)
+    return axis, selector
+
+
+def _exporter_origin(declared: dict, child: dict, parent: dict, record: dict, findings: list[dict]) -> None:
+    origin = declared.get("origin")
+    if not isinstance(origin, dict) or origin.get("customized") is None:
+        findings.append(
+            _finding(
+                "discovery.exporter_origin_invalid",
+                f"joint:{declared['name']}",
+                "saved joint origin customization state is unread",
+            )
+        )
+        return
+    if origin["customized"] is False:
+        # The exporter recalculates these rounded output values from named CAD
+        # coordinate systems. Fresh geometry, not this serialized cache, wins.
+        return
+    xyz, rpy = _finite_vector(origin.get("xyz"), 3), _finite_vector(origin.get("rpy"), 3)
+    parent_datum, child_datum = _body_datum(record, parent), _body_datum(record, child)
+    left = _finite_vector(parent_datum.get("array"), 16) if parent_datum else None
+    right = _finite_vector(child_datum.get("array"), 16) if child_datum else None
+    if xyz is None or rpy is None or left is None or right is None:
+        findings.append(
+            _finding(
+                "discovery.exporter_origin_invalid",
+                f"joint:{declared['name']}",
+                "customized joint origin lacks native frames or finite xyz/rpy",
+            )
+        )
+        return
+    cr, cp, cy = [math.cos(value) for value in rpy]
+    sr, sp, sy = [math.sin(value) for value in rpy]
+    rotation = [
+        [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+        [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+        [-sp, cp * sr, cp * cr],
+    ]
+    relative_xyz = [
+        sum(left[row * 4 + col] * (right[row * 4 + 3] - left[row * 4 + 3]) for row in range(3)) for col in range(3)
+    ]
+    relative_rotation = [
+        [sum(left[row * 4 + col] * right[row * 4 + axis] for row in range(3)) for axis in range(3)] for col in range(3)
+    ]
+    if any(abs(a - b) > 1e-6 for a, b in zip(xyz, relative_xyz, strict=True)) or any(
+        abs(rotation[row][col] - relative_rotation[row][col]) > 1e-6 for row in range(3) for col in range(3)
+    ):
+        findings.append(
+            _finding(
+                "discovery.exporter_origin_mismatch",
+                f"joint:{declared['name']}",
+                "customized joint origin contradicts the current native parent/child coordinate systems",
+            )
+        )
+
+
+def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], findings: list[dict]) -> list[dict]:
+    by_name = {body["name"]: body for body in bodies}
+    joints = []
+    for link in declaration["links"]:
+        if link["parent"] is None:
+            continue
+        declared = link["joint"]
+        obj = f"joint:{declared['name']}"
+        kind = declared["type"]
+        if kind not in {"fixed", "revolute", "continuous", "prismatic"}:
+            findings.append(
+                _finding(
+                    "discovery.joint_type_unsupported",
+                    obj,
+                    "saved declaration has an unsupported joint type",
+                    {"type": kind},
+                )
+            )
+        if any(value is not None for values in declared["optional"].values() for value in values.values()):
+            findings.append(
+                _finding(
+                    "discovery.exporter_joint_fields_unsupported",
+                    obj,
+                    "saved joint contains optional engineering declarations the current contract cannot carry",
+                    declared["optional"],
+                )
+            )
+        child, parent = by_name[link["name"]], by_name[link["parent"]]
+        _exporter_origin(declared, child, parent, record, findings)
+        axis, selector = ({"point": None, "direction": None, "source": "exporter"}, None)
+        if kind != "fixed":
+            axis, selector = _exporter_axis(record, declared, child, findings)
+        limits = declared["limits"]
+        if kind != "fixed":
+
+            def valid(value):
+                return type(value) in (int, float) and math.isfinite(value)
+
+            if kind != "continuous" and (
+                not isinstance(limits, dict)
+                or not all(valid(limits.get(key)) for key in ("lower", "upper"))
+                or limits["lower"] > limits["upper"]
+            ):
+                findings.append(
+                    _finding(
+                        "discovery.joint_limits_invalid",
+                        obj,
+                        "saved position limits must be finite and ordered",
+                        limits,
+                    )
+                )
+            elif kind != "continuous" and limits["lower"] == limits["upper"]:
+                findings.append(
+                    _finding(
+                        "discovery.joint_limits_degenerate",
+                        obj,
+                        "equal authored position bounds are retained for capture and generation; "
+                        "a usable joint range is not qualified",
+                        {"limits": limits, "qualification_blocker": "usable_joint_range"},
+                        blocking=False,
+                    )
+                )
+            if not isinstance(limits, dict) or not all(
+                valid(limits.get(key)) and limits[key] >= 0 for key in ("effort", "velocity")
+            ):
+                findings.append(
+                    _finding(
+                        "discovery.joint_drive_invalid",
+                        obj,
+                        "saved effort and velocity must be finite and nonnegative",
+                        limits,
+                    )
+                )
+            elif any(limits[key] == 0 for key in ("effort", "velocity")):
+                findings.append(
+                    _finding(
+                        "discovery.joint_drive_unspecified",
+                        obj,
+                        "authored zero effort or velocity is retained for capture and generation; "
+                        "a usable drive specification is not qualified",
+                        {"limits": limits, "qualification_blocker": "usable_joint_drive"},
+                        blocking=False,
+                    )
+                )
+            if (
+                kind == "continuous"
+                and isinstance(limits, dict)
+                and any(limits.get(key) is not None for key in ("lower", "upper"))
+            ):
+                findings.append(
+                    _finding(
+                        "discovery.joint_limits_unexpected", obj, "a continuous joint declares position limits", limits
+                    )
+                )
+        declared_axis = None
+        raw_axis = declared.get("axis")
+        if (
+            isinstance(raw_axis, (list, tuple))
+            and len(raw_axis) == 3
+            and all(type(value) in (int, float) and math.isfinite(value) for value in raw_axis)
+        ):
+            declared_axis = [float(value) for value in raw_axis]
+        joints.append(
+            {
+                "mate": f"exporter:{declared['name']}",
+                "mates": [],
+                "name": declared["name"],
+                "index": len(joints),
+                "type": kind,
+                "parent": link["parent"],
+                "child": link["name"],
+                "components": [link["parent"], link["name"]],
+                "axis": axis,
+                "declared_axis": declared_axis,
+                "axis_reference": selector,
+                "limits": limits,
+                "limit_evidence": None,
+                "drive": None,
+            }
+        )
+    return joints
+
+
 def _body_records(
     record: dict,
     clusters: _Clusters,
@@ -1891,9 +2784,7 @@ def _body_records(
             candidate = _datum(record, explicit, scope)
             if candidate is None:
                 foreign = [
-                    datum
-                    for datum in datums
-                    if str(datum.get("name")) == explicit and datum.get("owner") not in scope
+                    datum for datum in datums if str(datum.get("name")) == explicit and datum.get("owner") not in scope
                 ]
                 findings.append(
                     _finding(
@@ -2040,6 +2931,7 @@ def _interface_frames(
         for component in body["owners"]:
             body_of_component[component] = body
     link_datums = {(owner, str(body.get("datum"))) for body in bodies for owner in body["owners"]}
+    link_datums.update((body["datum_owner"], body["datum"]) for body in bodies if "datum_owner" in body)
     if base is not None and not any(
         str(datum.get("name")) == str(base.get("datum")) and str(datum.get("owner") or "") in base["owners"]
         for datum in record.get("datums") or []
@@ -2496,22 +3388,29 @@ def _budgets(
     settings: DiscoverySettings,
     findings: list[dict],
 ) -> tuple[dict | None, dict | None]:
-    """Resolve the versioned design budget/measurement record.
+    """Resolve an explicitly referenced design budget/measurement record.
 
     Exported CAD mass and bounding extents can never budget themselves.  The
-    CAD carries one scalar reference to a versioned design budget record; the
-    intervals it declares are the only accepted capture windows, and a missing
-    or malformed record blocks the package.
+    CAD may carry one scalar reference to a versioned design budget record.
+    Its authored intervals are acceptance checks when provided; without a
+    reference no intervals are constructed. An explicit reference that cannot
+    be resolved or validated still blocks the package.
     """
 
     reference = _scalar(record, NAMESPACE, "design_budget_record")
-    if not _text(reference):
+    if reference is None or (isinstance(reference, str) and not reference.strip()):
         findings.append(
             _finding(
-                "discovery.design_budget_missing",
+                "discovery.design_budget_unspecified",
                 "assembly",
-                "no versioned design budget record is referenced; exported CAD readings cannot budget themselves",
+                "no design budget is specified; no optional mass or extent acceptance ranges are applied",
+                blocking=False,
             )
+        )
+        return {}, None
+    if not _text(reference):
+        findings.append(
+            _finding("discovery.design_budget_invalid", "assembly", "design budget reference must be a nonempty string")
         )
         return None, None
     resolved = _resolve_record(settings, str(reference), findings, "assembly")
@@ -2566,28 +3465,89 @@ def _identity(
     assembly: str | None,
     native_files: Mapping[str, str],
 ) -> dict:
+    """Read authored identity, deferring absent administrative metadata to publication.
+
+    Absent hardware, revision, owner, change summary, control or robot name is a
+    publication-readiness gap: it is recorded as a nonblocking finding carrying
+    ``detail.publication_blocker``, the raw record keeps the absence and nothing
+    is invented.  Malformed or conflicting supplied values still block.
+    """
+
     namespace = NAMESPACE
+
+    def deferred(code: str, field: str, message: str, detail: dict | None = None) -> None:
+        payload = {"publication_blocker": field}
+        if detail:
+            payload.update(detail)
+        findings.append(_finding(code, "assembly", message, payload, blocking=False))
+
     hardware = _identity_value(record, namespace, "hardware_id")
-    if not _text(hardware):
-        findings.append(
-            _finding("discovery.identity_missing", "assembly", "hardware identity is not recorded in the CAD records")
-        )
     hardware = str(hardware).strip() if _text(hardware) else None
-    revision = _identity_value(record, namespace, "revision")
-    if not _text(revision):
-        findings.append(
-            _finding("discovery.revision_missing", "assembly", "structural revision is not recorded in the CAD records")
+    if hardware is None:
+        deferred(
+            "discovery.identity_missing",
+            "hardware_id",
+            "hardware identity is not recorded in the CAD records; publication readiness requires it",
         )
-    revision = str(revision).strip() if _text(revision) else None
-    owner = _identity_value(record, namespace, "owner")
-    if not _text(owner):
+    elif _IDENTITY_ID.fullmatch(hardware) is None:
         findings.append(
-            _finding("discovery.owner_missing", "assembly", "revision owner is not recorded in the CAD records")
+            _finding(
+                "discovery.identity_invalid",
+                "assembly",
+                "recorded hardware identity must be an ASCII identifier of at most 64 characters",
+                {"value": hardware},
+            )
+        )
+    revision = _identity_value(record, namespace, "revision")
+    revision = str(revision).strip() if _text(revision) else None
+    if revision is None:
+        deferred(
+            "discovery.revision_missing",
+            "revision",
+            "structural revision is not recorded in the CAD records; publication readiness requires it",
+        )
+    elif _IDENTITY_ID.fullmatch(revision) is None:
+        findings.append(
+            _finding(
+                "discovery.revision_invalid",
+                "assembly",
+                "recorded structural revision must be an ASCII identifier of at most 64 characters",
+                {"value": revision},
+            )
+        )
+    owner = _identity_value(record, namespace, "owner")
+    owner = str(owner).strip() if _text(owner) else None
+    if owner is None:
+        deferred(
+            "discovery.owner_missing",
+            "owner",
+            "revision owner is not recorded in the CAD records; publication readiness requires it",
+        )
+    elif not _authored_text(owner):
+        findings.append(
+            _finding(
+                "discovery.owner_invalid",
+                "assembly",
+                "recorded revision owner must be non-empty text without control characters",
+                {"value": owner},
+            )
         )
     summary = _identity_value(record, namespace, "change_summary")
-    if not _text(summary):
+    summary = str(summary).strip() if _text(summary) else None
+    if summary is None:
+        deferred(
+            "discovery.summary_missing",
+            "change_summary",
+            "change summary is not recorded in the CAD records; publication readiness requires it",
+        )
+    elif not _authored_text(summary):
         findings.append(
-            _finding("discovery.summary_missing", "assembly", "change summary is not recorded in the CAD records")
+            _finding(
+                "discovery.summary_invalid",
+                "assembly",
+                "recorded change summary must be non-empty text without control characters",
+                {"value": summary},
+            )
         )
     control = (record.get("identity") or {}).get("control")
     if not isinstance(control, dict):
@@ -2595,22 +3555,42 @@ def _identity(
             "system": _scalar(record, namespace, "control.system"),
             "reference": _scalar(record, namespace, "control.reference"),
         }
-    if not _text(control.get("system")) or not _text(control.get("reference")):
-        findings.append(
-            _finding("discovery.control_missing", "assembly", "CAD control system/reference are not recorded")
+    system = str(control["system"]).strip() if _text(control.get("system")) else None
+    reference = str(control["reference"]).strip() if _text(control.get("reference")) else None
+    if system is None or reference is None:
+        deferred(
+            "discovery.control_missing",
+            "control",
+            "CAD control system/reference are not recorded; publication readiness requires both",
         )
         control = None
-    elif str(control["system"]) not in CONTROL_SYSTEMS:
+    elif system not in CONTROL_SYSTEMS:
         findings.append(
             _finding(
                 "discovery.control_invalid",
                 "assembly",
                 "CAD control system must be git, pdm or handoff",
-                {"system": control["system"]},
+                {"system": system},
             )
         )
         control = None
-    delivery = configuration or _identity_value(record, namespace, "delivery_configuration")
+    elif system == "git" and _GIT_COMMIT.search(reference) is None:
+        findings.append(
+            _finding(
+                "discovery.control_invalid",
+                "assembly",
+                "Git CAD control reference must contain the full commit hash",
+                {"reference": reference},
+            )
+        )
+        control = None
+    else:
+        control = {"system": system, "reference": reference}
+    delivery = (
+        configuration
+        or _identity_value(record, namespace, "delivery_configuration")
+        or record.get("saved_configuration")
+    )
     if not _text(delivery):
         findings.append(
             _finding("discovery.configuration_missing", "assembly", "no saved delivery configuration is recorded")
@@ -2627,23 +3607,42 @@ def _identity(
                 {"assembly": main},
             )
         )
-    robot_name = _identity_value(record, namespace, "robot_name")
-    robot_name = str(robot_name).strip() if _text(robot_name) else _snake(hardware)
-    if not _text(robot_name) or _SNAKE.fullmatch(str(robot_name)) is None:
+    authored_name = _identity_value(record, namespace, "robot_name")
+    if _text(authored_name):
+        robot_name = str(authored_name).strip()
+        if _SNAKE.fullmatch(robot_name) is None:
+            findings.append(
+                _finding(
+                    "discovery.robot_name_invalid", "assembly", "robot name is not snake_case", {"name": robot_name}
+                )
+            )
+        technical_name = None
+    else:
+        technical = _snake(hardware) if hardware else None
+        technical_name = technical if technical and _SNAKE.fullmatch(technical) else "robot"
+        robot_name = None
         findings.append(
-            _finding("discovery.robot_name_invalid", "assembly", "robot name is not snake_case", {"name": robot_name})
+            _finding(
+                "discovery.robot_name_missing",
+                "assembly",
+                f"no authored robot name is recorded; the technical label {technical_name!r} is used for "
+                "generation and the native identity stays null",
+                {"technical_name": technical_name, "authored": False},
+                blocking=False,
+            )
         )
     parent = _identity_value(record, namespace, "parent_revision")
     return {
         "hardware_id": hardware,
         "revision": revision,
         "parent_revision": str(parent).strip() if _text(parent) else None,
-        "owner": str(owner).strip() if _text(owner) else None,
-        "change_summary": str(summary).strip() if _text(summary) else None,
-        "control": {"system": str(control["system"]), "reference": str(control["reference"])} if control else None,
+        "owner": owner,
+        "change_summary": summary,
+        "control": control,
         "delivery_configuration": delivery,
         "main_assembly": main,
-        "robot_name": str(robot_name) if _text(robot_name) else None,
+        "robot_name": robot_name,
+        "robot_name_technical": technical_name,
     }
 
 
@@ -2712,6 +3711,36 @@ def _write_yaml(path: Path, document: dict) -> None:
     path.write_text(text, encoding="utf-8", newline="\n")
 
 
+def _guarded_sink(on_activity):
+    """The observer guard: activity callbacks can never alter or fail the capture."""
+
+    if on_activity is None:
+        return None
+
+    def guarded(record):
+        try:
+            on_activity(record)
+        except Exception:  # noqa: BLE001 - an observer can never fail the capture
+            return
+
+    return guarded
+
+
+def _check_derivation_paths(frozen_source: Path, output: Path) -> None:
+    if frozen_source.is_symlink() or frozen_source.is_junction() or not frozen_source.is_dir():
+        raise PipelineError("frozen_source must be an existing native engineering directory, not a link")
+    if output.exists() and any(output.iterdir()):
+        raise PipelineError("prepared output directory must be empty")
+
+
+def _check_authored_files(native_files: Mapping[str, str]) -> None:
+    authored = sorted(
+        name for name in native_files if name in {ROBOT_FILE, REVISION_FILE} or name.startswith("discovery/")
+    )
+    if authored:
+        raise PipelineError(f"frozen_source already contains authored package files: {authored[:5]}")
+
+
 def prepare_native_package(
     frozen_source: Path,
     output: Path,
@@ -2722,23 +3751,35 @@ def prepare_native_package(
     configuration: str | None = None,
     assembly: str | None = None,
     on_event=None,
+    on_activity=None,
 ) -> PreparedPackage:
-    """Derive a prepared package from one immutable native engineering directory."""
+    """Read one immutable engineering directory natively, then derive purely.
+
+    The native-reading adapter is the only step that needs Windows/COM; the
+    derivation below is pure and can run wherever the raw record is available.
+    ``on_activity`` observes the native read and can never change the derived
+    record, the returned package or any failure path.
+    """
 
     settings = settings or DiscoverySettings()
-    frozen_source = Path(frozen_source)
-    output = Path(output)
-    if frozen_source.is_symlink() or frozen_source.is_junction() or not frozen_source.is_dir():
-        raise PipelineError("frozen_source must be an existing native engineering directory, not a link")
-    if output.exists() and any(output.iterdir()):
-        raise PipelineError("prepared output directory must be empty")
-    native_files = package_inventory(frozen_source)
-    handoff_sha256 = digest(native_files)
-    authored = sorted(
-        name for name in native_files if name in {ROBOT_FILE, REVISION_FILE} or name.startswith("discovery/")
+    _check_derivation_paths(Path(frozen_source), Path(output))
+    _check_authored_files(package_inventory(Path(frozen_source)))
+    record = read_native_record(frozen_source, settings, backend=backend, on_activity=on_activity)
+    return derive_native_package(
+        frozen_source,
+        output,
+        run_id,
+        record,
+        settings=settings,
+        configuration=configuration,
+        assembly=assembly,
+        on_event=on_event,
     )
-    if authored:
-        raise PipelineError(f"frozen_source already contains authored package files: {authored[:5]}")
+
+
+def read_native_record(frozen_source: Path, settings: DiscoverySettings, *, backend=None, on_activity=None) -> dict:
+    """Native-reading adapter: the only step that needs Windows/COM and a CAD session."""
+
     if backend is None:
         from .native import SolidWorksBackend
         from ...runtime import native_readiness
@@ -2748,22 +3789,134 @@ def prepare_native_package(
     native_settings = {"namespace": NAMESPACE, "contract": CONTRACT}
     if settings.main_assembly:
         native_settings["main_assembly"] = settings.main_assembly
-    record = backend.discover_native(frozen_source, native_settings)
+    record = backend.discover_native(Path(frozen_source), native_settings, on_activity=_guarded_sink(on_activity))
     if not isinstance(record, dict) or record.get("schema_version") != DISCOVERY_SCHEMA:
         raise PipelineError("native discovery backend returned an unexpected record schema")
+    return record
+
+
+def derive_native_package(
+    frozen_source: Path,
+    output: Path,
+    run_id: str,
+    record: dict,
+    *,
+    settings: DiscoverySettings | None = None,
+    configuration: str | None = None,
+    assembly: str | None = None,
+    on_event=None,
+) -> PreparedPackage:
+    """Derive a prepared package purely from a raw native record.
+
+    No backend, COM or session import happens here: the record is validated,
+    its file bindings are proven against the frozen bytes, and the robot
+    document, revision and findings follow from that evidence.
+    """
+
+    settings = settings or DiscoverySettings()
+    _check_derivation_paths(Path(frozen_source), Path(output))
+    if not isinstance(record, dict) or record.get("schema_version") != DISCOVERY_SCHEMA:
+        raise PipelineError("native discovery record has an unexpected schema")
+    frozen_source = Path(frozen_source)
+    output = Path(output)
+    native_files = package_inventory(frozen_source)
+    handoff_sha256 = digest(native_files)
+    _check_authored_files(native_files)
     _validate_native_record(record)
-    if settings.main_assembly:
-        identity_block = record.get("identity") if isinstance(record.get("identity"), dict) else {}
-        recorded_main = identity_block.get("main_assembly")
-        if not _text(recorded_main):
-            recorded_main = _identity_value(record, NAMESPACE, "main_assembly")
-        recorded_main = str(recorded_main).replace("\\", "/") if _text(recorded_main) else None
-        if recorded_main != settings.main_assembly:
-            raise PipelineError(
-                "Native discovery did not open the selected main assembly "
-                f"({recorded_main!r} != {settings.main_assembly!r})"
-            )
+    record_files = record.get("files")
+    if not isinstance(record_files, dict) or not record_files:
+        raise PipelineError(
+            "native discovery record carries no bound file inventory; the frozen bytes cannot be tied to the record"
+        )
+    for name, recorded_sha in record_files.items():
+        if not isinstance(recorded_sha, str) or native_files.get(str(name)) != recorded_sha:
+            raise PipelineError(f"native discovery record file binding does not match the frozen directory: {name!r}")
+    identity_block = record.get("identity") if isinstance(record.get("identity"), dict) else {}
+    recorded_main = identity_block.get("main_assembly")
+    if not _text(recorded_main):
+        recorded_main = _identity_value(record, NAMESPACE, "main_assembly")
+    recorded_main = str(recorded_main).replace("\\", "/") if _text(recorded_main) else None
+    if recorded_main is None or recorded_main not in record_files:
+        raise PipelineError("the recorded main assembly is not bound by the record file inventory")
+    if settings.main_assembly and recorded_main != settings.main_assembly:
+        raise PipelineError(
+            "Native discovery did not open the selected main assembly "
+            f"({recorded_main!r} != {settings.main_assembly!r})"
+        )
+    declared_configuration = _identity_value(record, NAMESPACE, "delivery_configuration")
+    saved_configuration = record.get("saved_configuration")
+    if (
+        _text(declared_configuration)
+        and _text(saved_configuration)
+        and str(declared_configuration) != str(saved_configuration)
+    ):
+        raise PipelineError("the recorded delivery configuration disagrees with the saved assembly configuration")
+    recorded_configuration = saved_configuration if _text(saved_configuration) else declared_configuration
+    if configuration is not None:
+        if not _text(recorded_configuration):
+            raise PipelineError("an explicit configuration cannot be bound: the record carries no usable configuration")
+        if str(configuration) != str(recorded_configuration):
+            raise PipelineError("the requested configuration does not match the recorded delivery configuration")
     findings: list[dict] = []
+    components = record.get("components")
+    if not isinstance(components, list):
+        findings.append(
+            _finding(
+                "discovery.suppression_state_invalid",
+                "assembly",
+                "the native record carries no component list to classify",
+                {"components": type(components).__name__},
+            )
+        )
+    for item in components if isinstance(components, list) else []:
+        if not isinstance(item, dict):
+            findings.append(
+                _finding(
+                    "discovery.suppression_state_invalid",
+                    "assembly",
+                    "a raw component entry is not an object",
+                    {"entry": repr(item)[:200]},
+                )
+            )
+            continue
+        name = str(item.get("name2") or "?")
+        state = item.get("suppression_state")
+        if type(state) is not int or state not in {0, 1, 2, 3, 4}:
+            findings.append(
+                _finding(
+                    "discovery.suppression_state_invalid",
+                    f"component:{name}",
+                    "every component must carry the documented raw suppression state "
+                    "(integer 0..4); state 5 and missing, boolean or undocumented values are refused",
+                    {"suppression_state": state},
+                )
+            )
+            continue
+        suppressed = item.get("suppressed")
+        lightweight = item.get("lightweight")
+        if type(suppressed) is not bool or type(lightweight) is not bool:
+            findings.append(
+                _finding(
+                    "discovery.suppression_state_invalid",
+                    f"component:{name}",
+                    "every component must carry boolean suppressed and lightweight flags",
+                    {"suppressed": suppressed, "lightweight": lightweight},
+                )
+            )
+            continue
+        if suppressed != (state == 0) or lightweight != (state in {1, 4}):
+            findings.append(
+                _finding(
+                    "discovery.suppression_state_incoherent",
+                    f"component:{name}",
+                    "the emitted suppression flags must agree with the raw suppression state",
+                    {
+                        "suppression_state": state,
+                        "suppressed": suppressed,
+                        "lightweight": lightweight,
+                    },
+                )
+            )
     known_occurrences = {
         str(item.get("name2"))
         for item in record.get("components") or []
@@ -2819,57 +3972,88 @@ def prepare_native_package(
         record, settings, findings, configuration=configuration, assembly=assembly, native_files=native_files
     )
     checks, budget_entry = _budgets(record, settings, findings)
-    clusters = _clusters(record, findings)
-    bodies, by_root = _body_records(record, clusters, settings, findings)
-    joints = _joint_facts(record, clusters, settings, findings)
-    root = _root_body(record, clusters, bodies, NAMESPACE, findings)
-    if root is not None:
-        if root["name"] != "base_link":
-            findings.append(
-                _finding(
-                    "discovery.root_name_missing",
-                    f"body:{root['root']}",
-                    "the fixed body must own a CS_base_link coordinate system",
-                    {"name": root["name"], "datum": root["datum"]},
+    exporter_block = record.get("exporter")
+    exporter_mode = "exporter" in record and not (
+        isinstance(exporter_block, dict) and exporter_block.get("state") == "absent"
+    )
+    if exporter_mode:
+        declaration = _exporter_declaration(record, identity, findings)
+        bodies, joints, frames, derived_names = [], [], [], {}
+        if declaration is not None:
+            bodies, clusters = _exporter_memberships(record, declaration, findings)
+            joints = _exporter_joint_facts(record, declaration, bodies, findings)
+            root = next(body for body in bodies if body["name"] == declaration["root"])
+            if root["name"] != "base_link":
+                findings.append(
+                    _finding(
+                        "discovery.root_name_missing",
+                        f"body:{root['name']}",
+                        "the declared root link must be named base_link",
+                    )
                 )
-            )
+            _exporter_constraint_checks(declaration, clusters, joints, findings)
+            frames = _interface_frames(record, clusters, bodies, root, findings)
+            for body in bodies:
+                if settings.frozen_names.get(body["identity"], body["name"]) != body["name"]:
+                    findings.append(
+                        _finding(
+                            "discovery.name_frozen_mismatch",
+                            f"body:{body['name']}",
+                            "saved declaration differs from the frozen published name",
+                        )
+                    )
     else:
-        bodies.append(
-            {
-                "root": "__unresolved__",
-                "components": [],
-                "owners": [],
-                "name": "base_link",
-                "source": "placeholder",
-                "identity": "assembly",
-                "datum": "",
-            }
-        )
-        by_root = {item["root"]: item for item in bodies}
-    base = _attached_base(clusters, bodies, root)
-    _frame_attachment_findings(record, clusters, bodies, findings)
-    _orient(joints, bodies, by_root, root, findings)
-    derived_names = _joint_names(joints, settings, findings)
-    for body in bodies:
-        if body["source"] == "frozen":
-            derived_names[body["identity"]] = body["name"]
-    seen_names: dict[str, str] = {}
-    for body in bodies:
-        if body["name"] in seen_names:
-            findings.append(
-                _finding(
-                    "discovery.body_name_duplicate",
-                    f"body:{body['root']}",
-                    "two rigid bodies resolve to the same name",
-                    {"name": body["name"], "other": seen_names[body["name"]]},
+        clusters = _clusters(record, findings)
+        bodies, by_root = _body_records(record, clusters, settings, findings)
+        joints = _joint_facts(record, clusters, settings, findings)
+        root = _root_body(record, clusters, bodies, NAMESPACE, findings)
+        if root is not None:
+            if root["name"] != "base_link":
+                findings.append(
+                    _finding(
+                        "discovery.root_name_missing",
+                        f"body:{root['root']}",
+                        "the fixed body must own a CS_base_link coordinate system",
+                        {"name": root["name"], "datum": root["datum"]},
+                    )
                 )
-            )
         else:
-            seen_names[body["name"]] = body["root"]
-    by_name = {body["name"]: body for body in bodies}
-    _frame_checks(joints, by_name, record, base, findings)
-    frames = _interface_frames(record, clusters, bodies, base, findings)
-    _jcs_check(record, joints, by_name, base, findings)
+            bodies.append(
+                {
+                    "root": "__unresolved__",
+                    "components": [],
+                    "owners": [],
+                    "name": "base_link",
+                    "source": "placeholder",
+                    "identity": "assembly",
+                    "datum": "",
+                }
+            )
+            by_root = {item["root"]: item for item in bodies}
+        base = _attached_base(clusters, bodies, root)
+        _frame_attachment_findings(record, clusters, bodies, findings)
+        _orient(joints, bodies, by_root, root, findings)
+        derived_names = _joint_names(joints, settings, findings)
+        for body in bodies:
+            if body["source"] == "frozen":
+                derived_names[body["identity"]] = body["name"]
+        seen_names: dict[str, str] = {}
+        for body in bodies:
+            if body["name"] in seen_names:
+                findings.append(
+                    _finding(
+                        "discovery.body_name_duplicate",
+                        f"body:{body['root']}",
+                        "two rigid bodies resolve to the same name",
+                        {"name": body["name"], "other": seen_names[body["name"]]},
+                    )
+                )
+            else:
+                seen_names[body["name"]] = body["root"]
+        by_name = {body["name"]: body for body in bodies}
+        _frame_checks(joints, by_name, record, base, findings)
+        frames = _interface_frames(record, clusters, bodies, base, findings)
+        _jcs_check(record, joints, by_name, base, findings)
     blocking = [item for item in findings if item["blocking"]]
     output.mkdir(parents=True, exist_ok=True)
     discovery_path = output / DISCOVERY_FILE
@@ -2902,6 +4086,12 @@ def prepare_native_package(
         "generator_version": GENERATOR_VERSION,
         "handoff_sha256": handoff_sha256,
         "native_files": native_files,
+        "derivation": {
+            "frozen_names": dict(settings.frozen_names),
+            "record_roots": [str(root) for root in settings.record_roots],
+            "main_assembly": recorded_main,
+            "configuration": configuration,
+        },
         "identity": identity,
         "records": [],
         "frozen_names": derived_names,
@@ -2953,16 +4143,26 @@ def prepare_native_package(
         identity, bodies, joints, record, settings, records, checks, frames, run_id, discovery_sha256, handoff_sha256
     )
     _write_yaml(output / ROBOT_FILE, document)
-    seal_revision(
-        output,
-        hardware_id=identity["hardware_id"],
-        revision=identity["revision"],
-        owner=identity["owner"],
-        system=identity["control"]["system"],
-        reference=identity["control"]["reference"],
-        summary=identity["change_summary"],
-        parent_revision=identity["parent_revision"],
+    # A partial administrative identity cannot seal a revision manifest.  The
+    # prepared package still proceeds so measurement and inspection continue;
+    # publication readiness stays deferred with the nonblocking findings above.
+    sealed_identity = all(
+        identity[field] is not None for field in ("hardware_id", "revision", "owner", "change_summary", "control")
     )
+    if sealed_identity:
+        seal_revision(
+            output,
+            hardware_id=identity["hardware_id"],
+            revision=identity["revision"],
+            owner=identity["owner"],
+            system=identity["control"]["system"],
+            reference=identity["control"]["reference"],
+            summary=identity["change_summary"],
+            parent_revision=identity["parent_revision"],
+        )
+        revision_sha256 = hashlib.sha256((output / REVISION_FILE).read_bytes()).hexdigest()
+    else:
+        revision_sha256 = ""
     from .input import load_package
 
     loaded = load_package(output)
@@ -2972,7 +4172,7 @@ def prepare_native_package(
         package=output,
         handoff_sha256=handoff_sha256,
         prepared_sha256=digest(inventory(output)),
-        revision_sha256=hashlib.sha256((output / REVISION_FILE).read_bytes()).hexdigest(),
+        revision_sha256=revision_sha256,
         hardware_id=identity["hardware_id"],
         revision=identity["revision"],
         source=loaded,
@@ -2999,7 +4199,7 @@ def _robot_document(
     by_name = {body["name"]: body for body in bodies}
     source: dict[str, Any] = {
         "provider": "solidworks",
-        "robot_name": identity["robot_name"],
+        "robot_name": identity.get("robot_name") or identity.get("robot_name_technical") or "robot",
         "assembly": identity["main_assembly"],
         "configuration": identity["delivery_configuration"],
         "bodies": [
@@ -3013,6 +4213,7 @@ def _robot_document(
             if body["components"]
         ],
         "joints": [],
+        "frames": [],
         "material_source": "cad",
     }
     if frames:
@@ -3029,10 +4230,35 @@ def _robot_document(
         if "parent" not in joint or "name" not in joint:
             continue
         body = by_name[joint["child"]]
-        datum = _datum(record, body["datum"], body["owners"])
+        datum = _body_datum(record, body)
+        if joint["type"] == "fixed":
+            source["joints"].append(
+                {
+                    "id": joint["name"],
+                    "name": joint["name"],
+                    "type": "fixed",
+                    "parent": joint["parent"],
+                    "child": joint["child"],
+                }
+            )
+            continue
         axis = _axis_in_child(joint, datum) if datum is not None else None
         if axis is None:
             raise PipelineError(f"joint {joint['name']!r} has no usable child frame")
+        if joint.get("axis", {}).get("source") == "exporter":
+            # The authored declaration is the source claim once the native
+            # geometry and its sign were proved consistent above; emitting the
+            # reprojected native line here would add float noise that the
+            # independent declaration check rejects.  The native line stays
+            # independently verified from the reference-axis evidence.
+            declared_axis = joint.get("declared_axis")
+            if (
+                not isinstance(declared_axis, (list, tuple))
+                or len(declared_axis) != 3
+                or not all(type(value) in (int, float) and math.isfinite(value) for value in declared_axis)
+            ):
+                raise PipelineError(f"joint {joint['name']!r} has no exact authored axis")
+            axis = [float(value) for value in declared_axis]
         entry: dict[str, Any] = {
             "id": joint["name"],
             "name": joint["name"],
@@ -3042,7 +4268,21 @@ def _robot_document(
             "axis": axis,
             "axis_reference": joint["axis_reference"],
         }
-        if joint["type"] == "continuous":
+        if joint["axis"].get("source") == "exporter":
+            entry["limits"] = {
+                key: float(joint["limits"][key])
+                for key in (
+                    ("effort", "velocity")
+                    if joint["type"] == "continuous"
+                    else ("lower", "upper", "effort", "velocity")
+                )
+            }
+            entry["limit_evidence"] = {
+                "file": DISCOVERY_FILE,
+                "sha256": discovery_sha256,
+                "anchor": record["exporter"]["raw_xml_sha256"],
+            }
+        elif joint["type"] == "continuous":
             entry["limits"] = {
                 "effort": float(joint["drive"]["value"]["effort"]),
                 "velocity": float(joint["drive"]["value"]["velocity"]),

@@ -41,8 +41,10 @@ from description_pipeline.orchestration.portal import (
     load_portal_config,
 )
 from description_pipeline.orchestration.uploads import MAX_FILE_BYTES, MAX_FILES, MAX_TOTAL_BYTES
+from description_pipeline.io import PipelineError
 from description_pipeline.stages import CONTRACT
-from tests.v1.test_airflow_client import RUN_ID, MockEndpoint
+
+from .protocol_support import protocol_events
 
 AIRFLOW_TOKEN = "airflow-session-token"
 FEISHU_NAME = "崔工"
@@ -54,6 +56,7 @@ ADMIN_TOKEN = "airflow-admin-token"
 NO_NAME_TOKEN = "airflow-no-name-token"
 NO_NAME_PRINCIPAL = "cli_app:tenant-a:ou_noname"
 DAG_RUN_ID = "portal-20261007T000000-abcdef01"
+RUN_ID = native_run_id(DAG_RUN_ID)
 _DEFAULT_ACTOR = object()
 
 
@@ -385,12 +388,15 @@ class PortalClient:
 
 
 def _endpoint_files() -> dict[str, str]:
-    artifacts = {
+    return {name: hashlib.sha256(data).hexdigest() for name, data in _endpoint_artifacts().items()}
+
+
+def _endpoint_artifacts() -> dict[str, bytes]:
+    return {
         "urdf/robot.urdf": b"<robot name='fixture'/>",
         "meshes/base.stl": b"solid base",
         "meshes/a b.stl": b"solid spaced",
     }
-    return {name: hashlib.sha256(data).hexdigest() for name, data in artifacts.items()}
 
 
 def _preview_payload() -> dict:
@@ -426,6 +432,190 @@ def _upload_body(
     return b"".join(chunks)
 
 
+class FakeEndpoint:
+    """Two-leg endpoint stand-in: job snapshots and rerun plans only, no preview route."""
+
+    def __init__(self, token: str = "test-token") -> None:
+        self.token = token
+        self.jobs: dict[str, dict] = {}
+        self.rerun_payloads: dict[str, dict] = {}
+        self.requests: list[str] = []
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args) -> None:
+                return
+
+            def _send(self, code: int, payload: dict) -> None:
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self) -> None:
+                outer.requests.append(self.path)
+                if self.headers.get("Authorization") != f"Bearer {outer.token}":
+                    self._send(401, {"error": "unauthorized"})
+                    return
+                if not self.path.startswith("/v1/jobs/"):
+                    self._send(404, {"error": "not found"})
+                    return
+                parts = self.path.split("/")
+                run_id = parts[3] if len(parts) > 3 else ""
+                if len(parts) >= 5 and parts[4] == "reruns":
+                    payload = outer.rerun_payloads.get(run_id)
+                    if payload is None:
+                        self._send(404, {"error": "no rerun plan"})
+                        return
+                    self._send(200, payload)
+                    return
+                if len(parts) != 4:
+                    self._send(404, {"error": "not found"})
+                    return
+                job = outer.jobs.get(run_id)
+                if job is None:
+                    self._send(404, {"error": "unknown run_id"})
+                    return
+                self._send(200, job)
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+    def __enter__(self) -> FakeEndpoint:
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.close()
+
+
+class _DigestStream:
+    """Bounded faithful artifact stream: the bound digest is verified at EOF."""
+
+    def __init__(self, data: bytes, expected: str) -> None:
+        self._data = data
+        self._expected = expected
+        self._offset = 0
+        self._verified = False
+
+    def read(self, size: int = -1) -> bytes:
+        if self._offset >= len(self._data):
+            if not self._verified:
+                self._verified = True
+                if hashlib.sha256(self._data).hexdigest() != self._expected:
+                    raise PipelineError("Delivery artifact failed its digest check")
+            return b""
+        end = len(self._data) if size is None or size < 0 else min(len(self._data), self._offset + size)
+        chunk = self._data[self._offset : end]
+        self._offset = end
+        return chunk
+
+    def close(self) -> None:
+        return
+
+    def __enter__(self) -> _DigestStream:
+        return self
+
+    def __exit__(self, *args) -> None:
+        return
+
+
+class PreviewStore:
+    """Bounded faithful double of the LinuxStore preview/artifact ownership.
+
+    It mirrors the exact surface the portal consumes (meta, delivery_dir, preview,
+    open_artifact, merged_job); the real store integrity rules stay covered by the
+    store's own tests.
+    """
+
+    def __init__(self, root: Path | None = None) -> None:
+        self.runs: dict[str, dict] = {}
+        self.root = Path(root) if root is not None else Path("/bounded-store")
+
+    def run_dir(self, run_id: str) -> Path:
+        path = self.root / run_id
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def add(
+        self,
+        run_id: str,
+        *,
+        meta: dict | None = None,
+        delivery: bool = False,
+        preview: dict | None = None,
+        artifacts: dict[str, bytes] | None = None,
+        checkpoints: tuple[str, ...] = (),
+        merged: dict | None = None,
+    ) -> None:
+        self.runs[run_id] = {
+            "meta": meta,
+            "delivery": delivery,
+            "preview": preview,
+            "artifacts": dict(artifacts or {}),
+            "checkpoints": tuple(checkpoints),
+            "merged": dict(merged or {}),
+        }
+
+    def meta(self, run_id: str) -> dict | None:
+        entry = self.runs.get(run_id)
+        if entry is None or entry["meta"] is None:
+            return None
+        return dict(entry["meta"])
+
+    def delivery_dir(self, run_id: str) -> Path | None:
+        entry = self.runs.get(run_id)
+        return self.root / run_id / "delivery" if entry and entry["delivery"] else None
+
+    def preview(self, run_id: str) -> dict:
+        entry = self.runs.get(run_id)
+        if entry is None or entry["preview"] is None:
+            raise PipelineError("The retained delivery has not passed independent verification")
+        return dict(entry["preview"])
+
+    def open_artifact(self, run_id: str, name: str, *, sha256: str):
+        entry = self.runs.get(run_id) or {}
+        preview = entry.get("preview") or {}
+        if (preview.get("files") or {}).get(name) != sha256:
+            raise PipelineError("The requested artifact is not part of the previewed delivery")
+        data = (entry.get("artifacts") or {}).get(name)
+        if data is None:
+            raise PipelineError("The previewed delivery no longer carries this artifact")
+        # The digest is verified on the stream at EOF, exactly like the real store: tampered
+        # bytes surface as a stream failure, never as a missing binding.
+        return _DigestStream(data, sha256), len(data)
+
+    def checkpoint_dir(self, run_id: str, stage: str) -> Path:
+        entry = self.runs.get(run_id)
+        stages = (entry or {}).get("checkpoints") or ()
+        if stage not in stages:
+            raise PipelineError(f"The attempt retains no {stage} checkpoint")
+        return Path("/bounded-store") / run_id / stage
+
+    def merged_job(self, run_id: str, native: dict | None = None) -> dict:
+        merged = (
+            dict(native)
+            if isinstance(native, dict)
+            else {
+                "schema_version": "solidworks-to-urdf.job/v1",
+                "pipeline_id": PIPELINE_ID,
+                "run_id": run_id,
+                "events": [],
+                "result": None,
+                "error": None,
+            }
+        )
+        entry = self.runs.get(run_id) or {}
+        merged.update(entry.get("merged") or {})
+        return merged
+
+
 class PortalTests(unittest.TestCase):
     def setUp(self) -> None:
         self.airflow = MockAirflow()
@@ -433,18 +623,23 @@ class PortalTests(unittest.TestCase):
         self.addCleanup(self.airflow.__exit__, None, None, None)
         self.upload_root = Path(tempfile.mkdtemp(prefix="portal-upload-"))
         self.addCleanup(shutil.rmtree, self.upload_root, ignore_errors=True)
-        self.endpoint_server = MockEndpoint(
-            preview_payload=_preview_payload(),
-        )
+        self.endpoint_server = FakeEndpoint()
         self.endpoint_server.__enter__()
         self.addCleanup(self.endpoint_server.__exit__, None, None, None)
         self.endpoint = WindowsEndpoint(EndpointConfig(base_url=self.endpoint_server.url, token="test-token"))
+        self.store_root = Path(tempfile.mkdtemp(prefix="portal-store-"))
+        self.addCleanup(shutil.rmtree, self.store_root, ignore_errors=True)
+        self.store = PreviewStore(self.store_root)
+        store_patch = patch("description_pipeline.orchestration.portal.LinuxStore", lambda root: self.store)
+        store_patch.start()
+        self.addCleanup(store_patch.stop)
         self.static_dir = Path(__file__).resolve().parents[2] / "src/description_pipeline/orchestration/static"
         config = PortalConfig(
             airflow=AirflowApi(self.airflow.url),
             endpoint=lambda: self.endpoint,
             static_dir=self.static_dir,
             upload_root=self.upload_root,
+            pipeline_store_root=self.store_root,
         )
         self.server = make_server(
             "127.0.0.1",
@@ -469,6 +664,7 @@ class PortalTests(unittest.TestCase):
             endpoint=lambda: self.endpoint,
             static_dir=self.static_dir,
             upload_root=self.upload_root,
+            pipeline_store_root=self.store_root,
         )
         server = make_server(
             "127.0.0.1", 0, PortalApp(config), server_class=_ThreadingWSGIServer, handler_class=_QuietHandler
@@ -484,10 +680,91 @@ class PortalTests(unittest.TestCase):
     def _seed_passed_job(self, dag_run_id: str = DAG_RUN_ID) -> str:
         self._seed_airflow_run(dag_run_id, state="success")
         run_id = native_run_id(dag_run_id)
-        self.endpoint.start_job(run_id=run_id, resolution=self.endpoint.resolve_handoff("handoff/m3.0"))
-        self.endpoint.get_job(run_id)
-        self.endpoint.get_job(run_id)
+        self._seed_job(dag_run_id, status="passed", result=self._passed_result())
+        self.store.add(
+            run_id,
+            meta={"handoff_sha256": "d" * 64},
+            delivery=True,
+            preview=_preview_payload(),
+            artifacts=_endpoint_artifacts(),
+            checkpoints=("capture", "generate", "verify"),
+        )
         return dag_run_id
+
+    def _passed_result(self, *, subject: str = "a" * 64, quality_subject: str | None = None) -> dict:
+        return {
+            "passed": True,
+            "pipeline_id": PIPELINE_ID,
+            "output": "build/out",
+            "subject_sha256": subject,
+            "quality": {
+                "passed": True,
+                "subject_sha256": quality_subject or subject,
+                "checks": [{"id": "x", "state": "passed"}],
+            },
+            "submission": {
+                "passed": True,
+                "subject_sha256": subject,
+                "base": "feature/m3.0",
+                "branch": "work/solidworks/m3.0",
+                "state": "published",
+                "commit": "c" * 40,
+                "repository_slug": "example/m3.0",
+                "url": "https://github.com/example/m3.0/pull/1",
+            },
+        }
+
+    def _seed_job(self, dag_run_id: str = DAG_RUN_ID, **overrides) -> dict:
+        """Direct fixture seeding: the two-leg job snapshot the portal reads, no endpoint API."""
+
+        run_id = native_run_id(dag_run_id)
+        job = {
+            "schema_version": "solidworks-to-urdf.job/v1",
+            "pipeline_id": PIPELINE_ID,
+            "run_id": run_id,
+            "request": {
+                "run_id": run_id,
+                "upload_files": {"cad/robot.SLDASM": "a" * 64},
+                "upload_sha256": "b" * 64,
+                "main_assembly": "cad/robot.SLDASM",
+            },
+            "status": "passed",
+            "events": protocol_events(),
+            "result": None,
+            "error": None,
+            "hardware_id": "m3.0",
+            "revision": "r1",
+            "repository_slug": "example/m3.0",
+            "repository_base": "feature/m3.0",
+        }
+        job.update(overrides)
+        self.endpoint_server.jobs[run_id] = job
+        return job
+
+    def _fail_job(self, dag_run_id: str = DAG_RUN_ID) -> None:
+        job = self.endpoint_server.jobs[native_run_id(dag_run_id)]
+        job.update(
+            status="failed",
+            error="cad capture failed",
+            result=None,
+            discovery={
+                "passed": False,
+                "findings": [
+                    {
+                        "schema_version": "native-discovery/finding/v1",
+                        "code": "discovery.axis_unresolved",
+                        "object": "mate:elbow-1",
+                        "message": "elbow axis cannot be resolved",
+                        "detail": {"route": "native"},
+                        "blocking": True,
+                    }
+                ],
+                "hardware_id": "m3.0",
+                "revision": "r1",
+                "discovery_sha256": "d" * 64,
+            },
+            events=protocol_events(failed_stage="discover"),
+        )
 
     def _seed_airflow_run(
         self,
@@ -588,7 +865,7 @@ class PortalTests(unittest.TestCase):
     def test_retry_native_failure_and_unavailable_evidence_are_diagnostics(self) -> None:
         self._seed_retryable_run()
         self.client.login()
-        self.endpoint_server.fail_job = True
+        self._fail_job()
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 200, body)
         self.assertEqual(json.loads(body)["retry"], {"eligible": False, "reason": "native_terminal_failure"})
@@ -1126,35 +1403,33 @@ class PortalTests(unittest.TestCase):
     def test_failed_job_reports_findings_and_no_success(self) -> None:
         self.client.login()
         self._seed_airflow_run(state="failed")
+        self._seed_job()
+        self._fail_job()
         run_id = native_run_id(DAG_RUN_ID)
-        with MockEndpoint(fail_job=True) as failing:
-            failing_endpoint = WindowsEndpoint(EndpointConfig(base_url=failing.url, token="test-token"))
-            failing_endpoint.start_job(run_id=run_id, resolution=failing_endpoint.resolve_handoff("handoff/m3.0"))
-            failing_endpoint.get_job(run_id)
-            self.endpoint = failing_endpoint
-            status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
-            self.assertEqual(status, 200, body)
-            payload = json.loads(body)
-            self.assertEqual(payload["automatic"]["state"], "failed")
-            self.assertEqual(payload["report"]["overall"]["state"], "failed")
-            self.assertEqual(payload["report"]["failure"]["stage"], "discover")
-            blocked = next(stage for stage in payload["report"]["stages"] if stage["id"] == "capture")
-            self.assertEqual(blocked["state_zh"], "上游阶段失败（未执行）")
-            self.assertTrue(any(check["id"] == "discovery.axis_unresolved" for check in payload["automatic"]["checks"]))
-            self.assertEqual(payload["coverage"]["structure"]["hardware_id"], "m3.0")
-            self.assertFalse(payload["discovery"]["passed"])
-            self.assertIsNone(payload["pr"])
-            self.assertTrue(any("cad capture failed" in finding["message"] for finding in payload["findings"]))
-            self.assertTrue(any(finding["object"] == "mate:elbow-1" for finding in payload["findings"]))
-            self.assertTrue(
-                any(
-                    finding.get("evidence", {}).get("detail", {}).get("route") == "native"
-                    and finding["evidence"]["discovery_sha256"] == "d" * 64
-                    for finding in payload["findings"]
-                )
+        self.store.add(run_id, meta={"handoff_sha256": "d" * 64}, delivery=True, preview=None)
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(payload["automatic"]["state"], "failed")
+        self.assertEqual(payload["report"]["overall"]["state"], "failed")
+        self.assertEqual(payload["report"]["failure"]["stage"], "discover")
+        blocked = next(stage for stage in payload["report"]["stages"] if stage["id"] == "capture")
+        self.assertEqual(blocked["state_zh"], "上游阶段失败（未执行）")
+        self.assertTrue(any(check["id"] == "discovery.axis_unresolved" for check in payload["automatic"]["checks"]))
+        self.assertEqual(payload["coverage"]["structure"]["hardware_id"], "m3.0")
+        self.assertFalse(payload["discovery"]["passed"])
+        self.assertIsNone(payload["pr"])
+        self.assertTrue(any("cad capture failed" in finding["message"] for finding in payload["findings"]))
+        self.assertTrue(any(finding["object"] == "mate:elbow-1" for finding in payload["findings"]))
+        self.assertTrue(
+            any(
+                finding.get("evidence", {}).get("detail", {}).get("route") == "native"
+                and finding["evidence"]["discovery_sha256"] == "d" * 64
+                for finding in payload["findings"]
             )
-            status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
-            self.assertEqual(status, 409)
+        )
+        status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
+        self.assertEqual(status, 409)
 
     def test_coverage_external_scope_ignores_job_confirmation_claims(self) -> None:
         self.client.login()
@@ -1182,10 +1457,103 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(headers.get("Content-Type"), "application/xml")
         status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/meshes/missing.stl")
         self.assertEqual(status, 404)
-        self.endpoint_server.artifacts["urdf/robot.urdf"] = b"tampered"
+        self.store.runs[RUN_ID]["artifacts"]["urdf/robot.urdf"] = b"tampered"
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/urdf/robot.urdf")
         self.assertEqual(status, 502)
         self.assertNotIn(b"tampered", body)
+        # Previews and artifacts are store-owned; the endpoint is never consulted for them.
+        self.assertFalse(any("preview" in path for path in self.endpoint_server.requests))
+
+    def test_failed_linux_run_serves_the_retained_structural_report(self) -> None:
+        self.client.login()
+        self._seed_airflow_run(DAG_RUN_ID, state="failed")
+        self._seed_job(DAG_RUN_ID)
+        self._fail_job(DAG_RUN_ID)
+        run_id = native_run_id(DAG_RUN_ID)
+        self.store.add(run_id, meta={"handoff_sha256": "d" * 64})
+        report = self.store.run_dir(run_id) / "reports/structural-team.md"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_bytes("# 结构团队报告\n\n阻塞项与警告见结构化证据。\n".encode())
+
+        status, headers, body = self.client.request(
+            "GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.md"
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body, report.read_bytes())
+        self.assertEqual(headers.get("Content-Type"), "text/markdown; charset=utf-8")
+        # The run page itself links the retained report; no URL hunting required.
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 200, body)
+        links = json.loads(body)["structural_report"]
+        self.assertEqual([entry["path"] for entry in links], ["reports/structural-team.md"])
+        self.assertEqual(links[0]["url"], f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.md")
+        self.assertTrue(links[0]["label_zh"])
+
+    def test_failed_native_run_serves_the_fetched_report_and_refuses_absent(self) -> None:
+        self.client.login()
+        self._seed_airflow_run(DAG_RUN_ID, state="failed")
+        self._seed_job(DAG_RUN_ID)
+        self._fail_job(DAG_RUN_ID)
+        run_id = native_run_id(DAG_RUN_ID)
+        self.store.add(run_id, meta={"handoff_sha256": "d" * 64})
+        markdown = self.store.run_dir(run_id) / "structural-team/structural-team.md"
+        markdown.parent.mkdir(parents=True, exist_ok=True)
+        markdown.write_bytes(b"native capture blocked\n")
+
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.md")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body, markdown.read_bytes())
+
+        # A member the run never retained is a clear 404, never a substitute report.
+        status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.json")
+        self.assertEqual(status, 404)
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 200, body)
+        links = json.loads(body)["structural_report"]
+        self.assertEqual([entry["path"] for entry in links], ["reports/structural-team.md"])
+
+    def test_verified_but_unpublished_run_serves_the_report_from_the_bound_delivery(self) -> None:
+        self.client.login()
+        self._seed_airflow_run(DAG_RUN_ID, state="failed")
+        self._seed_job(DAG_RUN_ID)
+        self._fail_job(DAG_RUN_ID)
+        run_id = native_run_id(DAG_RUN_ID)
+        # Verify green, publish unroutable: the bound delivery resolves to the verify
+        # checkpoint through store.delivery_dir and still carries the report.
+        self.store.add(run_id, meta={"handoff_sha256": "d" * 64}, delivery=True)
+        report = self.store.delivery_dir(run_id) / "reports/structural-team.md"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_bytes(b"verify checkpoint report\n")
+
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.md")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body, report.read_bytes())
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 200, body)
+        links = json.loads(body)["structural_report"]
+        self.assertEqual([entry["path"] for entry in links], ["reports/structural-team.md"])
+        # Authorization is unchanged: without a session the route refuses outright.
+        anonymous = PortalClient(self.client.base)
+        status, _, _ = anonymous.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.md")
+        self.assertEqual(status, 401)
+
+    def test_failed_publish_diagnostics_take_precedence_over_older_copies(self) -> None:
+        self.client.login()
+        self._seed_airflow_run(DAG_RUN_ID, state="failed")
+        self._seed_job(DAG_RUN_ID)
+        self._fail_job(DAG_RUN_ID)
+        run_id = native_run_id(DAG_RUN_ID)
+        self.store.add(run_id, meta={"handoff_sha256": "d" * 64}, delivery=True)
+        delivery = self.store.delivery_dir(run_id) / "reports/structural-team.md"
+        delivery.parent.mkdir(parents=True, exist_ok=True)
+        delivery.write_bytes(b"older delivered copy\n")
+        failed = self.store.run_dir(run_id) / "output.failed/reports/structural-team.md"
+        failed.parent.mkdir(parents=True, exist_ok=True)
+        failed.write_bytes(b"newest failed publish diagnostics\n")
+
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.md")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body, failed.read_bytes())
 
     def test_stage_view_exposes_contract_evidence_and_only_verified_assets_are_linkable(self) -> None:
         from description_pipeline.stages import CONTRACT, STAGE_IDS
@@ -1224,69 +1592,139 @@ class PortalTests(unittest.TestCase):
     def test_preview_waits_for_verification(self) -> None:
         self.client.login()
         self._seed_airflow_run()
-        run_id = native_run_id(DAG_RUN_ID)
-        self.endpoint.start_job(run_id=run_id, resolution=self.endpoint.resolve_handoff("handoff/m3.0"))
+        self._seed_job(
+            status="native_complete",
+            result={
+                "native_complete": True,
+                "capture_archive": {
+                    "name": "native-evidence.zip",
+                    "sha256": "a" * 64,
+                    "size": 1024,
+                    "manifest_sha256": "b" * 64,
+                },
+            },
+        )
         status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
         self.assertEqual(status, 404)
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 200, body)
-        self.assertEqual(json.loads(body)["automatic"]["state"], "passed")
+        automatic = json.loads(body)["automatic"]
+        # native_complete ends the native half only: no verified store delivery exists yet.
+        self.assertEqual(automatic["state"], "running")
+        self.assertEqual(automatic["job_state"], "native_complete")
 
     def test_verified_model_without_pull_request_is_still_previewable(self) -> None:
         self.client.login()
         self._seed_airflow_run(state="failed")
-        with MockEndpoint(omit_submission=True, preview_payload=_preview_payload()) as server:
-            endpoint = WindowsEndpoint(EndpointConfig(base_url=server.url, token="test-token"))
-            run_id = native_run_id(DAG_RUN_ID)
-            endpoint.start_job(run_id=run_id, resolution=endpoint.resolve_handoff("handoff/m3.0"))
-            endpoint.get_job(run_id)
-            endpoint.get_job(run_id)
-            self.endpoint = endpoint
-            status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
-            self.assertEqual(status, 200, body)
-            payload = json.loads(body)
-            self.assertEqual(payload["automatic"]["state"], "passed")
-            self.assertIsNone(payload["pr"])
-            status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
-            self.assertEqual(status, 200)
+        result = self._passed_result()
+        result["submission"] = {"passed": False, "subject_sha256": "a" * 64}
+        self._seed_job(status="failed", result=result, error="Incomplete or mismatched publication receipt")
+        self.store.add(
+            native_run_id(DAG_RUN_ID),
+            meta={"handoff_sha256": "d" * 64},
+            delivery=True,
+            preview=_preview_payload(),
+            artifacts=_endpoint_artifacts(),
+        )
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(payload["automatic"]["state"], "passed")
+        self.assertIsNone(payload["pr"])
+        status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
+        self.assertEqual(status, 200)
 
     def test_publication_failure_preserves_the_verified_preview(self) -> None:
         # Acceptance 8: a PR-service failure keeps the verified preview; the automatic summary
         # reflects the model qualification, not the overall job or publication state.
         self.client.login()
         self._seed_airflow_run(state="failed")
-        with MockEndpoint(publish_failed=True, preview_payload=_preview_payload()) as server:
-            endpoint = WindowsEndpoint(EndpointConfig(base_url=server.url, token="test-token"))
-            run_id = native_run_id(DAG_RUN_ID)
-            endpoint.start_job(run_id=run_id, resolution=endpoint.resolve_handoff("handoff/m3.0"))
-            endpoint.get_job(run_id)
-            self.endpoint = endpoint
-            status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
-            self.assertEqual(status, 200, body)
-            payload = json.loads(body)
-            self.assertEqual(payload["automatic"]["state"], "passed")
-            self.assertEqual(payload["job"]["status"], "failed")
-            self.assertIsNone(payload["pr"])
-            status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
-            self.assertEqual(status, 200, body)
-            self.assertEqual(json.loads(body)["urdf"], "urdf/robot.urdf")
+        subject = "a" * 64
+        self._seed_job(
+            status="failed",
+            error="Incomplete or mismatched publication receipt",
+            result={
+                "passed": False,
+                "pipeline_id": PIPELINE_ID,
+                "output": "build/out",
+                "stage": "publish",
+                "state": "failed",
+                "subject_sha256": subject,
+                "quality": {
+                    "passed": True,
+                    "subject_sha256": subject,
+                    "checks": [{"id": "physics.expected_mass", "state": "passed"}],
+                },
+                "submission": {
+                    "passed": False,
+                    "subject_sha256": subject,
+                    "base": "feature/m3.0",
+                    "branch": "work/solidworks/m3.0",
+                    "state": "failed",
+                    "error": "git_failed",
+                    "commit": "",
+                    "repository_slug": "example/m3.0",
+                },
+            },
+            events=protocol_events(subject=subject, failed_stage="publish"),
+        )
+        self.store.add(
+            native_run_id(DAG_RUN_ID),
+            meta={"handoff_sha256": "d" * 64},
+            delivery=True,
+            preview=_preview_payload(),
+            artifacts=_endpoint_artifacts(),
+        )
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(payload["automatic"]["state"], "passed")
+        self.assertEqual(payload["job"]["status"], "failed")
+        self.assertIsNone(payload["pr"])
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["urdf"], "urdf/robot.urdf")
 
     def test_publication_failure_with_mismatched_quality_is_still_blocked(self) -> None:
         self.client.login()
         self._seed_airflow_run(state="failed")
-        with MockEndpoint(publish_failed=True, quality_mismatch=True, preview_payload=_preview_payload()) as server:
-            endpoint = WindowsEndpoint(EndpointConfig(base_url=server.url, token="test-token"))
-            run_id = native_run_id(DAG_RUN_ID)
-            endpoint.start_job(run_id=run_id, resolution=endpoint.resolve_handoff("handoff/m3.0"))
-            endpoint.get_job(run_id)
-            self.endpoint = endpoint
-            status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
-            self.assertEqual(status, 200, body)
-            payload = json.loads(body)
-            self.assertEqual(payload["automatic"]["state"], "failed")
-            self.assertIn("subject_sha256 differs", payload["automatic"]["message"])
-            status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
-            self.assertEqual(status, 409)
+        subject = "a" * 64
+        self._seed_job(
+            status="failed",
+            error="Incomplete or mismatched publication receipt",
+            result={
+                "passed": False,
+                "pipeline_id": PIPELINE_ID,
+                "output": "build/out",
+                "stage": "publish",
+                "state": "failed",
+                "subject_sha256": subject,
+                "quality": {
+                    "passed": True,
+                    "subject_sha256": "b" * 64,
+                    "checks": [{"id": "physics.expected_mass", "state": "passed"}],
+                },
+                "submission": {
+                    "passed": False,
+                    "subject_sha256": subject,
+                    "base": "feature/m3.0",
+                    "branch": "work/solidworks/m3.0",
+                    "state": "failed",
+                    "error": "git_failed",
+                    "commit": "",
+                    "repository_slug": "example/m3.0",
+                },
+            },
+            events=protocol_events(subject=subject, failed_stage="publish"),
+        )
+        self.store.add(native_run_id(DAG_RUN_ID), meta={"handoff_sha256": "d" * 64}, delivery=True, preview=None)
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(payload["automatic"]["state"], "failed")
+        self.assertIn("subject_sha256 differs", payload["automatic"]["message"])
+        status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
+        self.assertEqual(status, 409)
 
     def test_static_assets_are_local_and_traversal_is_refused(self) -> None:
         client = PortalClient(self.client.base)
@@ -1564,24 +2002,40 @@ class PortalTests(unittest.TestCase):
     def test_rerun_attempt_refuses_ineligible_stage_with_earliest_required(self) -> None:
         self._seed_retryable_run()
         self.client.login()
-        rows = self._rerun_rows({"verify": (False, "dependency_changed", "discover")})
+        rows = self._rerun_rows({"capture": (False, "dependency_changed", "discover")})
         with patch.object(self.endpoint, "rerun_plan", create=True, return_value={"stage_reruns": rows}):
-            status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "verify"})
+            status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "capture"})
         self.assertEqual(status, 409, body)
         payload = json.loads(body)
         self.assertEqual(payload["reason"], "dependency_changed")
         self.assertEqual(payload["earliest_required"], "discover")
         self.assertTrue(payload["reason_zh"])
+        # A portable stage whose Linux checkpoint is missing refuses with the store's own reason.
+        self.store.runs[RUN_ID]["checkpoints"] = ("capture",)
+        with patch.object(self.endpoint, "rerun_plan", create=True, return_value={"stage_reruns": self._rerun_rows()}):
+            status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "verify"})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(json.loads(body)["reason"], "linux_checkpoint_missing")
         self.assertEqual(self.airflow.trigger_payloads, [])
 
     def test_rerun_attempt_without_planner_refuses_without_creating(self) -> None:
         self._seed_retryable_run()
         self.client.login()
+        # Without an admitted Linux attempt the Windows plan is the only restart evidence;
+        # its absence refuses instead of creating a linked run.
+        self.store.runs.pop(RUN_ID)
         with patch.object(self.endpoint, "rerun_plan", create=True, side_effect=EndpointError("planner offline")):
             status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
         self.assertEqual(status, 409, body)
         self.assertEqual(json.loads(body)["reason"], "endpoint_evidence_unavailable")
         self.assertEqual(self.airflow.trigger_payloads, [])
+        # With the admitted Linux attempt the store owns the restart surface: the linked
+        # portable rerun is still created while the Windows plan stays offline.
+        self._seed_retryable_run()
+        with patch.object(self.endpoint, "rerun_plan", create=True, side_effect=EndpointError("planner offline")):
+            status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
+        self.assertEqual(status, 202, body)
+        self.assertEqual(json.loads(body)["resume_from"], "generate")
 
     def test_rerun_attempt_reconciles_ambiguous_trigger(self) -> None:
         self._seed_retryable_run()
@@ -1626,15 +2080,30 @@ class PortalTests(unittest.TestCase):
     def test_run_detail_stage_reruns_passthrough_and_omission(self) -> None:
         self._seed_retryable_run()
         self.client.login()
+        # Without an admitted Linux attempt and without a Windows plan the key is omitted.
+        self.store.runs.pop(native_run_id(DAG_RUN_ID))
         with patch.object(self.endpoint, "rerun_plan", create=True, side_effect=EndpointError("planner offline")):
             status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 200, body)
         self.assertNotIn("stage_reruns", json.loads(body))
-        rows = self._rerun_rows()
+        # An admitted Linux attempt keeps its portable restart rows even without a Windows plan.
+        self._seed_retryable_run()
+        with patch.object(self.endpoint, "rerun_plan", create=True, side_effect=EndpointError("planner offline")):
+            status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 200, body)
+        linked = json.loads(body)["stage_reruns"]
+        self.assertEqual([row["stage"] for row in linked], [stage["id"] for stage in CONTRACT["stages"]])
+        portable = {row["stage"]: row for row in linked if row["stage"] in {"generate", "verify", "publish"}}
+        self.assertEqual({row["reason"] for row in portable.values()}, {"linux_ready"})
+        self.assertTrue(all(row["eligible"] for row in portable.values()))
+        # A Windows plan passes through with the Linux checkpoint overlay on the portable stages.
+        rows = [dict(row) for row in self._rerun_rows()]
         with patch.object(self.endpoint, "rerun_plan", create=True, return_value={"stage_reruns": rows}):
             status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 200, body)
-        self.assertEqual(json.loads(body)["stage_reruns"], rows)
+        served = json.loads(body)["stage_reruns"]
+        self.assertEqual([row["stage"] for row in served], [row["stage"] for row in rows])
+        self.assertTrue(all(row["eligible"] for row in served if row["stage"] in {"generate", "verify", "publish"}))
 
     def _write_rerun_reservation(self, attempt_id: str, stage: str) -> Path:
         folder = self.upload_root / ".rerun-attempts"

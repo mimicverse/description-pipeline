@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import copy
 import struct
 from pathlib import Path
 from typing import Any, cast
 from collections.abc import Sequence
 
 from description_pipeline.io import file_digest
+from description_pipeline.sources.solidworks.errors import CadError
 from description_pipeline.sources.solidworks.protocol import CadBackend, Matrix, RawComponent, RawScene
 
 
@@ -117,6 +119,103 @@ def mass_payload(
     }
 
 
+def compose_fixture_link_reads(
+    components: Sequence[dict[str, Any]],
+    effective: dict[str, dict[str, Any]],
+    selections: dict[str, Sequence[str]],
+    masses: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Fixture 'CAD' direct reads: the assembly-frame recombination of a selection.
+
+    Used by the fixture backend (so capture and scene agree exactly) and by
+    scene tests that need a valid link group record; divergence cases inject
+    their own read values instead.  The math is convention-free on purpose:
+    the native reader returns raw assembly numbers, and product-convention
+    refusals belong to the part rows, not to this read.
+    """
+
+    from description_pipeline.sources.solidworks.scene import combine_mass_properties  # noqa: PLC0415
+
+    def placed(transform: Sequence[float], com: Sequence[float]) -> list[float]:
+        rows = [list(transform[index : index + 3]) for index in (0, 4, 8)]
+        translation = [transform[3], transform[7], transform[11]]
+        return [
+            sum(rows[row][column] * float(com[column]) for column in range(3)) + translation[row]
+            for row in range(3)
+        ]
+
+    def rotated(transform: Sequence[float], inertia: Sequence[Sequence[float]]) -> list[list[float]]:
+        rows = [list(transform[index : index + 3]) for index in (0, 4, 8)]
+        rotated_rows = [
+            [sum(rows[row][k] * float(inertia[k][column]) for k in range(3)) for column in range(3)]
+            for row in range(3)
+        ]
+        return [
+            [sum(rotated_rows[row][k] * rows[column][k] for k in range(3)) for column in range(3)]
+            for row in range(3)
+        ]
+
+    def entry_for(name: str, payload: dict[str, Any], transform: Sequence[float]) -> dict[str, Any]:
+        scope = (payload.get("reference") or {}).get("scope") or "part_document"
+        com = [float(value) for value in payload["com"]]
+        inertia = [[float(value) for value in row] for row in payload["inertia"]]
+        if scope == "assembly_component_group":
+            return {"mass": float(payload["mass"]), "com": com, "inertia": inertia}
+        return {
+            "mass": float(payload["mass"]),
+            "com": placed(transform, com),
+            "inertia": rotated(transform, inertia),
+        }
+
+    by_name: dict[str, tuple[Any, dict[str, Any]]] = {}
+    for entry in components:
+        if isinstance(entry, dict):
+            by_name[str(entry["name"])] = (entry.get("transform") or _identity(), entry["mass"])
+        else:
+            mass = getattr(entry, "mass", None)
+            if mass is None and masses is not None:
+                mass = masses[str(entry.name)]
+            by_name[str(entry.name)] = (getattr(entry, "transform", None) or _identity(), mass)
+    links: dict[str, dict[str, Any]] = {}
+    for body, names in selections.items():
+        entries = []
+        claimed: set[str] = set()
+        for name in names:
+            parts = str(name).split("/")
+            ancestors = ["/".join(parts[:index]) for index in range(1, len(parts) + 1)]
+            provider = next((ancestor for ancestor in ancestors if ancestor in effective), None)
+            if provider is not None:
+                if provider in claimed:
+                    continue
+                claimed.add(provider)
+                payload = dict(effective[provider], mass_source="cad")
+                transform = by_name.get(provider, (_identity(), None))[0]
+                entries.append(entry_for(provider, payload, transform))
+            else:
+                transform, mass = by_name[str(name)]
+                entries.append(entry_for(str(name), mass, _matrix16(transform)))
+        combined = combine_mass_properties(entries)
+        read = {
+            "mass_kg": float(combined["mass"]),
+            "volume_m3": None,
+            "density_kg_m3": None,
+            "com_m": [float(value) for value in combined["com"]],
+            "inertia_tensor_about_com": [[float(value) for value in row] for row in combined["inertia"]],
+            "inertia_values_about_origin_api": {"error": "fixture"},
+            "overrides": {
+                "OverrideMass": False,
+                "OverrideCenterOfMass": False,
+                "OverrideMomentsOfInertia": False,
+            },
+        }
+        links[str(body)] = {
+            "selection": [str(name) for name in names],
+            "reads": [read, copy.deepcopy(read)],
+            "reproducibility": {"mass_delta_kg": 0.0, "com_delta_norm_m": 0.0, "tensor_delta_max_abs": 0.0},
+        }
+    return links
+
+
 class FixtureCadBackend(CadBackend):
     """A CAD host with deterministic content and no SolidWorks."""
 
@@ -187,6 +286,10 @@ class FixtureCadBackend(CadBackend):
         return [str(self.document), *(str(path) for path in self._dependencies)]
 
     def open_document(self, path: str) -> dict[str, Any]:
+        order = getattr(self, "order", None)
+        if order is None:
+            order = self.order = []
+        order.append("open_document")
         self.open_documents.append(str(path))
         return {"opened": Path(path).name, "path": str(path), "read_only": True}
 
@@ -229,7 +332,30 @@ class FixtureCadBackend(CadBackend):
             for item in self._dependencies
         ]
 
-    def collect_dependencies(self, path: str, destination_dir: str) -> dict[str, Any]:
+    def collect_dependencies(
+        self,
+        path: str,
+        destination_dir: str,
+        *,
+        skip_missing=(),
+        skip_session_temp: bool = False,
+        excluded_paths=(),
+        required_names=(),
+        admitted_roots=(),
+        closure_documents=None,
+        required_paths=(),
+    ) -> dict[str, Any]:
+        self.collect_skips = {
+            "skip_missing": sorted(str(item) for item in skip_missing),
+            "skip_session_temp": bool(skip_session_temp),
+            "excluded_paths": sorted(str(item) for item in excluded_paths),
+            "required_names": sorted(str(item) for item in required_names),
+            "admitted_roots": [str(item) for item in admitted_roots],
+            "closure_documents": (
+                sorted((closure_documents or {}).keys()) if isinstance(closure_documents, dict) else None
+            ),
+            "required_paths": sorted(str(item) for item in required_paths),
+        }
         target = Path(destination_dir)
         target.mkdir(parents=True, exist_ok=True)
         self.collected = []
@@ -264,6 +390,9 @@ class FixtureCadBackend(CadBackend):
                 "ok": bool(self.collected),
             },
             "files": list(self.collected),
+            "skipped_missing": self.collect_skips["skip_missing"],
+            "skipped_session_temp": [],
+            "skipped_excluded": self.collect_skips["excluded_paths"],
             "mapping": {
                 str(item): str(target / Path(item).name)
                 for item in [self.document, *self._dependencies]
@@ -325,6 +454,8 @@ class FixtureCadBackend(CadBackend):
                     "document": str(document) if document is not None else None,
                     "document_name": document.name.lower() if document is not None else None,
                     "configuration": configuration,
+                    "defining": str(Path(assembly_path)),
+                    "defining_anchor": None,
                     "suppressed": is_suppressed,
                     "depth": 0,
                 }
@@ -366,6 +497,10 @@ class FixtureCadBackend(CadBackend):
         progress=None,
         require_material: bool = True,
     ) -> RawScene:
+        order = getattr(self, "order", None)
+        if order is None:
+            order = self.order = []
+        order.append("collect_scene")
         self.collected_scene_calls.append(str(doc_path))
         if self.originals_change_during_capture:
             Path(self.document).write_bytes(b"fixture assembly edited during capture")
@@ -400,7 +535,45 @@ class FixtureCadBackend(CadBackend):
             }
         return entries
 
+    def link_group_mass_properties(self, path, selections):
+        """Direct link reads for the fixture: the assembly-frame recombination."""
+
+        order = getattr(self, "order", None)
+        if order is None:
+            order = self.order = []
+        order.append("link_group_read")
+        links = compose_fixture_link_reads(
+            self.components, getattr(self, "effective_readings", None) or {}, selections
+        )
+        override = getattr(self, "link_group_selection_override", None) or {}
+        for body, names in override.items():
+            if str(body) in links:
+                links[str(body)]["selection"] = [str(name) for name in names]
+        return {
+            "assembly": str(self.scene_document_override or path),
+            "configuration": str(getattr(self, "configuration_name", "Default")),
+            "used_api": "IMassProperty2 (SelectedItems = component set)",
+            "selection_rule": "top_most_providers+uncovered_leaves",
+            "links": links,
+        }
+
+    def close_all_documents(self):
+        """Fixture close-all for the pristine readout window."""
+
+        order = getattr(self, "order", None)
+        if order is None:
+            order = self.order = []
+        order.append("close_all_documents")
+        if getattr(self, "close_refuses", False):
+            raise CadError("cad_close_failed", "fixture refuses to close documents")
+        self.open_documents.clear()
+        return {"closed": True}
+
     def verify_sources_unchanged(self) -> dict[str, Any]:
+        order = getattr(self, "order", None)
+        if order is None:
+            order = self.order = []
+        order.append("verify_sources")
         files = [self.document, *self._dependencies]
         return {str(item): {"sha256": file_digest(Path(item))} for item in files if Path(item).is_file()}
 
@@ -423,6 +596,137 @@ def cleanup(path: Path) -> None:
     import shutil
 
     shutil.rmtree(path, ignore_errors=True)
+
+
+def write_link_group_mass_record(bundle: Path, model: dict, source: dict) -> None:
+    """Synthesize the direct link group record the producer will emit (fixture stand-in).
+
+    The record is derived from the bundle's sealed raw scene plus the model the
+    fixtures just built, so the verifier's direct-readout binding can run before
+    the native producer method lands.
+    """
+
+    import json as _json
+
+    import numpy as _np
+
+    from description_pipeline.sources.solidworks import verify as oracle
+
+    bundle = Path(bundle)
+    evidence = bundle / "evidence"
+    raw = _json.loads((evidence / "raw/scene_raw.json").read_text())
+    masses = _json.loads((evidence / "raw/mass_properties.json").read_text())
+    datums = _json.loads((evidence / "raw/coordinate_systems.json").read_text())
+    declared_path = evidence / "raw/declared_masses.json"
+    declared = (_json.loads(declared_path.read_text()).get("items") or {}) if declared_path.is_file() else {}
+    effective = oracle.effective_math_map(masses, raw)
+    links = {str(link["name"]): link for link in model.get("links", [])}
+    payload = {
+        "schema_version": "solidworks-to-urdf.link-group-mass-properties/v1",
+        "assembly": raw.get("source_document") or raw.get("document"),
+        "configuration": str(source.get("configuration") or "Default"),
+        "used_api": "IMassProperty2 (SelectedItems = component set)",
+        "selection_rule": "top_most_providers+uncovered_leaves",
+        "links": {},
+    }
+    for body in source.get("bodies") or []:
+        name = str(body.get("name"))
+        selection = sorted(
+            str(note["component"])
+            for *_rest, note in oracle._resolved_contributions(body, raw, masses, declared, effective)
+        )
+        mass, com_link, tensor_link = oracle._canonical_in_link_frame(links[name])
+        datum = _np.array(datums[body["frame"]["coordinate_system"]], dtype=float).reshape(4, 4)
+        com_assembly = datum[:3, :3] @ com_link + datum[:3, 3]
+        tensor_assembly = datum[:3, :3] @ tensor_link @ datum[:3, :3].T
+        read = {
+            "mass_kg": float(mass),
+            "volume_m3": 0.001,
+            "density_kg_m3": 1000.0,
+            "com_m": com_assembly.tolist(),
+            "inertia_tensor_about_com": tensor_assembly.tolist(),
+            "inertia_values_about_origin_api": {"error": "fixture"},
+            "overrides": {
+                "OverrideMass": False,
+                "OverrideCenterOfMass": False,
+                "OverrideMomentsOfInertia": False,
+            },
+        }
+        payload["links"][name] = {
+            "selection": selection,
+            "reads": [_json.loads(_json.dumps(read)), _json.loads(_json.dumps(read))],
+            "reproducibility": {
+                "mass_delta_kg": 0.0,
+                "com_delta_norm_m": 0.0,
+                "tensor_delta_max_abs": 0.0,
+            },
+        }
+    (evidence / "raw/link_group_mass_properties.json").write_text(
+        _json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def write_link_group_mass_record_from_recombination(bundle: Path, source: dict) -> None:
+    """Seed the direct link record from the recombination (fixtures without a model yet).
+
+    Used before ``load_scene``/manifest verification so a fixture bundle is
+    shaped exactly like a native12 capture; the scene that consumes it later
+    regenerates the same link inertials by construction.
+    """
+
+    import json as _json
+
+    from description_pipeline.sources.solidworks import verify as oracle
+
+    bundle = Path(bundle)
+    evidence = bundle / "evidence"
+    raw = _json.loads((evidence / "raw/scene_raw.json").read_text())
+    masses = _json.loads((evidence / "raw/mass_properties.json").read_text())
+    declared_path = evidence / "raw/declared_masses.json"
+    declared = (_json.loads(declared_path.read_text()).get("items") or {}) if declared_path.is_file() else {}
+    effective = oracle.effective_math_map(masses, raw)
+    payload = {
+        "schema_version": "solidworks-to-urdf.link-group-mass-properties/v1",
+        "assembly": raw.get("source_document") or raw.get("document"),
+        "configuration": str(source.get("configuration") or "Default"),
+        "used_api": "IMassProperty2 (SelectedItems = component set)",
+        "selection_rule": "top_most_providers+uncovered_leaves",
+        "links": {},
+    }
+    for body in source.get("bodies") or []:
+        name = str(body.get("name"))
+        selection = sorted(
+            str(note["component"])
+            for *_rest, note in oracle._resolved_contributions(body, raw, masses, declared, effective)
+        )
+        world = oracle._raw_world(body, raw, masses, declared)
+        read = {
+            "mass_kg": float(world["mass"]),
+            "volume_m3": None,
+            "density_kg_m3": None,
+            "com_m": [float(value) for value in world["com"]],
+            "inertia_tensor_about_com": [
+                [float(value) for value in row] for row in world["inertia"]
+            ],
+            "inertia_values_about_origin_api": {"error": "fixture"},
+            "overrides": {
+                "OverrideMass": False,
+                "OverrideCenterOfMass": False,
+                "OverrideMomentsOfInertia": False,
+            },
+        }
+        payload["links"][name] = {
+            "selection": selection,
+            "reads": [_json.loads(_json.dumps(read)), _json.loads(_json.dumps(read))],
+            "reproducibility": {
+                "mass_delta_kg": 0.0,
+                "com_delta_norm_m": 0.0,
+                "tensor_delta_max_abs": 0.0,
+            },
+        }
+    (evidence / "raw/link_group_mass_properties.json").write_text(
+        _json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
 
 
 def read_scene(snapshot: Path) -> dict:

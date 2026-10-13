@@ -27,6 +27,8 @@ from description_pipeline.sources.solidworks.discovery import (
 )
 from description_pipeline.verification.native_discovery import verify_discovery
 
+from .selection_support import sealed_selection
+
 RECORD_FILE = "discovery/native-discovery.json"
 
 IDENTITY = [
@@ -84,6 +86,20 @@ def _in_span(vector: list[float], basis: list[list[float]], tolerance: float = 1
 
 def native_record() -> dict:
     """Two bodies joined by a concentric shaft and a coincident plane (analytic fixture)."""
+
+    files = {
+        name: hashlib.sha256(f"placeholder {name}\n".encode()).hexdigest()
+        for name in ("cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT")
+    }
+    source_selection = sealed_selection(
+        files,
+        "cad/robot.SLDASM",
+        edges={
+            "cad/robot.SLDASM": ["cad/base.SLDPRT", "cad/arm.SLDPRT"],
+            "cad/base.SLDPRT": [],
+            "cad/arm.SLDPRT": [],
+        },
+    )
     return {
         "schema_version": DISCOVERY_SCHEMA,
         "contract": CONTRACT,
@@ -101,6 +117,8 @@ def native_record() -> dict:
         "components": [
             {
                 "name2": "base-1",
+                "lightweight": False,
+                "suppression_state": 2,
                 "instance_id": "base-1",
                 "document": "cad/base.SLDPRT",
                 "configuration": "Default",
@@ -110,6 +128,8 @@ def native_record() -> dict:
             },
             {
                 "name2": "arm-1",
+                "lightweight": False,
+                "suppression_state": 2,
                 "instance_id": "arm-1",
                 "document": "cad/arm.SLDPRT",
                 "configuration": "Default",
@@ -191,7 +211,10 @@ def native_record() -> dict:
                 }
             },
         },
-        "files": {},
+        # The fixture's frozen bytes are the deterministic placeholders written by
+        # ``baseline``; the derive contract requires the record to bind them.
+        "files": files,
+        "source_selection": source_selection,
     }
 
 
@@ -235,7 +258,7 @@ class _ReplayBackend:
     def __init__(self, payload: dict) -> None:
         self.payload = payload
 
-    def discover_native(self, frozen_source: Path, settings: dict) -> dict:
+    def discover_native(self, frozen_source: Path, settings: dict, *, on_activity=None) -> dict:
         return copy.deepcopy(self.payload)
 
 
@@ -331,6 +354,22 @@ class OracleSemanticsTests(unittest.TestCase):
         self._native(package, lambda raw, payload: None)
         passed, errors, _checks = self.check(package)
         self.assertTrue(passed, errors)
+
+    def test_unrecorded_inferred_joint_records_stay_rejected(self):
+        """Without an exporter declaration, missing controlled records still refuse."""
+
+        package = self.baseline()
+
+        def strip_annotations(raw, payload):
+            for group in (raw.get("properties") or {}).get("mates", {}).values():
+                if isinstance(group, dict):
+                    for key in ("dp.joint.limits_record", "dp.joint.drive_record"):
+                        group.pop(key, None)
+
+        self._native(package, strip_annotations)
+        report = verify_discovery(package)
+        self.assertFalse(report["passed"])
+        self.assertIn("discovery.joints", {item["code"] for item in report["errors"]})
 
     def test_suppressed_mate_is_excluded_not_checked(self) -> None:
         package = self.baseline()
@@ -595,6 +634,8 @@ class OracleSemanticsTests(unittest.TestCase):
     def _container(name: str = "sub-1", document: str = "cad/sub.SLDASM") -> dict:
         return {
             "name2": name,
+            "lightweight": False,
+            "suppression_state": 2,
             "instance_id": name,
             "document": document,
             "configuration": "Default",
@@ -934,7 +975,15 @@ class OracleSemanticsTests(unittest.TestCase):
             errors,
         )
 
-    def test_nested_frame_attachment_blocks(self) -> None:
+    def test_nested_self_frame_is_an_ordinary_pair_and_not_a_frame_problem(self) -> None:
+        """The scope's own frame entity is an ordinary in-scope endpoint (design contract).
+
+        A nested self-frame relation reconstructs as a normal in-scope pair and must not
+        raise the frozen-top frame-attachment block.  The undeclared material component
+        added alongside it is still caught by the independent body derivation, which is
+        a different channel and stays untouched.
+        """
+
         def mutate(raw, payload):
             raw["components"].append(self._container())
             child = copy.deepcopy(raw["components"][1])
@@ -942,7 +991,7 @@ class OracleSemanticsTests(unittest.TestCase):
             raw["components"].append(child)
             raw["mates"].append(
                 {
-                    "name": "nested_ground__coaxial",
+                    "name": "nested_self__coaxial",
                     "type": "concentric",
                     "suppressed": False,
                     "error_code": 0,
@@ -974,15 +1023,12 @@ class OracleSemanticsTests(unittest.TestCase):
 
         package = self.baseline()
         self._native(package, mutate)
-        passed, errors, _checks = self.check(package)
-        self.assertFalse(passed, errors)
-        self.assertTrue(
-            any(
-                error["code"] == "discovery.frame_attachment" and "outside the frozen top assembly" in error["message"]
-                for error in errors
-            ),
+        _passed, errors, _checks = self.check(package)
+        self.assertFalse(
+            any(error["code"] == "discovery.frame_attachment" for error in errors),
             errors,
         )
+        self.assertTrue(any(error["code"] == "discovery.bodies" for error in errors), errors)
 
     def test_assembly_frame_identity_requires_the_explicit_marker(self) -> None:
         from description_pipeline.verification.native_discovery import _frame_attachment, _frames, _rows_for
@@ -1278,6 +1324,8 @@ class OracleSemanticsTests(unittest.TestCase):
         components = [
             {
                 "name2": name,
+                "lightweight": False,
+                "suppression_state": 2,
                 "instance_id": name,
                 "document": f"cad/{name}.SLDPRT",
                 "configuration": "Default",

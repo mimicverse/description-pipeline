@@ -506,6 +506,139 @@ class ReportViewTests(unittest.TestCase):
         self.assertEqual(counts["executed"], 2)
         self.assertEqual(report["overall"]["state"], "failed")
 
+    def test_declaration_warnings_render_values_without_passing_or_confirmations(self) -> None:
+        job = passed_job()
+        job["discovery"] = {
+            "passed": True,
+            "discovery_sha256": "d" * 64,
+            "findings": [
+                {
+                    "code": "discovery.exporter_membership_uncovered",
+                    "object": "assembly",
+                    "message": "active material occurrences remain unassigned; capture retains their CAD "
+                    "geometry and mass, but complete material coverage is not qualified",
+                    "blocking": False,
+                    "detail": {
+                        "components": ["unowned-1", "unowned-2"],
+                        "mass_kg": 0.42,
+                        "qualification_blocker": "complete_material_coverage",
+                    },
+                },
+                {
+                    "code": "discovery.joint_limits_degenerate",
+                    "object": "joint:r_knee",
+                    "message": "equal authored position bounds are retained for capture and generation",
+                    "blocking": False,
+                    "detail": {"limits": {"lower": 0.0, "upper": 0.0}, "qualification_blocker": "usable_joint_range"},
+                },
+                {
+                    "code": "discovery.joint_drive_unspecified",
+                    "object": "joint:r_knee",
+                    "message": "authored zero effort or velocity is retained for capture and generation",
+                    "blocking": False,
+                    "detail": {
+                        "limits": {"effort": 0.0, "velocity": 0.0},
+                        "qualification_blocker": "usable_joint_drive",
+                    },
+                },
+                {"code": "discovery.link_name_missing", "object": "body:a", "message": "no CS", "blocking": True},
+            ],
+        }
+        report = build_report(job)
+        self.assertEqual(report["overall"]["state"], "passed")
+        self.assertEqual(report["overall"]["engineering_state"], "external_review")
+        self.assertEqual(report["warnings"]["total"], 3)
+        self.assertEqual(
+            {row["code"] for row in report["warnings"]["items"]},
+            {
+                "discovery.exporter_membership_uncovered",
+                "discovery.joint_limits_degenerate",
+                "discovery.joint_drive_unspecified",
+            },
+        )
+        stages = {stage["id"]: stage for stage in report["stages"]}
+        self.assertEqual(stages["discover"]["counts"]["warnings"], 3)
+        uncovered = next(
+            row for row in report["warnings"]["items"] if row["code"] == "discovery.exporter_membership_uncovered"
+        )
+        self.assertEqual(uncovered["label_zh"], "存在未归属实例（保留几何与质量）")
+        self.assertEqual(uncovered["components"], ["unowned-1", "unowned-2"])
+        self.assertEqual(uncovered["mass_kg"], 0.42)
+        degenerate = next(
+            row for row in report["warnings"]["items"] if row["code"] == "discovery.joint_limits_degenerate"
+        )
+        self.assertEqual(degenerate["object"], "joint:r_knee")
+        self.assertEqual(degenerate["limits"], {"lower": 0.0, "upper": 0.0})
+        self.assertEqual(degenerate["state_zh"], "警告")
+        for row in report["warnings"]["items"]:
+            with self.subTest(code=row["code"]):
+                self.assertEqual(row["state_zh"], "警告")
+                self.assertIs(row["blocking"], False)
+                self.assertNotIn("通过", row["state_zh"])
+        self.assertNotIn("link_name_missing", {row["code"] for row in report["warnings"]["items"]})
+        self.assertNotIn(
+            "存在未归属实例（保留几何与质量）", stages["discover"]["automatic"]["passed_labels"]
+        )
+        baseline = build_report(passed_job())
+        self.assertEqual(
+            len(report["external_review"]["scopes"]), len(baseline["external_review"]["scopes"])
+        )
+        scopes = repr(report["external_review"]["scopes"])
+        for code in ("discovery.exporter_membership_uncovered", "discovery.joint_limits_degenerate"):
+            self.assertNotIn(code, scopes)
+
+    def test_saved_pose_diagnostics_render_as_warnings_and_never_fail_the_check(self) -> None:
+        job = passed_job()
+        job["result"]["quality"]["checks"].append(
+            {
+                "id": "discovery.declarations",
+                "state": "passed",
+                "passed": True,
+                "details": {
+                    "bodies": 26,
+                    "joints": 25,
+                    "checks": [],
+                    "diagnostics": [
+                        {
+                            "code": "v14.saved_pose_restriction",
+                            "blocking": False,
+                            "message": "an active native mate restricts the declared joint in the saved CAD pose",
+                            "detail": {
+                                "joint": "r_knee",
+                                "mate": "平行24",
+                                "scope": "",
+                                "mate_type": "parallel",
+                                "components": ["hip-1", "thigh_link-1"],
+                                "links": ["r_thigh_yaw", "r_thigh_roll"],
+                                "max_abs_residual": 1.0,
+                                "max_normalized_residual": 1.0,
+                                "threshold": 1e-6,
+                            },
+                        }
+                    ],
+                },
+            }
+        )
+        report = build_report(job)
+        self.assertEqual(report["overall"]["state"], "passed")
+        self.assertEqual(report["overall"]["engineering_state"], "external_review")
+        self.assertIsNone(report["failure"])
+        verify = next(stage for stage in report["stages"] if stage["id"] == "verify")
+        self.assertEqual(verify["counts"]["warnings"], 1)
+        warning = verify["warnings"][0]
+        self.assertEqual(warning["code"], "v14.saved_pose_restriction")
+        self.assertEqual(warning["label_zh"], "已保存姿态限制（诊断）")
+        self.assertEqual(warning["state_zh"], "警告")
+        self.assertEqual(warning["object"], "joint:r_knee")
+        self.assertEqual(warning["mate"], "平行24")
+        self.assertEqual(warning["components"], ["hip-1", "thigh_link-1"])
+        self.assertEqual(warning["links"], ["r_thigh_yaw", "r_thigh_roll"])
+        self.assertEqual(
+            warning["residual"], {"max_abs_residual": 1.0, "max_normalized_residual": 1.0, "threshold": 1e-6}
+        )
+        check = next(row for row in verify["independent"] if row["id"] == "discovery.declarations")
+        self.assertEqual(check["state"], "passed")
+
 
 if __name__ == "__main__":
     unittest.main()

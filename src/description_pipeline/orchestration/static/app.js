@@ -2,6 +2,7 @@
 // module only talks to the portal's own JSON API and the digest-verified artifact routes.
 import { buildJointControls, createViewer, disposeRobot, loadRobot } from "/static/viewer.js";
 import { menuAction, overlayRun, resolveDeleted, resolveTitle } from "/static/run_history.js";
+import { activityPlacement, activityView } from "/static/activity.js";
 
 const state = {
   csrf: null,
@@ -21,6 +22,7 @@ const state = {
   viewer: null,
   controls: null,
   timer: null,
+  activityTimer: null,
   retryingRunId: null,
   tabsInitializedFor: null,
   rerunningRunId: null,
@@ -361,6 +363,8 @@ function clearPreview() {
   $("viewer-card").hidden = true;
   $("viewer-placeholder").hidden = false;
   $("preview-meta").textContent = "";
+  $("preview-diagnostic").hidden = true;
+  $("preview-diagnostic").textContent = "";
   $("viewer-note").hidden = true;
   $("joint-controls").textContent = "";
   setError($("preview-note"), "");
@@ -383,6 +387,7 @@ function clearSession() {
   $("stage-rerun").hidden = true;
   if (state.timer) window.clearInterval(state.timer);
   state.timer = null;
+  stopActivityTimer();
   $("workspace").hidden = true;
   $("account").hidden = true;
   $("login-card").hidden = false;
@@ -860,6 +865,7 @@ function stageList(run) {
         reportRow(row, row.boundary === "output" ? "output" : "input")),
       independent: (Array.isArray(stage.independent) ? stage.independent : []).map((row) => reportRow(row, "independent")),
       files: Array.isArray(stage.files) ? stage.files : [],
+      warnings: Array.isArray(stage.warnings) ? stage.warnings : [],
       unsupported: (Array.isArray(stage.unsupported) ? stage.unsupported : [])
         .map((item) => (item && typeof item === "object" ? item.label || item.id : item))
         .filter(Boolean),
@@ -902,16 +908,172 @@ function checkRow(parent, row) {
   return item;
 }
 
-function buildFailureCard(failure) {
+//: Recorded observations render as bounded warning rows: exact recorded values
+//: (including authored zeros), the qualification/publication blocker kind, and no
+//: pass bookkeeping or per-item human confirmation.
+const WARNING_ROW_LIMIT = 8;
+const WARNING_VALUE_LIMIT = 8;
+const WARNING_VALUE_KEYS = [
+  "limits",
+  "components",
+  "links",
+  "joint",
+  "mate",
+  "mate_type",
+  "scope",
+  "mass_kg",
+  "masses",
+  "qualification_blocker",
+  "publication_blocker",
+];
+
+function warningValueText(value) {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    const shown = value.slice(0, WARNING_VALUE_LIMIT).map((item) => warningValueText(item));
+    return `${shown.join("、")}${value.length > shown.length ? ` 等 ${value.length} 项` : ""}`;
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value).slice(0, WARNING_VALUE_LIMIT);
+    const shown = entries.map(([key, item]) => `${key}=${warningValueText(item)}`);
+    return `${shown.join("；")}${Object.keys(value).length > entries.length ? " …" : ""}`;
+  }
+  return String(value);
+}
+
+function stageWarningRow(row) {
+  const item = document.createElement("div");
+  item.className = "warning-row";
+  const head = document.createElement("div");
+  head.className = "warning-head";
+  const label = document.createElement("span");
+  label.className = "warning-label";
+  label.textContent = row.label_zh || row.code || "警告";
+  const chip = document.createElement("span");
+  chip.className = "chip warning";
+  chip.textContent = row.state_zh || "警告";
+  head.append(label, chip);
+  item.append(head);
+  const meta = [row.object, row.code].filter(Boolean).join(" · ");
+  if (meta) {
+    const line = document.createElement("p");
+    line.className = "warning-meta muted small";
+    line.textContent = meta;
+    item.append(line);
+  }
+  if (row.message) {
+    const message = document.createElement("p");
+    message.className = "warning-message";
+    message.textContent = row.message;
+    item.append(message);
+  }
+  const blockers = [];
+  if (row.qualification_blocker) blockers.push(`限定资格阻断：${row.qualification_blocker}`);
+  if (row.publication_blocker) blockers.push(`发布阻断：${row.publication_blocker}`);
+  if (blockers.length) {
+    const line = document.createElement("p");
+    line.className = "warning-blocker";
+    line.textContent = blockers.join("；");
+    item.append(line);
+  }
+  const keys = WARNING_VALUE_KEYS.filter((key) => row[key] !== undefined && row[key] !== null);
+  const residual = row.residual && typeof row.residual === "object" ? Object.entries(row.residual) : [];
+  if (keys.length || residual.length) {
+    const details = expandable(item, "记录值");
+    const list = document.createElement("div");
+    list.className = "warning-values";
+    for (const key of keys) {
+      const line = document.createElement("p");
+      line.textContent = `${key}：${warningValueText(row[key])}`;
+      list.append(line);
+    }
+    for (const [key, value] of residual) {
+      const line = document.createElement("p");
+      line.textContent = `residual.${key}：${warningValueText(value)}`;
+      list.append(line);
+    }
+    details.append(list);
+  }
+  return item;
+}
+
+function renderStageWarnings(root, stage, note) {
+  const rows = Array.isArray(stage.warnings) ? stage.warnings : [];
+  if (!rows.length) return;
+  const group = document.createElement("div");
+  group.className = "check-group warning-group";
+  const title = document.createElement("h4");
+  title.textContent = `警告（${rows.length}）`;
+  group.append(title);
+  const hint = document.createElement("p");
+  hint.className = "stage-note muted small";
+  hint.textContent = note || "记录项，不阻断采集与生成；不计为通过，也不作为验收或发布依据。";
+  group.append(hint);
+  for (const row of rows.slice(0, WARNING_ROW_LIMIT)) group.append(stageWarningRow(row));
+  if (rows.length > WARNING_ROW_LIMIT) {
+    const more = document.createElement("p");
+    more.className = "muted small";
+    more.textContent = `另有 ${rows.length - WARNING_ROW_LIMIT} 项警告，详见报告记录。`;
+    group.append(more);
+  }
+  root.append(group);
+}
+
+function buildFailureCard(failure, report) {
   const card = document.createElement("div");
   card.className = "fail-card";
   const title = document.createElement("strong");
   title.textContent = failure.title_zh || "运行失败";
   card.append(title);
-  if (failure.meaning_zh) {
+  const stage =
+    report && Array.isArray(report.stages) ? report.stages.find((entry) => entry && entry.id === failure.stage) : null;
+  const failedChecks = stage
+    ? [...(Array.isArray(stage.boundary) ? stage.boundary : []), ...(Array.isArray(stage.independent) ? stage.independent : [])]
+        .filter((row) => row && row.state === "failed")
+    : [];
+  const warningCount = stage && Number.isFinite(stage.counts && stage.counts.warnings) ? stage.counts.warnings : 0;
+  if (failure.meaning_zh && !(failure.kind === "unknown" && failedChecks.length)) {
     const meaning = document.createElement("p");
     meaning.textContent = failure.meaning_zh;
     card.append(meaning);
+  }
+  if (failedChecks.length) {
+    const heading = document.createElement("p");
+    heading.textContent = `未通过的自动检查（${failedChecks.length} 项）：`;
+    card.append(heading);
+    for (const row of failedChecks.slice(0, 5)) {
+      const line = document.createElement("p");
+      line.className = "muted small";
+      const message = row.summary && row.summary.actual ? row.summary.actual : "未通过";
+      line.textContent = `${row.label_zh || row.id || "检查"}：${message}`;
+      card.append(line);
+    }
+    if (failedChecks.length > 5) {
+      const more = document.createElement("p");
+      more.className = "muted small";
+      more.textContent = `另有 ${failedChecks.length - 5} 项未通过检查，逐项证据见下方阶段检查。`;
+      card.append(more);
+    }
+    if (failedChecks.some((row) => String(row.id || "").startsWith("source."))) {
+      const hint = document.createElement("p");
+      hint.className = "muted small";
+      hint.textContent =
+        "来源证据检查未通过；请依据失败检查及原始证据区分输入缺失、来源不一致或解析问题。";
+      card.append(hint);
+    } else {
+      const detail = document.createElement("p");
+      detail.className = "muted small";
+      detail.textContent = "逐项证据见下方阶段检查的“原始证据”。";
+      card.append(detail);
+    }
+  }
+  if (warningCount > 0) {
+    const warnings = document.createElement("p");
+    warnings.className = "muted small";
+    warnings.textContent = `该阶段另有 ${warningCount} 项记录警告：警告不计为通过，也不作为验收或发布依据。`;
+    card.append(warnings);
   }
   if (failure.kind === "definition" || failure.kind === "runtime") {
     const kind = document.createElement("p");
@@ -929,6 +1091,31 @@ function buildFailureCard(failure) {
       (failure.finding_counts.length > shown.length ? "…" : "") +
       (failure.finding_total ? `（共 ${failure.finding_total} 项，逐项见下方问题清单，可展开查看）` : "");
     card.append(groups);
+  }
+  if (Array.isArray(failure.finding_counts) && failure.finding_counts.length) {
+    const note = document.createElement("p");
+    note.className = "muted small";
+    note.textContent = "以上计数为平台报告发现与受影响实例，不代表 CAD 缺陷；逐项证据见下方问题清单（默认折叠）。";
+    card.append(note);
+    if (failure.finding_counts.some((group) => group && group.code === "discovery.link_name_missing")) {
+      const hint = document.createElement("p");
+      hint.className = "muted small";
+      hint.textContent =
+        "未识别刚体坐标系（discovery.link_name_missing）：记录表示刚体归属与命名尚未证明，并不代表 CAD 中不存在坐标系；" +
+        "处置方向为补齐交付定义与坐标系归属（由结构交付侧在原生工程中完成），" +
+        "不需要为每个供应商内部叶件单独添加坐标系。";
+      card.append(hint);
+      const samples = failure.finding_samples && Array.isArray(failure.finding_samples["discovery.link_name_missing"])
+        ? failure.finding_samples["discovery.link_name_missing"]
+        : [];
+      const objects = samples.map((row) => row && row.object).filter(Boolean).slice(0, 2);
+      if (objects.length) {
+        const sample = document.createElement("p");
+        sample.className = "muted small";
+        sample.textContent = `示例对象：${objects.join("、")}（完整清单见下方问题清单）`;
+        card.append(sample);
+      }
+    }
   }
   if (failure.stage_name_zh) {
     const stage = document.createElement("p");
@@ -983,6 +1170,9 @@ function renderStageDetail() {
   const pieces = [];
   if (stage.boundary.length) pieces.push(`边界检查：${countsText(stage.counts.boundary, stage.boundary)}`);
   if (stage.independent.length) pieces.push(`独立检查：${countsText(stage.counts.independent, stage.independent)}`);
+  if (Number.isFinite(stage.counts.warnings) && stage.counts.warnings > 0) {
+    pieces.push(`警告：${stage.counts.warnings} 项`);
+  }
   counts.textContent = pieces.join("　•　") || "无检查记录";
   summary.append(counts);
   if (stage.at) {
@@ -1015,6 +1205,13 @@ function renderStageDetail() {
     for (const row of rows) checkRow(group, row);
     root.append(group);
   }
+
+  const reportWarnings = state.lastRun && state.lastRun.report ? state.lastRun.report.warnings : null;
+  renderStageWarnings(
+    root,
+    stage,
+    reportWarnings && typeof reportWarnings.note_zh === "string" ? reportWarnings.note_zh : "",
+  );
 
   const fileRows = (stage.files || []).map((file) => ({
     label: file.label_zh || file.path || "文件",
@@ -1087,6 +1284,117 @@ function updatePreviewLayout() {
   workspace.classList.toggle("no-preview", !has);
 }
 
+function stopActivityTimer() {
+  if (state.activityTimer) window.clearInterval(state.activityTimer);
+  state.activityTimer = null;
+}
+
+// Local 1 s ticker: only re-renders elapsed/freshness text; the network poll stays at 3 s and
+// a successful poll is never treated as liveness.
+function startActivityTimer() {
+  if (state.activityTimer) return;
+  state.activityTimer = window.setInterval(() => {
+    const run = state.lastRun;
+    if (!run || run.dag_run_id !== state.dagRunId) return;
+    if (run.state === "success" || run.state === "failed") return;
+    renderActivity(run);
+  }, 1000);
+}
+
+function buildActivityCard(view) {
+  const card = document.createElement("section");
+  card.className = `activity-card state-${view.state}`;
+  card.setAttribute("aria-label", "实时活动");
+  const head = document.createElement("div");
+  head.className = "activity-head";
+  const dot = document.createElement("span");
+  dot.className = `dot ${view.state === "busy" || view.state === "queued" ? "run" : "idle"}`;
+  const title = document.createElement("strong");
+  title.textContent = view.final ? "最后活动" : "实时活动";
+  const chip = document.createElement("span");
+  chip.className = `chip ${view.state === "busy" ? "running" : view.state === "queued" ? "queued" : "blocked"}`;
+  chip.textContent = view.stateText;
+  head.append(dot, title, chip);
+  if (view.stageText) {
+    const stage = document.createElement("span");
+    stage.className = "muted small";
+    stage.textContent = `阶段：${view.stageText}`;
+    head.append(stage);
+  }
+  card.append(head);
+  if (view.actionText) {
+    const action = document.createElement("p");
+    action.className = "activity-action";
+    action.textContent = view.actionText;
+    card.append(action);
+  }
+  if (view.objectText) {
+    const object = document.createElement("p");
+    object.className = "activity-object muted small";
+    object.textContent = view.final ? `相关对象：${view.objectText}` : `当前对象：${view.objectText}`;
+    card.append(object);
+  }
+  const metaParts = view.final
+    ? [view.freshnessText].filter(Boolean)
+    : [view.elapsedText, view.countsText, view.freshnessText].filter(Boolean);
+  if (metaParts.length) {
+    const meta = document.createElement("p");
+    meta.className = view.stale ? "activity-meta muted small stale" : "activity-meta muted small";
+    meta.textContent = metaParts.join("　•　");
+    card.append(meta);
+  }
+  if (view.note) {
+    const note = document.createElement("p");
+    note.className = "activity-note muted small";
+    note.textContent = view.note;
+    card.append(note);
+  }
+  if (view.recent.length) {
+    const list = document.createElement("ul");
+    list.className = "activity-recent";
+    for (const row of view.recent) {
+      const item = document.createElement("li");
+      const time = document.createElement("time");
+      time.textContent = row.timeText || "—";
+      const text = document.createElement("span");
+      text.textContent = row.object ? `${row.text} · ${row.object}` : row.text;
+      item.append(time, text);
+      list.append(item);
+    }
+    card.append(list);
+  }
+  return card;
+}
+
+function renderActivity(run) {
+  const overview = $("activity-overview");
+  const stageHost = $("activity-stage");
+  if (!overview || !stageHost) return;
+  overview.textContent = "";
+  stageHost.textContent = "";
+  if (!run || run.dag_run_id !== state.dagRunId) return;
+  const view = activityView(run.activity, { runState: run.state, nowMs: Date.now() });
+  if (view.visible) overview.append(buildActivityCard(view));
+  const selected = Array.isArray(state.stages) && Number.isInteger(state.selectedStage)
+    ? state.stages[state.selectedStage] || null
+    : null;
+  const mode = activityPlacement(view, {
+    stageId: selected ? selected.id : "",
+    stageRunning: Boolean(selected && selected.state === "running"),
+    stageFailed: Boolean(selected && selected.state === "failed"),
+  });
+  if (mode === "live" || mode === "final") {
+    stageHost.append(buildActivityCard(view));
+  } else if (mode === "note") {
+    const note = document.createElement("p");
+    note.className = "activity-note muted small";
+    note.textContent = view.state === "busy" && view.stageText && selected && view.stage !== selected.id
+      ? `当前活动阶段为「${view.stageText}」，此阶段暂无详细进度。`
+      : "此阶段暂无详细进度可用。";
+    stageHost.append(note);
+  }
+}
+
 function renderStepper() {
   const stepper = $("stages");
   stepper.textContent = "";
@@ -1108,7 +1416,8 @@ function renderStepper() {
     } else {
       meta.textContent = `${Number.isFinite(stage.passed) ? stage.passed : 0}/${stage.total} 通过`;
     }
-    const tooltip = `${stage.nameZh} · ${stage.stateZh}${
+    const warningCount = Number.isFinite(stage.counts.warnings) ? stage.counts.warnings : 0;
+    const tooltip = `${stage.nameZh} · ${stage.stateZh}${warningCount > 0 ? ` · 警告 ${warningCount}` : ""}${
       Number.isFinite(stage.total) && stage.total > 0
         ? ` · 通过 ${Number.isFinite(stage.passed) ? stage.passed : 0}/${stage.total} · 已执行 ${
             Number.isFinite(stage.executed) ? stage.executed : 0
@@ -1393,7 +1702,7 @@ function renderRun(run) {
   const failureCard = $("failure-card");
   failureCard.textContent = "";
   if (report && report.failure) {
-    failureCard.append(buildFailureCard(report.failure));
+    failureCard.append(buildFailureCard(report.failure, report));
     failureCard.hidden = false;
   } else {
     failureCard.hidden = true;
@@ -1429,6 +1738,7 @@ function renderRun(run) {
   state.selectedStage = chooseStageIndex(state.stages, runId);
   renderStepper();
   renderStageDetail();
+  renderActivity(run);
 
   const automatic = $("automatic");
   automatic.textContent = "";
@@ -1530,6 +1840,25 @@ function renderRun(run) {
 
   const findings = $("findings");
   findings.textContent = "";
+  // The automatically retained structural-team report stays directly downloadable on runs
+  // without a verified delivery (failed Windows or Linux runs); no URL hunting required.
+  const retainedReports = Array.isArray(run.structural_report) ? run.structural_report : [];
+  if (retainedReports.length) {
+    const item = document.createElement("li");
+    item.className = "report-download";
+    const label = document.createElement("span");
+    label.textContent = "结构团队报告（自动生成）：";
+    item.append(label, " ");
+    for (const entry of retainedReports) {
+      const link = document.createElement("a");
+      link.href = String(entry.url || "");
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.textContent = entry.label_zh || entry.path || "结构团队报告";
+      item.append(link, " ");
+    }
+    findings.append(item);
+  }
   const failure = report && report.failure ? report.failure : null;
   // The auto finding repeating the failure card's raw error would be a second
   // red container for the same fact; show each failure once.
@@ -1539,11 +1868,21 @@ function renderRun(run) {
   const codeLabels = new Map(
     ((failure && failure.finding_counts) || []).map((group) => [group.code, group.label_zh || group.code]),
   );
+  const findingNameValue = (finding) => {
+    const evidence = finding && finding.evidence && typeof finding.evidence === "object" ? finding.evidence : {};
+    const detail = evidence.detail && typeof evidence.detail === "object" ? evidence.detail : {};
+    const value = typeof detail.name === "string" ? detail.name.trim() : "";
+    return value || null;
+  };
   const renderFinding = (finding) => {
     const item = document.createElement("li");
     if (finding.severity && finding.severity !== "error") item.className = "warn";
     const message = document.createElement("div");
-    message.textContent = finding.message || "未提供说明";
+    // A missing robot name is not a malformed name; keep the two cases distinct.
+    message.textContent =
+      finding.id === "discovery.robot_name_invalid" && findingNameValue(finding) === null
+        ? "未读取到机器人名称（detail.name 为空）。"
+        : finding.message || "未提供说明";
     const context = document.createElement("div");
     context.className = "object";
     context.textContent = [finding.id, finding.stage, finding.object].filter(Boolean).join(" · ") || "—";
@@ -1580,12 +1919,29 @@ function renderRun(run) {
   orderedGroups.forEach(([code, items], index) => {
     const outer = document.createElement("li");
     const section = document.createElement("details");
-    if (index === 0) section.open = true;
     const header = document.createElement("summary");
-    header.textContent = `${codeLabels.get(code) || code}（${items.length} 项）`;
+    let groupLabel = codeLabels.get(code) || code;
+    if (code === "discovery.robot_name_invalid") {
+      const missing = items.filter((finding) => findingNameValue(finding) === null).length;
+      if (missing === items.length) groupLabel = "缺少机器人名称";
+    }
+    header.textContent = `${groupLabel}（${items.length} 项）`;
     const nested = document.createElement("ul");
     nested.className = "finding-group";
-    for (const finding of items) nested.append(renderFinding(finding));
+    // Bounded first paint: a large group renders its rows only when the operator opens it.
+    let populated = false;
+    const populate = () => {
+      if (populated) return;
+      populated = true;
+      for (const finding of items) nested.append(renderFinding(finding));
+    };
+    section.addEventListener("toggle", () => {
+      if (section.open) populate();
+    });
+    if (index === 0 && items.length <= 12) {
+      section.open = true;
+      populate();
+    }
     section.append(header, nested);
     outer.append(section);
     findings.append(outer);
@@ -1616,6 +1972,30 @@ function renderRun(run) {
   updatePreviewLayout();
 }
 
+function renderPreviewDiagnostic(preview) {
+  const node = $("preview-diagnostic");
+  if (preview.verified !== false) {
+    node.hidden = true;
+    node.textContent = "";
+    return;
+  }
+  const lines = ["未通过工程校验：该交付仅供诊断，禁止发布。"];
+  const checks = Array.isArray(preview.failing_checks) ? preview.failing_checks : [];
+  const checksTotal = Number.isInteger(preview.failing_checks_total) ? preview.failing_checks_total : checks.length;
+  if (checks.length) {
+    const shown = checks.slice(0, 8).map((check) => `${check.id}（${check.message || "检查未通过"}）`);
+    lines.push(`未通过检查：${shown.join("、")}${checksTotal > shown.length ? ` 等 ${checksTotal} 项` : ""}`);
+  }
+  const warnings = Array.isArray(preview.warnings) ? preview.warnings : [];
+  const warningsTotal = Number.isInteger(preview.warnings_total) ? preview.warnings_total : warnings.length;
+  if (warnings.length) {
+    const shown = warnings.slice(0, 6).map((item) => `${item.code || "警告"}${item.object ? `（${item.object}）` : ""}`);
+    lines.push(`警告：${shown.join("、")}${warningsTotal > shown.length ? ` 等 ${warningsTotal} 条` : ""}`);
+  }
+  node.textContent = lines.join("\n");
+  node.hidden = false;
+}
+
 async function loadPreview(dagRunId) {
   if (state.previewRequest) return;
   const request = new AbortController();
@@ -1626,6 +2006,7 @@ async function loadPreview(dagRunId) {
     if (request.signal.aborted || state.dagRunId !== dagRunId) return;
     if (state.previewSubject === preview.subject_sha256) return;
     $("preview-meta").textContent = `交付摘要 ${String(preview.subject_sha256).slice(0, 12)}… · URDF ${preview.urdf}`;
+    renderPreviewDiagnostic(preview);
     note.hidden = true;
     setError($("preview-note"), "");
     if (!state.viewer) state.viewer = createViewer($("viewer"));
@@ -1682,11 +2063,12 @@ async function poll() {
     if (state.dagRunId !== dagRunId) return;
     setError($("run-error-detail"), "");
     const verified = run.automatic && run.automatic.state === "passed";
-    if (!verified) clearPreview();
+    const diagnosable = !verified && run.state === "failed";
+    if (!verified && !diagnosable) clearPreview();
     const previous = state.lastRun;
     state.lastRun = run;
     renderRun(run);
-    if (verified) {
+    if (verified || diagnosable) {
       await loadPreview(dagRunId);
     }
     if (state.dagRunId !== dagRunId) return;
@@ -1694,6 +2076,7 @@ async function poll() {
     if ((run.state === "success" || run.state === "failed") && jobDone && (!verified || state.previewSubject)) {
       if (state.timer) window.clearInterval(state.timer);
       state.timer = null;
+      stopActivityTimer();
     }
     const terminalNow = run.state === "success" || run.state === "failed";
     if (terminalNow && !(previous && (previous.state === "success" || previous.state === "failed"))) {
@@ -1714,6 +2097,7 @@ async function poll() {
       state.tabsInitializedFor = null;
       if (state.timer) window.clearInterval(state.timer);
       state.timer = null;
+      stopActivityTimer();
       $("retry-panel").hidden = true;
       showUploadView();
       await refreshRuns();
@@ -1727,6 +2111,7 @@ async function poll() {
 async function selectRun(dagRunId) {
   if (state.timer) window.clearInterval(state.timer);
   state.timer = null;
+  stopActivityTimer();
   clearPreview();
   state.dagRunId = dagRunId;
   state.lastRun = null;
@@ -1739,10 +2124,15 @@ async function selectRun(dagRunId) {
   setError($("retry-error"), "");
   showRunView();
   renderRunsList();
+  // A run opened from a stale list (deep link, another tab, freshly queued) still lands in the
+  // sidebar: refresh once when the selected id is not part of the cached page.
+  const knownRun = (state.runsList || []).some((item) => item && item.dag_run_id === dagRunId);
+  if (!knownRun) void refreshRuns();
   if (state.dagRunId !== dagRunId) return;
   state.timer = window.setInterval(() => {
     void poll();
   }, 3000);
+  startActivityTimer();
   await poll();
 }
 
@@ -1761,6 +2151,7 @@ async function retryRun() {
     await api(`/api/runs/${encodeURIComponent(dagRunId)}/retry`, { method: "POST", body: {} });
     if (state.dagRunId !== dagRunId) return;
     if (!state.timer) state.timer = window.setInterval(() => { void poll(); }, 3000);
+    startActivityTimer();
     await poll();
     await refreshRuns();
   } catch (error) {

@@ -113,7 +113,7 @@ class CadBackend:
     def verify_sources_unchanged(self) -> dict[str, dict]:
         raise NotImplementedError
 
-    def discover_native(self, frozen_source: Path, settings: dict) -> dict:
+    def discover_native(self, frozen_source: Path, settings: dict, *, on_activity=None) -> dict:
         """Read the raw native primitives used for CAD-only semantic discovery.
 
         Returns the ``solidworks-to-urdf.native-discovery/v1`` raw record:
@@ -121,6 +121,12 @@ class CadBackend:
         entities, named datums, user-defined properties, cylinder axes and the
         per-component mass/material readings, each with the file hashes it was
         read from.  Implementations fail closed; they never invent facts.
+
+        ``on_activity`` optionally receives partial live-activity records
+        (``phase``/``action`` plus optional ``params``, ``current_object``,
+        ``completed``/``total``, ``unit``) while the read is blocking; it is
+        observation only and can never change the record or the failure
+        behaviour.  Callbacks observed by the pipeline are invoked defensively.
         """
 
         raise NotImplementedError

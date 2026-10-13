@@ -6,6 +6,11 @@
     "url": "http://127.0.0.1:18765",
     "token_file": "/srv/description/secrets/endpoint.token"
   },
+  "pipeline": {
+    "store_root": "/srv/description/state/runs",
+    "repositories": {},
+    "discovery": {}
+  },
   "portal": {
     "host": "127.0.0.1",
     "port": 8788,

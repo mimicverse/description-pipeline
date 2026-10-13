@@ -2,8 +2,8 @@
 
 One Linux server hosts the HTTPS operator page, Airflow and PostgreSQL, and
 executes generation, independent MuJoCo verification and PR publication. One
-logged-in Windows computer with licensed SolidWorks serializes native input
-freezing, discovery and capture. Operators use **Feishu login → engineering folder → Start → checks,
+logged-in Windows computer with licensed SolidWorks serializes the native
+raw-record read and the native capture for each sealed selection. Operators use **Feishu login → engineering folder → Start → checks,
 URDF preview and review PR**.
 
 Use the same source-bound tool release on both hosts. This guide owns installation
@@ -37,7 +37,7 @@ Publish a version with the intended users in its availability scope; new
 configuration takes effect after publication. A creator-only release is
 sufficient for commissioning that user's sign-in.
 
-SolidWorks is required for fresh native discovery and capture. Verification and
+SolidWorks is required for the native record read and the native capture. Verification and
 rebuild of a complete frozen delivery run on Linux without opening CAD. Both hosts require Python 3.12 x86_64 and the pinned runtime wheels.
 Consumer checks load models without rendering; they require no display, GPU or
 graphics-driver setup. `description doctor` checks the host role: SolidWorks registration and COM
@@ -58,12 +58,13 @@ C:\description-runtime\Scripts\python.exe -m pip install --no-index --require-ha
 C:\description-runtime\Scripts\description.exe doctor
 ```
 
-Create the directories below. `C:\cad-handoffs` contains engineering sources;
-the worker collects immutable copies into `C:\description-packages`. Source
-roots must be narrow, real directories and separate from managed storage.
+Create the directories below. The worker holds no operator source roots and no
+controlled-record library; it collects immutable copies of each run's staged
+engineering into `C:\description-packages` and keeps managed deliveries,
+state and secrets separate.
 
 ```powershell
-New-Item -ItemType Directory -Force C:\cad-handoffs, C:\cad-records, C:\description-packages, C:\description-deliveries, C:\description-state, C:\description-secrets | Out-Null
+New-Item -ItemType Directory -Force C:\description-packages, C:\description-deliveries, C:\description-state, C:\description-secrets | Out-Null
 $account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 icacls C:\description-secrets /inheritance:r /grant:r "${account}:(OI)(CI)F"
 C:\description-runtime\Scripts\python.exe -c "import secrets; from pathlib import Path; Path('C:/description-secrets/endpoint.token').write_text(secrets.token_hex(32), encoding='ascii')"
@@ -76,16 +77,12 @@ Save `C:\description-state\endpoint.json`:
 ```json
 {
   "schema_version": "solidworks-to-urdf.endpoint/v1",
-  "handoff_roots": ["C:/cad-handoffs"],
   "package_root": "C:/description-packages",
   "output_root": "C:/description-deliveries",
   "state_root": "C:/description-state",
   "token_file": "C:/description-secrets/endpoint.token",
   "host": "127.0.0.1",
   "port": 8765,
-  "discovery": {
-    "record_roots": ["C:/cad-records"]
-  },
   "targets": {
     "arm": {
       "repository_slug": "<owner>/<model-repository>",
@@ -96,18 +93,12 @@ Save `C:\description-state\endpoint.json`:
 ```
 
 Replace `arm` with the CAD's `dp.hardware_id` and configure its model base.
-The endpoint rejects unconfigured hardware. Configure `discovery.record_roots`
-for the controlled specification library, for example `["C:/cad-records"]`.
-Populate the library with approved records before admitting jobs.
-CAD references include the approved record version, such as
-`arm/r2/budget.json#robot`, resolved as `C:/cad-records/arm/r2/budget.json`.
-Keep versions immutable and available together; do not replace a shared file
-between runs. Use real directories and files, without symbolic links or junctions.
-Each reference must match one file across the configured roots;
-duplicate matches block discovery even when their bytes agree. Files included
-with an operator's handoff are archived, but do not supply this authority.
-Optional `discovery.frozen_names_file` validates approved interface names.
-Neither setting is an operator input.
+Publication requires a configured hardware target; extraction and inspection
+can proceed while routing is absent. The endpoint keeps no discovery settings:
+controlled records and approved interface names are Linux-side derivation
+settings (section 2). The endpoint stages the complete uploaded folder it is
+given, resolves the main assembly's references inside that staging, reads the
+raw native record and captures the sealed engineering.
 
 Start the endpoint in the logged-in desktop:
 
@@ -159,6 +150,7 @@ Complete these configuration groups once:
 | `SOLIDWORKS_HANDOFF_ROOT` | Dedicated Linux intake, such as `/srv/description/cad-handoffs`, outside runtime and state |
 | `PIPELINE_STORE_ROOT` | Linux stage checkpoints, model deliveries and diagnostics; defaults to `OPERATOR_STATE/runs` |
 | `MODEL_REPOSITORIES_FILE` | Mode-`0600` JSON mapping repository slugs to dedicated Linux model checkouts |
+| `DISCOVERY_SETTINGS_FILE` | Optional mode-`0600` JSON with Linux `record_roots` and `frozen_names_file` |
 | `FEISHU_APP_SECRET_FILE`, `FEISHU_TENANT_KEYS` | App credentials and mandatory tenant allowlist |
 | `FEISHU_ADMIN_OPEN_IDS` | Explicit administrator identities; optional, no automatic administrator |
 
@@ -175,6 +167,24 @@ Installation renders the same store and routing into the portal and Airflow
 Connection. Health refuses an empty mapping. Reinstall after changing routing.
 Back up the run store with platform state; it owns portable checkpoints and
 published model receipts.
+
+Set `DISCOVERY_SETTINGS_FILE` to the absolute path of a private JSON file, for example
+`{"record_roots":["/srv/description/cad-records"],"frozen_names_file":"/srv/description/interface-names.json"}`.
+Omit unused keys. Installation carries this object through `pipeline.discovery`
+to the Airflow connection's `discovery` settings; reinstall after changing it.
+
+Controlled-record roots and the optional approved-interface-name file are Linux
+derivation settings set by the platform maintainer with the platform's Linux
+configuration; they are never operator inputs and never live on the endpoint.
+Populate the controlled library with approved records before admitting runs.
+CAD references include the approved record version, such as
+`arm/r2/budget.json#robot`, resolved as `/srv/description/cad-records/arm/r2/budget.json`.
+Keep versions immutable and available together; do not replace a shared file
+between runs. Use real directories and files, without symbolic links or
+junctions. Each reference must match one file across the configured roots;
+duplicate matches refuse the derivation even when their bytes agree. Files
+uploaded with an operator's folder are archived evidence and do not supply this
+authority.
 
 Use comma-separated tenant and administrator lists without spaces.
 The configuration example defines the remaining service and transport defaults.
@@ -307,7 +317,11 @@ Commission the complete workflow with actual native CAD and live Feishu:
    input/input QC/output/output QC in the page, the DAG contract table,
    terminal task logs and `engineering_stages` XCom. Confirm failed, blocked,
    not-run states and external engineering review scope, and the hashed `reports/stages.json`.
-   Verify the actual native discovery and every independent quality result.
+   Failed and delivered runs likewise retain `reports/structural-team.md` and
+   `reports/structural-team.json` (re-created on Linux from the sealed receipt);
+   verify their hashes from the run evidence.
+   Verify the native record read, the sealed closure selection binding and every
+   independent quality result.
    Confirm history and details show the original submitter's Feishu username
    after reload and when viewed by another authorized operator.
 6. Inspect the delivered URDF and actual meshes in the page. Exercise individual

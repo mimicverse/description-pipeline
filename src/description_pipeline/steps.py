@@ -70,9 +70,7 @@ def freeze_inputs(
                         "The selected main assembly case does not match the frozen handoff file: "
                         f"{main_assembly!r} vs {mismatched[0]!r}"
                     )
-                raise PipelineError(
-                    f"The selected main assembly is not part of the frozen handoff: {main_assembly!r}"
-                )
+                raise PipelineError(f"The selected main assembly is not part of the frozen handoff: {main_assembly!r}")
             detail["main_assembly"] = main_assembly
             detail["main_assembly_sha256"] = files[main_assembly]
         return detail
@@ -93,23 +91,42 @@ def discover_structure(
     configuration: dict,
     targets: dict,
     preparer=None,
+    prepared=None,
     on_event=None,
+    on_activity=None,
 ):
-    """Derive mechanical semantics and bind their native observations to the handoff."""
+    """Derive mechanical semantics and bind their native observations to the handoff.
+
+    ``on_activity`` observes the long native read for the live-activity view; it
+    never changes the checks, the derived package or any failure path.
+    """
     from .sources.solidworks.discovery import DiscoverySettings, prepare_native_package
 
     _state(on_event, "discover", "running")
 
     def discovery_inputs():
         _require(package_inventory(frozen) == expected_files, "Frozen engineering changed before discovery")
-        names = read_data(configuration["frozen_names_file"]) if configuration.get("frozen_names_file") else {}
+        if prepared is not None:
+            payload = read_data(prepared.discovery_path)
+            derivation = payload.get("derivation") if isinstance(payload, dict) else None
+            _require(isinstance(derivation, dict), "Prepared discovery lacks its Linux derivation settings")
+            _require(derivation.get("main_assembly") == main_assembly, "Linux derivation selected another assembly")
+            names = derivation.get("frozen_names")
+            record_roots = derivation.get("record_roots")
+            _require(
+                isinstance(record_roots, list) and all(isinstance(value, str) for value in record_roots),
+                "Prepared discovery has invalid controlled-record root identifiers",
+            )
+        else:
+            names = read_data(configuration["frozen_names_file"]) if configuration.get("frozen_names_file") else {}
+            record_roots = configuration.get("record_roots", [])
         _require(
             isinstance(names, dict)
             and all(isinstance(key, str) and isinstance(value, str) for key, value in names.items()),
             "Frozen-name registry must map native identities to interface names",
         )
         return DiscoverySettings(
-            record_roots=tuple(configuration.get("record_roots", [])),
+            record_roots=tuple(record_roots),
             frozen_names=names,
             main_assembly=main_assembly,
         )
@@ -119,6 +136,7 @@ def discover_structure(
             "handoff_sha256": expected_digest,
             "files_sha256": digest(expected_files),
             "frozen_names_sha256": digest(value.frozen_names),
+            "record_roots": [str(root) for root in value.record_roots],
         }
         if main_assembly is not None:
             described["main_assembly"] = main_assembly
@@ -132,7 +150,10 @@ def discover_structure(
         discovery_inputs,
         describe=describe_settings,
     )
-    prepared = (preparer or prepare_native_package)(frozen, output, run_id, settings=settings, on_event=on_event)
+    if prepared is None:
+        prepared = (preparer or prepare_native_package)(
+            frozen, output, run_id, settings=settings, on_event=on_event, on_activity=on_activity
+        )
     discovery = {
         "passed": prepared.passed,
         "findings": list(prepared.findings),
@@ -140,6 +161,17 @@ def discover_structure(
         "revision": prepared.revision,
         "discovery_sha256": prepared.discovery_sha256,
     }
+    target = targets.get(prepared.hardware_id)
+    if target is None:
+        discovery["findings"].append(
+            {
+                "code": "discovery.publication_target_missing",
+                "object": "assembly",
+                "message": "No model repository is configured for this CAD identity; publication is unavailable",
+                "blocking": False,
+                "detail": {"hardware_id": prepared.hardware_id, "publication_blocker": "repository_target"},
+            }
+        )
     _state(on_event, "discover", "running", discovery=discovery)
     checked(on_event, "discover", "output", "discovery.definition", lambda: discovery)
 
@@ -155,13 +187,17 @@ def discover_structure(
         _require(package_inventory(frozen) == expected_files, "Frozen engineering changed during discovery")
         for name, checksum in expected_files.items():
             _require(file_digest(confined(package, name)) == checksum, "Native preparation changed engineering files")
-        revision = read_revision(package)
-        _require(
-            revision["hardware_id"] == prepared.hardware_id and revision["revision"] == prepared.revision,
-            "Generated revision differs from native discovery",
-        )
-        target = targets.get(prepared.hardware_id)
-        _require(target is not None, f"Hardware {prepared.hardware_id!r} has no configured model repository")
+        if (package / "cad-revision.json").exists():
+            revision = read_revision(package)
+        else:
+            inspected = inspect_prepared_input(package)
+            _require(inspected["passed"], "Generated native inputs are invalid")
+            revision = inspected["cad_revision"]
+        if revision is not None:
+            _require(
+                revision["hardware_id"] == prepared.hardware_id and revision["revision"] == prepared.revision,
+                "Generated revision differs from native discovery",
+            )
         files = package_inventory(package)
         _require(digest(files) == prepared.prepared_sha256, "Prepared files differ from native discovery")
         return package, target, files
@@ -176,8 +212,8 @@ def discover_structure(
             "discovery_sha256": prepared.discovery_sha256,
             "hardware_id": prepared.hardware_id,
             "revision": prepared.revision,
-            "repository_slug": value[1]["repository_slug"],
-            "base": value[1]["base"],
+            "repository_slug": (value[1] or {}).get("repository_slug"),
+            "base": (value[1] or {}).get("base"),
             "prepared_sha256": digest(value[2]),
             "files": {"input/" + name: checksum for name, checksum in value[2].items()},
         },
@@ -187,15 +223,36 @@ def discover_structure(
 
 
 def inspect_prepared_input(package: Path) -> dict:
-    """Check robot semantics and the mechanical team's sealed CAD revision."""
+    """Check acquisition inputs; missing administrative facts defer publication."""
 
-    from .sources.solidworks.input import inspect_package
+    from .sources.solidworks.input import inspect_package, native_metadata
 
     report = inspect_package(package)
     try:
         author = report.get("input")
         hardware = author.get("hardware_id") if isinstance(author, dict) else None
-        report["cad_revision"] = read_revision(package, hardware_id=hardware)
+        report["cad_revision"] = None
+        if (package / "cad-revision.json").exists():
+            report["cad_revision"] = read_revision(package, hardware_id=hardware)
+            _require(
+                report["cad_revision"]["hardware_id"] == hardware,
+                "Revision claims an absent CAD hardware identity",
+            )
+        else:
+            identity = native_metadata(package, author or {})
+            missing = [
+                key
+                for key in ("hardware_id", "revision", "owner", "change_summary", "control")
+                if identity.get(key) is None
+            ]
+            _require(bool(missing), "Complete CAD identity requires its generated cad-revision.json")
+            report["warnings"].append(
+                {
+                    "code": "input.cad_revision_pending",
+                    "message": "CAD administrative identity is incomplete; publication is unavailable",
+                    "detail": {"publication_blocker": "cad_revision", "missing": missing},
+                }
+            )
     except (PipelineError, OSError, ValueError) as error:
         report["errors"].append({"code": "input.cad_revision", "message": str(error), "detail": None})
         report["passed"] = False
@@ -222,6 +279,10 @@ def _delivery_readme(hardware: str) -> str:
         "`reports/input.json` checks the supplied package. `reports/quality.json`\n"
         "records independent checks of the captured evidence and delivered URDF.\n"
         "`reports/tool.json` identifies the build tool and runtime.\n\n"
+        "`reports/structural-team.md` is the automatically generated report for the structural team; "
+        "`reports/structural-team.json` retains its structured evidence.\n\n"
+        "Generation alone does not qualify this model. Read the quality report\n"
+        "for unresolved coverage, mass and motion findings before using it.\n\n"
         "A passing report covers its stated checks and bound file bytes. It does\n"
         "not establish hardware safety, measured accuracy or training readiness.\n"
         "Rerun `description check .` before consuming a copied delivery.\n"
@@ -252,7 +313,7 @@ def capture_evidence(
 ):
     """Inspect generated inputs, archive them and capture a complete immutable snapshot."""
     from .sources.solidworks.freeze import freeze
-    from .sources.solidworks.input import resolve_package
+    from .sources.solidworks.input import native_source_closure, resolve_package
 
     _state(on_event, "capture", "running")
 
@@ -266,6 +327,8 @@ def capture_evidence(
             error.details = {"errors": report.get("errors", [])}
             raise error
         definition = resolve_package(report)
+        if (definition.get("provenance") or {}).get("generator") == "native-discovery":
+            definition["source"]["closure"] = native_source_closure(package, report["input"])
         files = {row["path"]: row["sha256"] for row in report["input_receipt"]["inventory"]}
         if expected_inputs is not None:
             _require(files == expected_inputs, "Inspected inputs differ from native discovery")
@@ -287,6 +350,7 @@ def capture_evidence(
             "handoff_sha256": handoff_sha256,
             "files_sha256": digest(value[1]["package_files"]),
             "cad_revision": value[1]["cad_revision"],
+            "warnings": value[1].get("warnings", []),
             "files": {"input/" + path: checksum for path, checksum in value[1]["package_files"].items()},
         },
     )
@@ -299,7 +363,7 @@ def capture_evidence(
             from .runtime import native_readiness
 
             return native_readiness()
-        return {"scope": "injected regression backend; no native qualification"}
+        return {"scope": "provided CAD backend; native qualification is recorded in the capture evidence"}
 
     checked(on_event, "capture", "input", "runtime.ready", ready)
     _require(package_inventory(package) == original_files, "Prepared inputs changed before native capture")
@@ -326,7 +390,7 @@ def capture_evidence(
 def generate_model(staging: Path, definition: dict, input_report: dict, *, on_event=None) -> str:
     """Generate one canonical model and bind every derived file before independent checking."""
     _state(on_event, "generate", "running")
-    checked(
+    snapshot = checked(
         on_event,
         "generate",
         "input",
@@ -334,13 +398,17 @@ def generate_model(staging: Path, definition: dict, input_report: dict, *, on_ev
         lambda: verify_snapshot(staging / "evidence"),
         describe=lambda value: _snapshot_details(staging, value),
     )
-    hardware = definition["hardware_id"]
-    (staging / "README.md").write_text(_delivery_readme(hardware), encoding="utf-8", newline="\n")
+    if snapshot.get("kind") == "solidworks":
+        from .sources.solidworks.closure import derive_mass_closure
+
+        write_json(staging / "reports/mass-closure.json", derive_mass_closure(staging / "evidence"))
+    name = definition["source"]["robot_name"]
+    (staging / "README.md").write_text(_delivery_readme(name), encoding="utf-8", newline="\n")
     write_json(staging / "reports/input.json", input_report)
     write_json(staging / "reports/tool.json", tool_record())
     robot = Robot.from_dict(load_scene(staging / "evidence"))
     write_json(staging / "model/robot.json", robot.to_dict())
-    generate_urdf(robot, staging / "evidence", staging, name=hardware)
+    generate_urdf(robot, staging / "evidence", staging, name=name)
 
     def generated():
         Robot.from_dict(read_data(staging / "model/robot.json"))
@@ -387,13 +455,15 @@ def verify_delivery(staging: Path, generated_subject: str, *, on_event=None) -> 
 def publish_model(
     bundle: Path, repository: Path, *, base: str | None = None, message: str | None = None, on_event=None
 ) -> dict:
-    """Recheck and submit a frozen delivery from either Windows or Linux."""
+    """Recheck and submit the frozen delivery on the Linux publication stage."""
 
     from .repository.urdf_pr import submit_bundle
 
     _state(on_event, "publish", "running")
     author = read_data(Path(bundle) / "input/robot.yaml")
     hardware = author["hardware_id"]
+    _require(isinstance(hardware, str) and bool(hardware), "Publication requires an authored CAD hardware identity")
+    read_revision(Path(bundle) / "input", hardware_id=hardware)
     result = submit_bundle(
         bundle,
         repository,
