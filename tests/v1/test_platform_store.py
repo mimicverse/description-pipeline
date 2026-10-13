@@ -70,6 +70,7 @@ class FakeWorld:
             ("scheduling", "dag/task/0", "r-1", "running", "in_flight", NOW),
         ]
         self.transactions = 0
+        self.open_transactions = 0
         self.closes = 0
         self.hidden_for_one_find = False
         self.statements: list[str] = []
@@ -90,9 +91,11 @@ class FakeConnection:
 
     def __enter__(self):
         self.world.transactions += 1
+        self.world.open_transactions += 1
         return self
 
     def __exit__(self, *exc):
+        self.world.open_transactions -= 1
         return False
 
 
@@ -139,7 +142,7 @@ class FakeCursor:
                 world.hidden_for_one_find = False
                 record = None
             self._rows = [record] if record else []
-        elif "SELECT state, from_stage FROM platform.run WHERE run_id = %s FOR UPDATE" in normalized:
+        elif "SELECT state, from_stage FROM platform.run WHERE run_id = %s" in normalized:
             state = world.run_states.get(params[0])
             self._rows = [(state, world.run_from_stage.get(params[0]))] if state is not None else []
         elif "FROM platform.operation WHERE run_id = %s AND kind = 'publish' AND state = 'succeeded'" in normalized:
@@ -535,6 +538,53 @@ class PlatformStoreTests(unittest.TestCase):
             receipt=self.verify_receipt(),
         )
         self.assertEqual(self.world.stages[("r-1", "verify")][0], "completed")
+
+    def test_the_successor_rebinding_runs_outside_the_registration_transaction(self) -> None:
+        self._running_run()
+        self.world.stages[("r-1", "generate")] = ("completed", self.generate_receipt(), CHECKPOINT)
+        observed = []
+
+        def sealing(uri):
+            observed.append(self.world.open_transactions)
+            return self.delivery
+
+        store = PlatformStore(self.world.connect, sealed=sealing)
+        record = store.register_operation(
+            run_id="r-1",
+            stage="verify",
+            kind="dispatch",
+            operation_key="r-1/verify:0",
+            params_digest="d" * 64,
+        )
+        self.assertEqual(record.stage, "verify")
+        self.assertIn("r-1/verify:0", self.world.operations)
+        self.assertEqual(observed, [0], "the sealed rebinding runs with no open transaction")
+        self.assertEqual(self.rebuilt.call_count, 1)
+
+    def test_a_predecessor_that_changes_after_verification_is_refused(self) -> None:
+        self._running_run()
+        self.world.stages[("r-1", "generate")] = ("completed", self.generate_receipt(), CHECKPOINT)
+        original = PlatformStore._rebind_predecessor
+
+        def racing(store, **kwargs):
+            binding = original(store, **kwargs)
+            self.world.stages[("r-1", "generate")] = ("completed", self.generate_receipt(), "checkpoint-moved")
+            return binding
+
+        payload = {
+            "run_id": "r-1",
+            "stage": "verify",
+            "kind": "dispatch",
+            "operation_key": "r-1/verify:0",
+            "params_digest": "d" * 64,
+        }
+        with (
+            mock.patch.object(PlatformStore, "_rebind_predecessor", new=racing),
+            self.assertRaisesRegex(PlatformStoreError, "changed after it was verified"),
+        ):
+            self.store.register_operation(**payload)
+        self.assertNotIn("r-1/verify:0", self.world.operations)
+        self.assertEqual(self.store.register_operation(**payload).stage, "verify")
 
     def test_unresolved_is_confirmed_only_by_evidenced_reconciliation(self) -> None:
         self._running_run(from_stage="generate")

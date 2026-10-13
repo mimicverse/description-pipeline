@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from ..delivery import BUNDLE_SCHEMA, read_delivery_manifest
-from ..io import PipelineError
+from ..io import PipelineError, digest
 from ..stages import (
     CONFIRMED_STAGE_PASSED,
     CONFIRMED_STAGE_STATES,
@@ -101,6 +101,7 @@ _FIND_OPERATION = (
     " FROM platform.operation WHERE operation_key = %s"
 )
 _LOCK_RUN = "SELECT state, from_stage FROM platform.run WHERE run_id = %s FOR UPDATE"
+_READ_RUN = "SELECT state, from_stage FROM platform.run WHERE run_id = %s"
 _CONFIRMED_PUBLISH = (
     "SELECT 1 FROM platform.operation WHERE run_id = %s AND kind = 'publish' AND state = 'succeeded' LIMIT 1"
 )
@@ -323,8 +324,14 @@ class PlatformStore:
         raises :class:`OperationConflictError`.  A concurrent duplicate is
         settled by the unique key: the insert does nothing and the same
         result is recovered, never re-sent as a new side effect.
+
+        A downstream stage's registered predecessor is rebound from its
+        sealed root *before* the registration transaction opens; the locked
+        transaction itself only re-checks that same predecessor identity,
+        reference and state before the insert.
         """
 
+        binding = self._rebind_predecessor(run_id=run_id, stage=stage, kind=kind)
         with self._transaction() as connection:
             cursor = connection.cursor()
             cursor.execute(_FIND_OPERATION, (operation_key,))
@@ -333,7 +340,7 @@ class PlatformStore:
                 return _matching_operation(row, run_id=run_id, stage=stage, kind=kind, params_digest=params_digest)
             if stage not in STAGE_IDS:
                 raise PlatformStoreError(f"The stage must be one of {tuple(STAGE_IDS)}: {stage!r}")
-            _require_successor(self, connection, run_id=run_id, kind=kind, stage=stage)
+            _require_successor(self, connection, run_id=run_id, kind=kind, stage=stage, binding=binding)
             return self._insert_operation(
                 connection,
                 run_id=run_id,
@@ -343,6 +350,55 @@ class PlatformStore:
                 params_digest=params_digest,
                 dispatch=dispatch or {},
             )
+
+    def _rebind_predecessor(self, *, run_id: str, stage: str, kind: str) -> dict | None:
+        """Rebind the successor's registered predecessor, outside any lock.
+
+        The frozen boundary keeps the sealed-byte work - resolver, delivery
+        manifest, independently rebuilt definition - out of the run-locking
+        registration transaction.  This short read locates the registered
+        predecessor and closes before the heavy verification runs; ``None``
+        means this registration needs no bound predecessor yet (terminal
+        kinds, a stage at or before the run's start stage, or a run and
+        predecessor that cannot offer one - the locked transaction still
+        raises the canonical refusal).
+        """
+
+        if kind in _TERMINAL_KINDS or stage not in STAGE_IDS:
+            return None
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(_READ_RUN, (run_id,))
+            run_row = cursor.fetchone()
+            if run_row is None or run_row[0] != "running":
+                return None
+            from_stage = run_row[1]
+            start = from_stage if from_stage in STAGE_IDS else STAGE_IDS[0]
+            stage_index = STAGE_IDS.index(stage)
+            start_index = STAGE_IDS.index(start)
+            if stage_index <= start_index:
+                return None
+            predecessor = STAGE_IDS[stage_index - 1]
+            cursor.execute(_READ_STAGE_ROW, (run_id, predecessor))
+            predecessor_row = cursor.fetchone()
+        if predecessor_row is None or predecessor_row[0] != "completed":
+            return None
+        definition = None
+        if predecessor in CONFIRMED_STAGE_STATES:
+            definition = self._verify_sealed(predecessor_row[2], predecessor_row[1])
+        _sealed_receipt(
+            predecessor_row[1],
+            run_id=run_id,
+            stage=predecessor,
+            state="completed",
+            checkpoint_uri=predecessor_row[2],
+            definition=definition,
+        )
+        return {
+            "stage": predecessor,
+            "checkpoint_uri": predecessor_row[2],
+            "receipt_digest": digest(predecessor_row[1]),
+        }
 
     def _insert_operation(
         self,
@@ -667,14 +723,18 @@ def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str, checkpoint_
             raise PlatformStoreError("The sealed publication receipt has no confirmed submission")
 
 
-def _require_successor(self, connection, *, run_id: str, kind: str, stage: str) -> None:
+def _require_successor(
+    self, connection, *, run_id: str, kind: str, stage: str, binding: dict | None = None
+) -> None:
     """The successor must be a legal transition of the admitted run.
 
     The run row is locked; non-terminal kinds need a running run (queued or
     unresolved runs cannot jump straight into downstream stages), terminal
     runs continue only through cancel/reconcile, a confirmed publication can
     never be cancelled, and every stage after the run's start stage requires
-    this run's own completed predecessor stage.
+    this run's own completed predecessor stage.  That predecessor was rebound
+    from its sealed root before this transaction; here only the same
+    identity, checkpoint reference and receipt digest are re-checked.
     """
 
     cursor = connection.cursor()
@@ -706,17 +766,16 @@ def _require_successor(self, connection, *, run_id: str, kind: str, stage: str) 
             raise PlatformStoreError(
                 f"The {stage!r} operation requires the completed {predecessor!r} stage of this run"
             )
-        definition = None
-        if predecessor in CONFIRMED_STAGE_STATES:
-            definition = self._verify_sealed(predecessor_row[2], predecessor_row[1])
-        _sealed_receipt(
-            predecessor_row[1],
-            run_id=run_id,
-            stage=predecessor,
-            state="completed",
-            checkpoint_uri=predecessor_row[2],
-            definition=definition,
-        )
+        if binding is None or binding.get("stage") != predecessor:
+            raise PlatformStoreError(
+                f"The {predecessor!r} predecessor was not rebound from its sealed root; retry the registration"
+            )
+        if binding.get("checkpoint_uri") != predecessor_row[2] or binding.get("receipt_digest") != digest(
+            predecessor_row[1]
+        ):
+            raise PlatformStoreError(
+                f"The registered {predecessor!r} stage changed after it was verified; retry the registration"
+            )
 
 
 def _matching_operation(row, *, run_id: str, stage: str, kind: str, params_digest: str) -> OperationRecord:
