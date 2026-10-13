@@ -9,14 +9,16 @@
 在[开发环境](CONTRIBUTING.md)中构建到两个新的外部目录：
 
 ```sh
-python tools/build_release.py --output /path/to/release-a --offline
-python tools/build_release.py --output /path/to/release-b --offline
+python tools/build_release.py --output /path/to/release-a
+python tools/build_release.py --output /path/to/release-b
 diff /path/to/release-a/release.json /path/to/release-b/release.json
 ```
 
 归档成员按相对 UTF-8 路径排序，固定权限、UID/GID 和空用户名，移除绝对路径及本机元数据；ZIP 使用固定 1980 epoch，tar/gzip 使用 epoch 0，压缩算法和版本锁定。模型与发行 JSON 使用[统一规范序列化](docs/contracts.md#delivery)。不同路径、时间和 ambient 安装下的独立构建必须得到相同字节，核对清单及每项资产摘要。
 
-`release.json` 是唯一发行清单，包含源码 commit、源码/包文件摘要、版本、schema/阶段/策略摘要、完整支持矩阵及各资产摘要。输出包含 wheel、源码、部署档案、Linux 离线运行档案与最小 Windows 离线运行档案。
+`release.json` 是唯一且必需的发行清单，包含源码 commit、源码/包文件摘要、版本、实际 schema 定义/阶段/策略摘要、完整支持矩阵及各资产摘要。schema 摘要覆盖结构与字段规则。支持矩阵明确两端操作系统、架构、CPython、角色依赖及原生 API 前提。
+
+每次构建交付同一完整集合：wheel、源码、部署档案、Linux 离线运行档案与最小 Windows 离线运行档案。校验入口要求清单和全部资产存在，核对部署成员、角色工具与依赖锁来自同一源码发行；缺项或重新封存后来源不一致均拒绝。
 
 运行档案只包含对应角色的全部精确依赖及 hash-locked 安装文件。Linux 支持生成、独立验证和平台；Windows 只支持原生执行及必要传输/资源管理。两端安装同一源码发行身份，原生资格记录精确 Windows、SolidWorks 版本/build 与 API 环境。
 
