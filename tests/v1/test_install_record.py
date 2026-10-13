@@ -607,6 +607,8 @@ class InstallRecordTests(unittest.TestCase):
         self.assertEqual(restored["install_id"], "gen-1")
         active = json.loads((state_root / "install-record.json").read_text(encoding="utf-8"))
         self.assertEqual(active["install_id"], "gen-1")
+        self.assertEqual(stat.S_IMODE((state_root / "install-record.json").stat().st_mode), 0o600)
+        self.assertFalse((state_root / "install-record.json.repoint.tmp").exists())
 
     def test_verify_active_consumes_the_canonical_validator(self):
         with tempfile.TemporaryDirectory(prefix="verify-active-") as temporary:

@@ -397,14 +397,19 @@ def previous_from_record(record: dict, record_path: Path) -> dict:
 def repoint_active(state_root: Path, record_path: Path) -> dict:
     """Atomically point ``install-record.json`` at an existing generation file (rollback).
 
-    The record is validated by the canonical package validator first; the generation files
-    themselves are never rewritten.
+    One read is the only source: those exact bytes are validated by the canonical package
+    validator and then committed, so nothing can change between the check and the write.  The
+    active pointer keeps mode 0600 and refuses a conflicting temporary path.
     """
 
     state_root, record_path = Path(state_root), Path(record_path)
     require(record_path.is_file(), f"rollback record not found: {record_path}")
     try:
-        document = json.loads(record_path.read_text(encoding="utf-8"))
+        payload = record_path.read_bytes()
+    except OSError as error:
+        die(f"cannot read record {record_path}: {error}")
+    try:
+        document = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as error:
         die(f"cannot parse rollback record {record_path}: {error}")
     try:
@@ -413,10 +418,36 @@ def repoint_active(state_root: Path, record_path: Path) -> dict:
         die(f"rollback record invalid: {error}")
     active = state_root / "install-record.json"
     active.parent.mkdir(parents=True, exist_ok=True)
-    temporary = active.with_suffix(".repoint.tmp")
-    temporary.write_bytes(record_path.read_bytes())
+    temporary = active.with_name(active.name + ".repoint.tmp")
+    require(not temporary.exists(), f"refuse a conflicting temporary path: {temporary}")
+    handle = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(handle, "wb") as stream:
+        stream.write(payload)
     os.replace(temporary, active)
     return document
+
+
+def validate_endpoint_health(health_document, release: dict) -> tuple[dict, dict]:
+    """Derive the Windows end's identity from the running endpoint's own IF-09 ``/health``.
+
+    The health payload is validated by the canonical package validator and its release triple
+    must equal the release manifest; a hand-written declaration never becomes an identity.
+    """
+
+    interface_records = _canonical_records()
+    try:
+        health = interface_records.validate_health(health_document)
+    except Exception as error:
+        die(f"endpoint health invalid: {error}")
+    require_matching_release(release, {"release": health["release"]})
+    identity = {
+        "install_id": health["install"]["install_id"],
+        "config_digest": health["install"]["config_digest"],
+        "release": {
+            key: health["release"][key] for key in ("version", "source_commit", "source_sha256", "role")
+        },
+    }
+    return identity, health
 
 
 def write_install_record(record: dict, state_root: Path, owner) -> tuple[Path, Path]:
@@ -467,6 +498,11 @@ def main(argv: list[str] | None = None) -> int:
     repoint = subparsers.add_parser("repoint")
     repoint.add_argument("--state-root", type=Path, required=True)
     repoint.add_argument("--record", type=Path, required=True, help="the generation file to activate (rollback)")
+    identity = subparsers.add_parser("endpoint-identity")
+    identity.add_argument("--health", type=Path, required=True, help="the endpoint's own /health payload")
+    identity.add_argument("--release-file", type=Path, required=True)
+    identity.add_argument("--record", type=Path, default=None, help="cross-check against this install record")
+    identity.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
 
     if args.action == "verify-active":
@@ -476,6 +512,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.action == "repoint":
         record = repoint_active(args.state_root, args.record)
         print(f"install_id={record['install_id']}")
+        return 0
+    if args.action == "endpoint-identity":
+        release = release_identity(_load_json(args.release_file, "release file"))
+        endpoint, health = validate_endpoint_health(_load_json(args.health, "endpoint health"), release)
+        if args.record is not None:
+            interface_records = _canonical_records()
+            try:
+                record = interface_records.validate_install_record(_load_json(args.record, "install record"))
+                interface_records.require_endpoint_matches_install_record(health, record)
+            except Exception as error:
+                die(f"endpoint does not match the active record: {error}")
+        args.out.write_text(json.dumps(endpoint, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(f"install_id={endpoint['install_id']}")
         return 0
     if args.action == "check":
         release = release_identity(_load_json(args.release_file, "release file"))

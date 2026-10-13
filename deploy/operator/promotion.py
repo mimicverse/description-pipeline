@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Promotion receipts for the unified stage/promote/rollback protocol.
 
-The install record is written once, at the pointer switch.  Every step of one switch attempt
-(stage included) is registered here as it happens - the plan, the actual status and the
-evidence - and a failed attempt leaves this receipt as the failure record that rollback reads.
-Everything lives under ``<state root>/promotions/<install_id>/``; nothing here touches the
-active pointer or the journal of an existing record.
+The install record is written once, at the pointer switch, and its journal references this
+receipt.  The receipt is the single step authority: every step of one switch attempt (stage
+included) is registered here as it happens - the plan, the actual status and the evidence -
+and a failed attempt leaves it as the failure record rollback reads.  The bound generations
+are immutable files with their real digests, never the mutable active pointer.  Everything
+lives under ``<state root>/promotions/<install_id>/``; nothing here touches the active
+pointer or the journal of an existing record.
 
 Exit codes: 0 success; 1 error (message on stderr); 2 usage error.
 """
@@ -13,6 +15,7 @@ Exit codes: 0 success; 1 error (message on stderr); 2 usage error.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -79,10 +82,6 @@ def main(argv: list[str] | None = None) -> int:
     step.add_argument("--status", choices=sorted(STATUSES), required=True)
     step.add_argument("--at", default=None)
     step.add_argument("--evidence", action="append", required=True, help="repeatable evidence reference")
-    journal = subparsers.add_parser("journal")
-    journal.add_argument("--state-root", type=Path, required=True)
-    journal.add_argument("--install-id", required=True)
-    journal.add_argument("--verb", choices=sorted(VERBS), required=True)
     show = subparsers.add_parser("show")
     show.add_argument("--state-root", type=Path, required=True)
     show.add_argument("--install-id", required=True)
@@ -93,13 +92,17 @@ def main(argv: list[str] | None = None) -> int:
         require(not path.exists(), f"preserve the existing promotion receipt: {path}")
         plan = [name for name in args.plan.split(",") if name]
         require(plan, "the promotion plan is empty")
+        require(args.source.is_file(), f"the bound source generation is missing: {args.source}")
+        require(args.target.is_file(), f"the bound target generation is missing: {args.target}")
         save_receipt(
             path,
             {
                 "schema_version": RECEIPT_SCHEMA,
                 "install_id": args.install_id,
                 "from": str(args.source),
+                "from_sha256": hashlib.sha256(args.source.read_bytes()).hexdigest(),
                 "to": str(args.target),
+                "to_sha256": hashlib.sha256(args.target.read_bytes()).hexdigest(),
                 "plan": plan,
                 "created_at": utc_now(),
                 "steps": [],
@@ -127,12 +130,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         save_receipt(path, document)
         print(f"receipt={path}")
-        return 0
-    if args.action == "journal":
-        document = load_receipt(path)
-        rows = [row for row in document["steps"] if row["verb"] == args.verb]
-        require(rows, f"the receipt has no {args.verb} steps yet")
-        print(json.dumps([{key: row[key] for key in ("verb", "step", "status", "at", "evidence")} for row in rows]))
         return 0
     if args.action == "show":
         document = load_receipt(path)

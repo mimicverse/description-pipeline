@@ -677,6 +677,11 @@ class LifecycleTests(unittest.TestCase):
             '    echo false > "$ADMISSION"\n'
             '    echo "platform open_admission" >> "$ORDER_LOG"\n'
             '    echo "admission=open revision=3" ;;\n'
+            "  *platform-reconcile*)\n"
+            '    [ -n "${RECONCILE_RUN_ID:-}" ] && [ -n "${RECONCILE_OUTCOME:-}" ] || exit 61\n'
+            '    echo "platform reconcile ${RECONCILE_RUN_ID}:${RECONCILE_STAGE}:${RECONCILE_OUTCOME}"'
+            ' >> "$ORDER_LOG"\n'
+            '    echo "reconciled=${RECONCILE_RUN_ID}:${RECONCILE_STAGE} outcome=${RECONCILE_OUTCOME}" ;;\n'
             "  *)\n"
             '    echo "airflow admission check" >> "$ORDER_LOG"\n'
             '    count=$(cat "$REGISTER_COUNT" 2>/dev/null || echo 0)\n'
@@ -750,6 +755,55 @@ class LifecycleTests(unittest.TestCase):
             )
             self.assertNotIn("is-active", order_text)
             self.assertNotIn("platform open_admission", order_text)
+
+    def test_promote_and_rollback_refuse_before_any_side_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, env, _, order = self._admission_fixture(Path(tmp))
+            missing_id = run(["bash", str(CONTROL), "promote", "--config", str(config_path)], env)
+            self.assertEqual(missing_id.returncode, 1)
+            self.assertIn("requires --install-id", missing_id.stderr)
+            no_receipt = run(
+                ["bash", str(CONTROL), "promote", "--config", str(config_path), "--install-id", "gen-9"], env
+            )
+            self.assertEqual(no_receipt.returncode, 1)
+            self.assertIn("run stage first", no_receipt.stderr)
+            rollback = run(["bash", str(CONTROL), "rollback", "--config", str(config_path)], env)
+            self.assertEqual(rollback.returncode, 1)
+            self.assertIn("no promotion receipt", rollback.stderr)
+            lines = order.read_text(encoding="utf-8").splitlines() if order.exists() else []
+            self.assertNotIn("platform close_admission", lines, "a refused switch must not touch the admission")
+            self.assertFalse([line for line in lines if line.startswith("airflow ") and "dags" in line])
+
+    def test_reconcile_binds_a_registered_operation_and_refuses_unbound_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, env, _, order = self._admission_fixture(Path(tmp))
+            refused = run(["bash", str(CONTROL), "reconcile", "--config", str(config_path)], env)
+            self.assertEqual(refused.returncode, 1)
+            self.assertIn("reconcile requires", refused.stderr)
+            bad = run(
+                [
+                    "bash", str(CONTROL), "reconcile", "--config", str(config_path),
+                    "--run-id", "run-1", "--stage", "capture", "--outcome", "unresolved",
+                    "--evidence", "receipt.json",
+                ],
+                env,
+            )
+            self.assertEqual(bad.returncode, 1)
+            self.assertIn("unresolved is not a result", bad.stderr)
+            reconciled = run(
+                [
+                    "bash", str(CONTROL), "reconcile", "--config", str(config_path),
+                    "--run-id", "run-1", "--stage", "capture", "--outcome", "completed",
+                    "--evidence", "receipt.json",
+                ],
+                env,
+            )
+            self.assertEqual(reconciled.returncode, 0, reconciled.stdout + reconciled.stderr)
+            self.assertIn("reconciled=run-1:capture outcome=completed", reconciled.stdout)
+            self.assertIn(
+                "platform reconcile run-1:capture:completed",
+                order.read_text(encoding="utf-8").splitlines(),
+            )
 
     def test_unpause_failure_does_not_start_ingress(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1246,6 +1300,8 @@ class InstallOrderingTests(unittest.TestCase):
         (tree / "platform.json").write_text(json.dumps(config), encoding="utf-8")
         windows_archive = tree / "description-1.4.0-windows-cp312-x86_64.zip"
         windows_archive.write_bytes(b"windows-archive")
+        (tree / "description-1.4.0-linux-cp312-x86_64.zip").write_bytes(b"linux-archive")
+        (tree / "description-1.4.0-deployment.zip").write_bytes(b"deployment-archive")
         (tree / "release.json").write_text(
             json.dumps(
                 {
@@ -1257,6 +1313,8 @@ class InstallOrderingTests(unittest.TestCase):
                     "artifacts": {
                         wheel.name: hashlib.sha256(wheel.read_bytes()).hexdigest(),
                         windows_archive.name: hashlib.sha256(windows_archive.read_bytes()).hexdigest(),
+                        "description-1.4.0-linux-cp312-x86_64.zip": hashlib.sha256(b"linux-archive").hexdigest(),
+                        "description-1.4.0-deployment.zip": hashlib.sha256(b"deployment-archive").hexdigest(),
                     },
                 }
             ),
@@ -1460,31 +1518,29 @@ class InstallOrderingTests(unittest.TestCase):
                 [row["step"] for row in receipt["steps"]], ["linux-generation", "windows-generation"]
             )
             self.assertEqual({row["status"] for row in receipt["steps"]}, {"completed"})
+            # The bound source is the immutable generation file with its real digest.
+            self.assertEqual(receipt["from"], str(state / "install-records" / "gen-1.json"))
+            self.assertEqual(len(receipt["from_sha256"]), 64)
+            self.assertEqual(len(receipt["to_sha256"]), 64)
             binding = json.loads(
                 (state / "promotions" / "gen-2" / "windows-binding.json").read_text(encoding="utf-8")
             )
             self.assertEqual(binding["task_name"], "description-e2e-endpoint")
             self.assertEqual(binding["state_root"], "C:/description-e2e/state")
+            self.assertEqual(binding["dir"], "C:/description-e2e/state/lifecycle/gen-2")
+            self.assertEqual(binding["archive"], "description-1.4.0-windows-cp312-x86_64.zip")
+            self.assertEqual(binding["artifact_sha256"], hashlib.sha256(b"windows-archive").hexdigest())
             lines = order.read_text(encoding="utf-8").splitlines()
-            self.assertTrue(any(line.startswith("scp ") for line in lines), lines[-10:])
-            self.assertTrue(any(line.startswith("ssh ") for line in lines), lines[-10:])
-            self.assertNotIn("platform close_admission", lines)
-            journalled = run(
-                [
-                    "python3",
-                    str(release / "operator" / "promotion.py"),
-                    "journal",
-                    "--state-root",
-                    str(state),
-                    "--install-id",
-                    "gen-2",
-                    "--verb",
-                    "promote",
-                ],
-                {},
+            mkdir_line = next(
+                index for index, line in enumerate(lines) if line.startswith("ssh ") and "New-Item" in line
             )
-            self.assertEqual(journalled.returncode, 0, journalled.stderr)
-            self.assertEqual(len(json.loads(journalled.stdout)), 2)
+            scp_line = next(index for index, line in enumerate(lines) if line.startswith("scp "))
+            self.assertLess(mkdir_line, scp_line, "the private remote directory exists before the transfer")
+            # The full release carries three archives; exactly the native one travels.
+            self.assertIn("description-1.4.0-windows-cp312-x86_64.zip", lines[scp_line])
+            self.assertNotIn("linux-cp312", lines[scp_line])
+            self.assertNotIn("deployment.zip", lines[scp_line])
+            self.assertNotIn("platform close_admission", lines)
 
     def test_not_ready_postgres_fails_before_migration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1492,7 +1548,7 @@ class InstallOrderingTests(unittest.TestCase):
             result = self._install(release, control_env)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("PostgreSQL did not become ready", result.stderr)
-            lines = order.read_text(encoding="utf-8").splitlines()
+            lines = order.read_text(encoding="utf-8").splitlines() if order.exists() else []
             self.assertNotIn("airflow_install", lines)
             self.assertNotIn("psql_db_query", lines)
             self.assertNotIn("createdb", lines)

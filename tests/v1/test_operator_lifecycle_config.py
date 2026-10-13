@@ -3,8 +3,9 @@
 All frozen lifecycle verbs (``validate/install/start/drain/stop/status/health/reconcile/stage/
 promote/rollback``) take ``--config`` as the single entry; every one of them passes the same
 static ``platform_config.py`` gate first.  The operational verbs load the active install
-record and its derived per-generation environment; verbs whose bridge has not landed yet exit 3
-without pretending.  ``--env-file`` does not exist as an entry point.
+record and its derived per-generation environment; each of them refuses on its real
+preconditions with zero side effects instead of pretending.  ``--env-file`` does not exist as
+an entry point.
 """
 
 from __future__ import annotations
@@ -35,10 +36,9 @@ ALL_VERBS = (
     "promote",
     "rollback",
 )
-UNBRIDGED_VERBS = tuple(
-    verb for verb in ALL_VERBS if verb not in {"validate", "install", "start", "drain", "stop", "status", "health"}
+OPERATIONAL_VERBS = tuple(
+    verb for verb in ALL_VERBS if verb not in {"validate", "install"}
 )
-BRIDGED_OPERATIONAL = ("start", "drain", "stop", "status", "health")
 
 
 def run(args: list[str]) -> subprocess.CompletedProcess:
@@ -108,13 +108,15 @@ class LifecycleSkeletonTests(unittest.TestCase):
         self.assertEqual(missing_release.returncode, 1)
         self.assertIn("release manifest", missing_release.stderr)
 
-    def test_every_other_verb_fails_closed_after_the_config_gate(self):
-        for verb in UNBRIDGED_VERBS:
+    def test_every_operational_verb_requires_an_installed_generation(self):
+        # Every verb — the maintenance switch included — fails closed on its real first
+        # precondition (the active generation) before any side effect, with no transitional
+        # "not implemented" state left anywhere.
+        for verb in OPERATIONAL_VERBS:
             with self.subTest(verb):
                 result = run([verb, "--config", str(self.config)])
-                self.assertEqual(result.returncode, 3)
-                self.assertIn(verb, result.stderr)
-                self.assertIn("not implemented in this increment", result.stderr)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("not installed", result.stderr)
 
     def test_invalid_config_fails_before_any_verb_behavior(self):
         bad = self.root / "bad.json"
@@ -138,14 +140,6 @@ class LifecycleSkeletonTests(unittest.TestCase):
         missing = run(["install", "--config", str(self.root / "missing.json")])
         self.assertEqual(missing.returncode, 1)
         self.assertIn("config file not found", missing.stderr)
-
-    def test_bridged_verbs_require_an_installed_generation(self):
-        for verb in BRIDGED_OPERATIONAL:
-            with self.subTest(verb):
-                result = run([verb, "--config", str(self.config)])
-                self.assertEqual(result.returncode, 1)
-                self.assertIn("not installed", result.stderr)
-
 
 if __name__ == "__main__":
     unittest.main()

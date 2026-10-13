@@ -39,36 +39,49 @@ function Action-Config([object]$task) {
   if (-not $match.Success) { Die 'task_ambiguous' 'the instance task does not run serve --config' }
   $match.Groups[1].Value
 }
-function Health-Probe([string]$configPath) {
+function Health-Probe([string]$configPath, [object]$binding) {
   $config = Read-Json $configPath
   $token = (Get-Content -LiteralPath $config.token_file -Raw).Trim()
   $deadline = (Get-Date).AddSeconds(30)
+  $health = $null
   do {
     try {
-      return Invoke-RestMethod -Uri ("http://127.0.0.1:" + $config.port + "/health") `
+      $health = Invoke-RestMethod -Uri ("http://127.0.0.1:" + $config.port + "/health") `
         -Headers @{Authorization=('Bearer ' + $token)} -TimeoutSec 3
     } catch { Start-Sleep -Milliseconds 500 }
-  } while ((Get-Date) -lt $deadline)
-  Die 'endpoint_unhealthy' 'the instance endpoint did not answer /health within 30s'
+  } while (-not $health -and (Get-Date) -lt $deadline)
+  if (-not $health) { throw 'the instance endpoint did not answer /health within 30s' }
+  if ($health.schema_version -ne 'solidworks-to-urdf.health/v1' -or -not $health.ready -or -not $health.native_platform) {
+    throw 'the instance endpoint /health is not a ready IF-09 identity'
+  }
+  if ($health.release.version -ne $binding.version -or $health.release.source_commit -ne $binding.source_commit -or $health.release.source_sha256 -ne $binding.source_sha256) {
+    throw 'the instance endpoint /health release identity differs from the release manifest'
+  }
+  if (-not $health.install.install_id -or -not $health.install.config_digest) {
+    throw 'the instance endpoint /health does not carry its install identity'
+  }
+  return $health
 }
 
 $binding = Read-Json $Binding
-foreach ($field in ('task_name','state_root','archive','version','source_commit','source_sha256')) {
+foreach ($field in ('task_name','state_root','generation','dir','archive','artifact_sha256','version','source_commit','source_sha256')) {
   if (-not $binding.$field) { Die 'binding_incomplete' "the binding misses $field" }
 }
 $task = Get-ScheduledTask -TaskName $binding.task_name -ErrorAction SilentlyContinue
 if ($Verb -eq 'health') {
   if (-not $task) { Die 'task_missing' 'the instance task is not registered' }
-  Emit @{passed=$true; verb='health'; health=(Health-Probe (Action-Config $task))}
+  try { $probe = Health-Probe (Action-Config $task) $binding } catch { Die 'endpoint_unhealthy' $_.Exception.Message }
+  Emit @{passed=$true; verb='health'; health=$probe}
   exit 0
 }
 
 if ($Verb -eq 'stage') {
   if (-not $StageDir) { Die 'stage_dir_required' 'stage needs -StageDir (the new generation directory)' }
   if (Test-Path -LiteralPath $StageDir) { Die 'stage_exists' "preserve the existing generation: $StageDir" }
-  if ((Sha256 $binding.archive) -ne $binding.source_sha256) { Die 'archive_mismatch' 'the offline archive digest differs from the release manifest' }
+  $archive = Join-Path $binding.dir $binding.archive
+  if ((Sha256 $archive) -ne $binding.artifact_sha256) { Die 'archive_mismatch' 'the transferred archive digest differs from the release manifest' }
   New-Item -ItemType Directory -Path $StageDir | Out-Null
-  Expand-Archive -LiteralPath $binding.archive -DestinationPath $StageDir
+  Expand-Archive -LiteralPath $archive -DestinationPath $StageDir
   $files = Read-Json (Join-Path $StageDir 'files.json')
   foreach ($name in $files.PSObject.Properties.Name) {
     if ((Sha256 (Join-Path $StageDir $name)) -ne $files.$name) { Die 'archive_file_mismatch' "file digest mismatch: $name" }
@@ -100,6 +113,16 @@ if ($Verb -eq 'promote') {
   if (-not $task) { Die 'task_missing' 'the instance task is not registered; install the instance before promoting' }
   if (@($task.Actions).Count -ne 1) { Die 'task_ambiguous' 'the instance task must carry exactly one action' }
   $configPath = Action-Config $task
+  # The old endpoint stops before anything switches; a listener that survives the stop refuses
+  # the promotion instead of being overwritten.
+  Stop-ScheduledTask -TaskName $binding.task_name
+  $stopDeadline = (Get-Date).AddSeconds(30)
+  while ((Get-NetTCPConnection -LocalPort $binding.port -State Listen -ErrorAction SilentlyContinue) -and (Get-Date) -lt $stopDeadline) {
+    Start-Sleep -Milliseconds 500
+  }
+  if (Get-NetTCPConnection -LocalPort $binding.port -State Listen -ErrorAction SilentlyContinue) {
+    Die 'stop_failed' 'the old endpoint is still listening; refusing to switch'
+  }
   New-Item -ItemType Directory -Path $promotions -ErrorAction SilentlyContinue | Out-Null
   $previous = Join-Path $promotions ('previous-' + (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ'))
   New-Item -ItemType Directory -Path $previous | Out-Null
@@ -110,7 +133,7 @@ if ($Verb -eq 'promote') {
   Set-ScheduledTask -TaskName $binding.task_name -Action $action | Out-Null
   try {
     Start-ScheduledTask -TaskName $binding.task_name
-    $health = Health-Probe $configPath
+    $health = Health-Probe $configPath $binding
     Write-Receipt (Join-Path $promotions 'last-promotion.json') @{
       passed=$true; verb='promote'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
       previous=$previous; health=$health}
@@ -135,7 +158,11 @@ if ($Verb -eq 'rollback') {
   Register-ScheduledTask -TaskName $binding.task_name -Xml (Get-Content -LiteralPath (Join-Path $last.previous 'task.xml') -Raw) -Force | Out-Null
   Copy-Item -LiteralPath (Join-Path $last.previous 'endpoint-before.json') -Destination $configPath -Force
   Start-ScheduledTask -TaskName $binding.task_name
-  $health = Health-Probe $configPath
+  try { $health = Health-Probe $configPath $binding } catch {
+    Write-Receipt (Join-Path $promotions 'failed-rollback.json') @{
+      passed=$false; verb='rollback'; at=(Get-Date).ToUniversalTime().ToString('o'); message=$_.Exception.Message}
+    Die 'rollback_failed' $_.Exception.Message
+  }
   Write-Receipt (Join-Path $promotions 'last-rollback.json') @{
     passed=$true; verb='rollback'; at=(Get-Date).ToUniversalTime().ToString('o');
     restored_from=$last.generation; previous=$last.previous; health=$health}
