@@ -1,6 +1,6 @@
 """Stable error codes and process exit codes for the bridge.
 
-Exit codes (architecture doc, section 4.1):
+Exit codes (documented in docs/operations.md#native-endpoint-exit-codes):
   0 success / 1 usage / 2 environment / 3 upstream CAD / 4 timeout / 5 internal
 """
 
