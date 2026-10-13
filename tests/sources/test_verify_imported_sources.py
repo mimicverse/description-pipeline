@@ -13,15 +13,15 @@ from description_pipeline.verification.native_discovery import DISCOVERY_SCHEMA,
 from .selection_support import sealed_selection
 from . import support
 
-ROOT = r"C:\description-v1-review\probe-46986340\input-copy"
-TEMP = r"C:\Users\33985\AppData\Local\Temp\swx42380\IC~~"
-CACHED_TEMP_ROOT = r"C:\Users\33985\AppData\Local\Temp\swx28528"
-CACHED_MATERIALIZATION = CACHED_TEMP_ROOT + r"\IC~~\HD-1910-C001-20260902.stp.SLDASM"
-SELECTION_TEMP_ROOT = r"C:\Users\33985\AppData\Local\Temp\swx99123"
-SELECTION_MATERIALIZATION = SELECTION_TEMP_ROOT + r"\IC~~\HD-1910-C001-20260902.stp.SLDASM"
-CACHED_AUTHOR = r"D:\M2.2(9.17) DengJingjie - 副本\change11\HD-1910-C001-20260902.stp"
-CACHED_OWNER = "HD-1910-C001-20260902.SLDASM"
-CACHED_OCCURRENCE = "HD-1910-C001-20260902-21/HD-1910-C001-20260902.stp-2"
+ROOT = r"C:\description-v1-review\capture-session\input-copy"
+TEMP = r"C:\Users\operator\AppData\Local\Temp\swx00001\IC~~"
+CACHED_TEMP_ROOT = r"C:\Users\operator\AppData\Local\Temp\swx00002"
+CACHED_MATERIALIZATION = CACHED_TEMP_ROOT + r"\IC~~\bracket_a.stp.SLDASM"
+SELECTION_TEMP_ROOT = r"C:\Users\operator\AppData\Local\Temp\swx00003"
+SELECTION_MATERIALIZATION = SELECTION_TEMP_ROOT + r"\IC~~\bracket_a.stp.SLDASM"
+CACHED_AUTHOR = r"D:\design-copy\change01\bracket_a.stp"
+CACHED_OWNER = "bracket_a.SLDASM"
+CACHED_OCCURRENCE = "bracket_a-21/bracket_a.stp-2"
 CACHED_API = "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual"
 
 
@@ -49,11 +49,11 @@ def foreign_provenance():
     return {
         "state": "unread",
         "source_root": ROOT,
-        "native_document_path": rf"{TEMP}\HD-1910-C001-20260902.stp.SLDASM",
+        "native_document_path": rf"{TEMP}\bracket_a.stp.SLDASM",
         "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
-        "imported_path": r"D:\M2.2(9.17) DengJingjie - 副本\change11\HD-1910-C001-20260902.stp",
+        "imported_path": r"D:\design-copy\change01\bracket_a.stp",
         "kind": None,
-        "document": "HD-1910-C001-20260902.stp",
+        "document": "bracket_a.stp",
         "sha256": None,
         "is_virtual": None,
         "error": "ValueError: native imported source does not resolve to a file inside the delivered folder",
@@ -63,7 +63,7 @@ def foreign_provenance():
 def foreign_component(name, *, containing=None):
     return {
         "name2": name,
-        "document": rf"{TEMP}\HD-1910-C001-20260902.stp.SLDASM",
+        "document": rf"{TEMP}\bracket_a.stp.SLDASM",
         "suppressed": False,
         "lightweight": False,
         "suppression_state": 2,
@@ -94,7 +94,7 @@ def cached_provenance(owner_sha, **overrides):
 
 def cached_component(owner_sha, **overrides):
     component = {
-        "name2": "HD-1910-C001-20260902.stp-2",
+        "name2": "bracket_a.stp-2",
         "document": None,
         "configuration": "Default",
         "suppressed": False,
@@ -134,7 +134,7 @@ def cached_carrier(owner_sha, imports=None):
 
 DISCOVERY_ROOT = r"C:\discovery\m3-flat"
 SELECTION_ROOT = r"C:\selection\m3-flat-absence"
-NP_RELATIVE = "NP-F550.step"
+NP_RELATIVE = "imported_part.step"
 
 
 def relocated_component(owner_sha):
@@ -142,7 +142,7 @@ def relocated_component(owner_sha):
         owner_sha,
         author_imported_in_source_root=True,
         author_imported_relative=NP_RELATIVE,
-        author_imported_path=DISCOVERY_ROOT + r"\NP-F550.step",
+        author_imported_path=DISCOVERY_ROOT + r"\imported_part.step",
         source_root=DISCOVERY_ROOT,
     )
     return cached_component(owner_sha, source_provenance=provenance)
@@ -153,7 +153,7 @@ def relocated_carrier(owner_sha, np_sha):
     slot.update(
         author_metadata_in_stage=True,
         bound_source=NP_RELATIVE,
-        author_imported_path=SELECTION_ROOT + r"\NP-F550.step",
+        author_imported_path=SELECTION_ROOT + r"\imported_part.step",
     )
     return sealed_selection(
         {CACHED_OWNER: owner_sha, NP_RELATIVE: np_sha},
@@ -212,15 +212,15 @@ class ImportedSourceTests(unittest.TestCase):
         content = b"frozen step bytes"
         sha = hashlib.sha256(content).hexdigest()
         baseline = {
-            "name2": "NP-F550.step-1",
-            "document": "NP-F550.step",
+            "name2": "imported_part.step-1",
+            "document": "imported_part.step",
             "suppressed": False,
             "lightweight": False,
             "suppression_state": 2,
-            "source_provenance": accepted_provenance("NP-F550.step", sha),
+            "source_provenance": accepted_provenance("imported_part.step", sha),
         }
         with tempfile.TemporaryDirectory() as directory:
-            package = self._package(directory, {"NP-F550.step": content}, [json.loads(json.dumps(baseline))])
+            package = self._package(directory, {"imported_part.step": content}, [json.loads(json.dumps(baseline))])
             report = verify_discovery(package)
             sealed_hash = hashlib.sha256((package / "evidence/discovery.json").read_bytes()).hexdigest()
         # The binding check stays first so the passed report keeps its sealed provenance hash.
@@ -244,7 +244,7 @@ class ImportedSourceTests(unittest.TestCase):
                 component = json.loads(json.dumps(baseline))
                 mutate(component)
                 with tempfile.TemporaryDirectory() as directory:
-                    package = self._package(directory, {"NP-F550.step": content}, [component])
+                    package = self._package(directory, {"imported_part.step": content}, [component])
                     report = verify_discovery(package)
                 failed = next(item for item in report["checks"] if item["id"] == "discovery.suppression_state")
                 self.assertFalse(failed["passed"], label)
@@ -260,15 +260,15 @@ class ImportedSourceTests(unittest.TestCase):
         content = b"frozen step bytes"
         sha = hashlib.sha256(content).hexdigest()
         component = {
-            "name2": "NP-F550.step-1",
-            "document": "NP-F550.step",
+            "name2": "imported_part.step-1",
+            "document": "imported_part.step",
             "suppressed": False,
             "lightweight": False,
             "suppression_state": 2,
-            "source_provenance": accepted_provenance("NP-F550.step", sha),
+            "source_provenance": accepted_provenance("imported_part.step", sha),
         }
         with tempfile.TemporaryDirectory() as directory:
-            package = self._package(directory, {"NP-F550.step": content}, [component])
+            package = self._package(directory, {"imported_part.step": content}, [component])
             record_path = package / "evidence/discovery.json"
             payload = json.loads(record_path.read_bytes())
             payload["raw"] = None
@@ -284,15 +284,15 @@ class ImportedSourceTests(unittest.TestCase):
         content = b"frozen step bytes"
         sha = hashlib.sha256(content).hexdigest()
         component = {
-            "name2": "NP-F550.step-1",
-            "document": "NP-F550.step",
+            "name2": "imported_part.step-1",
+            "document": "imported_part.step",
             "suppressed": False,
             "lightweight": False,
             "suppression_state": 2,
-            "source_provenance": accepted_provenance("NP-F550.step", sha),
+            "source_provenance": accepted_provenance("imported_part.step", sha),
         }
         with tempfile.TemporaryDirectory() as directory:
-            package = self._package(directory, {"NP-F550.step": content}, [component])
+            package = self._package(directory, {"imported_part.step": content}, [component])
             report = verify_discovery(package)
         self.assertTrue(self._check(report)["passed"], self._check(report)["details"])
         self.assertNotIn("discovery.imported_source_unbound", {item["code"] for item in report["errors"]})
@@ -301,15 +301,15 @@ class ImportedSourceTests(unittest.TestCase):
         content = b"frozen step bytes"
         sha = hashlib.sha256(content).hexdigest()
         component = {
-            "name2": "NP-F550.step-1",
-            "document": "NP-F550.step",
+            "name2": "imported_part.step-1",
+            "document": "imported_part.step",
             "suppressed": False,
             "lightweight": False,
             "suppression_state": 2,
-            "source_provenance": accepted_provenance("NP-F550.step", sha),
+            "source_provenance": accepted_provenance("imported_part.step", sha),
         }
         with tempfile.TemporaryDirectory() as directory:
-            package = self._package(directory, {"NP-F550.step": content}, [component], raw_files={})
+            package = self._package(directory, {"imported_part.step": content}, [component], raw_files={})
             report = verify_discovery(package)
         self.assertTrue(self._check(report)["passed"], self._check(report)["details"])
 
@@ -332,10 +332,10 @@ class ImportedSourceTests(unittest.TestCase):
         self.assertEqual(detail["occurrences"], ["module-1"])
         sample = detail["samples"][0]
         self.assertEqual(sample["occurrence"], "module-1")
-        self.assertEqual(sample["document"], rf"{TEMP}\HD-1910-C001-20260902.stp.SLDASM")
+        self.assertEqual(sample["document"], rf"{TEMP}\bracket_a.stp.SLDASM")
         self.assertEqual(sample["containing_document"], "module.SLDASM")
         self.assertIn("IC~~", sample["native_path"])
-        self.assertIn("M2.2", sample["imported_path"])
+        self.assertIn("design-copy", sample["imported_path"])
         self.assertIn("unread", sample["reason"])
 
     def test_all_unbound_occurrences_are_retained(self):
@@ -355,18 +355,20 @@ class ImportedSourceTests(unittest.TestCase):
         sha = hashlib.sha256(content).hexdigest()
         cases = (
             ({"document": "other.step"}, "differs"),
-            ({"document": "./NP-F550.step"}, "canonical"),
+            ({"document": "./imported_part.step"}, "canonical"),
             ({"is_virtual": True}, "virtual"),
             ({"sha256": "f" * 64}, "bound"),
-            ({"imported_path": r"C:\elsewhere\NP-F550.step"}, "frozen root"),
-            ({"imported_path": r"D:\elsewhere\NP-F550.step"}, "different drives"),
+            ({"imported_path": r"C:\elsewhere\imported_part.step"}, "frozen root"),
+            ({"imported_path": r"D:\elsewhere\imported_part.step"}, "different drives"),
         )
         for patch, token in cases:
-            provenance = accepted_provenance("NP-F550.step", sha)
+            provenance = accepted_provenance("imported_part.step", sha)
             provenance.update(patch)
-            component_document = "./NP-F550.step" if patch.get("document") == "./NP-F550.step" else "NP-F550.step"
+            component_document = (
+                "./imported_part.step" if patch.get("document") == "./imported_part.step" else "imported_part.step"
+            )
             component = {
-                "name2": "NP-F550.step-1",
+                "name2": "imported_part.step-1",
                 "document": component_document,
                 "suppressed": False,
                 "lightweight": False,
@@ -374,7 +376,7 @@ class ImportedSourceTests(unittest.TestCase):
                 "source_provenance": provenance,
             }
             with tempfile.TemporaryDirectory() as directory:
-                package = self._package(directory, {"NP-F550.step": content}, [component])
+                package = self._package(directory, {"imported_part.step": content}, [component])
                 report = verify_discovery(package)
             with self.subTest(patch=patch):
                 detail = self._unbound(report)["detail"]
@@ -385,19 +387,19 @@ class ImportedSourceTests(unittest.TestCase):
         content = b"frozen step bytes"
         sha = hashlib.sha256(content).hexdigest()
         component = {
-            "name2": "NP-F550.step-1",
-            "document": "NP-F550.step",
+            "name2": "imported_part.step-1",
+            "document": "imported_part.step",
             "suppressed": False,
             "lightweight": False,
             "suppression_state": 2,
-            "source_provenance": accepted_provenance("NP-F550.step", sha),
+            "source_provenance": accepted_provenance("imported_part.step", sha),
         }
         with tempfile.TemporaryDirectory() as directory:
             package = self._package(
                 directory,
-                {"NP-F550.step": content},
+                {"imported_part.step": content},
                 [component],
-                raw_files={"NP-F550.step": "e" * 64},
+                raw_files={"imported_part.step": "e" * 64},
             )
             report = verify_discovery(package)
         detail = self._unbound(report)["detail"]
@@ -438,7 +440,7 @@ class ImportedSourceTests(unittest.TestCase):
                 cached_component(
                     sha,
                     source_provenance=cached_provenance(
-                        sha, materialization_path=r"C:\other\swx00000\IC~~\HD-1910-C001-20260902.stp.SLDASM"
+                        sha, materialization_path=r"C:\other\swx00000\IC~~\bracket_a.stp.SLDASM"
                     ),
                 ),
                 cached_carrier(sha),
@@ -529,13 +531,13 @@ class ImportedSourceTests(unittest.TestCase):
                 bound_source="other.step"
             ),
             "author_outside_root": lambda component, carrier, files: component["source_provenance"].update(
-                author_imported_path=r"D:\elsewhere\NP-F550.step"
+                author_imported_path=r"D:\elsewhere\imported_part.step"
             ),
             "slot_not_in_stage": lambda component, carrier, files: carrier["closure"]["imports"][0].update(
                 author_metadata_in_stage=False
             ),
             "slot_author_outside_stage": lambda component, carrier, files: carrier["closure"]["imports"][0].update(
-                author_imported_path=r"C:\elsewhere\NP-F550.step"
+                author_imported_path=r"C:\elsewhere\imported_part.step"
             ),
         }
         for label, mutate in cases.items():

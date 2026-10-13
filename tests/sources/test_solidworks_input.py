@@ -862,7 +862,7 @@ class SelectionAcquisitionContractTests(unittest.TestCase):
         selected = {
             "robot.SLDASM": "a" * 64,
             "arm.SLDPRT": "b" * 64,
-            "NP-F550.step": "c" * 64,
+            "imported_part.step": "c" * 64,
         }
         record = {"native_files": dict(selected)}
         raw = {"files": dict(selected)}
@@ -874,10 +874,12 @@ class SelectionAcquisitionContractTests(unittest.TestCase):
 
     def test_missing_or_mutated_retained_source_is_refused(self):
         cases = {
-            "raw_missing": lambda record, raw, manifest: raw["files"].pop("NP-F550.step"),
-            "raw_mutated": lambda record, raw, manifest: raw["files"].update({"NP-F550.step": "e" * 64}),
-            "acquired_missing": lambda record, raw, manifest: record["native_files"].pop("NP-F550.step"),
-            "acquired_mutated": lambda record, raw, manifest: record["native_files"].update({"NP-F550.step": "e" * 64}),
+            "raw_missing": lambda record, raw, manifest: raw["files"].pop("imported_part.step"),
+            "raw_mutated": lambda record, raw, manifest: raw["files"].update({"imported_part.step": "e" * 64}),
+            "acquired_missing": lambda record, raw, manifest: record["native_files"].pop("imported_part.step"),
+            "acquired_mutated": lambda record, raw, manifest: record["native_files"].update(
+                {"imported_part.step": "e" * 64}
+            ),
             "raw_extra": lambda record, raw, manifest: raw["files"].update({"extra.step": "e" * 64}),
         }
         for label, mutate in cases.items():

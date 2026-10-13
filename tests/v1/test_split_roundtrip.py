@@ -303,7 +303,7 @@ class SplitRoundtripTests(unittest.TestCase):
         sealed_receipt = seed / "input/handoff.json"
         report = json.loads(sealed_receipt.read_text(encoding="utf-8"))
         report["input_receipt"]["resolved_package_root"] = (
-            rf"C:\description-v1-review\acc-24801e2\state\prepared\{self.run_id}"
+            rf"C:\description-v1-review\acceptance-review\state\prepared\{self.run_id}"
         )
         write_json(sealed_receipt, report)
         return seed, sealed_receipt

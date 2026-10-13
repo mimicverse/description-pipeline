@@ -164,7 +164,7 @@ class NativeReferenceCopyTests(unittest.TestCase):
             assembly, sub = root / "robot.SLDASM", root / "sub.SLDASM"
             assembly.write_bytes(b"assembly")
             sub.write_bytes(b"sub")
-            leaf = root / "NP-F550.step"
+            leaf = root / "imported_part.step"
             leaf.write_bytes(b"np-bytes")
             graph = {str(assembly): ["sub", str(sub)], str(sub): []}
             rewrites: list = []
@@ -176,7 +176,7 @@ class NativeReferenceCopyTests(unittest.TestCase):
             result = backend.collect_dependencies(
                 str(assembly),
                 str(root / "copy"),
-                required_names=["robot.SLDASM", "sub.SLDASM", "NP-F550.step"],
+                required_names=["robot.SLDASM", "sub.SLDASM", "imported_part.step"],
                 admitted_roots=[str(root)],
                 closure_documents={
                     "robot.SLDASM": {
@@ -234,7 +234,7 @@ class NativeReferenceCopyTests(unittest.TestCase):
             with self.assertRaises(CadError) as caught:
                 run([str(root / "gone.step")], "missing")
             self.assertEqual(caught.exception.code, "dependency_missing")
-            external = out / "NP-F550.step"
+            external = out / "imported_part.step"
             external.write_bytes(b"outside")
             with self.assertRaises(CadError) as caught:
                 run([str(external)], "external")
@@ -251,11 +251,11 @@ class NativeReferenceCopyTests(unittest.TestCase):
             root, out = Path(folder), Path(outside)
             assembly = root / "robot.SLDASM"
             assembly.write_bytes(b"assembly")
-            prepared_np = root / "NP-F550.step"
+            prepared_np = root / "imported_part.step"
             prepared_np.write_bytes(b"sealed np bytes")
-            desktop = out / "NP-F550.step"
+            desktop = out / "imported_part.step"
             desktop.write_bytes(b"author desktop np bytes")
-            graph = {str(assembly): ["NP-F550.step", str(desktop)]}
+            graph = {str(assembly): ["imported_part.step", str(desktop)]}
             copied = SimpleNamespace(ReplaceReferencedDocument=lambda *args: True)
             backend = SolidWorksBackend()
             backend._app_for_path = Mock(  # type: ignore[method-assign]
@@ -264,12 +264,12 @@ class NativeReferenceCopyTests(unittest.TestCase):
             result = backend.collect_dependencies(
                 str(assembly),
                 str(root / "copy"),
-                required_names=["robot.SLDASM", "NP-F550.step"],
+                required_names=["robot.SLDASM", "imported_part.step"],
                 admitted_roots=[str(root)],
                 closure_documents={
                     "robot.SLDASM": {
                         "stored_locations": [str(desktop)],
-                        "resolved_targets": ["NP-F550.step"],
+                        "resolved_targets": ["imported_part.step"],
                         "resolved_paths": [str(prepared_np)],
                     }
                 },

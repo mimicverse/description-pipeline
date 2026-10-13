@@ -42,8 +42,8 @@ class CopyCoverageTests(unittest.TestCase):
         root = self.root
         prepared = "C:\\prepared"
         rewritten_main, rewritten_shank = b"MAIN-REWRITTEN", b"SHANK-REWRITTEN"
-        copies = {"robot.SLDASM": rewritten_main, "shank.SLDPRT": rewritten_shank, "NP-F550.step": NP}
-        originals = {"robot.SLDASM": MAIN, "shank.SLDPRT": SHANK, "NP-F550.step": NP}
+        copies = {"robot.SLDASM": rewritten_main, "shank.SLDPRT": rewritten_shank, "imported_part.step": NP}
+        originals = {"robot.SLDASM": MAIN, "shank.SLDPRT": SHANK, "imported_part.step": NP}
         closure = {
             "declared_unresolved": [],
             "configuration": "Default",
@@ -59,13 +59,13 @@ class CopyCoverageTests(unittest.TestCase):
                 for name, instance in (
                     ("robot.SLDASM", "top_level"),
                     ("shank.SLDPRT", "shank-1"),
-                    ("NP-F550.step", "import_source"),
+                    ("imported_part.step", "import_source"),
                 )
             ],
             "copy_files": {"source/" + name: _sha(data) for name, data in copies.items()},
             "suppressed_instances": 0,
             "stale_stored_references": [],
-            "seeded_required_leaves": [prepared + "\\NP-F550.step"],
+            "seeded_required_leaves": [prepared + "\\imported_part.step"],
         }
         if mutate is not None:
             mutate(root, closure, copies)
@@ -114,10 +114,12 @@ class CopyCoverageTests(unittest.TestCase):
         )
 
     def _drop_np_everywhere(self, root: Path, closure: dict, copies: dict) -> None:
-        copies.pop("NP-F550.step")
-        closure["original_files"].pop(next(key for key in closure["original_files"] if key.endswith("NP-F550.step")))
-        closure["mapping"] = [row for row in closure["mapping"] if not row["copy"].endswith("NP-F550.step")]
-        closure["copy_files"].pop("source/NP-F550.step")
+        copies.pop("imported_part.step")
+        closure["original_files"].pop(
+            next(key for key in closure["original_files"] if key.endswith("imported_part.step"))
+        )
+        closure["mapping"] = [row for row in closure["mapping"] if not row["copy"].endswith("imported_part.step")]
+        closure["copy_files"].pop("source/imported_part.step")
 
     def test_full_coverage_passes_with_rewritten_native_bytes(self) -> None:
         self._build()
@@ -140,7 +142,7 @@ class CopyCoverageTests(unittest.TestCase):
         real = {
             "robot.SLDASM": _sha(MAIN),
             "shank.SLDPRT": _sha(SHANK),
-            "NP-F550.step": _sha(NP),
+            "imported_part.step": _sha(NP),
         }
         for label, package_files in (
             ("before", {"notrobot.SLDASM": decoy, **real}),
@@ -154,7 +156,7 @@ class CopyCoverageTests(unittest.TestCase):
         real = {
             "robot.SLDASM": _sha(MAIN),
             "shank.SLDPRT": _sha(SHANK),
-            "NP-F550.step": _sha(NP),
+            "imported_part.step": _sha(NP),
         }
         # The exact request key wins even beside a boundary twin.
         self._root_with_package_files({**real, "sub/robot.SLDASM": _sha(b"TWIN")})
@@ -162,7 +164,7 @@ class CopyCoverageTests(unittest.TestCase):
         # A nested key never substitutes the frozen path, even with the same
         # bytes (no suffix fallback may rewrite the frozen main-assembly key).
         self._root_with_package_files(
-            {"sub/robot.SLDASM": _sha(MAIN), "shank.SLDPRT": _sha(SHANK), "NP-F550.step": _sha(NP)}
+            {"sub/robot.SLDASM": _sha(MAIN), "shank.SLDPRT": _sha(SHANK), "imported_part.step": _sha(NP)}
         )
         with self.assertRaises(PipelineError):
             _dependencies(self.root, self.definition)
@@ -171,13 +173,13 @@ class CopyCoverageTests(unittest.TestCase):
             {
                 "sub/robot.SLDASM": _sha(b"DECOY"),
                 "shank.SLDPRT": _sha(SHANK),
-                "NP-F550.step": _sha(NP),
+                "imported_part.step": _sha(NP),
             }
         )
         with self.assertRaises(PipelineError):
             _dependencies(self.root, self.definition)
         # A missing main-assembly entry is refused outright.
-        self._root_with_package_files({"shank.SLDPRT": _sha(SHANK), "NP-F550.step": _sha(NP)})
+        self._root_with_package_files({"shank.SLDPRT": _sha(SHANK), "imported_part.step": _sha(NP)})
         with self.assertRaises(PipelineError):
             _dependencies(self.root, self.definition)
 
@@ -256,7 +258,7 @@ class CopyCoverageTests(unittest.TestCase):
 
     def test_mapping_missing_the_retained_source_is_refused(self) -> None:
         def mutate(root: Path, closure: dict, copies: dict) -> None:
-            closure["mapping"] = [row for row in closure["mapping"] if not row["copy"].endswith("NP-F550.step")]
+            closure["mapping"] = [row for row in closure["mapping"] if not row["copy"].endswith("imported_part.step")]
 
         self._build(mutate)
         with self.assertRaises(PipelineError):
@@ -265,11 +267,11 @@ class CopyCoverageTests(unittest.TestCase):
     def test_changed_retained_non_native_bytes_are_refused(self) -> None:
         def mutate(root: Path, closure: dict, copies: dict) -> None:
             changed = b"NP-STEP-CHANGED"
-            copies["NP-F550.step"] = changed
+            copies["imported_part.step"] = changed
             for row in closure["mapping"]:
-                if row["copy"].endswith("NP-F550.step"):
+                if row["copy"].endswith("imported_part.step"):
                     row["copy_sha256"] = _sha(changed)
-            closure["copy_files"]["source/NP-F550.step"] = _sha(changed)
+            closure["copy_files"]["source/imported_part.step"] = _sha(changed)
 
         self._build(mutate)
         with self.assertRaises(PipelineError):

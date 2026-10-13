@@ -586,7 +586,7 @@ class InstanceMeasurementIntegrationTests(unittest.TestCase):
         "OverrideCenterOfMass": False,
         "OverrideMomentsOfInertia": False,
     }
-    PART = "NP-F550.step-1"
+    PART = "imported_part.step-1"
 
     def setUp(self):
         directory = tempfile.TemporaryDirectory()

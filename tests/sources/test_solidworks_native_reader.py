@@ -2609,8 +2609,8 @@ class MainAssemblySelectionTests(unittest.TestCase):
                         "foot",
                         str(assembly),
                         False,
-                        "NP-F550",
-                        r"C:\missing\NP-F550.SLDPRT",
+                        "imported_part",
+                        r"C:\missing\imported_part.SLDPRT",
                         True,
                     )
                 },
@@ -2624,7 +2624,7 @@ class MainAssemblySelectionTests(unittest.TestCase):
             self.assertEqual(error.detail["errors"], 2)
             self.assertEqual(
                 error.detail["unresolved_references"],
-                [{"name": "NP-F550", "last_known_path": r"C:\missing\NP-F550.SLDPRT"}],
+                [{"name": "imported_part", "last_known_path": r"C:\missing\imported_part.SLDPRT"}],
             )
 
     def test_open_failure_without_dependency_enumeration_keeps_original_error(self) -> None:
@@ -3769,9 +3769,9 @@ class ComponentSourceDocumentTests(unittest.TestCase):
     def test_ic_marker_outside_session_temp_is_unread_not_cached(self) -> None:
         from description_pipeline.sources.solidworks.native import _component_source_document
 
-        outside = r"C:\Users\Mi\Documents\IC~~\X.step.SLDPRT"
+        outside = r"C:\Users\operator\Documents\IC~~\X.step.SLDPRT"
         result = _component_source_document(
-            self.component(outside, imported=r"C:\Users\Mi\Desktop\X.stp"), self.source_root
+            self.component(outside, imported=r"C:\Users\operator\Desktop\X.stp"), self.source_root
         )
         provenance = result["source_provenance"]
         self.assertEqual(provenance["state"], "unread")
@@ -3794,9 +3794,9 @@ class ComponentSourceDocumentTests(unittest.TestCase):
     def test_in_stage_author_source_does_not_override_the_cached_class(self) -> None:
         from description_pipeline.sources.solidworks.native import _component_source_document
 
-        (self.source_root / "NP-F550.step").write_bytes(b"np-bytes")
+        (self.source_root / "imported_part.step").write_bytes(b"np-bytes")
         result = _component_source_document(
-            self.component(self.materialization, imported=str(self.source_root / "NP-F550.step")),
+            self.component(self.materialization, imported=str(self.source_root / "imported_part.step")),
             self.source_root,
         )
         provenance = result["source_provenance"]
@@ -3806,7 +3806,7 @@ class ComponentSourceDocumentTests(unittest.TestCase):
         self.assertEqual(provenance["state"], "cached_materialization")
         self.assertIsNone(result["document"])
         self.assertTrue(provenance["author_imported_in_source_root"])
-        self.assertEqual(provenance["author_imported_relative"], "NP-F550.step")
+        self.assertEqual(provenance["author_imported_relative"], "imported_part.step")
 
 
 class MaterializationSessionOwnershipTests(unittest.TestCase):
@@ -3817,7 +3817,7 @@ class MaterializationSessionOwnershipTests(unittest.TestCase):
 
         self.tmp = Path(tempfile.mkdtemp(prefix="sw-materialization-"))
         self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True))
-        self.materialization = self.tmp / "swx4242" / "IC~~" / "NP-F550.step.SLDPRT"
+        self.materialization = self.tmp / "swx4242" / "IC~~" / "imported_part.step.SLDPRT"
         self.materialization.parent.mkdir(parents=True)
         self.materialization.write_bytes(b"materialized")
 

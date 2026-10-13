@@ -957,8 +957,8 @@ class NativeDeclarationsTests(unittest.TestCase):
     def test_cached_materialization_pid_binds_through_the_sealed_carrier(self):
         """A cached import PID is a complete identity: engine materialization + carrier."""
 
-        materialization = r"C:\Users\33985\AppData\Local\Temp\swx16840\IC~~\NP-F550.step.SLDPRT"
-        session_root = r"C:\Users\33985\AppData\Local\Temp\swx16840"
+        materialization = r"C:\Users\operator\AppData\Local\Temp\swx16840\IC~~\imported_part.step.SLDPRT"
+        session_root = r"C:\Users\operator\AppData\Local\Temp\swx16840"
         document = materialization.replace("/", "\\").strip().lower()
         owner, occurrence = "module.SLDASM", "module-1/tool_part"
         owner_sha = "a" * 64
@@ -970,7 +970,7 @@ class NativeDeclarationsTests(unittest.TestCase):
             "native_document_path": materialization,
             "materialization_path": materialization,
             "session_temp_root": session_root,
-            "author_imported_path": r"D:\author\NP-F550.step",
+            "author_imported_path": r"D:\author\imported_part.step",
             "author_imported_in_source_root": False,
             "author_imported_relative": None,
             "is_virtual": False,
@@ -988,7 +988,7 @@ class NativeDeclarationsTests(unittest.TestCase):
             "binding": "author_metadata_only",
             "materialization": materialization,
             "session_temp_root": session_root,
-            "author_imported_path": r"D:\author\NP-F550.step",
+            "author_imported_path": r"D:\author\imported_part.step",
             "owner_sha256": owner_sha,
             "configuration": "Default",
             "suppression_state": 2,
@@ -1008,11 +1008,11 @@ class NativeDeclarationsTests(unittest.TestCase):
         self.assertNotIn("v14.pid_binding", errors)
 
         cases = {
-            "outside_owned_temp": {"materialization_path": r"C:\elsewhere\IC~~\NP-F550.step.SLDPRT"},
-            "root_mismatch": {"session_temp_root": r"C:\Users\33985\AppData\Local\Temp\swx99999"},
+            "outside_owned_temp": {"materialization_path": r"C:\elsewhere\IC~~\imported_part.step.SLDPRT"},
+            "root_mismatch": {"session_temp_root": r"C:\Users\operator\AppData\Local\Temp\swx99999"},
             "not_cached_in_pid": {"state": "unread"},
-            "external_document": {"materialization_path": r"D:\author\NP-F550.step"},
-            "author_metadata_divergence": {"author_imported_path": r"D:\elsewhere\NP-F550.step"},
+            "external_document": {"materialization_path": r"D:\author\imported_part.step"},
+            "author_metadata_divergence": {"author_imported_path": r"D:\elsewhere\imported_part.step"},
         }
         for label, patch in cases.items():
             with self.subTest(case=label):
