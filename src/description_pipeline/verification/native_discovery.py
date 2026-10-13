@@ -1606,6 +1606,52 @@ def _datum_owners(full, attached: frozenset[str]) -> set[str]:
     return owners
 
 
+def rebuild_rigid_bodies(record: dict) -> list[dict]:
+    """Rebuild the rigid-body carrier from the raw capture alone (IF-17, in memory).
+
+    ``record`` is the raw native capture (or a payload carrying it under
+    ``raw``).  Bodies are the material rigid clusters the current mate matrix
+    proves; each body's frame is its unique owned ``CS_<name>`` native datum
+    and the body id/name is that datum's suffix.  Nothing here consumes the
+    saved derived definition - this is the verification-side interpretation of
+    the current capture - and a missing or ambiguous witness raises a
+    classified failure instead of guessing an attachment.
+    """
+
+    if isinstance(record.get("raw"), dict):
+        record = record["raw"]
+    by_material, _by_component = _cluster_bindings(record)
+    attached = _frame_attached_members(record)
+    bodies: list[dict] = []
+    for group, full in by_material.items():
+        owners = _datum_owners(full, attached)
+        candidates = [
+            datum
+            for datum in record.get("datums") or []
+            if isinstance(datum, dict)
+            and str(datum.get("name") or "").startswith("CS_")
+            and len(str(datum.get("name"))) > 3
+            and str(datum.get("owner") or "") in owners
+        ]
+        _require(
+            len(candidates) == 1,
+            "discovery.body_rebuild",
+            "a rigid cluster must own exactly one CS_<name> frame datum",
+            {"components": sorted(group), "candidates": sorted(str(datum.get("name")) for datum in candidates)},
+        )
+        name = str(candidates[0]["name"])[3:]
+        bodies.append(
+            {
+                "id": name,
+                "name": name,
+                "components": sorted(group),
+                "frame": {"coordinate_system": str(candidates[0]["name"])},
+            }
+        )
+    bodies.sort(key=lambda body: body["name"])
+    return bodies
+
+
 def _frame(values) -> list[list[float]] | None:
     try:
         raw = list(values or ())
