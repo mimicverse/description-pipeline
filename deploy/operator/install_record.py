@@ -106,6 +106,19 @@ def _is_link(path: Path) -> bool:
     return path.is_symlink() or path.is_junction()
 
 
+def confined_relative(name, what: str = "member") -> str:
+    """The one lexical rule for a confined relative member path (no escapes, no link syntax)."""
+
+    require(isinstance(name, str) and bool(name) and "\\" not in name, f"{what} is malformed: {name!r}")
+    require(not name.startswith("/"), f"{what} escapes its root: {name!r}")
+    parts = name.split("/")
+    require(
+        all(part not in {"", ".", ".."} for part in parts),
+        f"{what} escapes its root: {name!r}",
+    )
+    return name
+
+
 def _confined_artifact(root: Path, name) -> Path | None:
     """A release-index entry must stay a plain relative file under the distribution root.
 
@@ -113,13 +126,8 @@ def _confined_artifact(root: Path, name) -> Path | None:
     that is itself a symlink is refused even when it targets a real file inside the root.
     """
 
-    require(isinstance(name, str) and bool(name) and "\\" not in name, f"artifact name is malformed: {name!r}")
-    require(not name.startswith("/"), f"artifact path escapes the distribution root: {name!r}")
+    confined_relative(name, "artifact path")
     parts = name.split("/")
-    require(
-        all(part not in {"", ".", ".."} for part in parts),
-        f"artifact path escapes the distribution root: {name!r}",
-    )
     candidate = root.joinpath(*parts)
     node = candidate.parent
     while node != root:

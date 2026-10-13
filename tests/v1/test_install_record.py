@@ -444,7 +444,7 @@ class InstallRecordTests(unittest.TestCase):
             document["artifacts"] = {"../outsider.bin": hashlib.sha256(outsider.read_bytes()).hexdigest()}
             release.write_text(json.dumps(document), encoding="utf-8")
             result = run_cli(root, install_id="gen-1", snapshot=snapshot, release=release)
-            self.assertIn("escapes the distribution root", result.stderr)
+            self.assertIn("escapes its root", result.stderr)
             assert_no_record(root, result)
 
         with tempfile.TemporaryDirectory(prefix="install-record-binding-") as temporary:

@@ -1003,17 +1003,11 @@ except Exception:
       fi
       RECONCILIATION="$(python3 - "$RECEIPT_DIR/windows-binding.json" "$WINDOWS_STATUS" <<'PY'
 import json
-import re
 import sys
 
 
 def normalize(value):
     return str(value or "").replace("\\", "/").rstrip("/")
-
-
-def parse_config(arguments):
-    matches = re.findall(r"--config\s+\"?([^\"]+?)\"?(?:\s|$)", str(arguments or ""))
-    return normalize(matches[-1]) if matches else ""
 
 
 binding = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -1023,14 +1017,17 @@ live = status.get("live_task") if isinstance(status, dict) else None
 if not isinstance(live, dict):
     print("unknown")
     raise SystemExit(0)
+# The endpoint script owns task-config parsing; this side compares structured facts only.
 execute = normalize(live.get("execute")).lower()
-config = parse_config(live.get("arguments")).lower()
+config = normalize(live.get("config")).lower()
 if not execute or not config:
     print("unknown")
     raise SystemExit(0)
 records = [row for row in (status.get("pending"), status.get("last_promotion")) if isinstance(row, dict)]
 record = next((row for row in records if normalize(row.get("generation")) == target), None)
 source = normalize(record.get("previous")) if record else ""
+source_launcher = normalize(record.get("source_launcher")).lower() if record else ""
+source_config = normalize(record.get("source_config")).lower() if record else ""
 
 
 def runs(generation):
@@ -1043,8 +1040,14 @@ def runs(generation):
 
 if runs(target):
     print(source if source else "unknown")
-elif source and runs(source):
-    # Positively the bound source generation of THIS maintenance: nothing was switched.
+elif (
+    source
+    and source_launcher
+    and source_config
+    and execute == source_launcher
+    and config == source_config
+):
+    # Positively the ACTUAL launcher and configuration this maintenance bound as its source.
     print("before")
 else:
     # A foreign, unparseable or unbound launcher is never claimed as an unswitched source.

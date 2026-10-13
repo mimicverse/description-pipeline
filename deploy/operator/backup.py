@@ -19,6 +19,8 @@ import tarfile
 import tempfile
 from pathlib import Path
 
+import install_record
+
 
 def die(message: str) -> None:
     raise SystemExit(f"backup: {message}")
@@ -71,12 +73,25 @@ def open_archive(archive: Path, key: Path, manifest_path: Path, dest: Path) -> N
         manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         die(f"cannot read the backup manifest: {error}")
+    require(
+        isinstance(manifest, dict) and manifest.get("schema") == "solidworks-to-urdf.promote-backup/v1",
+        "the backup manifest schema is not supported",
+    )
     sealed = manifest.get("encrypted") if isinstance(manifest, dict) else None
     expected = sealed.get("sha256") if isinstance(sealed, dict) else None
     require(
         isinstance(expected, str) and hashlib.sha256(archive.read_bytes()).hexdigest() == expected,
         "the sealed archive digest does not match the manifest",
     )
+    declared = manifest.get("files")
+    require(isinstance(declared, dict) and bool(declared), "the backup manifest carries no member digests")
+    # The single path owner decides every member name before anything is read or written.
+    validated = {install_record.confined_relative(name, "manifest member"): value for name, value in declared.items()}
+    for name, checksum in validated.items():
+        require(
+            isinstance(checksum, str) and len(checksum) == 64,
+            f"manifest member digest is malformed: {name}",
+        )
     require(not dest.exists(), f"refuse to overwrite the restore destination: {dest}")
     dest.mkdir(parents=True)
     with tempfile.NamedTemporaryFile(dir=dest.parent, delete=False) as handle:
@@ -89,9 +104,7 @@ def open_archive(archive: Path, key: Path, manifest_path: Path, dest: Path) -> N
             tar.extractall(dest, filter="data")
     finally:
         plain.unlink(missing_ok=True)
-    files = manifest.get("files") if isinstance(manifest.get("files"), dict) else {}
-    require(files, "the backup manifest carries no member digests")
-    for name, checksum in files.items():
+    for name, checksum in validated.items():
         restored = dest / name
         require(
             restored.is_file() and hashlib.sha256(restored.read_bytes()).hexdigest() == checksum,
@@ -100,7 +113,7 @@ def open_archive(archive: Path, key: Path, manifest_path: Path, dest: Path) -> N
     extras = sorted(
         path.relative_to(dest).as_posix()
         for path in dest.rglob("*")
-        if path.is_file() and path.relative_to(dest).as_posix() not in files
+        if path.is_file() and path.relative_to(dest).as_posix() not in validated
     )
     require(not extras, f"the archive carries members outside the manifest: {extras[:3]}")
 

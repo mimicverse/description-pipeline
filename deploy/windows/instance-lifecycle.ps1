@@ -105,7 +105,10 @@ if ($Verb -eq 'status') {
   # reconciles an unacknowledged switch from what the task actually runs, never by resending it.
   $live = $null
   if ($task) {
-    $live = @{execute=$task.Actions[0].Execute; arguments=$task.Actions[0].Arguments; state=[string]$task.State}
+    $liveConfig = ''
+    try { $liveConfig = Action-Config $task } catch { }
+    $live = @{execute=$task.Actions[0].Execute; arguments=$task.Actions[0].Arguments;
+              config=$liveConfig; state=[string]$task.State}
   }
   $pending = $null
   $pendingPath = Join-Path $promotions 'pending-promotion.json'
@@ -166,6 +169,8 @@ if ($Verb -eq 'promote') {
   if (-not $task) { Die 'task_missing' 'the instance task is not registered; install the instance before promoting' }
   if (@($task.Actions).Count -ne 1) { Die 'task_ambiguous' 'the instance task must carry exactly one action' }
   $previousConfig = Action-Config $task
+  $sourceExecute = $task.Actions[0].Execute
+  $sourceConfig = $previousConfig
   Stop-Endpoint $binding
   New-Item -ItemType Directory -Path $promotions -ErrorAction SilentlyContinue | Out-Null
   $previous = Join-Path $promotions ('previous-' + (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ'))
@@ -176,7 +181,8 @@ if ($Verb -eq 'promote') {
   # generation identity and the bound previous generation on record.
   Write-Receipt (Join-Path $promotions 'pending-promotion.json') @{
     intent=$true; verb='promote'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
-    previous=$previous; task_before=(Join-Path $previous 'task.xml')}
+    previous=$previous; task_before=(Join-Path $previous 'task.xml');
+    source_launcher=$sourceExecute; source_config=$sourceConfig}
   $action = New-ScheduledTaskAction -Execute (Runtime-Launcher $StageDir) `
     -Argument ('serve --config "' + (Config-Path $StageDir) + '"') -WorkingDirectory $binding.state_root
   Set-ScheduledTask -TaskName $binding.task_name -Action $action | Out-Null
@@ -189,7 +195,7 @@ if ($Verb -eq 'promote') {
     }
     Write-Receipt (Join-Path $promotions 'last-promotion.json') @{
       passed=$true; verb='promote'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
-      previous=$previous; health=$health}
+      previous=$previous; source_launcher=$sourceExecute; source_config=$sourceConfig; health=$health}
     Emit @{passed=$true; verb='promote'; generation=$StageDir; previous=$previous}
     exit 0
   } catch {

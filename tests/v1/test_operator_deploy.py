@@ -655,22 +655,26 @@ class LifecycleTests(unittest.TestCase):
             "  *\"-Verb status\"*)\n"
             '    if [ "${FIXTURE_STATUS:-switched}" = "before" ]; then\n'
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
-            "{\"execute\":\"C:/description-e2e/state/instance-promotions/previous-0001/runtime/Scripts/description.exe\","
-            "\"arguments\":\"serve --config C:/description-e2e/state/instance-promotions/previous-0001/endpoint.json\","
-            "\"state\":\"Running\"},"
+            "{\"execute\":\"C:/original-install with spaces/runtime/Scripts/description.exe\","
+            "\"arguments\":\"serve --config \\\"C:/original-install with spaces/endpoint.json\\\"\","
+            "\"config\":\"C:/original-install with spaces/endpoint.json\",\"state\":\"Running\"},"
             "\"pending\":{\"intent\":true,\"verb\":\"promote\","
             "\"generation\":\"C:/description-e2e/state/lifecycle/gen-2/generation\","
-            "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\"},"
+            "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\","
+            "\"source_launcher\":\"C:/original-install with spaces/runtime/Scripts/description.exe\","
+            "\"source_config\":\"C:/original-install with spaces/endpoint.json\"},"
             "\"last_promotion\":null}'\n"
             '    elif [ "${FIXTURE_STATUS:-switched}" = "foreign" ]; then\n'
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
             "{\"execute\":\"C:/foreign/not-description.exe\","
-            "\"arguments\":\"foreign-service --option x\",\"state\":\"Running\"},"
+            "\"arguments\":\"foreign-service --option x\","
+            "\"config\":\"C:/foreign/foreign.json\",\"state\":\"Running\"},"
             "\"pending\":null,\"last_promotion\":null}'\n"
             "    else\n"
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
             "{\"execute\":\"C:/description-e2e/state/lifecycle/gen-2/generation/runtime/Scripts/description.exe\","
             "\"arguments\":\"serve --config C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\","
+            "\"config\":\"C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\","
             "\"state\":\"Running\"},"
             "\"pending\":{\"intent\":true,\"verb\":\"promote\","
             "\"generation\":\"C:/description-e2e/state/lifecycle/gen-2/generation\","
@@ -1535,22 +1539,26 @@ class InstallOrderingTests(unittest.TestCase):
             "  *\"-Verb status\"*)\n"
             '    if [ "${FIXTURE_STATUS:-switched}" = "before" ]; then\n'
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
-            "{\"execute\":\"C:/description-e2e/state/instance-promotions/previous-0001/runtime/Scripts/description.exe\","
-            "\"arguments\":\"serve --config C:/description-e2e/state/instance-promotions/previous-0001/endpoint.json\","
-            "\"state\":\"Running\"},"
+            "{\"execute\":\"C:/original-install with spaces/runtime/Scripts/description.exe\","
+            "\"arguments\":\"serve --config \\\"C:/original-install with spaces/endpoint.json\\\"\","
+            "\"config\":\"C:/original-install with spaces/endpoint.json\",\"state\":\"Running\"},"
             "\"pending\":{\"intent\":true,\"verb\":\"promote\","
             "\"generation\":\"C:/description-e2e/state/lifecycle/gen-2/generation\","
-            "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\"},"
+            "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\","
+            "\"source_launcher\":\"C:/original-install with spaces/runtime/Scripts/description.exe\","
+            "\"source_config\":\"C:/original-install with spaces/endpoint.json\"},"
             "\"last_promotion\":null}'\n"
             '    elif [ "${FIXTURE_STATUS:-switched}" = "foreign" ]; then\n'
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
             "{\"execute\":\"C:/foreign/not-description.exe\","
-            "\"arguments\":\"foreign-service --option x\",\"state\":\"Running\"},"
+            "\"arguments\":\"foreign-service --option x\","
+            "\"config\":\"C:/foreign/foreign.json\",\"state\":\"Running\"},"
             "\"pending\":null,\"last_promotion\":null}'\n"
             "    else\n"
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
             "{\"execute\":\"C:/description-e2e/state/lifecycle/gen-2/generation/runtime/Scripts/description.exe\","
             "\"arguments\":\"serve --config C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\","
+            "\"config\":\"C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\","
             "\"state\":\"Running\"},"
             "\"pending\":{\"intent\":true,\"verb\":\"promote\","
             "\"generation\":\"C:/description-e2e/state/lifecycle/gen-2/generation\","
@@ -1844,6 +1852,22 @@ class InstallOrderingTests(unittest.TestCase):
             )
             self.assertNotEqual(refused.returncode, 0)
             self.assertIn("does not match the manifest", refused.stderr)
+            marker = Path(tmp) / "outside-private.dat"
+            marker.write_bytes(b"outside")
+            forged_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            forged_manifest["files"] = {"../outside-private.dat": hashlib.sha256(marker.read_bytes()).hexdigest()}
+            forged_path = Path(tmp) / "forged-manifest.json"
+            forged_path.write_text(json.dumps(forged_manifest), encoding="utf-8")
+            escape = run(
+                [
+                    "python3", str(release / "operator" / "backup.py"), "open",
+                    "--archive", str(sealed), "--key", str(key), "--manifest", str(forged_path),
+                    "--dest", str(Path(tmp) / "escape-out"),
+                ],
+                {},
+            )
+            self.assertNotEqual(escape.returncode, 0)
+            self.assertIn("escapes its root", escape.stderr)
             (state / "install-record.json").write_bytes(
                 (scratch / "state" / "install-record.json").read_bytes()
             )
