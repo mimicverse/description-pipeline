@@ -68,8 +68,47 @@ def pin_utf8_streams() -> None:
             reconfigure(encoding="utf-8")
 
 
+def _canonical_value(value: Any) -> Any:
+    """Normalize the canonical number rule: unified zero, no NaN/Infinity survived."""
+
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ValueError("canonical encoding forbids NaN/Infinity")
+        return 0.0 if value == 0.0 else value
+    if isinstance(value, dict):
+        return {key: _canonical_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_canonical_value(item) for item in value]
+    return value
+
+
 def canonical(data: Any) -> bytes:
-    return (json.dumps(data, sort_keys=True, ensure_ascii=False, allow_nan=False, indent=2) + "\n").encode()
+    """The single canonical encoding (contracts §122): UTF-8, sorted keys, compact
+    separators (no extra whitespace), NaN/Infinity refused, unified zero
+    (``-0.0`` encodes as ``0.0``).  Digests are taken over exactly these bytes.
+    """
+
+    return json.dumps(
+        _canonical_value(data),
+        sort_keys=True,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode()
+
+
+def format_number(value: Any) -> str:
+    """The single numeric write format for URDF values: the shortest decimal that
+    round-trips the exact binary64 value, locale-independent, unified zero
+    (``-0.0`` and ``0.0`` both render ``0``); non-finite values are refused.
+    """
+
+    number = float(value)
+    if number != number or number in (float("inf"), float("-inf")):
+        raise PipelineError(f"Cannot format a non-finite number: {value!r}")
+    if number == 0.0:
+        return "0"
+    return repr(number)
 
 
 def digest(data: Any) -> str:

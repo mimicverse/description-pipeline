@@ -295,7 +295,7 @@ class B4FixSingleVariableTests(unittest.TestCase):
         ir.validate_resource_policy(ir.RESOURCE_POLICY_V1)
         self.assertEqual(ir.RESOURCE_POLICY_V1["limits"]["max_upload_bytes"], uploads.MAX_BODY_BYTES)
         self.assertEqual(
-            ir.resource_policy_v1_digest(), "e38f696ec0fe8668313e55dff852d1832800e5f7fd1806457b244d1cb416b4a6"
+            ir.resource_policy_v1_digest(), "d728fd27524e835c427d72f1463385814872778f5f0be30820e5d649fc8a45f8"
         )
 
     def test_health_single_variable_negatives(self) -> None:
@@ -599,7 +599,7 @@ class InterfaceRecordTests(unittest.TestCase):
         self.assertEqual(ir.RESOURCE_POLICY_V1["capacity"]["min_free_bytes"], uploads.DISK_RESERVE_FLOOR)
         # Pinned digest: changing any adopted value intentionally breaks this guard.
         self.assertEqual(
-            ir.resource_policy_v1_digest(), "e38f696ec0fe8668313e55dff852d1832800e5f7fd1806457b244d1cb416b4a6"
+            ir.resource_policy_v1_digest(), "d728fd27524e835c427d72f1463385814872778f5f0be30820e5d649fc8a45f8"
         )
 
     def test_check_policy_is_the_single_source_for_required_gates(self) -> None:
@@ -610,7 +610,7 @@ class InterfaceRecordTests(unittest.TestCase):
         self.assertEqual(ir.CHECK_POLICY_V1["fixed_checks"], sorted(FIXED_REQUIRED_CHECKS))
         self.assertEqual(set(required_checks()), set(FIXED_REQUIRED_CHECKS))
         # Pinned digest: generation, verification and the manifest consume this object.
-        self.assertEqual(ir.check_policy_digest(), "d1215dfa45ea0cab2ce43623168399c9018e6e6d2cfe422e09aabc0606f97702")
+        self.assertEqual(ir.check_policy_digest(), "f475fb5acc8df5bc0edfd12e1431387decd40ab9865e3eb545744d1928453b66")
         bad = copy.deepcopy(ir.CHECK_POLICY_V1)
         bad.pop("fixed_checks")
         self.reject("check_policy_invalid", lambda: ir.validate_check_policy(bad))
