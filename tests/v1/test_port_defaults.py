@@ -21,6 +21,10 @@ ROOT = Path(__file__).resolve().parents[2]
 AUDITED = ("src/description_pipeline", "deploy", "tools")
 CODE_OWNER = "src/description_pipeline/ports.py"
 DEPLOY_OWNER = "deploy/operator/render_operator.py"
+#: Windows-host candidate/promotion tooling mirrors the authored per-host endpoint
+#: configuration (``deploy/windows/endpoint.example.json`` documents ``endpoint.json``);
+#: only the pipeline-code endpoint default may appear there, any other port literal is stray.
+WINDOWS_MIRROR = "deploy/windows"
 LITERALS = ("8791", "18765", "5433", "8765", "8788", "8443", "8780")
 PATTERN = re.compile(r"(?<![\w.])(" + "|".join(LITERALS) + r")(?![\w.])")
 
@@ -52,6 +56,10 @@ class PortDefaultsTests(unittest.TestCase):
                     if line.strip().startswith("#"):
                         continue
                     for match in PATTERN.finditer(line):
+                        if relative.startswith(WINDOWS_MIRROR) and match.group(0) == str(
+                            ports.SOLIDWORKS_ENDPOINT_PORT
+                        ):
+                            continue
                         stray.setdefault(relative, []).append(f"{number}:{match.group(0)}")
         self.assertEqual(stray, {}, "port literals must live only in the two layer owners")
 

@@ -40,7 +40,11 @@ CA="${OPERATOR_TLS_CA:-$OP/state/tls/operator-tls-fullchain.crt}"
 ctl() { ( cd "$1" && bash deploy/operator/operatorctl.sh "$2" --env-file "$ENV_ACTIVE" ); }
 
 active_rows() {
-  "$PSQL" -h "$OP/airflow-pg/socket" -p 5433 -U solidworks -d airflow_meta -At -c \
+  local port
+  port="$(sed -n 's/^POSTGRES_PORT=//p' "$ENV_ACTIVE" | head -1)"
+  port="${POSTGRES_PORT:-$port}"
+  [ -n "$port" ] || { echo "POSTGRES_PORT is missing in $ENV_ACTIVE; add the rendered value"; exit 1; }
+  "$PSQL" -h "$OP/airflow-pg/socket" -p "$port" -U solidworks -d airflow_meta -At -c \
     "SELECT 'dag_run '||count(*) FROM dag_run WHERE state IN ('running','queued') UNION ALL
      SELECT 'task_instance '||count(*) FROM task_instance WHERE state IN
        ('running','queued','scheduled','up_for_retry','up_for_reschedule','restarting','deferred');"
@@ -147,7 +151,11 @@ print(json.dumps({"version": __version__, "source_sha256": record["source_sha256
 PY
 "$VENV/bin/python" -m pip check
 "$VENV/bin/python" -m pip show mimicverse-description | sed -n '1,3p'
-OPERATOR_URL="${OPERATOR_URL:-https://10.0.0.235:8443}"
+OPERATOR_URL="${OPERATOR_URL:-}"
+if [ -z "$OPERATOR_URL" ] && [ -f "$OP/state/resolved.env" ]; then
+  OPERATOR_URL="$(sed -n 's/^OPERATOR_URL=//p' "$OP/state/resolved.env" | head -1)"
+fi
+[ -n "$OPERATOR_URL" ] || { echo "OPERATOR_URL is missing; set it or install the deployment"; exit 1; }
 curl --cacert "$CA" -s -o /dev/null -w 'portal:%{http_code}\n' "${OPERATOR_URL%/}/"
 curl --cacert "$CA" -s "${OPERATOR_URL%/}/operator-healthz" | head -c 200; echo
 require_zero_active
