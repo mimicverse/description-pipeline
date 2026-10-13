@@ -48,7 +48,7 @@ MAX_MANIFEST_BYTES = 64 * 1024**2
 
 #: The immutable native provenance reports; the live ``reports/stages.json`` view is a Linux-side
 #: artifact and is deliberately excluded from the transfer payload.
-_REQUIRED_REPORTS = ("reports/input.json", "reports/native-tool.json", "reports/native-stages.json")
+_REQUIRED_REPORTS = ("input/handoff.json", "reports/native-tool.json", "reports/native-stages.json")
 #: The structural-team reports generated beside the native capture; they travel with the sealed
 #: payload so the Linux side can always hand them to the structural team, and the portable
 #: pipeline re-creates its own copy in a delivery.
@@ -245,8 +245,10 @@ def _validate_input(root: Path, report, main_assembly: str) -> str:
     _require(report.get("passed") is True, "Input report did not pass")
     package_files = report.get("package_files")
     _require(isinstance(package_files, dict) and package_files, "Input report lacks its package file inventory")
-    actual = package_inventory(root / "input")
-    _require(actual == package_files, "Archived input differs from reports/input.json")
+    actual = {
+        path: checksum for path, checksum in package_inventory(root / "input").items() if path != "handoff.json"
+    }
+    _require(actual == package_files, "Archived input differs from the frozen handoff inventory")
     if main_assembly not in package_files:
         near = sorted(name for name in package_files if name.casefold() == main_assembly.casefold())
         if near:
@@ -337,7 +339,7 @@ def _validate_capture(root: Path, *, run_id: str, handoff_sha256: str, main_asse
         run_id=run_id,
         handoff_sha256=handoff_sha256,
     )
-    main_assembly_sha256 = _validate_input(root, read_data(confined(root, "reports/input.json")), main_assembly)
+    main_assembly_sha256 = _validate_input(root, read_data(confined(root, "input/handoff.json")), main_assembly)
     native_sha256 = _validate_native_discovery(root, main_assembly=main_assembly, handoff_sha256=handoff_sha256)
     _require(
         native_sha256 == main_assembly_sha256,
@@ -692,7 +694,7 @@ def verify_transfer(bundle: Path, *, regenerated: tuple[str, ...] = ()) -> dict 
         run_id=run_id,
         handoff_sha256=handoff,
     )
-    main_sha = _validate_input(bundle, read_data(confined(bundle, "reports/input.json")), main_assembly)
+    main_sha = _validate_input(bundle, read_data(confined(bundle, "input/handoff.json")), main_assembly)
     native_sha = _validate_native_discovery(bundle, main_assembly=main_assembly, handoff_sha256=handoff)
     _require(
         main_sha == native_sha == manifest.get("main_assembly_sha256"),

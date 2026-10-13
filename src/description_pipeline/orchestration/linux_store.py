@@ -641,7 +641,7 @@ def _delivery_warnings(delivery: Path) -> list[dict]:
     """Input warnings and non-blocking discovery findings the retained delivery carries."""
 
     warnings: list[dict] = []
-    report = _read_optional_json(delivery / "reports/input.json")
+    report = _read_optional_json(delivery / "input/handoff.json")
     if isinstance(report, dict):
         for item in report.get("warnings") or []:
             if isinstance(item, dict) and item.get("code"):

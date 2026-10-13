@@ -263,7 +263,7 @@ def _archive_input(package: Path, staging: Path) -> None:
     """Archive the original handoff; evidence/source holds the relinked CAD copy."""
 
     destination = staging / "input"
-    destination.mkdir()
+    destination.mkdir(exist_ok=True)
     for name in package_inventory(package):
         original = confined(package, name)
         target = confined(destination, name, exists=False)
@@ -332,7 +332,7 @@ def capture_evidence(
         if expected_inputs is not None:
             _require(package_inventory(package) == expected_inputs, "Prepared inputs changed after discovery")
         report = inspect_prepared_input(package)
-        write_json(staging / "reports/input.json", report)
+        write_json(staging / "input/handoff.json", report)
         if report.get("passed") is not True:
             error = PipelineError("The CAD package does not meet the input specification")
             error.details = {"errors": report.get("errors", [])}
@@ -344,10 +344,15 @@ def capture_evidence(
         if expected_inputs is not None:
             _require(files == expected_inputs, "Inspected inputs differ from native discovery")
         _archive_input(package, staging)
-        if package_inventory(staging / "input") != files:
+        archived = {
+            path: checksum
+            for path, checksum in package_inventory(staging / "input").items()
+            if path != "handoff.json"
+        }
+        if archived != files:
             raise PipelineError("Archived input differs from its supplied package")
         report["package_files"] = files
-        write_json(staging / "reports/input.json", report)
+        write_json(staging / "input/handoff.json", report)
         return definition, report
 
     definition, input_report = checked(
@@ -426,6 +431,15 @@ def generate_model(staging: Path, definition: dict, input_report: dict, *, on_ev
     robot = Robot.from_dict(load_scene(staging / "evidence"))
     write_json(staging / "model/robot.json", robot.to_dict())
     generate_urdf(robot, staging / "evidence", staging, name=name)
+    from .delivery import write_delivery_manifest
+    from .interface_records import RESOURCE_POLICY_V1, resource_policy_v1_digest
+    from .stages import CONTRACT, CONTRACT_SHA256
+
+    write_delivery_manifest(
+        staging,
+        contract={"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
+        policy={"schema_version": RESOURCE_POLICY_V1["schema_version"], "digest": resource_policy_v1_digest()},
+    )
 
     def generated():
         Robot.from_dict(read_data(staging / "model/robot.json"))

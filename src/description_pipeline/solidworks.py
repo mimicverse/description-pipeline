@@ -72,18 +72,26 @@ def _seed_resume(staging: Path, seed_dir: Path | None, resume_from: str) -> None
         raise PipelineError("Resume checkpoints are unavailable")
     seed = Path(seed_dir)
     parts = {
-        "generate": ("input", "evidence", "reports/input.json"),
+        "generate": ("input", "evidence"),
         "verify": (
-            "README.md",
             "input",
             "evidence",
             "model",
             "urdf",
             "meshes",
-            "reports/input.json",
-            "reports/tool.json",
+            "tool.json",
+            "manifest.json",
         ),
-        "publish": ("README.md", "input", "evidence", "model", "urdf", "meshes", "reports"),
+        "publish": (
+            "input",
+            "evidence",
+            "model",
+            "urdf",
+            "meshes",
+            "tool.json",
+            "manifest.json",
+            "reports/quality.json",
+        ),
     }[resume_from]
     for part in parts:
         source = seed / part
@@ -101,10 +109,6 @@ def _seed_resume(staging: Path, seed_dir: Path | None, resume_from: str) -> None
             target = staging / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
-    if resume_from == "verify" and (seed / "reports/mass-closure.json").is_file():
-        target = staging / "reports/mass-closure.json"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(seed / "reports/mass-closure.json", target)
 
 
 def _install(staging: Path, target: Path) -> None:
@@ -363,19 +367,29 @@ def run(
                     )
             else:
                 _seed_resume(staging, seed_dir, resume_from)
-                input_report = read_data(staging / "reports/input.json")
+                input_report = read_data(staging / "input/handoff.json")
                 from .steps import inspect_prepared_input
 
                 replayed = inspect_prepared_input(staging / "input")
                 if replayed.get("passed") is not True:
                     raise PipelineError("Retained native inputs no longer pass static validation")
-                if inventory(staging / "input") != input_report.get("package_files"):
+                retained_files = {
+                    path: checksum
+                    for path, checksum in inventory(staging / "input").items()
+                    if path != "handoff.json"
+                }
+                if retained_files != input_report.get("package_files"):
                     raise PipelineError("Retained input bytes do not match the recorded inspection receipt")
                 for key in ("input", "cad_revision"):
                     if replayed.get(key) != input_report.get(key):
                         raise PipelineError("Retained input report does not match its archived native inputs")
                 receipt_rows = (input_report.get("input_receipt") or {}).get("inventory")
-                if receipt_rows and (replayed.get("input_receipt") or {}).get("inventory") != receipt_rows:
+                replayed_rows = (replayed.get("input_receipt") or {}).get("inventory")
+                if isinstance(replayed_rows, list):
+                    # The frozen handoff record lives inside input/ but is not part of
+                    # the archived native package inventory.
+                    replayed_rows = [row for row in replayed_rows if row.get("path") != "handoff.json"]
+                if receipt_rows and replayed_rows != receipt_rows:
                     raise PipelineError("Retained input inspection receipt does not match its archived native inputs")
                 # Resolve from the fresh inspection of the archived input: its receipt root is
                 # this host's local package directory, while the frozen report records the
@@ -497,7 +511,7 @@ def rebuild(
             from .steps import generate_model, publish_model, verify_delivery
 
             generated_subject = generate_model(
-                staging, definition, read_data(bundle / "reports/input.json"), on_event=event
+                staging, definition, read_data(bundle / "input/handoff.json"), on_event=event
             )
             report = verify_delivery(staging, generated_subject, on_event=event)
             receipt.update(

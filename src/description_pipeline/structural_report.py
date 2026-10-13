@@ -22,7 +22,7 @@ DIAGNOSTIC_SCHEMA = "solidworks-to-urdf.failure-diagnostics/v1"
 
 #: Evidence files the report builder projects into findings.
 REPORT_EVIDENCE_FILES = (
-    "reports/input.json",
+    "input/handoff.json",
     "reports/quality.json",
     "input/discovery/findings.json",
     "input/discovery/native-discovery.json",

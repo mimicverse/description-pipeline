@@ -300,7 +300,7 @@ class SplitRoundtripTests(unittest.TestCase):
         self._capture(events, prepared_package, prepared_files)
         seed = self.root / "resume-seed"
         shutil.copytree(self.capture_output, seed)
-        sealed_receipt = seed / "reports/input.json"
+        sealed_receipt = seed / "input/handoff.json"
         report = json.loads(sealed_receipt.read_text(encoding="utf-8"))
         report["input_receipt"]["resolved_package_root"] = (
             rf"C:\description-v1-review\acc-24801e2\state\prepared\{self.run_id}"
@@ -331,7 +331,7 @@ class SplitRoundtripTests(unittest.TestCase):
         self.assertEqual(sealed_receipt.read_bytes(), frozen)
         # ... and the generated checkpoint carries that archived report, not a local replay:
         # accidentally handing generate_model the replayed report would fail here.
-        self.assertEqual((output / "reports/input.json").read_bytes(), frozen)
+        self.assertEqual((output / "input/handoff.json").read_bytes(), frozen)
 
     def test_altered_captured_input_still_refuses_the_resume(self) -> None:
         events: list[dict] = []
