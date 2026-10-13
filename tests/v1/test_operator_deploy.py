@@ -86,6 +86,16 @@ def platform_fixture(
     token.chmod(0o600)
     wheel = tmp / "mimicverse_description-test-py3-none-any.whl"
     wheel.write_bytes(b"wheel")
+    release_document = {
+        "schema_version": "solidworks-to-urdf.release/v1",
+        "pipeline_id": "solidworks-to-urdf",
+        "version": "1.4.0",
+        "source_commit": "c" * 40,
+        "source_sha256": "a" * 64,
+        "artifacts": {wheel.name: hashlib.sha256(wheel.read_bytes()).hexdigest()},
+    }
+    release_path = tmp / "release.json"
+    release_path.write_text(json.dumps(release_document), encoding="utf-8")
     config = {
         "schema_version": schemas.PLATFORM_CONFIG_SCHEMA,
         "operator": {
@@ -148,6 +158,8 @@ def platform_fixture(
             install_id,
             "--tree",
             str(tmp),
+            "--release-file",
+            str(release_path),
         ],
         {},
     )

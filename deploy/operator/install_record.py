@@ -176,6 +176,42 @@ def endpoint_identity(document) -> dict:
     }
 
 
+def require_matching_release(release: dict, endpoint: dict) -> None:
+    """The endpoint generation must carry the same release triple (commit skew never passes)."""
+
+    triple = {key: release[key] for key in ("version", "source_commit", "source_sha256")}
+    differing = [key for key in triple if endpoint["release"].get(key) != triple[key]]
+    require(not differing, f"endpoint release identity mismatch on {differing}")
+
+
+def wheel_binding(release: dict, *, wheel: Path | None, tree_root: Path | None = None) -> Path:
+    """Select the installed wheel and bind it to the release manifest - the single place.
+
+    An explicit ``--wheel`` and tree discovery share one rule: the consumed file's name and
+    byte digest must equal a release artifact; anything else fails closed before any leg runs.
+    """
+
+    if wheel is not None:
+        candidate = Path(wheel)
+    else:
+        require(tree_root is not None, "either --wheel or --tree is required to select the installed wheel")
+        candidates = sorted(path for path in Path(tree_root).glob("*.whl") if path.is_file())
+        require(
+            len(candidates) == 1,
+            f"expected exactly one *.whl under {tree_root} (found {len(candidates)}); pass --wheel",
+        )
+        candidate = candidates[0]
+    require(candidate.is_file(), f"wheel not found: {candidate}")
+    rows = {row["name"]: row["sha256"] for row in release["artifacts"]}
+    require(candidate.name in rows, f"the consumed wheel {candidate.name!r} is not a release artifact")
+    actual = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    require(
+        actual == rows[candidate.name],
+        f"the consumed wheel {candidate.name} does not match release.json ({actual})",
+    )
+    return candidate
+
+
 def build_install_record(
     *,
     install_id: str,
@@ -223,8 +259,7 @@ def build_install_record(
     )
     triple = {key: release[key] for key in ("version", "source_commit", "source_sha256")}
     windows_release = endpoint["release"]
-    differing = [key for key in triple if windows_release.get(key) != triple[key]]
-    require(not differing, f"endpoint release identity mismatch on {differing}")
+    require_matching_release(release, endpoint)
 
     dag_file = Path(dag_file)
     require(dag_file.is_file(), f"dag file not found: {dag_file}")
@@ -296,12 +331,17 @@ def main(argv: list[str] | None = None) -> int:
     check = subparsers.add_parser("check")
     check.add_argument("--release-file", type=Path, required=True)
     check.add_argument("--endpoint-identity", type=Path, required=True)
+    check.add_argument("--wheel", type=Path, default=None, help="the wheel that will be installed")
+    check.add_argument("--tree", type=Path, default=None, help="deployment tree for wheel discovery")
     args = parser.parse_args(argv)
 
     if args.action == "check":
         release = release_identity(_load_json(args.release_file, "release file"))
         verified = verify_artifacts(args.release_file.parent, release["artifacts"])
-        endpoint_identity(_load_json(args.endpoint_identity, "endpoint identity"))
+        endpoint = endpoint_identity(_load_json(args.endpoint_identity, "endpoint identity"))
+        require_matching_release(release, endpoint)
+        if args.wheel is not None or args.tree is not None:
+            wheel_binding(release, wheel=args.wheel, tree_root=args.tree)
         print("check=ok")
         print(f"verified_artifacts={verified}")
         return 0

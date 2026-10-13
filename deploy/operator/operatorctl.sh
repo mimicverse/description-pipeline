@@ -63,10 +63,17 @@ install_from_config() {
     RELEASE_FILE="$HERE/../../release.json"
   fi
   [ -f "$RELEASE_FILE" ] || die "release manifest not found: $RELEASE_FILE"
-  # Preflight the bound identities (release triple + artifact digests; endpoint generation)
-  # before any installation step runs.
-  python3 "$HERE/install_record.py" check --release-file "$RELEASE_FILE" \
-    --endpoint-identity "$ENDPOINT_IDENTITY" >/dev/null || exit $?
+  # Preflight the bound identities and the installed asset before any step runs: release
+  # artifact digests, the endpoint generation, their common release triple, and the wheel
+  # that will actually be consumed.
+  if [ -n "$WHEEL_FILE" ]; then
+    python3 "$HERE/install_record.py" check --release-file "$RELEASE_FILE" \
+      --endpoint-identity "$ENDPOINT_IDENTITY" --tree "$HERE/../.." --wheel "$WHEEL_FILE" \
+      >/dev/null || exit $?
+  else
+    python3 "$HERE/install_record.py" check --release-file "$RELEASE_FILE" \
+      --endpoint-identity "$ENDPOINT_IDENTITY" --tree "$HERE/../.." >/dev/null || exit $?
+  fi
   if [ -z "$INSTALL_ID" ]; then
     INSTALL_ID="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
   fi
@@ -75,10 +82,12 @@ install_from_config() {
   [ -f "$SNAPSHOT_PATH" ] || die "config snapshot was not written"
   if [ -n "$WHEEL_FILE" ]; then
     DERIVED_ENV="$(python3 "$HERE/platform_env.py" emit --snapshot "$SNAPSHOT_PATH" \
-      --install-id "$INSTALL_ID" --tree "$HERE/../.." --wheel "$WHEEL_FILE" | sed -n 's/^env=//p')" || exit $?
+      --install-id "$INSTALL_ID" --tree "$HERE/../.." --release-file "$RELEASE_FILE" \
+      --wheel "$WHEEL_FILE" | sed -n 's/^env=//p')" || exit $?
   else
     DERIVED_ENV="$(python3 "$HERE/platform_env.py" emit --snapshot "$SNAPSHOT_PATH" \
-      --install-id "$INSTALL_ID" --tree "$HERE/../.." | sed -n 's/^env=//p')" || exit $?
+      --install-id "$INSTALL_ID" --tree "$HERE/../.." --release-file "$RELEASE_FILE" | sed -n 's/^env=//p')" \
+      || exit $?
   fi
   [ -f "$DERIVED_ENV" ] || die "derived environment was not written"
   ENV_FILE="$DERIVED_ENV"

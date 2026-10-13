@@ -12,7 +12,8 @@ Derivations (all paths under the configured storage roots; converged here as the
   AIRFLOW_HOME   = <state_root>/airflow-home
   POSTGRES_ROOT  = <state_root>/airflow-pg
   AIRFLOW_DB_URL = postgresql+psycopg2://solidworks@/airflow_meta?host=<POSTGRES_ROOT>/socket&port=<POSTGRES_PORT>
-  PIPELINE_WHEEL = exactly one ``*.whl`` under the deployment tree unless ``--wheel`` is given
+  PIPELINE_WHEEL = the installed wheel (explicit ``--wheel`` or the single ``*.whl`` under the
+  deployment tree), bound to a release artifact by name+digest before any leg runs
   MODEL_* / DISCOVERY files = derived JSON under <state_root>/derived (0600)
 
 The derived env file is written 0600 under <state_root>/derived and is an internal artifact of
@@ -32,6 +33,7 @@ from urllib.parse import urlsplit
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from platform_config import atomic_write_once, canonical, validate_snapshot_document  # noqa: E402  (shared helpers)
+from install_record import release_identity, wheel_binding  # noqa: E402  (single release/asset binding)
 from render_operator import PORT_DEFAULTS  # noqa: E402  (single deploy-layer port source, DEP-01)
 
 
@@ -67,21 +69,14 @@ def _origin_parts(origin: str, where: str) -> tuple[str, int]:
     return parts.hostname, port
 
 
-def resolve_wheel(tree_root: Path, wheel: Path | None) -> Path:
-    """The exact wheel for this generation: explicit or the single one in the tree."""
-
-    if wheel is not None:
-        require(wheel.is_file(), f"wheel not found: {wheel}")
-        return wheel
-    candidates = sorted(path for path in tree_root.glob("*.whl") if path.is_file())
-    require(
-        len(candidates) == 1,
-        f"expected exactly one *.whl under {tree_root} (found {len(candidates)}); pass --wheel",
-    )
-    return candidates[0]
-
-
-def derive(snapshot: dict, *, install_id: str, tree_root: Path, wheel: Path | None = None) -> dict:
+def derive(
+    snapshot: dict,
+    *,
+    install_id: str,
+    tree_root: Path,
+    release: dict,
+    wheel: Path | None = None,
+) -> dict:
     """Return ``{env, env_path, derived_dir, wheel}`` for one install generation."""
 
     require(bool(install_id) and all(character not in install_id for character in "\n\r/"), "install_id is malformed")
@@ -144,7 +139,11 @@ def derive(snapshot: dict, *, install_id: str, tree_root: Path, wheel: Path | No
     discovery_file = derived_dir / "discovery.json"
     env_path = derived_dir / "operator.env"
 
-    wheel_path = resolve_wheel(tree_root, wheel)
+    require(
+        isinstance(release, dict) and "artifacts" in release,
+        "the release identity is required to bind the consumed wheel",
+    )
+    wheel_path = wheel_binding(release, wheel=wheel, tree_root=tree_root)
     venv = f"{release_root.rstrip('/')}/airflow-venv-{install_id}"
     home = f"{state_root.rstrip('/')}/airflow-home"
     postgres_root = f"{state_root.rstrip('/')}/airflow-pg"
@@ -193,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
     emit.add_argument("--snapshot", type=Path, required=True)
     emit.add_argument("--install-id", required=True)
     emit.add_argument("--tree", type=Path, required=True, help="deployment tree root")
+    emit.add_argument("--release-file", type=Path, required=True)
     emit.add_argument("--wheel", type=Path, default=None)
     args = parser.parse_args(argv)
 
@@ -201,7 +201,18 @@ def main(argv: list[str] | None = None) -> int:
         snapshot = json.loads(args.snapshot.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         die(f"cannot parse snapshot {args.snapshot}: {error}")
-    result = derive(snapshot, install_id=args.install_id, tree_root=args.tree, wheel=args.wheel)
+    require(args.release_file.is_file(), f"release file not found: {args.release_file}")
+    try:
+        release = release_identity(json.loads(args.release_file.read_text(encoding="utf-8")))
+    except (OSError, ValueError) as error:
+        die(f"cannot read release file {args.release_file}: {error}")
+    result = derive(
+        snapshot,
+        install_id=args.install_id,
+        tree_root=args.tree,
+        release=release,
+        wheel=args.wheel,
+    )
     print(f"env={result['env_path']}")
     print(f"derived={result['derived_dir']}")
     print(f"wheel={result['wheel']}")

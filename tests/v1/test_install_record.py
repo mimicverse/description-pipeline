@@ -438,6 +438,64 @@ class InstallRecordTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue((root / "state" / "install-record.json").is_file())
 
+    def _check(self, *extra: str, identity: Path | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [
+                sys.executable,
+                str(OPERATOR / "install_record.py"),
+                "check",
+                "--release-file",
+                str(self.root / "distribution" / "release.json"),
+                "--endpoint-identity",
+                str(identity or (self.root / "endpoint-identity.json")),
+                *extra,
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(ROOT),
+        )
+
+    def test_check_binds_endpoint_triple_and_the_consumed_wheel(self):
+        tree = str(self.root / "distribution")
+        result = self._check("--tree", tree)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("check=ok", result.stdout)
+
+        rogue = self.root / "distribution" / "rogue-extra.whl"
+        rogue.write_bytes(b"extra")
+        result = self._check("--tree", tree)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("exactly one", result.stderr)
+        rogue.unlink()
+
+        base = json.loads((self.root / "endpoint-identity.json").read_text(encoding="utf-8"))
+        variant = self.root / "endpoint-identity-variant.json"
+        for key, value in (("version", "9.9.9"), ("source_commit", "e" * 40), ("source_sha256", "e" * 64)):
+            document = json.loads(json.dumps(base))
+            document["release"][key] = value
+            variant.write_text(json.dumps(document), encoding="utf-8")
+            result = self._check("--tree", tree, identity=variant)
+            self.assertNotEqual(result.returncode, 0, key)
+            self.assertIn("identity mismatch", result.stderr)
+        variant.unlink()
+
+        rogue_same_name = self.root / "unrelated" / WHEEL_NAME
+        rogue_same_name.parent.mkdir()
+        rogue_same_name.write_bytes(b"UNINDEXED-ROGUE-WHEEL")
+        result = self._check("--wheel", str(rogue_same_name))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not match release.json", result.stderr)
+
+        unknown = self.root / "unrelated" / "other.whl"
+        unknown.write_bytes(b"other")
+        result = self._check("--wheel", str(unknown))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a release artifact", result.stderr)
+
+        correct = self.root / "distribution" / WHEEL_NAME
+        result = self._check("--wheel", str(correct))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     @unittest.skipUnless(hasattr(os, "symlink"), "requires symlink support")
     def test_terminal_symlink_artifact_rejected_without_writing(self):
         with tempfile.TemporaryDirectory(prefix="install-record-terminal-link-") as temporary:

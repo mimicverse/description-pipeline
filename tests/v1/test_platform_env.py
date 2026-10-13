@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -25,6 +26,20 @@ def _load_from_path(name: str, path: Path):
 
 platform_config = _load_from_path("deploy_platform_config_env", OPERATOR / "platform_config.py")
 platform_env = _load_from_path("deploy_platform_env", OPERATOR / "platform_env.py")
+install_record = _load_from_path("deploy_install_record_env", OPERATOR / "install_record.py")
+
+
+def write_release(root: Path, *wheels: Path) -> dict:
+    document = {
+        "schema_version": install_record.RELEASE_SCHEMA,
+        "pipeline_id": "solidworks-to-urdf",
+        "version": "1.4.0",
+        "source_commit": "c" * 40,
+        "source_sha256": "a" * 64,
+        "artifacts": {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in wheels},
+    }
+    (root / "release.json").write_text(json.dumps(document), encoding="utf-8")
+    return install_record.release_identity(document)
 
 
 def platform_document(root: Path) -> dict:
@@ -81,12 +96,22 @@ class PlatformEnvTests(unittest.TestCase):
         self.tree.mkdir()
         self.wheel = self.tree / "mimicverse_description-1.4.0-py3-none-any.whl"
         self.wheel.write_bytes(b"wheel")
+        self.release = write_release(self.root, self.wheel)
+
+    def derive(self, snapshot, *, install_id, tree_root=None, wheel=None):
+        return platform_env.derive(
+            snapshot,
+            install_id=install_id,
+            tree_root=tree_root or self.tree,
+            release=self.release,
+            wheel=wheel,
+        )
 
     def tearDown(self) -> None:
         self._temporary.cleanup()
 
     def test_derives_the_internal_environment_and_derived_files(self):
-        result = platform_env.derive(self.snapshot, install_id="gen-1", tree_root=self.tree)
+        result = self.derive(self.snapshot, install_id="gen-1", tree_root=self.tree)
         env = result["env"]
         self.assertEqual(env["OPERATOR_HOST"], "10.0.0.235")
         self.assertEqual(env["OPERATOR_HTTPS_PORT"], "9443")
@@ -116,19 +141,31 @@ class PlatformEnvTests(unittest.TestCase):
         parsed = dict(line.split("=", 1) for line in env_file.read_text(encoding="utf-8").splitlines() if line)
         self.assertEqual(parsed, env)
 
-    def test_wheel_resolution_requires_exactly_one_or_explicit(self):
+    def test_wheel_selection_is_bound_to_the_release(self):
         second = self.tree / "another.whl"
         second.write_bytes(b"other")
         with self.assertRaises(SystemExit) as raised:
-            platform_env.derive(self.snapshot, install_id="gen-1", tree_root=self.tree)
+            self.derive(self.snapshot, install_id="gen-1")
         self.assertIn("exactly one", str(raised.exception))
-        result = platform_env.derive(self.snapshot, install_id="gen-1", tree_root=self.tree, wheel=second)
+        self.release = write_release(self.root, self.wheel, second)
+        result = self.derive(self.snapshot, install_id="gen-1", wheel=second)
         self.assertEqual(result["wheel"], second)
+        rogue = self.tree / "rogue.whl"
+        rogue.write_bytes(b"rogue")
+        with self.assertRaises(SystemExit) as raised:
+            self.derive(self.snapshot, install_id="gen-1", wheel=rogue)
+        self.assertIn("not a release artifact", str(raised.exception))
+        rogue_same_name = self.root / "unrelated" / self.wheel.name
+        rogue_same_name.parent.mkdir()
+        rogue_same_name.write_bytes(b"UNINDEXED-ROGUE-WHEEL")
+        with self.assertRaises(SystemExit) as raised:
+            self.derive(self.snapshot, install_id="gen-1", wheel=rogue_same_name)
+        self.assertIn("does not match release.json", str(raised.exception))
         with self.assertRaises(SystemExit):
-            platform_env.derive(self.snapshot, install_id="gen-1", tree_root=self.tree, wheel=self.tree / "missing.whl")
+            self.derive(self.snapshot, install_id="gen-1", wheel=self.tree / "missing.whl")
 
     def test_render_operator_consumes_the_derived_env(self):
-        result = platform_env.derive(self.snapshot, install_id="gen-1", tree_root=self.tree)
+        result = self.derive(self.snapshot, install_id="gen-1", tree_root=self.tree)
         state = self.root / "state"
         secrets = state / "secrets"
         secrets.mkdir(parents=True, exist_ok=True)
@@ -169,6 +206,8 @@ class PlatformEnvTests(unittest.TestCase):
                 "gen-1",
                 "--tree",
                 str(self.tree),
+                "--release-file",
+                str(self.root / "release.json"),
             ],
             capture_output=True,
             text=True,
@@ -180,7 +219,7 @@ class PlatformEnvTests(unittest.TestCase):
         self.assertEqual(Path(summary["wheel"]), self.wheel)
 
     def test_generations_are_independent_and_immutable(self):
-        first = platform_env.derive(self.snapshot, install_id="gen-1", tree_root=self.tree)
+        first = self.derive(self.snapshot, install_id="gen-1", tree_root=self.tree)
         first_env_bytes = Path(first["env_path"]).read_bytes()
         first_targets_path = Path(first["env"]["MODEL_TARGETS_FILE"])
         first_targets_bytes = first_targets_path.read_bytes()
@@ -189,7 +228,7 @@ class PlatformEnvTests(unittest.TestCase):
         second_snapshot["install_id"] = "gen-2"
         second_snapshot["resolved"]["targets"]["m3.0"]["base"] = "feature/review-next"
         platform_config.validate_snapshot_document(second_snapshot)
-        second = platform_env.derive(second_snapshot, install_id="gen-2", tree_root=self.tree)
+        second = self.derive(second_snapshot, install_id="gen-2", tree_root=self.tree)
         self.assertNotEqual(first["env_path"], second["env_path"])
         self.assertEqual(Path(first["env_path"]).read_bytes(), first_env_bytes)
         self.assertEqual(first_targets_path.read_bytes(), first_targets_bytes)
@@ -202,7 +241,7 @@ class PlatformEnvTests(unittest.TestCase):
         conflicting = json.loads(json.dumps(self.snapshot))
         conflicting["resolved"]["targets"]["m3.0"]["base"] = "other"
         with self.assertRaises(SystemExit):
-            platform_env.derive(conflicting, install_id="gen-1", tree_root=self.tree)
+            self.derive(conflicting, install_id="gen-1", tree_root=self.tree)
         self.assertEqual(first_targets_path.read_bytes(), first_targets_bytes)
         self.assertEqual(Path(first["env_path"]).read_bytes(), first_env_bytes)
 
@@ -222,7 +261,7 @@ class PlatformEnvTests(unittest.TestCase):
         for label, snapshot, install_id in cases:
             with self.subTest(label):
                 with self.assertRaises(SystemExit):
-                    platform_env.derive(snapshot, install_id=install_id, tree_root=self.tree)
+                    self.derive(snapshot, install_id=install_id, tree_root=self.tree)
                 self.assertFalse((self.root / "state" / "derived").exists(), "no derived files may be written")
 
 
