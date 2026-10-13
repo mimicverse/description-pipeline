@@ -537,43 +537,6 @@ def rebuild(
                 shutil.rmtree(staging)
 
 
-def submit(bundle: Path, repository: Path, *, base=None, message=None):
-    """Recover publication without repeating native work or losing the run history."""
-    from .steps import publish_model
-
-    with output_lock(Path(bundle)) as bundle:
-        marker = bundle / "reports/run.json"
-        receipt = (
-            read_data(marker)
-            if marker.is_file()
-            else {
-                "schema_version": BUNDLE_SCHEMA,
-                "pipeline_id": PIPELINE_ID,
-                "run_id": str(uuid.uuid4()),
-                "execution_scope": ["publish"],
-                "events": [],
-            }
-        )
-        receipt["execution_scope"] = ["publish"]
-        receipt.setdefault("publication_attempts", [receipt["submission"]] if receipt.get("submission") else [])
-        event = _event_sink(receipt)
-        try:
-            result = publish_model(bundle, repository, base=base, message=message, on_event=event)
-        except Exception as error:
-            return _failed_run(None, bundle, receipt, event, error)
-        receipt["publication_attempts"].append(result)
-        receipt.update(
-            submission=result,
-            state=result["state"],
-            passed=result["passed"],
-            subject_sha256=result.get("subject_sha256"),
-            error=result.get("error"),
-            detail=result.get("detail"),
-        )
-        _stamp(bundle, receipt)
-        return result
-
-
 def doctor() -> dict:
     """Check the pinned runtime and readiness required by this host's role."""
     role = runtime_role()
