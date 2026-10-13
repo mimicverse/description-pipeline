@@ -12,6 +12,7 @@ import unittest
 from datetime import UTC, datetime
 
 from description_pipeline.io import PipelineError
+from description_pipeline.interface_records import CHECK_POLICY_V1
 from description_pipeline.platform.store import (
     AdmissionClosedError,
     OperationConflictError,
@@ -22,6 +23,19 @@ from description_pipeline.platform.store import (
 NOW = datetime(2026, 10, 14, 10, 0, tzinfo=UTC)
 SUBJECT = "a" * 64
 HANDOFF = "b" * 64
+CHECKPOINT = "sealed://run/r-1"
+
+
+def qualified_quality(**overrides) -> dict:
+    expected = sorted(set(CHECK_POLICY_V1["fixed_checks"]))
+    payload = {
+        "passed": True,
+        "subject_sha256": SUBJECT,
+        "checks": [{"id": name, "state": "passed", "passed": True, "details": {}} for name in expected],
+        "required_checks": expected,
+    }
+    payload.update(overrides)
+    return payload
 
 
 def generate_receipt(**overrides) -> dict:
@@ -34,6 +48,7 @@ def generate_receipt(**overrides) -> dict:
         "passed": False,
         "subject_sha256": SUBJECT,
         "handoff_sha256": HANDOFF,
+        "artifacts": {"model/robot.json": SUBJECT},
     }
     payload.update(overrides)
     return payload
@@ -49,7 +64,8 @@ def verify_receipt(**overrides) -> dict:
         "passed": True,
         "subject_sha256": SUBJECT,
         "handoff_sha256": HANDOFF,
-        "quality": {"passed": True, "subject_sha256": SUBJECT},
+        "artifacts": {"model/robot.json": SUBJECT},
+        "quality": qualified_quality(),
     }
     payload.update(overrides)
     return payload
@@ -65,7 +81,8 @@ def publish_receipt(**overrides) -> dict:
         "passed": True,
         "subject_sha256": SUBJECT,
         "handoff_sha256": HANDOFF,
-        "quality": {"passed": True, "subject_sha256": SUBJECT},
+        "artifacts": {"model/robot.json": SUBJECT},
+        "quality": qualified_quality(),
         "submission": {
             "passed": True,
             "state": "published",
@@ -171,23 +188,32 @@ class FakeCursor:
         elif normalized.startswith("SELECT state FROM platform.stage WHERE run_id = %s AND stage = %s FOR UPDATE"):
             record = world.stages.get((params[0], params[1]))
             self._rows = [(record[0],)] if record else []
-        elif normalized.startswith("SELECT state, receipt FROM platform.stage WHERE run_id = %s AND stage = %s"):
+        elif normalized.startswith(
+            "SELECT state, receipt, checkpoint_uri FROM platform.stage WHERE run_id = %s AND stage = %s"
+        ):
             record = world.stages.get((params[0], params[1]))
             self._rows = [record] if record else []
+        elif "FROM platform.operation WHERE operation_id = %s AND run_id = %s AND kind = 'reconcile'" in normalized:
+            found = any(
+                item[0] == params[0] and item[4] == params[1] and item[6] == "reconcile"
+                for item in world.operations.values()
+            )
+            self._rows = [(1,)] if found else []
         elif normalized.startswith("INSERT INTO platform.stage"):
             run_id, stage, state = params[0], params[1], params[2]
             receipt = json.loads(params[3]) if params[3] is not None else None
+            checkpoint = params[4]
             existing = world.stages.get((run_id, stage))
             if "= 'unresolved'" in normalized:  # the reconciliation statement
                 if existing is not None and existing[0] == "unresolved":
-                    world.stages[(run_id, stage)] = (state, receipt)
+                    world.stages[(run_id, stage)] = (state, receipt, checkpoint)
                     self._rows = [(run_id, stage, state)]
                 else:
                     self._rows = []
             elif existing is not None and existing[0] in {"completed", "failed", "cancelled", "blocked", "unresolved"}:
                 self._rows = []
             else:
-                world.stages[(run_id, stage)] = (state, receipt)
+                world.stages[(run_id, stage)] = (state, receipt, checkpoint)
                 self._rows = [(run_id, stage, state)]
         elif "FROM platform.lifecycle_projection" in normalized:
             self.description = tuple(
@@ -231,7 +257,7 @@ class PlatformStoreTests(unittest.TestCase):
         self.admit(from_stage=from_stage)
         self.world.run_states["r-1"] = "running"
         if verify_done:
-            self.world.stages[("r-1", "verify")] = ("completed", verify_receipt())
+            self.world.stages[("r-1", "verify")] = ("completed", verify_receipt(), CHECKPOINT)
 
     def _publish_registration(self, **overrides):
         payload = {
@@ -336,10 +362,10 @@ class PlatformStoreTests(unittest.TestCase):
         self._running_run()  # a fresh run starts at freeze; publish needs verify first
         with self.assertRaisesRegex(PlatformStoreError, "requires the completed 'verify' stage"):
             self._publish_registration()
-        self.world.stages[("r-1", "verify")] = ("completed", {"run_id": "r-1", "stage": "verify"})
+        self.world.stages[("r-1", "verify")] = ("completed", {"run_id": "r-1", "stage": "verify"}, CHECKPOINT)
         with self.assertRaisesRegex(PlatformStoreError, "sealed receipt"):
             self._publish_registration()
-        self.world.stages[("r-1", "verify")] = ("completed", verify_receipt())
+        self.world.stages[("r-1", "verify")] = ("completed", verify_receipt(), CHECKPOINT)
         self.assertEqual(self._publish_registration().stage, "publish")
 
     def test_terminal_runs_only_continue_via_cancel_or_reconcile(self) -> None:
@@ -374,17 +400,34 @@ class PlatformStoreTests(unittest.TestCase):
             self.store.confirm_stage(
                 run_id="r-1", stage="generate", state="completed", receipt=generate_receipt(state="failed")
             )
-        with self.assertRaisesRegex(PlatformStoreError, "quality payload"):
+        with self.assertRaisesRegex(PlatformStoreError, "required checks"):
             self.store.confirm_stage(
                 run_id="r-1",
                 stage="verify",
                 state="completed",
-                receipt=verify_receipt(quality={"passed": False, "subject_sha256": SUBJECT}),
+                checkpoint_uri=CHECKPOINT,
+                receipt=verify_receipt(quality=qualified_quality(passed=False)),
+            )
+        with self.assertRaisesRegex(PlatformStoreError, "no checkpoint reference"):
+            self.store.confirm_stage(
+                run_id="r-1", stage="generate", state="completed", receipt=generate_receipt()
+            )
+        with self.assertRaisesRegex(PlatformStoreError, "artifact inventory"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="generate",
+                state="completed",
+                checkpoint_uri=CHECKPOINT,
+                receipt=generate_receipt(artifacts={}),
             )
         self.store.confirm_stage(run_id="r-1", stage="generate", state="running")
-        self.store.confirm_stage(run_id="r-1", stage="generate", state="completed", receipt=generate_receipt())
+        self.store.confirm_stage(
+            run_id="r-1", stage="generate", state="completed", checkpoint_uri=CHECKPOINT, receipt=generate_receipt()
+        )
         with self.assertRaisesRegex(PlatformStoreError, "already terminal"):
-            self.store.confirm_stage(run_id="r-1", stage="generate", state="failed", receipt=generate_receipt())
+            self.store.confirm_stage(
+                run_id="r-1", stage="generate", state="failed", checkpoint_uri=CHECKPOINT, receipt=generate_receipt()
+            )
         self.store.confirm_stage(
             run_id="r-1",
             stage="verify",
@@ -400,31 +443,77 @@ class PlatformStoreTests(unittest.TestCase):
             run_id="r-1", stage="generate", state="unresolved", receipt={**generate_receipt(), "state": "unresolved"}
         )
         with self.assertRaisesRegex(PlatformStoreError, "evidenced reconciliation"):
-            self.store.confirm_stage(run_id="r-1", stage="generate", state="completed", receipt=generate_receipt())
+            self.store.confirm_stage(
+                run_id="r-1", stage="generate", state="completed", checkpoint_uri=CHECKPOINT, receipt=generate_receipt()
+            )
         with self.assertRaisesRegex(PlatformStoreError, "definite outcome"):
             self.store.confirm_stage(
-                run_id="r-1", stage="generate", state="unresolved", receipt=generate_receipt(), reconcile={"ref": "x"}
+                run_id="r-1",
+                stage="generate",
+                state="unresolved",
+                receipt={**generate_receipt(), "state": "unresolved"},
+                reconcile={"operation_id": "x"},
             )
+        with self.assertRaisesRegex(PlatformStoreError, "must name its registered reconcile operation"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="generate",
+                state="completed",
+                checkpoint_uri=CHECKPOINT,
+                receipt=generate_receipt(),
+                reconcile={"result_ref": "unbound"},
+            )
+        with self.assertRaisesRegex(PlatformStoreError, "registered reconcile operation"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="generate",
+                state="completed",
+                checkpoint_uri=CHECKPOINT,
+                receipt=generate_receipt(),
+                reconcile={"operation_id": "unregistered-op"},
+            )
+        reconcile_op = self.store.register_operation(
+            run_id="r-1", stage="generate", kind="reconcile", operation_key="r-1/reconcile:0", params_digest="c" * 64
+        )
         self.store.confirm_stage(
             run_id="r-1",
             stage="generate",
             state="completed",
+            checkpoint_uri=CHECKPOINT,
             receipt=generate_receipt(),
-            reconcile={"result_ref": "reconcile-42"},
+            reconcile={"operation_id": reconcile_op.operation_id},
         )
         self.assertEqual(self.world.stages[("r-1", "generate")][0], "completed")
         self.assertEqual(
-            self.world.stages[("r-1", "generate")][1]["reconciliation"], {"result_ref": "reconcile-42"}
+            self.world.stages[("r-1", "generate")][1]["reconciliation"],
+            {"operation_id": reconcile_op.operation_id},
         )
         with self.assertRaisesRegex(PlatformStoreError, "already terminal"):
             self.store.confirm_stage(run_id="r-1", stage="generate", state="running")
+
+    def test_reconciliation_requires_an_existing_stage_record(self) -> None:
+        self._running_run()
+        reconcile_op = self.store.register_operation(
+            run_id="r-1", stage="generate", kind="reconcile", operation_key="r-1/reconcile:0", params_digest="c" * 64
+        )
+        with self.assertRaisesRegex(PlatformStoreError, "unresolved stage record"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="generate",
+                state="completed",
+                checkpoint_uri=CHECKPOINT,
+                receipt=generate_receipt(),
+                reconcile={"operation_id": reconcile_op.operation_id},
+            )
 
     def test_blocked_is_terminal_and_carries_no_receipt(self) -> None:
         self._running_run()
         self.store.confirm_stage(run_id="r-1", stage="generate", state="blocked")
         self.assertEqual(self.world.stages[("r-1", "generate")][0], "blocked")
         with self.assertRaisesRegex(PlatformStoreError, "already terminal"):
-            self.store.confirm_stage(run_id="r-1", stage="generate", state="completed", receipt=generate_receipt())
+            self.store.confirm_stage(
+                run_id="r-1", stage="generate", state="completed", checkpoint_uri=CHECKPOINT, receipt=generate_receipt()
+            )
 
     def test_confirmed_stage_returns_sealed_receipts_or_refuses(self) -> None:
         self._running_run()
@@ -432,10 +521,15 @@ class PlatformStoreTests(unittest.TestCase):
         self.store.confirm_stage(run_id="r-1", stage="generate", state="running")
         self.assertEqual(self.store.confirmed_stage("r-1", "generate"), None)
         receipt = generate_receipt()
-        self.store.confirm_stage(run_id="r-1", stage="generate", state="completed", receipt=receipt)
+        self.store.confirm_stage(
+            run_id="r-1", stage="generate", state="completed", checkpoint_uri=CHECKPOINT, receipt=receipt
+        )
         self.assertEqual(self.store.confirmed_stage("r-1", "generate"), receipt)
-        self.world.stages[("r-1", "generate")] = ("completed", {**receipt, "run_id": "r-2"})
+        self.world.stages[("r-1", "generate")] = ("completed", {**receipt, "run_id": "r-2"}, CHECKPOINT)
         with self.assertRaisesRegex(PlatformStoreError, "another run or stage"):
+            self.store.confirmed_stage("r-1", "generate")
+        self.world.stages[("r-1", "generate")] = ("completed", receipt, None)
+        with self.assertRaisesRegex(PlatformStoreError, "no checkpoint reference"):
             self.store.confirmed_stage("r-1", "generate")
 
     # ------------------------------------------------------------------ reads

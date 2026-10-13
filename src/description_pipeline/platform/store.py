@@ -102,9 +102,12 @@ _LOCK_RUN = "SELECT state, from_stage FROM platform.run WHERE run_id = %s FOR UP
 _CONFIRMED_PUBLISH = (
     "SELECT 1 FROM platform.operation WHERE run_id = %s AND kind = 'publish' AND state = 'succeeded' LIMIT 1"
 )
-_READ_STAGE_ROW = "SELECT state, receipt FROM platform.stage WHERE run_id = %s AND stage = %s"
-_READ_STAGE = "SELECT state, receipt FROM platform.stage WHERE run_id = %s AND stage = %s"
+_READ_STAGE_ROW = "SELECT state, receipt, checkpoint_uri FROM platform.stage WHERE run_id = %s AND stage = %s"
+_READ_STAGE = "SELECT state, receipt, checkpoint_uri FROM platform.stage WHERE run_id = %s AND stage = %s"
 _LOCK_STAGE = "SELECT state FROM platform.stage WHERE run_id = %s AND stage = %s FOR UPDATE"
+_FIND_RECONCILE = (
+    "SELECT 1 FROM platform.operation WHERE operation_id = %s AND run_id = %s AND kind = 'reconcile' LIMIT 1"
+)
 _INSERT_STAGE = (
     "INSERT INTO platform.stage (run_id, stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at)"
     " VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s)"
@@ -387,7 +390,18 @@ class PlatformStore:
                     )
                 if current != "unresolved" and reconcile is not None:
                     raise PlatformStoreError("Reconciliation only confirms an unresolved stage")
-            _sealed_receipt(receipt, run_id=run_id, stage=stage, state=state)
+            elif reconcile is not None:
+                raise PlatformStoreError("Reconciliation requires the unresolved stage record of this run")
+            if reconcile is not None:
+                operation_id = reconcile.get("operation_id")
+                if not isinstance(operation_id, str) or not operation_id:
+                    raise PlatformStoreError("Reconciliation must name its registered reconcile operation")
+                cursor.execute(_FIND_RECONCILE, (operation_id, run_id))
+                if cursor.fetchone() is None:
+                    raise PlatformStoreError(
+                        "The reconciliation names no registered reconcile operation of this run"
+                    )
+            _sealed_receipt(receipt, run_id=run_id, stage=stage, state=state, checkpoint_uri=checkpoint_uri)
             payload_receipt = {**receipt, "reconciliation": reconcile} if reconcile is not None else receipt
             if current == "unresolved":
                 cursor.execute(
@@ -433,7 +447,7 @@ class PlatformStore:
         if row is None or row[0] != "completed":
             return None
         receipt = row[1]
-        _sealed_receipt(receipt, run_id=run_id, stage=stage, state="completed")
+        _sealed_receipt(receipt, run_id=run_id, stage=stage, state="completed", checkpoint_uri=row[2])
         return receipt
 
     # ------------------------------------------------------------- read side
@@ -465,7 +479,7 @@ def _is_sha256(value) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
 
 
-def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str) -> None:
+def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str, checkpoint_uri) -> None:
     """The one sealed-receipt validator shared by the stage write and reuse paths.
 
     A terminal confirmation must bind its receipt completely, and the reuse
@@ -506,17 +520,22 @@ def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str) -> None:
         raise PlatformStoreError("A completed stage must be sealed with its confirmed receipt state")
     if receipt.get("passed") is not CONFIRMED_STAGE_PASSED[stage]:
         raise PlatformStoreError("The sealed receipt does not carry the stage's confirmed outcome")
+    if not isinstance(checkpoint_uri, str) or not checkpoint_uri:
+        raise PlatformStoreError("An unsealed stage completion is refused: no checkpoint reference")
+    if not isinstance(receipt.get("artifacts"), dict) or not receipt["artifacts"]:
+        raise PlatformStoreError("The sealed receipt lacks its artifact inventory")
     subject = receipt.get("subject_sha256")
     if not _is_sha256(subject):
         raise PlatformStoreError("The sealed receipt lacks its subject digest")
     if stage in {"verify", "publish"}:
-        quality = receipt.get("quality")
-        if (
-            not isinstance(quality, dict)
-            or quality.get("passed") is not True
-            or quality.get("subject_sha256") != subject
-        ):
-            raise PlatformStoreError("The sealed receipt's quality payload is missing or unbound")
+        from ..verification.solidworks_urdf import require_qualified_report
+
+        try:
+            quality = require_qualified_report(receipt.get("quality"))
+        except PipelineError as error:
+            raise PlatformStoreError(str(error)) from error
+        if quality.get("subject_sha256") != subject:
+            raise PlatformStoreError("The sealed receipt's quality payload is bound to another subject")
     if stage == "publish":
         submission = receipt.get("submission")
         if (
@@ -568,7 +587,9 @@ def _require_successor(connection, *, run_id: str, kind: str, stage: str) -> Non
             raise PlatformStoreError(
                 f"The {stage!r} operation requires the completed {predecessor!r} stage of this run"
             )
-        _sealed_receipt(predecessor_row[1], run_id=run_id, stage=predecessor, state="completed")
+        _sealed_receipt(
+            predecessor_row[1], run_id=run_id, stage=predecessor, state="completed", checkpoint_uri=predecessor_row[2]
+        )
 
 
 def _matching_operation(row, *, run_id: str, stage: str, kind: str, params_digest: str) -> OperationRecord:
