@@ -129,22 +129,6 @@ def _identity_of(source: dict) -> dict:
     }
 
 
-def _check_successor(previous: dict, current: dict) -> None:
-    """Guard the review branch against reusing a CAD revision for changed content.
-
-    Hardware identity must match; the same revision label is only allowed when
-    the content identity is identical.  The retired ``cad-revision.json`` seal
-    also required a new label to name its parent; that rule awaits the frozen
-    ``parent_revision`` field of ``input/source.json`` (field questioned to the
-    coordinator, not invented here).
-    """
-
-    if previous["hardware_id"] != current["hardware_id"]:
-        raise PrError("cad_revision_conflict", "CAD hardware identity changed across the review branch")
-    if previous["revision"] == current["revision"] and previous["source_revision_id"] != current["source_revision_id"]:
-        raise PrError("cad_revision_conflict", "CAD revision reused for different content; create a new revision")
-
-
 def _validate(bundle: Path) -> tuple[str, dict, dict]:
     for name in REQUIRED_FILES:
         if not (bundle / name).is_file():
@@ -173,8 +157,8 @@ def _validate(bundle: Path) -> tuple[str, dict, dict]:
         raise PrError("bundle_records_invalid", str(error)) from error
     hardware = _slug_hardware(str(source["selection"]["hardware_id"]))
     current = _identity_of(source)
-    if not isinstance(current["revision"], str) or not current["revision"]:
-        raise PrError("source_revision_missing", "input/source.json requires the CAD revision label")
+    # The CAD/PDM revision label is optional engineering metadata: a missing
+    # value stays missing and is never a publication rejection reason.
     return hardware, manifest, current
 
 
@@ -185,10 +169,9 @@ def _previous_revision(worktree: Path, hardware: str) -> dict | None:
         source = read_source_record(worktree)
     except PipelineError as error:
         raise PrError("previous_source_invalid", str(error)) from error
-    current = _identity_of(source)
-    if not current["revision"]:
-        return None
-    return current
+    # Content identity exists even when the CAD revision label is absent; the
+    # published subject chain is the platform-level successor evidence.
+    return _identity_of(source)
 
 
 def published_revision(repository: Path, hardware: str) -> dict | None:
@@ -205,7 +188,7 @@ def published_revision(repository: Path, hardware: str) -> dict | None:
     branch = REVIEW_BRANCH.format(hardware=hardware)
     _validate_ref(repository, branch, branch=True)
     try:
-        subprocess.run(
+        fetched = subprocess.run(
             ["git", "-C", str(repository), "fetch", "--quiet", "origin", branch],
             check=False,
             capture_output=True,
@@ -214,22 +197,33 @@ def published_revision(repository: Path, hardware: str) -> dict | None:
             timeout=PUBLISHED_REVISION_FETCH_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
-        log.warning("published revision fetch timed out for %s; continuing without a parent revision", branch)
-        return None
+        raise PrError("published_revision_unknown", f"fetch timed out for {branch}") from None
+    if fetched.returncode != 0:
+        stderr = (fetched.stderr or "").strip()
+        if "couldn't find remote ref" in stderr:
+            # The remote answered: this branch provably does not exist yet.
+            return None
+        raise PrError("published_revision_unknown", stderr[-200:] or "fetch failed")
     show = _git(repository, "show", "FETCH_HEAD:input/source.json", check=False)
-    if show.returncode != 0 or not show.stdout.strip():
-        return None
+    if show.returncode != 0:
+        stderr = (show.stderr or "").strip()
+        if "does not exist" in stderr or "but not in" in stderr:
+            # The branch was fetched: the file is provably absent there.
+            return None
+        raise PrError("published_revision_unknown", stderr[-200:] or "source record unreadable")
+    if not show.stdout.strip():
+        raise PrError("published_revision_unknown", "empty source record")
     try:
         payload = json.loads(show.stdout)
     except json.JSONDecodeError:
-        return None
+        raise PrError("published_revision_unknown", "source record is not JSON") from None
     try:
         payload = validate_source_record(payload)
-    except PipelineError:
-        return None
+    except PipelineError as error:
+        raise PrError("published_revision_unknown", str(error)) from error
     identity = _identity_of(payload)
-    if identity["hardware_id"] != hardware or not isinstance(identity["revision"], str) or not identity["revision"]:
-        return None
+    if identity["hardware_id"] != hardware:
+        raise PrError("published_revision_mismatch", {"expected": hardware, "observed": identity["hardware_id"]})
     return identity
 
 
@@ -582,8 +576,6 @@ def submit_bundle(
         try:
             _prepare_worktree(repository, worktree, base_sha, head_sha)
             previous = _previous_revision(worktree, hardware)
-            if previous is not None:
-                _check_successor(previous, current_revision)
             commit, noop = _stage_commit(
                 bundle, worktree, subject, message or f"feat({hardware}): publish SolidWorks-to-URDF bundle"
             )
@@ -597,6 +589,10 @@ def submit_bundle(
                     "commit": commit,
                     "copied_staged_committed": "reverified",
                     "git_attributes_sha256": file_digest(worktree / ".gitattributes"),
+                    # Published subject chain evidence: the previous content
+                    # identity (CAD label optional, kept raw) and the new one.
+                    **({} if previous is None else {"previous_source_revision_id": previous["source_revision_id"]}),
+                    "source_revision_id": current_revision["source_revision_id"],
                 },
             )
             phase = "publication.receipt"

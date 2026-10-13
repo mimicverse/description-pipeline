@@ -55,7 +55,7 @@ class Fixture:
             policy={"schema_version": CHECK_POLICY_SCHEMA, "digest": check_policy_digest()},
         )
 
-    def seal(self, revision_id: str, parent: str | None, *, cad: str = "part-1\n", fresh: bool = False) -> None:
+    def seal(self, revision_id: str | None, parent: str | None, *, cad: str = "part-1\n", fresh: bool = False) -> None:
         """Write the frozen input/source.json content identity for one revision."""
 
         inputs = self.bundle / "input"
@@ -525,13 +525,17 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(self.fx.remote_head(), second["commit"])
         self.assertTrue(self.fx.is_ancestor(first["commit"], second["commit"]))
 
-    def test_resealed_changed_cad_same_id_rejected(self) -> None:
+    def test_same_label_changed_content_is_not_a_rejection(self) -> None:
+        # Platform semantics: the CAD label is raw engineering metadata, never a
+        # content identity; protection comes from the fixed base/head, the
+        # published subject chain and CAS/ff, so a re-sealed label is allowed.
         first = self.submit()
         self.fx.seal("r1", None, cad="part-1-changed\n", fresh=True)
         self.fx.write_bundle("two\n")
-        result = self.submit()
-        self.assertEqual(result["error"], "cad_revision_conflict")
-        self.assertEqual(self.fx.remote_head(), first["commit"])
+        second = self.submit()
+        self.assertEqual(second["state"], "updated")
+        self.assertEqual(self.fx.remote_head(), second["commit"])
+        self.assertTrue(self.fx.is_ancestor(first["commit"], second["commit"]))
 
     def test_new_revision_label_is_allowed(self) -> None:
         first = self.submit()
@@ -543,9 +547,38 @@ class PublishTests(unittest.TestCase):
         source = json.loads(run("git", "show", "FETCH_HEAD:input/source.json", cwd=self.fx.repo))
         self.assertEqual(source["metadata"]["revision"], "r2")
         self.assertTrue(self.fx.is_ancestor(first["commit"], second["commit"]))
-        # The retired cad-revision.json parent-link rule awaits the frozen
-        # parent_revision field of input/source.json (field questioned to the
-        # coordinator); hardware identity and the same-label/content guard remain.
+
+    def test_missing_revision_label_publishes_with_content_identity(self) -> None:
+        self.submit()
+        self.fx.seal(None, None, cad="part-2\n", fresh=True)
+        self.fx.write_bundle("two\n")
+        second = self.submit()
+        self.assertEqual(second["state"], "updated")
+        run("git", "fetch", "--quiet", "origin", BRANCH, cwd=self.fx.repo)
+        source = json.loads(run("git", "show", "FETCH_HEAD:input/source.json", cwd=self.fx.repo))
+        self.assertIsNone(source["metadata"]["revision"])
+        previous = urdf_pr.published_revision(self.fx.repo, "m3.0")
+        self.assertIsNone(previous["revision"])
+        self.assertTrue(previous["source_revision_id"])
+
+    def test_published_revision_unknown_is_not_absent(self) -> None:
+        # A remote that answers "no such ref" is proven-absent; a transport or
+        # read failure is unknown and must not masquerade as absence.
+        self.assertIsNone(urdf_pr.published_revision(self.fx.repo, "m3.0"))
+        failure = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="network is unreachable")
+        real_run = subprocess.run
+
+        def fake_run(*args, **kwargs):
+            if "fetch" in args[0]:
+                return failure
+            return real_run(*args, **kwargs)
+
+        with (
+            mock.patch.object(urdf_pr.subprocess, "run", side_effect=fake_run),
+            self.assertRaises(urdf_pr.PrError) as raised,
+        ):
+            urdf_pr.published_revision(self.fx.repo, "m3.0")
+        self.assertEqual(raised.exception.code, "published_revision_unknown")
 
 
 if __name__ == "__main__":
