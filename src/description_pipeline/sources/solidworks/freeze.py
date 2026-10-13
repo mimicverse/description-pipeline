@@ -26,6 +26,7 @@ from .evidence import build_evidence, capture_environment
 from .jsonio import digest_json, sha256_file, write_json
 # The native adapter binds exported bytes; full mesh analysis runs on Linux.
 from ...io import inventory
+from ...schemas import EFFECTIVE_INSTANCES_SCHEMA, LINK_GROUP_MASS_SCHEMA
 
 #: Freeze/capture record ids now live in the ``solidworks-to-urdf.*`` family.
 #: Retained evidence written before the XC-01 rename carries the retired
@@ -1680,7 +1681,7 @@ def _effective_instance_record(
             }
         )
     return {
-        "schema_version": "solidworks-to-urdf.effective-instances/v1",
+        "schema_version": EFFECTIVE_INSTANCES_SCHEMA,
         "assembly": str(cfg.get("assembly") or ""),
         "configuration": str(cfg.get("configuration") or ""),
         "cache_error": cache_error,
@@ -1808,7 +1809,7 @@ def _export_geometry(
     return exported
 
 
-LINK_GROUP_SCHEMA = "solidworks-to-urdf.link-group-mass-properties/v1"
+LINK_GROUP_SCHEMA = LINK_GROUP_MASS_SCHEMA
 LINK_GROUP_USED_API = "IMassProperty2 (SelectedItems = component set)"
 LINK_GROUP_SELECTION_RULE = "top_most_providers+uncovered_leaves"
 #: Marker for the whole-assembly and direct link reads taken in the reopened,

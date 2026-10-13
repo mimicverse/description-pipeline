@@ -14,6 +14,9 @@ from typing import cast
 
 MAX_TRIANGLES = 5_000_000
 DEGENERATE_AREA = 1.0e-14  # m²，约 (0.1 µm)²
+#: Largest triangle count per delivered mesh part; larger native meshes are split
+#: losslessly.  Owned here so the generator and the verifier cannot drift (VER-03).
+MESH_PART_TRIANGLES_MAX = 199_999
 
 
 class StlError(ValueError):
