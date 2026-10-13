@@ -284,6 +284,7 @@ class LinuxSplitTests(unittest.TestCase):
                 "state": "generated",
                 "passed": False,
                 "subject_sha256": "a" * 64,
+                "handoff_sha256": HANDOFF,
             },
         )
         with (
@@ -313,6 +314,33 @@ class LinuxSplitTests(unittest.TestCase):
             self.assertRaisesRegex(PipelineError, "differs from the native capture"),
         ):
             linux_runner.run_portable_stage(self.store, self.run_id, "generate")
+
+    def test_verify_reuse_requires_the_bound_quality_report(self) -> None:
+        self.admit()
+        subject = self._registered_generate_checkpoint()
+        verify = self.store.stage_dir(self.run_id, "verify")
+        shutil.copytree(self.store.stage_dir(self.run_id, "generate"), verify)
+        write_json(verify / "reports/quality.json", {"passed": False, "subject_sha256": subject})
+        self.store.record_stage(
+            self.run_id,
+            "verify",
+            {
+                "schema_version": "solidworks-to-urdf.bundle/v1",
+                "run_id": self.run_id,
+                "stage": "verify",
+                "state": "verified",
+                "passed": True,
+                "subject_sha256": subject,
+                "handoff_sha256": HANDOFF,
+                "events": [],
+            },
+        )
+        with (
+            mock.patch.object(linux_runner, "tool_record", return_value=portable_record(self.tool)),
+            mock.patch.object(linux_runner.solidworks, "verify", side_effect=AssertionError("must not rerun")),
+            self.assertRaises(PipelineError),
+        ):
+            linux_runner.run_portable_stage(self.store, self.run_id, "verify", expected_subject=subject)
 
     def test_preview_and_artifacts_are_bound_to_the_verified_bytes(self) -> None:
         from description_pipeline.delivery import subject_digest

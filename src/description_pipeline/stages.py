@@ -58,6 +58,21 @@ CONFIRMED_STAGE_STATES = {
     "publish": frozenset({"published", "updated", "noop"}),
 }
 
+#: The expected ``passed`` flag of a confirmed receipt per portable stage.
+CONFIRMED_STAGE_PASSED = {
+    "generate": False,
+    "verify": True,
+    "publish": True,
+}
+
+#: The canonical platform stage states (frozen contracts); the store validates
+#: every stage confirmation against this single vocabulary.
+STAGE_STATES = frozenset({"pending", "running", "completed", "failed", "cancelled", "unresolved", "blocked"})
+
+#: Business terminal stage states: once a stage record reaches one of these it
+#: is never overwritten again - a redo is a linked run, not a rewrite.
+TERMINAL_STAGE_STATES = frozenset({"completed", "failed", "cancelled", "unresolved"})
+
 #: Fixed definition-independent required checks every quality report must carry;
 #: ``verification.solidworks_urdf.required_checks`` adds the dynamic per-object gates.
 FIXED_REQUIRED_CHECKS = frozenset(

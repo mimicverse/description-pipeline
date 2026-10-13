@@ -25,6 +25,13 @@ from datetime import datetime
 from typing import Any
 
 from ..io import PipelineError
+from ..stages import (
+    CONFIRMED_STAGE_PASSED,
+    CONFIRMED_STAGE_STATES,
+    STAGE_IDS,
+    STAGE_STATES,
+    TERMINAL_STAGE_STATES,
+)
 
 
 class PlatformStoreError(PipelineError):
@@ -90,10 +97,12 @@ _FIND_OPERATION = (
     "SELECT operation_id, state, operation_key, params_digest, run_id, stage, kind"
     " FROM platform.operation WHERE operation_key = %s"
 )
-_LOCK_RUN = "SELECT state FROM platform.run WHERE run_id = %s FOR UPDATE"
+_LOCK_RUN = "SELECT state, from_stage FROM platform.run WHERE run_id = %s FOR UPDATE"
 _CONFIRMED_PUBLISH = (
     "SELECT 1 FROM platform.operation WHERE run_id = %s AND kind = 'publish' AND state = 'succeeded' LIMIT 1"
 )
+_READ_STAGE_ROW = "SELECT state FROM platform.stage WHERE run_id = %s AND stage = %s"
+_READ_STAGE = "SELECT state, receipt FROM platform.stage WHERE run_id = %s AND stage = %s"
 _INSERT_STAGE = (
     "INSERT INTO platform.stage (run_id, stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at)"
     " VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s)"
@@ -101,7 +110,7 @@ _INSERT_STAGE = (
     " state = EXCLUDED.state, receipt = EXCLUDED.receipt, checkpoint_uri = EXCLUDED.checkpoint_uri,"
     " reused_from_run = EXCLUDED.reused_from_run, original_executed_at = EXCLUDED.original_executed_at,"
     " updated_at = now()"
-    " WHERE platform.stage.state <> 'completed'"
+    " WHERE platform.stage.state NOT IN ('completed','failed','cancelled','unresolved')"
     " RETURNING run_id, stage, state"
 )
 _READ_LIFECYCLE = (
@@ -270,7 +279,9 @@ class PlatformStore:
             row = cursor.fetchone()
             if row is not None:
                 return _matching_operation(row, run_id=run_id, stage=stage, kind=kind, params_digest=params_digest)
-            _require_successor(connection, run_id=run_id, kind=kind)
+            if stage not in STAGE_IDS:
+                raise PlatformStoreError(f"The stage must be one of {tuple(STAGE_IDS)}: {stage!r}")
+            _require_successor(connection, run_id=run_id, kind=kind, stage=stage)
             return self._insert_operation(
                 connection,
                 run_id=run_id,
@@ -338,6 +349,21 @@ class PlatformStore:
         of a rewrite (a redo is a linked run, not an overwrite).
         """
 
+        if state not in STAGE_STATES:
+            raise PlatformStoreError(f"The stage state must be one of {tuple(sorted(STAGE_STATES))}: {state!r}")
+        if state in TERMINAL_STAGE_STATES:
+            if (
+                not isinstance(receipt, dict)
+                or receipt.get("run_id") != run_id
+                or receipt.get("stage") != stage
+            ):
+                raise PlatformStoreError("A terminal stage confirmation must carry its bound sealed receipt")
+            if (
+                state == "completed"
+                and stage in CONFIRMED_STAGE_STATES
+                and receipt.get("state") not in CONFIRMED_STAGE_STATES[stage]
+            ):
+                raise PlatformStoreError("A completed stage must be sealed with its confirmed receipt state")
         with self._transaction() as connection:
             cursor = connection.cursor()
             cursor.execute(
@@ -346,8 +372,43 @@ class PlatformStore:
             )
             if cursor.fetchone() is None:
                 raise PlatformStoreError(
-                    f"The sealed {stage!r} receipt of run {run_id!r} is immutable; start a linked run instead"
+                    f"The {stage!r} stage of run {run_id!r} is already terminal; start a linked run instead"
                 )
+
+    def confirmed_stage(self, run_id: str, stage: str) -> dict | None:
+        """The platform-authority reuse query: the sealed receipt of a confirmed stage, or refusal.
+
+        Returns ``None`` while the stage is not confirmed yet (the caller
+        proceeds normally); a row that claims confirmation without binding its
+        receipt fields is a damaged store and raises instead.  The sealed-byte
+        rebinding (checkpoint/blob storage) is the deploy side's storage check;
+        this query binds the record's identity, outcome and subject digest.
+        """
+
+        if stage not in CONFIRMED_STAGE_STATES:
+            raise PlatformStoreError(f"stage must be one of {tuple(CONFIRMED_STAGE_STATES)}: {stage!r}")
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(_READ_STAGE, (run_id, stage))
+            row = cursor.fetchone()
+        if row is None or row[0] != "completed":
+            return None
+        receipt = row[1]
+        subject = receipt.get("subject_sha256") if isinstance(receipt, dict) else None
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("run_id") != run_id
+            or receipt.get("stage") != stage
+            or receipt.get("state") not in CONFIRMED_STAGE_STATES[stage]
+            or receipt.get("passed") is not CONFIRMED_STAGE_PASSED[stage]
+            or not (
+                isinstance(subject, str)
+                and len(subject) == 64
+                and all(character in "0123456789abcdef" for character in subject)
+            )
+        ):
+            raise PlatformStoreError("The confirmed stage record does not bind its sealed receipt fields")
+        return receipt
 
     # ------------------------------------------------------------- read side
 
@@ -374,21 +435,45 @@ def _require_open(connection) -> None:
         raise AdmissionClosedError(f"Admission is closed: {row[1] or 'no reason recorded'}")
 
 
-def _require_successor(connection, *, run_id: str, kind: str) -> None:
-    """The run must be admitted; terminal runs only continue through terminal kinds."""
+def _require_successor(connection, *, run_id: str, kind: str, stage: str) -> None:
+    """The successor must be a legal transition of the admitted run.
+
+    The run row is locked; non-terminal kinds need a running run (queued or
+    unresolved runs cannot jump straight into downstream stages), terminal
+    runs continue only through cancel/reconcile, a confirmed publication can
+    never be cancelled, and every stage after the run's start stage requires
+    this run's own completed predecessor stage.
+    """
 
     cursor = connection.cursor()
     cursor.execute(_LOCK_RUN, (run_id,))
     row = cursor.fetchone()
     if row is None:
         raise PlatformStoreError(f"The run {run_id!r} is not admitted")
-    state = row[0]
+    state, from_stage = row[0], row[1]
     if state in _TERMINAL_RUN_STATES and kind not in _TERMINAL_KINDS:
         raise PlatformStoreError(f"The run is terminal ({state}); only cancel/reconcile operations continue")
     if kind == "cancel":
         cursor.execute(_CONFIRMED_PUBLISH, (run_id,))
         if cursor.fetchone() is not None:
             raise PlatformStoreError("A confirmed publication can never be cancelled")
+    if kind in _TERMINAL_KINDS:
+        return
+    if state != "running":
+        raise PlatformStoreError(f"The run is not running ({state}); successors require a running run")
+    start = from_stage if from_stage in STAGE_IDS else STAGE_IDS[0]
+    stage_index = STAGE_IDS.index(stage)
+    start_index = STAGE_IDS.index(start)
+    if stage_index < start_index:
+        raise PlatformStoreError(f"The {stage!r} operation precedes this run's start stage {start!r}")
+    if stage_index > start_index:
+        predecessor = STAGE_IDS[stage_index - 1]
+        cursor.execute(_READ_STAGE_ROW, (run_id, predecessor))
+        predecessor_row = cursor.fetchone()
+        if predecessor_row is None or predecessor_row[0] != "completed":
+            raise PlatformStoreError(
+                f"The {stage!r} operation requires the completed {predecessor!r} stage of this run"
+            )
 
 
 def _matching_operation(row, *, run_id: str, stage: str, kind: str, params_digest: str) -> OperationRecord:

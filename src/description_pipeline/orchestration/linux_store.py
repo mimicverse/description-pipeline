@@ -25,7 +25,14 @@ from ..delivery import (
 from ..interface_records import check_policy_digest
 from ..io import PipelineError, confined, inventory, read_data, write_json
 from ..runtime import tool_record
-from ..stages import CONFIRMED_STAGE_STATES, CONTRACT_SHA256, PORTABLE_STAGES, STAGE_IDS, stage_view
+from ..stages import (
+    CONFIRMED_STAGE_PASSED,
+    CONFIRMED_STAGE_STATES,
+    CONTRACT_SHA256,
+    PORTABLE_STAGES,
+    STAGE_IDS,
+    stage_view,
+)
 from ..verification.solidworks_urdf import check_bundle, require_qualified_report
 from .airflow_client import JOB_SCHEMA, validate_run_id
 from .stage_transfer import CAPTURE_MANIFEST, TRANSFER_SCHEMA, admit_capture
@@ -130,6 +137,16 @@ class LinuxStore:
             raise PipelineError("The recorded stage receipt names another run or stage")
         if receipt.get("state") not in CONFIRMED_STAGE_STATES[stage]:
             return None
+        if receipt.get("passed") is not CONFIRMED_STAGE_PASSED[stage]:
+            raise PipelineError(f"The recorded {stage} receipt does not carry its confirmed outcome")
+        recorded_handoff = receipt.get("handoff_sha256")
+        meta = self.meta(run_id) or {}
+        if (
+            not isinstance(recorded_handoff, str)
+            or not recorded_handoff
+            or recorded_handoff != meta.get("handoff_sha256")
+        ):
+            raise PipelineError("The recorded checkpoint receipt is not bound to this attempt's handoff")
         directory = self.output_dir(run_id) if stage == "publish" else self.stage_dir(run_id, stage)
         if not directory.is_dir():
             raise PipelineError(f"The recorded {stage} checkpoint has no sealed delivery to reuse")
@@ -141,12 +158,31 @@ class LinuxStore:
         if read_data(directory / "tool.json") != tool_record():
             raise PipelineError("The recorded checkpoint was produced by another tool release")
         subject = receipt.get("subject_sha256")
-        if not isinstance(subject, str) or subject_digest(directory) != subject:
+        if not (
+            isinstance(subject, str)
+            and len(subject) == 64
+            and all(character in "0123456789abcdef" for character in subject)
+        ):
+            raise PipelineError("The recorded checkpoint receipt lacks its subject digest")
+        if subject_digest(directory) != subject:
             raise PipelineError("The recorded checkpoint bytes no longer match its receipt")
-        meta = self.meta(run_id) or {}
-        recorded_handoff = receipt.get("handoff_sha256")
-        if recorded_handoff and meta.get("handoff_sha256") and recorded_handoff != meta.get("handoff_sha256"):
-            raise PipelineError("The recorded checkpoint is bound to another handoff")
+        if stage == "verify":
+            report = require_qualified_report(read_data(directory / "reports/quality.json"))
+            if report.get("subject_sha256") != subject:
+                raise PipelineError("The verified quality report is bound to another subject")
+        if stage == "publish":
+            report = require_qualified_report(read_data(directory / "reports/quality.json"))
+            if report.get("subject_sha256") != subject:
+                raise PipelineError("The published quality report is bound to another subject")
+            submission = receipt.get("submission")
+            if (
+                not isinstance(submission, dict)
+                or submission.get("passed") is not True
+                or submission.get("state") not in {"published", "updated", "noop"}
+                or not submission.get("url")
+                or submission.get("subject_sha256") not in (None, subject)
+            ):
+                raise PipelineError("The recorded publication has no confirmed submission")
         return receipt
 
     def delivery_dir(self, run_id: str) -> Path | None:

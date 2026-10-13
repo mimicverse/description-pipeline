@@ -1,4 +1,4 @@
-"""Application-side platform store API: admission, successors, stages, reads.
+"""Application-side platform store API: admission, transitions, stages, reads.
 
 The fake world mirrors the deploy side's statements at the SQL level; real-PG
 atomicity, locking and recovery are proven by the deploy side's battery, not
@@ -7,6 +7,7 @@ claimed by these unit tests.
 
 from __future__ import annotations
 
+import json
 import unittest
 from datetime import UTC, datetime
 
@@ -29,8 +30,9 @@ class FakeWorld:
         self.requests: list[tuple] = []
         self.runs: list[tuple] = []
         self.run_states: dict[str, str] = {}
+        self.run_from_stage: dict[str, str | None] = {}
         self.operations: dict[str, tuple] = {}
-        self.stages: dict[tuple[str, str], str] = {}
+        self.stages: dict[tuple[str, str], tuple] = {}
         self.confirmed_publishes: set[tuple[str, str]] = set()
         self.lifecycle_rows = [
             ("run", "r-1", "r-1", "running", "in_flight", NOW),
@@ -87,6 +89,7 @@ class FakeCursor:
         elif normalized.startswith("INSERT INTO platform.run"):
             world.runs.append(tuple(params))
             world.run_states[params[0]] = "queued"
+            world.run_from_stage[params[0]] = params[3]
             self._rows = []
         elif normalized.startswith("INSERT INTO platform.operation"):
             key = params[4]
@@ -105,18 +108,25 @@ class FakeCursor:
                 world.hidden_for_one_find = False
                 record = None
             self._rows = [record] if record else []
-        elif "SELECT state FROM platform.run WHERE run_id = %s FOR UPDATE" in normalized:
+        elif "SELECT state, from_stage FROM platform.run WHERE run_id = %s FOR UPDATE" in normalized:
             state = world.run_states.get(params[0])
-            self._rows = [(state,)] if state is not None else []
+            self._rows = [(state, world.run_from_stage.get(params[0]))] if state is not None else []
         elif "FROM platform.operation WHERE run_id = %s AND kind = 'publish' AND state = 'succeeded'" in normalized:
             self._rows = [(1,)] if (params[0], "publish") in world.confirmed_publishes else []
+        elif normalized.startswith("SELECT state FROM platform.stage WHERE run_id = %s AND stage = %s"):
+            record = world.stages.get((params[0], params[1]))
+            self._rows = [(record[0],)] if record else []
+        elif normalized.startswith("SELECT state, receipt FROM platform.stage WHERE run_id = %s AND stage = %s"):
+            record = world.stages.get((params[0], params[1]))
+            self._rows = [record] if record else []
         elif normalized.startswith("INSERT INTO platform.stage"):
             run_id, stage, state = params[0], params[1], params[2]
+            receipt = json.loads(params[3]) if params[3] is not None else None
             existing = world.stages.get((run_id, stage))
-            if existing == "completed":
+            if existing is not None and existing[0] in {"completed", "failed", "cancelled", "unresolved"}:
                 self._rows = []
             else:
-                world.stages[(run_id, stage)] = state
+                world.stages[(run_id, stage)] = (state, receipt)
                 self._rows = [(run_id, stage, state)]
         elif "FROM platform.lifecycle_projection" in normalized:
             self.description = tuple(
@@ -142,6 +152,14 @@ NAMED = {
     "main_assembly": "cad/robot.SLDASM",
 }
 
+GENERATE_RECEIPT = {
+    "run_id": "r-1",
+    "stage": "generate",
+    "state": "generated",
+    "passed": False,
+    "subject_sha256": "a" * 64,
+}
+
 
 class PlatformStoreTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -155,6 +173,23 @@ class PlatformStoreTests(unittest.TestCase):
         }
         payload.update(overrides)
         self.store.admit_run(**payload)
+
+    def _running_run(self, *, from_stage=None, verify_done=False):
+        self.admit(from_stage=from_stage)
+        self.world.run_states["r-1"] = "running"
+        if verify_done:
+            self.world.stages[("r-1", "verify")] = ("completed", {"stage": "verify"})
+
+    def _publish_registration(self, **overrides):
+        payload = {
+            "run_id": "r-1",
+            "stage": "publish",
+            "kind": "publish",
+            "operation_key": "r-1/publish:0",
+            "params_digest": "b" * 64,
+        }
+        payload.update(overrides)
+        return self.store.register_operation(**payload)
 
     # ------------------------------------------------------------- admission
 
@@ -205,86 +240,100 @@ class PlatformStoreTests(unittest.TestCase):
 
     # ------------------------------------------------------------- successors
 
-    def _admitted_running(self) -> None:
-        self.admit()
-        self.world.run_states["r-1"] = "running"
-
     def test_successor_registration_is_not_gated_and_is_idempotent(self) -> None:
-        self._admitted_running()
+        self._running_run(from_stage="publish")
         self.store.close_admission(reason="drain", actor="operator")
-        first = self.store.register_operation(
-            run_id="r-1", stage="publish", kind="publish", operation_key="r-1/publish:0", params_digest="b" * 64
-        )
+        first = self._publish_registration()
         self.assertEqual(first.state, "queued")
-        again = self.store.register_operation(
-            run_id="r-1", stage="publish", kind="publish", operation_key="r-1/publish:0", params_digest="b" * 64
-        )
+        again = self._publish_registration()
         self.assertEqual(again, first)
         self.assertEqual(len(self.world.operations), 2, "a retry never restarts the side effect")
 
     def test_scope_or_parameter_drift_on_the_same_key_is_a_conflict(self) -> None:
-        self._admitted_running()
-        self.store.register_operation(
-            run_id="r-1", stage="publish", kind="publish", operation_key="k", params_digest="b" * 64
-        )
+        self._running_run(from_stage="publish")
+        self._publish_registration(operation_key="k")
         for drift in (
-            {"run_id": "r-2", "stage": "publish", "kind": "publish", "params_digest": "b" * 64},
-            {"run_id": "r-1", "stage": "verify", "kind": "publish", "params_digest": "b" * 64},
-            {"run_id": "r-1", "stage": "publish", "kind": "native", "params_digest": "b" * 64},
-            {"run_id": "r-1", "stage": "publish", "kind": "publish", "params_digest": "c" * 64},
+            {"run_id": "r-2"},
+            {"stage": "verify"},
+            {"kind": "native"},
+            {"params_digest": "c" * 64},
         ):
             with self.assertRaises(OperationConflictError):
-                self.store.register_operation(operation_key="k", **drift)
+                self._publish_registration(operation_key="k", **drift)
 
     def test_a_concurrent_duplicate_recovers_the_existing_result(self) -> None:
-        self._admitted_running()
-        self.store.register_operation(
-            run_id="r-1", stage="publish", kind="publish", operation_key="k", params_digest="b" * 64
-        )
+        self._running_run(from_stage="publish")
+        self._publish_registration(operation_key="k")
         before = len(self.world.operations)
         self.world.hidden_for_one_find = True  # the winner commits between our select and insert
-        recovered = self.store.register_operation(
-            run_id="r-1", stage="publish", kind="publish", operation_key="k", params_digest="b" * 64
-        )
+        recovered = self._publish_registration(operation_key="k")
         self.assertEqual(recovered.params_digest, "b" * 64)
         self.assertEqual(len(self.world.operations), before, "the collision was not re-sent as a new side effect")
 
-    def test_successors_require_an_admitted_run(self) -> None:
+    def test_successors_require_an_admitted_running_run(self) -> None:
         with self.assertRaisesRegex(PlatformStoreError, "not admitted"):
-            self.store.register_operation(
-                run_id="r-9", stage="publish", kind="publish", operation_key="k", params_digest="b" * 64
-            )
+            self._publish_registration()
+        self.admit()
+        for state in ("queued", "unresolved"):
+            self.world.run_states["r-1"] = state
+            with self.assertRaisesRegex(PlatformStoreError, "not running"):
+                self._publish_registration()
+
+    def test_a_stage_after_the_start_requires_its_completed_predecessor(self) -> None:
+        self._running_run()  # a fresh run starts at freeze; publish needs verify first
+        with self.assertRaisesRegex(PlatformStoreError, "requires the completed 'verify' stage"):
+            self._publish_registration()
+        self.world.stages[("r-1", "verify")] = ("completed", {"stage": "verify"})
+        self.assertEqual(self._publish_registration().stage, "publish")
 
     def test_terminal_runs_only_continue_via_cancel_or_reconcile(self) -> None:
-        self._admitted_running()
+        self._running_run(from_stage="publish")
         self.world.run_states["r-1"] = "failed"
         with self.assertRaisesRegex(PlatformStoreError, "terminal"):
-            self.store.register_operation(
-                run_id="r-1", stage="publish", kind="publish", operation_key="k", params_digest="b" * 64
-            )
-        record = self.store.register_operation(
-            run_id="r-1", stage="publish", kind="cancel", operation_key="k", params_digest="b" * 64
-        )
+            self._publish_registration()
+        record = self._publish_registration(kind="cancel")
         self.assertEqual(record.kind, "cancel")
 
     def test_a_confirmed_publication_can_never_be_cancelled(self) -> None:
-        self._admitted_running()
+        self._running_run(from_stage="publish")
         self.world.confirmed_publishes.add(("r-1", "publish"))
         with self.assertRaisesRegex(PlatformStoreError, "confirmed publication"):
-            self.store.register_operation(
-                run_id="r-1", stage="publish", kind="cancel", operation_key="k", params_digest="b" * 64
-            )
+            self._publish_registration(kind="cancel")
 
     # ----------------------------------------------------------------- stages
 
-    def test_confirm_stage_records_state_and_receipts(self) -> None:
-        self._admitted_running()
-        self.store.confirm_stage(run_id="r-1", stage="generate", state="generated", receipt={"subject": "s"})
-        self.assertEqual(self.world.stages[("r-1", "generate")], "generated")
-        self.store.confirm_stage(run_id="r-1", stage="generate", state="generated")
-        self.store.confirm_stage(run_id="r-1", stage="generate", state="completed", receipt={"final": True})
-        with self.assertRaisesRegex(PlatformStoreError, "immutable"):
-            self.store.confirm_stage(run_id="r-1", stage="generate", state="failed")
+    def test_confirm_stage_requires_bound_terminal_receipts_and_is_immutable(self) -> None:
+        self._running_run()
+        with self.assertRaisesRegex(PlatformStoreError, "state must be one of"):
+            self.store.confirm_stage(run_id="r-1", stage="generate", state="generated")
+        with self.assertRaisesRegex(PlatformStoreError, "bound sealed receipt"):
+            self.store.confirm_stage(run_id="r-1", stage="generate", state="completed")
+        with self.assertRaisesRegex(PlatformStoreError, "confirmed receipt state"):
+            self.store.confirm_stage(
+                run_id="r-1", stage="generate", state="completed", receipt={**GENERATE_RECEIPT, "state": "failed"}
+            )
+        self.store.confirm_stage(run_id="r-1", stage="generate", state="running")
+        self.store.confirm_stage(
+            run_id="r-1", stage="generate", state="completed", receipt=GENERATE_RECEIPT
+        )
+        with self.assertRaisesRegex(PlatformStoreError, "already terminal"):
+            self.store.confirm_stage(run_id="r-1", stage="generate", state="failed", receipt=GENERATE_RECEIPT)
+        self.store.confirm_stage(
+            run_id="r-1", stage="verify", state="failed", receipt={"run_id": "r-1", "stage": "verify"}
+        )
+        with self.assertRaisesRegex(PlatformStoreError, "already terminal"):
+            self.store.confirm_stage(run_id="r-1", stage="verify", state="running")
+
+    def test_confirmed_stage_returns_sealed_receipts_or_refuses(self) -> None:
+        self._running_run()
+        self.assertEqual(self.store.confirmed_stage("r-1", "generate"), None)
+        self.store.confirm_stage(run_id="r-1", stage="generate", state="running")
+        self.assertEqual(self.store.confirmed_stage("r-1", "generate"), None)
+        self.store.confirm_stage(run_id="r-1", stage="generate", state="completed", receipt=GENERATE_RECEIPT)
+        self.assertEqual(self.store.confirmed_stage("r-1", "generate"), GENERATE_RECEIPT)
+        self.world.stages[("r-1", "generate")] = ("completed", {**GENERATE_RECEIPT, "run_id": "r-2"})
+        with self.assertRaisesRegex(PlatformStoreError, "does not bind"):
+            self.store.confirmed_stage("r-1", "generate")
 
     # ------------------------------------------------------------------ reads
 
