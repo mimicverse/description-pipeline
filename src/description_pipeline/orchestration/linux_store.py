@@ -249,6 +249,27 @@ class LinuxStore:
             self.append_events(run_id, native_receipt.get("events"))
         return finalize({**provisional, "transfer": dict(manifest)})
 
+    def native_receipts(self, run_id: str) -> dict:
+        """The sealed native receipts, as immutable bytes, from run storage.
+
+        The delivery tree no longer carries ``reports/native-*`` or the transfer
+        manifest; the orchestration adapter hands consumers the exact sealed
+        bytes (no re-serialization, no state oracle) so verification can validate
+        them independently.
+        """
+
+        run_id = validate_run_id(run_id)
+        capture = self.capture_dir(run_id)
+        paths = {
+            "native_tool_bytes": capture / "reports/native-tool.json",
+            "native_stages_bytes": capture / "reports/native-stages.json",
+            "transfer_manifest_bytes": capture / "transfer-manifest.json",
+        }
+        missing = sorted(name for name, path in paths.items() if not path.is_file())
+        if missing:
+            raise PipelineError(f"Native receipts are missing from run storage: {missing}")
+        return {name: path.read_bytes() for name, path in paths.items()}
+
     def record_stage(self, run_id: str, stage: str, receipt: dict) -> None:
         """Keep one stage receipt and its raw events; the attempt is otherwise untouched."""
         if stage not in PORTABLE_STAGES:

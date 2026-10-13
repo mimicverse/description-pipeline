@@ -82,7 +82,7 @@ def capture_root(base: Path, *, run_id: str = RUN_ID, handoff: str = HANDOFF, ma
         name: file_digest(root / "input" / name) for name in ("robot.yaml", main, "discovery/native-discovery.json")
     }
     write_json(
-        root / "reports/input.json",
+        root / "input/handoff.json",
         {
             "passed": True,
             "input_receipt": {
@@ -324,10 +324,10 @@ class StageTransferTests(unittest.TestCase):
     def test_edited_or_replaced_member_bytes_are_refused(self) -> None:
         seal(self.root, self.archive)
         with zipfile.ZipFile(self.archive) as archive:
-            original = archive.read("reports/input.json")
+            original = archive.read("input/handoff.json")
         broken = self.base / "edited.zip"
         # Same length so the size invariant still holds and the content hash is what rejects it.
-        raw_copy(self.archive, broken, replace={"reports/input.json": b"X" * len(original)})
+        raw_copy(self.archive, broken, replace={"input/handoff.json": b"X" * len(original)})
         with self.assertRaisesRegex(PipelineError, "hash differs"):
             admit(broken, self.base / "out-edited")
 
@@ -370,10 +370,10 @@ class StageTransferTests(unittest.TestCase):
     def test_self_consistent_input_report_tamper_is_refused(self) -> None:
         seal(self.root, self.archive)
         with zipfile.ZipFile(self.archive) as source:
-            report = json.loads(source.read("reports/input.json"))
+            report = json.loads(source.read("input/handoff.json"))
         report["passed"] = False
         broken = self.base / "input.zip"
-        repack(self.archive, broken, {"reports/input.json": canonical(report)})
+        repack(self.archive, broken, {"input/handoff.json": canonical(report)})
         with self.assertRaisesRegex(PipelineError, "Input report did not pass"):
             admit(broken, self.base / "out-input")
 
@@ -381,7 +381,7 @@ class StageTransferTests(unittest.TestCase):
         seal(self.root, self.archive)
         replacement = b"OTHER-BYTES"
         with zipfile.ZipFile(self.archive) as source:
-            report = json.loads(source.read("reports/input.json"))
+            report = json.loads(source.read("input/handoff.json"))
         report["package_files"][MAIN_ASSEMBLY] = hashlib.sha256(replacement).hexdigest()
         broken = self.base / "main.zip"
         repack(
@@ -389,7 +389,7 @@ class StageTransferTests(unittest.TestCase):
             broken,
             {
                 "input/" + MAIN_ASSEMBLY: replacement,
-                "reports/input.json": canonical(report),
+                "input/handoff.json": canonical(report),
             },
         )
         # The archive is fully self-consistent; only the native discovery inventory still names
@@ -401,7 +401,7 @@ class StageTransferTests(unittest.TestCase):
         seal(self.root, self.archive)
         with zipfile.ZipFile(self.archive) as source:
             record = json.loads(source.read("input/discovery/native-discovery.json"))
-            report = json.loads(source.read("reports/input.json"))
+            report = json.loads(source.read("input/handoff.json"))
 
         renamed = {**record, "identity": {**record["identity"], "main_assembly": "other.SLDASM"}}
         renamed_bytes = canonical(renamed)
@@ -412,7 +412,7 @@ class StageTransferTests(unittest.TestCase):
             broken,
             {
                 "input/discovery/native-discovery.json": renamed_bytes,
-                "reports/input.json": canonical(report),
+                "input/handoff.json": canonical(report),
             },
         )
         with self.assertRaisesRegex(PipelineError, "opened another main assembly"):
@@ -427,7 +427,7 @@ class StageTransferTests(unittest.TestCase):
             broken,
             {
                 "input/discovery/native-discovery.json": rebased_bytes,
-                "reports/input.json": canonical(report),
+                "input/handoff.json": canonical(report),
             },
         )
         with self.assertRaisesRegex(PipelineError, "bound to another handoff"):
@@ -435,7 +435,7 @@ class StageTransferTests(unittest.TestCase):
 
     def test_structural_zip_tamper_is_refused(self) -> None:
         seal(self.root, self.archive)
-        duplicate = zipfile.ZipInfo("Reports/Input.json")
+        duplicate = zipfile.ZipInfo("Input/Handoff.json")
         duplicate.create_system = 3
         duplicate.external_attr = 0o644 << 16
         link = zipfile.ZipInfo("reports/link.json")
@@ -497,9 +497,9 @@ class StageTransferTests(unittest.TestCase):
     def test_seal_rejects_inconsistent_capture_roots(self) -> None:
         cases = []
 
-        input_report = json.loads((self.root / "reports/input.json").read_text(encoding="utf-8"))
+        input_report = json.loads((self.root / "input/handoff.json").read_text(encoding="utf-8"))
         input_report["passed"] = False
-        cases.append(("input-failed", input_report, "reports/input.json", "Input report did not pass"))
+        cases.append(("input-failed", input_report, "input/handoff.json", "Input report did not pass"))
 
         portable = {**native_tool(), "runtime": {"role": "portable"}}
         cases.append(("portable-tool", portable, "reports/native-tool.json", "runtime.role", portable))
@@ -551,9 +551,9 @@ class StageTransferTests(unittest.TestCase):
     def test_streaming_large_member_roundtrips(self) -> None:
         payload = b"x" * (4 * 1024 * 1024)
         (self.root / "input/big.bin").write_bytes(payload)
-        report = json.loads((self.root / "reports/input.json").read_text(encoding="utf-8"))
+        report = json.loads((self.root / "input/handoff.json").read_text(encoding="utf-8"))
         report["package_files"]["big.bin"] = hashlib.sha256(payload).hexdigest()
-        write_json(self.root / "reports/input.json", report)
+        write_json(self.root / "input/handoff.json", report)
 
         manifest = seal(self.root, self.archive)
         self.assertEqual(manifest["files"]["input/big.bin"], hashlib.sha256(payload).hexdigest())
@@ -685,7 +685,7 @@ class StageTransferTests(unittest.TestCase):
                 for name in ("robot.yaml", assembly.name, "discovery/native-discovery.json")
             }
             write_json(
-                capture / "reports/input.json",
+                capture / "input/handoff.json",
                 {
                     "passed": True,
                     "input_receipt": {
@@ -715,7 +715,7 @@ class StageTransferTests(unittest.TestCase):
         for name in ("input", "evidence", "model", "urdf", "meshes"):
             (bundle / name).mkdir(parents=True)
         (bundle / "README.md").write_text("delivery\n", encoding="utf-8")
-        write_json(bundle / "reports/input.json", {"passed": True})
+        write_json(bundle / "input/handoff.json", {"passed": True})
         write_json(bundle / "reports/tool.json", {"role": "portable"})
         write_json(bundle / "reports/quality.json", {"passed": True})
         write_json(bundle / "reports/native-tool.json", native_tool())
@@ -732,36 +732,35 @@ class StageTransferTests(unittest.TestCase):
         for name in ("input", "evidence", "model", "urdf", "meshes"):
             (neutral / name).mkdir(parents=True)
         (neutral / "README.md").write_text("delivery\n", encoding="utf-8")
-        write_json(neutral / "reports/input.json", {"passed": True})
+        write_json(neutral / "input/handoff.json", {"passed": True})
         write_json(neutral / "reports/tool.json", {"role": "portable"})
         neutral_worktree = self.base / "neutral-worktree"
         _copy_governed(neutral, neutral_worktree)
         self.assertFalse((neutral_worktree / "reports/native-tool.json").exists())
         self.assertFalse((neutral_worktree / transfer.CAPTURE_MANIFEST).exists())
 
-    def test_subject_includes_transfer_provenance_only_as_a_complete_triplet(self) -> None:
-        from description_pipeline.delivery import subject_digest, subject_inventory
+    def test_transfer_receipts_never_enter_the_delivery_subject(self) -> None:
+        from description_pipeline.delivery import check_layout, subject_inventory
 
         bundle = self.base / "subject-bundle"
         for name in ("input", "evidence", "model", "urdf", "meshes"):
             (bundle / name).mkdir(parents=True)
         (bundle / "README.md").write_text("delivery\n", encoding="utf-8")
-        write_json(bundle / "reports/input.json", {"passed": True})
-        write_json(bundle / "reports/tool.json", {"role": "portable"})
+        write_json(bundle / "input/handoff.json", {"passed": True})
+        write_json(bundle / "tool.json", {"role": "portable"})
 
-        neutral = subject_inventory(bundle)  # no transfer files: neutral fixtures stay valid
-        self.assertNotIn(transfer.CAPTURE_MANIFEST, neutral)
+        subject = subject_inventory(bundle)  # the target subject carries tool.json only
+        self.assertIn("tool.json", subject)
 
         write_json(bundle / "reports/native-tool.json", native_tool())
-        with self.assertRaisesRegex(PipelineError, "provenance is incomplete"):
-            subject_inventory(bundle)
-
         write_json(bundle / "reports/native-stages.json", stage_view())
         write_json(bundle / transfer.CAPTURE_MANIFEST, {"schema_version": transfer.TRANSFER_SCHEMA})
-        complete = subject_inventory(bundle)
         for name in ("reports/native-tool.json", "reports/native-stages.json", transfer.CAPTURE_MANIFEST):
-            self.assertIn(name, complete)
-        self.assertNotEqual(subject_digest(bundle), digest(neutral))
+            self.assertNotIn(name, subject)
+        self.assertEqual(subject_inventory(bundle), subject)  # receipts never bind into the subject
+        (bundle / "README.md").unlink()
+        with self.assertRaisesRegex(PipelineError, "Unregistered delivery"):
+            check_layout(bundle)
 
     def test_verify_transfer_gate_revalidates_resealed_deliveries(self) -> None:
         seal(self.root, self.archive)
@@ -811,13 +810,13 @@ class StageTransferTests(unittest.TestCase):
 
         remade = bundle("gate-main")
         replacement = b"OTHER-BYTES"
-        report = json.loads((remade / "reports/input.json").read_text(encoding="utf-8"))
+        report = json.loads((remade / "input/handoff.json").read_text(encoding="utf-8"))
         report["package_files"][MAIN_ASSEMBLY] = hashlib.sha256(replacement).hexdigest()
         reseal(
             remade,
             {
                 "input/" + MAIN_ASSEMBLY: replacement,
-                "reports/input.json": canonical(report),
+                "input/handoff.json": canonical(report),
             },
         )
         with self.assertRaisesRegex(PipelineError, "native file inventory"):
