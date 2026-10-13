@@ -103,7 +103,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         drifted = portable_twin(self.tool, source_sha256="0" * 64)
         with (
             mock.patch.object(linux_runner, "tool_record", return_value=drifted),
-            mock.patch.object(linux_runner.solidworks, "run", side_effect=AssertionError("must not run")),
+            mock.patch.object(linux_runner.solidworks, "verify", side_effect=AssertionError("must not run")),
             self.assertRaises(PipelineError),
         ):
             linux_runner.run_portable_stage(self.store, RUN, "verify", expected_subject="a" * 64)
@@ -112,7 +112,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         drifted = portable_twin(self.tool, source_sha256="0" * 64)
         with (
             mock.patch.object(linux_runner, "tool_record", return_value=drifted),
-            mock.patch.object(linux_runner.solidworks, "run", side_effect=AssertionError("must not run")),
+            mock.patch.object(linux_runner.solidworks, "generate", side_effect=AssertionError("must not run")),
             self.assertRaises(PipelineError),
         ):
             linux_runner.run_portable_stage(self.store, RUN, "generate")
@@ -125,7 +125,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         (self.store.capture_dir(RUN) / "input/robot.yaml").write_text('{"hardware_id": "tampered"}\n', encoding="utf-8")
         with (
             mock.patch.object(linux_runner, "tool_record", return_value=portable_twin(self.tool)),
-            mock.patch.object(linux_runner.solidworks, "run", side_effect=AssertionError("must not run")),
+            mock.patch.object(linux_runner.solidworks, "generate", side_effect=AssertionError("must not run")),
             self.assertRaises(PipelineError),
         ):
             linux_runner.run_portable_stage(self.store, RUN, "generate")
@@ -137,7 +137,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
 
         with (
             mock.patch.object(linux_runner, "tool_record", return_value=portable_twin(self.tool)),
-            mock.patch.object(linux_runner.solidworks, "run", side_effect=PipelineError("boom")),
+            mock.patch.object(linux_runner.solidworks, "generate", side_effect=PipelineError("boom")),
             self.assertRaises(PipelineError),
         ):
             linux_runner.run_portable_stage(self.store, RUN, "generate")
@@ -158,7 +158,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         }
         with (
             mock.patch.object(linux_runner, "tool_record", return_value=portable_twin(self.tool)),
-            mock.patch.object(linux_runner.solidworks, "run", return_value=failed),
+            mock.patch.object(linux_runner.solidworks, "generate", return_value=failed),
         ):
             linux_runner.run_portable_stage(self.store, RUN, "generate")
         meta = self.store.meta(RUN) or {}
@@ -285,7 +285,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         with (
             solidworks.output_lock(self.store.run_dir(RUN)),
             mock.patch.object(linux_runner, "tool_record", return_value=portable_twin(self.tool)),
-            mock.patch.object(linux_runner.solidworks, "run", side_effect=AssertionError("must not run")),
+            mock.patch.object(linux_runner.solidworks, "generate", side_effect=AssertionError("must not run")),
             self.assertRaises(PipelineError),
         ):
             linux_runner.run_portable_stage(self.store, RUN, "generate")
@@ -393,7 +393,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
 
         with (
             mock.patch.object(linux_runner, "tool_record", return_value=portable_twin(self.tool)),
-            mock.patch.object(linux_runner.solidworks, "run", side_effect=AssertionError("must not run")),
+            mock.patch.object(linux_runner.solidworks, "generate", side_effect=AssertionError("must not run")),
             self.assertRaises(PipelineError),
         ):
             linux_runner.run_portable_stage(self.store, RUN, "generate")

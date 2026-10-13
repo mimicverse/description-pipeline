@@ -254,17 +254,17 @@ def _owner_lock(path):
 
 
 def _default_runner(*args, **kwargs):
-    """The six-stage Linux executor, imported only when a run actually needs it.
+    """The native capture entry, imported only when a run actually needs it.
 
     ``orchestration.windows`` must stay inside the Windows capture closure: the
-    endpoint only ever supplies an explicit runner in production wiring or tests
-    that exercise the capture boundary, so the generation/verification domain is
-    never pulled in by importing or constructing the endpoint.
+    endpoint supplies an explicit runner in tests that exercise the capture
+    boundary, so the generation/verification domain is never pulled in by
+    importing or constructing the endpoint.
     """
 
-    from ..solidworks import run
+    from ..solidworks import capture
 
-    return run(*args, **kwargs)
+    return capture(*args, **kwargs)
 
 
 class Jobs:
@@ -1317,22 +1317,12 @@ class Jobs:
                 if from_stage in {None, "freeze", "discover"}:
                     package, target = self._prepare_native(identifier, package, selection)
                 else:
-                    # capture..publish reuse the parent's retained freeze+discover
-                    # checkpoints; the plan already proved them intact.
-                    parent = self.jobs[spec["parent_run"]]
+                    # A capture rerun reuses the parent's retained freeze+discover
+                    # checkpoints; the linked-run gate already refused the
+                    # Linux-owned stages before enqueue.
                     package = self._prepared_dir(job)
                     _require(package is not None, "The retained discovery checkpoint is no longer available")
                     target = self.config["targets"].get(job.get("hardware_id"))
-                    seed = self._delivery_dir(parent) if from_stage in {"generate", "verify", "publish"} else None
-                    _require(
-                        from_stage == "capture" or seed is not None,
-                        "The retained delivery of the selected run is no longer available",
-                    )
-                    resume_kwargs.update(
-                        resume_from=from_stage,
-                        seed_dir=seed,
-                        expected_subject=self._recorded_subject(parent),
-                    )
                 selection = job.get("main_assembly")
                 _require(
                     job.get("repository_slug") == (target or {}).get("repository_slug")
@@ -1344,7 +1334,6 @@ class Jobs:
                     self.config["output_root"] / identifier,
                     backend=self.backend_factory(package, job["package_files"]),
                     run_id=identifier,
-                    stop_after="capture",
                     main_assembly=selection,
                     on_event=lambda event, identifier=identifier: self._event(identifier, event),
                     on_activity=lambda item, identifier=identifier: self._activity(identifier, item),

@@ -172,9 +172,9 @@ class LinuxSplitTests(unittest.TestCase):
         self.admit()
         calls: dict = {}
 
-        def fake_run(package, output, **kwargs):
+        def fake_generate(seed_dir, output, **kwargs):
             calls.update(kwargs)
-            calls["package"], calls["output"] = Path(package), Path(output)
+            calls["seed_dir"], calls["output"] = Path(seed_dir), Path(output)
             kwargs["on_event"]({"stage": "generate", "state": "running", "at": "2026-10-10T00:30:00+00:00"})
             return {
                 "state": "generated",
@@ -184,17 +184,15 @@ class LinuxSplitTests(unittest.TestCase):
             }
 
         with (
-            mock.patch.object(linux_runner.solidworks, "run", side_effect=fake_run),
+            mock.patch.object(linux_runner.solidworks, "generate", side_effect=fake_generate),
             mock.patch.object(linux_runner, "tool_record", return_value=portable_record(self.tool)),
         ):
             receipt = linux_runner.run_portable_stage(self.store, self.run_id, "generate")
         self.assertEqual(receipt["state"], "generated")
-        self.assertEqual(calls["resume_from"], "generate")
-        self.assertEqual(calls["stop_after"], "generate")
-        self.assertIsNone(calls["repository"])
         self.assertEqual(Path(calls["seed_dir"]), self.store.capture_dir(self.run_id))
         self.assertEqual(calls["output"], self.store.stage_dir(self.run_id, "generate"))
-        self.assertEqual(calls["package"], self.store.capture_dir(self.run_id))
+        self.assertEqual(calls["run_id"], self.run_id)
+        self.assertIsNone(calls["resume"])
         self.assertEqual(calls["handoff_sha256"], HANDOFF)
         self.assertTrue(self.store.receipt_path(self.run_id, "generate").is_file())
         self.assertEqual((self.store.meta(self.run_id) or {}).get("state"), "generated")
@@ -274,18 +272,18 @@ class LinuxSplitTests(unittest.TestCase):
             drifted = portable_record(self.tool, source_sha256="0" * 64)
             with (
                 mock.patch.object(linux_runner, "tool_record", return_value=drifted),
-                mock.patch.object(linux_runner.solidworks, "run", side_effect=AssertionError("must not run")),
+                mock.patch.object(linux_runner.solidworks, "generate", side_effect=AssertionError("must not run")),
                 self.assertRaises(PipelineError),
             ):
                 linux_runner.run_portable_stage(self.store, self.run_id, "generate")
             with (
                 mock.patch.object(linux_runner, "tool_record", return_value=drifted),
-                mock.patch.object(linux_runner.solidworks, "run", side_effect=AssertionError("must not run")),
+                mock.patch.object(linux_runner.solidworks, "verify", side_effect=AssertionError("must not run")),
                 self.assertRaises(PipelineError),
             ):
                 linux_runner.run_portable_stage(self.store, self.run_id, "verify", expected_subject="a" * 64)
         with (
-            mock.patch.object(linux_runner.solidworks, "run", side_effect=AssertionError("must not run")),
+            mock.patch.object(linux_runner.solidworks, "generate", side_effect=AssertionError("must not run")),
             self.assertRaises(PipelineError),
         ):
             linux_runner.run_portable_stage(self.store, "0e4f3f74-0e7e-4c31-a1ad-6e5a4a1f0000", "generate")
@@ -296,7 +294,7 @@ class LinuxSplitTests(unittest.TestCase):
         target.write_bytes(target.read_bytes() + b"tampered")
         with (
             mock.patch.object(linux_runner, "tool_record", return_value=portable_record(self.tool)),
-            mock.patch.object(linux_runner.solidworks, "run", side_effect=AssertionError("must not run")),
+            mock.patch.object(linux_runner.solidworks, "generate", side_effect=AssertionError("must not run")),
             self.assertRaises(PipelineError),
         ):
             linux_runner.run_portable_stage(self.store, self.run_id, "generate")
@@ -313,7 +311,7 @@ class LinuxSplitTests(unittest.TestCase):
 
         with (
             mock.patch.object(linux_runner, "tool_record", return_value=portable_record(self.tool)),
-            mock.patch.object(linux_runner.solidworks, "run", side_effect=explode),
+            mock.patch.object(linux_runner.solidworks, "generate", side_effect=explode),
             self.assertRaises(RuntimeError),
         ):
             linux_runner.run_portable_stage(self.store, self.run_id, "generate")
@@ -344,24 +342,42 @@ class LinuxSplitTests(unittest.TestCase):
         self.admit()
         stages: list[tuple] = []
 
-        def fake_run(package, output, **kwargs):
-            stages.append((kwargs["resume_from"], Path(kwargs["seed_dir"]), Path(output), kwargs.get("repository")))
+        def fake_generate(seed_dir, output, **kwargs):
+            stages.append(("generate", Path(seed_dir), Path(output), None))
             Path(output).mkdir(parents=True, exist_ok=True)
             return {
-                "state": {"generate": "generated", "verify": "verified", "publish": "published"}[kwargs["resume_from"]],
-                "passed": kwargs["resume_from"] != "generate",
+                "state": "generated",
+                "passed": False,
                 "subject_sha256": "a" * 64,
                 "events": [
-                    {
-                        "stage": kwargs["resume_from"],
-                        "state": "completed",
-                        "at": f"2026-10-10T0{len(stages)}:00:00+00:00",
-                    }
+                    {"stage": "generate", "state": "completed", "at": "2026-10-10T01:00:00+00:00"}
                 ],
             }
 
+        def fake_verify(seed_dir, output, **kwargs):
+            stages.append(("verify", Path(seed_dir), Path(output), None))
+            Path(output).mkdir(parents=True, exist_ok=True)
+            return {
+                "state": "verified",
+                "passed": True,
+                "subject_sha256": "a" * 64,
+                "events": [{"stage": "verify", "state": "completed", "at": "2026-10-10T02:00:00+00:00"}],
+            }
+
+        def fake_publish(seed_dir, output, **kwargs):
+            stages.append(("publish", Path(seed_dir), Path(output), kwargs.get("repository")))
+            Path(output).mkdir(parents=True, exist_ok=True)
+            return {
+                "state": "published",
+                "passed": True,
+                "subject_sha256": "a" * 64,
+                "events": [{"stage": "publish", "state": "completed", "at": "2026-10-10T03:00:00+00:00"}],
+            }
+
         with (
-            mock.patch.object(linux_runner.solidworks, "run", side_effect=fake_run),
+            mock.patch.object(linux_runner.solidworks, "generate", side_effect=fake_generate),
+            mock.patch.object(linux_runner.solidworks, "verify", side_effect=fake_verify),
+            mock.patch.object(linux_runner.solidworks, "publish", side_effect=fake_publish),
             mock.patch.object(linux_runner, "tool_record", return_value=portable_record(self.tool)),
         ):
             linux_runner.run_portable_stage(self.store, self.run_id, "generate")

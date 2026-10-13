@@ -158,28 +158,32 @@ def run_portable_stage(
             if stage == "publish" and repository is None:
                 raise PipelineError("publish requires the configured model repository checkout")
             capture_owner = store.checkpoint_owner(run_id, "capture")
-            capture = store.capture_dir(capture_owner)
             _revalidate_capture(store, capture_owner)
             _portable_identity_gate(store, capture_owner)
             seed_stage = {"generate": "capture", "verify": "generate", "publish": "verify"}[stage]
             seed = store.checkpoint_dir(run_id, seed_stage)
             if owner != run_id and boundary == stage:
                 _seed_reuse(store, run_id, owner, stage)
-            receipt = solidworks.run(
-                capture,
-                outputs[stage],
-                repository=Path(repository) if stage == "publish" else None,
-                base=base,
-                run_id=run_id,
-                resume_from=stage,
-                stop_after=stage,
-                seed_dir=seed,
-                expected_subject=expected_subject,
-                handoff_sha256=meta.get("handoff_sha256"),
-                prior_events=store.events(run_id),
-                resume=resume,
-                on_event=sink,
-            )
+            common = {
+                "run_id": run_id,
+                "prior_events": store.events(run_id),
+                "resume": resume,
+                "handoff_sha256": meta.get("handoff_sha256"),
+                "on_event": sink,
+            }
+            if stage == "generate":
+                receipt = solidworks.generate(seed, outputs[stage], **common)
+            elif stage == "verify":
+                receipt = solidworks.verify(seed, outputs[stage], expected_subject=expected_subject, **common)
+            else:
+                receipt = solidworks.publish(
+                    seed,
+                    outputs[stage],
+                    expected_subject=expected_subject,
+                    repository=Path(repository),
+                    base=base,
+                    **common,
+                )
         except Exception as error:
             store.record_stage(run_id, stage, _failure_receipt(store, run_id, stage, error))
             raise

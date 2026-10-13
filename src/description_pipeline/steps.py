@@ -14,14 +14,11 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .backends.urdf import generate_urdf
 from .delivery import PIPELINE_ID, subject_digest, subject_inventory
 from .io import PipelineError, confined, digest, file_digest, read_data, write_json
-from .model import Robot
 from .runtime import tool_record
 from .sources.snapshot import verify_snapshot
 from .sources.solidworks.revision import package_inventory, read_revision
-from .sources.solidworks.scene import load_scene
 from .stages import checked
 
 
@@ -393,6 +390,10 @@ def capture_evidence(
 
 def generate_model(staging: Path, definition: dict, input_report: dict, *, on_event=None) -> str:
     """Generate one canonical model and bind every derived file before independent checking."""
+    from .backends.urdf import generate_urdf
+    from .model import Robot
+    from .sources.solidworks.scene import load_scene
+
     _state(on_event, "generate", "running")
     checked(
         on_event,

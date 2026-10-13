@@ -191,10 +191,9 @@ class SplitRoundtripTests(unittest.TestCase):
         # The capture phase runs under the native role; simulate only that environment
         # fact (the role-aware tool record refuses the portable host).
         with patch.object(solidworks, "_native_tool_record", return_value=native_tool()):
-            capture = solidworks.run(
+            capture = solidworks.capture(
                 prepared_package,
                 self.capture_output,
-                stop_after="capture",
                 backend=backend,
                 run_id=self.run_id,
                 handoff_sha256=self.handoff,
@@ -258,7 +257,8 @@ class SplitRoundtripTests(unittest.TestCase):
         failed = {
             check["id"] for check in quality["checks"] if check.get("passed") is False or check.get("state") == "failed"
         }
-        self.assertTrue(failed <= control_limits, sorted(failed - control_limits))
+        offenders = {check["id"]: check for check in quality["checks"] if check["id"] in failed - control_limits}
+        self.assertTrue(failed <= control_limits, json.dumps(offenders, ensure_ascii=False)[:2400])
         gates = {check.get("id"): check for check in quality["checks"]}
         for required in (
             "bundle.subject",
@@ -315,12 +315,9 @@ class SplitRoundtripTests(unittest.TestCase):
         frozen = sealed_receipt.read_bytes()
 
         output = self.root / "portable-generate"
-        result = solidworks.run(
+        result = solidworks.generate(
             seed,
             output,
-            resume_from="generate",
-            stop_after="generate",
-            seed_dir=seed,
             run_id=self.run_id,
             handoff_sha256=self.handoff,
             prior_events=events,
@@ -341,12 +338,9 @@ class SplitRoundtripTests(unittest.TestCase):
         altered.write_bytes(altered.read_bytes() + b"tamper")
 
         output = self.root / "portable-generate-tampered"
-        result = solidworks.run(
+        result = solidworks.generate(
             seed,
             output,
-            resume_from="generate",
-            stop_after="generate",
-            seed_dir=seed,
             run_id=self.run_id,
             handoff_sha256=self.handoff,
             prior_events=events,

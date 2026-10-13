@@ -1,4 +1,4 @@
-"""Per-stage stop boundaries: capture seal roundtrip, generated checkpoint, verified."""
+"""Per-stage boundary regressions: the native seal, the generated checkpoint, verification."""
 
 from __future__ import annotations
 
@@ -12,11 +12,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from description_pipeline import solidworks, steps
-from description_pipeline.io import PipelineError, file_digest
+from description_pipeline.delivery import subject_inventory
+from description_pipeline.io import digest, file_digest
 from description_pipeline.orchestration import stage_transfer as transfer
 from description_pipeline.stages import CONTRACT
 
-from .test_native_resume_runner import REPLAYED_INSPECTION, make_seed
+from .test_stage_entries import REPLAYED_INSPECTION, make_seed
 from .test_stage_transfer import capture_root as build_capture_root
 from .test_stage_transfer import native_tool as build_native_tool
 
@@ -46,12 +47,12 @@ def stage_events(stage_id: str) -> list[dict]:
 def forbid(calls, name):
     def blocked(*args, **kwargs):
         calls[name] += 1
-        raise AssertionError(f"{name} must not run when stopped earlier")
+        raise AssertionError(f"{name} must not run inside another stage's entry")
 
     return blocked
 
 
-class StopAfterRunTests(unittest.TestCase):
+class StageBoundaryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -89,7 +90,7 @@ class StopAfterRunTests(unittest.TestCase):
 
         return fake_capture
 
-    def test_run_forwards_capture_activity_to_the_capture_step(self) -> None:
+    def test_capture_forwards_activity_and_stops_at_the_seal(self) -> None:
         calls = {"capture": 0, "generate": 0, "verify": 0, "publish": 0}
         records = []
 
@@ -100,10 +101,9 @@ class StopAfterRunTests(unittest.TestCase):
             patch.object(steps, "verify_delivery", side_effect=forbid(calls, "verify")),
             patch.object(steps, "publish_model", side_effect=forbid(calls, "publish")),
         ):
-            solidworks.run(
+            result = solidworks.capture(
                 self.package,
                 self.output,
-                stop_after="capture",
                 backend=object(),
                 run_id="8d0c55c4-1cad-5aff-af5f-5cc0bfc5a977",
                 handoff_sha256=HANDOFF,
@@ -113,8 +113,10 @@ class StopAfterRunTests(unittest.TestCase):
             )
 
         self.assertEqual(records, [{"phase": "capture", "action": "seal"}])
+        self.assertIs(result["native_complete"], True)
+        self.assertEqual(calls, {"capture": 1, "generate": 0, "verify": 0, "publish": 0})
 
-    def test_capture_stop_seals_transfer_and_stops(self) -> None:
+    def test_capture_seals_transfer_and_stops(self) -> None:
         calls = {"capture": 0, "generate": 0, "verify": 0, "publish": 0}
 
         with (
@@ -124,10 +126,9 @@ class StopAfterRunTests(unittest.TestCase):
             patch.object(steps, "verify_delivery", side_effect=forbid(calls, "verify")),
             patch.object(steps, "publish_model", side_effect=forbid(calls, "publish")),
         ):
-            result = solidworks.run(
+            result = solidworks.capture(
                 self.package,
                 self.output,
-                stop_after="capture",
                 backend=object(),
                 run_id="7c9b44b3-0b9c-5ffe-9f4f-4bbdafb4a865",
                 handoff_sha256=HANDOFF,
@@ -164,7 +165,7 @@ class StopAfterRunTests(unittest.TestCase):
         self.assertIs(receipt["passed"], False)
         self.assertEqual(receipt["capture_archive"], info)
 
-        # Real-sealer roundtrip: seal → admit, and only the immutable native receipt travels.
+        # Real-sealer roundtrip: seal -> admit, and only the immutable native receipt travels.
         with zipfile.ZipFile(archive) as opened:
             names = opened.namelist()
         self.assertIn("reports/native-stages.json", names)
@@ -192,7 +193,7 @@ class StopAfterRunTests(unittest.TestCase):
             self.assertFalse((self.output / "reports" / name).exists())
             self.assertFalse((destination / "reports" / name).exists())
 
-    def test_generate_stop_installs_unverified_checkpoint(self) -> None:
+    def test_generate_installs_unverified_checkpoint(self) -> None:
         seed = make_seed(self.root)
         calls = {"generate": 0, "verify": 0, "publish": 0}
 
@@ -210,12 +211,9 @@ class StopAfterRunTests(unittest.TestCase):
                 return_value={"hardware_id": "arm"},
             ),
         ):
-            result = solidworks.run(
-                self.package,
+            result = solidworks.generate(
+                seed,
                 self.output,
-                resume_from="generate",
-                stop_after="generate",
-                seed_dir=seed,
                 resume={"parent_run": "8b6adf2e-5e19-4d87-a177-e26c2f0f4a1c", "from_stage": "generate"},
             )
         self.assertEqual(result["state"], "generated")
@@ -230,56 +228,47 @@ class StopAfterRunTests(unittest.TestCase):
         self.assertEqual(receipt["state"], "generated")
         self.assertIs(receipt["passed"], False)
 
-    def test_verify_stop_is_verified_without_submission(self) -> None:
+    def test_verify_reruns_the_checker_on_the_seeded_subject(self) -> None:
         seed = make_seed(self.root)
-        calls = {"generate": 0, "verify": 0, "publish": 0}
+        calls = {"generate": 0, "verify": 0}
 
         def fake_generate(staging, definition, input_report, on_event=None):
             calls["generate"] += 1
-            return "a" * 64
+            staging = Path(staging)
+            (staging / "model").mkdir(exist_ok=True)
+            (staging / "model" / "robot.json").write_text("{}\n", encoding="utf-8")
+            (staging / "urdf").mkdir(exist_ok=True)
+            (staging / "urdf" / "robot.urdf").write_text("<robot/>\n", encoding="utf-8")
+            (staging / "meshes").mkdir(exist_ok=True)
+            (staging / "meshes" / "part.stl").write_bytes(b"stl")
+            (staging / "tool.json").write_text("{}\n", encoding="utf-8")
+            (staging / "manifest.json").write_text("{}\n", encoding="utf-8")
+            return digest(subject_inventory(staging))
 
         def fake_verify(staging, generated_subject, on_event=None):
             calls["verify"] += 1
             return {"passed": True, "subject_sha256": generated_subject}
 
+        generated = self.root / "generated"
         with (
             patch.object(steps, "generate_model", side_effect=fake_generate),
             patch.object(steps, "verify_delivery", side_effect=fake_verify),
-            patch.object(steps, "publish_model", side_effect=forbid(calls, "publish")),
             patch.object(steps, "inspect_prepared_input", return_value=REPLAYED_INSPECTION),
             patch(
                 "description_pipeline.sources.solidworks.input.resolve_package",
                 return_value={"hardware_id": "arm"},
             ),
         ):
-            result = solidworks.run(
-                self.package,
-                self.output,
-                resume_from="generate",
-                stop_after="verify",
-                seed_dir=seed,
-                resume={"parent_run": "8b6adf2e-5e19-4d87-a177-e26c2f0f4a1c", "from_stage": "generate"},
-            )
+            checkpoint = solidworks.generate(seed, generated)
+            result = solidworks.verify(generated, self.output, expected_subject=checkpoint["subject_sha256"])
+        self.assertEqual(checkpoint["state"], "generated")
         self.assertEqual(result["state"], "verified")
         self.assertIs(result["passed"], True)
         self.assertEqual(result["quality"]["passed"], True)
-        self.assertEqual(calls, {"generate": 1, "verify": 1, "publish": 0})
+        self.assertEqual(result["subject_sha256"], checkpoint["subject_sha256"])
+        self.assertEqual(calls, {"generate": 1, "verify": 1})
 
-    def test_stop_after_guards(self) -> None:
-        with self.assertRaises(PipelineError) as unknown:
-            solidworks.run(self.package, self.output, stop_after="bogus")
-        self.assertIn("Unknown stop_after", str(unknown.exception))
-        with self.assertRaises(PipelineError) as precedes:
-            solidworks.run(self.package, self.output, stop_after="capture", resume_from="generate")
-        self.assertIn("must not precede", str(precedes.exception))
-        with self.assertRaises(PipelineError) as publishless:
-            solidworks.run(self.package, self.output, stop_after="capture", repository=self.root / "repo")
-        self.assertIn("omit the repository", str(publishless.exception))
-        with self.assertRaises(PipelineError) as unrepository:
-            solidworks.run(self.package, self.output, stop_after="publish")
-        self.assertIn("requires a model repository", str(unrepository.exception))
-
-    def test_generate_resume_carries_transfer_provenance(self) -> None:
+    def test_generate_carries_the_transfer_provenance(self) -> None:
         seed = make_seed(self.root)
         (seed / "reports" / "native-tool.json").write_text('{"role": "native"}\n', encoding="utf-8")
         (seed / "reports" / "native-stages.json").write_text('{"stages": []}\n', encoding="utf-8")
@@ -303,15 +292,10 @@ class StopAfterRunTests(unittest.TestCase):
                 return_value={"hardware_id": "arm"},
             ),
         ):
-            result = solidworks.run(
-                self.package,
-                self.output,
-                resume_from="generate",
-                seed_dir=seed,
-                resume={"parent_run": "8b6adf2e-5e19-4d87-a177-e26c2f0f4a1c", "from_stage": "generate"},
-            )
-        self.assertTrue(result["passed"], result)
-        self.assertEqual(calls, {"generate": 1, "verify": 1})
+            result = solidworks.generate(seed, self.output, handoff_sha256=HANDOFF)
+        self.assertEqual(result["state"], "generated")
+        self.assertEqual(calls, {"generate": 1, "verify": 0})
+        self.assertEqual(result["handoff_sha256"], HANDOFF)
         self.assertEqual(
             (self.output / "transfer-manifest.json").read_text(encoding="utf-8"),
             '{"schema_version": "stub"}\n',

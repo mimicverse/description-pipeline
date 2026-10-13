@@ -165,21 +165,23 @@ class WorkflowTests(unittest.TestCase):
             patch.object(solidworks.sys, "platform", "linux"),
             patch("description_pipeline.sources.solidworks.freeze.freeze") as native,
         ):
-            result = solidworks.run(self.package, self.output, on_event=events.append)
+            result = solidworks.capture(self.package, self.output, on_event=events.append)
         native.assert_not_called()
         self.assertFalse(result["passed"])
         self.assertIn("Windows", result["error"])
         self.assertTrue(result["run_id"])
         self.assertEqual("failed", events[-1]["state"])
         self.assertFalse(self.output.exists())
-        self.assertTrue((Path(result["diagnostic_path"]) / "reports/input.json").is_file())
+        diagnostic = Path(result["diagnostic_path"])
+        listing = sorted(path.relative_to(diagnostic).as_posix() for path in diagnostic.rglob("*"))
+        self.assertTrue((diagnostic / "input/handoff.json").is_file(), listing)
 
     def test_failed_input_does_not_replace_existing_owned_output(self):
         self.output.mkdir()
         marker = self.output / "README.md"
         marker.write_text("Existing output bytes")
         solidworks._stamp(self.output, {"schema_version": BUNDLE_SCHEMA, "pipeline_id": PIPELINE_ID})
-        result = solidworks.run(self.package, self.output)
+        result = solidworks.capture(self.package, self.output)
         self.assertFalse(result["passed"])
         self.assertEqual("Existing output bytes", marker.read_text())
         self.assertTrue(solidworks._owned_output(self.output))
@@ -193,7 +195,7 @@ class WorkflowTests(unittest.TestCase):
             patch("description_pipeline.runtime.native_readiness", side_effect=error),
             patch("description_pipeline.sources.solidworks.freeze.freeze") as capture,
         ):
-            result = solidworks.run(self.package, self.output)
+            result = solidworks.capture(self.package, self.output)
         capture.assert_not_called()
         self.assertFalse(result["passed"])
         self.assertEqual(result["stage"], "capture")
@@ -214,7 +216,7 @@ class WorkflowTests(unittest.TestCase):
         expected = package_inventory(self.package)
         (self.package / "assembly.SLDASM").write_bytes(b"Changed after discovery")
         with patch("description_pipeline.sources.solidworks.freeze.freeze") as native:
-            result = solidworks.run(self.package, self.output, expected_inputs=expected)
+            result = solidworks.capture(self.package, self.output, expected_inputs=expected)
         native.assert_not_called()
         self.assertFalse(result["passed"])
         self.assertIn("changed after discovery", result["error"])
@@ -237,7 +239,7 @@ class WorkflowTests(unittest.TestCase):
             patch.object(steps, "inspect_prepared_input", side_effect=change_after_inspection),
             patch("description_pipeline.sources.solidworks.freeze.freeze") as native,
         ):
-            result = solidworks.run(self.package, self.output)
+            result = solidworks.capture(self.package, self.output)
         inspect.assert_called_once()
         native.assert_not_called()
         self.assertIn("static validation", result["error"])
@@ -255,7 +257,7 @@ class WorkflowTests(unittest.TestCase):
             patch("description_pipeline.runtime.native_readiness", side_effect=error),
             patch("description_pipeline.sources.solidworks.freeze.freeze") as native,
         ):
-            result = solidworks.run(self.package, self.output, expected_inputs=expected, handoff_sha256=handoff)
+            result = solidworks.capture(self.package, self.output, expected_inputs=expected, handoff_sha256=handoff)
         native.assert_not_called()
         self.assertFalse(result["passed"])
         check = next(stage for stage in stage_view(result)["stages"] if stage["id"] == "capture")["input_qc"][0]
@@ -307,11 +309,20 @@ class WorkflowTests(unittest.TestCase):
         self.seal()
         bundle = self.root / "frozen"
         (bundle / "reports").mkdir(parents=True)
-        write_json(bundle / "reports/input.json", {"synthetic": True})
         write_json(bundle / "reports/run.json", {"run_id": "source-run"})
         import shutil
 
         shutil.copytree(self.package, bundle / "input")
+        write_json(
+            bundle / "input" / "handoff.json",
+            {
+                "passed": True,
+                "input": None,
+                "cad_revision": {"revision": "r1"},
+                "input_receipt": None,
+                "package_files": {},
+            },
+        )
         (bundle / "evidence").mkdir()
         (bundle / "evidence/raw.json").write_text('"Synthetic driver fixture"')
         for name in ("model", "urdf", "meshes"):
@@ -337,7 +348,7 @@ class WorkflowTests(unittest.TestCase):
             patch.object(steps, "verify_delivery", side_effect=verify),
         ):
             result = solidworks.rebuild(bundle, self.output)
-        self.assertTrue(result["passed"])
+        self.assertTrue(result["passed"], result)
         self.assertEqual(result["rebuild_from"]["run_id"], "source-run")
         self.assertEqual(result["rebuild_from"]["subject_sha256"], source_subject)
         view = read_data(self.output / "reports/stages.json")
@@ -410,18 +421,18 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(self.output.exists())
 
     def test_annotated_diagnostic_is_preserved_on_retry(self):
-        first = solidworks.run(self.package, self.output)
+        first = solidworks.capture(self.package, self.output)
         old = Path(first["diagnostic_path"])
         note = old / "operator-note.txt"
         note.write_text("Do not erase this review")
-        second = solidworks.run(self.package, self.output)
+        second = solidworks.capture(self.package, self.output)
         self.assertNotEqual(first["diagnostic_path"], second["diagnostic_path"])
         self.assertEqual("Do not erase this review", note.read_text())
 
     def test_output_and_input_cannot_overlap(self):
         before = (self.package / "robot.yaml").read_bytes()
         with self.assertRaises(PipelineError):
-            solidworks.run(self.package, self.package / "output")
+            solidworks.capture(self.package, self.package / "output")
         self.assertEqual(before, (self.package / "robot.yaml").read_bytes())
 
     def test_report_option_cannot_overwrite_delivery_input(self):
