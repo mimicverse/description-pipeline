@@ -33,7 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from platform_config import atomic_write_once, canonical  # noqa: E402  (shared write-once/canonical)
+from platform_config import atomic_write_once, canonical, validate_snapshot_document  # noqa: E402  (shared helpers)
 
 INSTALL_RECORD_SCHEMA = "solidworks-to-urdf.install-record/v1"
 RELEASE_SCHEMA = "solidworks-to-urdf.release/v1"
@@ -95,13 +95,40 @@ def release_identity(document) -> dict:
     return {"version": version, "source_commit": commit, "source_sha256": source_sha, "artifacts": rows}
 
 
+def _confined_artifact(root: Path, name) -> Path | None:
+    """A release-index entry must stay a plain relative file under the distribution root."""
+
+    require(isinstance(name, str) and bool(name) and "\\" not in name, f"artifact name is malformed: {name!r}")
+    require(not name.startswith("/"), f"artifact path escapes the distribution root: {name!r}")
+    parts = name.split("/")
+    require(
+        all(part not in {"", ".", ".."} for part in parts),
+        f"artifact path escapes the distribution root: {name!r}",
+    )
+    candidate = root.joinpath(*parts)
+    node = candidate.parent
+    while node != root:
+        require(not node.is_symlink(), f"artifact path crosses a link: {name!r}")
+        require(root in node.parents, f"artifact path escapes the distribution root: {name!r}")
+        node = node.parent
+    require(not node.is_symlink(), f"artifact path crosses a link: {name!r}")
+    if not candidate.exists():
+        return None
+    require(candidate.is_file(), f"artifact is not a regular file: {name!r}")
+    require(
+        Path(os.path.realpath(candidate)).is_relative_to(Path(os.path.realpath(root))),
+        f"artifact path escapes the distribution root: {name!r}",
+    )
+    return candidate
+
+
 def verify_artifacts(root: Path, artifacts: list[dict]) -> int:
     """Verify every cited artifact that is present under ``root``; at least one must be."""
 
     verified = 0
     for row in artifacts:
-        candidate = root / row["name"]
-        if not candidate.is_file():
+        candidate = _confined_artifact(root, row["name"])
+        if candidate is None:
             continue
         actual = hashlib.sha256(candidate.read_bytes()).hexdigest()
         require(actual == row["sha256"], f"artifact {row['name']} does not match release.json ({actual})")
@@ -168,9 +195,13 @@ def build_install_record(
         snapshot_document = json.loads(snapshot_bytes.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as error:
         die(f"cannot parse snapshot {snapshot_path}: {error}")
-    resolved = snapshot_document.get("resolved") if isinstance(snapshot_document, dict) else None
-    storage = resolved.get("storage") if isinstance(resolved, dict) else None
-    require(isinstance(storage, dict), "snapshot resolved.storage is missing")
+    validate_snapshot_document(snapshot_document)
+    actual_install_id = snapshot_document["install_id"]
+    require(
+        actual_install_id == install_id,
+        f"snapshot generation mismatch: the snapshot declares {actual_install_id!r}, the request is {install_id!r}",
+    )
+    storage = snapshot_document["resolved"]["storage"]
     paths = {}
     for name in ("state_root", "handoff_root", "artifact_root", "workspace_root", "release_root"):
         paths[name] = _text(storage.get(name), f"snapshot resolved.storage.{name}")

@@ -254,6 +254,58 @@ class ValidationTests(unittest.TestCase):
             with self.subTest(label):
                 self.assert_rejected(mutate, needle)
 
+    def test_snapshot_document_validator(self):
+        from description_pipeline import interface_records as ir
+
+        with tempfile.TemporaryDirectory(prefix="snapshot-validator-") as temporary:
+            root = Path(temporary)
+            resolved = platform_config.validate_platform(platform_document(root))
+            snapshot = platform_config.build_snapshot(
+                resolved,
+                platform_json_sha256="a" * 64,
+                install_id="gen-1",
+                generated_at="2026-10-13T00:00:00Z",
+            )
+        platform_config.validate_snapshot_document(snapshot)
+        ir.validate_config_snapshot(snapshot)
+        cases = (
+            (
+                "foreign schema",
+                lambda s: s.__setitem__("schema_version", "review.foreign-snapshot/v99"),
+                "schema_version",
+            ),
+            ("unknown top key", lambda s: s.__setitem__("extra", 1), "unknown keys"),
+            ("missing sources", lambda s: s.pop("sources"), "missing keys"),
+            ("impossible instant", lambda s: s.__setitem__("generated_at", "2026-99-99T99:99:99Z"), "generated_at"),
+            (
+                "secret key in resolved",
+                lambda s: s["resolved"]["auth"].__setitem__("app_secret", "x"),
+                "secret keys",
+            ),
+            (
+                "origin port collision",
+                lambda s: s["resolved"]["windows"].__setitem__("tunnel_loopback_port", 9443),
+                "must differ",
+            ),
+            (
+                "store root outside state",
+                lambda s: s["resolved"]["derived"].__setitem__("store_root", "/elsewhere/runs"),
+                "store_root",
+            ),
+            (
+                "execution zero",
+                lambda s: s["resolved"]["execution"].__setitem__("linux_concurrency", 0),
+                "positive integer",
+            ),
+        )
+        for label, mutate, needle in cases:
+            with self.subTest(label):
+                candidate = copy.deepcopy(snapshot)
+                mutate(candidate)
+                with self.assertRaises(SystemExit) as raised:
+                    platform_config.validate_snapshot_document(candidate)
+                self.assertIn(needle, str(raised.exception))
+
 
 class RenderTests(unittest.TestCase):
     def test_render_cli_writes_generation_snapshot_and_matches_package_validators(self):

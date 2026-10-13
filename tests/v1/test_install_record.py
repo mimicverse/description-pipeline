@@ -283,7 +283,7 @@ class InstallRecordTests(unittest.TestCase):
             (
                 "snapshot without storage",
                 lambda i, r: (r / "state" / "snapshots" / "gen-1.json").write_text("{}", encoding="utf-8"),
-                "resolved.storage is missing",
+                "missing keys",
             ),
             ("bad install id", lambda i, r: None, "install_id is malformed"),
         )
@@ -353,6 +353,89 @@ class InstallRecordTests(unittest.TestCase):
                 services=list(SERVICES),
                 dag_file=self.root / "solidworks_to_urdf.py",
             )
+
+    def test_review_bindings_reject_without_writing(self):
+        def run_cli(root: Path, *, install_id: str, snapshot: Path, release: Path) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                [
+                    sys.executable,
+                    str(OPERATOR / "install_record.py"),
+                    "build",
+                    "--state-root",
+                    str(root / "state"),
+                    "--install-id",
+                    install_id,
+                    "--timestamp",
+                    TIMESTAMP,
+                    "--snapshot",
+                    str(snapshot),
+                    "--release-file",
+                    str(release),
+                    "--endpoint-identity",
+                    str(root / "endpoint-identity.json"),
+                    "--services",
+                    ",".join(SERVICES),
+                    "--dag",
+                    str(root / "solidworks_to_urdf.py"),
+                ],
+                capture_output=True,
+                text=True,
+                cwd=str(ROOT),
+            )
+
+        def assert_no_record(root: Path, result: subprocess.CompletedProcess) -> None:
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            state = root / "state"
+            self.assertFalse((state / "install-record.json").exists(), "active record must not be written")
+            self.assertFalse((state / "install-records").exists(), "generation files must not be written")
+
+        with tempfile.TemporaryDirectory(prefix="install-record-binding-") as temporary:
+            root = Path(temporary)
+            snapshot = make_snapshot(root)
+            release = make_release(root)
+            make_endpoint_identity(root)
+            make_dag(root)
+            result = run_cli(root, install_id="gen-2", snapshot=snapshot, release=release)
+            self.assertIn("generation mismatch", result.stderr)
+            assert_no_record(root, result)
+
+        with tempfile.TemporaryDirectory(prefix="install-record-binding-") as temporary:
+            root = Path(temporary)
+            snapshot = make_snapshot(root)
+            release = make_release(root)
+            make_endpoint_identity(root)
+            make_dag(root)
+            document = json.loads(snapshot.read_text(encoding="utf-8"))
+            document["schema_version"] = "review.foreign-snapshot/v99"
+            snapshot.write_text(json.dumps(document), encoding="utf-8")
+            result = run_cli(root, install_id="gen-1", snapshot=snapshot, release=release)
+            self.assertIn("schema_version", result.stderr)
+            assert_no_record(root, result)
+
+        with tempfile.TemporaryDirectory(prefix="install-record-binding-") as temporary:
+            root = Path(temporary)
+            snapshot = make_snapshot(root)
+            release = make_release(root)
+            make_endpoint_identity(root)
+            make_dag(root)
+            outsider = root / "outsider.bin"
+            outsider.write_bytes(b"outside-distribution-controlled-by-review")
+            document = json.loads(release.read_text(encoding="utf-8"))
+            document["artifacts"] = {"../outsider.bin": hashlib.sha256(outsider.read_bytes()).hexdigest()}
+            release.write_text(json.dumps(document), encoding="utf-8")
+            result = run_cli(root, install_id="gen-1", snapshot=snapshot, release=release)
+            self.assertIn("escapes the distribution root", result.stderr)
+            assert_no_record(root, result)
+
+        with tempfile.TemporaryDirectory(prefix="install-record-binding-") as temporary:
+            root = Path(temporary)
+            snapshot = make_snapshot(root)
+            release = make_release(root)
+            make_endpoint_identity(root)
+            make_dag(root)
+            result = run_cli(root, install_id="gen-1", snapshot=snapshot, release=release)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((root / "state" / "install-record.json").is_file())
 
     def test_no_production_task_or_path_fallback_exists(self):
         source = (OPERATOR / "install_record.py").read_text(encoding="utf-8")
