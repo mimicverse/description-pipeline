@@ -405,6 +405,49 @@ def _operator_jwt(venv: Path, env: dict[str, str]) -> str:
     return minted.stdout.strip().splitlines()[-1]
 
 
+def _task_reschedule_evidence(
+    venv: Path, env: dict[str, str], dag_id: str, run_id: str, task_id: str
+) -> tuple[list[dict], str | None]:
+    """Raw TaskReschedule rows for one task of one run, read from the isolated metadata DB."""
+
+    code = (
+        "import json\n"
+        "from airflow.models.taskreschedule import TaskReschedule\n"
+        "from airflow.settings import Session\n"
+        f"dag, run, task = {dag_id!r}, {run_id!r}, {task_id!r}\n"
+        "def row(record):\n"
+        "    return {\n"
+        "        name: (None if getattr(record, name, None) is None else str(getattr(record, name)))\n"
+        "        for name in ('id', 'dag_id', 'run_id', 'task_id', 'try_number', 'start_date', 'end_date',\n"
+        "                     'reschedule_date', 'map_index')\n"
+        "    }\n"
+        "with Session() as session:\n"
+        "    rows = [\n"
+        "        row(record)\n"
+        "        for record in session.query(TaskReschedule).filter(\n"
+        "            TaskReschedule.dag_id == dag,\n"
+        "            TaskReschedule.run_id == run,\n"
+        "            TaskReschedule.task_id == task,\n"
+        "        ).all()\n"
+        "    ]\n"
+        "print(json.dumps({'rows': rows}))\n"
+    )
+    try:
+        probe = subprocess.run(
+            [str(venv / "bin/python"), "-c", code], env=env, capture_output=True, text=True, timeout=120
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return [], f"cannot query TaskReschedule: {error}"
+    if probe.returncode != 0:
+        return [], probe.stderr[-500:] or "TaskReschedule probe failed"
+    try:
+        payload = json.loads(probe.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError) as error:
+        return [], f"unreadable TaskReschedule probe output: {error}"
+    rows = payload.get("rows")
+    return (rows if isinstance(rows, list) else []), None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
@@ -582,7 +625,7 @@ def main() -> int:
         deadline = time.time() + args.timeout
         triggering_user_name = None
         dag_state = None
-        reschedule_observed = False
+        reschedule_observed: list[dict] = []
         while time.time() < deadline:
             try:
                 run = airflow.dag_run(token, DAG_ID, run_id)
@@ -597,8 +640,17 @@ def main() -> int:
                 live = airflow.task_instances(token, DAG_ID, run_id)
             except Exception:  # noqa: BLE001 - the run may not be visible for a moment
                 live = []
-            if any(str(item.get("state")) == "up_for_reschedule" for item in live):
-                reschedule_observed = True
+            if any(
+                str(item.get("task_id")) == "start_job" and str(item.get("state")) == "up_for_reschedule"
+                for item in live
+            ):
+                reschedule_observed.append(
+                    {
+                        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "task_id": "start_job",
+                        "state": "up_for_reschedule",
+                    }
+                )
             time.sleep(5)
         else:
             tails = {c: (log_dir / f"{c}.log").read_text(encoding="utf-8")[-400:] for c in logs}
@@ -637,12 +689,20 @@ def main() -> int:
                     f"task {task_id} is {actual.get('state')!r} with {actual.get('try_number')!r} attempts; "
                     "publication must be blocked without ever executing"
                 )
-        wait_attempts = (task_states.get("wait_for_job") or {}).get("try_number")
-        if (not isinstance(wait_attempts, int) or wait_attempts < 2) and not reschedule_observed:
-            problems.append(
-                f"wait_for_job ran {wait_attempts!r} attempt(s) and never showed up_for_reschedule; "
-                f"{SENSOR_MODE_REQUIRED} slot-release semantics are not verified"
-            )
+        # Slot-release proof: the run's own TaskReschedule rows for the native wait task plus an
+        # observed up_for_reschedule state on that task.  Counts, other tasks and the configured
+        # mode string are not evidence.
+        reschedule_query = (
+            f"TaskReschedule(dag_id={DAG_ID!r}, run_id={run_id!r}, task_id='start_job') "
+            "via the isolated home's Airflow ORM"
+        )
+        reschedule_rows, reschedule_error = _task_reschedule_evidence(args.venv, env, DAG_ID, run_id, "start_job")
+        if reschedule_error is not None:
+            problems.append(f"the TaskReschedule evidence could not be read: {reschedule_error}")
+        if not reschedule_rows:
+            problems.append("no TaskReschedule rows exist for start_job; the native wait's slot release is not proven")
+        if not reschedule_observed:
+            problems.append("start_job was never observed in up_for_reschedule; its slot release is not proven")
 
         store = LinuxStore(store_root)
         generated = _read_json(store.receipt_path(native_id, "generate"))
@@ -702,8 +762,12 @@ def main() -> int:
                     "trigger": "portal-airflow-client",
                     "triggering_user_name": triggering_user_name,
                     "dag_state": dag_state,
-                    "sensor_mode": SENSOR_MODE_REQUIRED,
-                    "reschedule_observed": reschedule_observed,
+                    "reschedule_evidence": {
+                        "query": reschedule_query,
+                        "rows": reschedule_rows,
+                        "observed": reschedule_observed,
+                        "error": reschedule_error,
+                    },
                     "task_states": task_states,
                     "selection_uploads": state["uploads"],
                     "definition_posts": state["definition_posts"],

@@ -1201,13 +1201,18 @@ class ScheduledSmokePreparationTests(unittest.TestCase):
         self.assertIn('SENSOR_MODE_REQUIRED = "reschedule"', text)
         self.assertIn("SOLIDWORKS_SENSOR_MODE=SENSOR_MODE_REQUIRED", text)
         self.assertNotIn('SOLIDWORKS_SENSOR_MODE="poke"', text)
-        self.assertIn("slot-release semantics", text)
 
-    def test_smoke_asserts_reschedule_slot_release(self) -> None:
+    def test_smoke_uses_only_the_current_six_task_ids(self) -> None:
         text = self.SMOKE.read_text(encoding="utf-8")
+        self.assertNotIn("wait_for_job", text)
+        self.assertNotIn("confirm_job", text)
+
+    def test_smoke_requires_raw_task_reschedule_evidence(self) -> None:
+        text = self.SMOKE.read_text(encoding="utf-8")
+        self.assertIn("TaskReschedule", text)
+        self.assertIn('"reschedule_evidence"', text)
         self.assertIn("up_for_reschedule", text)
-        self.assertIn("reschedule_observed", text)
-        self.assertIn('"sensor_mode": SENSOR_MODE_REQUIRED', text)
+        self.assertIn("not proven", text)
 
 
 if __name__ == "__main__":
