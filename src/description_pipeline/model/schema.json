@@ -2,7 +2,10 @@
   "type": "object",
   "properties": {
     "schema_version": {
+      "$comment": "Legacy description.scene/v1 and description.robot/v1 stay accepted for sealed deliveries; new documents use the solidworks-to-urdf.* ids.",
       "enum": [
+        "solidworks-to-urdf.scene/v1",
+        "solidworks-to-urdf.robot/v1",
         "description.scene/v1",
         "description.robot/v1"
       ]

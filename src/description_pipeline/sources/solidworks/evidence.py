@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-EVIDENCE_SCHEMA = "description-pipeline.solidworks-evidence/v1"
+EVIDENCE_SCHEMA = "solidworks-to-urdf.evidence/v1"
 
 
 def capture_environment(backend: Any = None, worker_version: str = "unknown") -> dict[str, Any]:

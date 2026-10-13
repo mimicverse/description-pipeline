@@ -11,5 +11,5 @@
   },
   "kind": "fixture",
   "scene": "scene.json",
-  "schema_version": "description.source/v1"
+  "schema_version": "solidworks-to-urdf.source/v1"
 }
