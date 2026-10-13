@@ -161,37 +161,23 @@ def required_checks(definition=None):
     return sorted(identifiers)
 
 
-def require_qualified_report(report):
+def require_qualified_report(report, definition):
     """Reject an incomplete/forged green flag before it can become a boundary pass.
 
-    The inventory is exact within the frozen policy: the executed gates must be
-    exactly the declared required set, that set must contain every fixed policy
-    gate, and every declared id must be a policy member (a fixed gate or a
-    per-raw-object expansion of a frozen family).  Callers may not add review
-    gates of their own; within-family ids are additionally exact through
-    ``check_bundle``'s recomputation against the delivery's own raw objects.
+    The executed gates must be exactly the required set expanded from the
+    independently rebuilt definition (frozen fixed gates plus the per-object
+    families its rebuilt bodies/joints/frames and sealed expectations produce).
+    A self-reported subset (for example fixed gates only) or a policy-shaped gate
+    for an object that does not exist in the rebuilt inventory cannot pass: the
+    required set is never taken from the report and never from author-side lists.
     """
-
-    def policy_member(name: str) -> bool:
-        fixed = set(CHECK_POLICY_V1["fixed_checks"])
-        if name in fixed:
-            return True
-        for rule in CHECK_POLICY_V1["dynamic_expansions"]:
-            family = str(rule["family"])
-            if "{" not in family:
-                if name == family:
-                    return True
-                continue
-            prefix, _, rest = family.partition("{")
-            _, _, suffix = rest.partition("}")
-            if name.startswith(prefix) and name.endswith(suffix):
-                middle = name[len(prefix) : len(name) - len(suffix) if suffix else None]
-                if middle:
-                    return True
-        return False
 
     try:
         _require(isinstance(report, dict), "Quality report must be an object")
+        _require(
+            isinstance(definition, dict) and isinstance(definition.get("source"), dict),
+            "Quality report must bind the rebuilt definition inventory",
+        )
         rows = report.get("checks") or []
         expected = report.get("required_checks") or []
         _require(
@@ -202,10 +188,10 @@ def require_qualified_report(report):
             "Quality gate inventory is malformed",
         )
         executed = [row["id"] for row in rows]
+        inventory = set(required_checks(definition))
         _require(
             report.get("passed") is True
-            and set(required_checks()) <= set(expected)
-            and all(policy_member(name) for name in expected)
+            and set(expected) == inventory
             and len(executed) == len(expected)
             and set(executed) == set(expected)
             and required_rows_complete(expected, rows),
@@ -215,6 +201,12 @@ def require_qualified_report(report):
         error.details = report
         raise
     return report
+
+
+def rebuilt_definition(root) -> dict:
+    """The independently rebuilt definition a quality report's inventory binds to."""
+
+    return _input(root)
 
 
 def _input(root, diagnostics=None):

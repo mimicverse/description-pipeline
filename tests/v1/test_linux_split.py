@@ -365,6 +365,7 @@ class LinuxSplitTests(unittest.TestCase):
 
         with (
             mock.patch.object(store_module, "check_bundle", side_effect=counting_check),
+            mock.patch.object(store_module, "rebuilt_definition", return_value={}),
             mock.patch.object(store_module, "require_qualified_report", return_value=report),
         ):
             preview = self.store.preview(self.run_id)

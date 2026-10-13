@@ -33,7 +33,7 @@ from ..stages import (
     STAGE_IDS,
     stage_view,
 )
-from ..verification.solidworks_urdf import check_bundle, require_qualified_report
+from ..verification.solidworks_urdf import check_bundle, rebuilt_definition, require_qualified_report
 from .airflow_client import JOB_SCHEMA, validate_run_id
 from .stage_transfer import CAPTURE_MANIFEST, TRANSFER_SCHEMA, admit_capture
 
@@ -460,7 +460,7 @@ class LinuxStore:
             if cached is not None:
                 return cached
             try:
-                report = require_qualified_report(check_bundle(delivery))
+                report = require_qualified_report(check_bundle(delivery), rebuilt_definition(delivery))
             except PipelineError as error:
                 verified_error = error
             else:

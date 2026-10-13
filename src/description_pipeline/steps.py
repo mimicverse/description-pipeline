@@ -430,7 +430,12 @@ def generate_model(staging: Path, definition: dict, input_report: dict, *, on_ev
 
 def verify_delivery(staging: Path, generated_subject: str, *, on_event=None) -> dict:
     """Reconstruct expectations from native evidence and inspect the actual delivery."""
-    from .verification.solidworks_urdf import check_bundle, evaluate_bundle, require_qualified_report
+    from .verification.solidworks_urdf import (
+        check_bundle,
+        evaluate_bundle,
+        rebuilt_definition,
+        require_qualified_report,
+    )
 
     _state(on_event, "verify", "running")
 
@@ -443,13 +448,19 @@ def verify_delivery(staging: Path, generated_subject: str, *, on_event=None) -> 
     checked(on_event, "verify", "input", "verification.subject", verify_subject)
     report = evaluate_bundle(staging)
     write_json(staging / "reports/quality.json", report)
-    checked(on_event, "verify", "output", "verification.gates", lambda: require_qualified_report(report))
+    checked(
+        on_event,
+        "verify",
+        "output",
+        "verification.gates",
+        lambda: require_qualified_report(report, rebuilt_definition(staging)),
+    )
     report = checked(
         on_event,
         "verify",
         "output",
         "verification.report_binding",
-        lambda: require_qualified_report(check_bundle(staging)),
+        lambda: require_qualified_report(check_bundle(staging), rebuilt_definition(staging)),
         describe=lambda value: {
             "passed": value.get("passed"),
             "subject_sha256": value.get("subject_sha256"),

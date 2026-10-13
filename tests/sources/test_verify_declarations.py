@@ -674,6 +674,44 @@ class DeclarationConsumerTests(unittest.TestCase):
             rebuild_interface_frames(raw, bodies=bodies, base=None)
         self.assertIn("no recorded referenced configuration", str(raised.exception))
 
+    def test_qualified_report_inventory_binds_the_declared_rebuild(self) -> None:
+        from description_pipeline.interface_records import CHECK_POLICY_V1
+
+        def inject(raw):
+            raw["datums"].append(self._interface("TCP_tool_tcp", "module-1/tool_part"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            definition = solidworks_urdf._input(self._delivery(directory, inject), [])
+        required = set(solidworks_urdf.required_checks(definition))
+        self.assertIn("frames.tool_tcp", required)
+        complete = {
+            "passed": True,
+            "required_checks": sorted(required),
+            "checks": [{"id": name, "state": "passed", "passed": True} for name in sorted(required)],
+        }
+        solidworks_urdf.require_qualified_report(complete, definition)
+        fixed = required & set(CHECK_POLICY_V1["fixed_checks"])
+        self.assertNotEqual(fixed, required)
+        fixed_only = {
+            "passed": True,
+            "required_checks": sorted(fixed),
+            "checks": [{"id": name, "state": "passed", "passed": True} for name in sorted(fixed)],
+        }
+        with self.assertRaises(PipelineError):
+            solidworks_urdf.require_qualified_report(fixed_only, definition)
+        with self.assertRaises(PipelineError):
+            solidworks_urdf.require_qualified_report(
+                {
+                    "passed": True,
+                    "required_checks": sorted(required | {"inertia.nonexistent_body"}),
+                    "checks": [
+                        {"id": name, "state": "passed", "passed": True}
+                        for name in sorted(required | {"inertia.nonexistent_body"})
+                    ],
+                },
+                definition,
+            )
+
 
 class NativeDeclarationsTests(unittest.TestCase):
     def errors(self, raw, source=None):

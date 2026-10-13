@@ -156,10 +156,11 @@ class StageEntryTests(unittest.TestCase):
             patch.object(steps, "inspect_prepared_input", return_value=REPLAYED_INSPECTION),
             patch.object(steps, "publish_model", side_effect=fake_publish),
             patch.object(solidworks_urdf, "check_bundle", return_value={"passed": True, "subject_sha256": subject}),
+            patch.object(solidworks_urdf, "rebuilt_definition", return_value={}),
             patch.object(
                 solidworks_urdf,
                 "require_qualified_report",
-                side_effect=lambda report: {"passed": True, "subject_sha256": subject},
+                side_effect=lambda report, definition: {"passed": True, "subject_sha256": subject},
             ),
             patch(
                 "description_pipeline.sources.solidworks.input.resolve_package",

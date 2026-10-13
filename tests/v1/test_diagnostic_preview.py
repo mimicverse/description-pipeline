@@ -406,6 +406,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         report = {"passed": True, "subject_sha256": subject_digest(verify)}
         with (
             mock.patch.object(store_module, "check_bundle", return_value=report),
+            mock.patch.object(store_module, "rebuilt_definition", return_value={}),
             mock.patch.object(store_module, "require_qualified_report", return_value=report),
         ):
             preview = self.store.preview(RUN)

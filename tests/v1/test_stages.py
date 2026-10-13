@@ -116,7 +116,9 @@ class StageTests(unittest.TestCase):
                     "verify",
                     "output",
                     "verification.gates",
-                    lambda report=report: require_qualified_report(report),
+                    lambda report=report: require_qualified_report(
+                        report, {"checks": {}, "source": {"bodies": [], "joints": [], "frames": []}}
+                    ),
                 )
             self.assertEqual(self.stage(stage_view({"events": events}), "verify")["output_qc"][0]["state"], "failed")
 

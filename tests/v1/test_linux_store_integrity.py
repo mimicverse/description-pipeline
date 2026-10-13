@@ -430,10 +430,11 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         write_json(quality, {"passed": True, "subject_sha256": subject_digest(delivery)})
         with (
             mock.patch.object(store_module, "check_bundle", side_effect=check_bundle),
+            mock.patch.object(store_module, "rebuilt_definition", return_value={}),
             mock.patch.object(
                 store_module,
                 "require_qualified_report",
-                side_effect=lambda report: report,
+                side_effect=lambda report, definition: report,
             ),
         ):
             first = self.store.preview(RUN)
@@ -454,6 +455,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         report = {"passed": True, "subject_sha256": subject_digest(delivery)}
         with (
             mock.patch.object(store_module, "check_bundle", return_value=report),
+            mock.patch.object(store_module, "rebuilt_definition", return_value={}),
             mock.patch.object(store_module, "require_qualified_report", return_value=report),
         ):
             preview = self.store.preview(RUN)

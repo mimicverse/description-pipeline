@@ -14,6 +14,7 @@ from xml.etree import ElementTree as ET
 
 import numpy as np
 
+from description_pipeline.interface_records import CHECK_POLICY_V1
 from description_pipeline.io import PipelineError, canonical, write_json
 from description_pipeline.sources.solidworks import verify as oracle
 from description_pipeline.verification import solidworks_urdf as quality
@@ -1966,9 +1967,59 @@ class EntityPartitionTests(unittest.TestCase):
             quality._entities(source, duplicate, model)
 
 
+class QualifiedReportInventoryTests(unittest.TestCase):
+    """R18: the report inventory binds the independently rebuilt object set."""
+
+    @staticmethod
+    def _definition() -> dict:
+        return {
+            "checks": {},
+            "source": {
+                "bodies": [{"name": "base"}, {"name": "tool"}],
+                "joints": [{"name": "hinge", "type": "revolute"}],
+                "frames": [{"name": "tool_tcp"}],
+            },
+        }
+
+    @staticmethod
+    def _report(names) -> dict:
+        required = sorted(names)
+        return {
+            "passed": True,
+            "required_checks": required,
+            "checks": [{"id": name, "state": "passed", "passed": True} for name in required],
+        }
+
+    def test_complete_rebuilt_inventory_passes(self):
+        definition = self._definition()
+        quality.require_qualified_report(self._report(set(quality.required_checks(definition))), definition)
+
+    def test_fixed_only_report_is_refused(self):
+        definition = self._definition()
+        required = set(quality.required_checks(definition))
+        fixed = set(CHECK_POLICY_V1["fixed_checks"])
+        dynamic = required - fixed
+        self.assertTrue(dynamic, "the rebuilt objects must expand dynamic gates")
+        with self.assertRaises(PipelineError):
+            quality.require_qualified_report(self._report(fixed & required), definition)
+
+    def test_unknown_object_gate_is_refused(self):
+        definition = self._definition()
+        report = self._report(set(quality.required_checks(definition)) | {"inertia.nonexistent_body"})
+        with self.assertRaises(PipelineError):
+            quality.require_qualified_report(report, definition)
+
+    def test_inventory_mismatch_against_rebuilt_objects_is_refused(self):
+        definition = self._definition()
+        other = self._definition()
+        other["source"]["frames"] = []
+        with self.assertRaises(PipelineError):
+            quality.require_qualified_report(self._report(set(quality.required_checks(other))), definition)
+
+
 class OptionalDesignExpectationTests(unittest.TestCase):
     def test_absent_expectations_do_not_execute_or_require_a_passing_placeholder(self):
-        definition = {"checks": {}}
+        definition = {"checks": {}, "source": {"bodies": [], "joints": [], "frames": []}}
         gates = quality._Gates()
         quality._author_expectations(gates, definition, {}, [])
         self.assertEqual(gates.checks, [])
@@ -1989,12 +2040,12 @@ class OptionalDesignExpectationTests(unittest.TestCase):
             "required_checks": required,
             "checks": [{"id": key, "state": "passed", "passed": True} for key in required],
         }
-        quality.require_qualified_report(report)
+        quality.require_qualified_report(report, definition)
         removed = copy.deepcopy(report)
         removed["checks"] = [row for row in removed["checks"] if row["id"] != "physics.mass_closure_equality"]
         removed["required_checks"].remove("physics.mass_closure_equality")
         with self.assertRaises(PipelineError):
-            quality.require_qualified_report(removed)
+            quality.require_qualified_report(removed, definition)
 
     def test_supplied_expectations_are_required_evaluated_and_not_defaulted(self):
         model = {"links": [{"inertial": {"mass": 2.0}}]}
