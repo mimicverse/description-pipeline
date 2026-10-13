@@ -1622,30 +1622,94 @@ def rebuild_rigid_bodies(record: dict) -> list[dict]:
         record = record["raw"]
     by_material, _by_component = _cluster_bindings(record)
     attached = _frame_attached_members(record)
+    properties = (record.get("properties") or {}).get("components") or {}
+    datums = [datum for datum in record.get("datums") or [] if isinstance(datum, dict)]
     bodies: list[dict] = []
     for group, full in by_material.items():
-        owners = _datum_owners(full, attached)
-        candidates = [
-            datum
-            for datum in record.get("datums") or []
-            if isinstance(datum, dict)
-            and str(datum.get("name") or "").startswith("CS_")
-            and len(str(datum.get("name"))) > 3
-            and str(datum.get("owner") or "") in owners
-        ]
+        members = sorted(str(value) for value in full)
+        declared = {
+            str(value).strip()
+            for member in members
+            if isinstance((value := (properties.get(member) or {}).get("dp.body_datum")), str) and value.strip()
+        }
         _require(
-            len(candidates) == 1,
+            len(declared) <= 1,
             "discovery.body_rebuild",
-            "a rigid cluster must own exactly one CS_<name> frame datum",
-            {"components": sorted(group), "candidates": sorted(str(datum.get("name")) for datum in candidates)},
+            "one body declares conflicting body datum names",
+            {"components": members, "datums": sorted(declared)},
         )
-        name = str(candidates[0]["name"])[3:]
+        explicit = next(iter(declared), None)
+        proven = bool(attached) and full == attached
+        owned = [
+            datum
+            for datum in datums
+            if str(datum.get("owner") or "") in set(members)
+            and str(datum.get("name") or "").startswith("CS_")
+            and len(str(datum.get("name") or "")) > 3
+        ]
+        ownerless = (
+            [
+                datum
+                for datum in datums
+                if str(datum.get("name") or "") == "CS_base_link" and str(datum.get("owner") or "") == ""
+            ]
+            if proven
+            else []
+        )
+        if explicit is not None:
+            scope = {*members, *({""} if proven and explicit == "CS_base_link" else set())}
+            chosen = next(
+                (
+                    datum
+                    for datum in datums
+                    if str(datum.get("name") or "") == explicit and str(datum.get("owner") or "") in scope
+                ),
+                None,
+            )
+            _require(
+                chosen is not None,
+                "discovery.body_rebuild",
+                "the declared body datum does not bind exactly one coordinate system owned by this body",
+                {"components": members, "datum": explicit},
+            )
+        elif len(owned) == 1:
+            chosen = owned[0]
+        elif owned:
+            _require(
+                False,
+                "discovery.body_rebuild",
+                "several CS_<link> coordinate systems are owned by one body and none is declared",
+                {"components": members, "datums": sorted(str(datum.get("name")) for datum in owned)},
+            )
+        elif len(ownerless) == 1:
+            chosen = ownerless[0]
+        elif ownerless:
+            _require(
+                False,
+                "discovery.body_rebuild",
+                "several ownerless CS_base_link datums are present",
+                {"components": members},
+            )
+        else:
+            _require(
+                False,
+                "discovery.body_rebuild",
+                "no CS_<link> coordinate system is owned by this rigid body",
+                {"components": members},
+            )
+        name = str(chosen["name"])[3:]
+        _require(
+            _SNAKE.fullmatch(name) is not None,
+            "discovery.body_rebuild",
+            "the CS_<link> suffix must be the exact snake_case interface name",
+            {"datum": str(chosen["name"])},
+        )
         bodies.append(
             {
                 "id": name,
                 "name": name,
                 "components": sorted(group),
-                "frame": {"coordinate_system": str(candidates[0]["name"])},
+                "frame": {"coordinate_system": str(chosen["name"])},
             }
         )
     bodies.sort(key=lambda body: body["name"])
@@ -1768,6 +1832,11 @@ def rebuild_joint_facts(record: dict, package: Path) -> list[dict]:
     bodies = rebuild_rigid_bodies(raw)
     by_name = {str(body["name"]): body for body in bodies}
     _require("base_link" in by_name, "discovery.joint_rebuild", "no base_link body in the rebuilt carrier")
+    by_material, _by_component = _cluster_bindings(raw)
+    full_cluster = {
+        str(body["name"]): by_material.get(frozenset(body["components"]), frozenset(body["components"]))
+        for body in bodies
+    }
     by_component = {
         str(component): str(body["name"]) for body in bodies for component in body["components"]
     }
@@ -2032,7 +2101,7 @@ def rebuild_joint_facts(record: dict, package: Path) -> list[dict]:
             datum = _owned_datum(
                 raw,
                 child["frame"]["coordinate_system"],
-                _datum_owners(frozenset(child["components"]), attached),
+                _datum_owners(full_cluster[neighbour], attached),
             )
             _require(
                 datum is not None,
@@ -2187,6 +2256,29 @@ def verify_discovery(package: Path) -> dict:
     diagnostics: list[dict] = []
     state: dict = {}
 
+    def _carrier() -> dict:
+        """The definition carriers rebuilt from the raw capture alone (IF-17).
+
+        The saved derived copy is never read; a missing or conflicting witness
+        raises the rebuild failure into the check that needed the carrier, so
+        every gate reports its own precise cause.
+        """
+
+        if "carrier" not in state:
+            payload = state["payload"]
+            try:
+                state["carrier"] = {
+                    "bodies": rebuild_rigid_bodies(payload),
+                    "joints": rebuild_joint_facts(payload, package),
+                    "frames": rebuild_interface_frames(payload),
+                }
+            except Exception as error:  # noqa: BLE001 - memoized and re-raised per consuming check
+                state["carrier"] = error
+        carrier = state["carrier"]
+        if isinstance(carrier, Exception):
+            raise carrier
+        return carrier
+
     def check(identifier, callback):
         try:
             details = _report_safe(callback() or {})
@@ -2244,8 +2336,6 @@ def verify_discovery(package: Path) -> dict:
             "the discovery record does not match the delivery manifest subject",
         )
         source = read_source_record(package)
-        derived = payload.get("derived")
-        _require(isinstance(derived, dict), "discovery.binding", "record carries no derived definition")
         identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
         robot = {
             "schema_version": payload.get("schema_version"),
@@ -2258,11 +2348,7 @@ def verify_discovery(package: Path) -> dict:
                 "assembly": source["selection"]["main_assembly"],
                 "configuration": source["selection"]["configuration"],
                 "robot_name": payload.get("robot_name"),
-                "bodies": derived.get("bodies") or [],
-                "joints": derived.get("joints") or [],
-                "frames": derived.get("frames") or [],
             },
-            "checks": derived.get("checks") or {},
         }
         state["robot"] = robot
         state["payload"] = payload
@@ -2533,12 +2619,9 @@ def verify_discovery(package: Path) -> dict:
         }
 
     def budgets():
-        robot = state["robot"]
         payload = state["payload"]
         entry = payload.get("budget")
         _require(isinstance(entry, dict), "discovery.budgets", "the package carries no design budget record binding")
-        checks = robot.get("checks")
-        _require(isinstance(checks, dict), "discovery.budgets", "robot.yaml carries no checks block")
         value = _record_value(
             package,
             {"package_file": entry.get("package_file"), "sha256": entry.get("sha256")},
@@ -2547,18 +2630,14 @@ def verify_discovery(package: Path) -> dict:
         _require(isinstance(value, dict), "discovery.budgets", "the design budget record entry is not an object")
         for key in ("expected_mass_kg", "expected_extent_m"):
             item = value.get(key)
-            declared = checks.get(key)
             _require(
                 isinstance(item, (list, tuple))
-                and isinstance(declared, (list, tuple))
-                and len(item) == len(declared) == 2
-                and all(_number(number) is not None for number in (*item, *declared))
-                and 0 <= item[0] < item[1]
-                and 0 <= declared[0] < declared[1]
-                and _close([float(declared[0]), float(declared[1])], [float(item[0]), float(item[1])], 1e-12),
+                and len(item) == 2
+                and all(_number(number) is not None for number in item)
+                and 0 <= item[0] < item[1],
                 "discovery.budgets",
-                f"the {key} capture window differs from the design budget record",
-                {"value": declared},
+                f"the design budget record lacks a usable {key} interval",
+                {"value": item},
             )
         return {"budget_file": entry.get("package_file")}
 
@@ -2748,7 +2827,9 @@ def verify_discovery(package: Path) -> dict:
             "the frame-attached cluster has no material body",
             {"components": sorted(members)},
         )
-        source_bodies = (state["robot"].get("source") or {}).get("bodies") or []
+        # Only the rigid bodies are needed here: a bad attachment proof must surface its own
+        # diagnostic instead of being masked by an unrelated carrier rebuild failure.
+        source_bodies = rebuild_rigid_bodies(state["payload"])
         body = next(
             (
                 item
@@ -2778,11 +2859,10 @@ def verify_discovery(package: Path) -> dict:
         }
 
     def bodies():
-        robot = state["robot"]
         raw = state["payload"]["raw"]
         attached = _frame_attached_members(raw)
         by_name = _components_by_name(raw)
-        source_bodies = (robot.get("source") or {}).get("bodies")
+        source_bodies = _carrier()["bodies"]
         _require(isinstance(source_bodies, list) and source_bodies, "discovery.bodies", "robot.yaml declares no bodies")
         # A body is a set of physical parts.  Assembly-document occurrences stay in the mate
         # graph as connectors but are never material members, so a rigid sub-assembly cannot
@@ -2885,13 +2965,12 @@ def verify_discovery(package: Path) -> dict:
         return {"components": len(seen), "containers": len(containers)}
 
     def names():
-        robot = state["robot"]
         payload = state["payload"]
         raw = payload["raw"]
         attached = _frame_attached_members(raw)
         frozen = payload.get("frozen_names") or {}
         _require(isinstance(frozen, dict), "discovery.names", "frozen_names must be an object")
-        source = robot.get("source") or {}
+        source = _carrier()
         bodies = source.get("bodies") or []
         joints = source.get("joints") or []
         _members, pairs = _independent_clusters(raw)
@@ -3014,11 +3093,10 @@ def verify_discovery(package: Path) -> dict:
         return {"frozen": len(frozen)}
 
     def joints():
-        robot = state["robot"]
         payload = state["payload"]
         raw = payload["raw"]
         attached = _frame_attached_members(raw)
-        source = robot.get("source") or {}
+        source = _carrier()
         source_joints = source.get("joints") or []
         bodies = {
             frozenset(str(value) for value in (body.get("components") or [])): body
@@ -3309,8 +3387,7 @@ def verify_discovery(package: Path) -> dict:
         return {"joints": derived}
 
     def tree():
-        robot = state["robot"]
-        source = robot.get("source") or {}
+        source = _carrier()
         bodies = [str(body.get("name")) for body in source.get("bodies") or []]
         _require("base_link" in bodies, "discovery.tree", "no base_link body")
         _require(
@@ -3356,11 +3433,10 @@ def verify_discovery(package: Path) -> dict:
         return {"bodies": len(bodies), "joints": len(source.get("joints") or [])}
 
     def frames():
-        robot = state["robot"]
         payload = state["payload"]
         raw = payload["raw"]
         attached = _frame_attached_members(raw)
-        source = robot.get("source") or {}
+        source = _carrier()
         bodies = source.get("bodies") or []
         by_material, _by_component = _cluster_bindings(raw)
         component_body: dict[str, str] = {}
@@ -3501,7 +3577,9 @@ def verify_discovery(package: Path) -> dict:
     def declarations():
         from .native_declarations import verify_declarations
 
-        report = verify_declarations(state["payload"]["raw"], state["robot"].get("source"))
+        # Declaration/exporter packages are the declaration-gate domain (sealed declaration
+        # record, four-state + fixed-key binding); they have no geometric carrier to rebuild.
+        report = verify_declarations(state["payload"]["raw"])
         _require(
             report["passed"],
             "discovery.declarations",
@@ -3510,7 +3588,7 @@ def verify_discovery(package: Path) -> dict:
         )
         return {
             "bodies": len(report["members"]),
-            "joints": len((state["robot"].get("source") or {}).get("joints") or []),
+            "joints": report["joints"],
             "checks": report["checks"],
             "rigid_completion": report["completion"],
             "diagnostics": report["diagnostics"],
@@ -3572,12 +3650,7 @@ def verify_discovery(package: Path) -> dict:
         raw_block = raw_block if isinstance(raw_block, dict) else {}
         document_properties = (raw_block.get("properties") or {}).get("document") or {}
         budget_reference = str(payload.get("namespace") or "dp") + ".design_budget_record"
-        expectations = state["robot"].get("checks") or {}
-        if (
-            "budget" not in payload
-            and budget_reference not in document_properties
-            and not any(key in expectations for key in ("expected_mass_kg", "expected_extent_m"))
-        ):
+        if "budget" not in payload and budget_reference not in document_properties:
             dependent = tuple(item for item in dependent if item[0] != "discovery.budgets")
     if bound["passed"]:
         for identifier, callback in dependent:

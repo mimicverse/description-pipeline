@@ -362,7 +362,7 @@ class OracleSemanticsTests(unittest.TestCase):
         self._native(package, strip_annotations)
         report = verify_discovery(package)
         self.assertFalse(report["passed"])
-        self.assertIn("discovery.joints", {item["code"] for item in report["errors"]})
+        self.assertTrue({"discovery.joints", "discovery.joint_rebuild"} & {item["code"] for item in report["errors"]})
 
     def test_absent_exporter_state_keeps_the_mate_suite_and_skips_declarations(self) -> None:
         """Only a proven absent exporter state means the capture has no declarations.
@@ -581,7 +581,7 @@ class OracleSemanticsTests(unittest.TestCase):
         self.assertFalse(passed, errors)
         self.assertTrue(
             any(
-                error["code"] == "discovery.joints"
+                error["code"] in {"discovery.joints", "discovery.joint_rebuild"}
                 and "no cylindrical mate entity carries the joint shaft" in error["message"]
                 for error in errors
             ),
@@ -628,7 +628,11 @@ class OracleSemanticsTests(unittest.TestCase):
         self.assertFalse(passed, errors)
         self.assertTrue(
             any(
-                error["code"] == "discovery.bodies" and "owned uniquely by that body" in error["message"]
+                error["code"] == "discovery.body_rebuild"
+                and (
+                    "owned by one body" in error["message"]
+                    or "no CS_<link> coordinate system is owned" in error["message"]
+                )
                 for error in errors
             ),
             errors,
@@ -646,8 +650,7 @@ class OracleSemanticsTests(unittest.TestCase):
         self.assertFalse(passed, errors)
         self.assertTrue(
             any(
-                error["code"] in {"discovery.bodies", "discovery.joints", "discovery.frames"}
-                and "owned uniquely" in error["message"]
+                error["code"] == "discovery.body_rebuild" and "owned by one body" in error["message"]
                 for error in errors
             ),
             errors,
@@ -717,21 +720,16 @@ class OracleSemanticsTests(unittest.TestCase):
 
         package = self.baseline()
         self._native(package, mutate)
-        # Let the derived carrier agree with the mutated mate graph so only the container rule can fail.
-        record = json.loads((package / RECORD_FILE).read_text(encoding="utf-8"))
-        for body in record["derived"]["bodies"]:
-            if body["name"] == "base_link":
-                body["components"] = ["base-1", "sub-1"]
-        self._seal(package, record)
         passed, errors, _checks = self.check(package)
-        self.assertFalse(passed, errors)
-        self.assertTrue(
-            any(
-                error["code"] == "discovery.bodies" and "assembly container as a material member" in error["message"]
-                for error in errors
-            ),
-            errors,
-        )
+        # The container rule lives in the rebuild: a rigidly attached container stays a
+        # connector and never becomes material of the body it is solved against, while the
+        # raw evidence itself is legal (the saved carrier is not a verification input).
+        self.assertTrue(passed, errors)
+        from description_pipeline.verification.native_discovery import rebuild_rigid_bodies
+
+        record = json.loads((package / RECORD_FILE).read_text(encoding="utf-8"))
+        base = next(body for body in rebuild_rigid_bodies(record) if body["name"] == "base_link")
+        self.assertEqual(base["components"], ["base-1"])
 
     def test_container_mass_must_not_duplicate_its_parts(self) -> None:
         def mutate(raw, payload):
@@ -834,7 +832,8 @@ class OracleSemanticsTests(unittest.TestCase):
         self.assertFalse(passed, errors)
         self.assertTrue(
             any(
-                error["code"] == "discovery.bodies" and "no datum owned uniquely by that body" in error["message"]
+                error["code"] == "discovery.body_rebuild"
+                and "no CS_<link> coordinate system is owned" in error["message"]
                 for error in errors
             ),
             errors,
@@ -847,11 +846,11 @@ class OracleSemanticsTests(unittest.TestCase):
         self.assertTrue(passed, errors)
 
     def test_foreign_same_named_link_datum_stays_an_interface(self) -> None:
-        """Only the exact (owner, name) pair a body uses as its frame is excluded.
+        """A foreign datum sharing a link name never vanishes silently.
 
-        With a name-only exclusion this foreign datum was silently dropped and the package
-        passed; the exact-pair rule surfaces it as an interface, which then blocks on the
-        body-name collision instead of vanishing.
+        The rebuild mirrors the producer's body-datum selection: with the foreign datum the
+        base cluster owns two CS_ datums and none is declared, so the ambiguity blocks
+        (the frame rebuild keeps the exact (owner, name) exclusion for the body's own datum).
         """
 
         def mutate(raw, payload):
@@ -863,8 +862,7 @@ class OracleSemanticsTests(unittest.TestCase):
         self.assertFalse(passed, errors)
         self.assertTrue(
             any(
-                error["code"] == "discovery.frames"
-                and ("collides with a body name" in error["message"] or "dropped or invented" in error["message"])
+                error["code"] == "discovery.body_rebuild" and "owned by one body" in error["message"]
                 for error in errors
             ),
             errors,
@@ -968,7 +966,8 @@ class OracleSemanticsTests(unittest.TestCase):
         self.assertFalse(passed, errors)
         self.assertTrue(
             any(
-                error["code"] == "discovery.bodies" and "no datum owned uniquely by that body" in error["message"]
+                error["code"] == "discovery.body_rebuild"
+                and "no CS_<link> coordinate system is owned" in error["message"]
                 for error in errors
             ),
             errors,
@@ -1069,7 +1068,9 @@ class OracleSemanticsTests(unittest.TestCase):
             any(error["code"] == "discovery.frame_attachment" for error in errors),
             errors,
         )
-        self.assertTrue(any(error["code"] == "discovery.bodies" for error in errors), errors)
+        self.assertTrue(
+            any(error["code"] in {"discovery.bodies", "discovery.body_rebuild"} for error in errors), errors
+        )
 
     def test_assembly_frame_identity_requires_the_explicit_marker(self) -> None:
         from description_pipeline.verification.native_discovery import _frame_attachment, _frames, _rows_for
@@ -1256,7 +1257,9 @@ class OracleSemanticsTests(unittest.TestCase):
         self.assertFalse(passed, errors)
         self.assertTrue(
             any(
-                error["code"] == "discovery.frames" and "not owned by any body" in error["message"] for error in errors
+                error["code"] in {"discovery.frames", "discovery.interface_frame_rebuild"}
+                and "not owned by any" in error["message"]
+                for error in errors
             ),
             errors,
         )
@@ -1277,7 +1280,9 @@ class OracleSemanticsTests(unittest.TestCase):
         )
         self.assertTrue(
             any(
-                error["code"] == "discovery.frames" and "not owned by any body" in error["message"] for error in errors
+                error["code"] in {"discovery.frames", "discovery.interface_frame_rebuild"}
+                and "not owned by any" in error["message"]
+                for error in errors
             ),
             errors,
         )

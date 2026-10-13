@@ -782,5 +782,6 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
         "errors": errors,
         "diagnostics": diagnostics,
         "members": {name: sorted(values) for name, values in state.get("members", {}).items()},
+        "joints": len(state.get("joints") or {}),
         "completion": state.get("completion", {}),
     }

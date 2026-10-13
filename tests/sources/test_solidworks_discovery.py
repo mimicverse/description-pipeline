@@ -37,7 +37,10 @@ from description_pipeline.sources.solidworks.discovery import (  # noqa: E402
 )
 from description_pipeline.sources.solidworks.errors import CadError  # noqa: E402
 from description_pipeline.sources.solidworks.native import _merge_property_scopes  # noqa: E402
-from description_pipeline.verification.native_discovery import verify_discovery  # noqa: E402
+from description_pipeline.verification.native_discovery import (  # noqa: E402
+    rebuild_interface_frames,
+    verify_discovery,
+)
 
 from .selection_support import sealed_selection  # noqa: E402
 from . import support  # noqa: E402
@@ -1512,8 +1515,11 @@ class DiscoveryTests(unittest.TestCase):
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         support.seal_delivery(destination)
         report = verify_discovery(destination)
-        self.assertFalse(report["passed"])
-        self.assertIn("discovery.frames", [item["code"] for item in report["errors"]])
+        # The frozen derived copy is no longer a verification input (IF-17): the carrier is
+        # rebuilt from raw, so dropping the saved frame changes nothing; the engineered
+        # interface is still derived from the raw datum.
+        self.assertTrue(report["passed"], report["errors"])
+        self.assertIn("pinch", [frame["name"] for frame in rebuild_interface_frames(payload)])
 
     def test_jcs_must_alias_the_child_datum(self):
         def alias(payload):
@@ -1983,8 +1989,9 @@ class DiscoveryTests(unittest.TestCase):
         record_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         support.seal_delivery(without_derived)
         report = verify_discovery(without_derived)
-        self.assertFalse(report["passed"])
-        self.assertIn("discovery.binding", [item["code"] for item in report["errors"]])
+        # The frozen derived copy is no longer a verification input (IF-17): the carrier is
+        # rebuilt from raw, so stripping it cannot weaken or fail the gate.
+        self.assertTrue(report["passed"], report["errors"])
 
     def test_gate_is_mandatory_and_has_no_legacy_mode(self):
         result, _source, output = self._prepare()

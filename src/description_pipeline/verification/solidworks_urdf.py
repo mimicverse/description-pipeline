@@ -228,11 +228,15 @@ def _input(root, diagnostics=None):
 
     diagnostics = [] if diagnostics is None else diagnostics
     discovery_record = ev.discovery(root)
-    derived = discovery_record.get("derived")
-    _require(
-        isinstance(derived, dict) and derived.get("bodies") is not None,
-        "Discovery record carries no derived definition",
-    )
+    _require(isinstance(discovery_record.get("raw"), dict), "Discovery record carries no raw capture")
+    from .native_discovery import rebuild_interface_frames, rebuild_joint_facts, rebuild_rigid_bodies
+
+    try:
+        bodies = rebuild_rigid_bodies(discovery_record)
+        joints = rebuild_joint_facts(discovery_record, root)
+        frames = rebuild_interface_frames(discovery_record)
+    except Exception:  # noqa: BLE001 - this binder stays total; the URDF gates fail closed on empty carriers
+        bodies, joints, frames = [], [], []
     source = read_source_record(root)
     handoff = ev.handoff(root)
     identity = source["identity"]
@@ -267,6 +271,18 @@ def _input(root, diagnostics=None):
                 "detail": {"hardware_id": identity["hardware_id"], "missing": list(authored.get("missing") or [])},
             }
         )
+    checks: dict = {}
+    budget_entry = discovery_record.get("budget")
+    if isinstance(budget_entry, dict):
+        from .native_discovery import _record_value
+
+        value = _record_value(
+            Path(root),
+            {"package_file": budget_entry.get("package_file"), "sha256": budget_entry.get("sha256")},
+            str(budget_entry.get("key") or ""),
+        )
+        _require(isinstance(value, dict), "Discovery record budget entry is not an object")
+        checks = {key: value[key] for key in ("expected_mass_kg", "expected_extent_m") if key in value}
     return {
         "schema_version": discovery_record.get("schema_version"),
         "hardware_id": identity["hardware_id"],
@@ -274,13 +290,13 @@ def _input(root, diagnostics=None):
             "assembly": identity["main_assembly"],
             "configuration": identity["configuration"],
             "robot_name": robot_name,
-            "bodies": derived["bodies"],
-            "joints": derived.get("joints") or [],
-            "frames": derived.get("frames") or [],
+            "bodies": bodies,
+            "joints": joints,
+            "frames": frames,
             "documented_masses": declared.get("items") or {},
             "mass_evidence": declared.get("evidence") or {},
         },
-        "checks": derived.get("checks") or {},
+        "checks": checks,
     }
 
 
