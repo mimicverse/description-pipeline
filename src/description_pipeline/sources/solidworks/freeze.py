@@ -27,7 +27,11 @@ from .jsonio import digest_json, sha256_file, write_json
 # The native adapter binds exported bytes; full mesh analysis runs on Linux.
 from ...io import inventory
 
-FREEZE_SCHEMA = "description-pipeline.solidworks-freeze/v1"
+#: Freeze/capture record ids now live in the ``solidworks-to-urdf.*`` family.
+#: Retained evidence written before the XC-01 rename carries the retired
+#: ``description-pipeline.*`` ids; readers that assert one of these ids must
+#: accept both spellings (mapping recorded in the rename PR).
+FREEZE_SCHEMA = "solidworks-to-urdf.freeze/v1"
 SOURCE_KIND = "solidworks"
 DEFAULT_ALLOWED_SUFFIXES = (".sldasm", ".sldprt")
 # Every key the adapter understands; anything else is a typo or an unimplemented
@@ -1199,7 +1203,7 @@ def _retain_failure(
     if not staging.exists():
         return None
     payload = {
-        "schema_version": "description-pipeline.solidworks-freeze-failure/v1",
+        "schema_version": "solidworks-to-urdf.freeze-failure/v1",
         "stage": stage,
         "code": getattr(error, "code", type(error).__name__),
         "message": _redact(str(error)),
@@ -1320,7 +1324,7 @@ def _component_context_record(reading: dict[str, Any], assembly_mass: float | No
             }
         )
     return {
-        "schema_version": "description-pipeline.solidworks-component-mass-context/v1",
+        "schema_version": "solidworks-to-urdf.component-mass-context/v1",
         "status": "recorded" if not errors else "partial",
         "assembly_mass_kg": None if assembly_mass is None else float(assembly_mass),
         "instances": instances,
@@ -1346,14 +1350,14 @@ def _component_mass_context(
         reading = reader(str(document or cfg["assembly"]))
     except Exception as error:  # noqa: BLE001 - an optional probe must not fail a valid capture
         return {
-            "schema_version": "description-pipeline.solidworks-component-mass-context/v1",
+            "schema_version": "solidworks-to-urdf.component-mass-context/v1",
             "status": "unavailable",
             "reason": str(getattr(error, "code", "") or type(error).__name__),
             "message": " ".join(str(error).split())[:200],
         }
     if not isinstance(reading, dict):
         return {
-            "schema_version": "description-pipeline.solidworks-component-mass-context/v1",
+            "schema_version": "solidworks-to-urdf.component-mass-context/v1",
             "status": "unavailable",
             "reason": "cad_component_context_malformed",
             "message": "the backend returned no component mass context object",
@@ -1362,7 +1366,7 @@ def _component_mass_context(
         return _component_context_record(reading, assembly_mass)
     except Exception as error:  # noqa: BLE001 - an optional probe must never abort a capture
         return {
-            "schema_version": "description-pipeline.solidworks-component-mass-context/v1",
+            "schema_version": "solidworks-to-urdf.component-mass-context/v1",
             "status": "unavailable",
             "reason": "cad_component_context_invalid",
             "message": " ".join(str(error).split())[:200],
@@ -1415,7 +1419,7 @@ def _mass_closure(backend: Any, cfg: dict[str, Any], document: str | None = None
     component_context = _component_mass_context(backend, cfg, top_mass, measured)
     if top_level is None or top_mass is None:
         unavailable_record: dict[str, Any] = {
-            "schema_version": "description-pipeline.solidworks-mass-closure/v1",
+            "schema_version": "solidworks-to-urdf.mass-closure/v1",
             "status": "unavailable",
             **(
                 failure
@@ -1426,7 +1430,7 @@ def _mass_closure(backend: Any, cfg: dict[str, Any], document: str | None = None
             unavailable_record["component_context"] = component_context
         return unavailable_record
     record = {
-        "schema_version": "description-pipeline.solidworks-mass-closure/v1",
+        "schema_version": "solidworks-to-urdf.mass-closure/v1",
         "status": "recorded",
         "mode": "full",
         "top_level": {
@@ -2234,7 +2238,7 @@ def _freeze_local(
         write_json(
             staging / "raw" / "declared_masses.json",
             {
-                "schema_version": "description-pipeline.solidworks-declared-masses/v1",
+                "schema_version": "solidworks-to-urdf.declared-masses/v1",
                 "evidence": cfg.get("mass_evidence"),
                 "items": cfg["documented_masses"],
             },

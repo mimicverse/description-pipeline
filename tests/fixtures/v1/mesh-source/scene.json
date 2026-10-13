@@ -239,7 +239,7 @@
     "fixture": true,
     "note": "hand-written mesh fixture (binary STL), not CAD evidence"
   },
-  "schema_version": "description.scene/v1",
+  "schema_version": "solidworks-to-urdf.scene/v1",
   "sensors": [],
   "units": "SI"
 }
