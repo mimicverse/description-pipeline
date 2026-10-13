@@ -1,15 +1,11 @@
 """Operational lifecycle projection for the drain/stop gates (C consumer).
 
-Domain split (joint with A): A owns the platform business state in the deployment PostgreSQL -
-the same instance, a separate schema and separate privileges: requests, runs, stage receipts and
-publish intents are the business authority.  This module is the consumer entry for the
-operatorctl gates; service control never scans run artifacts and never substitutes scheduler
-state for business receipts.
-
-The projection is fail-closed: only recognized terminal outcomes settle.  Unresolved, unknown
-and NULL states block drain completion, and every non-terminal object blocks stop.  The
-scheduler observation below queries Airflow rows without any state pre-filter so NULL/unknown
-states are never silently dropped.
+The business authority is A's platform schema: ``platform.lifecycle_projection`` owns the state
+vocabulary AND the ``bucket`` classification, and ``platform.admission_projection`` exposes the
+admission gate.  This consumer holds no enumeration copies: rows are consumed by their
+view-owned ``bucket`` (``terminal``/``in_flight``/``unresolved``/``unknown``); a row without a
+recognized bucket - including the pre-switch scheduler observation below - is ``unknown`` and
+fails closed, so the gates refuse until the platform authority answers.
 
 Exit codes: 0 projection satisfies the requested requirement; 1 it does not; 2 usage.
 """
@@ -20,61 +16,22 @@ import argparse
 import json
 import sys
 
-#: Recognized terminal outcomes across the platform vocabulary (runs, stages, publish intents).
-TERMINAL_STATES = frozenset({"succeeded", "success", "published", "completed", "failed", "cancelled"})
-#: Recognized non-terminal work still progressing (blocks stop; drain may complete).
-IN_FLIGHT_STATES = frozenset(
-    {
-        "pending",
-        "queued",
-        "running",
-        "scheduled",
-        "up_for_retry",
-        "up_for_reschedule",
-        "restarting",
-        "deferred",
-        "publishing",
-        "cancel_requested",
-    }
-)
-UNRESOLVED_STATES = frozenset({"unresolved"})
-
-
 def classify(rows) -> dict:
-    """Split projection rows into in-flight, unresolved and unknown outcomes (fail-closed).
+    """Split projection rows by their view-owned bucket (fail-closed, no local vocabulary).
 
-    Rows carrying the frozen projection ``bucket`` (the platform view's own classification:
-    terminal/in_flight/unresolved/unknown) are consumed verbatim; anything else falls back to
-    the canonical state vocabulary.  Unrecognized buckets, states - including NULL/empty - are
-    unknown and block both gates.
+    A row is consumed purely through ``bucket``; missing or unrecognized buckets are ``unknown``
+    and block both gates.  The consumer never re-derives the state vocabulary.
     """
 
-    bucket_map = {
-        "in_flight": "in_flight",
-        "unresolved": "unresolved",
-        "unknown": "unknown",
-    }
     in_flight, unresolved, unknown = [], [], []
     for row in rows:
         bucket = str(row.get("bucket") or "")
-        if bucket:
-            target = bucket_map.get(bucket)
-            if bucket == "terminal":
-                continue
-            if target == "in_flight":
-                in_flight.append(row)
-            elif target == "unresolved":
-                unresolved.append(row)
-            else:
-                unknown.append(row)
+        if bucket == "terminal":
             continue
-        state = str(row.get("state") or "")
-        if state in TERMINAL_STATES:
-            continue
-        if state in UNRESOLVED_STATES:
-            unresolved.append(row)
-        elif state in IN_FLIGHT_STATES:
+        if bucket == "in_flight":
             in_flight.append(row)
+        elif bucket == "unresolved":
+            unresolved.append(row)
         else:
             unknown.append(row)
     return {

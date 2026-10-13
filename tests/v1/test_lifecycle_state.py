@@ -1,4 +1,4 @@
-"""Lifecycle projection classification and gate exit codes (fail-closed platform vocabulary)."""
+"""Lifecycle projection classification and gate exit codes (fail-closed view-owned buckets)."""
 
 from __future__ import annotations
 
@@ -12,23 +12,26 @@ from description_pipeline.orchestration import lifecycle_state
 
 
 class LifecycleStateTests(unittest.TestCase):
-    def test_classify_settles_only_recognized_terminal_states(self):
-        for state in ("succeeded", "success", "published", "completed", "failed", "cancelled"):
-            with self.subTest(state=state):
-                self.assertTrue(lifecycle_state.classify([{"run_id": "r", "state": state}])["settled"])
-        for state in ("running", "queued", "pending", "publishing", "cancel_requested"):
-            with self.subTest(state=state):
-                data = lifecycle_state.classify([{"run_id": "r", "state": state}])
-                self.assertFalse(data["settled"])
-                self.assertEqual([row["run_id"] for row in data["in_flight"]], ["r"])
-        data = lifecycle_state.classify([{"run_id": "r", "state": "unresolved"}])
-        self.assertFalse(data["settled"])
-        self.assertEqual([row["run_id"] for row in data["unresolved"]], ["r"])
-        for state in ("unexpected", "unknown", ""):
-            with self.subTest(state=state):
-                data = lifecycle_state.classify([{"run_id": "r", "state": state}])
-                self.assertFalse(data["settled"])
-                self.assertEqual([row["run_id"] for row in data["unknown"]], ["r"])
+    def test_classify_consumes_only_the_view_owned_bucket(self):
+        settled = lifecycle_state.classify([{"run_id": "r", "state": "running", "bucket": "terminal"}])
+        self.assertTrue(settled["settled"])
+        in_flight = lifecycle_state.classify([{"run_id": "r", "state": "publishing", "bucket": "in_flight"}])
+        self.assertFalse(in_flight["settled"])
+        self.assertEqual([row["run_id"] for row in in_flight["in_flight"]], ["r"])
+        unresolved = lifecycle_state.classify([{"run_id": "r", "state": "unresolved", "bucket": "unresolved"}])
+        self.assertFalse(unresolved["settled"])
+        self.assertEqual([row["run_id"] for row in unresolved["unresolved"]], ["r"])
+        for row in (
+            {"run_id": "r", "state": "unexpected", "bucket": "unknown"},
+            {"run_id": "r", "state": "running", "bucket": "unrecognized"},
+            {"run_id": "r", "state": "success"},
+            {"run_id": "r", "state": None, "bucket": None},
+            {"run_id": "r"},
+        ):
+            with self.subTest(row=row):
+                data = lifecycle_state.classify([row])
+                self.assertFalse(data["settled"], "a row without a recognized bucket must never settle")
+                self.assertEqual([entry["run_id"] for entry in data["unknown"]], ["r"])
 
     def test_observe_keeps_null_states_visible_without_filters(self):
         observed_filters = []
@@ -90,17 +93,23 @@ class LifecycleStateTests(unittest.TestCase):
                 code = lifecycle_state.main(["report", *flags], collect=lambda: rows)
             return code, json.loads(stream.getvalue())
 
-        code, data = run([{"run_id": "a", "state": "running"}], "--require-no-unresolved")
+        code, data = run([{"run_id": "a", "state": "running", "bucket": "in_flight"}], "--require-no-unresolved")
         self.assertEqual(code, 0)
         self.assertEqual(data["in_flight"][0]["run_id"], "a")
-        code, _ = run([{"run_id": "a", "state": "running"}], "--require-settled")
+        code, _ = run([{"run_id": "a", "state": "running", "bucket": "in_flight"}], "--require-settled")
         self.assertEqual(code, 1)
-        code, _ = run([{"run_id": "a", "state": "unresolved"}], "--require-no-unresolved")
+        code, _ = run([{"run_id": "a", "state": "unresolved", "bucket": "unresolved"}], "--require-no-unresolved")
         self.assertEqual(code, 1)
-        code, _ = run([{"run_id": "a", "state": "unresolved"}], "--require-settled")
+        code, _ = run([{"run_id": "a", "state": "unresolved", "bucket": "unresolved"}], "--require-settled")
         self.assertEqual(code, 1)
-        code, _ = run([{"run_id": "a", "state": "published"}], "--require-settled", "--require-no-unresolved")
+        code, _ = run(
+            [{"run_id": "a", "state": "completed", "bucket": "terminal"}],
+            "--require-settled",
+            "--require-no-unresolved",
+        )
         self.assertEqual(code, 0)
+        code, _ = run([{"run_id": "a", "state": "success"}], "--require-settled")
+        self.assertEqual(code, 1, "scheduler rows without the view's bucket are unknown and must block")
 
 
 if __name__ == "__main__":
