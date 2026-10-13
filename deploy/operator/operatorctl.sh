@@ -13,8 +13,6 @@
 #   rollback  restore both ends from the recorded previous installation
 #
 #   operatorctl.sh <verb> --config FILE
-#   transitional until each verb is bridged:
-#     operatorctl.sh <start|stop|status|health> --env-file FILE
 #
 # Only description-* units are written; unrelated user units are untouched. Credentials and state
 # live under the configured state root (outside Git).
@@ -29,7 +27,6 @@ die() { echo "operatorctl: $*" >&2; exit 1; }
 usage() {
   cat >&2 <<'USAGE'
 usage: operatorctl.sh <validate|install|start|drain|stop|status|health|reconcile|stage|promote|rollback> --config FILE
-       operatorctl.sh <start|stop|status|health> --env-file FILE  # transitional entry
 install inputs: --install-id ID --wheel FILE --endpoint-identity FILE [--release-file FILE]
 exit codes: 0 ok; 1 configuration/environment error; 2 usage; 3 recognized verb without its --config bridge yet
 USAGE
@@ -47,7 +44,6 @@ RELEASE_FILE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --config) CONFIG_FILE="${2:-}"; shift 2 ;;
-    --env-file) ENV_FILE="${2:-}"; shift 2 ;;
     --install-id) INSTALL_ID="${2:-}"; shift 2 ;;
     --wheel) WHEEL_FILE="${2:-}"; shift 2 ;;
     --endpoint-identity) ENDPOINT_IDENTITY="${2:-}"; shift 2 ;;
@@ -88,34 +84,35 @@ install_from_config() {
   ENV_FILE="$DERIVED_ENV"
 }
 
-if [ -n "$CONFIG_FILE" ] && [ -n "$ENV_FILE" ]; then usage; fi
+load_active_env() {
+  STATE_ROOT="$(python3 "$HERE/platform_config.py" resolve --config "$CONFIG_FILE" | \
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["storage"]["state_root"])')" || exit $?
+  local record="$STATE_ROOT/install-record.json"
+  [ -f "$record" ] || die "not installed: $record is missing (run install first)"
+  local active
+  active="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["install_id"])' "$record")"
+  ENV_FILE="$STATE_ROOT/derived/$active/operator.env"
+  [ -f "$ENV_FILE" ] || die "derived environment missing for generation $active; run install"
+}
+
+[ -n "$CONFIG_FILE" ] || usage
 if [ -n "$INSTALL_ID$WHEEL_FILE$ENDPOINT_IDENTITY$RELEASE_FILE" ] && [ "$ACTION" != "install" ]; then usage; fi
-if [ -n "$CONFIG_FILE" ]; then
-  [ -f "$CONFIG_FILE" ] || die "config file not found: $CONFIG_FILE"
-  # Every verb passes the same static config gate first; the snapshot rendered at install stays
-  # the single authority for the whole lifecycle.
-  python3 "$HERE/platform_config.py" validate --config "$CONFIG_FILE" >/dev/null || exit $?
-  case "$ACTION" in
-    validate)
-      echo "operatorctl: configuration valid: $CONFIG_FILE"
-      exit 0 ;;
-    install)
-      install_from_config ;;
-    *)
-      echo "operatorctl: '$ACTION' is recognized but its --config bridge is not implemented in this increment;" >&2
-      echo "use the transitional --env-file entry for the current deployment" >&2
-      exit 3 ;;
-  esac
-fi
-if [ -z "$CONFIG_FILE" ]; then
-  # Transitional env-file entry, removed as each verb is bridged.
-  [ -n "$ENV_FILE" ] || usage
-  [ -f "$ENV_FILE" ] || die "env file not found: $ENV_FILE"
-  case "$ACTION" in
-    start|stop|status|health) ;;
-    *) usage ;;
-  esac
-fi
+[ -f "$CONFIG_FILE" ] || die "config file not found: $CONFIG_FILE"
+# Every verb passes the same static config gate first; the install record and its derived
+# per-generation environment stay the single authority for the operational verbs.
+python3 "$HERE/platform_config.py" validate --config "$CONFIG_FILE" >/dev/null || exit $?
+case "$ACTION" in
+  validate)
+    echo "operatorctl: configuration valid: $CONFIG_FILE"
+    exit 0 ;;
+  install)
+    install_from_config ;;
+  start|drain|stop|status|health)
+    load_active_env ;;
+  *)
+    echo "operatorctl: '$ACTION' is recognized but its --config bridge is not implemented in this increment" >&2
+    exit 3 ;;
+esac
 
 airflow_render() {
   AIRFLOW_VENV="$AIRFLOW_VENV" AIRFLOW_HOME="$AIRFLOW_HOME" \
@@ -291,6 +288,30 @@ case "$ACTION" in
     airflow_lifecycle start
     open_admission
     systemctl --user enable --now description-portal.service description-operator-proxy.service
+    ;;
+  drain)
+    load_installed
+    AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/airflow" dags pause solidworks_to_urdf \
+      || die "could not close the DAG admission"
+    # In-flight executions continue; unresolved outcomes are resolved by the reconcile verb
+    # (not bridged yet), so drain reports the run store verbatim instead of guessing states.
+    python3 - "$PIPELINE_STORE_ROOT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+rows = []
+for meta_path in sorted(root.glob("*/meta.json")):
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise SystemExit(f"drain: cannot read {meta_path}: {error}")
+    rows.append({"run_id": meta_path.parent.name, "state": str(meta.get("state") or "unknown")})
+inflight = [row for row in rows if row["state"] not in {"published", "failed", "cancelled"}]
+print(json.dumps({"admission": "closed", "in_flight": inflight, "runs": rows}))
+PY
+    echo "drain: admission closed; in-flight executions continue"
     ;;
   stop)
     load_installed

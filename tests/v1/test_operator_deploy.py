@@ -55,6 +55,116 @@ def render(state: Path, **overrides: str) -> subprocess.CompletedProcess:
     return run([sys.executable, str(RENDER), "--env-file", str(env_file)], env)
 
 
+def platform_fixture(
+    tmp: Path,
+    *,
+    install_id: str = "gen-1",
+    host: str = "rehearsal.local",
+    https_port: int = 18443,
+    ssh_host: str = "windows-m3",
+) -> tuple[Path, Path, dict[str, str]]:
+    """Config-driven fixture: platform.json + snapshot + derived env + active record.
+
+    The snapshot and the per-generation environment are produced by the real modules; the
+    active record is a minimal fixture (its install_id is the only field load_active_env
+    consumes - the full record binding is exercised by the install tests and
+    tests/v1/test_install_record.py).
+    """
+
+    state = tmp / "state"
+    secrets = tmp / "secrets"
+    secrets.mkdir(exist_ok=True)
+    for name in ("tls.crt", "tls.key"):
+        path = secrets / name
+        path.write_text("x", encoding="utf-8")
+        path.chmod(0o600)
+    feishu = secrets / "feishu.json"
+    feishu.write_text('{"app_id": "cli_test", "app_secret": "s"}\n', encoding="utf-8")
+    feishu.chmod(0o600)
+    token = secrets / "endpoint.token"
+    token.write_text("test-token\n", encoding="utf-8")
+    token.chmod(0o600)
+    wheel = tmp / "mimicverse_description-test-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+    config = {
+        "schema_version": schemas.PLATFORM_CONFIG_SCHEMA,
+        "operator": {
+            "origin": f"https://{host}:{https_port}",
+            "certificate_file": str(secrets / "tls.crt"),
+            "private_key_file": str(secrets / "tls.key"),
+        },
+        "storage": {
+            "state_root": str(state),
+            "handoff_root": str(tmp / "handoffs"),
+            "artifact_root": str(tmp / "artifacts"),
+            "workspace_root": str(tmp / "workspaces"),
+            "release_root": str(tmp / "releases"),
+        },
+        "database": {"dsn_file": str(secrets / "postgres.dsn")},
+        "windows": {
+            "ssh_host": ssh_host,
+            "endpoint_port": 9765,
+            "token_file": str(token),
+            "instance": {
+                "task_name": "description-e2e-endpoint",
+                "package_root": "C:/description-e2e/packages",
+                "output_root": "C:/description-e2e/results",
+                "state_root": "C:/description-e2e/state",
+            },
+        },
+        "auth": {
+            "feishu_secret_file": str(feishu),
+            "tenant_keys": ["tenant-key"],
+            "admin_open_ids": [],
+        },
+        "targets": {"m3.0": {"repository_slug": "owner/model-repository", "base": "main"}},
+        "specifications": {"record_roots": [str(tmp / "specifications")]},
+    }
+    config_path = tmp / "platform.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    rendered = run(
+        [
+            sys.executable,
+            str(OPERATOR / "platform_config.py"),
+            "render",
+            "--config",
+            str(config_path),
+            "--install-id",
+            install_id,
+        ],
+        {},
+    )
+    if rendered.returncode != 0:
+        raise AssertionError(rendered.stderr)
+    snapshot = next(line.split("=", 1)[1] for line in rendered.stdout.splitlines() if line.startswith("snapshot="))
+    emitted = run(
+        [
+            sys.executable,
+            str(OPERATOR / "platform_env.py"),
+            "emit",
+            "--snapshot",
+            snapshot,
+            "--install-id",
+            install_id,
+            "--tree",
+            str(tmp),
+        ],
+        {},
+    )
+    if emitted.returncode != 0:
+        raise AssertionError(emitted.stderr)
+    env_path = next(line.split("=", 1)[1] for line in emitted.stdout.splitlines() if line.startswith("env="))
+    env: dict[str, str] = {}
+    for line in Path(env_path).read_text(encoding="utf-8").splitlines():
+        key, _, value = line.partition("=")
+        if key:
+            env[key] = value
+    record = state / "install-record.json"
+    record.write_text(json.dumps({"install_id": install_id}), encoding="utf-8")
+    record.chmod(0o600)
+    return config_path, Path(env_path), env
+
+
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -394,54 +504,38 @@ class RenderTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.TestCase):
-    def _render_units(self, tmp: Path) -> tuple[Path, Path, Path]:
-        state = tmp / "state"
-        env_file = tmp / "operator.env"
-        secret = tmp / "feishu_app.json"
-        secret.write_text('{"app_id": "cli_test", "app_secret": "s"}\n', encoding="utf-8")
-        secret.chmod(0o600)
-        env = base_env(
-            state,
-            POSTGRES_ROOT=str(tmp / "pg"),
-            SOLIDWORKS_SSH_HOST="windows-m3",
-            FEISHU_APP_SECRET_FILE=str(secret),
-            FEISHU_TENANT_KEYS="tenant_a",
-        )
-        env_file.write_text("".join(f"{key}={value}\n" for key, value in env.items()), encoding="utf-8")
+    def _render_units(self, tmp: Path) -> tuple[Path, Path, Path, Path]:
+        config_path, env_path, env = platform_fixture(tmp)
+        state = Path(env["OPERATOR_STATE"])
         config_home = tmp / "config"
         target = config_home / "systemd" / "user"
         target.mkdir(parents=True)
         rendered = run(
-            [sys.executable, str(RENDER), "--env-file", str(env_file), "--units-dir", str(target)],
+            [sys.executable, str(RENDER), "--env-file", str(env_path), "--units-dir", str(target)],
             {"XDG_CONFIG_HOME": str(config_home)},
         )
         self.assertEqual(rendered.returncode, 0, rendered.stderr)
-        airflow = run(
-            ["bash", str(OPERATOR.parent / "airflow" / "services.sh"), "render"],
-            {
-                "XDG_CONFIG_HOME": str(config_home),
-                "AIRFLOW_VENV": env["AIRFLOW_VENV"],
-                "AIRFLOW_HOME": env["AIRFLOW_HOME"],
-                "POSTGRES_ROOT": env["POSTGRES_ROOT"],
-                "POSTGRES_MAJOR": "14",
-                "AIRFLOW_API_PORT": "8791",
-                "POSTGRES_PORT": "5433",
-                "TUNNEL_LOOPBACK_PORT": "18765",
-                "SOLIDWORKS_ENDPOINT_PORT": "8765",
-                "SOLIDWORKS_SSH_HOST": "windows-m3",
-                "FEISHU_ENV_FILE": str(state / "feishu.env"),
-            },
-        )
+        airflow_env = {"XDG_CONFIG_HOME": str(config_home)}
+        for line in (state / "resolved.env").read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition("=")
+            if key:
+                airflow_env[key] = value
+        airflow = run(["bash", str(OPERATOR.parent / "airflow" / "services.sh"), "render"], airflow_env)
         self.assertEqual(airflow.returncode, 0, airflow.stderr)
-        return state, config_home, target
+        return config_path, state, config_home, target
 
     def _admission_fixture(self, tmp: Path, *, register_after: int = 0, unpause_rc: int = 0, pause_rc: int = 0):
-        _, config_home, _ = self._render_units(tmp)
+        config_path, state, config_home, _ = self._render_units(tmp)
+        derived_env: dict[str, str] = {}
+        for line in (state / "derived" / "gen-1" / "operator.env").read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition("=")
+            if key:
+                derived_env[key] = value
         bindir = tmp / "bin"
         bindir.mkdir()
         write_stub(bindir / "systemctl", '#!/bin/bash\necho "systemctl $*" >> "$ORDER_LOG"\n')
         write_stub(bindir / "sleep", "#!/bin/bash\nexit 0\n")
-        venv = tmp / "venv/bin"
+        venv = Path(derived_env["AIRFLOW_VENV"]) / "bin"
         venv.mkdir(parents=True)
         write_stub(
             venv / "airflow",
@@ -477,13 +571,13 @@ class LifecycleTests(unittest.TestCase):
             "UNPAUSE_RC": str(unpause_rc),
             "PAUSE_RC": str(pause_rc),
         }
-        return tmp / "operator.env", env, admission, order
+        return config_path, env, admission, order
 
     def test_start_opens_verified_admission_before_ingress(self) -> None:
         for register_after in (0, 1):
             with self.subTest(register_after=register_after), tempfile.TemporaryDirectory() as tmp:
-                env_file, env, admission, order = self._admission_fixture(Path(tmp), register_after=register_after)
-                result = run(["bash", str(CONTROL), "start", "--env-file", str(env_file)], env)
+                config_path, env, admission, order = self._admission_fixture(Path(tmp), register_after=register_after)
+                result = run(["bash", str(CONTROL), "start", "--config", str(config_path)], env)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(admission.read_text().strip(), "false")
                 lines = order.read_text().splitlines()
@@ -495,8 +589,8 @@ class LifecycleTests(unittest.TestCase):
 
     def test_unpause_failure_does_not_start_ingress(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            env_file, env, admission, order = self._admission_fixture(Path(tmp), unpause_rc=7)
-            result = run(["bash", str(CONTROL), "start", "--env-file", str(env_file)], env)
+            config_path, env, admission, order = self._admission_fixture(Path(tmp), unpause_rc=7)
+            result = run(["bash", str(CONTROL), "start", "--config", str(config_path)], env)
             self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
             self.assertEqual(admission.read_text(), "true")
             self.assertNotIn("description-portal.service", order.read_text())
@@ -505,9 +599,9 @@ class LifecycleTests(unittest.TestCase):
     def test_stop_closes_ingress_and_stops_services_even_when_pause_fails(self) -> None:
         for pause_rc in (0, 9):
             with self.subTest(pause_rc=pause_rc), tempfile.TemporaryDirectory() as tmp:
-                env_file, env, admission, order = self._admission_fixture(Path(tmp), pause_rc=pause_rc)
+                config_path, env, admission, order = self._admission_fixture(Path(tmp), pause_rc=pause_rc)
                 admission.write_text("false")
-                result = run(["bash", str(CONTROL), "stop", "--env-file", str(env_file)], env)
+                result = run(["bash", str(CONTROL), "stop", "--config", str(config_path)], env)
                 self.assertEqual(result.returncode, pause_rc, result.stdout + result.stderr)
                 self.assertEqual(admission.read_text().strip(), "true" if pause_rc == 0 else "false")
                 lines = order.read_text().splitlines()
@@ -520,7 +614,7 @@ class LifecycleTests(unittest.TestCase):
 
     def test_units_render_and_static_health_passes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            state, config_home, target = self._render_units(Path(tmp))
+            _, state, config_home, target = self._render_units(Path(tmp))
             (target / "unrelated.service").write_text("[Unit]\nDescription=keep\n", encoding="utf-8")
             token_file = state / "secrets" / "endpoint.token"
             token_file.parent.mkdir(parents=True, exist_ok=True)
@@ -551,26 +645,31 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(health.returncode, 0, health.stdout + health.stderr)
             self.assertIn("STATIC OK", health.stdout)
 
-    def test_operatorctl_surface_and_env_file(self) -> None:
+    def test_operatorctl_surface_is_config_only(self) -> None:
         missing_target = run(["bash", str(CONTROL), "install"], {})
         self.assertEqual(missing_target.returncode, 2)
         self.assertIn("usage:", missing_target.stderr)
         with tempfile.TemporaryDirectory() as tmp:
-            env_file = Path(tmp) / "operator.env"
-            env_file.write_text("OPERATOR_HOST=rehearsal.local\n", encoding="utf-8")
-            removed = run(["bash", str(CONTROL), "rehearse", "--env-file", str(env_file)], {})
+            config_path, _, _ = platform_fixture(Path(tmp))
+            removed = run(["bash", str(CONTROL), "rehearse", "--config", str(config_path)], {})
             self.assertEqual(removed.returncode, 2)
-            legacy = run(["bash", str(CONTROL), "health", "--env-file", str(Path(tmp) / "nope.env")], {})
-            self.assertEqual(legacy.returncode, 1)
-            self.assertIn("env file not found", legacy.stderr)
-            config_only = run(["bash", str(CONTROL), "install", "--env-file", str(env_file)], {})
-            self.assertEqual(config_only.returncode, 2)
-            self.assertIn("usage:", config_only.stderr)
+            env_entry = run(["bash", str(CONTROL), "health", "--env-file", str(Path(tmp) / "operator.env")], {})
+            self.assertEqual(env_entry.returncode, 2)
+            self.assertIn("usage:", env_entry.stderr)
+            no_config = run(["bash", str(CONTROL), "start"], {})
+            self.assertEqual(no_config.returncode, 2)
+            other = Path(tmp) / "other.json"
+            other.write_text(
+                config_path.read_text(encoding="utf-8").replace(str(Path(tmp) / "state"), str(Path(tmp) / "other")),
+                encoding="utf-8",
+            )
+            not_installed = run(["bash", str(CONTROL), "status", "--config", str(other)], {})
+            self.assertEqual(not_installed.returncode, 1)
+            self.assertIn("not installed", not_installed.stderr)
 
     def test_status_is_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            state, config_home, target = self._render_units(Path(tmp))
-            env_file = Path(tmp) / "operator.env"
+            config_path, state, config_home, target = self._render_units(Path(tmp))
             tracked = (
                 state / "resolved.env",
                 state / "portal.json",
@@ -579,22 +678,13 @@ class LifecycleTests(unittest.TestCase):
             )
             before = {path: digest(path) for path in tracked}
             result = run(
-                ["bash", str(CONTROL), "status", "--env-file", str(env_file)], {"XDG_CONFIG_HOME": str(config_home)}
+                ["bash", str(CONTROL), "status", "--config", str(config_path)], {"XDG_CONFIG_HOME": str(config_home)}
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertNotIn("DRIFT", result.stdout)
             self.assertEqual(before, {path: digest(path) for path in before})
 
-    def test_env_example_and_toolchain_are_current(self) -> None:
-        example = (OPERATOR / "operator.env.example").read_text(encoding="utf-8")
-        self.assertIn("--env-file", example)
-        for stale in ("install-base", "install-proxy", "rehearse", "--refresh", "c9", "root provides"):
-            self.assertNotIn(stale, example)
-        self.assertIn("mimicverse_description-<version>-py3-none-any.whl", example)
-        self.assertIsNone(
-            re.search(r"mimicverse_description-\d+\.\d+\.\d+-py3-none-any\.whl", example),
-            "the example must not pin a concrete release wheel",
-        )
+    def test_toolchain_pins_are_current(self) -> None:
         toolchain = (OPERATOR / "scripts" / "install_toolchain.sh").read_text(encoding="utf-8")
         self.assertIn("UV_VERSION=0.12.23", toolchain)
         self.assertIn("PYTHON_VERSION=3.12.14", toolchain)
@@ -666,23 +756,22 @@ class LifecycleTests(unittest.TestCase):
 
     def test_drift_check_reports_missing_and_changed_units(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            state, config_home, target = self._render_units(Path(tmp))
-            env_file = Path(tmp) / "operator.env"
-            control_env = {"XDG_CONFIG_HOME": str(config_home), "OPERATOR_STATE": str(state)}
+            config_path, _, config_home, target = self._render_units(Path(tmp))
+            control_env = {"XDG_CONFIG_HOME": str(config_home)}
             portal = target / "description-portal.service"
             portal.write_text(portal.read_text(encoding="utf-8") + "# drifted\n", encoding="utf-8")
-            changed = run(["bash", str(CONTROL), "status", "--env-file", str(env_file)], control_env)
+            changed = run(["bash", str(CONTROL), "status", "--config", str(config_path)], control_env)
             self.assertEqual(changed.returncode, 0, changed.stdout + changed.stderr)
             self.assertIn("DRIFT unit differs: description-portal.service", changed.stdout)
             (target / "description-airflow-scheduler.service").unlink()
-            missing = run(["bash", str(CONTROL), "status", "--env-file", str(env_file)], control_env)
+            missing = run(["bash", str(CONTROL), "status", "--config", str(config_path)], control_env)
             self.assertIn("DRIFT unit missing: description-airflow-scheduler.service", missing.stdout)
             self.assertIn("DRIFT unit differs: description-portal.service", missing.stdout)
 
     def test_drift_check_reports_render_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            state, config_home, _ = self._render_units(Path(tmp))
-            env_file = Path(tmp) / "operator.env"
+            config_path, state, config_home, _ = self._render_units(Path(tmp))
+            env_file = state / "derived" / "gen-1" / "operator.env"
             env_file.write_text(
                 env_file.read_text(encoding="utf-8")
                 + f"OPERATOR_TLS_CERT={Path(tmp) / 'missing.crt'}\n"
@@ -690,8 +779,8 @@ class LifecycleTests(unittest.TestCase):
                 encoding="utf-8",
             )
             failed = run(
-                ["bash", str(CONTROL), "status", "--env-file", str(env_file)],
-                {"XDG_CONFIG_HOME": str(config_home), "OPERATOR_STATE": str(state)},
+                ["bash", str(CONTROL), "status", "--config", str(config_path)],
+                {"XDG_CONFIG_HOME": str(config_home)},
             )
             self.assertIn("DRIFT unit missing from render: description-portal.service", failed.stdout)
             self.assertIn("DRIFT unit missing from render: description-operator-proxy.service", failed.stdout)
@@ -699,7 +788,7 @@ class LifecycleTests(unittest.TestCase):
 
     def test_api_server_unit_loads_the_optional_feishu_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            state, _, target = self._render_units(Path(tmp))
+            _, state, _, target = self._render_units(Path(tmp))
             unit = (target / "description-airflow-api-server.service").read_text(encoding="utf-8")
             self.assertIn(f"EnvironmentFile=-{state}/feishu.env", unit)
             self.assertNotIn("@", unit)
@@ -707,26 +796,6 @@ class LifecycleTests(unittest.TestCase):
             self.assertNotIn("EnvironmentFile", scheduler)
             control = CONTROL.read_text(encoding="utf-8")
             self.assertIn('FEISHU_ENV_FILE="${FEISHU_ENV_FILE:-$AIRFLOW_HOME/feishu.env}"', control)
-
-    def test_shipped_example_path_relationships_validate(self) -> None:
-        example = (OPERATOR / "operator.env.example").read_text(encoding="utf-8")
-        values = dict(line.split("=", 1) for line in example.splitlines() if line and not line.startswith("#"))
-        original_prefix = Path(values["OPERATOR_STATE"]).parent
-        with tempfile.TemporaryDirectory() as tmp:
-            prefix = Path(tmp) / "deployment"
-            rewritten = example.replace(str(original_prefix), str(prefix))
-            env_file = Path(tmp) / "example.env"
-            env_file.write_text(rewritten + "\n", encoding="utf-8")
-            result = run([sys.executable, str(RENDER), "--env-file", str(env_file)], {})
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            resolved = (prefix / "state/resolved.env").read_text(encoding="utf-8")
-            self.assertIn(f"SOLIDWORKS_HANDOFF_ROOT={prefix}/cad-handoffs", resolved)
-            # The shipped intake must stay outside the managed state/runtime tree.
-            resolved_values = dict(line.split("=", 1) for line in resolved.splitlines() if line)
-            intake = Path(resolved_values["SOLIDWORKS_HANDOFF_ROOT"])
-            for key in ("OPERATOR_STATE", "AIRFLOW_VENV", "AIRFLOW_HOME", "POSTGRES_ROOT"):
-                runtime = Path(resolved_values[key])
-                self.assertFalse(intake.is_relative_to(runtime) or runtime.is_relative_to(intake))
 
     def test_scripts_are_syntactically_valid(self) -> None:
         for script in (

@@ -1,11 +1,10 @@
-"""operatorctl unified verb skeleton over platform.json (W2 lifecycle increment 1).
+"""operatorctl unified lifecycle surface over platform.json (config only).
 
-The skeleton recognizes the frozen lifecycle verbs
-(``validate/install/start/drain/stop/status/health/reconcile/stage/promote/rollback``), gates
-every one of them on the same static ``platform_config.py`` check, and refuses to pretend a
-bridge that does not exist: verbs without their ``--config`` implementation exit 3 and point at
-the transitional ``--env-file`` entry.  The transitional entry itself must stay behaviorally
-untouched until the bridge replaces it.
+All frozen lifecycle verbs (``validate/install/start/drain/stop/status/health/reconcile/stage/
+promote/rollback``) take ``--config`` as the single entry; every one of them passes the same
+static ``platform_config.py`` gate first.  The operational verbs load the active install
+record and its derived per-generation environment; verbs whose bridge has not landed yet exit 3
+without pretending.  ``--env-file`` does not exist as an entry point.
 """
 
 from __future__ import annotations
@@ -36,7 +35,10 @@ ALL_VERBS = (
     "promote",
     "rollback",
 )
-UNBRIDGED_VERBS = tuple(verb for verb in ALL_VERBS if verb not in {"validate", "install"})
+UNBRIDGED_VERBS = tuple(
+    verb for verb in ALL_VERBS if verb not in {"validate", "install", "start", "drain", "stop", "status", "health"}
+)
+BRIDGED_OPERATIONAL = ("start", "drain", "stop", "status", "health")
 
 
 def run(args: list[str]) -> subprocess.CompletedProcess:
@@ -113,7 +115,6 @@ class LifecycleSkeletonTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 3)
                 self.assertIn(verb, result.stderr)
                 self.assertIn("not implemented in this increment", result.stderr)
-                self.assertIn("--env-file", result.stderr)
 
     def test_invalid_config_fails_before_any_verb_behavior(self):
         bad = self.root / "bad.json"
@@ -138,15 +139,12 @@ class LifecycleSkeletonTests(unittest.TestCase):
         self.assertEqual(missing.returncode, 1)
         self.assertIn("config file not found", missing.stderr)
 
-    def test_transitional_env_entry_is_untouched(self):
-        result = run(["install", "--env-file", str(self.root / "missing.env")])
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("env file not found", result.stderr)
-        stub = self.root / "operator.env"
-        stub.write_text("OPERATOR_STATE=/nonexistent\n", encoding="utf-8")
-        result = run(["status", "--env-file", str(stub)])
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("not installed", result.stderr)
+    def test_bridged_verbs_require_an_installed_generation(self):
+        for verb in BRIDGED_OPERATIONAL:
+            with self.subTest(verb):
+                result = run([verb, "--config", str(self.config)])
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("not installed", result.stderr)
 
 
 if __name__ == "__main__":
