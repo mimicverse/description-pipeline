@@ -92,7 +92,7 @@ class MassEvidenceContractTests(unittest.TestCase):
             # 新合同：声明质量必须绑定归档证据文件；这里只给形状，文件由独立校验核对
             source["mass_evidence"] = _binding()
         return {
-            "schema_version": "description.definition/v1",
+            "schema_version": "solidworks-to-urdf.input/v1",
             "hardware_id": "fixture",
             "source": source,
             "overrides": [],

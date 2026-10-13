@@ -53,7 +53,7 @@ class EvidenceBindingTests(unittest.TestCase):
         self.root = self.tmp / "model"
         (self.root / "config").mkdir(parents=True)
         (self.root / "config" / "robot.yaml").write_text(
-            "schema_version: description.definition/v1\n", encoding="utf-8"
+            "schema_version: solidworks-to-urdf.input/v1\n", encoding="utf-8"
         )
         self.spec = self.root / "docs" / "provenance" / "mass-spec.json"
         self.spec.parent.mkdir(parents=True)
@@ -104,7 +104,7 @@ class EvidenceBindingTests(unittest.TestCase):
         source = dict(self.config)
         source.update(source_overrides)
         return {
-            "schema_version": "description.definition/v1",
+            "schema_version": "solidworks-to-urdf.input/v1",
             "hardware_id": "fixture",
             "source": source,
             "overrides": [],

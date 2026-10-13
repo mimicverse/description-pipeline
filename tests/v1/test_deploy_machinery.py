@@ -13,6 +13,10 @@ REHEARSAL = ROOT / "deploy/operator/rehearsal"
 CANDIDATE = ROOT / "deploy/windows/candidate"
 SCRIPTS = ("prepare-venv.sh", "stage-and-validate.sh", "switch.sh", "quiesce-admission.sh")
 GENERATION = re.compile(r"native(?:[0-9]{1,2}|-product[0-9]{1,2})")
+#: Schema ids outside the ``solidworks-to-urdf.*`` family are retired; the two
+#: documented exceptions below intentionally keep their historical ids (XC-01).
+RETIRED_SCHEMA_ID = re.compile(r"\b(?:description-pipeline|description)\.[A-Za-z][A-Za-z0-9._-]*/v[0-9]+\b")
+DOCUMENTED_ID_EXCEPTIONS = ("native-discovery/v1", "swbridge.material-assignment/v1")
 
 
 class DeployMachineryTests(unittest.TestCase):
@@ -41,6 +45,34 @@ class DeployMachineryTests(unittest.TestCase):
         for path in files:
             text = path.read_text(encoding="utf-8", errors="replace")
             self.assertNotRegex(text, GENERATION, path.name)
+
+    def test_retired_schema_namespace_is_absent_from_product_code(self) -> None:
+        """No ``description-pipeline.*``/``description.*`` schema ids in product code.
+
+        Tests are out of scope on purpose: the negative-control tests carry retired
+        ids as deliberate rejection fixtures.  Deploy-history review material is not
+        product code either.
+        """
+
+        found = []
+        for relative in ("src", "deploy", "tools"):
+            for path in sorted((ROOT / relative).rglob("*")):
+                if not path.is_file() or "__pycache__" in path.parts:
+                    continue
+                for match in RETIRED_SCHEMA_ID.finditer(path.read_text(encoding="utf-8", errors="ignore")):
+                    found.append(f"{path.relative_to(ROOT).as_posix()}: {match.group(0)}")
+        self.assertEqual([], found)
+        for exception in DOCUMENTED_ID_EXCEPTIONS:
+            self.assertNotRegex(exception, RETIRED_SCHEMA_ID)
+
+    def test_candidate_receipts_use_the_current_namespace(self) -> None:
+        for name, expected in (
+            ("stop-production-for-promotion.ps1", "solidworks-to-urdf.production-stop/v1"),
+            ("stop-candidate-endpoint-safe.ps1", "solidworks-to-urdf.candidate-safe-stop/v1"),
+        ):
+            text = (CANDIDATE / name).read_text(encoding="utf-8")
+            self.assertIn(expected, text)
+            self.assertNotIn("description-pipeline.", text)
 
     def test_candidate_stage_binding_is_single_sourced(self) -> None:
         # The register action passes -Stage <base>; the child must operate on exactly that

@@ -68,7 +68,7 @@ if (Test-Path -LiteralPath $ReceiptPath) {
   throw ('Preserve the existing stop receipt; inspect before retrying: ' + $ReceiptPath)
 }
 $Receipt = [ordered]@{
-  schema_version = 'description-pipeline.production-stop/v1'
+  schema_version = 'solidworks-to-urdf.production-stop/v1'
   at = (Get-Date).ToUniversalTime().ToString('o')
   host = $env:COMPUTERNAME
   user = $env:USERNAME

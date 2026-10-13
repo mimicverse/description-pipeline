@@ -133,7 +133,7 @@ class ProductConventionTests(unittest.TestCase):
         source = dict(self.config)
         source.update(source_overrides)
         return {
-            "schema_version": "description.definition/v1",
+            "schema_version": "solidworks-to-urdf.input/v1",
             "hardware_id": "fixture",
             "source": source,
             "overrides": [],

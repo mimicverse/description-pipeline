@@ -37,7 +37,7 @@ $CandidateStateRoot = Join-Path $Base 'state'
 $ProductionStateRoot = "$Root\endpoint-state"
 
 $Data = [ordered]@{
-  schema_version = 'description-pipeline.candidate-safe-stop/v1'
+  schema_version = 'solidworks-to-urdf.candidate-safe-stop/v1'
   at = (Get-Date).ToUniversalTime().ToString('o')
   reason = $Reason
   base = $Base

@@ -22,28 +22,31 @@ def build(root: Path, *, scene: object = None, extra: dict[str, str] | None = No
     return write_manifest(root, kind="fixture", identity=IDENTITY, evidence_class="fixture")
 
 
-class LegacyNamespaceTests(unittest.TestCase):
-    """XC-01: sealed evidence with the retired ids stays readable; unknowns fail."""
+class RetiredNamespaceTests(unittest.TestCase):
+    """Retired schema ids are refused fail-closed; era artifacts replay with era toolchains."""
 
-    def test_legacy_manifest_id_is_accepted(self) -> None:
+    def test_retired_manifest_id_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             manifest = build(root, extra={"parts/base.stl": "binary"})
             write_json(root / "manifest.json", {**manifest, "schema_version": "description.source/v1"})
-            self.assertEqual(verify_snapshot(root)["schema_version"], "description.source/v1")
-            self.assertEqual(load_scene(root), {"links": []})
+            with self.assertRaisesRegex(PipelineError, "Unsupported source manifest schema"):
+                verify_snapshot(root)
 
-    def test_legacy_model_ids_validate_and_unknown_ids_fail(self) -> None:
+    def test_retired_model_and_scene_ids_are_rejected(self) -> None:
         from description_pipeline.model import validate_scene_schema
+        from description_pipeline.sources.solidworks.scene import SCENE_SCHEMA, scene_schema_supported
 
         fixture = Path(__file__).resolve().parents[1] / "fixtures" / "v1" / "mesh-source" / "scene.json"
         model = json.loads(fixture.read_text(encoding="utf-8"))
         validate_scene_schema(model)
-        for legacy in ("description.scene/v1", "description.robot/v1"):
-            with self.subTest(schema=legacy):
-                validate_scene_schema({**model, "schema_version": legacy})
+        for retired in ("description.scene/v1", "description.robot/v1", "description.source/v1"):
+            with self.subTest(schema=retired), self.assertRaises(PipelineError):
+                validate_scene_schema({**model, "schema_version": retired})
         with self.assertRaises(PipelineError):
             validate_scene_schema({**model, "schema_version": "description.scene/v2"})
+        self.assertTrue(scene_schema_supported(SCENE_SCHEMA))
+        self.assertFalse(scene_schema_supported("description.scene/v1"))
 
 
 class WriteManifestTests(unittest.TestCase):

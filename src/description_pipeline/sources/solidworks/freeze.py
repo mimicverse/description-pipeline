@@ -28,10 +28,9 @@ from .jsonio import digest_json, sha256_file, write_json
 from ...io import inventory
 from ...schemas import EFFECTIVE_INSTANCES_SCHEMA, LINK_GROUP_MASS_SCHEMA
 
-#: Freeze/capture record ids now live in the ``solidworks-to-urdf.*`` family.
-#: Retained evidence written before the XC-01 rename carries the retired
-#: ``description-pipeline.*`` ids; readers that assert one of these ids must
-#: accept both spellings (mapping recorded in the rename PR).
+#: Freeze/capture record ids live in the ``solidworks-to-urdf.*`` family only.
+#: Sealed evidence from before the XC-01 rename is replayed with its era
+#: toolchain instead of being read by current code.
 FREEZE_SCHEMA = "solidworks-to-urdf.freeze/v1"
 SOURCE_KIND = "solidworks"
 DEFAULT_ALLOWED_SUFFIXES = (".sldasm", ".sldprt")
