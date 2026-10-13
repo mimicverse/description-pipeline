@@ -18,7 +18,7 @@ from description_pipeline.delivery import (
     write_delivery_manifest,
 )
 from description_pipeline.io import PipelineError, digest
-from description_pipeline.schemas import SOURCE_RECORD_SCHEMA
+from description_pipeline.schemas import CHECK_POLICY_SCHEMA, SOURCE_RECORD_SCHEMA
 from description_pipeline.stages import CONTRACT
 
 HEX = "a" * 64
@@ -68,7 +68,7 @@ class DeliveryTests(unittest.TestCase):
         (self.root / "reports/quality.json").write_text('{"passed": true}')
         (self.root / "input/source.json").write_text("{}")
         self.contract = {"schema_version": CONTRACT["schema_version"], "digest": HEX}
-        self.policy = {"schema_version": "solidworks-to-urdf.quality-policy/v1", "digest": OTHER_HEX}
+        self.policy = {"schema_version": CHECK_POLICY_SCHEMA, "digest": OTHER_HEX}
         write_delivery_manifest(self.root, contract=self.contract, policy=self.policy)
 
     def test_subject_binds_assets_and_excludes_manifest_and_quality_report(self):
@@ -96,7 +96,7 @@ class DeliveryTests(unittest.TestCase):
         manifest = read_delivery_manifest(self.root)
         self.assertEqual(manifest["subject"]["digest"], subject_digest(self.root))
         (self.root / "model/subject.txt").write_text("changed")
-        with self.assertRaisesRegex(PipelineError, "differs from manifest.json"):
+        with self.assertRaisesRegex(PipelineError, "differ(s)? from manifest.json"):
             read_delivery_manifest(self.root)
         (self.root / "model/subject.txt").write_text("model")
         (self.root / "manifest.json").write_text(
@@ -104,6 +104,25 @@ class DeliveryTests(unittest.TestCase):
         )
         with self.assertRaises(ir.InterfaceRecordError):
             read_delivery_manifest(self.root)
+
+    def test_manifest_reader_rebinds_every_subject_record(self):
+        manifest_path = self.root / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["subject"]["files"][0]["bytes"] += 1
+        manifest_path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(PipelineError, "files differ"):
+            read_delivery_manifest(self.root)
+        write_delivery_manifest(self.root, contract=self.contract, policy=self.policy)
+        (self.root / "evidence/extra.json").write_text("{}")
+        with self.assertRaisesRegex(PipelineError, "files differ"):
+            read_delivery_manifest(self.root)
+        (self.root / "evidence/extra.json").unlink()
+        target = self.root / "meshes/subject.txt"
+        target.write_text("changed")
+        with self.assertRaisesRegex(PipelineError, "files differ"):
+            read_delivery_manifest(self.root)
+        target.write_text("meshes")
+        read_delivery_manifest(self.root)
 
     def test_layout_refuses_unregistered_files(self):
         check_layout(self.root)

@@ -13,7 +13,7 @@ from unittest import mock
 from description_pipeline.delivery import write_delivery_manifest, subject_digest
 from description_pipeline.io import digest
 from description_pipeline.repository import urdf_pr
-from description_pipeline.schemas import SOURCE_RECORD_SCHEMA
+from description_pipeline.schemas import CHECK_POLICY_SCHEMA, SOURCE_RECORD_SCHEMA
 from description_pipeline.stages import CONTRACT
 
 BRANCH = "work/solidworks/m3.0"
@@ -51,7 +51,7 @@ class Fixture:
         write_delivery_manifest(
             self.bundle,
             contract={"schema_version": CONTRACT["schema_version"], "digest": "a" * 64},
-            policy={"schema_version": "solidworks-to-urdf.quality-policy/v1", "digest": "b" * 64},
+            policy={"schema_version": CHECK_POLICY_SCHEMA, "digest": "b" * 64},
         )
 
     def seal(self, revision_id: str, parent: str | None, *, cad: str = "part-1\n", fresh: bool = False) -> None:

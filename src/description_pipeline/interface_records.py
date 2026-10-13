@@ -23,12 +23,12 @@ import stat
 from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 
+from . import schemas as _schemas
 from .delivery import PIPELINE_ID
 from .io import PipelineError, artifact_path_parts, digest
 from .schemas import (
     CACHE_IMPORT_CONFIRMATION_SCHEMA,
     CACHE_RELEASE_RECEIPT_SCHEMA,
-    CACHE_RELEASE_SCHEMA,
     CONFIG_SNAPSHOT_SCHEMA,
     DELIVERY_MANIFEST_SCHEMA,
     HEALTH_SCHEMA,
@@ -38,6 +38,13 @@ from .schemas import (
     SOURCE_RECORD_SCHEMA,
 )
 from .stages import CONTRACT, STAGE_IDS
+
+#: Every machine schema version this release knows: the single-owner schema ids
+#: plus the stage contract.  Unknown versions are refused wherever a record
+#: quotes one (call bindings, manifests, ...).
+KNOWN_SCHEMA_VERSIONS = frozenset(
+    value for name, value in vars(_schemas).items() if name.endswith("_SCHEMA") and isinstance(value, str)
+) | {CONTRACT["schema_version"]}
 
 
 class InterfaceRecordError(PipelineError):
@@ -137,6 +144,11 @@ def _utc(value, code: str, where: str) -> str:
     return value
 
 
+def _known_schema(value, code: str, where: str) -> str:
+    _require(isinstance(value, str) and value in KNOWN_SCHEMA_VERSIONS, code, {"where": where})
+    return value
+
+
 def _reject_secrets(record, *, code: str) -> None:
     stack = [("", record)]
     while stack:
@@ -219,7 +231,7 @@ def validate_call_binding(binding) -> dict:
     _hex64(binding["params_sha256"], code, "binding.params_sha256")
     validate_release_identity(binding["release"], code=code)
     _exact_keys(binding["contract"], {"schema_version", "digest"}, code, "binding.contract")
-    _text(binding["contract"]["schema_version"], code, "binding.contract.schema_version")
+    _known_schema(binding["contract"]["schema_version"], code, "binding.contract.schema_version")
     _hex64(binding["contract"]["digest"], code, "binding.contract.digest")
     return binding
 
@@ -362,54 +374,108 @@ def validate_health(payload) -> dict:
     return payload
 
 
-def cache_release_params_digest(confirmation) -> str:
-    """The parameter digest bound by a cache-release operation id.
-
-    The request's ``import`` block IS the complete minimal import confirmation
-    (run id, manifest/receipt digests, files, bytes, confirmed_at); a receipt
-    binds ``operation_id`` + ``params_sha256`` + this same object, so the same
-    operation id replayed with the same parameters returns the original receipt.
-    """
-
-    validate_cache_import_confirmation(confirmation)
-    return digest({"operation": "cache.release", "import": confirmation})
-
-
-def validate_cache_release_request(request) -> dict:
-    """``POST /v1/jobs/<run_id>/cache/release`` request (IF-10)."""
+def validate_cache_production_identity(block) -> dict:
+    """Native production operation/cache identity (never the release operation)."""
 
     code = "cache_release_invalid"
-    _exact_keys(request, {"schema_version", "binding", "import"}, code, "request")
-    _require(request["schema_version"] == CACHE_RELEASE_SCHEMA, code, {"where": "schema_version"})
-    validate_call_binding(request["binding"])
-    validate_cache_import_confirmation(request["import"])
-    expected = cache_release_params_digest(request["import"])
-    _require(
-        request["binding"]["params_sha256"] == expected,
-        "cache_release_params_mismatch",
-        {"expected": expected, "actual": request["binding"]["params_sha256"]},
-    )
-    return request
+    _exact_keys(block, {"run_id", "operation_id"}, code, "production")
+    _text(block["run_id"], code, "production.run_id")
+    _text(block["operation_id"], code, "production.operation_id")
+    return block
+
+
+def cache_import_confirmation_digest(confirmation) -> str:
+    """Canonical recompute digest over the full confirmation content."""
+
+    payload = {key: value for key, value in confirmation.items() if key != "digest"}
+    return digest(payload)
 
 
 def validate_cache_import_confirmation(record) -> dict:
-    """The Linux-side confirmation that a full import landed before cache release."""
+    """The complete minimal import confirmation (IF-10, frozen final).
+
+    Carries the imported closed inventory (path/bytes/sha256 records - content,
+    not counts), the native production identity, the Linux sealed confirmation,
+    and a recompute digest over the whole payload; the endpoint verifies it
+    against its sealed cache/production ledger and deletes nothing on mismatch.
+    """
 
     code = "cache_import_confirmation_invalid"
-    _exact_keys(
-        record,
-        {"schema_version", "run_id", "manifest_sha256", "receipt_sha256", "files", "bytes", "confirmed_at"},
-        code,
-        "confirmation",
-    )
+    _exact_keys(record, {"schema_version", "imported", "production", "sealed", "digest"}, code, "confirmation")
     _require(record["schema_version"] == CACHE_IMPORT_CONFIRMATION_SCHEMA, code, {"where": "schema_version"})
-    _text(record["run_id"], code, "run_id")
-    _hex64(record["manifest_sha256"], code, "manifest_sha256")
-    _hex64(record["receipt_sha256"], code, "receipt_sha256")
-    _non_negative_int(record["files"], code, "files")
-    _non_negative_int(record["bytes"], code, "bytes")
-    _utc(record["confirmed_at"], code, "confirmed_at")
+    imported = record["imported"]
+    _require(isinstance(imported, list) and imported, code, {"where": "confirmation.imported"})
+    paths: list[str] = []
+    for index, entry in enumerate(imported):
+        where = f"confirmation.imported[{index}]"
+        _exact_keys(entry, {"path", "bytes", "sha256"}, code, where)
+        name = entry["path"]
+        _require(isinstance(name, str), code, {"where": f"{where}.path"})
+        artifact_path_parts(name)
+        paths.append(name)
+        _non_negative_int(entry["bytes"], code, f"{where}.bytes")
+        _hex64(entry["sha256"], code, f"{where}.sha256")
+    _require(paths == sorted(set(paths)), code, {"where": "confirmation.imported", "reason": "closed, sorted, unique"})
+    validate_cache_production_identity(record["production"])
+    _exact_keys(record["sealed"], {"confirmed_at", "receipt_sha256"}, code, "confirmation.sealed")
+    _utc(record["sealed"]["confirmed_at"], code, "confirmation.sealed.confirmed_at")
+    _hex64(record["sealed"]["receipt_sha256"], code, "confirmation.sealed.receipt_sha256")
+    _hex64(record["digest"], code, "confirmation.digest")
+    _require(
+        record["digest"] == cache_import_confirmation_digest(record),
+        code,
+        {"where": "confirmation.digest", "reason": "must recompute over the confirmation content"},
+    )
     return record
+
+
+def validate_cache_import_block(import_block) -> dict:
+    """The request import: Linux run + native production + full confirmation."""
+
+    code = "cache_release_invalid"
+    _exact_keys(import_block, {"linux_run_id", "production", "confirmation"}, code, "import")
+    _text(import_block["linux_run_id"], code, "import.linux_run_id")
+    production = validate_cache_production_identity(import_block["production"])
+    confirmation = validate_cache_import_confirmation(import_block["confirmation"])
+    _require(
+        confirmation["production"] == production,
+        code,
+        {"rule": "the imported confirmation must bind the requested production identity"},
+    )
+    return import_block
+
+
+def cache_release_params_digest(import_block) -> str:
+    """The parameter digest bound by a cache-release operation id.
+
+    The import block is the frozen three-way identity (Linux run, native
+    production, complete confirmation); a receipt binds ``operation_id`` +
+    ``params_sha256`` + this same object, so replaying one operation id with the
+    same parameters returns the original receipt unchanged.
+    """
+
+    validate_cache_import_block(import_block)
+    return digest({"operation": "cache.release", "import": import_block})
+
+
+def validate_cache_release_request(request) -> dict:
+    """``POST /v1/jobs/<run_id>/cache/release`` request (IF-10 frozen final)."""
+
+    code = "cache_release_invalid"
+    _exact_keys(request, {"operation_id", "binding", "import"}, code, "request")
+    _text(request["operation_id"], code, "operation_id")
+    _exact_keys(request["binding"], {"release", "contract"}, code, "binding")
+    validate_release_identity(request["binding"]["release"], code=code)
+    _exact_keys(request["binding"]["contract"], {"schema_version", "digest"}, code, "binding.contract")
+    _known_schema(request["binding"]["contract"]["schema_version"], code, "binding.contract.schema_version")
+    _hex64(request["binding"]["contract"]["digest"], code, "binding.contract.digest")
+    import_block = validate_cache_import_block(request["import"])
+    _require(
+        request["operation_id"] != import_block["production"]["operation_id"],
+        code,
+        {"rule": "the release operation cannot impersonate the production operation"},
+    )
+    return request
 
 
 def cache_release_receipt_digest(receipt) -> str:
@@ -444,7 +510,7 @@ def validate_cache_release_receipt(receipt) -> dict:
     _require(receipt["status"] in {"released", "already_released"}, code, {"where": "status"})
     _text(receipt["operation_id"], code, "operation_id")
     _hex64(receipt["params_sha256"], code, "params_sha256")
-    validate_cache_import_confirmation(receipt["import"])
+    validate_cache_import_block(receipt["import"])
     _require(
         receipt["params_sha256"] == cache_release_params_digest(receipt["import"]),
         code,
@@ -933,7 +999,7 @@ def validate_delivery_manifest(manifest) -> dict:
     )
     _hex64(manifest["contract"]["digest"], code, "contract.digest")
     _exact_keys(manifest["policy"], {"schema_version", "digest"}, code, "policy")
-    _text(manifest["policy"]["schema_version"], code, "policy.schema_version")
+    _known_schema(manifest["policy"]["schema_version"], code, "policy.schema_version")
     _hex64(manifest["policy"]["digest"], code, "policy.digest")
     return manifest
 

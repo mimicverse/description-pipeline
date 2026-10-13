@@ -16,7 +16,7 @@ from description_pipeline.io import digest
 from description_pipeline.schemas import (
     CACHE_IMPORT_CONFIRMATION_SCHEMA,
     CACHE_RELEASE_RECEIPT_SCHEMA,
-    CACHE_RELEASE_SCHEMA,
+    CHECK_POLICY_SCHEMA,
     CONFIG_SNAPSHOT_SCHEMA,
     DELIVERY_MANIFEST_SCHEMA,
     HEALTH_SCHEMA,
@@ -77,34 +77,39 @@ def health(ready: bool = True) -> dict:
     }
 
 
-def import_confirmation() -> dict:
-    return {
+def production() -> dict:
+    return {"run_id": "native-run-7", "operation_id": "native-op-42"}
+
+
+def import_confirmation(*, production_block: dict | None = None) -> dict:
+    confirmation = {
         "schema_version": CACHE_IMPORT_CONFIRMATION_SCHEMA,
-        "run_id": "7c9b44b3-0b9c-5ffe-9f4f-4bbdafb4a865",
-        "manifest_sha256": HEX,
-        "receipt_sha256": OTHER_HEX,
-        "files": 12,
-        "bytes": 4096,
-        "confirmed_at": TS,
+        "imported": [
+            {"path": "evidence/discovery.json", "bytes": 1, "sha256": HEX},
+            {"path": "input/source.json", "bytes": 2, "sha256": OTHER_HEX},
+        ],
+        "production": production() if production_block is None else production_block,
+        "sealed": {"confirmed_at": TS, "receipt_sha256": OTHER_HEX},
+        "digest": "0" * 64,
     }
+    confirmation["digest"] = ir.cache_import_confirmation_digest(confirmation)
+    return confirmation
+
+
+def import_block() -> dict:
+    return {"linux_run_id": "linux-run-9", "production": production(), "confirmation": import_confirmation()}
 
 
 def cache_request() -> dict:
-    block = import_confirmation()
     return {
-        "schema_version": CACHE_RELEASE_SCHEMA,
-        "binding": {
-            "operation_id": "op-0001",
-            "params_sha256": ir.cache_release_params_digest(block),
-            "release": release(),
-            "contract": {"schema_version": CONTRACT["schema_version"], "digest": HEX},
-        },
-        "import": block,
+        "operation_id": "release-op-1",
+        "binding": {"release": release(), "contract": {"schema_version": CONTRACT["schema_version"], "digest": HEX}},
+        "import": import_block(),
     }
 
 
 def cache_receipt(*, status: str = "released", released_files: int = 12) -> dict:
-    block = import_confirmation()
+    block = import_block()
     receipt = {
         "schema_version": CACHE_RELEASE_RECEIPT_SCHEMA,
         "status": status,
@@ -249,7 +254,7 @@ def manifest() -> dict:
         "schema_version": DELIVERY_MANIFEST_SCHEMA,
         "subject": {"files": files, "digest": digest(mapping)},
         "contract": {"schema_version": CONTRACT["schema_version"], "digest": HEX},
-        "policy": {"schema_version": "solidworks-to-urdf.quality-policy/v1", "digest": OTHER_HEX},
+        "policy": {"schema_version": CHECK_POLICY_SCHEMA, "digest": OTHER_HEX},
     }
 
 
@@ -410,16 +415,36 @@ class B4FixSingleVariableTests(unittest.TestCase):
         request_positive = cache_request()
         request_cases = (
             (
-                "import reduced to receipt hash",
+                "confirmation reduced to counts",
                 lambda r: r.__setitem__(
-                    "import", {k: r["import"][k] for k in ("run_id", "manifest_sha256", "receipt_sha256")}
+                    "import",
+                    {
+                        **r["import"],
+                        "confirmation": {
+                            "schema_version": CACHE_IMPORT_CONFIRMATION_SCHEMA,
+                            "run_id": "linux-run-9",
+                            "files": 12,
+                            "bytes": 4096,
+                            "confirmed_at": TS,
+                        },
+                    },
                 ),
                 "cache_import_confirmation_invalid",
             ),
             (
-                "binding parameter mismatch",
-                lambda r: r["binding"].__setitem__("params_sha256", OTHER_HEX),
-                "cache_release_params_mismatch",
+                "unknown contract version",
+                lambda r: r["binding"]["contract"].__setitem__("schema_version", "unknown.contract/v99"),
+                "cache_release_invalid",
+            ),
+            (
+                "release operation equals production operation",
+                lambda r: r.__setitem__("operation_id", r["import"]["production"]["operation_id"]),
+                "cache_release_invalid",
+            ),
+            (
+                "confirmation digest not recomputed",
+                lambda r: r["import"]["confirmation"].__setitem__("digest", OTHER_HEX),
+                "cache_import_confirmation_invalid",
             ),
         )
         for label, mutate, code in request_cases:
@@ -596,23 +621,49 @@ class InterfaceRecordTests(unittest.TestCase):
         all_empty = config_snapshot()
         all_empty["resolved"] = {key: {} for key in all_empty["resolved"]}
         self.reject("config_snapshot_invalid", lambda: ir.validate_config_snapshot(all_empty))
-        receipt_hash_only = cache_request()
-        receipt_hash_only["import"] = {
-            key: receipt_hash_only["import"][key] for key in ("run_id", "manifest_sha256", "receipt_sha256")
+        counts_only = cache_request()
+        counts_only["import"]["confirmation"] = {
+            "schema_version": CACHE_IMPORT_CONFIRMATION_SCHEMA,
+            "run_id": "linux-run-9",
+            "manifest_sha256": HEX,
+            "receipt_sha256": OTHER_HEX,
+            "files": 12,
+            "bytes": 4096,
+            "confirmed_at": TS,
         }
-        self.reject("cache_import_confirmation_invalid", lambda: ir.validate_cache_release_request(receipt_hash_only))
+        # A counts-only import cannot stand in for the complete confirmation
+        # (imported inventory + production identity + sealed confirmation).
+        self.reject("cache_import_confirmation_invalid", lambda: ir.validate_cache_release_request(counts_only))
 
     def test_cache_release_binds_full_import_confirmation(self) -> None:
         ir.validate_cache_release_request(cache_request())
         bad = cache_request()
-        bad["binding"]["params_sha256"] = OTHER_HEX
-        self.reject("cache_release_params_mismatch", lambda: ir.validate_cache_release_request(bad))
+        bad["binding"]["contract"]["schema_version"] = "unknown.contract/v99"
+        self.reject("cache_release_invalid", lambda: ir.validate_cache_release_request(bad))
         bad = cache_request()
-        bad["import"]["receipt_sha256"] = "not-hex"
+        bad["operation_id"] = bad["import"]["production"]["operation_id"]
+        self.reject("cache_release_invalid", lambda: ir.validate_cache_release_request(bad))
+        bad = cache_request()
+        bad["import"]["confirmation"] = {
+            "schema_version": CACHE_IMPORT_CONFIRMATION_SCHEMA,
+            "run_id": "linux-run-9",
+            "manifest_sha256": HEX,
+            "receipt_sha256": OTHER_HEX,
+            "files": 12,
+            "bytes": 4096,
+            "confirmed_at": TS,
+        }
         self.reject("cache_import_confirmation_invalid", lambda: ir.validate_cache_release_request(bad))
         bad = cache_request()
-        bad["binding"]["operation_id"] = ""
-        self.reject("call_binding_invalid", lambda: ir.validate_cache_release_request(bad))
+        bad["import"]["confirmation"]["digest"] = OTHER_HEX
+        self.reject("cache_import_confirmation_invalid", lambda: ir.validate_cache_release_request(bad))
+        bad = cache_request()
+        mismatched = import_confirmation(production_block={"run_id": "native-run-8", "operation_id": "native-op-42"})
+        bad["import"]["confirmation"] = mismatched
+        self.reject("cache_release_invalid", lambda: ir.validate_cache_release_request(bad))
+        bad = cache_request()
+        bad["import"]["linux_run_id"] = ""
+        self.reject("cache_release_invalid", lambda: ir.validate_cache_release_request(bad))
 
     def test_cache_receipt_zero_delete_and_immutability(self) -> None:
         ir.validate_cache_release_receipt(cache_receipt())
@@ -805,6 +856,9 @@ class InterfaceRecordTests(unittest.TestCase):
     def test_delivery_manifest_subject_records(self) -> None:
         manifest_value = manifest()
         ir.validate_delivery_manifest(manifest_value)
+        bad = copy.deepcopy(manifest_value)
+        bad["policy"]["schema_version"] = "unknown.policy/v99"
+        self.reject("delivery_manifest_invalid", lambda: ir.validate_delivery_manifest(bad))
         bad = copy.deepcopy(manifest_value)
         bad["subject"]["digest"] = OTHER_HEX
         self.reject("delivery_manifest_subject_mismatch", lambda: ir.validate_delivery_manifest(bad))

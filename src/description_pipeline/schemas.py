@@ -37,6 +37,11 @@ SOURCE_RECORD_SCHEMA = "solidworks-to-urdf.source-record/v1"
 #: (deployment.md §配置权威; consumed by IF-11/IF-16).
 PLATFORM_CONFIG_SCHEMA = "solidworks-to-urdf.platform/v1"
 
+#: Check-strategy machine definition shipped with the release (contracts §系统契约:
+#: schema + stage definition + check policy).  Owner B; consumers reference this id
+#: instead of quoting an arbitrary policy string.
+CHECK_POLICY_SCHEMA = "solidworks-to-urdf.check-policy/v1"
+
 
 def exporter_declaration_present(record: object) -> bool:
     """The shared producer/verifier predicate over the raw record's exporter block.

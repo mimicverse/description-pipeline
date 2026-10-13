@@ -126,14 +126,22 @@ def write_delivery_manifest(root: Path, *, contract: dict, policy: dict) -> dict
 
 
 def read_delivery_manifest(root: Path) -> dict:
-    """Read and validate ``manifest.json``, re-binding it to the current subject."""
+    """Read and validate ``manifest.json``, re-binding every subject record.
+
+    The stored ``{path, bytes, sha256}`` records must equal the current subject
+    record-for-record (missing, extra, replaced or re-sized entries are refused,
+    including byte-length changes that keep the digest), and the subject digest
+    must recompute over those records.
+    """
 
     from .interface_records import validate_delivery_manifest
 
     root = Path(root)
     manifest = validate_delivery_manifest(read_data(confined(root, MANIFEST)))
-    expected = subject_digest(root)
-    if manifest["subject"]["digest"] != expected:
+    records = subject_records(root)
+    if manifest["subject"]["files"] != records:
+        raise PipelineError("Delivery subject files differ from manifest.json")
+    if manifest["subject"]["digest"] != subject_digest(root):
         raise PipelineError("Delivery subject digest differs from manifest.json")
     return manifest
 

@@ -64,9 +64,7 @@ class ContractConvergenceTests(unittest.TestCase):
 
     def test_portable_stages_derive_from_the_contract_hosts(self) -> None:
         self.assertEqual(PORTABLE_STAGES, ("freeze", "generate", "verify", "publish"))
-        self.assertEqual(
-            tuple(stage for stage, hosts in HOST_BY_STAGE.items() if hosts == ("linux",)), PORTABLE_STAGES
-        )
+        self.assertEqual(tuple(stage for stage, hosts in HOST_BY_STAGE.items() if hosts == ("linux",)), PORTABLE_STAGES)
 
     def test_delivery_stages_split_the_native_boundary_from_report_rendering(self) -> None:
         """Report rendering keys on delivery stages, not on every portable stage."""
@@ -76,9 +74,7 @@ class ContractConvergenceTests(unittest.TestCase):
 
     def test_owned_schema_ids_are_never_retyped_as_literals(self) -> None:
         owned = {
-            name: value
-            for name, value in vars(schemas).items()
-            if name.endswith("_SCHEMA") and isinstance(value, str)
+            name: value for name, value in vars(schemas).items() if name.endswith("_SCHEMA") and isinstance(value, str)
         }
         self.assertLessEqual(
             {
@@ -98,6 +94,7 @@ class ContractConvergenceTests(unittest.TestCase):
                 "DELIVERY_MANIFEST_SCHEMA",
                 "SOURCE_RECORD_SCHEMA",
                 "PLATFORM_CONFIG_SCHEMA",
+                "CHECK_POLICY_SCHEMA",
             },
             set(owned),
         )
