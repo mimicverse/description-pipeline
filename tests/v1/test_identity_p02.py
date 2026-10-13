@@ -291,7 +291,7 @@ class PublishedRevisionTimeoutTests(unittest.TestCase):
         with (
             patch.object(urdf_pr, "_validate_ref"),
             patch.object(urdf_pr.subprocess, "run", side_effect=subprocess.TimeoutExpired("git", 60)),
+            self.assertRaises(urdf_pr.PrError) as raised,
         ):
-            with self.assertRaises(urdf_pr.PrError) as raised:
-                urdf_pr.published_revision(Path("/srv/models/arm"), "m3.0")
+            urdf_pr.published_revision(Path("/srv/models/arm"), "m3.0")
         self.assertEqual(raised.exception.code, "published_revision_unknown")
