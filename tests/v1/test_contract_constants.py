@@ -80,7 +80,26 @@ class ContractConvergenceTests(unittest.TestCase):
             for name, value in vars(schemas).items()
             if name.endswith("_SCHEMA") and isinstance(value, str)
         }
-        self.assertEqual(len(owned), 6)
+        self.assertLessEqual(
+            {
+                "INPUT_SCHEMA",
+                "TOOL_SCHEMA",
+                "EFFECTIVE_INSTANCES_SCHEMA",
+                "LINK_GROUP_MASS_SCHEMA",
+                "MASS_CLOSURE_REPORT_SCHEMA",
+                "CAD_REVISION_SCHEMA",
+                "HEALTH_SCHEMA",
+                "RESOURCE_POLICY_SCHEMA",
+                "CACHE_RELEASE_SCHEMA",
+                "CACHE_RELEASE_RECEIPT_SCHEMA",
+                "CACHE_IMPORT_CONFIRMATION_SCHEMA",
+                "CONFIG_SNAPSHOT_SCHEMA",
+                "INSTALL_RECORD_SCHEMA",
+                "DELIVERY_MANIFEST_SCHEMA",
+                "SOURCE_RECORD_SCHEMA",
+            },
+            set(owned),
+        )
         offenders = []
         for base in ("src", "tests"):
             for path in (REPO / base).rglob("*.py"):

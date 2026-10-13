@@ -15,6 +15,24 @@ LINK_GROUP_MASS_SCHEMA = "solidworks-to-urdf.link-group-mass-properties/v1"
 MASS_CLOSURE_REPORT_SCHEMA = "solidworks-to-urdf.mass-closure-report/v1"
 CAD_REVISION_SCHEMA = "solidworks-to-urdf.cad-revision/v1"
 
+#: W1 machine schemas for records crossing the platform / endpoint boundary
+#: (frozen-interfaces-v1.1 IF-04/09/10/11/16).  One owner module; consumers
+#: import the constants instead of quoting the literal.
+HEALTH_SCHEMA = "solidworks-to-urdf.health/v1"
+RESOURCE_POLICY_SCHEMA = "solidworks-to-urdf.resource-policy/v1"
+CACHE_RELEASE_SCHEMA = "solidworks-to-urdf.cache-release/v1"
+CACHE_RELEASE_RECEIPT_SCHEMA = "solidworks-to-urdf.cache-release-receipt/v1"
+CACHE_IMPORT_CONFIRMATION_SCHEMA = "solidworks-to-urdf.cache-import-confirmation/v1"
+CONFIG_SNAPSHOT_SCHEMA = "solidworks-to-urdf.config-snapshot/v1"
+INSTALL_RECORD_SCHEMA = "solidworks-to-urdf.install-record/v1"
+
+#: Delivery-tree records owned alongside the delivery boundary (IF-13):
+#: ``manifest.json`` (subject inventory, subject digest, contract/policy
+#: identity) and ``input/source.json`` (content identity, selection, metadata
+#: provenance).
+DELIVERY_MANIFEST_SCHEMA = "solidworks-to-urdf.delivery-manifest/v1"
+SOURCE_RECORD_SCHEMA = "solidworks-to-urdf.source-record/v1"
+
 
 def exporter_declaration_present(record: object) -> bool:
     """The shared producer/verifier predicate over the raw record's exporter block.
