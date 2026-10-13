@@ -34,6 +34,13 @@ RUNTIME_VERSIONS = {
 #: The one supported interpreter range; pyproject's requires-python and the
 #: release build mirror this line (IF-15 support single source).
 SUPPORTED_PYTHON = ">=3.12,<3.13"
+#: The supported end of each role (IF-15 support matrix): host id, display OS,
+#: CPU architecture and the native API prerequisite.  Qualification binds to a
+#: real Windows/SolidWorks/build outside this structural statement.
+RUNTIME_HOSTS = {
+    "native": {"host": "windows", "os": "Windows", "arch": "x86_64", "api": "SolidWorks COM API"},
+    "portable": {"host": "linux", "os": "Linux", "arch": "x86_64"},
+}
 
 
 def runtime_role(role: str | None = None) -> str:

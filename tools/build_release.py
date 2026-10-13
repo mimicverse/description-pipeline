@@ -151,7 +151,7 @@ def offline_bundle(source, output, wheel, platform, bound):
         return target
 
 
-def build(root, output, *, offline=False):
+def build(root, output):
     root, output = root.resolve(), output.resolve()
     bound = bind_source_closure(root / "src")
     if sys.version_info[:2] != (3, 12):
@@ -183,6 +183,22 @@ def build(root, output, *, offline=False):
         if source_inventory(root / "src/description_pipeline", bound) != source_inventory(package, bound):
             raise bound.PipelineError("the bound source closure differs from the archived commit")
         files = bound.inventory(package)
+        resources = [
+            path
+            for directory in ("deploy", "docs", "requirements")
+            for path in (source / directory).rglob("*")
+            if path.is_file()
+        ]
+        resources += [
+            source / name for name in ("README.md", "LICENSE", "CODE_OF_CONDUCT.md", "CONTRIBUTING.md", "RELEASING.md")
+        ]
+        deployment_files = {
+            path.relative_to(source).as_posix(): bound.file_digest(path) for path in resources
+        }
+        runtime_locks = {
+            platform: bound.file_digest(source / f"requirements/{platform}-py312.lock")
+            for platform in ("linux", "windows")
+        }
         identity = {
             "schema_version": "solidworks-to-urdf.release/v1",
             "pipeline_id": bound.PIPELINE_ID,
@@ -190,6 +206,8 @@ def build(root, output, *, offline=False):
             "source_commit": commit,
             "source_sha256": bound.digest(files),
             "package_files": files,
+            "deployment_files": deployment_files,
+            "runtime_locks": runtime_locks,
             **bound.release_domain_identity(),
             "builder": {"python": sys.version.split()[0], **builders},
         }
@@ -205,19 +223,9 @@ def build(root, output, *, offline=False):
         bound.normalize_zip(wheel)
         bound.normalize_sdist(sdist)
         deployment = output / f"description-{bound.version}-deployment.zip"
-        resources = [
-            path
-            for directory in ("deploy", "docs", "requirements")
-            for path in (source / directory).rglob("*")
-            if path.is_file()
-        ]
-        resources += [
-            source / name for name in ("README.md", "LICENSE", "CODE_OF_CONDUCT.md", "CONTRIBUTING.md", "RELEASING.md")
-        ]
         bound.write_zip(deployment, ((path.relative_to(source).as_posix(), path.read_bytes()) for path in resources))
-        if offline:
-            for platform in ("linux", "windows"):
-                offline_bundle(source, output, wheel, platform, bound)
+        for platform in ("linux", "windows"):
+            offline_bundle(source, output, wheel, platform, bound)
         artifacts = bound.inventory(output)
         bound.write_json(output / "release.json", {**identity, "artifacts": artifacts})
     return {
@@ -231,9 +239,8 @@ def build(root, output, *, offline=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--offline", action="store_true", help="also bundle the locked Linux and Windows wheels")
     args = parser.parse_args()
-    result = build(Path(__file__).resolve().parent.parent, args.output, offline=args.offline)
+    result = build(Path(__file__).resolve().parent.parent, args.output)
     print(json.dumps(result, indent=2))
 
 

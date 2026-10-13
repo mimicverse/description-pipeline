@@ -26,8 +26,8 @@ from pathlib import Path, PurePosixPath
 
 from . import schemas as _schemas
 from .delivery import PIPELINE_ID
-from .io import PipelineError, artifact_path_parts, digest
-from .runtime import RUNTIME_VERSIONS, SUPPORTED_PYTHON, required_packages
+from .io import PipelineError, artifact_path_parts, digest, file_digest
+from .runtime import RUNTIME_HOSTS, RUNTIME_VERSIONS, SUPPORTED_PYTHON, required_packages
 from .schemas import (
     CACHE_IMPORT_CONFIRMATION_SCHEMA,
     CACHE_RELEASE_RECEIPT_SCHEMA,
@@ -53,8 +53,21 @@ SCHEMA_VERSIONS = frozenset(
 #: quotes one (call bindings, manifests, ...).
 KNOWN_SCHEMA_VERSIONS = SCHEMA_VERSIONS | {CONTRACT["schema_version"]}
 
-#: Canonical digest of the boundary schema id set (IF-15 release identity).
-SCHEMA_DIGEST = digest(sorted(SCHEMA_VERSIONS))
+#: The shipped schema definition files the schema digest covers: the model
+#: document schema carries the structure and field rules of the produced
+#: documents (IF-15: the digest is over the definitions, never the id strings).
+SCHEMA_DEFINITION_FILES = ("model/schema.json",)
+
+
+def schema_definition_digest(definition_root=None) -> str:
+    """Canonical digest of the shipped schema definitions' actual content."""
+
+    root = Path(definition_root) if definition_root is not None else Path(__file__).parent
+    return digest({name: file_digest(root / name) for name in SCHEMA_DEFINITION_FILES})
+
+
+#: Canonical digest of the schema definitions of this release (IF-15 release identity).
+SCHEMA_DEFINITION_DIGEST = schema_definition_digest()
 
 
 class InterfaceRecordError(PipelineError):
@@ -72,8 +85,8 @@ _RFC3339_UTC = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z\Z")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 RELEASE_ROLES = ("native", "portable")
-#: The frozen host/role pairing of the two ends (IF-15 support matrix source).
-END_ROLES = (("linux", "portable"), ("windows", "native"))
+#: The frozen host/role pairing of the two ends, derived from the role hosts.
+END_ROLES = tuple((RUNTIME_HOSTS[role]["host"], role) for role in RELEASE_ROLES)
 #: Secret-like keys are refused anywhere in a snapshot or install record.
 #: File references (``*_file``) stay allowed: only identities and paths travel.
 _SECRET_KEYS = frozenset(
@@ -1227,12 +1240,12 @@ def release_contract() -> dict:
     """The contract identity every release manifest carries.
 
     Each value is the canonical digest of one single-owner machine definition:
-    the boundary schema id set (``schemas.py``), the stage contract, the check
-    policy and the resource policy.
+    the shipped schema definitions (structure and field rules), the stage
+    contract, the check policy and the resource policy.
     """
 
     return {
-        "schema": SCHEMA_DIGEST,
+        "schema": SCHEMA_DEFINITION_DIGEST,
         "stage": CONTRACT_SHA256,
         "check_policy": check_policy_digest(),
         "resource_policy": resource_policy_v1_digest(),
@@ -1242,18 +1255,18 @@ def release_contract() -> dict:
 def release_support() -> dict:
     """The structural support matrix of this release (IF-15).
 
-    It states what the release is built to support - the interpreter range, the
-    roles with their exact dependency closures, and the stages each host
-    executes - and never a qualification: pass/fail claims belong to acceptance
-    records, not to the release manifest.
+    It states what the release is built to support - operating system,
+    architecture and interpreter range, the roles with their exact dependency
+    closures and native API prerequisite, and the stages each host executes -
+    and never a qualification: pass/fail claims belong to acceptance records,
+    not to the release manifest.
     """
 
-    host_by_role = {role: host for host, role in END_ROLES}
     return {
         "python": SUPPORTED_PYTHON,
         "roles": {
             role: {
-                "host": host_by_role[role],
+                **RUNTIME_HOSTS[role],
                 "packages": {name: RUNTIME_VERSIONS[name] for name in required_packages(role)},
             }
             for role in RELEASE_ROLES

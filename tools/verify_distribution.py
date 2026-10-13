@@ -41,8 +41,11 @@ def verify_release(directory, identity):
     """Check the complete release boundary: release.json alone binds every artifact."""
     if (directory / "SHA256SUMS.json").exists():
         raise PipelineError("a current release carries release.json only; SHA256SUMS.json is a legacy artifact")
+    if not (directory / "release.json").is_file():
+        raise PipelineError("a complete release carries its release.json manifest")
     release = read_data(directory / "release.json")
-    if release.get("artifacts") != inventory(directory, exclude=("release.json",)):
+    artifacts = release.get("artifacts")
+    if artifacts != inventory(directory, exclude=("release.json",)):
         raise PipelineError("Release assets differ from release.json")
     if {key: value for key, value in release.items() if key != "artifacts"} != identity:
         raise PipelineError("Release manifest does not bind the wheel source identity")
@@ -51,7 +54,19 @@ def verify_release(directory, identity):
         raise PipelineError("Release manifest does not bind the live schema/stage/policy digests")
     if identity.get("support") != domain["support"]:
         raise PipelineError("Release manifest does not bind the live support matrix")
-    for name in release["artifacts"]:
+    version = identity.get("version")
+    wheel_name = f"mimicverse_description-{version}-py3-none-any.whl"
+    complete = (
+        wheel_name,
+        f"mimicverse_description-{version}.tar.gz",
+        f"description-{version}-deployment.zip",
+        f"description-{version}-linux-cp312-x86_64.zip",
+        f"description-{version}-windows-cp312-x86_64.zip",
+    )
+    for name in complete:
+        if name not in artifacts:
+            raise PipelineError(f"Release is incomplete: {name} is missing")
+    for name in artifacts:
         path = directory / name
         if name.endswith(".tar.gz"):
             with tarfile.open(path) as archive:
@@ -75,6 +90,27 @@ def verify_release(directory, identity):
                 safe_members(archive.namelist())
                 if any(stat.S_ISLNK(info.external_attr >> 16) for info in archive.infolist()):
                     raise PipelineError("Release ZIP contains a symlink")
+                if name == f"description-{version}-deployment.zip":
+                    members = {
+                        member: hashlib.sha256(archive.read(member)).hexdigest()
+                        for member in archive.namelist()
+                    }
+                    if members != identity.get("deployment_files"):
+                        raise PipelineError("Deployment members do not come from this source release")
+                    locks = identity.get("runtime_locks") or {}
+                    for platform in ("linux", "windows"):
+                        lock = f"requirements/{platform}-py312.lock"
+                        if locks.get(platform) != members.get(lock):
+                            raise PipelineError(f"Deployment lock {lock} is not this release's lock")
+                if name in {
+                    f"description-{version}-linux-cp312-x86_64.zip",
+                    f"description-{version}-windows-cp312-x86_64.zip",
+                }:
+                    member = f"wheels/{wheel_name}"
+                    if archive.namelist().count(member) != 1:
+                        raise PipelineError(f"Role archive {name} does not carry the release wheel")
+                    if hashlib.sha256(archive.read(member)).hexdigest() != artifacts[wheel_name]:
+                        raise PipelineError(f"Role archive {name} carries another wheel than this release")
                 if "files.json" in archive.namelist():
                     expected = json.loads(archive.read("files.json"))
                     actual = {
@@ -120,8 +156,7 @@ def wheel_identity(wheel):
 
 def verify(wheel, runtime_lock, *, wheelhouse=None, bundle=None):
     identity = wheel_identity(wheel)
-    if (wheel.parent / "release.json").is_file():
-        verify_release(wheel.parent, identity)
+    verify_release(wheel.parent, identity)
     with tempfile.TemporaryDirectory(prefix="description-installed-") as temporary:
         root = Path(temporary)
         subprocess.run([sys.executable, "-I", "-m", "venv", str(root / "venv")], check=True)

@@ -106,7 +106,7 @@ jobs:
           init = Path("/tmp/ambient-src/description_pipeline/__init__.py")
           init.write_text(re.sub(r'__version__ = "[^"]+"', '__version__ = "0.0.0"', init.read_text()))
           PY
-          PYTHONPATH=/tmp/ambient-src python tools/build_release.py --output "$RUNNER_TEMP/release-a" --offline > "$RUNNER_TEMP/release-a.log"
+          PYTHONPATH=/tmp/ambient-src python tools/build_release.py --output "$RUNNER_TEMP/release-a" > "$RUNNER_TEMP/release-a.log"
           python - <<'PY'
           import json
           import os
@@ -121,7 +121,7 @@ jobs:
       - name: A second checkout path builds byte-identical artifacts
         run: |
           set -eu
-          (cd "$RUNNER_TEMP/build-b" && python tools/build_release.py --output "$RUNNER_TEMP/release-b" --offline > "$RUNNER_TEMP/release-b.log")
+          (cd "$RUNNER_TEMP/build-b" && python tools/build_release.py --output "$RUNNER_TEMP/release-b" > "$RUNNER_TEMP/release-b.log")
           diff -r "$RUNNER_TEMP/release-a" "$RUNNER_TEMP/release-b"
       - name: The role archives resolve offline for their targets
         run: |
