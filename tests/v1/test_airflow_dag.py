@@ -230,7 +230,7 @@ class DagTests(unittest.TestCase):
                 with self.assertRaises(AirflowFailException):
                     # The portable half only starts from the native_complete boundary;
                     # the full split is covered by test_split_workflow/test_linux_split.
-                    dag.task_dict["fetch_capture"].python_callable(started)
+                    dag.task_dict["fetch_capture"].python_callable(request)
             self.assertEqual(len(server.jobs), 1)
             job = next(iter(server.jobs.values()))
             self.assertEqual(
