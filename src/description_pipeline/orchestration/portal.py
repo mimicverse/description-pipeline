@@ -47,6 +47,7 @@ from .airflow_client import (
     WindowsEndpoint,
     _linux_repositories,
     _linux_store_root,
+    _linux_targets,
     check_result,
     native_run_id,
     validate_artifact_name,
@@ -373,13 +374,15 @@ class PortalConfig:
     #: Split-pipeline routing: the Linux attempt store and model-repository checkouts.
     pipeline_store_root: Path | None = None
     pipeline_repositories: dict[str, Path] | None = None
+    #: Configured publication targets used by the upload selector and conf validation.
+    pipeline_targets: dict[str, dict] | None = None
 
 
 _CONFIG_KEYS = {
     "airflow": {"url"},
     "endpoint": {"url", "token_file"},
     "portal": {"host", "port", "upload_root", "upload_concurrency"},
-    "pipeline": {"store_root", "repositories", "discovery"},
+    "pipeline": {"store_root", "repositories", "targets", "discovery"},
 }
 
 
@@ -440,8 +443,15 @@ def load_portal_config(path: Path) -> PortalConfig:
     try:
         pipeline_store_root = _linux_store_root(pipeline_section.get("store_root"))
         pipeline_repositories = _linux_repositories(pipeline_section.get("repositories") or {})
+        pipeline_targets = _linux_targets(pipeline_section.get("targets") or {})
     except EndpointProtocolError as error:
         raise AirflowApiError(f"portal config [pipeline]: {error}") from error
+    for hardware, target in pipeline_targets.items():
+        if target["repository_slug"] not in (pipeline_repositories or {}):
+            raise AirflowApiError(
+                f"portal config [pipeline]: target {hardware!r} names an unconfigured repository "
+                f"{target['repository_slug']!r}"
+            )
     return PortalConfig(
         airflow=AirflowApi(url.strip()),
         endpoint=_endpoint_from_config(endpoint_section),
@@ -451,6 +461,7 @@ def load_portal_config(path: Path) -> PortalConfig:
         upload_concurrency=_upload_concurrency(portal_section),
         pipeline_store_root=pipeline_store_root,
         pipeline_repositories=pipeline_repositories,
+        pipeline_targets=pipeline_targets,
     )
 
 
@@ -533,6 +544,17 @@ def _optional_str(value: object) -> str | None:
 def _stage_name_zh(value: object) -> str | None:
     stage = _optional_str(value)
     return _STAGE_NAMES_ZH.get(stage) if stage is not None else None
+
+
+def suggest_target(candidates: list[str], targets: dict[str, dict]) -> str | None:
+    """The unique configured hardware identity contained in the candidate names."""
+
+    hits = [
+        hardware
+        for hardware in targets
+        if any(hardware.casefold() in str(candidate).casefold() for candidate in candidates if str(candidate).strip())
+    ]
+    return hits[0] if len(hits) == 1 else None
 
 
 def _page_integer(query: dict, name: str, *, default: int, minimum: int, maximum: int) -> int:
@@ -767,6 +789,8 @@ class PortalApp:
             return self._static(start_response, "index.html")
         if path.startswith("/static/") and method == "GET":
             return self._static(start_response, path[len("/static/") :])
+        if path == "/api/targets" and method == "GET":
+            return self._targets(environ, start_response)
         if path == "/api/session":
             if method == "GET":
                 return self._session_info(environ, start_response)
@@ -921,6 +945,28 @@ class PortalApp:
         return _json_response(start_response, 200, {"authenticated": False}, self.config, headers)
 
     # ------------------------------------------------------------------ runs
+    def _targets(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
+        """The configured publication targets and the unique name-based suggestion."""
+        self._session(environ)
+        from urllib.parse import parse_qs
+
+        query = parse_qs(str(environ.get("QUERY_STRING") or ""))
+        folder = str((query.get("folder") or [""])[0]).strip()
+        assembly = str((query.get("main_assembly") or [""])[0]).strip()
+        targets = self.config.pipeline_targets or {}
+        suggestion = suggest_target([folder, assembly], targets) if (folder or assembly) else None
+        return _json_response(
+            start_response,
+            200,
+            {
+                "targets": [{"hardware_id": hardware, **target} for hardware, target in sorted(targets.items())],
+                "suggestion": suggestion,
+                "rule": "casefold_containment_unique",
+                "configured": bool(targets),
+            },
+            self.config,
+        )
+
     def _list_runs(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
         session = self._session(environ)
         query = urlparse.parse_qs(str(environ.get("QUERY_STRING") or ""), keep_blank_values=True)
@@ -1064,6 +1110,8 @@ class PortalApp:
                     [("Retry-After", "5")],
                 )
             raise PortalError(error.status, error.message) from error
+        if receipt.target_hardware is not None and receipt.target_hardware not in (self.config.pipeline_targets or {}):
+            raise PortalError(HTTPStatus.BAD_REQUEST, "发布目标不在平台配置中，请重新选择后再提交")
         handoff_path = str(self.config.upload_root / dag_run_id / receipt.folder)
         with self._lock:
             self._runs[dag_run_id] = PortalRun(
@@ -1072,7 +1120,14 @@ class PortalApp:
                 principal=session.principal,
                 started_at=time.time(),
             )
-        outcome = self._trigger_uploaded_run(session, dag_run_id, handoff_path, receipt.main_assembly)
+        outcome = self._trigger_uploaded_run(
+            session,
+            dag_run_id,
+            handoff_path,
+            receipt.main_assembly,
+            receipt.target_hardware,
+            receipt.change_summary,
+        )
         if outcome == "auth":
             return _json_response(
                 start_response,
@@ -1109,6 +1164,8 @@ class PortalApp:
         }
         if receipt.main_assembly is not None:
             payload["main_assembly"] = receipt.main_assembly
+        if receipt.target_hardware is not None:
+            payload["target_hardware"] = receipt.target_hardware
         return _json_response(start_response, 201, payload, self.config)
 
     def _trigger_uploaded_run(
@@ -1117,11 +1174,19 @@ class PortalApp:
         dag_run_id: str,
         handoff_path: str,
         main_assembly: str | None = None,
+        target_hardware: str | None = None,
+        change_summary: str | None = None,
     ) -> str:
         """Trigger once; an ambiguous failure is reconciled on the exact run id, never blind-retried."""
         conf = {"handoff_path": handoff_path}
         if main_assembly is not None:
             conf["main_assembly"] = main_assembly
+        if target_hardware is not None:
+            conf["target_hardware"] = target_hardware
+        if change_summary is not None:
+            conf["change_summary"] = change_summary
+        if target_hardware is not None and session.principal:
+            conf["submission_principal"] = session.principal
         try:
             self.config.airflow.trigger_dag_run(session.token, self.config.dag_id, dag_run_id, conf)
             return "created"

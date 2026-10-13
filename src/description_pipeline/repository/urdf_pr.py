@@ -159,6 +159,36 @@ def _previous_revision(worktree: Path, hardware: str) -> dict | None:
         raise PrError("previous_cad_revision_invalid", str(error)) from error
 
 
+def published_revision(repository: Path, hardware: str) -> dict | None:
+    """Read the published cad-revision.json of one hardware review branch (read-only).
+
+    Best-effort identity resolution for the submission lane: it fetches the
+    deterministic review branch and reads the manifest from the fetched commit,
+    never creating a worktree.  Any unavailability returns ``None`` so the
+    caller keeps ``parent_revision`` absent; publication's own
+    ``check_successor`` remains the deciding gate.
+    """
+
+    branch = REVIEW_BRANCH.format(hardware=hardware)
+    _validate_ref(repository, branch, branch=True)
+    _git(repository, "fetch", "--quiet", "origin", branch, check=False)
+    show = _git(repository, "show", f"refs/remotes/origin/{branch}:input/cad-revision.json", check=False)
+    if show.returncode != 0 or not show.stdout.strip():
+        return None
+    try:
+        payload = json.loads(show.stdout)
+    except json.JSONDecodeError:
+        return None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("hardware_id") != hardware
+        or not isinstance(payload.get("revision"), str)
+        or not payload["revision"].strip()
+    ):
+        return None
+    return payload
+
+
 def _validate_ref(repository: Path, name: str, *, branch: bool) -> None:
     if not name or name.startswith("-") or name.endswith(".lock") or ".." in name:
         raise PrError("invalid_ref", name)

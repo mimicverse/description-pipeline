@@ -9,6 +9,7 @@
   "pipeline": {
     "store_root": "/srv/description/state/runs",
     "repositories": {},
+    "targets": {},
     "discovery": {}
   },
   "portal": {

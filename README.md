@@ -114,3 +114,12 @@ collision models or control interfaces.
 | [Release procedure](RELEASING.md) | Tool acceptance and publication |
 
 [Apache License 2.0](LICENSE) · [Code of Conduct](CODE_OF_CONDUCT.md)
+
+## Publication identity
+
+The operator portal's upload window lists the configured publication targets and pre-selects the
+unique hardware identity matched from the folder or main-assembly name; the selector allows an
+explicit override. With a target selected, publication needs no CAD metadata edits or sidecar
+files: hardware, revision (deterministic from the frozen inventory digest and date), owner,
+change summary and handoff control are derived for the submission. CAD-carried `dp.*` values
+always win, and a conflicting submitted hardware identity blocks publication.

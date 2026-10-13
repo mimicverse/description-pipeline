@@ -251,7 +251,8 @@ class RenderTests(unittest.TestCase):
             parsed = json.loads(portal)
             self.assertEqual(sorted(parsed), ["airflow", "endpoint", "pipeline", "portal"])
             self.assertEqual(
-                parsed["pipeline"], {"store_root": str(state / "runs"), "repositories": {}, "discovery": {}}
+                parsed["pipeline"],
+                {"store_root": str(state / "runs"), "repositories": {}, "targets": {}, "discovery": {}},
             )
             self.assertEqual(sorted(parsed["airflow"]), ["url"])
             self.assertEqual(sorted(parsed["endpoint"]), ["token_file", "url"])

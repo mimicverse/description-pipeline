@@ -54,6 +54,10 @@ from ..sources.solidworks.handoff import describe_handoff
 UPLOAD_FIELD = "files"
 MAIN_ASSEMBLY_FIELD = "main_assembly"
 MAX_MAIN_ASSEMBLY_BYTES = 1024
+TARGET_HARDWARE_FIELD = "target_hardware"
+CHANGE_SUMMARY_FIELD = "change_summary"
+MAX_TARGET_HARDWARE_BYTES = 128
+MAX_CHANGE_SUMMARY_BYTES = 1024
 MAX_FILES = 4096
 MAX_TOTAL_BYTES = 2 * 1024**3
 MAX_FILE_BYTES = 512 * 1024**2
@@ -89,6 +93,8 @@ class UploadReceipt:
     bytes: int
     handoff_sha256: str
     main_assembly: str | None = None
+    target_hardware: str | None = None
+    change_summary: str | None = None
 
 
 class UploadGate:
@@ -252,6 +258,10 @@ class _Receiver:
         self._text_data = bytearray()
         self._assembly_seen = False
         self._assembly: str | None = None
+        self._target_seen = False
+        self._summary_seen = False
+        self._target: str | None = None
+        self._summary: str | None = None
 
     def callbacks(self) -> dict[str, Any]:
         return {
@@ -300,8 +310,22 @@ class _Receiver:
             self._assembly_seen = True
             self._text_field = MAIN_ASSEMBLY_FIELD
             return
+        if field in {TARGET_HARDWARE_FIELD.encode("ascii"), CHANGE_SUMMARY_FIELD.encode("ascii")}:
+            name = bytes(field).decode("ascii")
+            if params.get(b"filename"):
+                raise UploadRejected(400, "发布身份字段不能作为文件上传")
+            if (name == TARGET_HARDWARE_FIELD and self._target_seen) or (
+                name == CHANGE_SUMMARY_FIELD and self._summary_seen
+            ):
+                raise UploadRejected(400, "上传包含重复的发布身份字段")
+            if name == TARGET_HARDWARE_FIELD:
+                self._target_seen = True
+            else:
+                self._summary_seen = True
+            self._text_field = name
+            return
         if field != UPLOAD_FIELD.encode("ascii"):
-            raise UploadRejected(400, "只接受名为 files 的文件部分与 main_assembly 选择")
+            raise UploadRejected(400, "只接受 files 文件部分与 main_assembly/target_hardware/change_summary 选择")
         raw_name = params.get(b"filename")
         if not raw_name:
             raise UploadRejected(400, "上传分片缺少文件名")
@@ -350,8 +374,15 @@ class _Receiver:
     def _on_part_data(self, data: bytes, start: int, end: int) -> None:
         if self._text_field is not None:
             self._text_data.extend(bytes(data[start:end]))
-            if len(self._text_data) > MAX_MAIN_ASSEMBLY_BYTES:
-                raise UploadRejected(400, "主装配选择过长")
+            limit = {
+                MAIN_ASSEMBLY_FIELD: MAX_MAIN_ASSEMBLY_BYTES,
+                TARGET_HARDWARE_FIELD: MAX_TARGET_HARDWARE_BYTES,
+                CHANGE_SUMMARY_FIELD: MAX_CHANGE_SUMMARY_BYTES,
+            }.get(self._text_field, MAX_MAIN_ASSEMBLY_BYTES)
+            if len(self._text_data) > limit:
+                if self._text_field == MAIN_ASSEMBLY_FIELD:
+                    raise UploadRejected(400, "主装配选择过长")
+                raise UploadRejected(400, "发布身份文本过长")
             return
         if self._handle is None:
             raise UploadRejected(400, "上传分片数据出现在文件打开之前")
@@ -390,13 +421,26 @@ class _Receiver:
 
     def _finish_text(self) -> None:
         raw = bytes(self._text_data)
+        field = self._text_field
+        self._text_field = None
+        self._text_data = bytearray()
+        if field == MAIN_ASSEMBLY_FIELD:
+            try:
+                self._assembly = raw.decode("utf-8", "strict")
+            except UnicodeDecodeError as error:
+                raise UploadRejected(400, "主装配选择不是有效的 UTF-8 文本") from error
+            return
         try:
             value = raw.decode("utf-8", "strict")
         except UnicodeDecodeError as error:
-            raise UploadRejected(400, "主装配选择不是有效的 UTF-8 文本") from error
-        self._assembly = value
-        self._text_field = None
-        self._text_data = bytearray()
+            raise UploadRejected(400, "发布身份文本不是有效的 UTF-8 文本") from error
+        if field == TARGET_HARDWARE_FIELD:
+            self._target = value.strip() or None
+            return
+        if field == CHANGE_SUMMARY_FIELD:
+            self._summary = value.strip() or None
+            return
+        raise UploadRejected(400, "未知的上传文本字段")
 
     def _validate_main_assembly(self) -> str | None:
         """One canonical, case-exact selection inside the uploaded top folder."""
@@ -442,6 +486,8 @@ class _Receiver:
             bytes=self.total,
             handoff_sha256=str(identity["handoff_sha256"]),
             main_assembly=self._validate_main_assembly(),
+            target_hardware=self._target,
+            change_summary=self._summary,
         )
 
     def close(self) -> None:

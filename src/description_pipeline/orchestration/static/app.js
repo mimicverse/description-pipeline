@@ -229,6 +229,45 @@ function applyAssemblies(pick) {
   }
 }
 
+async function loadTargets(pick) {
+  const row = $("target-row");
+  const select = $("target-select");
+  const summary = $("change-summary");
+  const note = $("target-note");
+  select.textContent = "";
+  row.hidden = false;
+  select.hidden = false;
+  summary.hidden = false;
+  const main = state.assemblyChoice ? `${pick.top}/${state.assemblyChoice}` : "";
+  let payload = { targets: [], suggestion: null };
+  try {
+    payload = await api(
+      `/api/targets?folder=${encodeURIComponent(pick.top)}&main_assembly=${encodeURIComponent(main)}`
+    );
+  } catch {
+    // Selector stays empty; the run keeps today's deferred release-blocking behavior.
+  }
+  const targets = payload.targets || [];
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = targets.length ? "不指定（发布保持待办）" : "平台未配置发布目标";
+  select.append(placeholder);
+  for (const item of targets) {
+    const option = document.createElement("option");
+    option.value = item.hardware_id;
+    option.textContent = `${item.hardware_id} → ${item.repository_slug}@${item.base}`;
+    select.append(option);
+  }
+  if (payload.suggestion) {
+    select.value = payload.suggestion;
+    note.hidden = false;
+    note.textContent = `已按文件夹名匹配：${payload.suggestion}`;
+  } else {
+    note.hidden = true;
+    note.textContent = "";
+  }
+}
+
 function updateStartEnabled() {
   $("start-button").disabled = !(state.folderPick && !state.blockedPick && !state.uploading && state.assemblyChoice);
 }
@@ -238,6 +277,10 @@ function submitRun(pick, { onProgress } = {}) {
     const form = new FormData();
     for (const item of pick.records) form.append("files", item.file, item.path);
     if (state.assemblyChoice) form.append("main_assembly", state.assemblyChoice);
+    const targetSelect = $("target-select");
+    if (targetSelect && targetSelect.value) form.append("target_hardware", targetSelect.value);
+    const summaryInput = $("change-summary");
+    if (summaryInput && summaryInput.value.trim()) form.append("change_summary", summaryInput.value.trim());
     const request = new XMLHttpRequest();
     request.open("POST", "/api/runs");
     request.withCredentials = true;
@@ -284,6 +327,8 @@ function resetPick() {
   $("folder-summary").hidden = true;
   $("upload-status").hidden = true;
   resetAssemblyRow();
+  const targetSelect = $("target-select");
+  if (targetSelect) targetSelect.value = "";
   $("start-button").disabled = true;
 }
 
@@ -2213,6 +2258,7 @@ function wire() {
     summary.textContent = `${picked.top} · ${picked.count} 个文件 · ${formatBytes(picked.bytes)}`;
     setError($("run-error"), "");
     applyAssemblies(picked);
+    loadTargets(picked);
     updateStartEnabled();
   });
 
