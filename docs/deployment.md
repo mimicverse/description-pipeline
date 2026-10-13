@@ -49,9 +49,13 @@ Linux 使用一份私有 `platform.json`。schema 拒绝未知键、不安全路
   "targets": {
     "arm": {"repository_slug": "<owner>/<model-repository>", "base": "main"}
   },
-  "specifications": {"record_roots": ["/srv/description/specifications"]}
+  "specifications": {"record_roots": ["/srv/description/specifications"]},
+  "execution": {"linux_concurrency": 1},
+  "retention": {"unreferenced_evidence_days": null}
 }
 ```
+
+`execution.linux_concurrency` 为 Linux 工程任务并行上限，默认 `1`；原生资源始终为 `1`。`retention.unreferenced_evidence_days` 默认为 `null`，不自动删除封存证据；正整数只控制无引用证据保留天数。
 
 配置、状态、上传、交付、临时工作区、发行安装和规格库使用专用目录，禁止使用主目录/操作系统根、目录重叠、符号链接或 junction。Linux 私有配置和秘密文件权限为 `0600`，私有目录为 `0700`；Windows 使用仅执行用户可读写的 ACL。日志只展示标识、摘要和路径，不展示秘密值。
 
@@ -124,6 +128,7 @@ bash deploy/operator/operatorctl.sh health --config /srv/description/platform.js
 4. 同时提交、重复请求、断连与重启保持幂等；原生作业串行，未知 CAD 会话被拒绝且不被访问或终止。
 5. 缺失/包外来源、错误配置、坏证据及验证失败阻断下游；诊断与未验证预览的身份清晰。发布失败保留验证结果，未知外部结果通过对账恢复。
 6. 阶段重跑正确复用完整上游，保留原时间和生产身份；删除/恢复显示记录不移除证据。服务重启后请求、历史、准入和发布状态可恢复。
+7. 演练 stage/promote/rollback 与第二主机切换失败，注入配置漂移，核对仓库规则允许追加且禁止非 fast-forward，完成凭据轮换及备份恢复；全部维护路径使用同一生命周期和资源域。
 
 保留真实原生、身份、授权、失败和恢复证据。mock、健康绿标或能打开页面不能替代完整验收。
 
