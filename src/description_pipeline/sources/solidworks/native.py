@@ -4061,6 +4061,9 @@ class SolidWorksBackend(CadBackend):
                     completed=index,
                     total=total,
                 )
+            # The 0.25 s repeat throttle may drop the last per-component notes on a
+            # fast batch; one forced final note keeps the accepted activity at n/N.
+            note("mesh_export", completed=total, total=total, force=True)
             return entries
 
     def _write_component_mesh(self, component, dest_path, holder):

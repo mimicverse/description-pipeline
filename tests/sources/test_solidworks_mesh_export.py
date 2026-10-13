@@ -233,8 +233,8 @@ class ComponentMeshExportTests(unittest.TestCase):
         self.assertEqual(entry["triangles"], 1)
         self.assertTrue(all(item["phase"] == "capture" for item in records))
         self.assertEqual(
-            [(item["action"], item["current_object"], item["completed"], item["total"]) for item in records],
-            [("mesh_export", "pcb-1", 0, 1), ("mesh_export", "pcb-1", 1, 1)],
+            [(item["action"], item.get("current_object"), item["completed"], item["total"]) for item in records],
+            [("mesh_export", "pcb-1", 0, 1), ("mesh_export", "pcb-1", 1, 1), ("mesh_export", None, 1, 1)],
         )
 
         def exploded(_record):
@@ -247,6 +247,19 @@ class ComponentMeshExportTests(unittest.TestCase):
         )
         entry = _backend(again).export_component_meshes({"pcb-1": second}, on_activity=exploded)["pcb-1"]
         self.assertEqual(entry["triangles"], 1)
+
+        # Under the 0.25 s repeat throttle the per-component notes may be dropped;
+        # the forced final note must still leave the accepted activity at n/N.
+        throttled = []
+        third = self.tmp / "mesh-throttled.stl"
+        final = FakeComponent(
+            FakeDocument([]),
+            {0: [FakeBody([FakeFace(TRIANGLE)])], 1: []},
+        )
+        entry = _backend(final).export_component_meshes({"pcb-1": third}, on_activity=throttled.append)["pcb-1"]
+        self.assertEqual(entry["triangles"], 1)
+        self.assertEqual((throttled[-1]["completed"], throttled[-1]["total"]), (1, 1))
+        self.assertNotIn("current_object", throttled[-1])
 
     def test_mixed_part_exports_solids_and_sheets(self):
         component = FakeComponent(
