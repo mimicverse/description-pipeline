@@ -371,6 +371,56 @@ class OracleSemanticsTests(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertIn("discovery.joints", {item["code"] for item in report["errors"]})
 
+    def test_absent_exporter_state_keeps_the_mate_suite_and_skips_declarations(self) -> None:
+        """Only a proven absent exporter state means the capture has no declarations.
+
+        The native capture writes the exporter block unconditionally; the verifier must
+        mirror the producer predicate so an absent-state capture runs the mate-inference
+        suite it was derived for instead of failing closed in the declaration boundary.
+        """
+
+        package = self.baseline()
+
+        def declare_absent(raw, _payload):
+            raw["exporter"] = {
+                "state": "absent",
+                "attribute_name": "URDF Export Configuration (v1.4)",
+                "document": "cad/robot.SLDASM",
+                "configuration": "Default",
+                "registration": {},
+                "pid_bindings": [],
+            }
+
+        self._native(package, declare_absent)
+        passed, errors, checks = self.check(package)
+        self.assertTrue(passed, errors)
+        self.assertIn("discovery.joints", checks)
+        self.assertIn("discovery.frames", checks)
+        self.assertNotIn("discovery.declarations", checks)
+
+    def test_unread_exporter_state_stays_in_declarations_and_fails_closed(self) -> None:
+        """Every present non-absent state keeps the declarations suite and its refusal."""
+
+        package = self.baseline()
+
+        def declare_unread(raw, _payload):
+            raw["exporter"] = {
+                "state": "unread",
+                "attribute_name": "URDF Export Configuration (v1.4)",
+                "document": "cad/robot.SLDASM",
+                "configuration": "Default",
+                "registration": {},
+                "pid_bindings": [],
+                "error": "native read failed",
+            }
+
+        self._native(package, declare_unread)
+        passed, _errors, checks = self.check(package)
+        self.assertFalse(passed)
+        self.assertIn("discovery.declarations", checks)
+        self.assertFalse(checks["discovery.declarations"]["passed"])
+        self.assertNotIn("discovery.joints", checks)
+
     def test_suppressed_mate_is_excluded_not_checked(self) -> None:
         package = self.baseline()
         self._native(package, lambda raw, payload: raw["mates"][1].update({"suppressed": True}))
