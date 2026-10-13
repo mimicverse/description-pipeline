@@ -19,6 +19,31 @@ from description_pipeline.orchestration.windows import Jobs, RequestError, handl
 from .endpoint_support import MAIN, TOOL, EndpointFixture
 
 
+class _DelayedWorkerMutex:
+    """Wrap ``Jobs.mutex`` and make the queue worker sleep before it acquires.
+
+    Injected by ``test_terminal_publication_is_observably_atomic`` only: the
+    lock stays free during the sleep, so a reader can always snapshot the
+    intermediate record if the producer publishes a terminal status before the
+    rest of its completion record (the pre-fix release/reacquire race).
+    """
+
+    def __init__(self, inner, worker, delay):
+        self.inner = inner
+        self.worker = worker
+        self.delay = delay
+
+    def __enter__(self):
+        if threading.current_thread() is self.worker:
+            time.sleep(self.delay)
+        self.inner.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.inner.release()
+        return False
+
+
 class EndpointTests(EndpointFixture, unittest.TestCase):
     def test_selection_flow_reaches_a_sealed_capture_transfer(self):
         calls: list[dict] = []
@@ -154,6 +179,81 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
                     self.assertFalse(recovered.create(request)[1])
                 finally:
                     recovered.close()
+
+    def test_terminal_publication_is_observably_atomic(self):
+        """A terminal snapshot always carries the complete completion record.
+
+        The worker's mutex acquisitions are delayed (test only; the lock stays
+        free while it sleeps), which pins the release/reacquire interleaving: if
+        a terminal status could be snapshotted before ``completed_at``, the
+        terminal event or the sealed failure diagnostics, this observer sees it.
+        """
+
+        from description_pipeline.sources.solidworks.errors import CadError
+
+        for scenario in ("failure", "success"):
+            with self.subTest(scenario=scenario):
+                if scenario == "failure":
+                    error = CadError(
+                        "cad_read_failed", "Native read failed", detail={"phase": "read", "cause": "lost binding"}
+                    )
+
+                    def native_reader(frozen, settings, on_activity=None, error=error):
+                        raise error
+
+                    def runner(*args, **kwargs):
+                        raise AssertionError("Capture ran after the native reader failed")
+
+                    jobs = self.jobs(runner, native_reader=native_reader)
+                    terminal_status = "failed"
+                    terminal_event = "failed"
+                else:
+
+                    def runner(package, output, **kwargs):
+                        return self.capture_transfer_result(
+                            output, run_id=kwargs["run_id"], on_event=kwargs.get("on_event")
+                        )
+
+                    jobs = self.jobs(runner)
+                    terminal_status = "native_complete"
+                    terminal_event = "completed"
+
+                jobs.mutex = _DelayedWorkerMutex(jobs.mutex, jobs.thread, 0.02)
+                stop = threading.Event()
+                violations: list = []
+                request = self.request()
+                run_id = request["run_id"]
+
+                def observe(
+                    jobs=jobs, run_id=run_id, stop=stop, terminal_event=terminal_event, violations=violations
+                ):
+                    while not stop.is_set():
+                        job = jobs.snapshot(run_id)
+                        if job["status"] in {"failed", "native_complete", "passed"}:
+                            missing = []
+                            if not isinstance(job.get("completed_at"), str):
+                                missing.append("completed_at")
+                            events = job.get("events") or []
+                            if not events or events[-1].get("state") != terminal_event:
+                                missing.append("terminal_event")
+                            if job["status"] == "failed" and not isinstance(job.get("failure_diagnostics"), dict):
+                                missing.append("failure_diagnostics")
+                            if missing:
+                                violations.append({"status": job["status"], "missing": missing})
+                                return
+                        time.sleep(0.0005)
+
+                jobs.create(request)
+                observer = threading.Thread(target=observe, name="terminal-publication-observer", daemon=True)
+                observer.start()
+                try:
+                    finished = self.run_to_terminal(jobs, run_id)
+                    self.assertEqual(terminal_status, finished["status"], finished.get("error"))
+                finally:
+                    jobs.close()
+                    stop.set()
+                    observer.join(5)
+                self.assertEqual([], violations, f"terminal snapshots missed completion fields: {violations}")
 
     def test_native_jobs_are_serial(self):
         active, peak = 0, 0
