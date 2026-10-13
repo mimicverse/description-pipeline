@@ -143,6 +143,13 @@ def _unassigned_mass_rows(evidence_root: Path, source: dict) -> list[dict]:
 #: The sealed partition literal for unassigned-group readings.
 UNASSIGNED_PARTITION = "unassigned"
 
+#: Qualified reading bases and the measurement scope each one must carry.
+UNASSIGNED_BASES = {
+    "part_document": "part_document",
+    "cad_assembly_instance_measurement": "assembly_component_group",
+    "cad_authored_effective_instance": "assembly_component_group",
+}
+
 
 def _unassigned_readings(evidence_root: Path, source: dict) -> list[dict]:
     """The sealed unassigned group: one independently measured reading per member.
@@ -151,10 +158,12 @@ def _unassigned_readings(evidence_root: Path, source: dict) -> list[dict]:
     member must carry its own measured mass/COM/full tensor in the capture's
     ``mass_closure.unassigned[]`` list (same keys/source/units as the
     component-level readings), covering the partition exactly - no merging, no
-    redistribution.  A wire without that measurement fails closed: a residual
-    or a part-value recombination may never stand in for the independent
-    reading, and a reading that disagrees with the sealed component-level
-    measurement is refused.
+    redistribution.  Each entry is bound to the occurrence's authoritative
+    sealed reading (the effective assembly reading when one is recorded,
+    otherwise the component-level reading) including its qualified basis,
+    scope, axes and convention: a wire without that measurement fails closed,
+    a residual or part-value recombination may never stand in for it, and a
+    conflicting or unqualified reading is refused.
     """
 
     scene = ev.scene(evidence_root)
@@ -176,6 +185,7 @@ def _unassigned_readings(evidence_root: Path, source: dict) -> list[dict]:
         "The unassigned partition requires an independent measured reading for every member",
     )
     components = {str(row.get("name")): row for row in ev.components(evidence_root) if isinstance(row, dict)}
+    notes = oracle._notes_effective(scene)
     readings: list[dict] = []
     seen: set[str] = set()
     for item in recorded:
@@ -216,13 +226,54 @@ def _unassigned_readings(evidence_root: Path, source: dict) -> list[dict]:
             ),
             name + ": unassigned reading tensor is malformed",
         )
-        row = (components.get(name) or {}).get("mass_properties")
-        _require(isinstance(row, dict), name + ": the unassigned occurrence has no component-level reading")
-        measured = {
-            "mass": float(row.get("mass")),
-            "com": [float(value) for value in row.get("com") or []],
-            "inertia": [[float(value) for value in entry] for entry in row.get("inertia") or []],
-        }
+        note = notes.get(name)
+        if isinstance(note, dict):
+            # An effective assembly reading is the occurrence's authoritative
+            # measurement; the sealed ledger value must repeat it, never a
+            # shadowed part diagnostic.
+            reference = note.get("reference") if isinstance(note.get("reference"), dict) else {}
+            measured = {
+                "mass": float(note.get("mass")),
+                "com": [float(value) for value in note.get("com") or []],
+                "inertia": [[float(value) for value in entry] for entry in note.get("inertia") or []],
+            }
+        else:
+            row = (components.get(name) or {}).get("mass_properties")
+            _require(isinstance(row, dict), name + ": the unassigned occurrence has no component-level reading")
+            reference = row.get("reference") if isinstance(row.get("reference"), dict) else {}
+            measured = {
+                "mass": float(row.get("mass")),
+                "com": [float(value) for value in row.get("com") or []],
+                "inertia": [[float(value) for value in entry] for entry in row.get("inertia") or []],
+            }
+        basis = reference.get("measurement_basis")
+        if basis is None and reference.get("scope") == "part_document":
+            basis = "part_document"
+        _require(basis in UNASSIGNED_BASES, name + ": the unassigned reading carries no qualified basis")
+        _require(
+            item["basis"] == basis,
+            name + ": unassigned basis differs from the recorded reading",
+        )
+        _require(
+            reference.get("product_convention") == "solidworks_standard",
+            name + ": unassigned reading has an unqualified convention",
+        )
+        _require(
+            reference.get("use_system_units") is True,
+            name + ": unassigned reading is not in native SI units",
+        )
+        _require(
+            reference.get("reference_point") == "center_of_mass",
+            name + ": unassigned tensor is not about the center of mass",
+        )
+        _require(
+            reference.get("scope") == UNASSIGNED_BASES[basis],
+            name + ": unassigned reading scope differs from its basis",
+        )
+        _require(
+            isinstance(reference.get("axes"), str) and bool(reference["axes"]),
+            name + ": unassigned reading records no axes",
+        )
         _require(
             math.isclose(float(mass), measured["mass"], abs_tol=1e-12, rel_tol=1e-9)
             and len(measured["com"]) == 3
@@ -236,7 +287,7 @@ def _unassigned_readings(evidence_root: Path, source: dict) -> list[dict]:
                 for row_a, row_b in zip(inertia, measured["inertia"], strict=True)
                 for a, b in zip(row_a, row_b, strict=True)
             ),
-            name + ": the unassigned reading does not match the sealed component measurement",
+            name + ": the unassigned reading differs from the recorded authoritative measurement",
         )
         readings.append(
             {
@@ -256,8 +307,13 @@ def _combine_groups(entries: list[tuple[float, np.ndarray, np.ndarray]]) -> tupl
 
     total = math.fsum(float(mass) for mass, _com, _tensor in entries)
     _require(total > 0.0, "The closure ledger carries no positive mass")
-    weighted = sum(
-        (float(mass) * np.asarray(com, dtype=float) for mass, com, _tensor in entries), np.zeros(3)
+    weighted = np.array(
+        [
+            math.fsum(
+                float(mass) * float(np.asarray(com, dtype=float)[index]) for mass, com, _tensor in entries
+            )
+            for index in range(3)
+        ]
     )
     center = weighted / total
     inertia = np.zeros((3, 3))
@@ -270,26 +326,29 @@ def _combine_groups(entries: list[tuple[float, np.ndarray, np.ndarray]]) -> tupl
 
 
 def _unassigned_world(item: dict, raw_scene: dict) -> tuple[float, np.ndarray, np.ndarray]:
-    """One sealed unassigned reading placed in the assembly frame."""
+    """One sealed unassigned reading placed in the assembly frame.
 
-    world = oracle._raw_world(
-        {"id": "unassigned", "components": [item["name"]]},
-        raw_scene,
-        {
-            item["name"]: {
-                "mass": item["mass"],
-                "com": item["com"],
-                "inertia": item["inertia"],
-                "reference": {"product_convention": "solidworks_standard"},
-            }
-        },
-        {},
+    The explicit ledger values are the values that accounting uses: no
+    notes/effective substitution may replace them.  Part-document readings
+    convert with their recorded placement; assembly-context readings are
+    already recorded in assembly axes and stay verbatim.
+    """
+
+    com = np.asarray(item["com"], dtype=float)
+    inertia = np.asarray(item["inertia"], dtype=float)
+    if item["basis"] != "part_document":
+        return float(item["mass"]), com, inertia
+    placements = {
+        str(entry.get("name")): entry.get("transform") for entry in raw_scene.get("components") or []
+    }
+    placement = placements.get(item["name"])
+    _require(placement is not None, item["name"] + ": the unassigned occurrence has no recorded placement")
+    rotation, translation = oracle._transform(placement)
+    _require(
+        np.allclose(rotation @ rotation.T, np.eye(3), atol=1e-9),
+        item["name"] + ": the unassigned placement is not orthonormal",
     )
-    return (
-        float(world["mass"]),
-        np.asarray(world["com"], dtype=float),
-        np.asarray(world["inertia"], dtype=float),
-    )
+    return float(item["mass"]), rotation @ com + translation, rotation @ inertia @ rotation.T
 
 
 def _link_direct_record(evidence_root: Path) -> dict:
@@ -352,8 +411,10 @@ def _direct_link_sum(record: dict, source: dict) -> tuple[float, np.ndarray, np.
         _require(np.isfinite(tensor).all(), name + ": nonfinite link group tensor")
         entries.append((mass, com, tensor))
     _require(bool(entries), "The direct link sum carries no bodies")
-    total = float(sum(mass for mass, _com, _tensor in entries))
-    center = sum((mass * com for mass, com, _tensor in entries), np.zeros(3)) / total
+    total = math.fsum(mass for mass, _com, _tensor in entries)
+    center = np.array(
+        [math.fsum(mass * float(com[index]) for mass, com, _tensor in entries) for index in range(3)]
+    ) / total
     inertia = np.zeros((3, 3))
     for mass, com, tensor in entries:
         offset = com - center

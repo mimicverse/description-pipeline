@@ -1339,7 +1339,7 @@ class UnassignedLedgerTests(unittest.TestCase):
                     "mass": 1.0,
                     "com": [0.0, 0.0, 0.0],
                     "inertia": copy.deepcopy(individual),
-                    "basis": "cad_assembly_instance_measurement",
+                    "basis": "part_document",
                     "partition": "unassigned",
                 }
                 for name in remaining
@@ -1382,7 +1382,58 @@ class UnassignedLedgerTests(unittest.TestCase):
         failed = self.failures()
         self.assertIn("physics.closure", failed)
         checks = {check["id"]: check for check in verify_physics(self.root, self.source, self.model)}
-        self.assertIn("sealed component measurement", checks["physics.closure"]["details"]["error"])
+        self.assertIn("recorded authoritative measurement", checks["physics.closure"]["details"]["error"])
+
+    def test_unknown_basis_is_refused(self):
+        """An unqualified basis string never stands in for the recorded reading."""
+
+        self._two_cube_fixture(["a"], sealed_unassigned=True)
+        self.closure["unassigned"][0]["basis"] = "review.part_value_recombination"
+        failed = self.failures()
+        self.assertIn("physics.closure", failed)
+        checks = {check["id"]: check for check in verify_physics(self.root, self.source, self.model)}
+        self.assertIn("differs from the recorded reading", checks["physics.closure"]["details"]["error"])
+
+    def test_rotated_offdiagonal_unassigned_tensor_closes(self):
+        """Rz(90) placement and an off-diagonal tensor combine with rotation terms."""
+
+        self._two_cube_fixture(["a"], sealed_unassigned=True)
+        tensor = [[0.02, 0.001, 0.002], [0.001, 0.025, 0.003], [0.002, 0.003, 0.03]]
+        whole = [[0.045, 0.0, -0.001], [0.0, 0.545, 0.005], [-0.001, 0.005, 0.56]]
+        placement = np.array([[0.0, -1.0, 0.0, 1.0], [1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]])
+        self.raw["components"][1]["transform"] = placement.ravel().tolist()
+        for name in ("a", "b"):
+            self.masses[name]["inertia"] = copy.deepcopy(tensor)
+        self.closure["unassigned"][0]["inertia"] = copy.deepcopy(tensor)
+        self.closure["top_level"]["inertia"] = copy.deepcopy(whole)
+        self.model["links"][0]["inertial"]["inertia"] = [0.02, 0.001, 0.002, 0.025, 0.003, 0.03]
+        for read in self.fixture.link_direct["links"]["base_link"]["reads"]:
+            read["inertia_tensor_about_com"] = copy.deepcopy(tensor)
+        self.write()
+        self.assertEqual([], self.failures())
+
+    def test_effective_shadowed_unassigned_part_diagnostic_is_refused(self):
+        """A part diagnostic can never shadow the recorded assembly singleton."""
+
+        self.fixture._mark_instance_measurement()
+        # a's recorded effective singleton is 1.5 kg; its part diagnostic is 1 kg.
+        self.source["bodies"][0]["components"] = ["b"]
+        part = self.masses["a"]
+        self.closure["unassigned"] = [
+            {
+                "name": "a",
+                "mass": part["mass"],
+                "com": copy.deepcopy(part["com"]),
+                "inertia": copy.deepcopy(part["inertia"]),
+                "basis": "cad_assembly_instance_measurement",
+                "partition": "unassigned",
+            }
+        ]
+        self.write()
+        failed = self.failures()
+        self.assertIn("physics.closure", failed)
+        checks = {check["id"]: check for check in verify_physics(self.root, self.source, self.model)}
+        self.assertIn("recorded authoritative measurement", checks["physics.closure"]["details"]["error"])
 
 
 class StructuralQualityTests(unittest.TestCase):
