@@ -157,6 +157,33 @@ class RuntimeRoleTests(unittest.TestCase):
             "packages owned by the portable surfaces must never be base requirements",
         )
 
+    def test_pyproject_python_range_is_the_support_single_source(self):
+        root = Path(__file__).resolve().parents[2]
+        project = tomllib.loads((root / "pyproject.toml").read_text())["project"]
+        self.assertEqual(project["requires-python"], runtime.SUPPORTED_PYTHON)
+
+    def test_release_domain_identity_comes_from_the_machine_definitions(self):
+        from description_pipeline import interface_records, stages
+
+        contract = interface_records.release_contract()
+        self.assertEqual(contract["stage"], stages.CONTRACT_SHA256)
+        self.assertEqual(contract["check_policy"], interface_records.check_policy_digest())
+        self.assertEqual(contract["resource_policy"], interface_records.resource_policy_v1_digest())
+        self.assertRegex(contract["schema"], r"\A[0-9a-f]{64}\Z")
+        support = interface_records.release_support()
+        self.assertEqual(support["python"], runtime.SUPPORTED_PYTHON)
+        self.assertEqual([block["host"] for block in support["roles"].values()], ["windows", "linux"])
+        for role, block in support["roles"].items():
+            self.assertEqual(
+                block["packages"],
+                {name: runtime.RUNTIME_VERSIONS[name] for name in runtime.required_packages(role)},
+            )
+        self.assertEqual(support["hosts"]["windows"], ["discover", "capture"])
+        self.assertEqual(
+            support["hosts"]["linux"],
+            ["freeze", "discover", "capture", "generate", "verify", "publish"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

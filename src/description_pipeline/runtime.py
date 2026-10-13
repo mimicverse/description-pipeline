@@ -31,6 +31,9 @@ RUNTIME_VERSIONS = {
     "pywin32": "311",
     "mujoco": "3.13.0",
 }
+#: The one supported interpreter range; pyproject's requires-python and the
+#: release build mirror this line (IF-15 support single source).
+SUPPORTED_PYTHON = ">=3.12,<3.13"
 
 
 def runtime_role(role: str | None = None) -> str:

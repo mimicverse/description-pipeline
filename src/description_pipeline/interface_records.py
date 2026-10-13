@@ -26,6 +26,7 @@ from pathlib import Path, PurePosixPath
 from . import schemas as _schemas
 from .delivery import PIPELINE_ID
 from .io import PipelineError, artifact_path_parts, digest
+from .runtime import RUNTIME_VERSIONS, SUPPORTED_PYTHON, required_packages
 from .schemas import (
     CACHE_IMPORT_CONFIRMATION_SCHEMA,
     CACHE_RELEASE_RECEIPT_SCHEMA,
@@ -38,14 +39,21 @@ from .schemas import (
     RESOURCE_POLICY_SCHEMA,
     SOURCE_RECORD_SCHEMA,
 )
-from .stages import CONTRACT, FIXED_REQUIRED_CHECKS, STAGE_IDS
+from .stages import CONTRACT, CONTRACT_SHA256, FIXED_REQUIRED_CHECKS, HOST_BY_STAGE, HOST_IDS, STAGE_IDS
+
+#: Every single-owner boundary schema id of this release (one enumeration, the
+#: schema module stays the owner of the ids themselves).
+SCHEMA_VERSIONS = frozenset(
+    value for name, value in vars(_schemas).items() if name.endswith("_SCHEMA") and isinstance(value, str)
+)
 
 #: Every machine schema version this release knows: the single-owner schema ids
 #: plus the stage contract.  Unknown versions are refused wherever a record
 #: quotes one (call bindings, manifests, ...).
-KNOWN_SCHEMA_VERSIONS = frozenset(
-    value for name, value in vars(_schemas).items() if name.endswith("_SCHEMA") and isinstance(value, str)
-) | {CONTRACT["schema_version"]}
+KNOWN_SCHEMA_VERSIONS = SCHEMA_VERSIONS | {CONTRACT["schema_version"]}
+
+#: Canonical digest of the boundary schema id set (IF-15 release identity).
+SCHEMA_DIGEST = digest(sorted(SCHEMA_VERSIONS))
 
 
 class InterfaceRecordError(PipelineError):
@@ -63,6 +71,8 @@ _RFC3339_UTC = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z\Z")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 RELEASE_ROLES = ("native", "portable")
+#: The frozen host/role pairing of the two ends (IF-15 support matrix source).
+END_ROLES = (("linux", "portable"), ("windows", "native"))
 #: Secret-like keys are refused anywhere in a snapshot or install record.
 #: File references (``*_file``) stay allowed: only identities and paths travel.
 _SECRET_KEYS = frozenset(
@@ -975,7 +985,7 @@ def validate_install_record(record, *, previous_required: bool = False) -> dict:
     _hex64(record["dag"]["digest"], code, "dag.digest")
     _require(record["dag"]["tasks"] == len(STAGE_IDS), code, {"where": "dag.tasks", "expected": len(STAGE_IDS)})
     _exact_keys(record["ends"], {"linux", "windows"}, code, "ends")
-    for side, role in (("linux", "portable"), ("windows", "native")):
+    for side, role in END_ROLES:
         end = record["ends"][side]
         _exact_keys(end, {"install_id", "config_digest", "release"}, code, f"ends.{side}")
         _text(end["install_id"], code, f"ends.{side}.install_id")
@@ -1176,3 +1186,53 @@ def validate_source_record(record) -> dict:
         {"where": "metadata.change_summary_source"},
     )
     return record
+
+
+# --- IF-15 release identity: contract digests and the support matrix -------------
+
+
+def release_contract() -> dict:
+    """The contract identity every release manifest carries.
+
+    Each value is the canonical digest of one single-owner machine definition:
+    the boundary schema id set (``schemas.py``), the stage contract, the check
+    policy and the resource policy.
+    """
+
+    return {
+        "schema": SCHEMA_DIGEST,
+        "stage": CONTRACT_SHA256,
+        "check_policy": check_policy_digest(),
+        "resource_policy": resource_policy_v1_digest(),
+    }
+
+
+def release_support() -> dict:
+    """The structural support matrix of this release (IF-15).
+
+    It states what the release is built to support - the interpreter range, the
+    roles with their exact dependency closures, and the stages each host
+    executes - and never a qualification: pass/fail claims belong to acceptance
+    records, not to the release manifest.
+    """
+
+    host_by_role = {role: host for host, role in END_ROLES}
+    return {
+        "python": SUPPORTED_PYTHON,
+        "roles": {
+            role: {
+                "host": host_by_role[role],
+                "packages": {name: RUNTIME_VERSIONS[name] for name in required_packages(role)},
+            }
+            for role in RELEASE_ROLES
+        },
+        "hosts": {
+            host: [stage for stage in STAGE_IDS if host in HOST_BY_STAGE[stage]] for host in HOST_IDS
+        },
+    }
+
+
+def release_domain_identity() -> dict:
+    """The domain block of the release manifest: contract digests + support matrix."""
+
+    return {"contract": release_contract(), "support": release_support()}

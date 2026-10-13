@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -48,8 +49,10 @@ def bind_source_closure(source: Path) -> SimpleNamespace:
         from description_pipeline import io as pipeline_io  # noqa: PLC0415
         from description_pipeline.build import archive as build_archive  # noqa: PLC0415
         from description_pipeline.delivery import PIPELINE_ID  # noqa: PLC0415
+        from description_pipeline import interface_records as pipeline_records  # noqa: PLC0415
+        from description_pipeline import runtime as pipeline_runtime  # noqa: PLC0415
 
-        for module in (description_pipeline, pipeline_io, build_archive):
+        for module in (description_pipeline, pipeline_io, build_archive, pipeline_records, pipeline_runtime):
             module_file = getattr(module, "__file__", "") or ""
             if not Path(module_file).resolve().is_relative_to(source):
                 raise pipeline_io.PipelineError(
@@ -66,6 +69,8 @@ def bind_source_closure(source: Path) -> SimpleNamespace:
             normalize_zip=build_archive.normalize_zip,
             normalize_sdist=build_archive.normalize_sdist,
             write_zip=build_archive.write_zip,
+            release_domain_identity=pipeline_records.release_domain_identity,
+            SUPPORTED_PYTHON=pipeline_runtime.SUPPORTED_PYTHON,
         )
     finally:
         sys.path.remove(str(source))
@@ -151,6 +156,11 @@ def build(root, output, *, offline=False):
     bound = bind_source_closure(root / "src")
     if sys.version_info[:2] != (3, 12):
         raise bound.PipelineError("Release builds require CPython 3.12")
+    requires_python = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"][
+        "requires-python"
+    ]
+    if requires_python != bound.SUPPORTED_PYTHON:
+        raise bound.PipelineError("pyproject requires-python differs from the supported interpreter range")
     if git(root, "status", "--porcelain", "--untracked-files=normal"):
         raise bound.PipelineError("Release builds require a clean committed checkout")
     if output.exists() and any(output.iterdir()):
@@ -180,6 +190,7 @@ def build(root, output, *, offline=False):
             "source_commit": commit,
             "source_sha256": bound.digest(files),
             "package_files": files,
+            **bound.release_domain_identity(),
             "builder": {"python": sys.version.split()[0], **builders},
         }
         bound.write_json(package / "tool-release.json", identity)

@@ -25,6 +25,7 @@ from description_pipeline.io import (
     read_data,
     write_json,
 )
+from description_pipeline.interface_records import release_domain_identity
 
 
 def safe_members(names):
@@ -37,18 +38,20 @@ def safe_members(names):
 
 
 def verify_release(directory, identity):
-    """Check the complete release boundary, including every non-wheel artifact."""
+    """Check the complete release boundary: release.json alone binds every artifact."""
+    if (directory / "SHA256SUMS.json").exists():
+        raise PipelineError("a current release carries release.json only; SHA256SUMS.json is a legacy artifact")
     release = read_data(directory / "release.json")
-    checksums = read_data(directory / "SHA256SUMS.json")
-    if inventory(directory, exclude=("SHA256SUMS.json",)) != checksums:
-        raise PipelineError("Release assets differ from SHA256SUMS.json")
-    artifacts = {name: checksum for name, checksum in checksums.items() if name != "release.json"}
-    if (
-        release.get("artifacts") != artifacts
-        or {key: value for key, value in release.items() if key != "artifacts"} != identity
-    ):
-        raise PipelineError("Release manifest does not bind the artifact set and wheel source identity")
-    for name in artifacts:
+    if release.get("artifacts") != inventory(directory, exclude=("release.json",)):
+        raise PipelineError("Release assets differ from release.json")
+    if {key: value for key, value in release.items() if key != "artifacts"} != identity:
+        raise PipelineError("Release manifest does not bind the wheel source identity")
+    domain = release_domain_identity()
+    if identity.get("contract") != domain["contract"]:
+        raise PipelineError("Release manifest does not bind the live schema/stage/policy digests")
+    if identity.get("support") != domain["support"]:
+        raise PipelineError("Release manifest does not bind the live support matrix")
+    for name in release["artifacts"]:
         path = directory / name
         if name.endswith(".tar.gz"):
             with tarfile.open(path) as archive:

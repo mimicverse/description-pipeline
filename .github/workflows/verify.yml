@@ -66,14 +66,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - name: Check out the repository (build A)
+      - name: Check out the repository
         uses: actions/checkout@v4
-        with:
-          path: checkout-a
-      - name: Check out the repository (build B)
-        uses: actions/checkout@v4
-        with:
-          path: checkout-b
       - name: Install the pinned CPython
         uses: actions/setup-python@v5
         with:
@@ -95,12 +89,16 @@ jobs:
               raise SystemExit(f"CI runtime identity drift: found CPython {version}, pinned {pinned}")
           print(f"runtime identity: CPython {version}, {platform.system()}/{platform.machine()}")
           PY
-      - name: Install the locked release builders
-        run: python -m pip install --disable-pip-version-check -r requirements/build-py312.lock
+      - name: The second build path is a worktree of this checkout
+        run: git worktree add --detach "$RUNNER_TEMP/build-b" HEAD
+      - name: Install the pinned development environment
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements/linux-py312.lock -r requirements/build-py312.lock
+          python -m pip install --no-deps --no-build-isolation -e .
       - name: Ambient negative control binds the release identity to the source closure
         run: |
           set -eu
-          cp -r checkout-a/src /tmp/ambient-src
+          cp -r src /tmp/ambient-src
           python - <<'PY'
           import re
           from pathlib import Path
@@ -108,43 +106,34 @@ jobs:
           init = Path("/tmp/ambient-src/description_pipeline/__init__.py")
           init.write_text(re.sub(r'__version__ = "[^"]+"', '__version__ = "0.0.0"', init.read_text()))
           PY
-          (cd checkout-a && PYTHONPATH=/tmp/ambient-src python tools/build_release.py --output ../release-a --offline > ../release-a.log)
-          (cd checkout-a && python - <<'PY'
+          PYTHONPATH=/tmp/ambient-src python tools/build_release.py --output "$RUNNER_TEMP/release-a" --offline > "$RUNNER_TEMP/release-a.log"
+          python - <<'PY'
           import json
+          import os
           import re
           from pathlib import Path
 
-          release = json.loads(Path("../release-a/release.json").read_text())
+          release = json.loads((Path(os.environ["RUNNER_TEMP"]) / "release-a/release.json").read_text())
           source = re.search(r'__version__ = "([^"]+)"', Path("src/description_pipeline/__init__.py").read_text()).group(1)
           assert release["version"] == source, (release["version"], source)
           assert release["version"] != "0.0.0"
           PY
-          )
       - name: A second checkout path builds byte-identical artifacts
         run: |
           set -eu
-          (cd checkout-b && python tools/build_release.py --output ../release-b --offline > ../release-b.log)
-          diff -r release-a release-b
-          python - <<'PY'
-          import hashlib
-          import json
-          from pathlib import Path
-
-          for name in ("release-a", "release-b"):
-              release = json.loads(Path(name, "release.json").read_text())
-              for artifact, checksum in release["artifacts"].items():
-                  actual = hashlib.sha256(Path(name, artifact).read_bytes()).hexdigest()
-                  assert actual == checksum, (name, artifact)
-          PY
+          (cd "$RUNNER_TEMP/build-b" && python tools/build_release.py --output "$RUNNER_TEMP/release-b" --offline > "$RUNNER_TEMP/release-b.log")
+          diff -r "$RUNNER_TEMP/release-a" "$RUNNER_TEMP/release-b"
       - name: The role archives resolve offline for their targets
         run: |
           set -eu
           python - <<'PY'
+          import os
           import subprocess
           import sys
           import zipfile
           from pathlib import Path
 
+          release = Path(os.environ["RUNNER_TEMP"]) / "release-a"
           # The native (Windows) end installs this archive with no index and no extra
           # portable packages; the resolver must accept the wheel metadata as it stands.
           targets = {
@@ -157,7 +146,7 @@ jobs:
               ],
           }
           for platform, constraints in targets.items():
-              (archive,) = Path("release-a").glob(f"description-*-{platform}-cp312-x86_64.zip")
+              (archive,) = release.glob(f"description-*-{platform}-cp312-x86_64.zip")
               target = Path("/tmp") / f"role-{platform}"
               with zipfile.ZipFile(archive) as source:
                   source.extractall(target)
@@ -173,28 +162,34 @@ jobs:
               if result.returncode != 0:
                   raise SystemExit(f"the {platform} role archive does not resolve offline")
           PY
-      - name: The Linux role archive installs in isolation outside the checkout
+      - name: The real verifier binds the release and exercises the isolated install
         run: |
           set -eu
-          python -m venv /tmp/role-venv
-          /tmp/role-venv/bin/python -m pip install --no-index --require-hashes --only-binary=:all: \
-            --find-links /tmp/role-linux/wheels -r /tmp/role-linux/requirements.lock
-          /tmp/role-venv/bin/python -m pip check
-          cat > /tmp/role-identity.py <<'PY'
+          wheel=( "$RUNNER_TEMP"/release-a/*.whl )
+          python tools/verify_distribution.py "${wheel[0]}" \
+            --runtime-lock requirements/linux-py312.lock \
+            --wheelhouse /tmp/role-linux/wheels \
+            --report release-verify-report.json
+      - name: Record the verification runtime environment
+        run: |
+          set -eu
+          python - <<'PY' > release-verify-environment.json
+          import importlib.metadata as metadata
           import json
+          import platform
           import sys
-          from pathlib import Path
 
-          from description_pipeline.runtime import tool_record
-
-          release = json.loads(Path(sys.argv[1]).read_text())
-          record = tool_record("portable")
-          assert record["version"] == release["version"], (record["version"], release["version"])
-          assert record["release"]["source_commit"] == release["source_commit"], (
-              record["release"]["source_commit"],
-              release["source_commit"],
-          )
-          assert record["runtime"]["role"] == "portable"
-          print(json.dumps({"version": record["version"], "source_commit": record["release"]["source_commit"]}))
+          print(json.dumps({
+              "python": sys.version.split()[0],
+              "platform": platform.platform(),
+              "machine": platform.machine(),
+              "builders": {name: metadata.version(name) for name in ("build", "setuptools", "wheel")},
+          }, indent=2))
           PY
-          /tmp/role-venv/bin/python -I /tmp/role-identity.py "$PWD/release-a/release.json"
+      - name: Keep the report and the environment with the run
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-verification
+          path: |
+            release-verify-report.json
+            release-verify-environment.json

@@ -11,6 +11,7 @@ import shutil
 import sys
 from pathlib import Path
 
+from description_pipeline.interface_records import release_domain_identity
 from description_pipeline.io import PipelineError, inventory, write_json
 from tools.verify_distribution import safe_members, verify_release
 
@@ -24,14 +25,14 @@ class DistributionTests(unittest.TestCase):
     def test_release_checks_every_asset_and_its_source_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            identity = {"source_commit": "a" * 40}
+            identity = {"source_commit": "a" * 40, **release_domain_identity()}
             path = root / "deployment.zip"
             with zipfile.ZipFile(path, "w") as archive:
                 archive.writestr("docs/mechanical-handoff-spec.md", "approved\n")
             write_json(root / "release.json", {**identity, "artifacts": inventory(root)})
             verify_release(root, identity)
             with self.assertRaises(PipelineError):
-                verify_release(root, {"source_commit": "b" * 40})
+                verify_release(root, {**identity, "source_commit": "b" * 40})
             with zipfile.ZipFile(path, "a") as archive:
                 archive.writestr("docs/unknown.md", "extra\n")
             with self.assertRaises(PipelineError):
@@ -40,7 +41,7 @@ class DistributionTests(unittest.TestCase):
     def test_legacy_second_manifest_is_refused(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            identity = {"source_commit": "a" * 40}
+            identity = {"source_commit": "a" * 40, **release_domain_identity()}
             (root / "artifact.zip").write_bytes(b"release bytes")
             write_json(root / "release.json", {**identity, "artifacts": inventory(root)})
             write_json(root / "SHA256SUMS.json", {})
@@ -51,7 +52,7 @@ class DistributionTests(unittest.TestCase):
     def test_missing_and_tampered_artifacts_are_refused(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            identity = {"source_commit": "a" * 40}
+            identity = {"source_commit": "a" * 40, **release_domain_identity()}
             artifact = root / "artifact.zip"
             with zipfile.ZipFile(artifact, "w") as archive:
                 archive.writestr("member.txt", "original\n")
@@ -64,6 +65,32 @@ class DistributionTests(unittest.TestCase):
             artifact.unlink()
             with self.assertRaises(PipelineError):
                 verify_release(root, identity)
+
+    def test_the_manifest_binds_the_live_contract_and_support_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            identity = {"source_commit": "a" * 40, **release_domain_identity()}
+            (root / "artifact.bin").write_bytes(b"release bytes")
+            artifacts = inventory(root)
+            write_json(root / "release.json", {**identity, "artifacts": artifacts})
+            verify_release(root, identity)
+            cases = [
+                ("contract", "schema"),
+                ("contract", "stage"),
+                ("contract", "check_policy"),
+                ("contract", "resource_policy"),
+                ("support", "python"),
+            ]
+            for field, key in cases:
+                broken = {**identity, field: {**identity[field], key: "0" * 64}}
+                with self.subTest(field=field, key=key):
+                    write_json(root / "release.json", {**broken, "artifacts": artifacts})
+                    with self.assertRaises(PipelineError):
+                        verify_release(root, broken)
+            without_support = {key: value for key, value in identity.items() if key != "support"}
+            write_json(root / "release.json", {**without_support, "artifacts": artifacts})
+            with self.assertRaises(PipelineError):
+                verify_release(root, without_support)
 
     def test_builder_binds_the_specified_source_closure(self):
         from tools import build_release
@@ -119,7 +146,7 @@ class DistributionTests(unittest.TestCase):
                 patch.object(
                     build_release,
                     "bind_source_closure",
-                    return_value=SimpleNamespace(PipelineError=PipelineError),
+                    return_value=SimpleNamespace(PipelineError=PipelineError, SUPPORTED_PYTHON=">=3.12,<3.13"),
                 ),
                 patch.object(build_release, "sys", SimpleNamespace(version_info=(3, 11, 9))),
                 self.assertRaisesRegex(PipelineError, "CPython 3.12"),
@@ -129,7 +156,7 @@ class DistributionTests(unittest.TestCase):
                 patch.object(
                     build_release,
                     "bind_source_closure",
-                    return_value=SimpleNamespace(PipelineError=PipelineError),
+                    return_value=SimpleNamespace(PipelineError=PipelineError, SUPPORTED_PYTHON=">=3.12,<3.13"),
                 ),
                 patch.object(build_release, "git", return_value=""),
                 patch.object(build_release.importlib.metadata, "version", return_value="0.0.0"),
