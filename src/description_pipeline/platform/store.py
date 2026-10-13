@@ -1,10 +1,10 @@
-"""The application-side platform store API (v3.3 frozen semantics).
+"""The application-side platform store API.
 
 One module, one transaction entry: admission close/open, ONE new-admission
 entry that registers a request with its run and initial dispatch intent in a
 single short transaction (all-or-nothing), qualified registration of
 successor operations for admitted runs (cancel/reconcile included),
-stage-confirmation writes and read-only queries over the two frozen
+stage-confirmation writes and read-only queries over the two lifecycle
 projection views.
 
 The connection is injected - this module carries no import-time database
@@ -151,7 +151,11 @@ _TERMINAL_KINDS = frozenset({"cancel", "reconcile"})
 
 
 def _json(value: Any) -> str | None:
-    """jsonb parameters travel as the single canonical JSON text (the R17 codec)."""
+    """jsonb parameters travel as the single canonical JSON text.
+
+    The codec belongs to the shared foundation; this guard fail-closes
+    instead of emitting NaN/Infinity.
+    """
 
     if value is None:
         return None
@@ -359,7 +363,7 @@ class PlatformStore:
         """Pure identity read of one operation key; never touches a checkpoint.
 
         The duplicate path returns the registered record without consuming or
-        re-verifying the sealed checkpoint: the lookup only proves the frozen
+        re-verifying the sealed checkpoint: the lookup only proves the
         idempotency contract (the same request returns the same operation and
         a recorded side effect is never re-sent), and parameter drift is the
         same conflict as in the locked re-check.
@@ -376,7 +380,7 @@ class PlatformStore:
     def _rebind_predecessor(self, *, run_id: str, stage: str, kind: str) -> dict | None:
         """Rebind the successor's registered predecessor, outside any lock.
 
-        The frozen boundary keeps the sealed-byte work - resolver, delivery
+        The short-transaction boundary keeps the sealed-byte work - resolver, delivery
         manifest, independently rebuilt definition - out of the run-locking
         registration transaction.  This short read locates the registered
         predecessor and closes before the heavy verification runs; ``None``
@@ -650,7 +654,7 @@ class PlatformStore:
     # ------------------------------------------------------------- read side
 
     def lifecycle_rows(self) -> list[dict]:
-        """Every row of the frozen lifecycle projection (single query, no pre-filtering)."""
+        """Every row of the lifecycle projection (single query, no pre-filtering)."""
 
         with self._transaction() as connection:
             cursor = connection.cursor()
