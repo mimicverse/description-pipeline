@@ -210,6 +210,7 @@ def ensure_portal_config(state: Path, resolved: dict[str, str]) -> Path:
         rendered = rendered.replace(token, value)
     rendered = rendered.replace('"@PIPELINE_STORE_ROOT@"', json.dumps(resolved["PIPELINE_STORE_ROOT"]))
     rendered = rendered.replace("@MODEL_REPOSITORIES_JSON@", resolved["MODEL_REPOSITORIES_JSON"])
+    rendered = rendered.replace("@MODEL_TARGETS_JSON@", resolved["MODEL_TARGETS_JSON"])
     rendered = rendered.replace("@DISCOVERY_SETTINGS_JSON@", resolved["DISCOVERY_SETTINGS_JSON"])
     write_private(target, rendered)
     return target
@@ -319,6 +320,39 @@ def main() -> int:
             for label, other in [("capture store", store_root), ("handoff intake", handoff_root), *runtime_paths]:
                 if directory.is_relative_to(other) or other.is_relative_to(directory):
                     die(f"Model checkout must not overlap {label}")
+    targets = {}
+    targets_file = values.get("MODEL_TARGETS_FILE", "")
+    if targets_file:
+        path = private_file(targets_file, "MODEL_TARGETS_FILE")
+        try:
+            targets = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            die(f"MODEL_TARGETS_FILE is unreadable: {error}")
+        if not isinstance(targets, dict):
+            die("MODEL_TARGETS_FILE must map hardware identities to repository routing")
+        for hardware, target in targets.items():
+            if (
+                not isinstance(hardware, str)
+                or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", hardware)
+                or not isinstance(target, dict)
+                or set(target) != {"repository_slug", "base"}
+            ):
+                die("MODEL_TARGETS_FILE requires hardware -> {repository_slug, base}")
+            slug, base = target["repository_slug"], target["base"]
+            if (
+                not isinstance(slug, str)
+                or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", slug)
+                or slug not in repositories
+            ):
+                die(f"MODEL_TARGETS_FILE target {hardware!r} must name a configured repository")
+            if (
+                not isinstance(base, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", base)
+                or ".." in base
+                or base.endswith(".lock")
+                or base.startswith("-")
+            ):
+                die(f"MODEL_TARGETS_FILE target {hardware!r} base must be a well-formed git branch")
     discovery = {}
     discovery_file = values.get("DISCOVERY_SETTINGS_FILE", "")
     if discovery_file:
@@ -377,6 +411,7 @@ def main() -> int:
         SOLIDWORKS_HANDOFF_ROOT=str(handoff_root),
         PIPELINE_STORE_ROOT=str(store_root),
         MODEL_REPOSITORIES_JSON=json.dumps(repositories, sort_keys=True),
+        MODEL_TARGETS_JSON=json.dumps(targets, sort_keys=True),
         DISCOVERY_SETTINGS_JSON=json.dumps(discovery, sort_keys=True),
         ENDPOINT_TOKEN_FILE=values.get("ENDPOINT_TOKEN_FILE", str(state / "secrets" / "endpoint.token")),
         NGINX_BIN=nginx_bin,

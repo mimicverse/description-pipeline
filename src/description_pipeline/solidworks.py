@@ -267,6 +267,7 @@ def run(
     backend=None,
     run_id: str | None = None,
     on_event=None,
+    on_activity=None,
     prior_events=None,
     expected_inputs=None,
     handoff_sha256=None,
@@ -290,6 +291,8 @@ def run(
     the endpoint always uses the native SolidWorks backend. Capture or quality
     failure preserves a previous delivery. Submission failure keeps the new
     verified delivery and any publication receipt for retry without CAD.
+    ``on_activity`` optionally observes best-effort capture progress records for
+    the live-activity view; progress can never change a run.
     """
 
     package = Path(package)
@@ -344,6 +347,7 @@ def run(
                     staging,
                     backend=backend,
                     on_event=event,
+                    on_activity=on_activity,
                     expected_inputs=expected_inputs,
                     handoff_sha256=handoff_sha256,
                 )

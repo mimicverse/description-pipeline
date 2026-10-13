@@ -63,7 +63,16 @@ class StopAfterRunTests(unittest.TestCase):
 
     @staticmethod
     def _fake_capture(calls):
-        def fake_capture(package, staging, *, backend=None, on_event=None, expected_inputs=None, handoff_sha256=None):
+        def fake_capture(
+            package,
+            staging,
+            *,
+            backend=None,
+            on_event=None,
+            on_activity=None,
+            expected_inputs=None,
+            handoff_sha256=None,
+        ):
             calls["capture"] += 1
             fixture = build_capture_root(Path(staging).parent / "fixture", handoff=handoff_sha256)
             shutil.copytree(fixture, Path(staging), dirs_exist_ok=True)
@@ -74,9 +83,36 @@ class StopAfterRunTests(unittest.TestCase):
             if on_event is not None:
                 for event in stage_events("capture"):
                     on_event(event)
+            if on_activity is not None:
+                on_activity({"phase": "capture", "action": "seal"})
             return {"hardware_id": "robot"}, {"cad_revision": {"revision": "r1"}, "package_files": {}}
 
         return fake_capture
+
+    def test_run_forwards_capture_activity_to_the_capture_step(self) -> None:
+        calls = {"capture": 0, "generate": 0, "verify": 0, "publish": 0}
+        records = []
+
+        with (
+            patch.object(solidworks, "_native_tool_record", return_value=build_native_tool()),
+            patch.object(steps, "capture_evidence", side_effect=self._fake_capture(calls)),
+            patch.object(steps, "generate_model", side_effect=forbid(calls, "generate")),
+            patch.object(steps, "verify_delivery", side_effect=forbid(calls, "verify")),
+            patch.object(steps, "publish_model", side_effect=forbid(calls, "publish")),
+        ):
+            solidworks.run(
+                self.package,
+                self.output,
+                stop_after="capture",
+                backend=object(),
+                run_id="8d0c55c4-1cad-5aff-af5f-5cc0bfc5a977",
+                handoff_sha256=HANDOFF,
+                main_assembly=MAIN,
+                prior_events=[*stage_events("freeze"), *stage_events("discover")],
+                on_activity=records.append,
+            )
+
+        self.assertEqual(records, [{"phase": "capture", "action": "seal"}])
 
     def test_capture_stop_seals_transfer_and_stops(self) -> None:
         calls = {"capture": 0, "generate": 0, "verify": 0, "publish": 0}

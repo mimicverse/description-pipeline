@@ -974,6 +974,18 @@ class PortalTests(unittest.TestCase):
         staging = self.upload_root / ".staging"
         self.assertTrue(not staging.exists() or not any(staging.iterdir()))
 
+    def test_unknown_target_hardware_is_rejected(self) -> None:
+        self.client.login()
+        files = [("model.SLDASM", b"<assembly/>")]
+        status, _, body = self.client.request_raw(
+            "POST",
+            "/api/runs",
+            _upload_body(files=files, fields=[("target_hardware", "ghost")]),
+            "multipart/form-data; boundary=portal-boundary",
+        )
+        self.assertEqual(status, 400, body)
+        self.assertIn("发布目标不在平台配置中", json.loads(body)["error"])
+
     def test_main_assembly_selection_is_validated_and_persisted(self) -> None:
         self.client.login()
         files = [

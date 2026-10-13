@@ -19,7 +19,7 @@ import logging
 import os
 import shutil
 import tempfile
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from airflow.sdk import Param, dag, task
@@ -37,6 +37,7 @@ from description_pipeline.orchestration.airflow_client import (
     drive_staging,
     native_run_id,
     resolved_routing,
+    submission_identity,
     validate_main_assembly,
 )
 from description_pipeline.orchestration.linux_runner import fetch_capture as fetch_native_capture
@@ -183,6 +184,43 @@ def _linked_conf(context) -> dict | None:
     if not (isinstance(parent, str) and parent.strip() and isinstance(stage, str) and stage in STAGE_IDS):
         raise AirflowFailException("A linked attempt requires parent_dag_run_id and a canonical resume_from stage")
     return {"parent_run": native_run_id(parent.strip()), "from_stage": stage}
+
+
+def _submission_identity(context) -> dict | None:
+    """The portal submission identity carried beside the endpoint request.
+
+    ``None`` keeps today's deferred release-blocking behavior when no configured
+    target was selected.  A selected target that is not configured on the Linux
+    side fails closed; the parent revision is read best-effort from the model
+    checkout so the derived revision keeps its successor linkage.
+    """
+
+    conf = getattr(context["dag_run"], "conf", None)
+    conf = conf if isinstance(conf, dict) else {}
+    target = str(conf.get("target_hardware") or context["params"].get("target_hardware") or "").strip()
+    summary = str(conf.get("change_summary") or context["params"].get("change_summary") or "").strip()
+    principal = conf.get("submission_principal")
+    if not isinstance(principal, str) or not principal.strip():
+        principal = str(getattr(context["dag_run"], "triggering_user_name", "") or "").strip()
+    if not target:
+        if summary:
+            log.info("submission change summary ignored without a configured target identity")
+        return None
+    config = config_from_airflow_connection(CONN_ID)
+    from description_pipeline.repository.urdf_pr import published_revision
+
+    try:
+        return submission_identity(
+            target_hardware=target,
+            change_summary=summary,
+            principal=principal,
+            config=config,
+            as_of=datetime.now(UTC).strftime("%Y%m%d"),
+            published_revision=published_revision,
+            warn=lambda message: log.warning("%s", message),
+        )
+    except EndpointProtocolError as error:
+        raise AirflowFailException(str(error)) from error
 
 
 def _param_selection(context) -> str | None:
@@ -387,6 +425,25 @@ def _provide_definition(endpoint: WindowsEndpoint, request: dict) -> None:
             raise AirflowFailException("The sealed selection lists no files to derive")
         settings = _definition_settings(endpoint.config, main_assembly)
         frozen = _materialize_selection(Path(intake), selected, work / "selected")
+        identity_block = request.get("identity") if isinstance(request.get("identity"), dict) else None
+        submission = None
+        if identity_block is not None:
+            from description_pipeline.sources.solidworks.discovery import SubmissionIdentity
+
+            handoff_digest = manifest.get("handoff_sha256")
+            submission = SubmissionIdentity(
+                hardware_id=identity_block.get("hardware_id"),
+                owner=identity_block.get("owner"),
+                change_summary=identity_block.get("change_summary"),
+                parent_revision=identity_block.get("parent_revision"),
+                control_reference=(
+                    handoff_digest if isinstance(handoff_digest, str) else identity_block.get("control_reference")
+                ),
+                as_of=identity_block.get("as_of"),
+                inventory_digest=(
+                    handoff_digest if isinstance(handoff_digest, str) else request.get("upload_sha256")
+                ),
+            )
         admission = admit_raw_record_bundle(
             bundle,
             expected_run_id=run_id,
@@ -408,6 +465,7 @@ def _provide_definition(endpoint: WindowsEndpoint, request: dict) -> None:
             expected_native_tool=snapshot.native_tool,
             expected_archive_sha256=snapshot.record_sha256,
             settings=settings,
+            submission_identity=submission,
         )
         if prepared.passed is not True:
             raise PipelineError("the derivation did not pass; its findings must be resolved before capture")
@@ -573,6 +631,21 @@ def _same_request(job: dict, request: dict) -> None:
                 "when provided."
             ),
         ),
+        "target_hardware": Param(
+            "",
+            type="string",
+            title="Publication target hardware identity",
+            description=(
+                "Optional configured hardware identity used to derive the publication identity when the "
+                "CAD records do not carry dp.hardware_id; must name a configured target"
+            ),
+        ),
+        "change_summary": Param(
+            "",
+            type="string",
+            title="Change summary",
+            description="Optional one-line change summary used when the CAD records do not carry one",
+        ),
     },
 )
 def solidworks_to_urdf():
@@ -636,6 +709,9 @@ def solidworks_to_urdf():
                 if validate_file_index(package_inventory(intake)) != upload_files:
                     raise AirflowFailException("The linked intake no longer matches the parent's retained selection")
                 request["intake_dir"] = str(intake)
+            identity = _submission_identity(context)
+            if identity is not None:
+                request["identity"] = {**identity, "control_reference": request["upload_sha256"]}
             return request
         handoff_path = str(context["params"]["handoff_path"]).strip()
         if not handoff_path:
@@ -653,7 +729,7 @@ def solidworks_to_urdf():
             main,
             CONN_ID,
         )
-        return {
+        request = {
             "run_id": run_id,
             "upload_files": upload_files,
             "upload_sha256": digest(upload_files),
@@ -661,6 +737,10 @@ def solidworks_to_urdf():
             "intake_dir": str(intake),
             "conn_id": CONN_ID,
         }
+        identity = _submission_identity(context)
+        if identity is not None:
+            request["identity"] = {**identity, "control_reference": request["upload_sha256"]}
+        return request
 
     @task(doc_md="Submit the same UUID and frozen handoff to the serial Windows queue; retries never replay CAD.")
     def start_job(request: dict) -> dict:

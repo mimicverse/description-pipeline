@@ -16,6 +16,7 @@ Guarantees:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -67,6 +68,10 @@ REQUIRED_FILES = (
 REQUIRED_DIRS = ("evidence", "meshes")
 REVIEW_BRANCH = "work/solidworks/{hardware}"
 PUBLISHER_MARKER = "Urdf-Publisher: description-pipeline"
+log = logging.getLogger(__name__)
+
+#: Bound on the best-effort fetch that resolves a previous published revision.
+PUBLISHED_REVISION_FETCH_TIMEOUT_SECONDS = 60
 
 
 class PrError(RuntimeError):
@@ -157,6 +162,47 @@ def _previous_revision(worktree: Path, hardware: str) -> dict | None:
         return cad_revision.read_revision(worktree / "input")
     except PipelineError as error:
         raise PrError("previous_cad_revision_invalid", str(error)) from error
+
+
+def published_revision(repository: Path, hardware: str) -> dict | None:
+    """Read the published cad-revision.json of one hardware review branch (read-only).
+
+    Best-effort identity resolution for the submission lane: it fetches the
+    deterministic review branch and reads the manifest from the fetched commit,
+    never creating a worktree.  Any unavailability returns ``None`` so the
+    caller keeps ``parent_revision`` absent; publication's own
+    ``check_successor`` remains the deciding gate.
+    """
+
+    branch = REVIEW_BRANCH.format(hardware=hardware)
+    _validate_ref(repository, branch, branch=True)
+    try:
+        subprocess.run(
+            ["git", "-C", str(repository), "fetch", "--quiet", "origin", branch],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=PUBLISHED_REVISION_FETCH_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning("published revision fetch timed out for %s; continuing without a parent revision", branch)
+        return None
+    show = _git(repository, "show", f"refs/remotes/origin/{branch}:input/cad-revision.json", check=False)
+    if show.returncode != 0 or not show.stdout.strip():
+        return None
+    try:
+        payload = json.loads(show.stdout)
+    except json.JSONDecodeError:
+        return None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("hardware_id") != hardware
+        or not isinstance(payload.get("revision"), str)
+        or not payload["revision"].strip()
+    ):
+        return None
+    return payload
 
 
 def _validate_ref(repository: Path, name: str, *, branch: bool) -> None:

@@ -1078,7 +1078,7 @@ class DiscoveryTests(unittest.TestCase):
                 record = copy.deepcopy(complete)
                 record["identity"].pop(field)
                 findings: list[dict] = []
-                identity = _identity(
+                identity, _identity_sources = _identity(
                     record,
                     DiscoverySettings(),
                     findings,
@@ -1097,7 +1097,7 @@ class DiscoveryTests(unittest.TestCase):
         record = copy.deepcopy(complete)
         record["identity"].pop("robot_name")
         findings = []
-        identity = _identity(
+        identity, _identity_sources = _identity(
             record,
             DiscoverySettings(),
             findings,
@@ -1114,7 +1114,7 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_absent_identity_fields_use_a_technical_robot_name(self):
         findings: list[dict] = []
-        identity = _identity(
+        identity, _identity_sources = _identity(
             {"identity": {}, "properties": {"document": {}}},
             DiscoverySettings(),
             findings,
@@ -1127,7 +1127,7 @@ class DiscoveryTests(unittest.TestCase):
         item = next(finding for finding in findings if finding["code"] == "discovery.robot_name_missing")
         self.assertEqual(item["detail"], {"technical_name": "robot", "authored": False})
         findings = []
-        identity = _identity(
+        identity, _identity_sources = _identity(
             {"identity": {"hardware_id": "Wrist_Drive-2"}, "properties": {"document": {}}},
             DiscoverySettings(),
             findings,
