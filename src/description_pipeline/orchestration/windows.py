@@ -45,6 +45,7 @@ from ..io import (
     read_data,
     write_json,
 )
+from ..ports import SOLIDWORKS_ENDPOINT_PORT
 from ..sources.snapshot import verify_snapshot
 from ..sources.solidworks.revision import package_inventory
 from ..sources.solidworks.selection import SelectionError
@@ -227,7 +228,7 @@ def read_config(path):
     config["token"] = token
     config.pop("token_file")
     config.setdefault("host", "127.0.0.1")
-    config.setdefault("port", 8765)
+    config.setdefault("port", SOLIDWORKS_ENDPOINT_PORT)
     _require(
         isinstance(config["port"], int) and not isinstance(config["port"], bool) and 1 <= config["port"] <= 65535,
         "Invalid endpoint port",

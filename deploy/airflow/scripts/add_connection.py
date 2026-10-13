@@ -19,7 +19,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--conn-id", default="solidworks_windows")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=18765)
+    parser.add_argument("--port", type=int, required=True, help="Linux loopback port of the endpoint tunnel")
     parser.add_argument("--token-file", required=True)
     parser.add_argument(
         "--pipeline-config", required=True, help="rendered portal config containing Linux execution routing"

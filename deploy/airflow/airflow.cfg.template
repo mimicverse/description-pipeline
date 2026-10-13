@@ -3,7 +3,7 @@ dags_folder = @DAGS_FOLDER@
 executor = LocalExecutor
 load_examples = False
 fernet_key = @FERNET_KEY@
-execution_api_server_url = http://127.0.0.1:8791/execution
+execution_api_server_url = http://127.0.0.1:@AIRFLOW_API_PORT@/execution
 # One operator SSO: the package-local Feishu auth manager. Its FEISHU_* settings come from the
 # private environment file referenced by the api-server unit; with none supplied it fails
 # explicitly (no password login and no fallback).

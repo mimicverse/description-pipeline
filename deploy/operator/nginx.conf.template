@@ -47,7 +47,7 @@ http {
             if ($host != "@OPERATOR_HOST@") {
                 return 302 https://@OPERATOR_HOST@:@OPERATOR_HTTPS_PORT@/auth/feishu/login;
             }
-            proxy_pass http://127.0.0.1:8791;
+            proxy_pass http://127.0.0.1:@AIRFLOW_API_PORT@;
             proxy_http_version 1.1;
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;
@@ -58,7 +58,7 @@ http {
             if ($host != "@OPERATOR_HOST@") {
                 return 302 https://@OPERATOR_HOST@:@OPERATOR_HTTPS_PORT@$uri$is_args$args;
             }
-            proxy_pass http://127.0.0.1:8791;
+            proxy_pass http://127.0.0.1:@AIRFLOW_API_PORT@;
             proxy_http_version 1.1;
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;
@@ -67,7 +67,7 @@ http {
 
         # Feishu SSO callback goes to the Airflow api-server; the operator page stays on the portal.
         location ^~ /auth/feishu/ {
-            proxy_pass http://127.0.0.1:8791;
+            proxy_pass http://127.0.0.1:@AIRFLOW_API_PORT@;
             proxy_http_version 1.1;
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;

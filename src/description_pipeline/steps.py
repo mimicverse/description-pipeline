@@ -477,6 +477,16 @@ def publish_model(
     from .repository.urdf_pr import submit_bundle
 
     _state(on_event, "publish", "running")
+    # Fail closed on degraded installs: a source/PYTHONPATH checkout carries no
+    # embedded release identity, so the split-workflow gate compares empty
+    # release records.  Publication must never bind a PR to an unidentified
+    # tool (ORC-04).
+    tool = tool_record()
+    _require(
+        isinstance(tool.get("release"), dict) and bool(tool.get("release")),
+        "Refusing to publish: this runtime carries no embedded release identity "
+        "(tool-release.json is absent); install the released distribution",
+    )
     author = read_data(Path(bundle) / "input/robot.yaml")
     hardware = author["hardware_id"]
     _require(isinstance(hardware, str) and bool(hardware), "Publication requires an authored CAD hardware identity")

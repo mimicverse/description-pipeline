@@ -20,6 +20,10 @@ if [ ! -f "$OPERATOR_STATE/resolved.env" ]; then
 fi
 # shellcheck disable=SC1090
 source "$OPERATOR_STATE/resolved.env"
+# Every port comes from the single deploy source (render_operator.py) via resolved.env.
+for key in AIRFLOW_API_PORT TUNNEL_LOOPBACK_PORT PORTAL_PORT OPERATOR_HTTPS_PORT; do
+  [ -n "${!key:-}" ] || { report FAIL "resolved.env is missing $key (run install to re-render)"; exit 1; }
+done
 
 [ "$(stat -c '%a' "$OPERATOR_STATE")" = "700" ] && report PASS "state dir is 0700" \
   || report FAIL "state dir is not 0700: $OPERATOR_STATE"
@@ -72,10 +76,10 @@ fi
 
 # Authenticated endpoint probe through the tunnel: a bare HTTP response is not health.
 if [ -f "${ENDPOINT_TOKEN_FILE:-}" ]; then
-  if python3 - "$ENDPOINT_TOKEN_FILE" "$PORTAL_CONFIG" <<'PY'
+  if python3 - "$ENDPOINT_TOKEN_FILE" "$PORTAL_CONFIG" "$TUNNEL_LOOPBACK_PORT" <<'PY'
 import json, sys, urllib.request
 token = open(sys.argv[1]).read().strip()
-request = urllib.request.Request("http://127.0.0.1:18765/health",
+request = urllib.request.Request(f"http://127.0.0.1:{sys.argv[3]}/health",
                                  headers={"Authorization": "Bearer " + token})
 with urllib.request.urlopen(request, timeout=15) as response:
     body = json.load(response)
@@ -99,7 +103,7 @@ fi
 # the handoff allowlist. Neither the token nor the connection is ever printed.
 if [ -x "${AIRFLOW_VENV:-}/bin/python" ] && [ -f "${ENDPOINT_TOKEN_FILE:-}" ]; then
   if AIRFLOW_HOME="${AIRFLOW_HOME:-}" "$AIRFLOW_VENV/bin/python" - \
-      "$SOLIDWORKS_HANDOFF_ROOT" "$ENDPOINT_TOKEN_FILE" "$PORTAL_CONFIG" <<'PY'
+      "$SOLIDWORKS_HANDOFF_ROOT" "$ENDPOINT_TOKEN_FILE" "$PORTAL_CONFIG" "$TUNNEL_LOOPBACK_PORT" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -111,7 +115,7 @@ expected_root = sys.argv[1]
 expected_token = Path(sys.argv[2]).read_text(encoding="utf-8").strip()
 with Session() as session:
     connection = session.query(Connection).filter(Connection.conn_id == "solidworks_windows").one_or_none()
-host_ok = bool(connection) and connection.host == "127.0.0.1" and connection.port == 18765
+host_ok = bool(connection) and connection.host == "127.0.0.1" and connection.port == int(sys.argv[4])
 token_ok = bool(connection) and bool(expected_token) and connection.password == expected_token
 roots_ok = bool(connection) and (connection.extra_dejson or {}).get("handoff_roots") == [expected_root]
 pipeline = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))["pipeline"]
@@ -172,10 +176,10 @@ state="$(systemctl --user is-active description-solidworks-tunnel 2>/dev/null ||
   || report FAIL "unit is $state: description-solidworks-tunnel"
 
 if command -v curl >/dev/null 2>&1; then
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:8791/ || true)"
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://127.0.0.1:${AIRFLOW_API_PORT}/" || true)"
   case "$code" in
-    2??|3??) report PASS "Airflow api-server serves its login entry on 127.0.0.1:8791 (HTTP $code)" ;;
-    *) report FAIL "Airflow api-server is not serving its login entry on 127.0.0.1:8791 (HTTP $code)" ;;
+    2??|3??) report PASS "Airflow api-server serves its login entry on 127.0.0.1:${AIRFLOW_API_PORT} (HTTP $code)" ;;
+    *) report FAIL "Airflow api-server is not serving its login entry on 127.0.0.1:${AIRFLOW_API_PORT} (HTTP $code)" ;;
   esac
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:${PORTAL_PORT}/ || true)"
   case "$code" in

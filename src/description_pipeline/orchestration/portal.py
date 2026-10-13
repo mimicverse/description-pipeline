@@ -54,6 +54,7 @@ from .airflow_client import (
     verified_result,
 )
 from ..io import PipelineError
+from ..ports import PORTAL_HTTP_PORT
 from .linux_store import LinuxStore
 from .stage_transfer import TEAM_REPORTS
 from .feishu_oauth import (
@@ -364,7 +365,7 @@ class PortalConfig:
     dag_id: str = DEFAULT_DAG_ID
     static_dir: Path = Path(__file__).resolve().parent / "static"
     host: str = "127.0.0.1"
-    port: int = 8780
+    port: int = PORTAL_HTTP_PORT
     session_ttl: float = 12 * 3600.0
     artifact_limit: int = 64 * 1024 * 1024
     preview_ttl: float = 60.0
@@ -456,7 +457,7 @@ def load_portal_config(path: Path) -> PortalConfig:
         airflow=AirflowApi(url.strip()),
         endpoint=_endpoint_from_config(endpoint_section),
         host=str(portal_section.get("host") or "127.0.0.1"),
-        port=int(portal_section.get("port", 8780)),
+        port=int(portal_section.get("port", PORTAL_HTTP_PORT)),
         upload_root=_upload_root(portal_section),
         upload_concurrency=_upload_concurrency(portal_section),
         pipeline_store_root=pipeline_store_root,

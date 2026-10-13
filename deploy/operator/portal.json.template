@@ -3,7 +3,7 @@
     "url": "@AIRFLOW_BASE_URL@"
   },
   "endpoint": {
-    "url": "http://127.0.0.1:18765",
+    "url": "http://127.0.0.1:@TUNNEL_LOOPBACK_PORT@",
     "token_file": "@ENDPOINT_TOKEN_FILE@"
   },
   "pipeline": {
