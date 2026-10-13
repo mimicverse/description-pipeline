@@ -34,6 +34,9 @@ python -B -m unittest discover -s tests -t .
 python -m ruff check src tests tools deploy
 ```
 
+GitHub Actions runs these two commands on every pull request and on pushes to
+`main`; the `verify` check gates merges into `main`.
+
 Windows uses the native capture dependency lock; its runtime does not include
 MuJoCo. Run native adapter regressions there with `.venv\Scripts\python.exe`.
 Run the full suite and consumer checks in the Linux verification environment.
