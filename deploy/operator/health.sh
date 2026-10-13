@@ -74,66 +74,71 @@ if [ "$MODE" = "--static" ]; then
   exit "$([ "$FAILURES" = "0" ] && echo 0 || echo 1)"
 fi
 
-# Authenticated endpoint probe through the tunnel: a bare HTTP response is not health.
-if [ -f "${ENDPOINT_TOKEN_FILE:-}" ]; then
-  if python3 - "$ENDPOINT_TOKEN_FILE" "$PORTAL_CONFIG" "$TUNNEL_LOOPBACK_PORT" <<'PY'
-import json, sys, urllib.request
-token = open(sys.argv[1]).read().strip()
-request = urllib.request.Request(f"http://127.0.0.1:{sys.argv[3]}/health",
-                                 headers={"Authorization": "Bearer " + token})
-with urllib.request.urlopen(request, timeout=15) as response:
-    body = json.load(response)
-configured = json.load(open(sys.argv[2], encoding="utf-8"))["pipeline"].get("targets", {})
-raise SystemExit(
-    0
-    if body.get("ready")
-    and body.get("pipeline_id") == "solidworks-to-urdf"
-    and sorted(body.get("targets") or []) == sorted(configured)
-    else 1
-)
-PY
-  then
-    report PASS "endpoint /health authenticated via tunnel + token; targets match portal config"
-  else
-    report FAIL "endpoint /health rejected the token, is not ready, or its targets differ from the portal config"
-  fi
-fi
-
-# The installed connection must exist with the same host/port, the endpoint token file content and
-# the handoff allowlist. Neither the token nor the connection is ever printed.
+# Authenticated endpoint probe through the tunnel: the canonical IF-09 validators decide the
+# identity against the active install record; the health check keeps no identity lexemes.
 if [ -x "${AIRFLOW_VENV:-}/bin/python" ] && [ -f "${ENDPOINT_TOKEN_FILE:-}" ]; then
   if AIRFLOW_HOME="${AIRFLOW_HOME:-}" "$AIRFLOW_VENV/bin/python" - \
-      "$SOLIDWORKS_HANDOFF_ROOT" "$ENDPOINT_TOKEN_FILE" "$PORTAL_CONFIG" "$TUNNEL_LOOPBACK_PORT" <<'PY'
+      "$ENDPOINT_TOKEN_FILE" "$TUNNEL_LOOPBACK_PORT" "$OPERATOR_STATE/install-record.json" <<'PY'
 import json
 import sys
-from pathlib import Path
+import urllib.request
+
+from description_pipeline import interface_records
+
+token = open(sys.argv[1], encoding="utf-8").read().strip()
+request = urllib.request.Request(
+    f"http://127.0.0.1:{sys.argv[2]}/health", headers={"Authorization": "Bearer " + token}
+)
+with urllib.request.urlopen(request, timeout=15) as response:
+    health = interface_records.validate_health(json.load(response))
+record = json.load(open(sys.argv[3], encoding="utf-8"))
+interface_records.require_endpoint_matches_install_record(health, record)
+PY
+  then
+    report PASS "endpoint /health is a validated IF-09 identity matching the active install record"
+  else
+    report FAIL "endpoint /health rejected the token or failed the canonical IF-09 identity check"
+  fi
+else
+  report FAIL "endpoint identity check cannot run: the deployment interpreter or token file is missing"
+fi
+
+# The installed connection is consumed through the IF-11 config-identity owner: it is a
+# reference to the active config snapshot, checked on the consuming host with the canonical
+# file/digest/admission rules.  A surviving route copy is refused by the same owner.
+if [ -x "${AIRFLOW_VENV:-}/bin/python" ]; then
+  if AIRFLOW_HOME="${AIRFLOW_HOME:-}" "$AIRFLOW_VENV/bin/python" - \
+      "$OPERATOR_STATE" "$OPERATOR_STATE/install-record.json" <<'PY'
+import json
+import sys
 
 from airflow.models.connection import Connection
 from airflow.settings import Session
 
-expected_root = sys.argv[1]
-expected_token = Path(sys.argv[2]).read_text(encoding="utf-8").strip()
+from description_pipeline import interface_records
+
+allowed_root, record_path = sys.argv[1], sys.argv[2]
 with Session() as session:
     connection = session.query(Connection).filter(Connection.conn_id == "solidworks_windows").one_or_none()
-host_ok = bool(connection) and connection.host == "127.0.0.1" and connection.port == int(sys.argv[4])
-token_ok = bool(connection) and bool(expected_token) and connection.password == expected_token
-roots_ok = bool(connection) and (connection.extra_dejson or {}).get("handoff_roots") == [expected_root]
-pipeline = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))["pipeline"]
-extra = (connection.extra_dejson or {}) if connection else {}
-pipeline_ok = (
-    bool(pipeline["repositories"])
-    and extra.get("repositories") == pipeline["repositories"]
-    and extra.get("store_root") == pipeline["store_root"]
-    and extra.get("discovery") == pipeline.get("discovery", {})
-    and Path(pipeline["store_root"]).is_dir()
-)
-raise SystemExit(0 if host_ok and token_ok and roots_ok and pipeline_ok else 1)
+document = {
+    "host": (connection.host or "") if connection else "",
+    "port": connection.port if connection else None,
+    "password": (connection.password or "") if connection else "",
+    "extra": dict(connection.extra_dejson or {}) if connection else {},
+}
+identity = interface_records.validate_connection_config_identity(document)
+payload = interface_records.check_config_identity_file(identity, allowed_root=allowed_root)
+interface_records.verify_config_identity_digest(payload, identity)
+record = json.load(open(record_path, encoding="utf-8"))
+interface_records.require_active_config_identity(identity, record)
 PY
   then
-    report PASS "connection solidworks_windows matches endpoint, handoff_roots and Linux execution routing"
+    report PASS "connection solidworks_windows is an active IF-11 config-identity reference"
   else
-    report FAIL "connection solidworks_windows is missing or differs from the deployment env"
+    report FAIL "connection solidworks_windows is missing, legacy-shaped, or not the active config identity"
   fi
+else
+  report FAIL "connection config identity cannot be verified: AIRFLOW_VENV is not executable"
 fi
 
 # The packaged request-context plugin must be discoverable: without it every operator run write
