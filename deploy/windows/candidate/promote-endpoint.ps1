@@ -21,7 +21,7 @@ if(Get-Process SLDWORKS -ErrorAction SilentlyContinue){throw 'CAD remains active
 if(Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction SilentlyContinue){throw 'Endpoint listener remains'}
 $writers=@(Get-CimInstance Win32_Process|Where-Object {$_.CommandLine -match '-m description_pipeline serve|endpoint-launcher\.py'})
 if($writers.Count){throw 'Endpoint writer remains; inspect without broad termination'}
-$controller=Get-Content -LiteralPath ($base+'\run-journal-$Tag.json') -Raw -Encoding UTF8|ConvertFrom-Json
+$controller=Get-Content -LiteralPath ($base+"\run-journal-$Tag.json") -Raw -Encoding UTF8|ConvertFrom-Json
 if($controller.phase -ne 'candidate_finished' -or -not $controller.endpoint_restored){throw 'Candidate controller did not finish cleanly'}
 $action=$task.Actions[0]
 if($action.Arguments -notmatch 'endpoint-launcher\.py'){throw 'Unexpected original endpoint launcher'}

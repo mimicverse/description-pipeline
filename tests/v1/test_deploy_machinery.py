@@ -51,6 +51,14 @@ class DeployMachineryTests(unittest.TestCase):
         self.assertIn('-Stage "', register)
         self.assertIn("$B = $Stage", child)
 
+    def test_candidate_paths_use_interpolating_quotes(self) -> None:
+        # Single-quoted PowerShell strings do not expand $variables; a parameterized path
+        # in that form silently reads or writes the wrong file (caught live once).
+        shape = re.compile(r"'\\[^'\n]*\$[A-Za-z_]")
+        for path in CANDIDATE.iterdir():
+            if path.suffix == ".ps1":
+                self.assertNotRegex(path.read_text(encoding="utf-8", errors="replace"), shape, path.name)
+
     def test_endpoint_example_carries_no_secret_material(self) -> None:
         text = (ROOT / "deploy/windows/endpoint.example.json").read_text(encoding="utf-8")
         for marker in ("gho_", "ghp_", "Bearer ", "BEGIN OPENSSH", "app_secret", "password"):
