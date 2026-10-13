@@ -19,9 +19,9 @@ from .. import solidworks
 from ..io import PipelineError, digest, file_digest, read_data
 from ..runtime import RUNTIME_VERSIONS, required_packages, tool_record
 from ..sources.solidworks.selection import validate_file_index, verify_selection
-from ..stages import STAGE_IDS
+from ..stages import DELIVERY_STAGES, STAGE_IDS
 from .airflow_client import capture_archive_metadata, validate_run_id
-from .linux_store import PORTABLE_STAGES, LinuxStore
+from .linux_store import LinuxStore
 from .stage_transfer import CAPTURE_ARCHIVE, CAPTURE_MANIFEST, MAX_MANIFEST_BYTES, verify_transfer
 
 
@@ -108,8 +108,8 @@ def run_portable_stage(
 ) -> dict:
     """Run one portable stage to its boundary and record the receipt in the store."""
     run_id = validate_run_id(run_id)
-    if stage not in PORTABLE_STAGES:
-        raise PipelineError(f"stage must be one of {PORTABLE_STAGES}: {stage!r}")
+    if stage not in DELIVERY_STAGES:
+        raise PipelineError(f"stage must be one of {DELIVERY_STAGES}: {stage!r}")
     owner = validate_run_id(source_run_id or parent_run) if source_run_id or parent_run else run_id
     outputs = {
         "generate": store.stage_dir(run_id, "generate"),

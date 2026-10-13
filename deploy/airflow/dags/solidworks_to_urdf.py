@@ -44,7 +44,7 @@ from description_pipeline.orchestration.linux_runner import fetch_capture as fet
 from description_pipeline.orchestration.linux_runner import run_portable_stage
 from description_pipeline.orchestration.linux_store import LinuxStore
 from description_pipeline.stages import (
-    PORTABLE_STAGES,
+    DELIVERY_STAGES,
     STAGE_IDS,
     compact_view,
     contract_markdown,
@@ -733,7 +733,7 @@ def solidworks_to_urdf():
     def resolve_handoff(**context) -> dict:
         linked = _linked_conf(context)
         if linked is not None:
-            if linked["from_stage"] in PORTABLE_STAGES:
+            if linked["from_stage"] in DELIVERY_STAGES:
                 # A portable-linked rerun resumes from the parent's Linux attempt and never
                 # contacts Windows: the parent store already holds the admitted capture.
                 store = _linux_store(CONN_ID)

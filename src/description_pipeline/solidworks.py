@@ -23,7 +23,7 @@ from .delivery import BUNDLE_SCHEMA, PIPELINE_ID, subject_inventory
 from .io import PipelineError, acquire_process_lock, digest, file_digest, inventory, read_data, write_json
 
 from .runtime import RUNTIME_VERSIONS, native_readiness, required_packages, runtime_role
-from .stages import PORTABLE_STAGES, STAGE_IDS, stage_view
+from .stages import DELIVERY_STAGES, STAGE_IDS, stage_view
 
 
 @contextmanager
@@ -129,10 +129,10 @@ def _install(staging: Path, target: Path) -> None:
             shutil.rmtree(backup)
 
 
-#: The portable stage set; a receipt renders a report only when its executed
-#: scope declares at least one of these stages (the Windows capture boundary
-#: receipts carry no portable scope, so the native host renders nothing).
-_PORTABLE_SCOPE = frozenset(PORTABLE_STAGES)
+#: The delivery stage set; a receipt renders a report only when its executed
+#: scope declares at least one of these stages (the native boundary receipts
+#: carry no delivery scope, so the native host renders nothing).
+_PORTABLE_SCOPE = frozenset(DELIVERY_STAGES)
 
 
 def _stamp(root: Path, receipt: dict) -> None:
