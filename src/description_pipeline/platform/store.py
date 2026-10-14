@@ -30,6 +30,8 @@ from ..io import PipelineError, canonical, digest
 from ..stages import (
     CONFIRMED_STAGE_PASSED,
     CONFIRMED_STAGE_STATES,
+    DELIVERY_STAGES,
+    STAGE_EVIDENCE,
     STAGE_IDS,
     STAGE_STATES,
     TERMINAL_STAGE_STATES,
@@ -524,6 +526,8 @@ class PlatformStore:
         outcome - never a redo of an unknown side effect.
         """
 
+        if stage not in STAGE_IDS:
+            raise PlatformStoreError(f"The stage must be one of {tuple(STAGE_IDS)}: {stage!r}")
         if state not in STAGE_STATES:
             raise PlatformStoreError(f"The stage state must be one of {tuple(sorted(STAGE_STATES))}: {state!r}")
         if reconcile is not None and (not isinstance(reconcile, dict) or not reconcile):
@@ -627,18 +631,19 @@ class PlatformStore:
         sequence = row[0] if row else 1
         cursor.execute(_INSERT_EVENT, (run_id, sequence, kind, stage, operation_id, _json(payload)))
 
-    def _verify_sealed(self, checkpoint_uri, receipt) -> dict:
-        """Rebind the real sealed delivery before any registration.
+    def _verify_sealed(self, checkpoint_uri, receipt) -> dict | None:
+        """Rebind the real sealed delivery for any stage before any registration.
 
-        The receipt's URI and inventory are self-reported; the bytes are not.
-        The resolver (deploy-side sealed storage) locates the sealed delivery
-        root, ``read_delivery_manifest`` re-binds every subject record and the
-        subject digest, the receipt's artifact inventory must carry the
-        delivery's subject records verbatim (``{path, bytes, sha256}``,
-        order-normalized per record), and the definition the quality inventory
-        binds to is rebuilt from that very sealed tree (never from platform
-        records) - so a syntactic URI or an invented inventory can never mint
-        a completion.
+        One owner for all six stages: the receipt's URI and inventory are
+        self-reported; the bytes are not.  The resolver locates the sealed
+        tree, ``read_delivery_manifest`` re-binds every subject record to the
+        current bytes, the receipt's artifact inventory must equal those
+        records verbatim, the receipt's handoff must be a sha256 equal to the
+        sealed ``input/handoff.json`` record, and the tree must cover the
+        stage contract's declared evidence paths.  The definition the quality
+        inventory binds to is rebuilt - from that very sealed tree, never
+        from platform records - only where a quality report exists
+        (verify/publish).
         """
 
         if self._sealed is None:
@@ -646,7 +651,8 @@ class PlatformStore:
         root = Path(self._sealed(checkpoint_uri))
         manifest = read_delivery_manifest(root)
         subject = manifest.get("subject") or {}
-        if subject.get("digest") != receipt.get("subject_sha256"):
+        stage = receipt.get("stage")
+        if stage in DELIVERY_STAGES and subject.get("digest") != receipt.get("subject_sha256"):
             raise PlatformStoreError("The sealed delivery subject does not match the receipt")
         records = subject.get("files") or []
         artifacts = receipt.get("artifacts")
@@ -662,12 +668,24 @@ class PlatformStore:
         received = {record["path"]: (record["bytes"], record["sha256"]) for record in artifacts}
         if received != stamped:
             raise PlatformStoreError("The receipt's artifact inventory does not bind the sealed delivery")
-        from ..verification.solidworks_urdf import rebuilt_definition
+        sealed_handoff = stamped.get("input/handoff.json")
+        if sealed_handoff is None or receipt.get("handoff_sha256") != sealed_handoff[1]:
+            raise PlatformStoreError("The receipt's handoff binding does not match the sealed input/handoff.json")
+        missing = [
+            entry
+            for entry in STAGE_EVIDENCE.get(stage, ())
+            if _evidence_path(entry) and not _covered(root, stamped, entry)
+        ]
+        if missing:
+            raise PlatformStoreError(f"The sealed {stage!r} delivery does not cover its declared evidence: {missing}")
+        if stage in {"verify", "publish"}:
+            from ..verification.solidworks_urdf import rebuilt_definition
 
-        definition = rebuilt_definition(root)
-        if not isinstance(definition, dict) or not isinstance(definition.get("source"), dict):
-            raise PlatformStoreError("The sealed delivery does not rebuild a definition inventory")
-        return definition
+            definition = rebuilt_definition(root)
+            if not isinstance(definition, dict) or not isinstance(definition.get("source"), dict):
+                raise PlatformStoreError("The sealed delivery does not rebuild a definition inventory")
+            return definition
+        return None
 
     def confirmed_stage(self, run_id: str, stage: str) -> dict | None:
         """The platform-authority reuse query: the sealed receipt of a confirmed stage, or refusal.
@@ -771,6 +789,20 @@ def _is_sha256(value) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
 
 
+def _evidence_path(entry) -> bool:
+    """A contract evidence entry that names a sealed path, not a receipt field."""
+
+    return isinstance(entry, str) and "/" in entry and entry.isascii() and not entry.startswith("/")
+
+
+def _covered(root: Path, records: dict, entry: str) -> bool:
+    """Whether the sealed tree covers one declared evidence path or directory."""
+
+    if entry.endswith("/"):
+        return any(path.startswith(entry) for path in records) or (root / entry).is_dir()
+    return entry in records or (root / entry).is_file()
+
+
 def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str, checkpoint_uri, definition) -> None:
     """The one sealed-receipt validator shared by the stage write and reuse paths.
 
@@ -803,11 +835,11 @@ def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str, checkpoint_
             raise PlatformStoreError("A cancelled stage must be sealed with its cancelled receipt")
         return
     handoff = receipt.get("handoff_sha256")
-    if not isinstance(handoff, str) or not handoff:
+    if not _is_sha256(handoff):
         raise PlatformStoreError("The sealed receipt lacks its handoff binding")
     expected = CONFIRMED_STAGE_STATES.get(stage)
     if expected is None:
-        return
+        raise PlatformStoreError(f"The stage {stage!r} carries no confirmed vocabulary")
     if receipt.get("state") not in expected:
         raise PlatformStoreError("A completed stage must be sealed with its confirmed receipt state")
     if receipt.get("passed") is not CONFIRMED_STAGE_PASSED[stage]:
@@ -816,8 +848,16 @@ def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str, checkpoint_
         raise PlatformStoreError("An unsealed stage completion is refused: no checkpoint reference")
     if not isinstance(receipt.get("artifacts"), list) or not receipt["artifacts"]:
         raise PlatformStoreError("The sealed receipt lacks its artifact inventory")
+    if stage == "freeze":
+        tool = receipt.get("tool")
+        if not isinstance(tool, dict) or not tool:
+            raise PlatformStoreError("The frozen receipt lacks its tool identity")
+    if stage in {"discover", "capture"}:
+        native_tool = receipt.get("native_tool")
+        if not isinstance(native_tool, dict) or not native_tool:
+            raise PlatformStoreError("The native stage receipt lacks its native tool identity")
     subject = receipt.get("subject_sha256")
-    if not _is_sha256(subject):
+    if stage in DELIVERY_STAGES and not _is_sha256(subject):
         raise PlatformStoreError("The sealed receipt lacks its subject digest")
     if stage in {"verify", "publish"}:
         from ..verification.solidworks_urdf import require_qualified_report

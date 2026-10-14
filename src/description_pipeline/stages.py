@@ -53,17 +53,28 @@ DELIVERY_STAGES = ("generate", "verify", "publish")
 #: store (which rebinds the sealed artifacts) and never re-derive the
 #: vocabulary themselves.
 CONFIRMED_STAGE_STATES = {
+    "freeze": frozenset({"frozen"}),
+    "discover": frozenset({"discovered"}),
+    "capture": frozenset({"native_complete"}),
     "generate": frozenset({"generated"}),
     "verify": frozenset({"verified"}),
     "publish": frozenset({"published", "updated", "noop"}),
 }
 
-#: The expected ``passed`` flag of a confirmed receipt per portable stage.
+#: The expected ``passed`` flag of a confirmed receipt per stage.
 CONFIRMED_STAGE_PASSED = {
+    "freeze": False,
+    "discover": False,
+    "capture": False,
     "generate": False,
     "verify": True,
     "publish": True,
 }
+
+#: The stage contract's declared evidence, per stage.  Entries containing a
+#: path separator are sealed paths a checkpoint tree must cover (receipt-field
+#: entries such as ``handoff_sha256`` are validated by the receipt rules).
+STAGE_EVIDENCE = {stage["id"]: tuple(stage.get("evidence") or ()) for stage in CONTRACT["stages"]}
 
 #: The canonical platform stage states (frozen contracts); the store validates
 #: every stage confirmation against this single vocabulary.

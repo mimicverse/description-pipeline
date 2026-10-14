@@ -18,6 +18,7 @@ from unittest import mock
 from description_pipeline.delivery import read_delivery_manifest, write_delivery_manifest
 from description_pipeline.interface_records import CHECK_POLICY_SCHEMA, CHECK_POLICY_V1, check_policy_digest
 from description_pipeline.io import PipelineError, write_json
+from description_pipeline.platform import store as store_module
 from description_pipeline.platform.store import (
     AdmissionClosedError,
     OperationConflictError,
@@ -26,23 +27,42 @@ from description_pipeline.platform.store import (
     RunNotAdmittedError,
 )
 from description_pipeline.runtime import tool_record
+from description_pipeline.schemas import TOOL_SCHEMA
 from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
 from description_pipeline.verification import solidworks_urdf
 from description_pipeline.verification.solidworks_urdf import required_checks
 
 NOW = datetime(2026, 10, 14, 10, 0, tzinfo=UTC)
-HANDOFF = "b" * 64
 CHECKPOINT = "store://sealed/run-r-1"
+NATIVE_STAGE_STATES = {"freeze": "frozen", "discover": "discovered", "capture": "native_complete"}
 
 
-def build_sealed_delivery(root: Path) -> tuple[str, dict]:
-    """One real sealed delivery: manifest record-for-record plus its digests."""
+def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str]:
+    """One real sealed delivery: manifest record-for-record plus its digests.
 
-    for name in ("input", "evidence", "model", "urdf", "meshes"):
+    The tree covers the declared evidence of all six stages, so the same
+    delivery serves the portable and the native confirmations; the third
+    return value is the sealed ``input/handoff.json`` digest every receipt
+    must bind.
+    """
+
+    for name in ("input", "evidence", "model", "urdf", "meshes", "reports"):
         (root / name).mkdir(parents=True)
-    (root / "input" / "robot.yaml").write_text("{}\n", encoding="utf-8")
-    (root / "model" / "robot.json").write_text("{}\n", encoding="utf-8")
+    (root / "input" / "records").mkdir()
+    (root / "evidence" / "native-meshes").mkdir()
+    write_json(root / "input" / "handoff.json", {"handoff": "fixture"})
+    write_json(root / "input" / "source.json", {"source": "fixture"})
+    write_json(root / "input" / "records" / "arm.json", {"record": "fixture"})
+    write_json(root / "evidence" / "discovery.json", {"discovery": "fixture"})
+    write_json(root / "evidence" / "capture-plan.json", {"plan": "fixture"})
+    write_json(root / "evidence" / "capture.json", {"capture": "fixture"})
+    write_json(root / "evidence" / "native-runtime.json", {"runtime": "fixture"})
+    (root / "evidence" / "native-meshes" / "part.stl").write_bytes(b"native-stl")
+    write_json(root / "model" / "robot.json", {"model": "fixture"})
+    (root / "urdf" / "robot.urdf").write_text("<robot/>\n", encoding="utf-8")
+    (root / "meshes" / "part.stl").write_bytes(b"mesh-stl")
     write_json(root / "tool.json", tool_record())
+    write_json(root / "reports" / "quality.json", {"quality": "fixture"})
     write_delivery_manifest(
         root,
         contract={"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
@@ -50,7 +70,8 @@ def build_sealed_delivery(root: Path) -> tuple[str, dict]:
     )
     manifest = read_delivery_manifest(root)
     artifacts = [dict(record) for record in manifest["subject"]["files"]]
-    return manifest["subject"]["digest"], artifacts
+    handoff = next(record["sha256"] for record in artifacts if record["path"] == "input/handoff.json")
+    return manifest["subject"]["digest"], artifacts, handoff
 
 
 class FakeWorld:
@@ -269,7 +290,7 @@ class PlatformStoreTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.delivery = Path(self.directory.name) / "sealed"
         self.delivery.mkdir()
-        self.subject, self.artifacts = build_sealed_delivery(self.delivery)
+        self.subject, self.artifacts, self.handoff = build_sealed_delivery(self.delivery)
         self.definition = {"source": {"bodies": [{"name": "base_link"}]}, "checks": {}}
         self.rebuilt = mock.Mock(return_value=self.definition)
         definition_patch = mock.patch.object(solidworks_urdf, "rebuilt_definition", new=self.rebuilt)
@@ -309,7 +330,7 @@ class PlatformStoreTests(unittest.TestCase):
             "state": "generated",
             "passed": False,
             "subject_sha256": self.subject,
-            "handoff_sha256": HANDOFF,
+            "handoff_sha256": self.handoff,
             "artifacts": [dict(record) for record in self.artifacts],
         }
         payload.update(overrides)
@@ -324,7 +345,7 @@ class PlatformStoreTests(unittest.TestCase):
             "state": "verified",
             "passed": True,
             "subject_sha256": self.subject,
-            "handoff_sha256": HANDOFF,
+            "handoff_sha256": self.handoff,
             "artifacts": [dict(record) for record in self.artifacts],
             "quality": self.qualified_quality(),
         }
@@ -562,7 +583,8 @@ class PlatformStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(PlatformStoreError, "does not match the receipt"):
             self._confirm_generate(receipt=self.generate_receipt(subject_sha256="f" * 64))
         self._confirm_generate()
-        self.rebuilt.assert_called_with(self.delivery)
+        # The definition rebuild belongs to the verify/publish quality binding.
+        self.rebuilt.assert_not_called()
 
     def test_the_receipt_inventory_must_mirror_the_sealed_records_verbatim(self) -> None:
         self._running_run()
@@ -585,6 +607,107 @@ class PlatformStoreTests(unittest.TestCase):
             self._confirm_generate(receipt=self.generate_receipt(artifacts=tripled))
         self._confirm_generate(receipt=self.generate_receipt(artifacts=list(reversed(records))))
         self.assertEqual(self.world.stages[("r-1", "generate")][0], "completed")
+
+    def _native_receipt(self, stage: str, **overrides) -> dict:
+        payload = {
+            "schema_version": "solidworks-to-urdf.bundle/v1",
+            "pipeline_id": "solidworks-to-urdf",
+            "run_id": "r-1",
+            "stage": stage,
+            "state": NATIVE_STAGE_STATES[stage],
+            "passed": False,
+            "handoff_sha256": self.handoff,
+            "artifacts": [dict(record) for record in self.artifacts],
+        }
+        if stage == "freeze":
+            payload["tool"] = {"schema_version": TOOL_SCHEMA, "version": "1.4.0"}
+        else:
+            payload["native_tool"] = {"name": "native-tool", "source_sha256": "a" * 64}
+        payload.update(overrides)
+        return payload
+
+    def test_native_stages_bind_their_sealed_evidence_like_the_portable_ones(self) -> None:
+        self._running_run()
+        self.rebuilt.reset_mock()
+        for stage in ("freeze", "discover", "capture"):
+            with self.subTest(stage=stage):
+                self.store.confirm_stage(
+                    run_id="r-1",
+                    stage=stage,
+                    state="completed",
+                    checkpoint_uri=CHECKPOINT,
+                    receipt=self._native_receipt(stage),
+                )
+                self.assertEqual(self.world.stages[("r-1", stage)][0], "completed")
+                self.assertIsNotNone(self.store.confirmed_stage("r-1", stage))
+        self.rebuilt.assert_not_called()
+
+    def test_native_receipts_without_their_bindings_are_refused(self) -> None:
+        self._running_run()
+        base = self._native_receipt("capture")
+        without_tool = {key: value for key, value in base.items() if key != "native_tool"}
+        with self.assertRaisesRegex(PlatformStoreError, "native tool"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="capture",
+                state="completed",
+                checkpoint_uri=CHECKPOINT,
+                receipt=without_tool,
+            )
+        with self.assertRaisesRegex(PlatformStoreError, "handoff"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="capture",
+                state="completed",
+                checkpoint_uri=CHECKPOINT,
+                receipt={**base, "handoff_sha256": "not-a-sha256"},
+            )
+        with self.assertRaisesRegex(PlatformStoreError, "handoff"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="capture",
+                state="completed",
+                checkpoint_uri=CHECKPOINT,
+                receipt={**base, "handoff_sha256": "f" * 64},
+            )
+        with self.assertRaisesRegex(PlatformStoreError, "confirmed receipt state"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="capture",
+                state="completed",
+                checkpoint_uri=CHECKPOINT,
+                receipt={**base, "state": "bogus-outcome"},
+            )
+        trimmed = [record for record in base["artifacts"] if not record["path"].startswith("evidence/")]
+        with self.assertRaisesRegex(PlatformStoreError, "artifact inventory"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="capture",
+                state="completed",
+                checkpoint_uri=CHECKPOINT,
+                receipt={**base, "artifacts": trimmed},
+            )
+        with (
+            mock.patch.object(store_module, "STAGE_EVIDENCE", {"capture": ("evidence/absent.json",)}),
+            self.assertRaisesRegex(PlatformStoreError, "declared evidence"),
+        ):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="capture",
+                state="completed",
+                checkpoint_uri=CHECKPOINT,
+                receipt=self._native_receipt("capture"),
+            )
+        with self.assertRaisesRegex(PlatformStoreError, "stage must be one of"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="pending",
+                state="completed",
+                checkpoint_uri=CHECKPOINT,
+                receipt={**self._native_receipt("capture"), "stage": "pending"},
+            )
+        with self.assertRaisesRegex(PlatformStoreError, "stage must be one of"):
+            self.store.confirmed_stage("r-1", "pending")
 
     def test_the_quality_inventory_binds_the_rebuilt_definition(self) -> None:
         self._running_run()
@@ -628,7 +751,7 @@ class PlatformStoreTests(unittest.TestCase):
         self.assertEqual(record.stage, "verify")
         self.assertIn("r-1/verify:0", self.world.operations)
         self.assertEqual(observed, [0], "the sealed rebinding runs with no open transaction")
-        self.assertEqual(self.rebuilt.call_count, 1)
+        self.rebuilt.assert_not_called()
 
     def test_a_predecessor_that_changes_after_verification_is_refused(self) -> None:
         self._running_run()
