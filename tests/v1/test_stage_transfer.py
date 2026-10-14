@@ -17,7 +17,7 @@ from packaging.utils import canonicalize_name
 from description_pipeline import __version__ as PIPELINE_VERSION
 from description_pipeline.build.archive import write_zip
 from description_pipeline.delivery import PIPELINE_ID
-from description_pipeline.io import PipelineError, canonical, digest, file_digest, write_json
+from description_pipeline.io import PipelineError, canonical, digest, file_digest, read_data, write_json
 from description_pipeline.orchestration import stage_transfer as transfer
 from description_pipeline.runtime import RUNTIME_VERSIONS, required_packages
 from description_pipeline.sources.snapshot import write_manifest
@@ -67,29 +67,29 @@ def stage_view(
 
 def capture_root(base: Path, *, run_id: str = RUN_ID, handoff: str = HANDOFF, main: str = MAIN_ASSEMBLY) -> Path:
     root = Path(base) / "capture"
-    (root / "input").mkdir(parents=True)
-    write_json(root / "input/robot.yaml", {"hardware_id": "robot"})
-    (root / "input" / main).write_bytes(b"CAD-BYTES")
+    (root / "input" / "cad").mkdir(parents=True)
+    (root / "input" / "cad" / main).write_bytes(b"CAD-BYTES")
+    native_files = {main: file_digest(root / "input" / "cad" / main)}
     write_json(
-        root / "input/discovery/native-discovery.json",
+        root / "evidence/discovery.json",
         {
             "identity": {"main_assembly": main},
             "handoff_sha256": handoff,
-            "native_files": {main: file_digest(root / "input" / main)},
+            "native_files": native_files,
+            "findings": [],
+            "robot_name": "robot",
         },
     )
-    package_files = {
-        name: file_digest(root / "input" / name) for name in ("robot.yaml", main, "discovery/native-discovery.json")
-    }
+    package_files = {"cad/" + main: native_files[main]}
     write_json(
         root / "input/handoff.json",
         {
             "passed": True,
-            "input_receipt": {
-                "inventory": [{"path": name, "sha256": sha} for name, sha in sorted(package_files.items())]
-            },
+            "input_receipt": {"inventory": dict(sorted(native_files.items()))},
             "cad_revision": {"revision": "r1"},
-            "package_files": package_files,
+            "package_files": dict(sorted(package_files.items())),
+            "main_assembly": main,
+            "configuration": "Default",
         },
     )
     evidence = root / "evidence"
@@ -98,7 +98,11 @@ def capture_root(base: Path, *, run_id: str = RUN_ID, handoff: str = HANDOFF, ma
     write_json(evidence / "raw/scene_raw.json", {"components": [], "mates": []})
     write_json(evidence / "raw/source_config.json", {})
     (evidence / "evidence").mkdir()
-    identity = {"provider": "solidworks", "assembly": str(root / "input" / main), "dependency_digest": "c" * 64}
+    identity = {
+        "provider": "solidworks",
+        "assembly": str(root / "input" / "cad" / main),
+        "dependency_digest": "c" * 64,
+    }
     write_json(
         evidence / "evidence/collection.json",
         {
@@ -233,7 +237,7 @@ class StageTransferTests(unittest.TestCase):
         self.assertEqual(manifest["run_id"], RUN_ID)
         self.assertEqual(manifest["file_count"], len(manifest["files"]))
         self.assertEqual(manifest["native_stage_scope"], list(transfer.NATIVE_STAGE_SCOPE))
-        self.assertEqual(manifest["main_assembly_sha256"], manifest["files"]["input/" + MAIN_ASSEMBLY])
+        self.assertEqual(manifest["main_assembly_sha256"], manifest["files"]["input/cad/" + MAIN_ASSEMBLY])
 
         destination = self.base / "admitted"
         admitted = admit(self.archive, destination)
@@ -382,13 +386,13 @@ class StageTransferTests(unittest.TestCase):
         replacement = b"OTHER-BYTES"
         with zipfile.ZipFile(self.archive) as source:
             report = json.loads(source.read("input/handoff.json"))
-        report["package_files"][MAIN_ASSEMBLY] = hashlib.sha256(replacement).hexdigest()
+        report["input_receipt"]["inventory"][MAIN_ASSEMBLY] = hashlib.sha256(replacement).hexdigest()
         broken = self.base / "main.zip"
         repack(
             self.archive,
             broken,
             {
-                "input/" + MAIN_ASSEMBLY: replacement,
+                "input/cad/" + MAIN_ASSEMBLY: replacement,
                 "input/handoff.json": canonical(report),
             },
         )
@@ -400,34 +404,27 @@ class StageTransferTests(unittest.TestCase):
     def test_native_discovery_binding_is_enforced(self) -> None:
         seal(self.root, self.archive)
         with zipfile.ZipFile(self.archive) as source:
-            record = json.loads(source.read("input/discovery/native-discovery.json"))
-            report = json.loads(source.read("input/handoff.json"))
+            record = json.loads(source.read("evidence/discovery.json"))
 
         renamed = {**record, "identity": {**record["identity"], "main_assembly": "other.SLDASM"}}
-        renamed_bytes = canonical(renamed)
-        report["package_files"]["discovery/native-discovery.json"] = hashlib.sha256(renamed_bytes).hexdigest()
         broken = self.base / "discovery-name.zip"
         repack(
             self.archive,
             broken,
             {
-                "input/discovery/native-discovery.json": renamed_bytes,
-                "input/handoff.json": canonical(report),
+                "evidence/discovery.json": canonical(renamed),
             },
         )
         with self.assertRaisesRegex(PipelineError, "opened another main assembly"):
             admit(broken, self.base / "out-discovery-name")
 
         rebased = {**record, "handoff_sha256": "b" * 64}
-        rebased_bytes = canonical(rebased)
-        report["package_files"]["discovery/native-discovery.json"] = hashlib.sha256(rebased_bytes).hexdigest()
         broken = self.base / "discovery-handoff.zip"
         repack(
             self.archive,
             broken,
             {
-                "input/discovery/native-discovery.json": rebased_bytes,
-                "input/handoff.json": canonical(report),
+                "evidence/discovery.json": canonical(rebased),
             },
         )
         with self.assertRaisesRegex(PipelineError, "bound to another handoff"):
@@ -522,7 +519,7 @@ class StageTransferTests(unittest.TestCase):
                     seal(root, self.base / f"{label}.zip", **({"native_tool": tool} if tool else {}))
 
     def test_seal_rejects_changed_archived_input(self) -> None:
-        (self.root / "input" / MAIN_ASSEMBLY).write_bytes(b"CHANGED")
+        (self.root / "input" / "cad" / MAIN_ASSEMBLY).write_bytes(b"CHANGED")
         with self.assertRaisesRegex(PipelineError, "Archived input differs"):
             seal(self.root, self.archive)
 
@@ -674,34 +671,34 @@ class StageTransferTests(unittest.TestCase):
             freeze(config, snapshot, backend=backend, worker_version="test-worker")
 
             capture = self.base / "real-capture"
-            (capture / "input").mkdir(parents=True)
-            write_json(capture / "input/robot.yaml", {"hardware_id": "robot"})
-            shutil.copyfile(assembly, capture / "input" / assembly.name)
+            (capture / "input" / "cad").mkdir(parents=True)
+            shutil.copyfile(assembly, capture / "input" / "cad" / assembly.name)
             shutil.copytree(snapshot, capture / "evidence")
             native_files = {
                 name: file_digest(work / "cad" / name) for name in ("robot.SLDASM", "base.SLDPRT", "arm.SLDPRT")
             }
             write_json(
-                capture / "input/discovery/native-discovery.json",
+                capture / "evidence/discovery.json",
                 {
                     "identity": {"main_assembly": assembly.name},
                     "handoff_sha256": HANDOFF,
                     "native_files": native_files,
                 },
             )
-            package_files = {
-                name: file_digest(capture / "input" / name)
-                for name in ("robot.yaml", assembly.name, "discovery/native-discovery.json")
-            }
+            manifest = read_data(capture / "evidence" / "manifest.json")
+            manifest["files"]["discovery.json"] = file_digest(capture / "evidence" / "discovery.json")
+            manifest["files"] = dict(sorted(manifest["files"].items()))
+            write_json(capture / "evidence" / "manifest.json", manifest)
+            package_files = {"cad/" + assembly.name: file_digest(capture / "input" / "cad" / assembly.name)}
             write_json(
                 capture / "input/handoff.json",
                 {
                     "passed": True,
-                    "input_receipt": {
-                        "inventory": [{"path": name, "sha256": sha} for name, sha in sorted(package_files.items())]
-                    },
+                    "input_receipt": {"inventory": {assembly.name: package_files["cad/" + assembly.name]}},
                     "cad_revision": {"revision": "r1"},
-                    "package_files": package_files,
+                    "package_files": dict(sorted(package_files.items())),
+                    "main_assembly": assembly.name,
+                    "configuration": "Default",
                 },
             )
             write_json(capture / "reports/native-tool.json", native_tool())
@@ -821,11 +818,11 @@ class StageTransferTests(unittest.TestCase):
         remade = bundle("gate-main")
         replacement = b"OTHER-BYTES"
         report = json.loads((remade / "input/handoff.json").read_text(encoding="utf-8"))
-        report["package_files"][MAIN_ASSEMBLY] = hashlib.sha256(replacement).hexdigest()
+        report["input_receipt"]["inventory"][MAIN_ASSEMBLY] = hashlib.sha256(replacement).hexdigest()
         reseal(
             remade,
             {
-                "input/" + MAIN_ASSEMBLY: replacement,
+                "input/cad/" + MAIN_ASSEMBLY: replacement,
                 "input/handoff.json": canonical(report),
             },
         )

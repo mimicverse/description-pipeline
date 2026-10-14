@@ -242,15 +242,14 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
 
     def test_fetch_refuses_a_resealed_capture_with_another_native_inventory(self) -> None:
         source = capture_root(self.tmp / "foreign-inventory", run_id=FRESH, handoff=HANDOFF)
-        record_path = source / "input/discovery/native-discovery.json"
+        record_path = source / "evidence/discovery.json"
         record = json.loads(record_path.read_text())
         record["native_files"]["stray.SLDPRT"] = "0" * 64
         write_json(record_path, record)
-        report_path = source / "input/handoff.json"
-        report = json.loads(report_path.read_text())
-        report["package_files"]["discovery/native-discovery.json"] = file_digest(record_path)
-        report["input_receipt"]["inventory"] = dict(sorted(report["package_files"].items()))
-        write_json(report_path, report)
+        manifest_path = source / "evidence" / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["files"]["discovery.json"] = file_digest(record_path)
+        write_json(manifest_path, manifest)
         archive = self.tmp / "foreign-inventory.zip"
         seal_capture(
             source,
@@ -375,15 +374,16 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
 
         capture = self.store.capture_dir(RUN)
         report_path = capture / "input/handoff.json"
-        target = capture / "input/robot.yaml"
-        tampered = b'{"hardware_id": "tampered"}\n'
+        target = capture / "input/cad" / MAIN_ASSEMBLY
+        tampered = b"CAD-TAMPERED-AFTER-ADMISSION\n"
         target.write_bytes(tampered)
         report = json.loads(report_path.read_text(encoding="utf-8"))
-        report["package_files"]["robot.yaml"] = hashlib.sha256(tampered).hexdigest()
+        report["input_receipt"]["inventory"][MAIN_ASSEMBLY] = hashlib.sha256(tampered).hexdigest()
+        report["package_files"]["cad/" + MAIN_ASSEMBLY] = hashlib.sha256(tampered).hexdigest()
         write_json(report_path, report)
         manifest_path = capture / CAPTURE_MANIFEST
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest["files"]["input/robot.yaml"] = hashlib.sha256(tampered).hexdigest()
+        manifest["files"]["input/cad/" + MAIN_ASSEMBLY] = hashlib.sha256(tampered).hexdigest()
         manifest["files"]["input/handoff.json"] = hashlib.sha256(report_path.read_bytes()).hexdigest()
         manifest["file_count"] = len(manifest["files"])
         manifest["total_bytes"] = sum((capture / name).stat().st_size for name in manifest["files"])

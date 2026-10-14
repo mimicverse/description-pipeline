@@ -121,7 +121,7 @@ class LinuxSplitTests(unittest.TestCase):
         self.assertIsNone(self.store.meta(self.run_id))
         meta = self.admit()
         self.assertEqual(meta["state"], "capture_admitted")
-        self.assertTrue((self.store.capture_dir(self.run_id) / "input/robot.yaml").is_file())
+        self.assertTrue((self.store.capture_dir(self.run_id) / "input" / "cad" / MAIN_ASSEMBLY).is_file())
         native_receipt = json.loads((self.store.capture_dir(self.run_id) / "reports/native-stages.json").read_text())
         self.assertEqual(self.store.events(self.run_id), native_receipt.get("events") or [])
         self.assertIsNone(self.store.delivery_dir(self.run_id))
@@ -430,7 +430,7 @@ class LinuxSplitTests(unittest.TestCase):
 
     def test_capture_is_revalidated_before_generate(self) -> None:
         self.admit()
-        target = self.store.capture_dir(self.run_id) / "input/robot.yaml"
+        target = self.store.capture_dir(self.run_id) / "input" / "cad" / MAIN_ASSEMBLY
         target.write_bytes(target.read_bytes() + b"tampered")
         with (
             mock.patch.object(linux_runner, "tool_record", return_value=portable_record(self.tool)),

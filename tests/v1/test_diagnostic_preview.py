@@ -22,7 +22,7 @@ from pathlib import Path
 from unittest import mock
 
 from description_pipeline.delivery import subject_digest
-from description_pipeline.io import PipelineError, write_json
+from description_pipeline.io import PipelineError, file_digest, write_json
 from description_pipeline.orchestration import portal as portal_module
 from description_pipeline.orchestration import linux_store as store_module
 from description_pipeline.orchestration.airflow_client import EndpointError, native_run_id
@@ -119,10 +119,14 @@ class DiagnosticPreviewTests(unittest.TestCase):
         )
         # The prepared package ships its discovery findings inside the captured payload; the
         # admitted capture and every delivery seeded from it therefore carry them too.
-        discovery_path = self.store.capture_dir(RUN) / "input/discovery/native-discovery.json"
+        discovery_path = self.store.capture_dir(RUN) / "evidence/discovery.json"
         payload = json.loads(discovery_path.read_text(encoding="utf-8"))
         payload["findings"] = DISCOVERY_FINDINGS["findings"]
         write_json(discovery_path, payload)
+        evidence_manifest_path = self.store.capture_dir(RUN) / "evidence" / "manifest.json"
+        evidence_manifest = json.loads(evidence_manifest_path.read_text(encoding="utf-8"))
+        evidence_manifest["files"]["discovery.json"] = file_digest(discovery_path)
+        write_json(evidence_manifest_path, evidence_manifest)
         handoff_path = self.store.capture_dir(RUN) / "input/handoff.json"
         handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
         handoff["warnings"] = INPUT_WARNINGS["warnings"]

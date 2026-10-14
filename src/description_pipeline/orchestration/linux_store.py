@@ -749,11 +749,8 @@ def _delivery_warnings(delivery: Path) -> list[dict]:
                         "detail": item.get("detail"),
                     }
                 )
-    findings = _read_optional_json(delivery / "input/discovery/findings.json")
-    rows = findings.get("findings") if isinstance(findings, dict) else None
-    if not isinstance(rows, list):
-        payload = _read_optional_json(delivery / "input/discovery/native-discovery.json")
-        rows = payload.get("findings") if isinstance(payload, dict) else None
+    payload = _read_optional_json(delivery / "evidence/discovery.json")
+    rows = payload.get("findings") if isinstance(payload, dict) else None
     if isinstance(rows, list):
         for item in rows:
             if isinstance(item, dict) and item.get("blocking") is False:

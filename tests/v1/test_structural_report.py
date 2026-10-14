@@ -16,7 +16,7 @@ class StructuralReportTests(unittest.TestCase):
             (root / "urdf").mkdir()
             (root / "urdf/robot.urdf").write_text('<robot name="cad"/>')
             write_json(
-                root / "input/discovery/findings.json",
+                root / "evidence/discovery.json",
                 {
                     "findings": [
                         {

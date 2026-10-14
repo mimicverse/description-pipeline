@@ -247,18 +247,19 @@ def _validate_input(root: Path, report, main_assembly: str) -> str:
     _require(report.get("passed") is True, "Input report did not pass")
     package_files = report.get("package_files")
     _require(isinstance(package_files, dict) and package_files, "Input report lacks its package file inventory")
-    actual = {
-        path: checksum for path, checksum in package_inventory(root / "input").items() if path != "handoff.json"
-    }
-    _require(actual == package_files, "Archived input differs from the frozen handoff inventory")
-    if main_assembly not in package_files:
-        near = sorted(name for name in package_files if name.casefold() == main_assembly.casefold())
+    actual = package_inventory(root / "input" / "cad")
+    _require(
+        actual == report["input_receipt"]["inventory"],
+        "Archived input differs from the frozen handoff inventory",
+    )
+    if main_assembly not in actual:
+        near = sorted(name for name in actual if name.casefold() == main_assembly.casefold())
         if near:
             raise PipelineError(
                 f"The selected main assembly case does not match the capture input: {main_assembly!r} vs {near[0]!r}"
             )
         raise PipelineError(f"The selected main assembly is not part of the capture input: {main_assembly!r}")
-    return package_files[main_assembly]
+    return actual[main_assembly]
 
 
 def _validate_evidence(root: Path) -> None:
@@ -300,7 +301,7 @@ def _validate_native_discovery(root: Path, *, main_assembly: str, handoff_sha256
     and the native file inventory it hashed; the archived input must carry the same bytes.
     """
 
-    record = read_data(confined(root, "input/discovery/native-discovery.json"))
+    record = read_data(confined(root, "evidence/discovery.json"))
     _require(isinstance(record, dict), "Native discovery record must be an object")
     identity = record.get("identity") if isinstance(record.get("identity"), dict) else {}
     recorded = identity.get("main_assembly")
@@ -322,7 +323,7 @@ def _validate_native_discovery(root: Path, *, main_assembly: str, handoff_sha256
         main_assembly in native_files,
         f"The native discovery record does not inventory the main assembly: {main_assembly!r}",
     )
-    digest_value = file_digest(confined(root, "input/" + main_assembly))
+    digest_value = file_digest(confined(root, "input/cad/" + main_assembly))
     _require(
         native_files[main_assembly] == digest_value,
         "The archived main assembly differs from the native file inventory",
@@ -617,7 +618,7 @@ def verify_transfer(bundle: Path, *, regenerated: tuple[str, ...] = ()) -> dict 
 
     Returns ``None`` for a neutral delivery that carries no transfer.  A partial triplet is
     refused; a complete one re-hashes the sealed payload and re-reads the native tool record,
-    stage receipts, input/discovery main-assembly binding and evidence snapshot, so a resealed
+    stage receipts, evidence/discovery main-assembly binding and evidence snapshot, so a resealed
     but semantically invalid manifest cannot reach publication.
 
     ``regenerated`` names payload members whose delivery copy the receiving pipeline

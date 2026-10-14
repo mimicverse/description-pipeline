@@ -24,8 +24,7 @@ DIAGNOSTIC_SCHEMA = "solidworks-to-urdf.failure-diagnostics/v1"
 REPORT_EVIDENCE_FILES = (
     "input/handoff.json",
     "reports/quality.json",
-    "input/discovery/findings.json",
-    "input/discovery/native-discovery.json",
+    "evidence/discovery.json",
     "evidence/raw/dependency_closure.json",
     "evidence/raw/material_provenance.json",
     "evidence/raw/effective_instances.json",

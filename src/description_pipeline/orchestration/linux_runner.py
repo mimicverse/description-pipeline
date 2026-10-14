@@ -261,11 +261,11 @@ def _capture_selection(job: dict, run_id: str, native_tool: dict) -> dict:
 def _check_selected_capture(store: LinuxStore, run_id: str, selection: dict) -> None:
     """Require the archived native files to be the selected bytes."""
     capture = store.capture_dir(run_id)
-    record = read_data(capture / "input/discovery/native-discovery.json")
+    record = read_data(capture / "evidence/discovery.json")
     if record.get("native_files") != selection["files"]:
         raise PipelineError("The capture native inventory differs from the sealed selection")
     for name, checksum in selection["files"].items():
-        if file_digest(capture / "input" / name) != checksum:
+        if file_digest(capture / "input/cad" / name) != checksum:
             raise PipelineError(f"The captured source differs from the selected bytes: {name}")
 
 
