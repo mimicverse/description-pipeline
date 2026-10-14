@@ -16,6 +16,7 @@ import stat
 import zipfile
 from pathlib import Path
 
+from packaging.tags import compatible_tags, cpython_tags
 from packaging.utils import canonicalize_name, parse_wheel_filename
 
 from description_pipeline.io import (
@@ -55,23 +56,28 @@ def _locked_pins(data: bytes) -> dict:
     return pins
 
 
-def _wheel_target_compatible(tags, system: str) -> bool:
-    """Python/ABI/OS/architecture compatibility of a wheel's parsed tags."""
+#: The release build's Linux glibc baseline: the offline builder resolves against
+#: manylinux_2_28, so spellings for a newer baseline are never installable here.
+LINUX_GLIBC_BASELINE = 28
 
-    interpreters = {"cp312", "py3", "py312"}
-    abis = {"cp312", "abi3", "none"}
-    for tag in tags:
-        if tag.interpreter not in interpreters or tag.abi not in abis:
-            continue
-        if system == "windows":
-            if tag.platform in {"win_amd64", "any"}:
-                return True
-        elif (
-            tag.platform in {"any", "linux_x86_64"}
-            or (tag.platform.startswith("manylinux") and tag.platform.endswith("x86_64"))
-        ):
-            return True
-    return False
+
+def _target_tags(system: str) -> set:
+    """The installable tag set of the archive's target (CPython 3.12, x86_64).
+
+    Built with ``packaging.tags`` so interpreter/ABI/platform combinations stay
+    exactly those a real installer accepts - including the older-CPython abi3
+    ladder and the generic ``any`` platform for pure wheels - and bound to the
+    same Linux/Windows role targets as the support matrix.
+    """
+
+    if system == "windows":
+        platforms = ["win_amd64"]
+    else:
+        platforms = [f"manylinux_2_{minor}_x86_64" for minor in range(5, LINUX_GLIBC_BASELINE + 1)]
+        platforms += ["manylinux2014_x86_64", "manylinux2010_x86_64", "manylinux1_x86_64", "linux_x86_64"]
+    tags = set(cpython_tags(python_version=(3, 12), abis=["cp312", "abi3", "none"], platforms=platforms))
+    tags |= set(compatible_tags(python_version=(3, 12), interpreter="cp312", platforms=platforms))
+    return tags
 
 
 def verify_release(directory, identity):
@@ -173,7 +179,7 @@ def verify_release(directory, identity):
                     wheels = {}
                     for wheel_member in wheel_members:
                         parsed, wheel_version, _, tags = parse_wheel_filename(Path(wheel_member).name)
-                        if not _wheel_target_compatible(tags, roles[name]):
+                        if not tags & _target_tags(roles[name]):
                             raise PipelineError(
                                 f"Role archive {name} carries a wheel for another target: {wheel_member}"
                             )

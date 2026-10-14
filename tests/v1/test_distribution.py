@@ -227,13 +227,48 @@ class DistributionTests(unittest.TestCase):
                 self.assertIn("repeats demo", str(raised.exception))
 
     def test_role_wheels_must_match_the_archive_target(self):
+        cases = {
+            "windows_tag_on_linux": "demo-1.0-cp312-cp312-win_amd64.whl",
+            "any_platform_with_cp_abi": "demo-1.0-cp312-cp312-any.whl",
+            "abi3_with_generic_interpreter": "demo-1.0-py3-abi3-any.whl",
+            "future_glibc_baseline": "demo-1.0-cp312-cp312-manylinux_999_999_x86_64.whl",
+        }
+        for label, member in cases.items():
+            with tempfile.TemporaryDirectory() as directory, self.subTest(case=label):
+                root = Path(directory)
+                identity = complete_release(root)
+                archive_path = root / f"description-{VERSION}-linux-cp312-x86_64.zip"
+                with zipfile.ZipFile(archive_path) as source:
+                    members = {name: source.read(name) for name in source.namelist()}
+                members[f"wheels/{member}"] = members.pop("wheels/demo-1.0-py3-none-any.whl")
+                members["files.json"] = json.dumps(
+                    {
+                        name: hashlib.sha256(payload).hexdigest()
+                        for name, payload in members.items()
+                        if name != "files.json"
+                    },
+                    sort_keys=True,
+                ).encode()
+                with zipfile.ZipFile(archive_path, "w") as archive:
+                    for name, payload in members.items():
+                        archive.writestr(name, payload)
+                write_json(
+                    root / "release.json", {**identity, "artifacts": inventory(root, exclude=("release.json",))}
+                )
+                with self.assertRaises(PipelineError) as raised:
+                    verify_release(root, identity)
+                self.assertIn("another target", str(raised.exception))
+
+    def test_older_cpython_abi3_tags_stay_compatible(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             identity = complete_release(root)
             archive_path = root / f"description-{VERSION}-linux-cp312-x86_64.zip"
             with zipfile.ZipFile(archive_path) as source:
                 members = {name: source.read(name) for name in source.namelist()}
-            members["wheels/demo-1.0-cp312-cp312-win_amd64.whl"] = members.pop("wheels/demo-1.0-py3-none-any.whl")
+            members["wheels/demo-1.0-cp311-abi3-manylinux_2_28_x86_64.whl"] = members.pop(
+                "wheels/demo-1.0-py3-none-any.whl"
+            )
             members["files.json"] = json.dumps(
                 {
                     name: hashlib.sha256(payload).hexdigest()
@@ -246,9 +281,7 @@ class DistributionTests(unittest.TestCase):
                 for name, payload in members.items():
                     archive.writestr(name, payload)
             write_json(root / "release.json", {**identity, "artifacts": inventory(root, exclude=("release.json",))})
-            with self.assertRaises(PipelineError) as raised:
-                verify_release(root, identity)
-            self.assertIn("another target", str(raised.exception))
+            verify_release(root, identity)
 
     def test_deployment_inputs_must_match_the_source_archive(self):
         with tempfile.TemporaryDirectory() as directory:
