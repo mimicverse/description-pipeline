@@ -385,3 +385,22 @@ details pre { white-space: pre-wrap; overflow-wrap: anywhere; }
   .viewer { height: 320px; }
   .viewer-footer { grid-template-columns: 1fr; }
 }
+
+/* 1.4.2 preview enhancement: default-expanded workspace with the five data panels. */
+.viewer-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.viewer-title { font-weight: 600; }
+.preview-info { margin: 6px 0 4px; }
+.panel-title { margin: 0 0 6px; font-weight: 600; font-size: 13px; }
+.preview-panels { margin-top: 10px; display: grid; gap: 8px; }
+.preview-panel { border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 8px 10px; background: #fbfcfe; }
+.preview-panel > summary { cursor: pointer; font-weight: 600; font-size: 13px; }
+.panel-table { margin-top: 6px; overflow-x: auto; }
+.panel-grid { width: 100%; border-collapse: collapse; font-size: 12px; }
+.panel-grid th, .panel-grid td { text-align: left; padding: 3px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.panel-grid th { color: var(--muted); font-weight: 600; }
+#viewer-card.preview-collapsed #viewer,
+#viewer-card.preview-collapsed .viewer-footer,
+#viewer-card.preview-collapsed .preview-panels,
+#viewer-card.preview-collapsed #preview-info { display: none; }
+.stage-quick-summary { border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 8px 10px; margin: 8px 0; background: #fbfcfe; }
+.stage-quick-summary h4 { margin: 0 0 4px; font-size: 13px; }

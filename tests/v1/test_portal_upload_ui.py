@@ -565,6 +565,21 @@ class ActivityJsLogicTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
 
 
+class Preview142JsBatteryTests(unittest.TestCase):
+    """Focused Node battery for the 1.4.2 preview defaults (P1-P5)."""
+
+    @unittest.skipUnless(shutil.which("node"), "node is required to run the JS battery")
+    def test_preview142_battery_regression(self) -> None:
+        script = ROOT / "tests" / "js" / "preview142_battery_test.mjs"
+        result = subprocess.run(
+            [shutil.which("node"), str(script)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
+
+
 class FailureDisplayUiContractTests(unittest.TestCase):
     """Terminal-failure summary: reported-finding counts, bounded collapsible evidence."""
 
