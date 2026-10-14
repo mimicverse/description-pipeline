@@ -81,8 +81,9 @@ def resolve(
         command += ["-r", extra]
     for constraint in constraint_files:
         command += ["-c", str(constraint)]
-    # Linux owns independent consumer verification; resolve its optional runtime too.
-    command.append(wheel + "[verify]")
+    # Resolve the full Linux role closure: the portable surfaces plus the independent
+    # consumer behind the verify extra; the base set is the native (Windows) closure.
+    command.append(wheel + "[portable,verify]")
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
         raise SystemExit(f"pip resolve failed:\n{result.stdout}\n{result.stderr}")

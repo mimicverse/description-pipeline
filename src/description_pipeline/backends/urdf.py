@@ -7,7 +7,7 @@ import struct
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-from ..io import PipelineError, confined
+from ..io import PipelineError, confined, format_number
 from ..geometry.stl import MESH_PART_TRIANGLES_MAX
 from ..model import Robot
 
@@ -20,7 +20,7 @@ _STL_TRIANGLE_BYTES = 50
 
 
 def _numbers(values) -> str:
-    return " ".join(format(float(value), ".17g") for value in values)
+    return " ".join(format_number(value) for value in values)
 
 
 def _origin(parent: ET.Element, data: dict) -> None:
@@ -77,10 +77,6 @@ def generate_urdf(robot: Robot, source: Path, destination: Path, *, name: str) -
     """
 
     data = robot.to_dict()
-    if data["constraints"]:
-        raise PipelineError("URDF v1 does not support closed-loop constraints")
-    if data.get("actuators") or data.get("sensors"):
-        raise PipelineError("URDF v1 requires explicit extensions for actuator or sensor definitions")
     document = ET.Element("robot", name=name)
     for link in data["links"]:
         node = ET.SubElement(document, "link", name=link["name"])

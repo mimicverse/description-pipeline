@@ -91,7 +91,6 @@ class SplitWorkflowTests(unittest.TestCase):
             ("run_generate", "fetch_capture"),
             ("run_verify", "run_generate"),
             ("run_publish", "run_verify"),
-            ("confirm_job", "run_publish"),
         ):
             with self.subTest(stage=task_id):
                 task = dag.get_task(task_id)
@@ -153,7 +152,7 @@ class SplitWorkflowTests(unittest.TestCase):
             (output / "input").mkdir(parents=True)
             write_json(output / "reports/quality.json", {"passed": True, "subject_sha256": subject})
             store.append_events(run_id, protocol_events(subject=subject))
-            confirm = module.dag.get_task("confirm_job").python_callable
+            confirm = module._confirm_delivery
             with (
                 patch.object(module, "_linux_store", return_value=store),
                 patch.object(module, "_endpoint", side_effect=AssertionError("Linux confirmation must not open CAD")),

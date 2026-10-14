@@ -7,10 +7,9 @@ It runs without Windows or SolidWorks: everything it needs (the raw record, the
 embedded controlled records and the generated contract files) is inside the
 package.
 
-Only three facts are taken from the package as *claims*: ``robot.yaml``, a supplied
-``cad-revision.json`` seal and the discovery payload itself.  The payload is
-bound by digest to the package's provenance block; every derived value is
-recomputed here before it is accepted.
+Only two facts are taken from the package as *claims*: ``input/source.json``
+and the discovery payload itself.  The payload is bound by digest to the
+package's subject; every derived value is recomputed here before it is accepted.
 
 Two verification regimes are supported by design, selected by the same shared
 predicate as the producer (``schemas.exporter_declaration_present`` — the helper
@@ -41,13 +40,12 @@ from pathlib import Path, PurePosixPath
 
 import yaml
 
-from ..schemas import CAD_REVISION_SCHEMA, INPUT_SCHEMA, exporter_declaration_present
+from ..delivery import read_delivery_manifest, read_source_record
+from ..io import PipelineError, confined, digest, read_data
+from ..schemas import exporter_declaration_present
 
 VERIFICATION_SCHEMA = "solidworks-to-urdf.native-discovery-verification/v1"
 DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v1"
-ROBOT_FILE = "robot.yaml"
-REVISION_FILE = "cad-revision.json"
-DISCOVERY_FILE = "discovery/native-discovery.json"
 
 SUPPORTED_MATES = {
     "coincident",
@@ -89,12 +87,6 @@ class _Failure(Exception):
 def _require(condition: bool, code: str, message: str, detail=None) -> None:
     if not condition:
         raise _Failure(code, message, detail)
-
-
-def _read_yaml(path: Path) -> dict:
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    _require(isinstance(data, dict), "discovery.file", f"{path.name} must be a mapping", {"path": path.name})
-    return data
 
 
 def _read_json(path: Path) -> dict:
@@ -1607,6 +1599,594 @@ def _datum_owners(full, attached: frozenset[str]) -> set[str]:
     return owners
 
 
+def rebuild_rigid_bodies(record: dict) -> list[dict]:
+    """Rebuild the rigid-body carrier from the raw capture alone (IF-17, in memory).
+
+    ``record`` is the raw native capture (or a payload carrying it under
+    ``raw``).  Bodies are the material rigid clusters the current mate matrix
+    proves; each body's frame is its unique owned ``CS_<name>`` native datum
+    and the body id/name is that datum's suffix.  Nothing here consumes the
+    saved derived definition - this is the verification-side interpretation of
+    the current capture - and a missing or ambiguous witness raises a
+    classified failure instead of guessing an attachment.
+    """
+
+    if isinstance(record.get("raw"), dict):
+        record = record["raw"]
+    by_material, _by_component = _cluster_bindings(record)
+    attached = _frame_attached_members(record)
+    properties = (record.get("properties") or {}).get("components") or {}
+    datums = [datum for datum in record.get("datums") or [] if isinstance(datum, dict)]
+    bodies: list[dict] = []
+    for group, full in by_material.items():
+        members = sorted(str(value) for value in full)
+        declared = {
+            str(value).strip()
+            for member in members
+            if isinstance((value := (properties.get(member) or {}).get("dp.body_datum")), str) and value.strip()
+        }
+        _require(
+            len(declared) <= 1,
+            "discovery.body_rebuild",
+            "one body declares conflicting body datum names",
+            {"components": members, "datums": sorted(declared)},
+        )
+        explicit = next(iter(declared), None)
+        proven = bool(attached) and full == attached
+        owned = [
+            datum
+            for datum in datums
+            if str(datum.get("owner") or "") in set(members)
+            and str(datum.get("name") or "").startswith("CS_")
+            and len(str(datum.get("name") or "")) > 3
+        ]
+        ownerless = (
+            [
+                datum
+                for datum in datums
+                if str(datum.get("name") or "") == "CS_base_link" and str(datum.get("owner") or "") == ""
+            ]
+            if proven
+            else []
+        )
+        if explicit is not None:
+            scope = {*members, *({""} if proven and explicit == "CS_base_link" else set())}
+            chosen = next(
+                (
+                    datum
+                    for datum in datums
+                    if str(datum.get("name") or "") == explicit and str(datum.get("owner") or "") in scope
+                ),
+                None,
+            )
+            _require(
+                chosen is not None,
+                "discovery.body_rebuild",
+                "the declared body datum does not bind exactly one coordinate system owned by this body",
+                {"components": members, "datum": explicit},
+            )
+        elif len(owned) == 1:
+            chosen = owned[0]
+        elif owned:
+            _require(
+                False,
+                "discovery.body_rebuild",
+                "several CS_<link> coordinate systems are owned by one body and none is declared",
+                {"components": members, "datums": sorted(str(datum.get("name")) for datum in owned)},
+            )
+        elif len(ownerless) == 1:
+            chosen = ownerless[0]
+        elif ownerless:
+            _require(
+                False,
+                "discovery.body_rebuild",
+                "several ownerless CS_base_link datums are present",
+                {"components": members},
+            )
+        else:
+            _require(
+                False,
+                "discovery.body_rebuild",
+                "no CS_<link> coordinate system is owned by this rigid body",
+                {"components": members},
+            )
+        name = str(chosen["name"])[3:]
+        _require(
+            _SNAKE.fullmatch(name) is not None,
+            "discovery.body_rebuild",
+            "the CS_<link> suffix must be the exact snake_case interface name",
+            {"datum": str(chosen["name"])},
+        )
+        bodies.append(
+            {
+                "id": name,
+                "name": name,
+                "components": sorted(group),
+                "frame": {"coordinate_system": str(chosen["name"])},
+            }
+        )
+    bodies.sort(key=lambda body: body["name"])
+    return bodies
+
+
+def rebuild_interface_frames(
+    record: dict,
+    *,
+    bodies: list[dict] | None = None,
+    base: dict | None = None,
+    expansion: dict | None = None,
+) -> list[dict]:
+    """Rebuild the interface-frame carrier from the raw capture alone (IF-17, in memory).
+
+    ``record`` is the raw native capture (or a payload carrying it under ``raw``).
+    The reconstruction mirrors the producer's interface rule on the verification
+    side: every recognised datum (``CS_``/``TCP_``/``SCS_`` prefix) that is not a
+    body's own link datum becomes a frame parented to the rigid body whose cluster
+    owns it; the frozen top assembly's ownerless datums bind only to the proven
+    base body; the frame name is the datum suffix after the first underscore and
+    must already be exact snake_case.  A recognised interface that cannot be
+    attributed, a duplicate frame name or a body-name collision refuses instead of
+    guessing, and the saved derived carrier is never read.
+
+    ``bodies``/``base`` let the declaration domain supply its independently decoded
+    tree (the same native interface interpretation, its own membership proof);
+    without them the rigid bodies and the proven frame-attached base are rebuilt
+    from the raw capture.  ``expansion`` maps a native owner occurrence to its full
+    leaf set (declaration domain): a sub-assembly owned interface is attributed
+    only when every expanded leaf proves the same body, never by name prefix.
+    Interface datums carrying a configuration bind the native owner's referenced
+    configuration (the main assembly configuration only applies to ownerless datums).
+    """
+
+    raw = record["raw"] if isinstance(record.get("raw"), dict) else record
+    if bodies is None:
+        bodies = rebuild_rigid_bodies(raw)
+        by_material, _by_component = _cluster_bindings(raw)
+        full_of_body: dict[str, frozenset[str]] = {}
+        for body in bodies:
+            material = frozenset(str(value) for value in body["components"])
+            full_of_body[str(body["name"])] = by_material.get(material, material)
+        named = [body for body in bodies if str(body["frame"]["coordinate_system"]) == "CS_base_link"]
+        _require(
+            len(named) == 1,
+            "discovery.interface_frame_rebuild",
+            "the rebuilt carrier has no unique CS_base_link body",
+            {"datums": [str(body["frame"]["coordinate_system"]) for body in named]},
+        )
+        root = named[0]
+        attached = _frame_attached_members(raw)
+        base = root if attached and full_of_body[str(root["name"])] == attached else None
+    else:
+        full_of_body = {str(body["name"]): frozenset(str(value) for value in body["components"]) for body in bodies}
+    body_of_component = {
+        str(component): str(body["name"]) for body in bodies for component in full_of_body[str(body["name"])]
+    }
+    referenced_configurations = {
+        str(item.get("name2")): item.get("configuration")
+        for item in raw.get("components") or []
+        if isinstance(item, dict) and isinstance(item.get("name2"), str)
+    }
+
+    def _body_of(owner: str) -> str | None:
+        direct = body_of_component.get(owner)
+        if direct is not None:
+            return direct
+        if expansion is not None:
+            expanded = {str(leaf) for leaf in expansion.get(owner, ())}
+            mapped = {body_of_component.get(leaf) for leaf in expanded}
+            if expanded and len(mapped) == 1 and None not in mapped:
+                return str(next(iter(mapped)))
+        return None
+    # Link datums: every cluster member paired with the body's own CS_ frame datum
+    # (the producer excludes the whole member scope, not only the datum's owner).
+    link_datums = {
+        (str(component), str(body["frame"]["coordinate_system"]))
+        for body in bodies
+        for component in full_of_body[str(body["name"])]
+    }
+    if base is not None:
+        base_datum = str(base["frame"]["coordinate_system"])
+        owned = any(
+            isinstance(datum, dict)
+            and str(datum.get("name")) == base_datum
+            and str(datum.get("owner") or "") in full_of_body[str(base["name"])]
+            for datum in raw.get("datums") or []
+        )
+        if not owned:
+            link_datums.add(("", base_datum))
+    body_names = {str(body["name"]) for body in bodies}
+    frames: list[dict] = []
+    seen: dict[str, str] = {}
+    for datum in raw.get("datums") or []:
+        if not isinstance(datum, dict):
+            continue
+        name = str(datum.get("name") or "")
+        if not name.startswith(INTERFACE_PREFIXES):
+            continue
+        owner = str(datum.get("owner") or "")
+        if (owner, name) in link_datums:
+            continue
+        body_name = _body_of(owner)
+        if body_name is None and base is not None and owner == "":
+            body_name = str(base["name"])
+        _require(
+            body_name is not None,
+            "discovery.interface_frame_rebuild",
+            "recognised interface datum is not owned by any rebuilt body",
+            {"datum": name, "owner": owner},
+        )
+        if "configuration" in datum:
+            carried = str(datum.get("configuration") or "")
+            if owner == "":
+                expected = str(raw.get("saved_configuration") or "")
+            else:
+                referenced = referenced_configurations.get(owner)
+                _require(
+                    isinstance(referenced, str) and bool(referenced),
+                    "discovery.interface_frame_rebuild",
+                    "interface datum names an owner with no recorded referenced configuration",
+                    {"datum": name, "owner": owner},
+                )
+                expected = str(referenced)
+            _require(
+                carried == expected,
+                "discovery.interface_frame_rebuild",
+                "interface datum belongs to another referenced configuration",
+                {"datum": name, "owner": owner, "configuration": carried, "referenced": expected},
+            )
+        _prefix, _separator, suffix = name.partition("_")
+        _require(
+            _SNAKE.fullmatch(suffix) is not None,
+            "discovery.interface_frame_rebuild",
+            "interface datum suffix must already be exact snake_case",
+            {"datum": name},
+        )
+        _require(
+            suffix not in seen,
+            "discovery.interface_frame_rebuild",
+            "two interface datums derive the same frame name",
+            {"name": suffix, "other": seen.get(suffix)},
+        )
+        _require(
+            suffix not in body_names,
+            "discovery.interface_frame_rebuild",
+            "an interface frame collides with a body name under the shared name contract",
+            {"name": suffix},
+        )
+        seen[suffix] = name
+        frames.append({"id": suffix, "name": suffix, "parent": body_name, "coordinate_system": name})
+    return frames
+
+
+def rebuild_joint_facts(record: dict, package: Path) -> list[dict]:
+    """Rebuild the movable-joint carrier from the raw capture alone (IF-17, in memory).
+
+    ``record`` is the discovery payload (its ``raw`` block, ``frozen_names``,
+    ``namespace`` and controlled-record entries); ``package`` resolves the
+    embedded record bytes.  The reconstruction mirrors the documented rules on
+    the verification side: the raw mate rank/twist proves the freedom and type,
+    the recorded shaft and axis sign give the native direction, the child body
+    frame gives the local axis, and the controlled records give the position
+    and drive ranges.  Every missing or conflicting witness raises a classified
+    failure - the saved derived definition is never read.
+    """
+
+    payload = record if isinstance(record.get("raw"), dict) else {"raw": record}
+    raw = payload["raw"]
+    namespace = str(payload.get("namespace") or "dp")
+    frozen = payload.get("frozen_names") or {}
+    bodies = rebuild_rigid_bodies(raw)
+    by_name = {str(body["name"]): body for body in bodies}
+    _require("base_link" in by_name, "discovery.joint_rebuild", "no base_link body in the rebuilt carrier")
+    by_material, _by_component = _cluster_bindings(raw)
+    full_cluster = {
+        str(body["name"]): by_material.get(frozenset(body["components"]), frozenset(body["components"]))
+        for body in bodies
+    }
+    by_component = {
+        str(component): str(body["name"]) for body in bodies for component in body["components"]
+    }
+    attached = _frame_attached_members(raw)
+    raw_mates = raw.get("mates") or []
+    _members, pairs = _independent_clusters(raw)
+    facts: list[dict] = []
+    for key, group in sorted(pairs.items()):
+        left, right = sorted(key)
+        if group.get("unresolved") or group["rank"] == 6:
+            continue
+        left_body, right_body = by_component.get(left), by_component.get(right)
+        _require(
+            left_body is not None and right_body is not None and left_body != right_body,
+            "discovery.joint_rebuild",
+            "a movable mate pair must connect two distinct rigid bodies",
+            {"components": [left, right]},
+        )
+        mates = [raw_mates[index] for index in group["mates"] if 0 <= index < len(raw_mates)]
+        _require(bool(mates), "discovery.joint_rebuild", "a movable pair carries no raw mates", {"pair": sorted(key)})
+        properties, conflicts = _joint_properties(raw, mates)
+        _require(
+            not conflicts,
+            "discovery.joint_rebuild",
+            "two native sources declare the same joint scalar differently",
+            {"conflicts": conflicts},
+        )
+        nullity = 6 - group["rank"]
+        _require(
+            nullity == 1,
+            "discovery.joint_rebuild",
+            "the mate pair does not leave exactly one motion",
+            {"rank": group["rank"], "components": [left, right]},
+        )
+        twist = _null_space(group["rows"], 6)[0]
+        velocity, omega = twist[:3], twist[3:]
+        w = math.sqrt(_dot(omega, omega))
+        v = math.sqrt(_dot(velocity, velocity))
+        hint = str(properties.get(f"{namespace}.joint.type") or "").strip().lower()
+        if w <= 1e-9:
+            joint_type = "prismatic"
+            _require(
+                v > 1e-9,
+                "discovery.joint_rebuild",
+                "the reconstructed motion has no axis",
+                {"pair": [left, right]},
+            )
+            direction = [value / v for value in velocity]
+            axis_point = None
+        else:
+            _require(
+                not (v > 1e-9 and abs(_dot(velocity, omega)) > 1e-6 * max(v, w) ** 2),
+                "discovery.joint_rebuild",
+                "the reconstructed motion is a screw, not a supported joint",
+                {"pair": [left, right]},
+            )
+            joint_type = "continuous" if hint == "continuous" else "revolute"
+            direction = [value / w for value in omega]
+            axis_point = [value / (w * w) for value in _cross(omega, velocity)]
+        _require(
+            hint in {"", joint_type},
+            "discovery.joint_rebuild",
+            "the joint type annotation contradicts the reconstructed freedom",
+            {"annotation": hint, "derived": joint_type},
+        )
+        shaft = group["axis"]
+        _require(
+            shaft is not None,
+            "discovery.joint_rebuild",
+            "no cylindrical mate entity carries the joint shaft",
+            {"pair": [left, right]},
+        )
+        _require(
+            abs(abs(_dot(shaft, direction)) - 1.0) <= 1e-4,
+            "discovery.joint_rebuild",
+            "the recorded shaft does not follow the reconstructed freedom",
+            {"pair": [left, right]},
+        )
+        if axis_point is not None and group.get("point") is not None:
+            _require(
+                _offset(group["point"], axis_point, direction) <= AXIS_OFFSET_TOL_M,
+                "discovery.joint_rebuild",
+                "the recorded shaft misses the reconstructed axis",
+                {"pair": [left, right]},
+            )
+        sign_value = properties.get(f"{namespace}.joint.axis_sign")
+        sign = None
+        if type(sign_value) is int and sign_value in (1, -1):
+            sign = sign_value
+        elif type(sign_value) is str and sign_value in ("+1", "1", "-1"):
+            sign = 1 if sign_value in ("+1", "1") else -1
+        _require(
+            sign is not None,
+            "discovery.joint_rebuild",
+            "dp.joint.axis_sign must be exactly +1 or -1",
+            {"pair": [left, right], "value": sign_value},
+        )
+        native_direction = [float(value) for value in shaft]
+        if sign == -1:
+            native_direction = [-value for value in native_direction]
+        cylinder = next(
+            (
+                item
+                for mate in mates
+                for item in _entities(mate)
+                if isinstance(item.get("cylinder"), dict)
+                and isinstance(item.get("component"), str)
+                and item.get("component")
+                and (
+                    (isinstance(item.get("feature"), str) and item.get("feature"))
+                    or isinstance(item.get("face_index"), int)
+                )
+            ),
+            None,
+        )
+        _require(
+            cylinder is not None,
+            "discovery.joint_rebuild",
+            "the cylindrical mate entity carries no feature name or face index",
+            {"pair": [left, right]},
+        )
+        axis_reference = {"component": str(cylinder["component"]), "body_type": "solid"}
+        if isinstance(cylinder.get("feature"), str) and cylinder.get("feature"):
+            axis_reference["feature_name"] = str(cylinder["feature"])
+        else:
+            axis_reference["face_index"] = int(cylinder["face_index"])
+        heads: list[str] = []
+        mate_names = [str(mate.get("name") or "") for mate in mates]
+        for mate_name in mate_names:
+            head, separator, role = mate_name.partition("__")
+            if not separator or not role or _SNAKE.fullmatch(head) is None:
+                heads = []
+                break
+            heads.append(head)
+        _require(
+            bool(heads) and len(set(heads)) == 1,
+            "discovery.joint_rebuild",
+            "mate names must share one snake_case <joint>__<role> group name",
+            {"mates": mate_names},
+        )
+        name = heads[0]
+        identity = mate_names[0]
+        if identity in frozen:
+            name = str(frozen[identity])
+        _require(_SNAKE.fullmatch(name) is not None, "discovery.joint_rebuild", "joint name is not snake_case")
+        limits: dict | None = None
+        limit_evidence = None
+        native_limits = group["limits"]
+        limits_reference = properties.get(f"{namespace}.joint.limits_record")
+        if joint_type == "continuous":
+            _require(
+                not isinstance(native_limits, dict),
+                "discovery.joint_rebuild",
+                "a continuous joint carries native position limits",
+                {"pair": [left, right]},
+            )
+        elif isinstance(native_limits, dict):
+            expected_unit = "m" if joint_type == "prismatic" else "rad"
+            _require(
+                native_limits.get("unit") == expected_unit,
+                "discovery.joint_rebuild",
+                "native limits are not in SI units",
+                {"pair": [left, right], "unit": native_limits.get("unit")},
+            )
+            limits = {"lower": float(native_limits["lower"]), "upper": float(native_limits["upper"])}
+            if isinstance(limits_reference, str) and limits_reference.strip():
+                entry = _find_record_entry(payload, limits_reference)
+                value = _record_value(package, entry["entry"], entry["key"])
+                _require(
+                    _close([limits["lower"], limits["upper"]], [value.get("lower"), value.get("upper")], 1e-12),
+                    "discovery.joint_rebuild",
+                    "native mate limits and the controlled record disagree",
+                    {"pair": [left, right]},
+                )
+                limit_evidence = {
+                    "file": entry["entry"].get("package_file"),
+                    "sha256": entry["entry"].get("sha256"),
+                    "anchor": entry["entry"].get("anchor"),
+                }
+        else:
+            _require(
+                isinstance(limits_reference, str) and limits_reference.strip(),
+                "discovery.joint_rebuild",
+                "the joint has no native or controlled position range",
+                {"pair": [left, right]},
+            )
+            entry = _find_record_entry(payload, limits_reference)
+            value = _record_value(package, entry["entry"], entry["key"])
+            limits = {"lower": float(value["lower"]), "upper": float(value["upper"])}
+            limit_evidence = {
+                "file": entry["entry"].get("package_file"),
+                "sha256": entry["entry"].get("sha256"),
+                "anchor": entry["entry"].get("anchor"),
+            }
+        drive_reference = properties.get(f"{namespace}.joint.drive_record")
+        _require(
+            isinstance(drive_reference, str) and drive_reference.strip(),
+            "discovery.joint_rebuild",
+            "the joint has no controlled drive record",
+            {"pair": [left, right]},
+        )
+        entry = _find_record_entry(payload, drive_reference)
+        drive = _record_value(package, entry["entry"], entry["key"])
+        effort = float(drive["effort"])
+        velocity_limit = float(drive["velocity"])
+        _require(
+            math.isfinite(effort) and math.isfinite(velocity_limit) and effort > 0.0 and velocity_limit > 0.0,
+            "discovery.joint_rebuild",
+            "drive record effort/velocity must be finite and positive",
+            {"pair": [left, right]},
+        )
+        limits = dict(limits or {})
+        limits["effort"] = effort
+        limits["velocity"] = velocity_limit
+        facts.append(
+            {
+                "nodes": (left_body, right_body),
+                "components": [left, right],
+                "native_direction": native_direction,
+                "entry": {
+                    "id": name,
+                    "name": name,
+                    "type": joint_type,
+                    "axis_reference": axis_reference,
+                    "limits": limits,
+                    "limit_evidence": limit_evidence,
+                },
+            }
+        )
+    # Orient away from the base body (breadth-first over the body graph).
+    adjacency: dict[str, list[tuple[str, int]]] = {}
+    for index, fact in enumerate(facts):
+        first, second = fact["nodes"]
+        adjacency.setdefault(first, []).append((second, index))
+        adjacency.setdefault(second, []).append((first, index))
+    order = {"base_link": 0}
+    queue = ["base_link"]
+    consumed: set[int] = set()
+    edges: set[frozenset[str]] = set()
+    for fact in facts:
+        fact["entry"]["parent"] = None
+        fact["entry"]["child"] = None
+        fact["entry"]["axis"] = None
+    while queue:
+        current = queue.pop(0)
+        for neighbour, index in sorted(adjacency.get(current, []), key=lambda item: item[1]):
+            if index in consumed:
+                continue
+            edge = frozenset((current, neighbour))
+            _require(
+                edge not in edges,
+                "discovery.joint_rebuild",
+                "two movable mates connect the same pair of bodies; one reduction is ambiguous",
+                {"components": facts[index]["components"]},
+            )
+            consumed.add(index)
+            edges.add(edge)
+            fact = facts[index]
+            fact["entry"]["parent"] = current
+            fact["entry"]["child"] = neighbour
+            child = by_name[neighbour]
+            datum = _owned_datum(
+                raw,
+                child["frame"]["coordinate_system"],
+                _datum_owners(full_cluster[neighbour], attached),
+            )
+            _require(
+                datum is not None,
+                "discovery.joint_rebuild",
+                "the child body frame names no datum owned uniquely by that body",
+                {"body": neighbour},
+            )
+            frame = _frame(datum.get("array"))
+            _require(frame is not None, "discovery.joint_rebuild", "the child body frame datum is unreadable")
+            local = _local_axis(frame, fact["native_direction"])
+            _require(
+                math.sqrt(_dot(local, local)) > 0.0,
+                "discovery.joint_rebuild",
+                "the child frame collapses the joint axis",
+                {"body": neighbour},
+            )
+            norm = math.sqrt(_dot(local, local))
+            fact["entry"]["axis"] = [value / norm for value in local]
+            if neighbour not in order:
+                order[neighbour] = order[current] + 1
+                queue.append(neighbour)
+    _require(
+        len(consumed) == len(facts),
+        "discovery.joint_rebuild",
+        "the movable mates do not form a tree reachable from base_link",
+        {"joints": len(facts), "reached": len(consumed)},
+    )
+    entries = [fact["entry"] for fact in facts]
+    entries.sort(key=lambda entry: entry["name"])
+    names = [entry["name"] for entry in entries]
+    _require(
+        len(set(names)) == len(names),
+        "discovery.joint_rebuild",
+        "two joints resolve to the same name",
+        {"names": names},
+    )
+    return entries
+
+
 def _frame(values) -> list[list[float]] | None:
     try:
         raw = list(values or ())
@@ -1642,7 +2222,9 @@ def _close(left, right, tolerance: float = 1e-9) -> bool:
 
 
 def _record_value(package: Path, entry: dict, key: str):
-    target = package / str(entry.get("package_file") or "")
+    relative = str(entry.get("package_file") or "")
+    candidates = [package / relative, package / "input/records" / relative]
+    target = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
     _require(
         target.is_file(), "discovery.record", "embedded record file is missing", {"file": entry.get("package_file")}
     )
@@ -1720,6 +2302,29 @@ def verify_discovery(package: Path) -> dict:
     diagnostics: list[dict] = []
     state: dict = {}
 
+    def _carrier() -> dict:
+        """The definition carriers rebuilt from the raw capture alone (IF-17).
+
+        The saved derived copy is never read; a missing or conflicting witness
+        raises the rebuild failure into the check that needed the carrier, so
+        every gate reports its own precise cause.
+        """
+
+        if "carrier" not in state:
+            payload = state["payload"]
+            try:
+                state["carrier"] = {
+                    "bodies": rebuild_rigid_bodies(payload),
+                    "joints": rebuild_joint_facts(payload, package),
+                    "frames": rebuild_interface_frames(payload),
+                }
+            except Exception as error:  # noqa: BLE001 - memoized and re-raised per consuming check
+                state["carrier"] = error
+        carrier = state["carrier"]
+        if isinstance(carrier, Exception):
+            raise carrier
+        return carrier
+
     def check(identifier, callback):
         try:
             details = _report_safe(callback() or {})
@@ -1747,82 +2352,67 @@ def verify_discovery(package: Path) -> dict:
             errors.append({"code": "discovery.internal", "message": str(error), "detail": {}})
         return checks[-1]
 
-    robot_path = package / ROBOT_FILE
-    revision_path = package / REVISION_FILE
-    record_path = package / DISCOVERY_FILE
+    record_path = package / "evidence/discovery.json"
+    source_path = package / "input/source.json"
+    originals_root = package / "input/cad"
 
     def binding():
-        _require(robot_path.is_file(), "discovery.file", "robot.yaml is missing")
         _require(record_path.is_file(), "discovery.file", "the discovery record is missing")
-        robot = _read_yaml(robot_path)
-        provenance = robot.get("provenance")
-        _require(isinstance(provenance, dict), "discovery.binding", "robot.yaml carries no native-discovery provenance")
-        _require(
-            provenance.get("generator") == "native-discovery",
-            "discovery.binding",
-            "provenance.generator is not native-discovery",
-        )
-        for key in ("generator_version", "contract", "run_id"):
-            _require(
-                isinstance(provenance.get(key), str) and provenance[key].strip(),
-                "discovery.binding",
-                f"provenance.{key} is missing",
-            )
-        for key in ("discovery_sha256", "native_inventory_sha256"):
-            _require(
-                isinstance(provenance.get(key), str) and _HEX.match(provenance[key]),
-                "discovery.binding",
-                f"provenance.{key} is not a digest",
-            )
         payload_bytes = record_path.read_bytes()
-        _require(
-            hashlib.sha256(payload_bytes).hexdigest() == provenance["discovery_sha256"],
-            "discovery.binding",
-            "the discovery record does not match provenance.discovery_sha256",
-        )
         payload = json.loads(payload_bytes.decode("utf-8"))
         _require(payload.get("schema_version") == DISCOVERY_SCHEMA, "discovery.binding", "unexpected discovery schema")
+        files = payload.get("files")
         _require(
-            payload.get("contract") == provenance.get("contract"),
+            isinstance(files, list) and files and all(isinstance(row, dict) for row in files),
             "discovery.binding",
-            "record contract differs from provenance",
+            "record carries no file inventory",
         )
         _require(
-            payload.get("run_id") == provenance.get("run_id"),
+            digest(files) == payload.get("native_inventory_sha256"),
             "discovery.binding",
-            "record run_id differs from provenance",
+            "the native inventory digest does not match the file records",
         )
-        native_files = payload.get("native_files")
+        manifest = read_delivery_manifest(package)
+        entry = next(
+            (row for row in manifest["subject"]["files"] if row.get("path") == "evidence/discovery.json"), None
+        )
         _require(
-            isinstance(native_files, dict) and native_files,
+            entry is not None and entry.get("sha256") == hashlib.sha256(payload_bytes).hexdigest(),
             "discovery.binding",
-            "record carries no native file inventory",
+            "the discovery record does not match the delivery manifest subject",
         )
-        # The inventory digest mirrors the pipeline's canonical JSON encoding
-        # (sorted keys, UTF-8, two-space indent, trailing newline).
-        canonical = hashlib.sha256(
-            (json.dumps(native_files, sort_keys=True, ensure_ascii=False, allow_nan=False, indent=2) + "\n").encode()
-        ).hexdigest()
-        _require(
-            canonical == provenance["native_inventory_sha256"],
-            "discovery.binding",
-            "the native inventory digest does not match provenance",
-        )
-        _require(robot.get("schema_version") == INPUT_SCHEMA, "discovery.binding", "robot.yaml schema changed")
-        state["robot"] = robot
+        source = read_source_record(package)
+        identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
+        definition = {
+            "schema_version": payload.get("schema_version"),
+            # The definition identity must reflect the authored claim the
+            # identity gate compares it against; a missing value stays missing
+            # (readiness), never silently substituted from the selection.
+            "hardware_id": identity.get("hardware_id"),
+            "robot_name": payload.get("robot_name"),
+            "source": {
+                "assembly": source["selection"]["main_assembly"],
+                "configuration": source["selection"]["configuration"],
+                "robot_name": payload.get("robot_name"),
+            },
+        }
+        state["definition"] = definition
         state["payload"] = payload
-        state["provenance"] = provenance
         return {
-            "discovery_sha256": provenance["discovery_sha256"],
-            "native_inventory_sha256": provenance["native_inventory_sha256"],
-            "run_id": provenance["run_id"],
-            "contract": provenance.get("contract"),
+            "discovery_sha256": hashlib.sha256(payload_bytes).hexdigest(),
+            "native_inventory_sha256": payload.get("native_inventory_sha256"),
+            "run_id": payload.get("run_id"),
+            "contract": payload.get("contract"),
         }
 
     def files():
         payload = state["payload"]
-        inventory = _digest_files(package)
-        native = payload["native_files"]
+        inventory = _digest_files(originals_root)
+        native = {
+            str(row["path"]): str(row["sha256"])
+            for row in payload.get("files") or []
+            if isinstance(row, dict) and isinstance(row.get("path"), str)
+        }
         for relative, checksum in sorted(native.items()):
             _require(
                 relative in inventory,
@@ -1872,7 +2462,11 @@ def verify_discovery(package: Path) -> dict:
 
         payload = state["payload"]
         raw = payload.get("raw") or {}
-        native = payload.get("native_files") or {}
+        native = {
+            str(row["path"]): str(row["sha256"])
+            for row in payload.get("files") or []
+            if isinstance(row, dict) and isinstance(row.get("path"), str)
+        }
         raw_files = raw.get("files") or {}
         carrier = raw.get("source_selection")
         closure = carrier.get("closure") if isinstance(carrier, dict) else None
@@ -2010,7 +2604,7 @@ def verify_discovery(package: Path) -> dict:
         return {"imported_occurrences": observed, "cached_materializations": len(cached_used)}
 
     def identity():
-        payload, robot = state["payload"], state["robot"]
+        payload, definition = state["payload"], state["definition"]
         authored = _authored_identity(payload.get("raw") or {}, str(payload.get("namespace") or "dp"))
         state["authored_identity"] = authored
         claimed = payload.get("identity")
@@ -2023,9 +2617,9 @@ def verify_discovery(package: Path) -> dict:
                 {"field": key},
             )
         _require(
-            robot.get("hardware_id") == authored["hardware_id"],
+            definition.get("hardware_id") == authored["hardware_id"],
             "discovery.identity",
-            "robot.yaml hardware_id differs from authored native metadata",
+            "the definition hardware_id differs from authored native metadata",
         )
         technical_name = authored["robot_name"]
         label_source = "authored_robot_name"
@@ -2033,7 +2627,7 @@ def verify_discovery(package: Path) -> dict:
             label_source = "hardware_id" if authored["hardware_id"] is not None else "technical_default"
             technical_name = re.sub(r"[^0-9A-Za-z]+", "_", authored["hardware_id"] or "robot").strip("_").lower()
         _require(
-            (robot.get("source") or {}).get("robot_name") == technical_name,
+            (definition.get("source") or {}).get("robot_name") == technical_name,
             "discovery.identity",
             "generated robot label differs from its recorded naming source",
         )
@@ -2053,65 +2647,27 @@ def verify_discovery(package: Path) -> dict:
         }
 
     def revision():
-        robot = state["robot"]
-        _require(not revision_path.is_symlink(), "discovery.revision", "cad-revision.json must be a regular file")
-        _require(revision_path.is_file(), "discovery.revision", "cad-revision.json is missing")
-        revision = _read_json(revision_path)
-        fields = {
-            "schema_version",
-            "hardware_id",
-            "revision",
-            "parent_revision",
-            "owner",
-            "change_summary",
-            "control",
-            "cad_files",
-        }
-        _require(
-            isinstance(revision, dict)
-            and not set(revision) - fields
-            and revision.get("schema_version") == CAD_REVISION_SCHEMA,
-            "discovery.revision",
-            "the supplied revision manifest is malformed",
-        )
+        _require(source_path.is_file(), "discovery.revision", "the archived source record is missing")
+        source = read_source_record(package)
+        metadata = source.get("metadata") or {}
         authored = state.get("authored_identity")
-        _require(
-            authored is not None and not authored["missing"],
-            "discovery.revision",
-            "the revision manifest lacks complete native author metadata",
-        )
-        for key in ("hardware_id", "revision", "parent_revision", "owner", "change_summary", "control"):
+        if isinstance(authored, dict) and not authored.get("missing"):
+            declared = metadata.get("revision")
             _require(
-                revision.get(key) == authored[key],
+                declared in (None, authored.get("revision")),
                 "discovery.revision",
                 "revision metadata differs from native author metadata",
-                {"field": key},
+                {"field": "revision"},
             )
-        _require(
-            revision.get("hardware_id") == robot.get("hardware_id"),
-            "discovery.revision",
-            "revision hardware_id differs from robot.yaml",
-        )
-        inventory = _digest_files(package)
-        observed = {
-            name: checksum
-            for name, checksum in inventory.items()
-            if Path(name).suffix.lower() in {".sldasm", ".sldprt"}
+        return {
+            "revision": metadata.get("revision"),
+            "label_source": (source.get("selection") or {}).get("hardware_source"),
         }
-        _require(
-            revision.get("cad_files") == observed,
-            "discovery.revision",
-            "the revision does not seal the package CAD bytes",
-        )
-        return {"cad_files": len(observed)}
 
     def budgets():
-        robot = state["robot"]
         payload = state["payload"]
         entry = payload.get("budget")
         _require(isinstance(entry, dict), "discovery.budgets", "the package carries no design budget record binding")
-        checks = robot.get("checks")
-        _require(isinstance(checks, dict), "discovery.budgets", "robot.yaml carries no checks block")
         value = _record_value(
             package,
             {"package_file": entry.get("package_file"), "sha256": entry.get("sha256")},
@@ -2120,18 +2676,14 @@ def verify_discovery(package: Path) -> dict:
         _require(isinstance(value, dict), "discovery.budgets", "the design budget record entry is not an object")
         for key in ("expected_mass_kg", "expected_extent_m"):
             item = value.get(key)
-            declared = checks.get(key)
             _require(
                 isinstance(item, (list, tuple))
-                and isinstance(declared, (list, tuple))
-                and len(item) == len(declared) == 2
-                and all(_number(number) is not None for number in (*item, *declared))
-                and 0 <= item[0] < item[1]
-                and 0 <= declared[0] < declared[1]
-                and _close([float(declared[0]), float(declared[1])], [float(item[0]), float(item[1])], 1e-12),
+                and len(item) == 2
+                and all(_number(number) is not None for number in item)
+                and 0 <= item[0] < item[1],
                 "discovery.budgets",
-                f"the {key} capture window differs from the design budget record",
-                {"value": declared},
+                f"the design budget record lacks a usable {key} interval",
+                {"value": item},
             )
         return {"budget_file": entry.get("package_file")}
 
@@ -2321,7 +2873,9 @@ def verify_discovery(package: Path) -> dict:
             "the frame-attached cluster has no material body",
             {"components": sorted(members)},
         )
-        source_bodies = (state["robot"].get("source") or {}).get("bodies") or []
+        # Only the rigid bodies are needed here: a bad attachment proof must surface its own
+        # diagnostic instead of being masked by an unrelated carrier rebuild failure.
+        source_bodies = rebuild_rigid_bodies(state["payload"])
         body = next(
             (
                 item
@@ -2351,12 +2905,15 @@ def verify_discovery(package: Path) -> dict:
         }
 
     def bodies():
-        robot = state["robot"]
         raw = state["payload"]["raw"]
         attached = _frame_attached_members(raw)
         by_name = _components_by_name(raw)
-        source_bodies = (robot.get("source") or {}).get("bodies")
-        _require(isinstance(source_bodies, list) and source_bodies, "discovery.bodies", "robot.yaml declares no bodies")
+        source_bodies = _carrier()["bodies"]
+        _require(
+            isinstance(source_bodies, list) and source_bodies,
+            "discovery.bodies",
+            "the rebuilt source definition declares no bodies",
+        )
         # A body is a set of physical parts.  Assembly-document occurrences stay in the mate
         # graph as connectors but are never material members, so a rigid sub-assembly cannot
         # become a body of its own or double the material of its parts.
@@ -2458,13 +3015,12 @@ def verify_discovery(package: Path) -> dict:
         return {"components": len(seen), "containers": len(containers)}
 
     def names():
-        robot = state["robot"]
         payload = state["payload"]
         raw = payload["raw"]
         attached = _frame_attached_members(raw)
         frozen = payload.get("frozen_names") or {}
         _require(isinstance(frozen, dict), "discovery.names", "frozen_names must be an object")
-        source = robot.get("source") or {}
+        source = _carrier()
         bodies = source.get("bodies") or []
         joints = source.get("joints") or []
         _members, pairs = _independent_clusters(raw)
@@ -2480,7 +3036,7 @@ def verify_discovery(package: Path) -> dict:
             _require(
                 body is not None,
                 "discovery.names",
-                "a rigid body has no robot.yaml body",
+                "a rigid body has no source definition body",
                 {"components": sorted(group)},
             )
             name = str(body.get("name"))
@@ -2587,11 +3143,10 @@ def verify_discovery(package: Path) -> dict:
         return {"frozen": len(frozen)}
 
     def joints():
-        robot = state["robot"]
         payload = state["payload"]
         raw = payload["raw"]
         attached = _frame_attached_members(raw)
-        source = robot.get("source") or {}
+        source = _carrier()
         source_joints = source.get("joints") or []
         bodies = {
             frozenset(str(value) for value in (body.get("components") or [])): body
@@ -2605,7 +3160,7 @@ def verify_discovery(package: Path) -> dict:
             _require(
                 body is not None,
                 "discovery.joints",
-                "a rigid body has no robot.yaml body",
+                "a rigid body has no source definition body",
                 {"components": sorted(material)},
             )
             name = str(body.get("name"))
@@ -2876,14 +3431,13 @@ def verify_discovery(package: Path) -> dict:
             _require(
                 pair in seen,
                 "discovery.joints",
-                "robot.yaml contains a joint with no movable mate pair",
+                "the source definition contains a joint with no movable mate pair",
                 {"joint": joint.get("name")},
             )
         return {"joints": derived}
 
     def tree():
-        robot = state["robot"]
-        source = robot.get("source") or {}
+        source = _carrier()
         bodies = [str(body.get("name")) for body in source.get("bodies") or []]
         _require("base_link" in bodies, "discovery.tree", "no base_link body")
         _require(
@@ -2929,11 +3483,10 @@ def verify_discovery(package: Path) -> dict:
         return {"bodies": len(bodies), "joints": len(source.get("joints") or [])}
 
     def frames():
-        robot = state["robot"]
         payload = state["payload"]
         raw = payload["raw"]
         attached = _frame_attached_members(raw)
-        source = robot.get("source") or {}
+        source = _carrier()
         bodies = source.get("bodies") or []
         by_material, _by_component = _cluster_bindings(raw)
         component_body: dict[str, str] = {}
@@ -3074,7 +3627,9 @@ def verify_discovery(package: Path) -> dict:
     def declarations():
         from .native_declarations import verify_declarations
 
-        report = verify_declarations(state["payload"]["raw"], state["robot"].get("source"))
+        # Declaration/exporter packages are the declaration-gate domain (sealed declaration
+        # record, four-state + fixed-key binding); they have no geometric carrier to rebuild.
+        report = verify_declarations(state["payload"]["raw"])
         _require(
             report["passed"],
             "discovery.declarations",
@@ -3083,7 +3638,7 @@ def verify_discovery(package: Path) -> dict:
         )
         return {
             "bodies": len(report["members"]),
-            "joints": len((state["robot"].get("source") or {}).get("joints") or []),
+            "joints": report["joints"],
             "checks": report["checks"],
             "rigid_completion": report["completion"],
             "diagnostics": report["diagnostics"],
@@ -3145,28 +3700,22 @@ def verify_discovery(package: Path) -> dict:
         raw_block = raw_block if isinstance(raw_block, dict) else {}
         document_properties = (raw_block.get("properties") or {}).get("document") or {}
         budget_reference = str(payload.get("namespace") or "dp") + ".design_budget_record"
-        expectations = state["robot"].get("checks") or {}
-        if (
-            "budget" not in payload
-            and budget_reference not in document_properties
-            and not any(key in expectations for key in ("expected_mass_kg", "expected_extent_m"))
-        ):
+        if "budget" not in payload and budget_reference not in document_properties:
             dependent = tuple(item for item in dependent if item[0] != "discovery.budgets")
     if bound["passed"]:
         for identifier, callback in dependent:
             if identifier == "discovery.revision":
                 authored = state.get("authored_identity") or {}
-                if not revision_path.exists() and not revision_path.is_symlink() and authored.get("missing"):
-                    # Native file/provenance checks still bind every captured byte. The
-                    # absent publication seal is a readiness warning, never a passed check.
+                declared = (read_source_record(package).get("metadata") or {}).get("revision")
+                if not declared:
+                    # The CAD revision label is optional raw metadata; its absence is a
+                    # readiness warning, never a passed check.
                     diagnostics.append(
                         {
-                            "code": "discovery.revision_not_sealed",
+                            "code": "discovery.revision_absent",
                             "blocking": False,
-                            "message": (
-                                "cad-revision.json is absent while authored publication metadata is incomplete"
-                            ),
-                            "detail": {"state": "not_sealed", "missing": list(authored.get("missing") or [])},
+                            "message": "the CAD revision label is absent; the raw value stays missing",
+                            "detail": {"state": "absent", "missing": list(authored.get("missing") or [])},
                         }
                     )
                     continue
@@ -3223,3 +3772,136 @@ def _find_record_entry(payload: dict, reference: str) -> dict:
         "the referenced controlled record was not embedded in the package",
         {"reference": reference},
     )
+
+
+# ---------------------------------------------------------------------------
+# Delivery evidence reads (IF-13 tree): one owner for the frozen block shapes.
+
+CAPTURE = "evidence/capture.json"
+DISCOVERY = "evidence/discovery.json"
+RUNTIME = "evidence/native-runtime.json"
+HANDOFF = "input/handoff.json"
+
+
+def _delivery_root(root: Path) -> Path:
+    root = Path(root).resolve()
+    return root.parent if root.name == "evidence" else root
+
+
+def capture(root) -> dict:
+    record = read_data(confined(_delivery_root(root), CAPTURE))
+    if not isinstance(record, dict):
+        raise PipelineError("Capture evidence is not an object")
+    return record
+
+
+def discovery(root) -> dict:
+    record = read_data(confined(_delivery_root(root), DISCOVERY))
+    if not isinstance(record, dict):
+        raise PipelineError("Discovery evidence is not an object")
+    return record
+
+
+def runtime(root) -> dict:
+    record = read_data(confined(_delivery_root(root), RUNTIME))
+    if not isinstance(record, dict):
+        raise PipelineError("Native runtime evidence is not an object")
+    return record
+
+
+def handoff(root) -> dict:
+    record = read_data(confined(_delivery_root(root), HANDOFF))
+    if not isinstance(record, dict):
+        raise PipelineError("Frozen handoff record is not an object")
+    return record
+
+
+def source(root) -> dict:
+    return read_source_record(_delivery_root(root))
+
+
+def block(root, name: str):
+    """A same-name verbatim capture block (the frozen payloads)."""
+
+    record = capture(root)
+    if name not in record:
+        raise PipelineError(f"Capture evidence block is missing: {name}")
+    return record[name]
+
+
+def scene(root) -> dict:
+    return block(root, "scene")
+
+
+def mass_closure(root) -> dict:
+    return block(root, "mass_closure")
+
+
+def material_provenance(root) -> dict:
+    return block(root, "material_provenance")
+
+
+def declared_masses(root) -> dict:
+    return block(root, "declared_masses")
+
+
+def dependency_closure(root) -> dict:
+    return block(root, "dependency_closure")
+
+
+def link_group_mass_properties(root) -> dict:
+    return block(root, "link_group_mass_properties")
+
+
+def collection(root) -> dict:
+    """The verbatim collection block (kind/evidence_class/identity/limits/environment)."""
+
+    return block(root, "collection")
+
+
+def effective_instances(root) -> dict:
+    """The verbatim effective-instance record (schema/warnings/readings keys intact)."""
+
+    return block(root, "effective_instances")
+
+
+def geometry(root):
+    return block(root, "geometry")
+
+
+def components(root) -> list:
+    record = capture(root)
+    rows = record.get("components")
+    if not isinstance(rows, list):
+        raise PipelineError("Capture evidence carries no component readings")
+    return rows
+
+
+def mass_properties(root) -> dict:
+    """Component-name to mass-property reading, as carried by the capture rows."""
+
+    rows = components(root)
+    readings = {str(row.get("name")): row.get("mass_properties") for row in rows}
+    if not readings or any(value is None for value in readings.values()):
+        raise PipelineError("Component mass-property readings are missing")
+    return readings
+
+
+def datums(root) -> dict:
+    """Datum name to 4x4 row-major matrix, as carried by the capture rows."""
+
+    record = capture(root)
+    rows = record.get("datums")
+    if not isinstance(rows, list):
+        raise PipelineError("Capture evidence carries no datum records")
+    return {str(row["name"]): row["matrix"] for row in rows}
+
+
+def axes(root) -> list:
+    """Axis re-read records (verbatim entries, plus ``kinds`` for the rebuild)."""
+
+    record = capture(root)
+    rows = record.get("axes")
+    if not isinstance(rows, list):
+        raise PipelineError("Capture evidence carries no axis references")
+    return rows

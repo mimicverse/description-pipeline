@@ -59,6 +59,59 @@ PCB = "board-1/EasyEDA PCB Model~Nz70-1"
 CHASSIS = "chassis-1"
 
 
+def _capture_from_raw(evidence: Path, *, identity: dict) -> dict:
+    """The IF-13 capture blocks folded from the native snapshot's raw records."""
+
+    raw = evidence / "raw"
+
+    def read(name: str):
+        return json.loads((raw / name).read_text(encoding="utf-8"))
+
+    scene = read("scene_raw.json")
+    masses = read("mass_properties.json")
+    return {
+        "scene": scene,
+        "components": [{"name": name, "mass_properties": value} for name, value in masses.items()],
+        "datums": [
+            {"name": name, "matrix": matrix}
+            for name, matrix in (scene.get("coordinate_systems") or {}).items()
+        ],
+        "mass_closure": read("mass_closure.json"),
+        "declared_masses": read("declared_masses.json"),
+        "material_provenance": read("material_provenance.json"),
+        "effective_instances": read("effective_instances.json"),
+        "link_group_mass_properties": read("link_group_mass_properties.json"),
+        "collection": {
+            "kind": "solidworks",
+            "evidence_class": "cad",
+            "identity": copy.deepcopy(identity),
+            "limits": {"native_cad": True},
+            "environment": {"solidworks": {"revision": "34.0"}},
+        },
+    }
+
+
+def _publish(bundle: Path, evidence: Path) -> dict:
+    """Materialize the target-tree delivery the physics verifier consumes.
+
+    The native snapshot under ``evidence`` stays untouched (the producer-side
+    helpers keep reading it); the frozen delivery is a sibling tree.
+    """
+
+    source = support.default_source_record(
+        main_assembly="3.0 总装1008.SLDASM",
+        configuration="Default",
+        hardware_id="fixture",
+        revision=None,
+    )
+    support.write_target_delivery(
+        Path(bundle) / "delivery",
+        capture=_capture_from_raw(evidence, identity=source["identity"]),
+        source=source,
+    )
+    return source
+
+
 def placement(rotation, translation):
     grid = np.eye(4)
     grid[:3, :3] = rotation
@@ -422,15 +475,14 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
             evidence_class="cad",
         )
         report = closure_module.derive_mass_closure(self.evidence)
-        (self.bundle / "reports").mkdir(parents=True, exist_ok=True)
-        (self.bundle / "reports/mass-closure.json").write_text(json.dumps(report), encoding="utf-8")
+        _publish(self.bundle, self.evidence)
         self.report = report
         return record
 
     def _verify(self):
         loaded = scene_module.load_scene(self.evidence)
         model = {"links": [{"name": link["name"], "inertial": link["inertial"]} for link in loaded["links"]]}
-        checks = verify_physics(self.evidence, self.source, model)
+        checks = verify_physics(self.bundle / "delivery", self.source, model)
         return loaded, model, {check["id"]: check for check in checks}
 
     def test_producer_outputs_pass_the_independent_verifier(self):
@@ -459,12 +511,21 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
         self.assertAlmostEqual(self.report["derived"]["effective_total"]["mass"], mass, places=12)
         self.assertTrue(np.allclose(link["inertial"]["xyz"], com, atol=1e-12))
 
-    def test_derived_mutation_is_rejected(self):
+    def test_effective_closure_drift_is_rejected(self):
+        """A sealed observation that no longer closes with the ledger is refused."""
+
         self._build_snapshot()
-        report_path = self.bundle / "reports/mass-closure.json"
-        report = json.loads(report_path.read_text())
-        report["derived"]["effective_total"]["mass"] += 0.01
-        report_path.write_text(json.dumps(report), encoding="utf-8")
+        native_path = self.evidence / "raw/mass_closure.json"
+        native = json.loads(native_path.read_text())
+        native["top_level"]["mass"] += 0.01
+        native_path.write_text(json.dumps(native), encoding="utf-8")
+        write_manifest(
+            self.evidence,
+            kind="solidworks",
+            identity={"assembly": ORIGINAL, "configuration": "Default", "provider": "solidworks"},
+            evidence_class="cad",
+        )
+        _publish(self.bundle, self.evidence)
         _loaded, _model, checks = self._verify()
         self.assertFalse(checks["physics.closure"]["passed"])
 
@@ -472,19 +533,24 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
         self._build_snapshot()
         raw_path = self.evidence / "raw/mass_closure.json"
         native = json.loads(raw_path.read_text())
-        native["component_context"]["instances"][2]["context_mass_kg"] = 0.03
+        # The substituted instance's effective reading is a sealed observation:
+        # drifting it away from the sealed effective-instance record must fail
+        # the closure gate on the record's own evidence.
+        native["component_context"]["instances"][0]["effective"]["mass"] += 0.01
         raw_path.write_text(json.dumps(native), encoding="utf-8")
-        # Re-seal the manifest so the snapshot integrity layer cannot mask the
-        # report/native drift the physics gate must detect on its own.
-        support.write_link_group_mass_record_from_recombination(self.bundle, self.source)
+        # Re-publish so the delivery binding layer cannot mask the drift the
+        # physics gates must detect on their own.
         write_manifest(
             self.evidence,
             kind="solidworks",
             identity={"assembly": ORIGINAL, "configuration": "Default", "provider": "solidworks"},
             evidence_class="cad",
         )
+        _publish(self.bundle, self.evidence)
         _loaded, _model, checks = self._verify()
-        self.assertFalse(checks["physics.closure"]["passed"])
+        # The drifted context reading no longer matches the sealed
+        # effective-instance record the capture binds it to.
+        self.assertFalse(checks["physics.effective_instances"]["passed"])
 
 
 class StubInstanceBackend:
@@ -520,7 +586,7 @@ class InstanceMeasurementIntegrationTests(unittest.TestCase):
         "OverrideCenterOfMass": False,
         "OverrideMomentsOfInertia": False,
     }
-    PART = "NP-F550.step-1"
+    PART = "imported_part.step-1"
 
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
@@ -735,14 +801,13 @@ class InstanceMeasurementIntegrationTests(unittest.TestCase):
             evidence_class="cad",
         )
         report = closure_module.derive_mass_closure(self.evidence)
-        (self.bundle / "reports").mkdir(parents=True, exist_ok=True)
-        (self.bundle / "reports/mass-closure.json").write_text(json.dumps(report), encoding="utf-8")
+        _publish(self.bundle, self.evidence)
         return record, report
 
     def _verify(self):
         loaded = scene_module.load_scene(self.evidence)
         model = {"links": [{"name": link["name"], "inertial": link["inertial"]} for link in loaded["links"]]}
-        checks = verify_physics(self.evidence, self.source, model)
+        checks = verify_physics(self.bundle / "delivery", self.source, model)
         return loaded, {check["id"]: check for check in checks}
 
     def test_flagless_instance_measurement_is_primary_and_bound(self):
@@ -782,6 +847,7 @@ class InstanceMeasurementIntegrationTests(unittest.TestCase):
             identity={"assembly": ORIGINAL, "configuration": "Default", "provider": "solidworks"},
             evidence_class="cad",
         )
+        _publish(self.bundle, self.evidence)
         _loaded, checks = self._verify()
         self.assertFalse(checks["physics.effective_instances"]["passed"])
 

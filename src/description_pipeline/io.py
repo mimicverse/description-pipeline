@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import ntpath
 import os
 import shlex
@@ -11,8 +12,6 @@ import sys
 import tempfile
 from pathlib import Path, PureWindowsPath
 from typing import Any
-
-import yaml
 
 
 class PipelineError(ValueError):
@@ -70,8 +69,47 @@ def pin_utf8_streams() -> None:
             reconfigure(encoding="utf-8")
 
 
+def _canonical_value(value: Any) -> Any:
+    """Normalize the canonical number rule: unified zero, no NaN/Infinity survived."""
+
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ValueError("canonical encoding forbids NaN/Infinity")
+        return 0.0 if value == 0.0 else value
+    if isinstance(value, dict):
+        return {key: _canonical_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_canonical_value(item) for item in value]
+    return value
+
+
 def canonical(data: Any) -> bytes:
-    return (json.dumps(data, sort_keys=True, ensure_ascii=False, allow_nan=False, indent=2) + "\n").encode()
+    """The single canonical encoding (contracts §122): UTF-8, sorted keys, compact
+    separators (no extra whitespace), NaN/Infinity refused, unified zero
+    (``-0.0`` encodes as ``0.0``).  Digests are taken over exactly these bytes.
+    """
+
+    return json.dumps(
+        _canonical_value(data),
+        sort_keys=True,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode()
+
+
+def format_number(value: Any) -> str:
+    """The single numeric write format for URDF values: the shortest decimal that
+    round-trips the exact binary64 value, locale-independent, unified zero
+    (``-0.0`` and ``0.0`` both render ``0``); non-finite values are refused.
+    """
+
+    number = float(value)
+    if number != number or number in (float("inf"), float("-inf")):
+        raise PipelineError(f"Cannot format a non-finite number: {value!r}")
+    if number == 0.0:
+        return "0"
+    return repr(number)
 
 
 def digest(data: Any) -> str:
@@ -136,13 +174,45 @@ def _unique_mapping(pairs) -> dict:
     return mapping
 
 
-class _UniqueLoader(yaml.SafeLoader):
-    def construct_mapping(self, node, deep=False):
-        self.flatten_mapping(node)
-        return _unique_mapping(
-            (self.construct_object(key, deep=deep), self.construct_object(value, deep=deep))
-            for key, value in node.value
-        )
+def _load_yaml(text: str) -> Any:
+    """Parse YAML with duplicate-key rejection; the only PyYAML-dependent surface.
+
+    The import is deferred so the contract closure (schemas/io/delivery/stages/
+    interface_records) loads in bootstrap interpreters without ambient packages:
+    PyYAML is required only when a capture actually carries a YAML document.
+    """
+    try:
+        import yaml  # noqa: PLC0415  (deferred on purpose: the bootstrap closure must import without PyYAML)
+    except ModuleNotFoundError as error:
+        raise PipelineError(f"the YAML parser (PyYAML) is required to read this input ({error.name})") from error
+
+    class UniqueLoader(yaml.SafeLoader):
+        def construct_mapping(self, node, deep=False):
+            self.flatten_mapping(node)
+            return _unique_mapping(
+                (self.construct_object(key, deep=deep), self.construct_object(value, deep=deep))
+                for key, value in node.value
+            )
+
+    try:
+        return yaml.load(text, Loader=UniqueLoader)
+    except yaml.YAMLError as error:
+        raise PipelineError(str(error)) from error
+
+
+def _parse_constant(name: str) -> Any:
+    """Reject the non-finite JSON constants in the single foundation reader."""
+
+    raise PipelineError(f"the JSON document carries the non-finite constant {name}")
+
+
+def _parse_float(text: str) -> float:
+    """Parse one JSON number, refusing values that overflow binary64 to non-finite."""
+
+    value = float(text)
+    if not math.isfinite(value):
+        raise PipelineError(f"the JSON number {text} is not finite")
+    return value
 
 
 def parse_data(content: bytes, path: Path) -> Any:
@@ -151,9 +221,14 @@ def parse_data(content: bytes, path: Path) -> Any:
         # Windows PowerShell 5.1 writes a BOM for Set-Content -Encoding UTF8.
         text = content.decode("utf-8-sig")
         if path.suffix in {".yaml", ".yml"}:
-            return yaml.load(text, Loader=_UniqueLoader)
-        return json.loads(text, object_pairs_hook=_unique_mapping)
-    except (PipelineError, yaml.YAMLError, json.JSONDecodeError, UnicodeDecodeError) as error:
+            return _load_yaml(text)
+        return json.loads(
+            text,
+            object_pairs_hook=_unique_mapping,
+            parse_constant=_parse_constant,
+            parse_float=_parse_float,
+        )
+    except (PipelineError, json.JSONDecodeError, UnicodeDecodeError) as error:
         raise PipelineError(f"Invalid input {path}: {error}") from error
 
 

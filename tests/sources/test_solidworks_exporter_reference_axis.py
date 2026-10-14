@@ -308,9 +308,9 @@ class ImportedSourceBindingTests(unittest.TestCase):
         with TemporaryDirectory() as tmp, TemporaryDirectory() as native_tmp:
             root = Path(tmp)
             assembly = _write(root, "robot.SLDASM")
-            imported = _write(root, "NP-F550.step")
-            generated = session_materialization(Path(native_tmp), "NP-F550.step.SLDPRT")
-            component = _Component("NP-F550.step-1", generated)
+            imported = _write(root, "imported_part.step")
+            generated = session_materialization(Path(native_tmp), "imported_part.step.SLDPRT")
+            component = _Component("imported_part.step-1", generated)
             component.GetImportedPath = lambda: str(imported)
             component.IsVirtual = False
             app = _App({assembly: _Doc(assembly, children=[component])})
@@ -320,7 +320,7 @@ class ImportedSourceBindingTests(unittest.TestCase):
             # The validated in-stage author source is an acquired CAD document:
             # its staged bytes are hashed into the native file inventory.
             self.assertEqual(
-                record["files"]["NP-F550.step"], hashlib.sha256(imported.read_bytes()).hexdigest()
+                record["files"]["imported_part.step"], hashlib.sha256(imported.read_bytes()).hexdigest()
             )
             self.assertIn("robot.SLDASM", record["files"])
 
@@ -328,17 +328,17 @@ class ImportedSourceBindingTests(unittest.TestCase):
         with TemporaryDirectory() as tmp, TemporaryDirectory() as native_tmp, TemporaryDirectory() as outside:
             root = Path(tmp)
             assembly = _write(root, "robot.SLDASM")
-            external = Path(outside) / "NP-F550.step"
+            external = Path(outside) / "imported_part.step"
             external.write_bytes(b"external author source")
-            generated = session_materialization(Path(native_tmp), "NP-F550.step.SLDPRT")
-            component = _Component("NP-F550.step-1", generated)
+            generated = session_materialization(Path(native_tmp), "imported_part.step.SLDPRT")
+            component = _Component("imported_part.step-1", generated)
             component.GetImportedPath = lambda: str(external)
             component.IsVirtual = False
             app = _App({assembly: _Doc(assembly, children=[component])})
             backend = N.SolidWorksBackend(session_factory=lambda: _Session(app))
             with _com_stubs():
                 record = backend.discover_native(root, {"main_assembly": "robot.SLDASM"})
-            self.assertNotIn("NP-F550.step", record["files"])
+            self.assertNotIn("imported_part.step", record["files"])
             for name in record["files"]:
                 self.assertFalse(str(name).startswith("/"))
 
@@ -346,10 +346,10 @@ class ImportedSourceBindingTests(unittest.TestCase):
         with TemporaryDirectory() as tmp, TemporaryDirectory() as native_tmp:
             root = Path(tmp)
             assembly = _write(root, "robot.SLDASM")
-            (root / "NP-F550.step").write_bytes(b"present at read time")
-            generated = session_materialization(Path(native_tmp), "NP-F550.step.SLDPRT")
-            component = _Component("NP-F550.step-1", generated)
-            component.GetImportedPath = lambda: str(root / "NP-F550.step")
+            (root / "imported_part.step").write_bytes(b"present at read time")
+            generated = session_materialization(Path(native_tmp), "imported_part.step.SLDPRT")
+            component = _Component("imported_part.step-1", generated)
+            component.GetImportedPath = lambda: str(root / "imported_part.step")
             component.IsVirtual = False
             app = _App({assembly: _Doc(assembly, children=[component])})
             backend = N.SolidWorksBackend(session_factory=lambda: _Session(app))

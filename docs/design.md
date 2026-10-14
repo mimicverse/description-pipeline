@@ -1,239 +1,92 @@
-# Design
+# 架构设计
 
-One operator workflow: **SolidWorks folder → Airflow → verified URDF → review PR**.
+系统将一份原生工程转换为可审查的模型交付。设计围绕三个约束展开：工程事实有明确来源，跨边界结果不可变，验证结论只适用于其绑定的文件与检查范围。
 
-## 1. Core principles
+系统保持最小完整形态：一条工作流、一个完整模型、每项规则一个属主。目录对应明确职责，模块边界服务于独立验证和必要副作用；重复入口、并行表示、兼容流程及过渡层随变更移除。文档各自拥有一个职责，直接描述支持的行为。
 
-- Single source of truth.
-- Automatic derivation.
-- Verified publication.
-
-## 2. How the system works
-
-SolidWorks defines geometry, assembly relationships, motion and datums. Versioned
-component records in the platform's controlled library supply physical and drive
-specifications. CAD references identify their approved versions.
-
-When the main assembly carries the saved native URDF exporter declaration,
-discovery ingests it as explicit declared evidence: link membership by persistent
-component IDs, and joint names, types, origins, axes and named frames. Authored
-limits are preserved verbatim; zero or degenerate values are kept for capture and
-generation, flagged as stage warnings, and never qualify motion. Stored meshes,
-inertias and non-customized joint origins are derived content and are regenerated
-from native CAD, never adopted. Independent verification re-decodes the sealed
-payload. Mates that restrict declared motion in the saved pose remain diagnostics;
-invalid declarations, unresolved references and inconsistent native geometry fail.
-
-Each fact has one effective definition and a recorded source; conflicting or
-ambiguous definitions stop derivation. Mechanical engineers maintain these inputs;
-the pipeline generates definitions, models, meshes and reports within the
-[supported native constraint scope](mechanical-handoff-spec.md#52-连接与自由度).
-Unsupported or ambiguous evidence produces a diagnostic, not an inferred model.
+## 工作流与职责
 
 ```mermaid
 flowchart LR
-  F[1 Freeze inputs] --> D[2 Discover structure]
-  D --> C[3 Capture evidence]
-  C --> G[4 Generate URDF]
-  G --> V[5 Independent verification]
-  V -->|pass| P[6 Publish review PR]
-  V -->|fail| E[Retained findings and diagnostics]
+  F[冻结输入] --> D[解析结构] --> C[采集证据]
+  C --> G[生成 URDF] --> V[独立验证]
+  V -->|通过| P[预览与评审 PR]
+  V -->|失败| E[诊断与未验证预览]
 ```
 
-The pipeline has **six engineering steps**. Their single machine-readable definition
-is [`stage-contract.json`](../src/description_pipeline/stage-contract.json); the
-same definition renders this table, the Airflow DAG documentation and the operator view.
-Generated-input inspection is the input check of `capture`.
+六个阶段及其输入、检查、输出由[系统契约](contracts.md#stages)统一定义。Airflow 调度这些阶段；操作台提交命令和展示结果。两者都不实现机械推导或质量判定。
 
-<!-- stage-contract:start -->
-| # | Stage | Input | Input QC | Output | Output QC |
-|---|---|---|---|---|---|
-| 1 | `freeze` — Freeze inputs | Saved SolidWorks folder | Admitted path, regular files and native package | Frozen handoff, file inventory and digest | Exact file inventory and handoff digest |
-| 2 | `discover` — Discover structure | Frozen handoff and explicitly referenced component records | Unchanged handoff and controlled discovery settings | Native observations and findings; Derived definition; structural revision when metadata is complete | Resolvable model definition with explicit inspection warnings; Native evidence and original files agree; publication readiness recorded |
-| 3 | `capture` — Capture evidence | Prepared definition, saved CAD and native runtime | Derived definition, native provenance and archive integrity; Native Windows, COM and SolidWorks prerequisites | Collected CAD, raw measurements, native meshes and manifest | Complete snapshot with capture and saved-state guards; Original handoff unchanged after capture |
-| 4 | `generate` — Generate URDF | Frozen native evidence | Snapshot integrity before consumption | Canonical model; URDF and local meshes; Tool identity and file subject | Valid canonical schema and complete hashed delivery |
-| 5 | `verify` — Independent verification | Original evidence and actual generated files | Generated file subject unchanged | Deterministic per-object quality report | All required native, physical, frame, geometry and consumer checks; Saved report equals independent recomputation |
-| 6 | `publish` — Publish review PR | Verified delivery and configured model repository | Reverified delivery, clean repository and deterministic review branch | Candidate commit and PR receipt | Copied, staged and committed bytes match the verified subject; Remote commit, PR head/base and subject agree |
-<!-- stage-contract:end -->
+| 边界 | 职责 | 持有的数据与凭据 |
+|---|---|---|
+| 浏览器 | 飞书登录、上传、主装配和目标选择、结果与预览 | 用户选择的文件和会话 |
+| Linux 平台 | 冻结、规格解析、推导、生成、验证、报告、发布与持久化 | 工程证据、规格快照、模型仓库和 Git 凭据 |
+| Windows 原生执行器 | SolidWorks 原生读取、重建、质量属性读取、网格导出和会话管理 | 临时工程副本、原生任务、资源所有权和传输凭据 |
+| 工程评审 | 设计与实物对应、全行程安全、参数真实性和用途批准 | 受控工程记录与对应 PR |
 
-Each boundary records its actual check result before the next step consumes its
-output. Missing checks remain `not_run`; a failure blocks downstream work.
-Live activity is separate from these checks: the worker records its current
-operation, object and known item counts with timestamps and a bounded history.
-The operator page displays these observations without inferring progress from
-polling, inventing a completion percentage or changing qualification results.
-Each receipt declares its `execution_scope`: Windows covers freeze, discover and
-capture, including reading and sealing the raw native record and the saved
-exporter declaration; it runs no structure derivation, URDF generation, MuJoCo
-verification or Git operations. Linux derives the prepared definition and covers
-generate, verify and publish, including an independent re-decode of the sealed
-declaration. The complete Airflow run
-combines both receipts, while maintenance commands cover only the stages they execute
-([operations](operations.md#6-independent-review-and-recovery)); unexecuted
-native stages are reported as out of scope, never as qualified.
-[Quality](quality.md) defines the independent gates and tolerances. Exact selected-set accounting — native-selected plus independently measured unassigned mass closing to the whole within 1e-12 kg — is distinct from full-assembly coverage qualification: the authoritative declared model governs coverage and may leave an explicit unassigned occurrence warning.
-Link mass properties follow the native one-shot direct read over each body's
-full selected component set (the selection the independent verifier recomputes
-and requires verbatim); the model binds to that record by the exact
-assembly→link transform, the per-instance recombination remains a recorded
-audit, and the assembly closure compares the sum of the direct link reads with
-the whole-assembly reading.
-[The mechanical specification](mechanical-handoff-spec.md#111-自动检查与工程师确认)
-defines the remaining external engineering facts. Passed automatic checks are
-accepted without repeated manual review. After verification, the page shows only
-this external review scope; approvals remain in the matching PR or controlled
-records and are not inferred by the portal. Unsupported capabilities stay visible
-on their responsible step.
+Windows 遵循最小职责原则：只有依赖 Windows/SolidWorks 的操作才在其上执行。它不推导结构，不计算质量闭包，不生成模型或报告，不运行 MuJoCo，不维护产品身份、规格库、发布路由或 Git 状态。两端执行同一源码发行版本，使用各自最小依赖集。
 
-Any engineering step can start a new linked run. Upstream results are reused
-only after checking their frozen inputs, tool and dependency identities, and
-checkpoint integrity. The selected step and all downstream steps execute again;
-prior runs remain immutable. Reports identify reused evidence and retain its
-original timestamps. A missing or invalid prerequisite points to the earliest
-safe restart step. Transport recovery reconnects an existing job and remains
-separate from engineering reruns.
+## 数据权威
 
-Native input and collected evidence remain immutable. The canonical model contains
-topology, transforms, geometry and full physical properties. Verification reconstructs
-expectations from native observations and inspects the actual XML, mesh bytes and
-isolated consumer loading. Publication checks the copied, staged and committed
-bytes, then confirms the remote commit and PR head/base. A candidate PR requires
-engineering approval before model release.
+| 事实 | 权威来源 | 生成物的地位 |
+|---|---|---|
+| 文档、配置、实例、几何、基准、配合和原生声明 | 已保存的 CAD 与直接原生观察 | 保留来源，不能反写或补造 |
+| 工作限位、驱动能力及独立预算 | CAD 中的有效定义或明确引用的受控规格 | 固定引用、原文与摘要 |
+| 产品路由、提交主体、运行身份 | Linux 配置与认证提交 | 只建立行政身份 |
+| 规范化模型、URDF、交付网格 | 原生证据经确定规则推导；原生网格是源观察，交付网格是其无损分片与放置 | 待独立验证的声明 |
+| 自动质量结论 | 独立验算及实际交付文件 | 绑定主体和检查策略 |
+| 工程批准与用途资格 | 工程负责人及对应验收记录 | 平台不推断批准 |
 
-Publication generates byte-preserving Git attributes and rejects conflicting
-repository settings. Frozen evidence and controlled records retain their original
-bytes through commits and fresh checkouts.
+原始 CAD 缺项保持缺项。认证提交人不能代填结构负责人，行政身份不能补齐机械参数。具体身份与来源规则见[系统契约](contracts.md#identity)；工程表达见[机械规范](mechanical-handoff-spec.md)。
 
-The pipeline ID is `solidworks-to-urdf`; every run has a UUID. Source revisions,
-controlled records, tool code, dependencies, environment and file hashes bind the
-execution. Transport retries reconnect to the same UUID and frozen inputs. A
-terminal native failure or source correction requires a new run. Frozen evidence
-can be rebuilt on Linux without reopening CAD.
+## 领域组织
 
-Airflow stages the complete uploaded folder to the serialized Windows worker,
-which resolves the main assembly's references inside that staging, reads the raw
-native record and later captures the sealed engineering. Linux
-admits the record against the sealed selection, derives the prepared definition
-from the frozen selected bytes alone and returns only the generated text
-definition; no CAD is re-transferred. Windows then returns a sealed capture
-bundle, including the saved exporter declaration payload and its PID resolution
-rows when present; Linux checks its complete inventory, file hashes, selected
-assembly, run identity and native tool identity before use. Native completion is
-an intermediate state, not a verified model: an extracted declaration is
-evidence to reconcile, extraction warnings (uncovered occurrences, unusable
-ranges or drives) stay visible. Saved-pose mate restrictions do not override the
-declared kinematics. Administrative metadata absence is publication-readiness
-only ([quality](quality.md#scope-of-acceptance)); measurement and the raw record
-continue unchanged.
+系统是一个模块化应用，部署在一台 Linux 主机与一个串行 Windows 执行端。领域逻辑不依赖 Airflow、HTTP、页面或部署脚本。
 
-The whole uploaded native folder is staged provisionally, then the native
-engine itself resolves the main assembly's references; the pipeline seals the
-dependency closure only when every engine-reported binding lies inside the
-staged root and matches the uploaded index — or is an engine-materialized import
-admitted only through the sealed closure's owner/occurrence evidence matched to
-its staged source by native identity, never by temporary path or file name. A
-missing or outside-stage reference fails the run after resolution, before
-capture. This is a closure-admission rule over reported bindings, not an
-operating-system sandbox and not a pre-geometry read gate.
+| 领域 | 唯一职责 | 允许依赖 |
+|---|---|---|
+| 契约基础 | 类型、schema、路径、规范序列化、摘要、阶段和判据定义 | 标准库与纯基础算法 |
+| 原生适配 | 读取 SolidWorks、绑定实例与会话、封存原始观察 | 契约基础与 Windows API |
+| 结构推导 | 原始观察与规格快照转为采集计划 | 契约基础 |
+| 生成 | 完整证据转为规范化模型及 URDF/网格 | 契约基础与模型表示 |
+| 独立验证 | 从原始证据重建预期并检查实际产物 | 契约基础与独立验证算法 |
+| 发布 | 交付重验、Git 提交、PR 确认与幂等恢复 | 契约基础与验证入口 |
+| 编排 | 命令、运行、阶段、检查点、资源约束与适配器 | 领域入口 |
+| 展示 | 操作台、报告与预览 | 编排查询结果与封存文件 |
 
-Both hosts use the same tool source release and record their own runtime
-requirements. Windows checks SolidWorks and COM readiness. Linux checks MuJoCo
-and loads the actual generated URDF in isolation. Git credentials and model
-checkouts stay on Linux. Each stage's results, checks and execution host appear
-in the operator view; the final receipt binds both hosts' evidence. The Linux
-store supplies model previews, downloads and publication results. Previews are
-explicit about status: a verified delivery is served as verified, while a
-retained failed-verification checkpoint is served only as an explicitly
-unverified diagnostic preview that never asserts verification and never
-authorizes publication.
+推导与验证各自实现机械解释；验证不能导入推导、生成或编排模块，不能借用其模型、缓存、成功标志或期望值。可共享无业务推导的数学原语、格式解析器和契约常量；共享内容本身须有解析、解析解和反例测试。发布调用完整验证入口，禁止另写简化验收。
 
-Multi-assembly selection is an operator step
-([operations](operations.md#2-collect-and-save-a-controlled-version)): a single
-assembly is selected automatically; otherwise the choice is frozen with the
-handoff, reused by retries and reruns, and fixes only the entry point — every
-identity, dependency and physical check still applies to the native data.
+采集计划只描述要读取的原生对象、选择集合、基准和证据项目，不承担完整机器人模型的第二种表示。完整模型只有一个规范化表示，URDF 是其交付编码。报告与页面由同一结构化结果投影，展示操作没有工程执行副作用。
 
-## 3. How engineering is organized
+## 跨主机执行
 
-| Repository or system | Responsibility |
-|---|---|
-| Public `description-pipeline`, `main` | Current tool, specifications and neutral tests |
-| Private `description`, `feature/<hardware>` | Reviewed inputs and model deliveries for a hardware design |
-| Private `description`, `work/solidworks/<hardware>` | Generated candidate and its review PR |
-| Private `description`, `release/<hardware>/<release>` | Approved, frozen model delivery |
-| Mechanical PDM, Git LFS or controlled directory | Retrievable CAD revisions and engineering approvals |
-| Controlled component library | Versioned physical and drive specifications |
+1. Linux 完成上传、路径准入和不可变冻结，固定主装配、工具版本与提交请求。
+2. Windows 接收一次工程副本，在自有 SolidWorks 会话中解析主装配，读取依赖绑定和原始结构观察，封存发现结果并释放会话。
+3. Linux 核验原生结果，解析并封存受控规格，选择机械解释模式，生成绑定发现摘要的采集计划。
+4. Windows 复用同一工程副本，重新建立自有会话，核对计划及实例身份，重建并读取物理属性、轴线和网格，封存完整证据后释放会话。
+5. Linux 核验完整传输，生成模型，执行独立验证，并发布候选 PR。
 
-`main` contains the smallest complete current system. Intermediate implementations
-remain in Git history. Tool releases use ordinary version tags; each model records
-the tool identity used to build it.
+等待 Linux 推导时不占用 CAD 会话。原生执行器串行处理需要 CAD 的操作；传输、Linux 验证与报告不占用 CAD 资源。原生副本在发现与采集之间不得修改或重新上传。
 
-```text
-src/description_pipeline/
-  stage-contract.json    six steps, boundary check identifiers and responsibility references
-  stages.py              check observations and shared result rendering
-  steps.py               the six engineering handlers
-  solidworks.py          linear delivery/replay driver and output ownership
-  runtime.py             installed tool and dependency identity
-  sources/solidworks/    native reading and definition derivation
-  model/                 canonical mechanical and physical semantics
-  backends/              URDF generation
-  verification/          independent native, physical and artifact checks
-  repository/            verified Git and PR publication
-  orchestration/         queue, Airflow, authentication and result access
-  cli.py                 commissioning, diagnostics and frozen replay
-tests/                   neutral, analytic and adversarial fixtures
-deploy/                  platform installation and lifecycle
-docs/                    specifications and operating guides
-```
+依赖闭包依据 SolidWorks 实际解析的绑定判定。包外、缺失或无法与封存来源绑定的依赖拒绝进入采集。此检查发生在引擎解析之后，不构成操作系统文件访问沙箱；执行主机不向任务暴露无关工程目录或共享盘。
 
-`steps.py` owns `freeze_inputs`, `discover_structure`, `capture_evidence`,
-`generate_model`, `verify_delivery` and `publish_model`. Each handler owns its
-input checks, action and output checks. Native adapters, the independent verifier
-and Git publisher own their domain rules. Drivers sequence work and preserve
-receipts; the renderer does not execute engineering work.
+原生声明与配合推导是同一工作流的两种机械解释。声明存在且有效时采用声明；原生读取明确证明声明不存在时才采用配合推导。损坏、不可读或未判定的声明不能触发隐式回退。两种解释的工程边界见[机械规范](mechanical-handoff-spec.md#structure)。
 
-One Linux server hosts Airflow, its database and the operator page. One licensed
-Windows endpoint serializes native jobs in owned processes, separate from an
-engineer's CAD session. Native runtime readiness precedes CAD access; consumer
-readiness is checked on Linux. Native acquisitions
-bind their documented interfaces; each rebuild refreshes and verifies the owned
-document once before continuation. Lost bindings or unavailable capabilities
-stop execution, retain diagnostics and release owned resources.
+## 持久化与一致性
 
-Feishu API authentication supplies the operator's verified username. Run history
-and details show each run's original submitter by that name. The authenticated
-app, tenant and `open_id` remain the internal audit identity. The platform
-restricts tenant and workflow permissions and keeps credentials server-side.
+Linux 的平台数据库是请求、运行、检查点引用、显示元数据和发布意图的唯一可变权威；与 Airflow 元数据库使用同一 PostgreSQL 实例、不同 schema 和权限。Airflow 拥有任务调度状态，平台阶段收据是工程结果权威，页面只读取平台投影。任务成功不能替代工程收据；两者不一致时由编排对账，运行成功要求六阶段收据完整、发布已确认且调度不存在在途操作。
 
-Approved Feishu users may start new pipeline runs and view shared results. Each
-run records its initiator's stable authenticated identity and displays that
-operator's original Feishu username. The run's initiator and platform
-administrators may start a linked attempt from any step whose retained inputs
-pass validation. Earlier results are reused with their original evidence;
-the selected step and its successors execute again. The original run remains
-unchanged. Recoverable transport interruption has a separate continuation action
-within the same run. Changed CAD requires a new upload. Administrators retain
-broader platform administration.
+维护只读取准入与生命周期两个受控视图，在同一只读事务中取得一致快照。生命周期视图直接关联平台派发意图和真实 Airflow 任务，统一解释活动、终态、未决与未知；不保存第二份调度状态。绑定或源记录缺失仍保留未知对象，权威不可读则拒绝维护操作。调度重试保持同一任务绑定，不能改写已封存的工程终态。
 
-Maintainers configure storage roots and hardware routing once; operators choose
-one complete engineering folder on their own computer in the page, and the
-platform uploads it to its managed intake before freezing. Deployment settings
-and model facts remain outside tool code.
+大文件存放在专用文件存储中，以闭合清单与摘要封存。写入临时目录、核验并原子提交后，数据库事务才登记可消费的检查点。崩溃留下的未登记文件不能被下游采用；登记成功的检查点不得覆盖。定期对账恢复未完成调度与外部操作，不依赖网页持续轮询。
 
-## 4. How to operate
+新请求、关联运行与初始派发意图在一个短准入事务中登记，与关闭准入共用同一门锁。阶段状态与收据登记在同一事务中；重试使用相同幂等键，发布前登记外部操作意图。数据库事务不跨 HTTP、CAD 或 Git。跨系统一致性由摘要核验、幂等调用、条件写入和事后确认建立。
 
-1. Complete the native design and engineering checks under the
-   [mechanical specification](mechanical-handoff-spec.md).
-2. Save the delivery configuration and collect a controlled version with its dependencies.
-3. Sign in, choose the complete engineering folder in the page (Chrome or Edge)
-   and start the run; the browser uploads it to the platform before anything is
-   frozen. If the folder contains several assemblies, choose the main one when the
-   page asks.
-4. Inspect all six steps and their checks; correct engineering findings at their source.
-5. Review the verified URDF, evidence and PR, and complete engineering confirmations.
-6. Approve the intended uses and freeze the model release.
+## 资源与失败边界
 
-[Operations](operations.md) covers this workflow and recovery;
-[deployment](deployment.md) covers installation and commissioning. URDF consistency,
-simulation, training and hardware control have separate acceptance criteria.
+CAD 资源以端点级独占租约及可核验的进程身份管理。只能访问、关闭或终止自己创建且仍能证明身份的会话；未知会话导致拒绝执行。超时或租约过期只说明需要恢复，不能赋予终止权限。具体规则见[资源契约](contracts.md#resources)。
+
+Linux 不同运行使用独立工作目录。发布按仓库与硬件目标串行；远端变更用显式前置提交与条件更新防护，本地锁不能代替远端校验。
+
+网络错误不证明原生失败，也不触发新 CAD 作业。重连查询同一操作；原生终态失败保留诊断，工程重跑创建新运行并明确复用范围。验证失败阻断发布，发布失败保留已验证交付和所有可确认的外部结果。
+
+完整恢复规则由[系统契约](contracts.md#recovery)定义。[质量规范](quality.md)定义自动结论与用途边界，[操作指南](operations.md)定义工程师的处理流程，[部署指南](deployment.md)定义平台维护。

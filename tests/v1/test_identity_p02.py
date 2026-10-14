@@ -285,9 +285,13 @@ class SubmissionIdentityHelperTests(unittest.TestCase):
 
 
 class PublishedRevisionTimeoutTests(unittest.TestCase):
-    def test_fetch_timeout_reports_unavailable(self) -> None:
+    def test_fetch_timeout_reports_unknown_not_absent(self) -> None:
+        """A fetch timeout is an unknown state; it must not masquerade as 'no parent'."""
+
         with (
             patch.object(urdf_pr, "_validate_ref"),
             patch.object(urdf_pr.subprocess, "run", side_effect=subprocess.TimeoutExpired("git", 60)),
+            self.assertRaises(urdf_pr.PrError) as raised,
         ):
-            self.assertIsNone(urdf_pr.published_revision(Path("/srv/models/arm"), "m3.0"))
+            urdf_pr.published_revision(Path("/srv/models/arm"), "m3.0")
+        self.assertEqual(raised.exception.code, "published_revision_unknown")

@@ -2,12 +2,10 @@
   "type": "object",
   "properties": {
     "schema_version": {
-      "$comment": "Legacy description.scene/v1 and description.robot/v1 stay accepted for sealed deliveries; new documents use the solidworks-to-urdf.* ids.",
+      "$comment": "One current id per document kind; the retired description.* v1 ids are refused.",
       "enum": [
         "solidworks-to-urdf.scene/v1",
-        "solidworks-to-urdf.robot/v1",
-        "description.scene/v1",
-        "description.robot/v1"
+        "solidworks-to-urdf.robot/v1"
       ]
     },
     "name": {
@@ -537,153 +535,6 @@
         "additionalProperties": false
       }
     },
-    "actuators": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string"
-          },
-          "name": {
-            "type": "string",
-            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
-          },
-          "joint": {
-            "type": "string",
-            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
-          },
-          "type": {
-            "enum": [
-              "motor"
-            ]
-          },
-          "gear": {
-            "type": "number"
-          },
-          "control_range": {
-            "type": "array",
-            "items": {
-              "type": "number"
-            },
-            "minItems": 2,
-            "maxItems": 2
-          },
-          "provenance": {
-            "type": "object"
-          }
-        },
-        "required": [
-          "id",
-          "name",
-          "joint",
-          "type",
-          "gear",
-          "control_range",
-          "provenance"
-        ],
-        "additionalProperties": false
-      }
-    },
-    "sensors": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string"
-          },
-          "name": {
-            "type": "string",
-            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
-          },
-          "type": {
-            "enum": [
-              "gyro",
-              "accelerometer",
-              "framequat",
-              "framepos",
-              "force",
-              "torque"
-            ]
-          },
-          "frame": {
-            "type": "string",
-            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
-          },
-          "provenance": {
-            "type": "object"
-          }
-        },
-        "required": [
-          "id",
-          "name",
-          "type",
-          "frame",
-          "provenance"
-        ],
-        "additionalProperties": false
-      }
-    },
-    "mechanical_drives": {
-      "type": "object",
-      "additionalProperties": {
-        "oneOf": [
-          {
-            "type": "object",
-            "properties": {"kind": {"const": "passive"}},
-            "required": ["kind"],
-            "additionalProperties": false
-          },
-          {
-            "type": "object",
-            "properties": {
-              "kind": {"const": "active"},
-              "id": {"type": "string", "minLength": 1},
-              "stator": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1, "uniqueItems": true},
-              "rotor": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1, "uniqueItems": true}
-            },
-            "required": ["kind", "id", "stator", "rotor"],
-            "additionalProperties": false
-          }
-        ]
-      }
-    },
-    "constraints": {
-      "type": "array",
-      "items": {
-        "type": "object"
-      }
-    },
-    "control": {
-      "type": "object"
-    },
-    "contact_excludes": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "body1": {
-            "type": "string",
-            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
-          },
-          "body2": {
-            "type": "string",
-            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
-          },
-          "reason": {
-            "type": "string",
-            "minLength": 1
-          }
-        },
-        "required": [
-          "body1",
-          "body2",
-          "reason"
-        ],
-        "additionalProperties": false
-      }
-    },
     "provenance": {
       "type": "object"
     }
@@ -695,11 +546,6 @@
     "links",
     "joints",
     "frames",
-    "actuators",
-    "sensors",
-    "constraints",
-    "control",
-    "contact_excludes",
     "provenance"
   ],
   "additionalProperties": false,

@@ -73,9 +73,12 @@ def native_twin() -> dict:
     }
 
 
-def build_fixture_capture(root: Path, *, run_id: str, main_assembly: str = "cad/robot.SLDASM") -> dict:
+def build_fixture_capture(
+    root: Path, *, run_id: str, main_assembly: str = "cad/robot.SLDASM", runner=None
+) -> dict:
     """Run the real producer over the control fixture and return the sealed transfer."""
 
+    capture_entry = solidworks.capture if runner is None else runner
     root = Path(root)
     handoff_dir = root / "native"
     for name in ("cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT"):
@@ -141,10 +144,9 @@ def build_fixture_capture(root: Path, *, run_id: str, main_assembly: str = "cad/
     tool = native_twin()
     capture_output = root / "capture-delivery"
     with patch.object(solidworks, "_native_tool_record", return_value=tool):
-        capture = solidworks.run(
+        capture = capture_entry(
             prepared_package,
             capture_output,
-            stop_after="capture",
             backend=backend,
             run_id=run_id,
             handoff_sha256=handoff,

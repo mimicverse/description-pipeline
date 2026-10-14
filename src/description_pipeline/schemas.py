@@ -15,6 +15,38 @@ LINK_GROUP_MASS_SCHEMA = "solidworks-to-urdf.link-group-mass-properties/v1"
 MASS_CLOSURE_REPORT_SCHEMA = "solidworks-to-urdf.mass-closure-report/v1"
 CAD_REVISION_SCHEMA = "solidworks-to-urdf.cad-revision/v1"
 
+#: W1 machine schemas for records crossing the platform / endpoint boundary
+#: (frozen-interfaces-v1.1 IF-04/09/10/11/16).  One owner module; consumers
+#: import the constants instead of quoting the literal.
+HEALTH_SCHEMA = "solidworks-to-urdf.health/v1"
+RESOURCE_POLICY_SCHEMA = "solidworks-to-urdf.resource-policy/v1"
+CACHE_RELEASE_SCHEMA = "solidworks-to-urdf.cache-release/v1"
+CHECK_POLICY_SCHEMA = "solidworks-to-urdf.check-policy/v1"
+CACHE_RELEASE_RECEIPT_SCHEMA = "solidworks-to-urdf.cache-release-receipt/v1"
+CACHE_IMPORT_CONFIRMATION_SCHEMA = "solidworks-to-urdf.cache-import-confirmation/v1"
+CONFIG_SNAPSHOT_SCHEMA = "solidworks-to-urdf.config-snapshot/v1"
+INSTALL_RECORD_SCHEMA = "solidworks-to-urdf.install-record/v1"
+
+#: Delivery-tree records owned alongside the delivery boundary (IF-13):
+#: ``manifest.json`` (subject inventory, subject digest, contract/policy
+#: identity) and ``input/source.json`` (content identity, selection, metadata
+#: provenance).
+DELIVERY_MANIFEST_SCHEMA = "solidworks-to-urdf.delivery-manifest/v1"
+SOURCE_RECORD_SCHEMA = "solidworks-to-urdf.source-record/v1"
+
+#: Platform configuration schema rendered into the immutable config snapshot
+#: (deployment.md §配置权威; consumed by IF-11/IF-16).
+PLATFORM_CONFIG_SCHEMA = "solidworks-to-urdf.platform/v1"
+
+#: Check-strategy machine definition shipped with the release (contracts §系统契约:
+#: schema + stage definition + check policy).  Owner B; consumers reference this id
+#: instead of quoting an arbitrary policy string.
+CHECK_POLICY_SCHEMA = "solidworks-to-urdf.check-policy/v1"
+
+#: Qualification record machine schema (quality §警告与资格, IF-14): a policy
+#: fact plus its three-state conclusion and its evidence references.
+QUALIFICATION_SCHEMA = "solidworks-to-urdf.qualification/v1"
+
 
 def exporter_declaration_present(record: object) -> bool:
     """The shared producer/verifier predicate over the raw record's exporter block.

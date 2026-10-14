@@ -21,14 +21,70 @@ CONTRACT_FILE_SHA256 = file_digest(Path(__file__).with_name("stage-contract.json
 STAGE_IDS = tuple(stage["id"] for stage in CONTRACT["stages"])
 #: Discovery combines Windows observations with Linux derivation. Capture stays
 #: native; generation, verification and publication stay portable.
-HOST_IDS = ("native", "portable", "native+portable")
-HOST_BY_STAGE = {stage["id"]: stage.get("host") for stage in CONTRACT["stages"]}
-if set(HOST_BY_STAGE.values()) - set(HOST_IDS) or any(host is None for host in HOST_BY_STAGE.values()):
+HOST_IDS = ("linux", "windows")
+HOST_BY_STAGE = {stage["id"]: tuple(stage.get("hosts") or ()) for stage in CONTRACT["stages"]}
+if any(
+    not hosts or len(set(hosts)) != len(hosts) or set(hosts) - set(HOST_IDS)
+    for hosts in HOST_BY_STAGE.values()
+):
     raise PipelineError("Every engineering stage must declare its execution hosts")
+if any(
+    not isinstance(stage.get("host_text"), str)
+    or not stage["host_text"]
+    or not isinstance(stage.get("doc"), dict)
+    or not all(isinstance(stage["doc"].get(key), str) and stage["doc"][key] for key in ("input", "output"))
+    for stage in CONTRACT["stages"]
+):
+    raise PipelineError("Every engineering stage must declare its documented contract row")
 VIEW_SCHEMA = "solidworks-to-urdf.stages/v1"
-#: Stages the portable Linux host owns, derived from the contract's host field
-#: so the set never depends on stage order (ORC-02).
-PORTABLE_STAGES = tuple(stage for stage, host in HOST_BY_STAGE.items() if host == "portable")
+#: Stages only the portable Linux host owns, derived from the contract's hosts
+#: field so the set never depends on stage order (ORC-02).  Mixed Windows+Linux
+#: stages (discover, capture) are native-driven and stay out of this set.
+PORTABLE_STAGES = tuple(stage for stage, hosts in HOST_BY_STAGE.items() if hosts == ("linux",))
+
+#: Portable stages after the native boundary that produce the delivery and its
+#: rendered reports.  A receipt renders a report only when its executed scope
+#: declares at least one of these stages; the native freeze/discover/capture
+#: boundary receipts stay raw-evidence-only.
+DELIVERY_STAGES = ("generate", "verify", "publish")
+
+#: The stage states whose checkpoint counts as registered and immutable.  This
+#: mapping is the single owner of that fact: reuse paths query the authoritative
+#: store (which rebinds the sealed artifacts) and never re-derive the
+#: vocabulary themselves.
+CONFIRMED_STAGE_STATES = {
+    "freeze": frozenset({"frozen"}),
+    "discover": frozenset({"discovered"}),
+    "capture": frozenset({"native_complete"}),
+    "generate": frozenset({"generated"}),
+    "verify": frozenset({"verified"}),
+    "publish": frozenset({"published", "updated", "noop"}),
+}
+
+#: The expected ``passed`` flag of a confirmed receipt per stage.
+CONFIRMED_STAGE_PASSED = {
+    "freeze": False,
+    "discover": False,
+    "capture": False,
+    "generate": False,
+    "verify": True,
+    "publish": True,
+}
+
+#: The stage contract's declared evidence, per stage.  Entries containing a
+#: path separator are sealed paths a checkpoint tree must cover (receipt-field
+#: entries such as ``handoff_sha256`` are validated by the receipt rules).
+STAGE_EVIDENCE = {stage["id"]: tuple(stage.get("evidence") or ()) for stage in CONTRACT["stages"]}
+
+#: The canonical platform stage states (frozen contracts); the store validates
+#: every stage confirmation against this single vocabulary.
+STAGE_STATES = frozenset({"pending", "running", "completed", "failed", "cancelled", "unresolved", "blocked"})
+
+#: Business terminal stage states: once a stage record reaches one of these it
+#: is never overwritten again - a redo is a linked run, not a rewrite.
+#: ``unresolved`` is deliberately NOT terminal: it is a pending unknown that
+#: only an evidenced reconciliation of the same operation may confirm.
+TERMINAL_STAGE_STATES = frozenset({"completed", "failed", "cancelled", "blocked"})
 
 #: Fixed definition-independent required checks every quality report must carry;
 #: ``verification.solidworks_urdf.required_checks`` adds the dynamic per-object gates.
@@ -311,8 +367,8 @@ def activity_view(job) -> dict:
     return view
 
 
-def stage_host(stage_id: str) -> str:
-    """The declared execution hosts of one engineering stage."""
+def stage_host(stage_id: str) -> tuple[str, ...]:
+    """The declared execution hosts of one engineering stage (frozen role tokens)."""
 
     try:
         return HOST_BY_STAGE[stage_id]
@@ -510,16 +566,20 @@ def require_complete(view):
 
 
 def contract_markdown():
-    """Shared table for Airflow's DAG documentation and the architecture document."""
+    """The six-stage table rendered cell-for-cell from the machine contract.
+
+    The same definition the runtime consumes renders this table, so
+    ``docs/contracts.md`` is compared exactly against this output.
+    """
     rows = [
-        "| # | Stage | Input | Input QC | Output | Output QC |",
-        "|---|---|---|---|---|---|",
+        "| 阶段 | 执行 | 输入与输入检查 | 封存输出与输出检查 |",
+        "|---|---|---|---|",
     ]
-    for number, stage in enumerate(CONTRACT["stages"], 1):
-        cells = [str(number), f"`{stage['id']}` — {stage['name']}"]
-        for field in ("inputs", "input_qc", "outputs", "output_qc"):
-            cells.append("; ".join(item["label"] for item in stage[field]))
-        rows.append("| " + " | ".join(cells) + " |")
+    for stage in CONTRACT["stages"]:
+        rows.append(
+            f"| `{stage['id']}` {stage['name_zh']} | {stage['host_text']} | "
+            f"{stage['doc']['input']} | {stage['doc']['output']} |"
+        )
     return "\n".join(rows)
 
 
@@ -549,7 +609,7 @@ def compact_view(view):
         "stages": [
             {
                 "id": stage["id"],
-                "host": stage["host"],
+                "hosts": list(stage["hosts"]),
                 "state": stage["state"],
                 "checks_passed": stage["checks_passed"],
                 "checks_total": stage["checks_total"],

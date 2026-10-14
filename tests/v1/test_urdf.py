@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import struct
 import shutil
 import tempfile
@@ -49,6 +50,34 @@ def _staged_source(root: Path, raw: bytes, name: str = "geometry/big.stl") -> Pa
     shutil.copytree(fixture / "geometry", source / "geometry")
     (source / name).write_bytes(raw)
     return source
+
+
+class UrdfNumericContractTests(unittest.TestCase):
+    """R17 owner contract: the real writer emits io.format_number tokens on its artifacts."""
+
+    def test_real_artifact_uses_the_single_numeric_rule(self) -> None:
+        source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
+        scene = read_data(source / "scene.json")
+        joint = next(row for row in scene["joints"] if row["type"] == "revolute")
+        joint["xyz"] = [0.1, math.pi, 1e-12]
+        joint["rpy"] = [-0.0, 2.5, 0.0]
+        joint["limits"] = {"lower": 0.1, "upper": math.pi, "effort": 1e-12, "velocity": 2.5}
+        robot = Robot.from_dict(scene)
+        with tempfile.TemporaryDirectory() as temp:
+            output = generate_urdf(robot, source, Path(temp), name="numeric_contract")
+            node = next(row for row in ET.parse(output).getroot().findall("joint") if row.get("name") == joint["name"])
+            xyz = node.find("origin").attrib["xyz"].split()
+            rpy = node.find("origin").attrib["rpy"].split()
+            limits = node.find("limit").attrib
+        # Shortest binary64 round-trip tokens, produced by the one numeric owner.
+        self.assertEqual(xyz, ["0.1", "3.141592653589793", "1e-12"])
+        self.assertEqual(rpy, ["0", "2.5", "0"])  # -0.0 renders the unified zero
+        self.assertEqual(
+            limits,
+            {"lower": "0.1", "upper": "3.141592653589793", "effort": "1e-12", "velocity": "2.5"},
+        )
+        for token, value in zip(xyz + rpy, list(joint["xyz"]) + list(joint["rpy"]), strict=True):
+            self.assertEqual(float(token), value)
 
 
 class UrdfWriterTests(unittest.TestCase):

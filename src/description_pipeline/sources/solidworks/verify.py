@@ -632,14 +632,21 @@ def load_effective_instances(evidence_root) -> dict[str, dict]:
     Both the sheet-only leaf fallback and non-leaf (group) native overrides are
     recorded here; the raw math stays in ``mass_properties.json`` rows and
     ``scene_raw.notes.effective_instances``, and this record binds them with
-    verbatim measured values.
+    verbatim measured values.  The record lives in the delivery capture block
+    ``effective_instances``; the caller may pass the delivery root or its
+    ``evidence/`` directory.
     """
 
-    path = Path(evidence_root) / "raw" / "effective_instances.json"
-    if not path.is_file():
+    root = Path(evidence_root)
+    base = root.parent if root.name == "evidence" else root
+    capture_path = base / "evidence" / "capture.json"
+    if not capture_path.is_file():
+        raise PipelineError("the CAD capture has no capture record")
+    capture = read_json(capture_path)
+    payload = capture.get("effective_instances") if isinstance(capture, dict) else None
+    if not isinstance(payload, dict):
         raise PipelineError("the CAD capture has no effective instance record")
-    payload = read_json(path)
-    if not isinstance(payload, dict) or payload.get("schema_version") != EFFECTIVE_SCHEMA:
+    if payload.get("schema_version") != EFFECTIVE_SCHEMA:
         raise PipelineError("effective instance record schema changed")
     warnings = payload.get("warnings")
     if not isinstance(warnings, list):

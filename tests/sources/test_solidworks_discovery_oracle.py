@@ -1,9 +1,9 @@
 """Independent-oracle semantics: resealed adversarial records must fail on meaning.
 
 Each test builds one genuinely valid package with the generator, then mutates the bound native
-record and *reseals* it: the record's own digest and the native inventory digest in ``robot.yaml``
-are recomputed, so ``discovery.binding`` passes and the only possible failure is the semantic rule
-under test.  Nothing here touches SolidWorks; the verification module itself imports no generator.
+record and *reseals* it: the record's own digest and the delivery binding are recomputed, so
+``discovery.binding`` passes and the only possible failure is the semantic rule under test.
+Nothing here touches SolidWorks; the verification module itself imports no generator.
 """
 
 from __future__ import annotations
@@ -17,19 +17,18 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import yaml
-
 from description_pipeline.sources.solidworks.discovery import (
     CONTRACT,
     DISCOVERY_SCHEMA,
     DiscoverySettings,
     prepare_native_package,
 )
-from description_pipeline.verification.native_discovery import verify_discovery
+from description_pipeline.verification.native_discovery import rebuild_rigid_bodies, verify_discovery
 
+from . import support
 from .selection_support import sealed_selection
 
-RECORD_FILE = "discovery/native-discovery.json"
+RECORD_FILE = "evidence/discovery.json"
 
 IDENTITY = [
     1.0,
@@ -269,7 +268,7 @@ class OracleSemanticsTests(unittest.TestCase):
         self.serial = 0
 
     def baseline(self, record: dict | None = None) -> Path:
-        """One package produced by the generator from the analytic fixture (or a variant)."""
+        """One delivery produced by the generator from the analytic fixture (or a variant)."""
         self.serial += 1
         source = self.tmp / f"native{self.serial}"
         for name in ("cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT"):
@@ -295,11 +294,12 @@ class OracleSemanticsTests(unittest.TestCase):
             settings=DiscoverySettings(record_roots=(records,)),
         )
         self.assertTrue(result.passed, result.findings)
-        return output
+        delivery = self.tmp / f"delivery{self.serial}"
+        return support.native_discovery_delivery(delivery, output)
 
     @staticmethod
     def _native(package: Path, mutate) -> Path:
-        """Mutate the bound record and reseal both digests, keeping the binding check honest."""
+        """Mutate the bound record and reseal the manifest, keeping the binding check honest."""
         record_path = package / RECORD_FILE
         payload = json.loads(record_path.read_text(encoding="utf-8"))
         mutate(payload["raw"], payload)
@@ -313,20 +313,13 @@ class OracleSemanticsTests(unittest.TestCase):
 
     @staticmethod
     def _seal(package: Path, payload: dict | None = None) -> None:
-        """Refresh the two digests the oracle checks after any package edit."""
+        """Write the record (when given) and refresh the delivery manifest binding."""
         record_path = package / RECORD_FILE
-        if payload is None:
-            payload = json.loads(record_path.read_text(encoding="utf-8"))
-        robot_path = package / "robot.yaml"
-        robot = yaml.safe_load(robot_path.read_text(encoding="utf-8"))
-        robot["provenance"]["discovery_sha256"] = hashlib.sha256(record_path.read_bytes()).hexdigest()
-        robot["provenance"]["native_inventory_sha256"] = hashlib.sha256(
-            (
-                json.dumps(payload["native_files"], sort_keys=True, ensure_ascii=False, allow_nan=False, indent=2)
-                + "\n"
-            ).encode()
-        ).hexdigest()
-        robot_path.write_text(yaml.safe_dump(robot, sort_keys=False), encoding="utf-8")
+        if payload is not None:
+            record_path.write_text(
+                json.dumps(payload, sort_keys=True, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            )
+        support.seal_delivery(package)
 
     def check(self, package: Path) -> tuple[bool, list[dict], dict]:
         report = verify_discovery(package)
@@ -369,7 +362,7 @@ class OracleSemanticsTests(unittest.TestCase):
         self._native(package, strip_annotations)
         report = verify_discovery(package)
         self.assertFalse(report["passed"])
-        self.assertIn("discovery.joints", {item["code"] for item in report["errors"]})
+        self.assertTrue({"discovery.joints", "discovery.joint_rebuild"} & {item["code"] for item in report["errors"]})
 
     def test_absent_exporter_state_keeps_the_mate_suite_and_skips_declarations(self) -> None:
         """Only a proven absent exporter state means the capture has no declarations.
@@ -425,7 +418,7 @@ class OracleSemanticsTests(unittest.TestCase):
         package = self.baseline()
         self._native(package, lambda raw, payload: raw["mates"][1].update({"suppressed": True}))
         _passed, errors, checks = self.check(package)
-        # The graph check itself must pass; later checks may disagree with the stale robot.yaml.
+        # The graph check itself must pass; later checks may disagree with the stale carrier.
         self.assertTrue(checks["discovery.graph"]["passed"], checks["discovery.graph"])
         self.assertNotIn("discovery.graph", [error["code"] for error in errors])
 
@@ -588,7 +581,7 @@ class OracleSemanticsTests(unittest.TestCase):
         self.assertFalse(passed, errors)
         self.assertTrue(
             any(
-                error["code"] == "discovery.joints"
+                error["code"] in {"discovery.joints", "discovery.joint_rebuild"}
                 and "no cylindrical mate entity carries the joint shaft" in error["message"]
                 for error in errors
             ),
@@ -635,7 +628,11 @@ class OracleSemanticsTests(unittest.TestCase):
         self.assertFalse(passed, errors)
         self.assertTrue(
             any(
-                error["code"] == "discovery.bodies" and "owned uniquely by that body" in error["message"]
+                error["code"] == "discovery.body_rebuild"
+                and (
+                    "owned by one body" in error["message"]
+                    or "no CS_<link> coordinate system is owned" in error["message"]
+                )
                 for error in errors
             ),
             errors,
@@ -653,8 +650,7 @@ class OracleSemanticsTests(unittest.TestCase):
         self.assertFalse(passed, errors)
         self.assertTrue(
             any(
-                error["code"] in {"discovery.bodies", "discovery.joints", "discovery.frames"}
-                and "owned uniquely" in error["message"]
+                error["code"] == "discovery.body_rebuild" and "owned by one body" in error["message"]
                 for error in errors
             ),
             errors,
@@ -724,23 +720,16 @@ class OracleSemanticsTests(unittest.TestCase):
 
         package = self.baseline()
         self._native(package, mutate)
-        # Let robot.yaml agree with the mutated mate graph so only the container rule can fail.
-        robot_path = package / "robot.yaml"
-        robot = yaml.safe_load(robot_path.read_text(encoding="utf-8"))
-        for body in robot["source"]["bodies"]:
-            if body["name"] == "base_link":
-                body["components"] = ["base-1", "sub-1"]
-        robot_path.write_text(yaml.safe_dump(robot, sort_keys=False), encoding="utf-8")
-        self._seal(package)
         passed, errors, _checks = self.check(package)
-        self.assertFalse(passed, errors)
-        self.assertTrue(
-            any(
-                error["code"] == "discovery.bodies" and "assembly container as a material member" in error["message"]
-                for error in errors
-            ),
-            errors,
-        )
+        # The container rule lives in the rebuild: a rigidly attached container stays a
+        # connector and never becomes material of the body it is solved against, while the
+        # raw evidence itself is legal (the saved carrier is not a verification input).
+        self.assertTrue(passed, errors)
+        from description_pipeline.verification.native_discovery import rebuild_rigid_bodies
+
+        record = json.loads((package / RECORD_FILE).read_text(encoding="utf-8"))
+        base = next(body for body in rebuild_rigid_bodies(record) if body["name"] == "base_link")
+        self.assertEqual(base["components"], ["base-1"])
 
     def test_container_mass_must_not_duplicate_its_parts(self) -> None:
         def mutate(raw, payload):
@@ -843,7 +832,8 @@ class OracleSemanticsTests(unittest.TestCase):
         self.assertFalse(passed, errors)
         self.assertTrue(
             any(
-                error["code"] == "discovery.bodies" and "no datum owned uniquely by that body" in error["message"]
+                error["code"] == "discovery.body_rebuild"
+                and "no CS_<link> coordinate system is owned" in error["message"]
                 for error in errors
             ),
             errors,
@@ -856,11 +846,11 @@ class OracleSemanticsTests(unittest.TestCase):
         self.assertTrue(passed, errors)
 
     def test_foreign_same_named_link_datum_stays_an_interface(self) -> None:
-        """Only the exact (owner, name) pair a body uses as its frame is excluded.
+        """A foreign datum sharing a link name never vanishes silently.
 
-        With a name-only exclusion this foreign datum was silently dropped and the package
-        passed; the exact-pair rule surfaces it as an interface, which then blocks on the
-        body-name collision instead of vanishing.
+        The rebuild mirrors the producer's body-datum selection: with the foreign datum the
+        base cluster owns two CS_ datums and none is declared, so the ambiguity blocks
+        (the frame rebuild keeps the exact (owner, name) exclusion for the body's own datum).
         """
 
         def mutate(raw, payload):
@@ -872,8 +862,7 @@ class OracleSemanticsTests(unittest.TestCase):
         self.assertFalse(passed, errors)
         self.assertTrue(
             any(
-                error["code"] == "discovery.frames"
-                and ("collides with a body name" in error["message"] or "dropped or invented" in error["message"])
+                error["code"] == "discovery.body_rebuild" and "owned by one body" in error["message"]
                 for error in errors
             ),
             errors,
@@ -918,8 +907,8 @@ class OracleSemanticsTests(unittest.TestCase):
         self._native(package, strip_point_geometry)
         passed, errors, _checks = self.check(package)
         self.assertTrue(passed, errors)
-        document = yaml.safe_load((package / "robot.yaml").read_text(encoding="utf-8"))
-        bodies = [(body["name"], sorted(body["components"])) for body in document["source"]["bodies"]]
+        record = json.loads((package / RECORD_FILE).read_text(encoding="utf-8"))
+        bodies = [(body["name"], sorted(body["components"])) for body in rebuild_rigid_bodies(record)]
         self.assertEqual(bodies, [("base_link", ["arm-1", "base-1"])])
 
     def test_lock_with_a_missing_occurrence_frame_blocks(self) -> None:
@@ -977,7 +966,8 @@ class OracleSemanticsTests(unittest.TestCase):
         self.assertFalse(passed, errors)
         self.assertTrue(
             any(
-                error["code"] == "discovery.bodies" and "no datum owned uniquely by that body" in error["message"]
+                error["code"] == "discovery.body_rebuild"
+                and "no CS_<link> coordinate system is owned" in error["message"]
                 for error in errors
             ),
             errors,
@@ -1078,7 +1068,9 @@ class OracleSemanticsTests(unittest.TestCase):
             any(error["code"] == "discovery.frame_attachment" for error in errors),
             errors,
         )
-        self.assertTrue(any(error["code"] == "discovery.bodies" for error in errors), errors)
+        self.assertTrue(
+            any(error["code"] in {"discovery.bodies", "discovery.body_rebuild"} for error in errors), errors
+        )
 
     def test_assembly_frame_identity_requires_the_explicit_marker(self) -> None:
         from description_pipeline.verification.native_discovery import _frame_attachment, _frames, _rows_for
@@ -1232,11 +1224,12 @@ class OracleSemanticsTests(unittest.TestCase):
 
     def test_top_owned_interface_datum_binds_the_proven_base(self) -> None:
         def publish_frame(package: Path, parent: str) -> None:
-            robot_path = package / "robot.yaml"
-            robot = yaml.safe_load(robot_path.read_text(encoding="utf-8"))
-            robot["source"].setdefault("frames", [])
-            robot["source"]["frames"].append({"name": "tool", "parent": parent, "coordinate_system": "TCP_tool"})
-            robot_path.write_text(yaml.safe_dump(robot, sort_keys=False), encoding="utf-8")
+            # A planted legacy second-model carrier must never steer the rebuild.
+            record = json.loads((package / RECORD_FILE).read_text(encoding="utf-8"))
+            record.setdefault("derived", {}).setdefault("frames", []).append(
+                {"name": "tool", "parent": parent, "coordinate_system": "TCP_tool"}
+            )
+            OracleSemanticsTests._seal(package, record)
 
         def add_tool_datum(raw, payload):
             raw["datums"].append({"name": "TCP_tool", "owner": "", "array": copy.deepcopy(IDENTITY)})
@@ -1266,7 +1259,9 @@ class OracleSemanticsTests(unittest.TestCase):
         self.assertFalse(passed, errors)
         self.assertTrue(
             any(
-                error["code"] == "discovery.frames" and "not owned by any body" in error["message"] for error in errors
+                error["code"] in {"discovery.frames", "discovery.interface_frame_rebuild"}
+                and "not owned by any" in error["message"]
+                for error in errors
             ),
             errors,
         )
@@ -1287,7 +1282,9 @@ class OracleSemanticsTests(unittest.TestCase):
         )
         self.assertTrue(
             any(
-                error["code"] == "discovery.frames" and "not owned by any body" in error["message"] for error in errors
+                error["code"] in {"discovery.frames", "discovery.interface_frame_rebuild"}
+                and "not owned by any" in error["message"]
+                for error in errors
             ),
             errors,
         )

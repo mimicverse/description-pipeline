@@ -20,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookiejar import Cookie, CookieJar
 from pathlib import Path
 from socketserver import ThreadingMixIn
+from types import SimpleNamespace
 from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
@@ -36,12 +37,14 @@ from description_pipeline.orchestration.feishu_oauth import TRIGGERING_USER_NAME
 from description_pipeline.orchestration.portal import (
     AirflowApi,
     AirflowApiError,
+    DEFAULT_DAG_ID,
     PortalApp,
     PortalConfig,
     load_portal_config,
 )
 from description_pipeline.orchestration.uploads import MAX_FILE_BYTES, MAX_FILES, MAX_TOTAL_BYTES
 from description_pipeline.io import PipelineError
+from description_pipeline.platform.store import AdmissionClosedError, PlatformStoreError
 from description_pipeline.stages import CONTRACT
 
 from .protocol_support import protocol_events
@@ -620,11 +623,39 @@ class PreviewStore:
         return merged
 
 
+class FakePlatformStore:
+    """The portal-side admission surface: open by default, recording every admit."""
+
+    def __init__(self) -> None:
+        self.state = "open"
+        self.read_error: Exception | None = None
+        self.admit_error: Exception | None = None
+        self.admits: list[dict] = []
+        self.displays: dict[str, object] = {}
+
+    def admission(self):
+        if self.read_error is not None:
+            raise self.read_error
+        return SimpleNamespace(state=self.state)
+
+    def admit_run(self, **kwargs) -> None:
+        if self.admit_error is not None:
+            raise self.admit_error
+        self.admits.append(kwargs)
+
+    def run_display(self, run_id: str):
+        return self.displays.get(run_id)
+
+    def run_displays(self) -> dict:
+        return dict(self.displays)
+
+
 class PortalTests(unittest.TestCase):
     def setUp(self) -> None:
         self.airflow = MockAirflow()
         self.airflow.__enter__()
         self.addCleanup(self.airflow.__exit__, None, None, None)
+        self.platform = FakePlatformStore()
         self.upload_root = Path(tempfile.mkdtemp(prefix="portal-upload-"))
         self.addCleanup(shutil.rmtree, self.upload_root, ignore_errors=True)
         self.endpoint_server = FakeEndpoint()
@@ -644,6 +675,7 @@ class PortalTests(unittest.TestCase):
             static_dir=self.static_dir,
             upload_root=self.upload_root,
             pipeline_store_root=self.store_root,
+            platform_store=self.platform,
             pipeline_targets=TEST_TARGETS,
         )
         self.server = make_server(
@@ -670,6 +702,7 @@ class PortalTests(unittest.TestCase):
             static_dir=self.static_dir,
             upload_root=self.upload_root,
             pipeline_store_root=self.store_root,
+            platform_store=self.platform,
             pipeline_targets=TEST_TARGETS,
         )
         server = make_server(
@@ -996,6 +1029,72 @@ class PortalTests(unittest.TestCase):
         staging = self.upload_root / ".staging"
         self.assertTrue(not staging.exists() or not any(staging.iterdir()))
 
+    def test_a_closed_admission_gate_refuses_before_uploading_or_triggering(self) -> None:
+        self.client.login()
+        self.platform.state = "closed"
+        files = [("model.SLDASM", b"<assembly/>")]
+        status, _, body = self.client.request_raw(
+            "POST", "/api/runs", _upload_body(files=files), "multipart/form-data; boundary=portal-boundary"
+        )
+        self.assertEqual(status, 503, body)
+        self.assertIn("准入窗口已关闭", json.loads(body)["error"])
+        self.assertEqual(self.platform.admits, [])
+        self.assertEqual(self.airflow.trigger_payloads, [])
+        self.assertEqual([entry.name for entry in self.upload_root.iterdir() if entry.name != ".staging"], [])
+
+    def test_the_submission_admits_the_run_with_its_dispatch_intent(self) -> None:
+        self.client.login()
+        files = [("model.SLDASM", b"<assembly/>"), ("parts/p1.SLDPRT", b"<part1/>")]
+        status, _, body = self.client.request_raw(
+            "POST",
+            "/api/runs",
+            _upload_body(files=files, fields=list(UPLOAD_CHOICES)),
+            "multipart/form-data; boundary=portal-boundary",
+        )
+        self.assertEqual(status, 201, body)
+        dag_run_id = json.loads(body)["dag_run_id"]
+        self.assertEqual(len(self.platform.admits), 1)
+        admit = self.platform.admits[0]
+        self.assertEqual(admit["request_id"], f"portal-{dag_run_id}")
+        self.assertEqual(admit["run_id"], dag_run_id)
+        self.assertEqual(admit["principal"], FEISHU_PRINCIPAL)
+        self.assertEqual(admit["main_assembly"], "model.SLDASM")
+        dispatch = admit["dispatch"]
+        self.assertEqual(dispatch["stage"], "capture")
+        self.assertEqual(dispatch["operation_key"], f"portal-{dag_run_id}/capture:0")
+        self.assertEqual(dispatch["dag_run_id"], dag_run_id)
+        self.assertEqual(dispatch["dag_id"], DEFAULT_DAG_ID)
+        self.assertRegex(dispatch["params_digest"], r"^[0-9a-f]{64}$")
+        self.assertEqual(len(self.airflow.trigger_payloads), 1)
+        self.assertEqual(self.airflow.trigger_payloads[0]["dag_run_id"], dag_run_id)
+
+    def test_an_admission_that_closes_after_upload_removes_the_intake(self) -> None:
+        self.client.login()
+        self.platform.admit_error = AdmissionClosedError("the gate closed mid-upload")
+        files = [("model.SLDASM", b"<assembly/>")]
+        status, _, body = self.client.request_raw(
+            "POST",
+            "/api/runs",
+            _upload_body(files=files, fields=list(UPLOAD_CHOICES)),
+            "multipart/form-data; boundary=portal-boundary",
+        )
+        self.assertEqual(status, 503, body)
+        self.assertIn("未接纳", json.loads(body)["error"])
+        self.assertEqual(self.platform.admits, [])
+        self.assertEqual(self.airflow.trigger_payloads, [])
+        self.assertEqual([entry.name for entry in self.upload_root.iterdir() if entry.name != ".staging"], [])
+
+    def test_an_unavailable_platform_refuses_the_submission(self) -> None:
+        self.client.login()
+        self.platform.read_error = PlatformStoreError("PLATFORM_SERVICE_DSN is not configured")
+        files = [("model.SLDASM", b"<assembly/>")]
+        status, _, body = self.client.request_raw(
+            "POST", "/api/runs", _upload_body(files=files), "multipart/form-data; boundary=portal-boundary"
+        )
+        self.assertEqual(status, 503, body)
+        self.assertIn("暂不可用", json.loads(body)["error"])
+        self.assertEqual(self.airflow.trigger_payloads, [])
+        self.assertEqual([entry.name for entry in self.upload_root.iterdir() if entry.name != ".staging"], [])
     def test_submission_requires_a_configured_target_and_a_change_summary(self) -> None:
         self.client.login()
         cases = {

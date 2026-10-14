@@ -4,10 +4,9 @@ The mechanical team supplies one immutable SolidWorks engineering directory.
 This module reads the *raw* native record produced by an owned CAD session
 (:meth:`CadBackend.discover_native`), derives rigid memberships, joints, axes,
 limits and physical facts with explicit provenance, and writes an internal
-prepared package: a generated ``robot.yaml`` (marked with a ``provenance``
-block), a generated ``cad-revision.json``, the raw discovery record and the
-findings list.  The engineering files are copied through unmodified at the
-same relative paths.
+prepared package: its generated content identity ``source.json``, the raw
+discovery record and the findings list.  The engineering files are copied
+through unmodified at the same relative paths.
 
 Nothing here invents a mechanical fact.  Facts that cannot be derived from the
 native record, a versioned controlled record, or a scalar CAD annotation become
@@ -68,20 +67,17 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from collections.abc import Mapping, Sequence
 
-import yaml
-
-from ...io import PipelineError, confined, digest, inventory, parse_data
+from ...io import PipelineError, confined, digest, inventory, parse_data, read_data
 from .jsonio import write_json
 from .errors import CadError
 from .exporter import ExporterDeclarationError, decode_exporter_v14
-from .revision import package_inventory, seal_revision
-from ...schemas import INPUT_SCHEMA, exporter_declaration_present
+from .revision import package_inventory
+from ...schemas import SOURCE_RECORD_SCHEMA, exporter_declaration_present
 
 DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v1"
 PREPARED_SCHEMA = "solidworks-to-urdf.prepared-package/v1"
 FINDING_SCHEMA = "solidworks-to-urdf.discovery-finding/v1"
-ROBOT_FILE = "robot.yaml"
-REVISION_FILE = "cad-revision.json"
+SOURCE_FILE = "source.json"
 DISCOVERY_FILE = "discovery/native-discovery.json"
 FINDINGS_FILE = "discovery/findings.json"
 IDENTITY_FILE = "discovery/identity-resolution.json"
@@ -178,10 +174,8 @@ class PreparedPackage:
     package: Path
     handoff_sha256: str  # original frozen native input inventory
     prepared_sha256: str  # generated package identity
-    revision_sha256: str
     hardware_id: str | None
     revision: str | None
-    source: dict | None
     discovery_path: Path
     discovery_sha256: str
     findings: tuple[dict, ...]
@@ -3849,11 +3843,6 @@ def _copy_tree(source: Path, output: Path, files: Mapping[str, str]) -> None:
         shutil.copyfile(original, target)
 
 
-def _write_yaml(path: Path, document: dict) -> None:
-    text = yaml.safe_dump(document, sort_keys=False, allow_unicode=True, default_flow_style=False)
-    path.write_text(text, encoding="utf-8", newline="\n")
-
-
 def _guarded_sink(on_activity):
     """The observer guard: activity callbacks can never alter or fail the capture."""
 
@@ -3878,7 +3867,7 @@ def _check_derivation_paths(frozen_source: Path, output: Path) -> None:
 
 def _check_authored_files(native_files: Mapping[str, str]) -> None:
     authored = sorted(
-        name for name in native_files if name in {ROBOT_FILE, REVISION_FILE} or name.startswith("discovery/")
+        name for name in native_files if name == SOURCE_FILE or name.startswith("discovery/")
     )
     if authored:
         raise PipelineError(f"frozen_source already contains authored package files: {authored[:5]}")
@@ -4139,108 +4128,11 @@ def derive_native_package(
             },
         )
     checks, budget_entry = _budgets(record, settings, findings)
-    exporter_mode = exporter_declaration_present(record)
-    if exporter_mode:
-        declaration = _exporter_declaration(record, identity, findings)
-        bodies, joints, frames, derived_names = [], [], [], {}
-        if declaration is not None:
-            bodies, clusters = _exporter_memberships(record, declaration, findings)
-            joints = _exporter_joint_facts(record, declaration, bodies, findings)
-            root = next(body for body in bodies if body["name"] == declaration["root"])
-            if root["name"] != "base_link":
-                findings.append(
-                    _finding(
-                        "discovery.root_name_missing",
-                        f"body:{root['name']}",
-                        "the declared root link must be named base_link",
-                    )
-                )
-            _exporter_constraint_checks(declaration, clusters, joints, findings)
-            frames = _interface_frames(record, clusters, bodies, root, findings)
-            for body in bodies:
-                if settings.frozen_names.get(body["identity"], body["name"]) != body["name"]:
-                    findings.append(
-                        _finding(
-                            "discovery.name_frozen_mismatch",
-                            f"body:{body['name']}",
-                            "saved declaration differs from the frozen published name",
-                        )
-                    )
-    else:
-        clusters = _clusters(record, findings)
-        bodies, by_root = _body_records(record, clusters, settings, findings)
-        joints = _joint_facts(record, clusters, settings, findings)
-        root = _root_body(record, clusters, bodies, NAMESPACE, findings)
-        if root is not None:
-            if root["name"] != "base_link":
-                findings.append(
-                    _finding(
-                        "discovery.root_name_missing",
-                        f"body:{root['root']}",
-                        "the fixed body must own a CS_base_link coordinate system",
-                        {"name": root["name"], "datum": root["datum"]},
-                    )
-                )
-        else:
-            bodies.append(
-                {
-                    "root": "__unresolved__",
-                    "components": [],
-                    "owners": [],
-                    "name": "base_link",
-                    "source": "placeholder",
-                    "identity": "assembly",
-                    "datum": "",
-                }
-            )
-            by_root = {item["root"]: item for item in bodies}
-        base = _attached_base(clusters, bodies, root)
-        _frame_attachment_findings(record, clusters, bodies, findings)
-        _orient(joints, bodies, by_root, root, findings)
-        derived_names = _joint_names(joints, settings, findings)
-        for body in bodies:
-            if body["source"] == "frozen":
-                derived_names[body["identity"]] = body["name"]
-        seen_names: dict[str, str] = {}
-        for body in bodies:
-            if body["name"] in seen_names:
-                findings.append(
-                    _finding(
-                        "discovery.body_name_duplicate",
-                        f"body:{body['root']}",
-                        "two rigid bodies resolve to the same name",
-                        {"name": body["name"], "other": seen_names[body["name"]]},
-                    )
-                )
-            else:
-                seen_names[body["name"]] = body["root"]
-        by_name = {body["name"]: body for body in bodies}
-        _frame_checks(joints, by_name, record, base, findings)
-        frames = _interface_frames(record, clusters, bodies, base, findings)
-        _jcs_check(record, joints, by_name, base, findings)
+    _bodies, joints, _frames, derived_names = _derive_carriers(record, identity, settings, findings)
     blocking = [item for item in findings if item["blocking"]]
     output.mkdir(parents=True, exist_ok=True)
     discovery_path = output / DISCOVERY_FILE
     discovery_path.parent.mkdir(parents=True, exist_ok=True)
-    derived = {
-        "bodies": [
-            {"name": body["name"], "components": body["components"], "frame": {"coordinate_system": body["datum"]}}
-            for body in sorted(bodies, key=lambda item: item["name"])
-        ],
-        "joints": [
-            {
-                "mate": joint["mate"],
-                "name": joint.get("name"),
-                "type": joint["type"],
-                "parent": joint.get("parent"),
-                "child": joint.get("child"),
-                "axis": joint["axis"],
-                "limits": joint["limits"],
-            }
-            for joint in joints
-        ],
-        "frames": frames,
-    }
     payload = {
         "schema_version": DISCOVERY_SCHEMA,
         "contract": CONTRACT,
@@ -4260,7 +4152,6 @@ def derive_native_package(
         "records": [],
         "frozen_names": derived_names,
         "raw": record,
-        "derived": derived,
         "findings": findings,
     }
     write_json(discovery_path, payload)
@@ -4273,10 +4164,8 @@ def derive_native_package(
             package=output,
             handoff_sha256=handoff_sha256,
             prepared_sha256=digest(inventory(output)),
-            revision_sha256="",
             hardware_id=identity["hardware_id"],
             revision=identity["revision"],
-            source=None,
             discovery_path=discovery_path,
             discovery_sha256=discovery_sha256,
             findings=tuple(findings),
@@ -4303,43 +4192,20 @@ def derive_native_package(
             }
         write_json(discovery_path, payload)
         discovery_sha256 = hashlib.sha256(discovery_path.read_bytes()).hexdigest()
-    document = _robot_document(
-        identity, bodies, joints, record, settings, records, checks, frames, run_id, discovery_sha256, handoff_sha256
-    )
-    _write_yaml(output / ROBOT_FILE, document)
-    # A partial administrative identity cannot seal a revision manifest.  The
-    # prepared package still proceeds so measurement and inspection continue;
-    # publication readiness stays deferred with the nonblocking findings above.
-    sealed_identity = all(
-        identity[field] is not None for field in ("hardware_id", "revision", "owner", "change_summary", "control")
-    )
-    if sealed_identity:
-        seal_revision(
-            output,
-            hardware_id=identity["hardware_id"],
-            revision=identity["revision"],
-            owner=identity["owner"],
-            system=identity["control"]["system"],
-            reference=identity["control"]["reference"],
-            summary=identity["change_summary"],
-            parent_revision=identity["parent_revision"],
-        )
-        revision_sha256 = hashlib.sha256((output / REVISION_FILE).read_bytes()).hexdigest()
-    else:
-        revision_sha256 = ""
-    from .input import load_package
-
-    loaded = load_package(output)
+    # A partial content identity cannot name the frozen revision.  The prepared
+    # package still proceeds so measurement and inspection continue; publication
+    # readiness stays deferred with the nonblocking findings above.
+    source_record = _source_record(identity, identity_sources, handoff_sha256, records)
+    if source_record is not None:
+        write_json(output / SOURCE_FILE, source_record)
     return PreparedPackage(
         schema_version=PREPARED_SCHEMA,
         run_id=run_id,
         package=output,
         handoff_sha256=handoff_sha256,
         prepared_sha256=digest(inventory(output)),
-        revision_sha256=revision_sha256,
         hardware_id=identity["hardware_id"],
         revision=identity["revision"],
-        source=loaded,
         discovery_path=discovery_path,
         discovery_sha256=discovery_sha256,
         findings=tuple(findings),
@@ -4347,56 +4213,151 @@ def derive_native_package(
     )
 
 
-def _robot_document(
-    identity: dict,
-    bodies: list[dict],
-    joints: list[dict],
-    record: dict,
-    settings: DiscoverySettings,
-    records: list[dict],
-    checks: dict | None,
-    frames: list[dict],
-    run_id: str,
-    discovery_sha256: str,
-    handoff_sha256: str,
-) -> dict:
+def _derive_carriers(
+    record: dict, identity: dict, settings: DiscoverySettings, findings: list[dict]
+) -> tuple[list, list, list, dict]:
+    """Derive the in-memory source carriers: bodies, joints, frames and frozen names.
+
+    Shared by the discover stage and the capture-side definition rebuild; the
+    carriers are always derived from the raw record alone, never read from a
+    sealed definition.
+    """
+
+    if exporter_declaration_present(record):
+        declaration = _exporter_declaration(record, identity, findings)
+        bodies, joints, derived_names = [], [], {}
+        frames: list = []
+        if declaration is not None:
+            bodies, clusters = _exporter_memberships(record, declaration, findings)
+            joints = _exporter_joint_facts(record, declaration, bodies, findings)
+            root = next(body for body in bodies if body["name"] == declaration["root"])
+            if root["name"] != "base_link":
+                findings.append(
+                    _finding(
+                        "discovery.root_name_missing",
+                        f"body:{root['name']}",
+                        "the declared root link must be named base_link",
+                    )
+                )
+            _exporter_constraint_checks(declaration, clusters, joints, findings)
+            frames = _interface_frames(record, clusters, bodies, root, findings)
+            for body in bodies:
+                if settings.frozen_names.get(body["identity"], body["name"]) != body["name"]:
+                    findings.append(
+                        _finding(
+                            "discovery.name_frozen_mismatch",
+                            f"body:{body['name']}",
+                            "saved declaration differs from the frozen published name",
+                        )
+                    )
+        return bodies, joints, frames, derived_names
+    clusters = _clusters(record, findings)
+    bodies, by_root = _body_records(record, clusters, settings, findings)
+    joints = _joint_facts(record, clusters, settings, findings)
+    root = _root_body(record, clusters, bodies, NAMESPACE, findings)
+    if root is not None:
+        if root["name"] != "base_link":
+            findings.append(
+                _finding(
+                    "discovery.root_name_missing",
+                    f"body:{root['root']}",
+                    "the fixed body must own a CS_base_link coordinate system",
+                    {"name": root["name"], "datum": root["datum"]},
+                )
+            )
+    else:
+        bodies.append(
+            {
+                "root": "__unresolved__",
+                "components": [],
+                "owners": [],
+                "name": "base_link",
+                "source": "placeholder",
+                "identity": "assembly",
+                "datum": "",
+            }
+        )
+        by_root = {item["root"]: item for item in bodies}
+    base = _attached_base(clusters, bodies, root)
+    _frame_attachment_findings(record, clusters, bodies, findings)
+    _orient(joints, bodies, by_root, root, findings)
+    derived_names = _joint_names(joints, settings, findings)
+    for body in bodies:
+        if body["source"] == "frozen":
+            derived_names[body["identity"]] = body["name"]
+    seen_names: dict[str, str] = {}
+    for body in bodies:
+        if body["name"] in seen_names:
+            findings.append(
+                _finding(
+                    "discovery.body_name_duplicate",
+                    f"body:{body['root']}",
+                    "two rigid bodies resolve to the same name",
+                    {"name": body["name"], "other": seen_names[body["name"]]},
+                )
+            )
+        else:
+            seen_names[body["name"]] = body["root"]
     by_name = {body["name"]: body for body in bodies}
-    source: dict[str, Any] = {
-        "provider": "solidworks",
-        "robot_name": identity.get("robot_name") or identity.get("robot_name_technical") or "robot",
-        "assembly": identity["main_assembly"],
-        "configuration": identity["delivery_configuration"],
-        "bodies": [
-            {
-                "id": body["name"],
-                "name": body["name"],
-                "components": body["components"],
-                "frame": {"coordinate_system": body["datum"]},
-            }
-            for body in sorted(bodies, key=lambda item: item["name"])
-            if body["components"]
-        ],
-        "joints": [],
-        "frames": [],
-        "material_source": "cad",
-    }
-    if frames:
-        source["frames"] = [
-            {
-                "id": frame["id"],
-                "name": frame["name"],
-                "parent": frame["parent"],
-                "coordinate_system": frame["coordinate_system"],
-            }
-            for frame in sorted(frames, key=lambda item: item["name"])
-        ]
+    _frame_checks(joints, by_name, record, base, findings)
+    frames = _interface_frames(record, clusters, bodies, base, findings)
+    _jcs_check(record, joints, by_name, base, findings)
+    return bodies, joints, frames, derived_names
+
+
+def source_definition(package: Path) -> dict:
+    """Rebuild one prepared package's in-memory source definition (the freeze/scene ``source``).
+
+    The frozen raw record, the recorded derivation settings and the embedded
+    controlled records are the only inputs: nothing is read from a sealed
+    definition and nothing is written.  A rebuild whose findings block would
+    have blocked discovery, so the same rules failing here refuse the capture.
+    """
+
+    import tempfile
+
+    package = Path(package)
+    payload = read_data(package / DISCOVERY_FILE)
+    raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
+    identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
+    derivation = payload.get("derivation") if isinstance(payload.get("derivation"), dict) else {}
+    records = [item for item in payload.get("records") or [] if isinstance(item, dict)]
+    with tempfile.TemporaryDirectory(prefix="source-definition-") as temporary:
+        root = Path(temporary)
+        for entry in records:
+            relative = str(entry.get("file") or "").replace("\\", "/")
+            if not relative:
+                continue
+            target = confined(root, relative, exists=False)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(confined(package, str(entry.get("package_file") or "")), target)
+        settings = DiscoverySettings(
+            record_roots=(root,),
+            frozen_names=dict(derivation.get("frozen_names") or {}),
+            main_assembly=derivation.get("main_assembly") or None,
+        )
+        findings: list[dict] = []
+        view = {
+            "main_assembly": identity.get("main_assembly") or derivation.get("main_assembly"),
+            "delivery_configuration": identity.get("delivery_configuration") or derivation.get("configuration"),
+        }
+        checks, _budget_entry = _budgets(raw, settings, findings)
+        bodies, joints, frames, _names = _derive_carriers(raw, view, settings, findings)
+    blocking = [item for item in findings if item.get("blocking")]
+    if blocking:
+        raise PipelineError(
+            f"the frozen discovery carriers cannot be rebuilt: {[item['code'] for item in blocking][:5]}"
+        )
+    discovery_sha256 = hashlib.sha256((package / DISCOVERY_FILE).read_bytes()).hexdigest()
+    by_name = {body["name"]: body for body in bodies}
+    joints_out: list[dict] = []
     for joint in sorted(joints, key=lambda item: item.get("name") or ""):
         if "parent" not in joint or "name" not in joint:
             continue
         body = by_name[joint["child"]]
-        datum = _body_datum(record, body)
+        datum = _body_datum(raw, body)
         if joint["type"] == "fixed":
-            source["joints"].append(
+            joints_out.append(
                 {
                     "id": joint["name"],
                     "name": joint["name"],
@@ -4410,11 +4371,9 @@ def _robot_document(
         if axis is None:
             raise PipelineError(f"joint {joint['name']!r} has no usable child frame")
         if joint.get("axis", {}).get("source") == "exporter":
-            # The authored declaration is the source claim once the native
-            # geometry and its sign were proved consistent above; emitting the
-            # reprojected native line here would add float noise that the
-            # independent declaration check rejects.  The native line stays
-            # independently verified from the reference-axis evidence.
+            # The authored declaration is the source claim once the native geometry
+            # and its sign were proved; the reprojected native line would only add
+            # float noise the independent declaration check rejects.
             declared_axis = joint.get("declared_axis")
             if (
                 not isinstance(declared_axis, (list, tuple))
@@ -4444,7 +4403,7 @@ def _robot_document(
             entry["limit_evidence"] = {
                 "file": DISCOVERY_FILE,
                 "sha256": discovery_sha256,
-                "anchor": record["exporter"]["raw_xml_sha256"],
+                "anchor": raw["exporter"]["raw_xml_sha256"],
             }
         elif joint["type"] == "continuous":
             entry["limits"] = {
@@ -4474,20 +4433,104 @@ def _robot_document(
                     "sha256": embedded["sha256"],
                     "anchor": embedded["anchor"],
                 }
-        source["joints"].append(entry)
-    document: dict[str, Any] = {
-        "schema_version": INPUT_SCHEMA,
-        "hardware_id": identity["hardware_id"],
-        "source": source,
-        "provenance": {
-            "generator": GENERATOR,
-            "generator_version": GENERATOR_VERSION,
-            "contract": CONTRACT,
-            "discovery_sha256": discovery_sha256,
-            "native_inventory_sha256": handoff_sha256,
-            "run_id": run_id,
-        },
+        joints_out.append(entry)
+    coordinate_systems = sorted(
+        {str(body["datum"]) for body in bodies if body.get("datum")}
+        | {str(frame["coordinate_system"]) for frame in frames if frame.get("coordinate_system")}
+    )
+    source: dict[str, Any] = {
+        "provider": "solidworks",
+        "robot_name": identity.get("robot_name") or identity.get("robot_name_technical") or "robot",
+        "assembly": str(confined(package.resolve(), str(view["main_assembly"]))),
+        "configuration": view["delivery_configuration"],
+        "allowed_roots": [str(package.resolve())],
+        "document_suffixes": [".sldasm", ".sldprt"],
+        "geometry": {"enabled": True, "format": "stl_binary"},
+        "coordinate_systems": coordinate_systems,
+        "bodies": [
+            {
+                "id": body["name"],
+                "name": body["name"],
+                "components": body["components"],
+                "frame": {"coordinate_system": body["datum"]},
+            }
+            for body in sorted(bodies, key=lambda item: item["name"])
+            if body["components"]
+        ],
+        "joints": joints_out,
+        "frames": [
+            {
+                "id": frame["id"],
+                "name": frame["name"],
+                "parent": frame["parent"],
+                "coordinate_system": frame["coordinate_system"],
+            }
+            for frame in sorted(frames, key=lambda item: item["name"])
+        ],
+        "material_source": "cad",
+        "documented_masses": {},
+        "mass_evidence": None,
+        "geometry_exclusions": {},
+        "expected_mass_kg": (checks or {}).get("expected_mass_kg"),
+        "expected_extent_m": (checks or {}).get("expected_extent_m"),
+        "require_saved": True,
     }
-    if checks:
-        document["checks"] = checks
-    return document
+    return source
+
+
+def _source_record(identity: dict, identity_sources: dict, handoff_sha256: str, records: list[dict]) -> dict | None:
+    """The archived content identity (IF-06) that replaces robot.yaml and cad-revision.json.
+
+    Written only once the content identity is nameable - hardware, main assembly
+    and configuration; anything less keeps the package unnamed and publication
+    deferred with the findings already recorded above.
+    """
+
+    from ...interface_records import validate_source_record
+
+    hardware = identity.get("hardware_id")
+    assembly = identity.get("main_assembly")
+    configuration = identity.get("delivery_configuration")
+    if not (_text(hardware) and _text(assembly) and _text(configuration)):
+        return None
+    references: dict[str, str] = {}
+    for entry in records:
+        reference = str(entry.get("reference") or "")
+        checksum = str(entry.get("sha256") or "")
+        if reference and checksum:
+            references[reference] = checksum
+    content = {
+        "kind": "source-revision",
+        "handoff_digest": handoff_sha256,
+        "main_assembly": str(assembly),
+        "configuration": str(configuration),
+        "hardware_id": str(hardware),
+        "records": [
+            {"reference": reference, "file_sha256": references[reference]} for reference in sorted(references)
+        ],
+    }
+    return validate_source_record(
+        {
+            "schema_version": SOURCE_RECORD_SCHEMA,
+            "source_revision_id": digest(content),
+            "identity": content,
+            "selection": {
+                "main_assembly": content["main_assembly"],
+                "configuration": content["configuration"],
+                "hardware_id": content["hardware_id"],
+                "hardware_source": "platform-config"
+                if identity_sources.get("hardware_id") == "submission"
+                else "cad",
+            },
+            "metadata": {
+                "revision": identity.get("revision"),
+                "owner": identity.get("owner"),
+                "control": identity.get("control"),
+                "change_summary": identity.get("change_summary"),
+                "change_summary_source": {
+                    "cad": "cad",
+                    "submission": "submission",
+                }.get(identity_sources.get("change_summary"), "generated"),
+            },
+        }
+    )

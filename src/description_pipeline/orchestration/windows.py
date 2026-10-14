@@ -50,7 +50,16 @@ from ..sources.snapshot import verify_snapshot
 from ..sources.solidworks.revision import package_inventory
 from ..sources.solidworks.selection import SelectionError
 from ..runtime import tool_record
-from ..stages import ACTIVITY_HISTORY_LIMIT, STAGE_IDS, merge_activity, normalize_activity, stage_view
+from ..interface_records import HEALTH_SCHEMA, RESOURCE_POLICY_SCHEMA, resource_policy_v1_digest
+from ..stages import (
+    ACTIVITY_HISTORY_LIMIT,
+    CONTRACT,
+    CONTRACT_SHA256,
+    STAGE_IDS,
+    merge_activity,
+    normalize_activity,
+    stage_view,
+)
 from .stage_transfer import CAPTURE_MANIFEST as CAPTURE_MANIFEST_NAME
 from .selection_transport import StagedSelection
 from ..sources.solidworks.selection import validate_file_index, verify_selection
@@ -193,11 +202,17 @@ def read_config(path):
         },
         "Unknown endpoint configuration key",
     )
+    #: The install identity digests the document itself, before any derived key:
+    #: the lifecycle stage step computes the same value with the same owner.
+    config_digest = digest(config)
     for key in ("package_root", "output_root", "state_root"):
         config[key] = _root(config[key])
     _require(config["package_root"].is_dir(), "Package root does not exist")
-    targets = config["targets"]
-    _require(isinstance(targets, dict) and bool(targets), "Configure at least one model repository target")
+    #: Model-repository routing belongs to the Linux side; the endpoint accepts
+    #: the documented minimal configuration without targets and never requires
+    #: one to exist.
+    targets = config.get("targets") or {}
+    _require(isinstance(targets, dict), "Endpoint targets must be a mapping")
     roots = [config[key] for key in ("package_root", "output_root", "state_root")]
     for hardware, target in targets.items():
         _require(
@@ -232,6 +247,8 @@ def read_config(path):
     )
     config["token"] = token
     config.pop("token_file")
+    config["targets"] = targets
+    config["config_digest"] = config_digest
     config.setdefault("host", "127.0.0.1")
     config.setdefault("port", SOLIDWORKS_ENDPOINT_PORT)
     _require(
@@ -253,6 +270,158 @@ def _owner_lock(path):
         raise PipelineError("Another endpoint owns the state root or its ownership lock is unavailable") from error
 
 
+def provision_install_id(state_root: Path) -> str:
+    """The endpoint's own install identity: written once, stable across restarts.
+
+    The operator derives install records from the running endpoint's ``/health``,
+    so the endpoint itself must mint and keep its identity; a write-once marker
+    in the instance state root survives config switches and crash restarts.
+    """
+
+    marker = Path(state_root) / "install-id"
+    try:
+        existing = marker.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        existing = ""
+    if existing:
+        return existing
+    fresh = "win-" + uuid.uuid4().hex
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        handle = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return marker.read_text(encoding="utf-8").strip()
+    with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        stream.write(fresh + "\n")
+    return fresh
+
+
+#: Endpoint job states, partitioned for the health identity: anything outside the
+#: known sets is unresolved (a fail-closed bucket, never silently healthy).
+_HEALTH_ACTIVE_JOB_STATES = frozenset({"running", "selecting", "awaiting_definition"})
+_HEALTH_QUEUED_JOB_STATES = frozenset({"queued"})
+_HEALTH_TERMINAL_JOB_STATES = frozenset({"passed", "failed", "native_complete"})
+
+
+def _cad_health(jobs) -> tuple[dict, list[str]]:
+    """CAD session facts via the isolation owner; observe-only, never opens or terminates CAD."""
+
+    if sys.platform != "win32":
+        return {"external_session_detected": False, "owned_sessions": 0, "lease_held": False}, ["unsupported_platform"]
+    try:
+        from ..sources.solidworks import isolation
+
+        facts = isolation.cad_session_facts(
+            isolation.registered_executable(), ownership_file=jobs.cad_ownership_file
+        )
+    except Exception:  # noqa: BLE001 - an unprovable CAD state is a readiness problem, never a pass
+        return {"external_session_detected": False, "owned_sessions": 0, "lease_held": False}, ["cad_state_unavailable"]
+    return (
+        {
+            "external_session_detected": facts["external_session_detected"],
+            "owned_sessions": facts["owned_sessions"],
+            "lease_held": facts["lease_held"],
+        },
+        list(facts["problems"]),
+    )
+
+
+def health_payload(jobs) -> dict:
+    """The IF-09 endpoint identity from its own install record, config snapshot and live state."""
+
+    config = jobs.config
+    record = tool_record()
+    embedded = record.get("release") if isinstance(record.get("release"), dict) else None
+    if embedded is None:
+        # An unreadable own identity is never a green health document: the
+        # handler turns this into the stable 500 identity-unavailable code.
+        raise PipelineError("The endpoint has no installed release identity; /health cannot report an IF-09 identity")
+    release = {
+        "version": str(record.get("version") or ""),
+        "source_commit": str((embedded or {}).get("source_commit") or ""),
+        "source_sha256": str(record.get("source_sha256") or ""),
+        "role": "native",
+    }
+    problems: list[str] = []
+    native_ok = sys.platform == "win32"
+    if not native_ok:
+        problems.append("unsupported_platform")
+    if not getattr(jobs, "thread", None) or not jobs.thread.is_alive():
+        problems.append("queue_thread_unavailable")
+    if native_ok:
+        try:
+            from ..runtime import native_readiness
+
+            native_readiness()
+        except Exception:  # noqa: BLE001 - an unprovable native state is a readiness problem, never a pass
+            problems.append("native_readiness_failed")
+    for key in ("package_root", "output_root"):
+        if not Path(config[key]).is_dir():
+            problems.append(f"missing_{key}")
+    with jobs.mutex:
+        states = [str(job.get("status") or "") for job in jobs.jobs.values()]
+    active = sum(1 for state in states if state in _HEALTH_ACTIVE_JOB_STATES)
+    queued = sum(1 for state in states if state in _HEALTH_QUEUED_JOB_STATES)
+    unresolved = sum(
+        1
+        for state in states
+        if state not in (_HEALTH_ACTIVE_JOB_STATES | _HEALTH_QUEUED_JOB_STATES | _HEALTH_TERMINAL_JOB_STATES)
+    )
+    cad, cad_problems = _cad_health(jobs)
+    problems.extend(cad_problems)
+    ready = native_ok and not problems and not cad["external_session_detected"] and unresolved == 0
+    if ready:
+        reason_code = None
+    elif problems:
+        reason_code = problems[0]
+    elif cad["external_session_detected"]:
+        reason_code = "external_cad_session"
+    else:
+        reason_code = "unresolved_operations"
+    usage = shutil.disk_usage(Path(config["output_root"]))
+    payload = {
+        "schema_version": HEALTH_SCHEMA,
+        "pipeline_id": PIPELINE_ID,
+        "native_platform": native_ok,
+        "ready": ready,
+        "release": release,
+        "contract": {"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
+        "resource_policy": {"schema_version": RESOURCE_POLICY_SCHEMA, "digest": resource_policy_v1_digest()},
+        "install": {"config_digest": config["config_digest"], "install_id": jobs.install_id},
+        "endpoint": {"port": config["port"]},
+        "cad": cad,
+        "jobs": {"active": active, "queued": queued, "unresolved": unresolved},
+        "capacity": {"free_bytes": int(usage.free), "reserved_bytes": 0},
+        "readiness": {
+            "reason_code": reason_code,
+            "native": {"ok": native_ok and not problems, "problems": problems},
+        },
+    }
+    from ..interface_records import InterfaceRecordError, validate_health
+
+    try:
+        validate_health(payload)
+    except InterfaceRecordError as error:
+        # An incomplete or invalid identity is never a green document: the
+        # same schema owner refuses it, and the handler answers the stable 500.
+        raise PipelineError(f"The endpoint cannot read its complete IF-09 identity: {error}") from error
+    return payload
+
+
+def _default_runner(*args, **kwargs):
+    """The native capture entry, imported only when a run actually needs it.
+
+    ``orchestration.windows`` must stay inside the Windows capture closure: the
+    endpoint supplies an explicit runner in tests that exercise the capture
+    boundary, so the generation/verification domain is never pulled in by
+    importing or constructing the endpoint.
+    """
+
+    from ..solidworks import capture
+
+    return capture(*args, **kwargs)
+
+
 class Jobs:
     """One persistent queue, one CAD runner, one endpoint process owner."""
 
@@ -261,19 +430,21 @@ class Jobs:
     PLAN_TTL = 30.0
 
     def __init__(self, config, *, runner=None, selection_reader_factory=None, native_reader=None, backend_factory=None):
-        from ..solidworks import run
-
         self.config = config
-        self.runner = runner or run
+        self.runner = runner or _default_runner
         self.selection_reader_factory = selection_reader_factory
         self.native_reader = native_reader
         self.backend_factory = backend_factory or self._sealed_backend
+        #: Every endpoint-side owned launch (selection and capture) records
+        #: into this one ledger.
+        self.cad_ownership_file = config["state_root"] / "cad-ownership.json"
         self._plans = {}
         self.directory = config["state_root"] / "jobs"
         self.directory.mkdir(parents=True, exist_ok=True)
         inventory(self.directory)
         self.lock_path = config["state_root"] / ".endpoint.lock"
         self.handle = _owner_lock(self.lock_path)
+        self.install_id = provision_install_id(config["state_root"])
         self._closed = False
         self.mutex = threading.RLock()
         self.condition = threading.Condition(self.mutex)
@@ -894,15 +1065,29 @@ class Jobs:
                     raise PipelineError("Timed out waiting for the bound Linux continuation")
                 self.condition.wait(timeout=min(remaining, 10))
 
+    def _default_selection_reader(self, identifier):
+        """The selection reader shares the sealed backend's ownership ledger.
+
+        Selection (closure admission) and capture both launch SolidWorks on
+        this endpoint, so both must record into one ledger: otherwise a
+        corpse left by one path is unrecorded for the other path's sweep,
+        and the liveness semantics of the two paths diverge.
+        """
+
+        from ..sources.solidworks.native_selection import NativeSelectionReader
+
+        return NativeSelectionReader(
+            reader_sha256=self.jobs[identifier]["native_tool"]["source_sha256"],
+            cad_ownership_file=self.cad_ownership_file,
+        )
+
     def _select_native(self, identifier):
         """Resolve the fully staged folder once, then retain its proven native closure."""
         session = self.selections[identifier]
         factory = self.selection_reader_factory
         if factory is None:
-            from ..sources.solidworks.native_selection import NativeSelectionReader
-
             def factory():
-                return NativeSelectionReader(reader_sha256=self.jobs[identifier]["native_tool"]["source_sha256"])
+                return self._default_selection_reader(identifier)
 
         _require(session.state == "reading", "The complete uploaded folder must be staged before native resolution")
         _require(
@@ -1187,13 +1372,12 @@ class Jobs:
             self._save(job)
         return package, target
 
-    @staticmethod
-    def _sealed_backend(package, files):
+    def _sealed_backend(self, package, files):
         from ..runtime import native_readiness
         from ..sources.solidworks.native import SolidWorksBackend
 
         native_readiness()
-        backend = SolidWorksBackend()
+        backend = SolidWorksBackend(cad_ownership_file=self.cad_ownership_file)
         backend.configure_staged_search(package)
         backend.seal_documents([confined(package, name) for name in files])
         return backend
@@ -1289,22 +1473,12 @@ class Jobs:
                 if from_stage in {None, "freeze", "discover"}:
                     package, target = self._prepare_native(identifier, package, selection)
                 else:
-                    # capture..publish reuse the parent's retained freeze+discover
-                    # checkpoints; the plan already proved them intact.
-                    parent = self.jobs[spec["parent_run"]]
+                    # A capture rerun reuses the parent's retained freeze+discover
+                    # checkpoints; the linked-run gate already refused the
+                    # Linux-owned stages before enqueue.
                     package = self._prepared_dir(job)
                     _require(package is not None, "The retained discovery checkpoint is no longer available")
                     target = self.config["targets"].get(job.get("hardware_id"))
-                    seed = self._delivery_dir(parent) if from_stage in {"generate", "verify", "publish"} else None
-                    _require(
-                        from_stage == "capture" or seed is not None,
-                        "The retained delivery of the selected run is no longer available",
-                    )
-                    resume_kwargs.update(
-                        resume_from=from_stage,
-                        seed_dir=seed,
-                        expected_subject=self._recorded_subject(parent),
-                    )
                 selection = job.get("main_assembly")
                 _require(
                     job.get("repository_slug") == (target or {}).get("repository_slug")
@@ -1316,7 +1490,6 @@ class Jobs:
                     self.config["output_root"] / identifier,
                     backend=self.backend_factory(package, job["package_files"]),
                     run_id=identifier,
-                    stop_after="capture",
                     main_assembly=selection,
                     on_event=lambda event, identifier=identifier: self._event(identifier, event),
                     on_activity=lambda item, identifier=identifier: self._activity(identifier, item),
@@ -1446,15 +1619,12 @@ def handler(jobs, token):
                 return
             try:
                 if self.path == "/health":
-                    self._reply(
-                        200,
-                        {
-                            "pipeline_id": PIPELINE_ID,
-                            "ready": jobs.thread.is_alive(),
-                            "native_platform": sys.platform == "win32",
-                            "targets": sorted(jobs.config["targets"]),
-                        },
-                    )
+                    try:
+                        payload = health_payload(jobs)
+                    except PipelineError as error:
+                        self._reply(500, {"error": str(error), "error_code": "health_identity_unavailable"})
+                    else:
+                        self._reply(200, payload)
                 elif self.path.startswith("/v1/jobs/"):
                     suffix = self.path[len("/v1/jobs/") :]
                     if "/artifacts/" in suffix:

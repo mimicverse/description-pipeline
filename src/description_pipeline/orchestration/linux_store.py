@@ -14,10 +14,26 @@ import os
 import tempfile
 from pathlib import Path
 
-from ..delivery import BUNDLE_SCHEMA, PIPELINE_ID, subject_digest, subject_inventory
+from ..delivery import (
+    BUNDLE_SCHEMA,
+    PIPELINE_ID,
+    read_delivery_manifest,
+    stamped_output,
+    subject_digest,
+    subject_inventory,
+)
+from ..interface_records import check_policy_digest
 from ..io import PipelineError, confined, inventory, read_data, write_json
-from ..stages import PORTABLE_STAGES, STAGE_IDS, stage_view
-from ..verification.solidworks_urdf import check_bundle, require_qualified_report
+from ..runtime import tool_record
+from ..stages import (
+    CONFIRMED_STAGE_PASSED,
+    CONFIRMED_STAGE_STATES,
+    CONTRACT_SHA256,
+    PORTABLE_STAGES,
+    STAGE_IDS,
+    stage_view,
+)
+from ..verification.solidworks_urdf import check_bundle, rebuilt_definition, require_qualified_report
 from .airflow_client import JOB_SCHEMA, validate_run_id
 from .stage_transfer import CAPTURE_MANIFEST, TRANSFER_SCHEMA, admit_capture
 
@@ -95,6 +111,83 @@ class LinuxStore:
 
     def checkpoint_receipt(self, run_id: str, stage: str) -> Path:
         return self.receipt_path(self.checkpoint_owner(run_id, stage), stage)
+
+    def confirmed_stage_checkpoint(self, run_id: str, stage: str) -> dict | None:
+        """The attempt's registered stage receipt, fully rebound - or an explicit refusal.
+
+        Reuse only stands through this query: the receipt must name this run and
+        stage with a confirmed state, and the sealed artifacts must still bind
+        - the delivery manifest record-for-record with its contract and check
+        policy digests, the delivery tool identity, the subject recomputed from
+        the checkpoint bytes and the stored handoff.  A receipt that claims
+        confirmation without binding artifacts is a damaged store: it refuses
+        instead of silently re-running, and no caller keeps its own copy of the
+        confirmed-state vocabulary.
+        """
+
+        if stage not in CONFIRMED_STAGE_STATES:
+            raise PipelineError(f"stage must be one of {tuple(CONFIRMED_STAGE_STATES)}: {stage!r}")
+        path = self.receipt_path(run_id, stage)
+        if not path.is_file():
+            return None
+        receipt = read_data(path)
+        if not isinstance(receipt, dict) or receipt.get("schema_version") != BUNDLE_SCHEMA:
+            raise PipelineError("The recorded stage receipt is malformed")
+        if receipt.get("run_id") != run_id or receipt.get("stage") != stage:
+            raise PipelineError("The recorded stage receipt names another run or stage")
+        if receipt.get("state") not in CONFIRMED_STAGE_STATES[stage]:
+            return None
+        if receipt.get("passed") is not CONFIRMED_STAGE_PASSED[stage]:
+            raise PipelineError(f"The recorded {stage} receipt does not carry its confirmed outcome")
+        recorded_handoff = receipt.get("handoff_sha256")
+        meta = self.meta(run_id) or {}
+        if (
+            not isinstance(recorded_handoff, str)
+            or not recorded_handoff
+            or recorded_handoff != meta.get("handoff_sha256")
+        ):
+            raise PipelineError("The recorded checkpoint receipt is not bound to this attempt's handoff")
+        directory = self.output_dir(run_id) if stage == "publish" else self.stage_dir(run_id, stage)
+        if not directory.is_dir():
+            raise PipelineError(f"The recorded {stage} checkpoint has no sealed delivery to reuse")
+        manifest = read_delivery_manifest(directory)
+        if manifest.get("contract", {}).get("digest") != CONTRACT_SHA256:
+            raise PipelineError("The recorded checkpoint was produced under another contract")
+        if manifest.get("policy", {}).get("digest") != check_policy_digest():
+            raise PipelineError("The recorded checkpoint was recorded under another check policy")
+        if read_data(directory / "tool.json") != tool_record():
+            raise PipelineError("The recorded checkpoint was produced by another tool release")
+        subject = receipt.get("subject_sha256")
+        if not (
+            isinstance(subject, str)
+            and len(subject) == 64
+            and all(character in "0123456789abcdef" for character in subject)
+        ):
+            raise PipelineError("The recorded checkpoint receipt lacks its subject digest")
+        if subject_digest(directory) != subject:
+            raise PipelineError("The recorded checkpoint bytes no longer match its receipt")
+        if stage == "verify":
+            report = require_qualified_report(
+                read_data(directory / "reports/quality.json"), rebuilt_definition(directory)
+            )
+            if report.get("subject_sha256") != subject:
+                raise PipelineError("The verified quality report is bound to another subject")
+        if stage == "publish":
+            report = require_qualified_report(
+                read_data(directory / "reports/quality.json"), rebuilt_definition(directory)
+            )
+            if report.get("subject_sha256") != subject:
+                raise PipelineError("The published quality report is bound to another subject")
+            submission = receipt.get("submission")
+            if (
+                not isinstance(submission, dict)
+                or submission.get("passed") is not True
+                or submission.get("state") not in {"published", "updated", "noop"}
+                or not submission.get("url")
+                or submission.get("subject_sha256") not in (None, subject)
+            ):
+                raise PipelineError("The recorded publication has no confirmed submission")
+        return receipt
 
     def delivery_dir(self, run_id: str) -> Path | None:
         """The newest installed delivery of this attempt (publish, verify or generate)."""
@@ -249,6 +342,27 @@ class LinuxStore:
             self.append_events(run_id, native_receipt.get("events"))
         return finalize({**provisional, "transfer": dict(manifest)})
 
+    def native_receipts(self, run_id: str) -> dict:
+        """The sealed native receipts, as immutable bytes, from run storage.
+
+        The delivery tree no longer carries ``reports/native-*`` or the transfer
+        manifest; the orchestration adapter hands consumers the exact sealed
+        bytes (no re-serialization, no state oracle) so verification can validate
+        them independently.
+        """
+
+        run_id = validate_run_id(run_id)
+        capture = self.capture_dir(run_id)
+        paths = {
+            "native_tool_bytes": capture / "reports/native-tool.json",
+            "native_stages_bytes": capture / "reports/native-stages.json",
+            "transfer_manifest_bytes": capture / "transfer-manifest.json",
+        }
+        missing = sorted(name for name, path in paths.items() if not path.is_file())
+        if missing:
+            raise PipelineError(f"Native receipts are missing from run storage: {missing}")
+        return {name: path.read_bytes() for name, path in paths.items()}
+
     def record_stage(self, run_id: str, stage: str, receipt: dict) -> None:
         """Keep one stage receipt and its raw events; the attempt is otherwise untouched."""
         if stage not in PORTABLE_STAGES:
@@ -301,8 +415,8 @@ class LinuxStore:
             capture = self.checkpoint_dir(run_id, "capture")
         except PipelineError:
             capture = None
-        hardware = _capture_value(capture, "input/robot.yaml", "hardware_id") if capture else None
-        revision = _capture_value(capture, "input/cad-revision.json", "revision") if capture else None
+        hardware = _capture_value(capture, "input/source.json", ("identity", "hardware_id")) if capture else None
+        revision = _capture_value(capture, "input/source.json", ("metadata", "revision")) if capture else None
         if submission is not None:
             result["submission"] = submission
         if (native_job or {}).get("status") == "failed":
@@ -350,7 +464,9 @@ class LinuxStore:
             if cached is not None:
                 return cached
             try:
-                report = require_qualified_report(check_bundle(delivery))
+                report = require_qualified_report(
+                    check_bundle(delivery), rebuilt_definition(delivery), root=delivery
+                )
             except PipelineError as error:
                 verified_error = error
             else:
@@ -403,10 +519,12 @@ class LinuxStore:
         inventory, the embedded receipt's run id, handoff and subject equal to this
         attempt's recorded ones, the transfer provenance (when present) naming the
         native capture owner and the same handoff, and the archived input bytes equal
-        to that owner's admitted capture.  A linked attempt reuses the parent's
-        immutable transfer and checkpoints, so its own receipts must name the child
-        while the transfer may legitimately name the parent.  Failure at any step is
-        an integrity error, never a reason to serve something else, so a foreign
+        to that owner's admitted capture.  The delivery itself is bound by
+        recomputing its subject from the retained bytes - the receipt no longer
+        travels inside the delivery.  A linked attempt reuses the parent's immutable
+        transfer and checkpoints, so its own receipts must name the child while the
+        transfer may legitimately name the parent.  Failure at any step is an
+        integrity error, never a reason to serve something else, so a foreign
         stamped bundle copied into another attempt cannot be mislabeled as its
         diagnostic preview.
         """
@@ -427,24 +545,23 @@ class LinuxStore:
         candidate = Path(recorded).resolve()
         if candidate != run_root and run_root not in candidate.parents:
             raise PipelineError("The retained diagnostic location is outside this attempt")
-        embedded = _stamped_receipt(candidate)
-        if embedded is None:
+        if not stamped_output(candidate):
             raise PipelineError("The retained diagnostic delivery is not a stamped pipeline output")
         if receipt.get("run_id") != run_id:
             raise PipelineError("The retained verify receipt belongs to another attempt")
         subject = receipt.get("subject_sha256")
         if not isinstance(subject, str):
             raise PipelineError("The failed verify receipt is not bound to a subject")
+        try:
+            computed_subject = subject_digest(candidate)
+        except PipelineError as error:
+            raise PipelineError("The retained diagnostic delivery is not a stamped pipeline output") from error
+        if computed_subject != subject:
+            raise PipelineError("The retained diagnostic delivery does not match its recorded subject")
         meta = self.meta(run_id) or {}
         expected_handoff = meta.get("handoff_sha256") or receipt.get("handoff_sha256")
         if not isinstance(expected_handoff, str) or not expected_handoff:
             raise PipelineError("This attempt records no handoff identity for its diagnostic delivery")
-        if (
-            embedded.get("run_id") != run_id
-            or embedded.get("handoff_sha256") != expected_handoff
-            or embedded.get("subject_sha256") != subject
-        ):
-            raise PipelineError("The retained diagnostic delivery belongs to another run or handoff")
         try:
             capture_owner = self.checkpoint_owner(run_id, "capture")
             capture = self.capture_dir(capture_owner)
@@ -563,7 +680,7 @@ class _BoundArtifact:
         return getattr(self._handle, item)
 
 
-def _capture_value(capture: Path, relative: str, key: str) -> str | None:
+def _capture_value(capture: Path, relative: str, key) -> str | None:
     """One scalar from the admitted native input, or ``None`` when it is absent."""
     path = Path(capture) / relative
     if not path.is_file():
@@ -572,7 +689,9 @@ def _capture_value(capture: Path, relative: str, key: str) -> str | None:
         payload = read_data(path)
     except (PipelineError, OSError, ValueError, TypeError):
         return None
-    value = payload.get(key) if isinstance(payload, dict) else None
+    for part in key if isinstance(key, tuple) else (key,):
+        payload = payload.get(part) if isinstance(payload, dict) else None
+    value = payload
     return value if isinstance(value, str) and value else None
 
 
@@ -584,30 +703,6 @@ def _delivery_fingerprint(delivery: Path) -> tuple:
             stat = path.stat()
             rows.append((path.relative_to(delivery).as_posix(), stat.st_size, stat.st_mtime_ns))
     return tuple(rows)
-
-
-def _stamped_receipt(path: Path) -> dict | None:
-    """The receipt of a directory this pipeline stamped, when members match its inventory."""
-
-    path = Path(path)
-    if path.is_symlink() or path.is_junction() or not path.is_dir():
-        return None
-    if not (path / "input").is_dir() or not (path / "reports").is_dir():
-        return None
-    marker = path / "reports/run.json"
-    if not marker.is_file():
-        return None
-    try:
-        receipt = read_data(marker)
-    except (PipelineError, OSError, ValueError):
-        return None
-    if (
-        isinstance(receipt, dict)
-        and receipt.get("schema_version") == BUNDLE_SCHEMA
-        and receipt.get("owned_files") == inventory(path, exclude=("reports/run.json",))
-    ):
-        return receipt
-    return None
 
 
 def _read_optional_json(path: Path) -> object | None:
@@ -641,7 +736,7 @@ def _delivery_warnings(delivery: Path) -> list[dict]:
     """Input warnings and non-blocking discovery findings the retained delivery carries."""
 
     warnings: list[dict] = []
-    report = _read_optional_json(delivery / "reports/input.json")
+    report = _read_optional_json(delivery / "input/handoff.json")
     if isinstance(report, dict):
         for item in report.get("warnings") or []:
             if isinstance(item, dict) and item.get("code"):
@@ -654,11 +749,8 @@ def _delivery_warnings(delivery: Path) -> list[dict]:
                         "detail": item.get("detail"),
                     }
                 )
-    findings = _read_optional_json(delivery / "input/discovery/findings.json")
-    rows = findings.get("findings") if isinstance(findings, dict) else None
-    if not isinstance(rows, list):
-        payload = _read_optional_json(delivery / "input/discovery/native-discovery.json")
-        rows = payload.get("findings") if isinstance(payload, dict) else None
+    payload = _read_optional_json(delivery / "evidence/discovery.json")
+    rows = payload.get("findings") if isinstance(payload, dict) else None
     if isinstance(rows, list):
         for item in rows:
             if isinstance(item, dict) and item.get("blocking") is False:

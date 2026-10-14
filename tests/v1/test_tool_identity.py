@@ -11,7 +11,6 @@ from unittest.mock import patch
 from description_pipeline import __version__, runtime, steps
 from description_pipeline.delivery import PIPELINE_ID
 from description_pipeline.io import PipelineError, digest, inventory, read_data, write_json
-from description_pipeline.sources.solidworks.revision import seal_revision
 
 
 class ToolIdentityTests(unittest.TestCase):
@@ -81,19 +80,40 @@ class ToolIdentityTests(unittest.TestCase):
     def _publishable_bundle(root: Path) -> Path:
         """A minimal delivery whose inputs pass before the publication identity gate."""
 
+        from description_pipeline.schemas import SOURCE_RECORD_SCHEMA
+
         bundle = root / "bundle"
         inputs = bundle / "input"
         inputs.mkdir(parents=True)
         (inputs / "arm.SLDASM").write_bytes(b"release-identity fixture\n")
-        (inputs / "robot.yaml").write_text('{"hardware_id": "arm"}\n', encoding="utf-8")
-        seal_revision(
-            inputs,
-            hardware_id="arm",
-            revision="arm-1",
-            owner="t",
-            system="handoff",
-            reference="local-handoff",
-            summary="release identity fixture",
+        identity = {
+            "kind": "source-revision",
+            "handoff_digest": digest({"fixture": "arm"}),
+            "main_assembly": "arm.SLDASM",
+            "configuration": "Default",
+            "hardware_id": "arm",
+            "records": [],
+        }
+        write_json(
+            inputs / "source.json",
+            {
+                "schema_version": SOURCE_RECORD_SCHEMA,
+                "source_revision_id": digest(identity),
+                "identity": identity,
+                "selection": {
+                    "main_assembly": "arm.SLDASM",
+                    "configuration": "Default",
+                    "hardware_id": "arm",
+                    "hardware_source": "cad",
+                },
+                "metadata": {
+                    "revision": "arm-1",
+                    "owner": "t",
+                    "control": {"system": "handoff", "reference": "local-handoff"},
+                    "change_summary": "release identity fixture",
+                    "change_summary_source": "submission",
+                },
+            },
         )
         return bundle
 

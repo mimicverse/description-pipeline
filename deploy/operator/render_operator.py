@@ -509,6 +509,7 @@ def main() -> int:
         for token, value in (
             ("@OPERATOR_STATE@", str(state)),
             ("@AIRFLOW_HOME@", str(home)),
+            ("@ENV_FILE@", str(args.env_file)),
             ("@PORTAL_COMMAND@", resolved["PORTAL_COMMAND"]),
         ):
             portal_unit = portal_unit.replace(token, value)

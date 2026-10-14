@@ -18,17 +18,15 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 import numpy as np
-import yaml
 
-from ..delivery import PIPELINE_ID, subject_digest
+from ..delivery import PIPELINE_ID, read_delivery_manifest, read_source_record, subject_digest
 from ..geometry import stl
-from ..io import PipelineError, confined, file_digest, inventory, read_data
-from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, TOOL_SCHEMA
-from ..sources.snapshot import verify_snapshot
-from ..sources.solidworks.input import inspect_package
+from ..io import PipelineError, confined, digest, file_digest, inventory, read_data
+from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, TOOL_SCHEMA, exporter_declaration_present
 from ..sources.solidworks.revision import NATIVE_SUFFIXES
-from ..sources.solidworks.revision import package_inventory, read_revision
-from ..stages import FIXED_REQUIRED_CHECKS, required_rows_complete
+from ..interface_records import CHECK_POLICY_V1, QUALIFICATION_SCHEMA, qualification_facts, validate_qualification
+from ..stages import required_rows_complete
+from . import native_discovery as evidence
 from .consumer import load as load_consumer
 
 QUALITY_SCHEMA = "solidworks-to-urdf.quality/v1"
@@ -130,30 +128,61 @@ class _Gates:
 
 
 def required_checks(definition=None):
-    """Required independent gates, including every declared body, joint and frame."""
-    identifiers = set(FIXED_REQUIRED_CHECKS)
-    expectations = (definition or {}).get("checks") or {}
-    for key, identifier in (
-        ("expected_mass_kg", "physics.expected_mass"),
-        ("expected_extent_m", "geometry.expected_extent"),
-    ):
-        if key in expectations:
-            identifiers.add(identifier)
-    source = (definition or {}).get("source") or {}
-    for body in source.get("bodies", []):
-        identifiers.update(("inertia." + body["name"], "geometry." + body["name"]))
-    for joint in source.get("joints", []):
-        identifiers.add("joints." + joint["name"])
-        if joint["type"] != "fixed":
-            identifiers.add("shafts." + joint["name"])
-    identifiers.update("frames." + frame["name"] for frame in source.get("frames", []))
+    """Required independent gates expanded from the canonical check policy.
+
+    The expansion rules are data in ``interface_records.CHECK_POLICY_V1``; this
+    evaluator applies them to the sealed definition so generation, verification
+    and publication all expand the same single-source policy.
+    """
+
+    definition = definition or {}
+    identifiers = set(CHECK_POLICY_V1["fixed_checks"])
+    expectations = definition.get("checks") or {}
+    source = definition.get("source") or {}
+    for rule in CHECK_POLICY_V1["dynamic_expansions"]:
+        selector, family = rule["selector"], rule["family"]
+        if selector == "expectation:expected_mass_kg":
+            if "expected_mass_kg" in expectations:
+                identifiers.add(family)
+        elif selector == "expectation:expected_extent_m":
+            if "expected_extent_m" in expectations:
+                identifiers.add(family)
+        elif selector == "source.bodies[*].name":
+            identifiers.update(family.format(body=body["name"]) for body in source.get("bodies", []))
+        elif selector == "source.joints[*].name":
+            for joint in source.get("joints", []):
+                if rule.get("when") == "type != fixed" and joint["type"] == "fixed":
+                    continue
+                identifiers.add(family.format(joint=joint["name"]))
+        elif selector == "source.frames[*].name":
+            identifiers.update(family.format(frame=frame["name"]) for frame in source.get("frames", []))
+        else:
+            raise PipelineError(f"Unknown check-policy selector: {selector}")
     return sorted(identifiers)
 
 
-def require_qualified_report(report):
-    """Reject an incomplete/forged green flag before it can become a boundary pass."""
+def require_qualified_report(report, definition, root=None):
+    """Reject an incomplete/forged green flag before it can become a boundary pass.
+
+    The executed gates must be exactly the required set expanded from the
+    independently rebuilt definition (frozen fixed gates plus the per-object
+    families its rebuilt bodies/joints/frames and sealed expectations produce).
+    A self-reported subset (for example fixed gates only) or a policy-shaped gate
+    for an object that does not exist in the rebuilt inventory cannot pass: the
+    required set is never taken from the report and never from author-side lists.
+
+    The report's qualification items must carry exactly the facts the rebuilt
+    definition expands, with their three-state conclusions and resolvable
+    evidence references: with a ``root``, a missing record or digest mismatch
+    refuses the ungrounded qualification instead of passing or downgrading it.
+    """
+
     try:
         _require(isinstance(report, dict), "Quality report must be an object")
+        _require(
+            isinstance(definition, dict) and isinstance(definition.get("source"), dict),
+            "Quality report must bind the rebuilt definition inventory",
+        )
         rows = report.get("checks") or []
         expected = report.get("required_checks") or []
         _require(
@@ -163,81 +192,154 @@ def require_qualified_report(report):
             and all(isinstance(name, str) for name in expected),
             "Quality gate inventory is malformed",
         )
+        executed = [row["id"] for row in rows]
+        inventory = set(required_checks(definition))
         _require(
             report.get("passed") is True
-            and set(required_checks()) <= set(expected)
+            and set(expected) == inventory
+            and len(executed) == len(expected)
+            and set(executed) == set(expected)
             and required_rows_complete(expected, rows),
             "URDF verification failed or required checks were not executed; see reports/quality.json",
         )
+        qualifications = report.get("qualifications")
+        facts = qualification_facts(definition)
+        _require(
+            isinstance(qualifications, list)
+            and sorted(
+                (item["fact_id"], item["scope"], item["object_id"]) for item in qualifications
+            )
+            == sorted((fact["fact_id"], fact["scope"], fact["object_id"]) for fact in facts),
+            "Quality report does not carry exactly the rebuilt definition's qualification facts",
+        )
+        for item in qualifications:
+            validate_qualification(item, resolve=root)
     except PipelineError as error:
         error.details = report
         raise
     return report
 
 
-def _input(root, diagnostics=None):
-    """Bind the archived input; an absent publication seal is a readiness warning, not a failure.
+def rebuilt_definition(root) -> dict:
+    """The independently rebuilt definition a quality report's inventory binds to."""
 
-    A supplied cad-revision.json stays strictly validated (malformed or tampered metadata
-    fails).  When the seal is absent the delivery is only acceptable while the authored
-    administrative identity is incomplete; engineering evidence is bound to the archived
-    native record and the captured package inventory instead.
+    return _input(root)
+
+
+def _input(root, diagnostics=None):
+    """Bind the frozen input and the author definition carried by the discovery record.
+
+    The CAD/PDM revision label is optional raw metadata (a missing value stays
+    missing, as a readiness diagnostic); engineering evidence binds to the
+    discovery record, the frozen handoff record and the archived originals under
+    ``input/cad``.
     """
 
-    from .native_discovery import REVISION_FILE
-
     diagnostics = [] if diagnostics is None else diagnostics
-    report = inspect_package(root / "input")
-    _require(report.get("passed") is True, str(report.get("errors")))
-    definition = report["input"]
-    saved = read_data(confined(root, "reports/input.json"))
-    _require(
-        saved.get("passed") is True and saved.get("input") == definition,
-        "Input report does not bind the author definition",
-    )
-    seal = root / "input" / REVISION_FILE
-    _require(not seal.is_symlink(), "The revision manifest cannot be a symlink")
-    if seal.is_file():
-        revision = read_revision(root / "input", hardware_id=definition.get("hardware_id"))
-        _require(saved.get("cad_revision") == revision, "Input report has another CAD revision")
-    else:
-        from .native_discovery import DISCOVERY_FILE, publication_metadata_state
+    discovery_record = evidence.discovery(root)
+    _require(isinstance(discovery_record.get("raw"), dict), "Discovery record carries no raw capture")
+    raw = discovery_record["raw"]
+    from .native_discovery import rebuild_interface_frames, rebuild_joint_facts, rebuild_rigid_bodies
 
-        payload = read_data(confined(root / "input", DISCOVERY_FILE))
-        authored = publication_metadata_state(payload.get("raw") or {}, str(payload.get("namespace") or "dp"))
+    if exporter_declaration_present(raw):
+        # The declaration domain carries its own independent decode: the consumer
+        # expectations come from the sealed declaration, and the failure cause is never
+        # swallowed into zero objects.
+        from .native_declarations import verify_declarations
+
+        declarations = verify_declarations(raw)
         _require(
-            authored["missing"],
-            "Missing generated cad-revision.json for complete authored publication metadata",
+            declarations["passed"],
+            f"the discovery record declaration gate failed: {declarations['errors'][:1]}",
+        )
+        carrier = declarations["carrier"]
+        bodies, joints = carrier["bodies"], carrier["joints"]
+        # The native interface interpretation is shared across the two modes: each mode
+        # proves its own members/base first, then rebuilds the CS_/TCP_/SCS_ interfaces
+        # from the raw datums (a missing declaration extension never proves absence).
+        base = next((body for body in bodies if body["name"] == carrier.get("root")), None)
+        frames = rebuild_interface_frames(raw, bodies=bodies, base=base, expansion=carrier.get("expansion"))
+    else:
+        bodies = rebuild_rigid_bodies(discovery_record)
+        joints = rebuild_joint_facts(discovery_record, root)
+        frames = rebuild_interface_frames(discovery_record)
+    source = read_source_record(root)
+    handoff = evidence.handoff(root)
+    identity = source["identity"]
+    _require(
+        handoff.get("main_assembly") == identity["main_assembly"],
+        "Handoff and source record disagree on the main assembly",
+    )
+    _require(
+        handoff.get("configuration") == identity["configuration"],
+        "Handoff and source record disagree on the configuration",
+    )
+    robot_name = discovery_record.get("robot_name")
+    _require(isinstance(robot_name, str) and robot_name, "Discovery record carries no robot name")
+    declared = evidence.declared_masses(root)
+    recorded = (handoff.get("input_receipt") or {}).get("inventory")
+    if isinstance(recorded, dict) and recorded:
+        archived = inventory(root / "input/cad")
+        missing = [name for name, checksum in recorded.items() if archived.get(name) != checksum]
+        _require(not missing, f"Archived input differs from the frozen handoff inventory: {missing[:5]}")
+    revision = source["metadata"].get("revision")
+    if not isinstance(revision, str) or not revision:
+        from .native_discovery import publication_metadata_state
+
+        authored = publication_metadata_state(
+            discovery_record.get("raw") or {}, str(discovery_record.get("namespace") or "dp")
         )
         diagnostics.append(
             {
-                "code": "input.cad_revision_not_sealed",
+                "code": "input.cad_revision_absent",
                 "blocking": False,
-                "message": (
-                    "cad-revision.json is absent while authored publication metadata is incomplete; "
-                    "engineering checks bind the archived native evidence instead"
-                ),
-                "detail": {"hardware_id": definition.get("hardware_id"), "missing": list(authored["missing"])},
+                "message": "the CAD revision label is absent; the raw value stays missing",
+                "detail": {"hardware_id": identity["hardware_id"], "missing": list(authored.get("missing") or [])},
             }
         )
-    files = package_inventory(root / "input")
-    _require(saved.get("package_files") == files, "Archived input differs from the captured package")
-    return definition
+    checks: dict = {}
+    budget_entry = discovery_record.get("budget")
+    if isinstance(budget_entry, dict):
+        from .native_discovery import _record_value
+
+        value = _record_value(
+            Path(root),
+            {"package_file": budget_entry.get("package_file"), "sha256": budget_entry.get("sha256")},
+            str(budget_entry.get("key") or ""),
+        )
+        _require(isinstance(value, dict), "Discovery record budget entry is not an object")
+        checks = {key: value[key] for key in ("expected_mass_kg", "expected_extent_m") if key in value}
+    return {
+        "schema_version": discovery_record.get("schema_version"),
+        "hardware_id": identity["hardware_id"],
+        "source": {
+            "assembly": identity["main_assembly"],
+            "configuration": identity["configuration"],
+            "robot_name": robot_name,
+            "bodies": bodies,
+            "joints": joints,
+            "frames": frames,
+            "documented_masses": declared.get("items") or {},
+            "mass_evidence": declared.get("evidence") or {},
+        },
+        "checks": checks,
+    }
 
 
-def _native(root, manifest):
+def _native(root):
+    source = read_source_record(root)
+    collection = evidence.collection(root)
     _require(
-        manifest["kind"] == "solidworks" and manifest["evidence_class"] == "cad",
+        collection.get("kind") == "solidworks" and collection.get("evidence_class") == "cad",
         "A release requires native SolidWorks evidence",
     )
-    collection = read_data(confined(root / "evidence", "evidence/collection.json"))
-    _require(collection["identity"] == manifest["identity"], "Collection and snapshot identities differ")
-    environment = read_data(confined(root / "evidence", "evidence/environment.json"))
-    _require(environment == collection["environment"], "Environment evidence differs")
+    _require(collection.get("identity") == source["identity"], "Collection and archived source identities differ")
+    environment = evidence.runtime(root)
+    _require(environment == collection.get("environment"), "Environment evidence differs")
     revision = str(environment["solidworks"]["revision"])
     _require(revision.split(".")[0] == "34", "Native inertia API qualification currently covers SolidWorks 34 only")
-    _require(collection["limits"]["native_cad"] is True, "Native capture was not recorded")
-    return {"solidworks_revision": revision, "configuration": manifest["identity"]["configuration"]}
+    _require((collection.get("limits") or {}).get("native_cad") is True, "Native capture was not recorded")
+    return {"solidworks_revision": revision, "configuration": source["selection"]["configuration"]}
 
 
 def _native_discovery(package, diagnostics=None):
@@ -282,31 +384,60 @@ def _native_discovery(package, diagnostics=None):
 
 
 def _dependencies(root, definition):
-    closure = read_data(confined(root / "evidence", "raw/dependency_closure.json"))
+    closure = evidence.dependency_closure(root)
     _require(not closure["declared_unresolved"], "Unresolved CAD references")
     stale_skips = _stale_stored_reference_skips(root, closure)
     _require(closure["configuration"] == definition["source"]["configuration"], "Captured another configuration")
     original = closure["original_files"]
     _require(bool(original) and bool(closure["mapping"]), "Missing dependency mapping")
-    actual = {"source/" + name: checksum for name, checksum in inventory(root / "evidence/source").items()}
+    actual = {"source/" + name: checksum for name, checksum in inventory(root / "input/cad").items()}
     _require(actual == closure["copy_files"], "Collected CAD changed")
-    original_hashes = _handoff_native_hashes(root / "input")
-    _require(set(original.values()) <= original_hashes, "Capture used CAD outside the mechanical handoff")
+    # The archived input carries the dependency-closure copies; the frozen
+    # discovery inventory binds those copy bytes.
+    _handoff_native_hashes(root)
+    # Original coverage is a digest-mapping decision: the originals stay in the
+    # platform's frozen upload storage, so their identity is the handoff upload
+    # index (name -> original digest), never an equality with the - possibly
+    # engine-rewritten - copy bytes.
+    handoff = evidence.handoff(root)
+    package_files = handoff.get("package_files")
+    _require(isinstance(package_files, dict) and bool(package_files), "The frozen upload index is missing")
+    upload_hashes = {str(checksum) for checksum in package_files.values()}
     top = [row for row in closure["mapping"] if row["instance"] == "top_level"]
     _require(len(top) == 1, "Missing unique top assembly mapping")
-    expected = file_digest(confined(root / "input", definition["source"]["assembly"]))
+    main = str(definition["source"]["assembly"])
+    normalized_main = ntpath.normcase(main.replace("/", "\\"))
+    # The frozen package-relative main assembly must exist in the upload index
+    # exactly; there is no suffix fallback that could rewrite its path.  (The
+    # native absolute path's rooted original->copy mapping is a separate layer.)
+    exact = [
+        name for name in package_files if ntpath.normcase(str(name).replace("/", "\\")) == normalized_main
+    ]
+    _require(len(exact) == 1, "The frozen upload index does not name exactly one captured main assembly")
+    main_key = exact[0]
+    expected = str(package_files[main_key])
+    _require(
+        ntpath.normcase(str(top[0].get("source") or "")).endswith("\\" + normalized_main),
+        "The top mapping does not name the requested main assembly",
+    )
     _require(top[0]["source_sha256"] == expected, "Captured another top assembly revision")
     for row in closure["mapping"]:
         _require(original.get(row["source"]) == row["source_sha256"], "Source mapping hash differs")
+        _require(
+            str(row["source_sha256"]) in upload_hashes,
+            "A captured original is outside the frozen upload index",
+        )
         _require(actual.get(row["copy"]) == row["copy_sha256"], "Copied mapping hash differs")
+    _require(
+        {str(checksum) for checksum in original.values()} <= upload_hashes,
+        "Capture used CAD outside the frozen upload index",
+    )
     _require(
         {ntpath.normcase(str(row["source"])) for row in closure["mapping"]}
         == {ntpath.normcase(str(path)) for path in original},
         "The copied graph does not cover the captured original files",
     )
-    from .native_discovery import DISCOVERY_FILE  # noqa: PLC0415 - mirrors _handoff_native_hashes
-
-    record = read_data(confined(root / "input", DISCOVERY_FILE))
+    record = evidence.discovery(root)
     selected = ((record.get("raw") or {}).get("source_selection") or {}).get("files") or {}
     for name, checksum in sorted(selected.items()):
         suffix = ntpath.normcase(str(name).replace("/", "\\"))
@@ -346,10 +477,16 @@ def _dependencies(root, definition):
             any(tail == suffix or tail.endswith("\\" + suffix) for suffix in selected_suffixes),
             f"A seeded required leaf is not a selected source: {path}",
         )
-    collection = read_data(root / "evidence/evidence/collection.json")
-    _require(collection["dependency_closure"] == closure, "Collection dependency record differs")
+    # The frozen tree keeps the dependency closure and the source-stability
+    # record once, as capture blocks (the old evidence collection file no longer
+    # enters the delivery tree).  The closure block is re-read against the
+    # record these checks consumed, and the stability record must cover the
+    # captured input inventory.
+    capture = evidence.capture(root)
+    _require(capture.get("dependency_closure") == closure, "Capture dependency record differs")
+    stability = capture.get("originals_unchanged")
     _require(
-        collection["capture"]["originals_unchanged"]["files_checked"] == len(original),
+        isinstance(stability, dict) and stability.get("files_checked") == len(original),
         "Source stability was not verified",
     )
     return {
@@ -377,9 +514,7 @@ def _stale_stored_reference_skips(root: Path, closure: dict) -> int:
         return 0
     skips = closure["stale_stored_references"]
     _require(isinstance(skips, list), "Stored-reference skip record is malformed")
-    from .native_discovery import DISCOVERY_FILE  # noqa: PLC0415 - mirrors _handoff_native_hashes
-
-    record = read_data(confined(root / "input", DISCOVERY_FILE))
+    record = evidence.discovery(root)
     manifest = (record.get("raw") or {}).get("source_selection") or {}
     sealed = manifest.get("closure") or {}
     files = manifest.get("files") or {}
@@ -501,42 +636,29 @@ def _stale_stored_reference_skips(root: Path, closure: dict) -> int:
     return len(skips)
 
 
-def _handoff_native_hashes(input_root: Path) -> set[str]:
-    """Hashes of the frozen handoff bytes, strictly from the proven native inventory.
+def _handoff_native_hashes(root: Path) -> set[str]:
+    """Hashes of the frozen handoff bytes, from the sealed discovery record.
 
-    Every named native file must still match its recorded bytes in the archived input,
-    and the inventory digest and discovery-record digest must match robot.yaml
-    provenance. The raw record and a supplied publication seal may only confirm a
-    matching subset of that inventory; they never widen the allowed dependency sources.
+    The discovery record carries its own provenance; its byte binding is the
+    delivery manifest subject entry (re-checked by ``read_delivery_manifest``),
+    and ``native_inventory_sha256`` is a top-level digest over the inventory.
+    The raw record may only confirm a matching subset of that inventory.
     """
 
-    from .native_discovery import DISCOVERY_FILE, REVISION_FILE
-
-    record_path = input_root / DISCOVERY_FILE
-    payload = read_data(confined(input_root, DISCOVERY_FILE))
-    native = payload.get("native_files") if isinstance(payload, dict) else None
-    _require(isinstance(native, dict) and bool(native), "The archived native file inventory is missing")
-    frozen = {str(name): str(checksum) for name, checksum in native.items()}
+    payload = evidence.discovery(root)
+    native = payload.get("files") if isinstance(payload, dict) else None
+    _require(isinstance(native, list) and bool(native), "The archived native file inventory is missing")
+    frozen = {str(row["path"]): str(row["sha256"]) for row in native}
     for relative, checksum in sorted(frozen.items()):
-        path = confined(input_root, relative)
+        path = confined(root / "input/cad", relative)
         _require(path.is_file(), f"A frozen native file is missing from the archived input: {relative}")
         _require(
             file_digest(path) == checksum,
             f"A frozen native file differs from its recorded bytes: {relative}",
         )
-    robot = yaml.safe_load((input_root / "robot.yaml").read_text(encoding="utf-8"))
-    provenance = robot.get("provenance") if isinstance(robot, dict) else None
-    _require(isinstance(provenance, dict), "Archived robot.yaml carries no provenance")
-    canonical = hashlib.sha256(
-        (json.dumps(frozen, sort_keys=True, ensure_ascii=False, allow_nan=False, indent=2) + "\n").encode()
-    ).hexdigest()
     _require(
-        canonical == provenance.get("native_inventory_sha256"),
-        "The native inventory digest does not match provenance",
-    )
-    _require(
-        hashlib.sha256(record_path.read_bytes()).hexdigest() == provenance.get("discovery_sha256"),
-        "The archived discovery record does not match provenance",
+        digest(native) == payload.get("native_inventory_sha256"),
+        "The native inventory digest does not match the discovery record",
     )
     raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
     raw_files = {str(name): str(checksum) for name, checksum in (raw.get("files") or {}).items()}
@@ -545,15 +667,6 @@ def _handoff_native_hashes(input_root: Path) -> set[str]:
         "Raw-recorded documents are not a matching subset of the frozen native inventory: "
         f"{sorted(set(raw_files) - set(frozen))}",
     )
-    seal = input_root / REVISION_FILE
-    _require(not seal.is_symlink(), "The revision manifest cannot be a symlink")
-    if seal.is_file():
-        cad_files = {str(name): str(checksum) for name, checksum in read_revision(input_root)["cad_files"].items()}
-        _require(
-            cad_files.items() <= frozen.items(),
-            "The revision seal is not a matching subset of the frozen native inventory: "
-            f"{sorted(set(cad_files) - set(frozen))}",
-        )
     return set(frozen.values())
 
 
@@ -587,10 +700,59 @@ def _entities(source, raw, model):
     }
 
 
-def _tool(root):
+def _native_receipts_evidence(root, receipts):
+    """Independently validate native receipts supplied as immutable bytes.
+
+    The orchestration adapter resolves and transports the sealed receipt bytes;
+    verification never imports the store or trusts a stored status.  Identity,
+    schema, byte digests and release binding are re-checked here, and the parsed
+    bytes are the evidence (never a re-serialized copy).
+    """
+
+    names = ("native_tool_bytes", "native_stages_bytes", "transfer_manifest_bytes")
+    _require(isinstance(receipts, dict), "Native receipts must be supplied as an object")
+    blobs = {}
+    for name in names:
+        blob = receipts.get(name)
+        _require(
+            isinstance(blob, (bytes, bytearray)) and bool(blob),
+            f"Native receipt {name} is missing",
+        )
+        blobs[name] = bytes(blob)
+    parsed = {}
+    for name, blob in blobs.items():
+        try:
+            parsed[name] = json.loads(blob.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as error:
+            raise PipelineError(f"Native receipt {name} is not sealed JSON") from error
+    native_tool = parsed["native_tool_bytes"]
+    _require(
+        isinstance(native_tool, dict) and native_tool.get("schema_version") == TOOL_SCHEMA,
+        "Native tool receipt schema changed",
+    )
+    runtime = native_tool.get("runtime") or {}
+    _require(runtime.get("role") == "native", "Native tool receipt carries another role")
+    delivery = read_data(confined(root, "tool.json"))
+    _require(
+        native_tool.get("version") == delivery.get("version")
+        and native_tool.get("source_sha256") == delivery.get("source_sha256"),
+        "Native receipt does not bind this delivery's release identity",
+    )
+    stages = parsed["native_stages_bytes"]
+    transfer = parsed["transfer_manifest_bytes"]
+    _require(isinstance(stages, dict) and isinstance(transfer, dict), "Native receipts are not sealed records")
+    return {
+        "digests": {name: hashlib.sha256(blob).hexdigest() for name, blob in blobs.items()},
+        "native_tool": {"version": native_tool.get("version"), "source_sha256": native_tool.get("source_sha256")},
+        "native_stages": stages,
+        "transfer_manifest": transfer,
+    }
+
+
+def _tool(root, native_receipts=None):
     from packaging.version import Version
 
-    tool = read_data(confined(root, "reports/tool.json"))
+    tool = read_data(confined(root, "tool.json"))
     _require(
         tool["pipeline_id"] == PIPELINE_ID and tool["schema_version"] == TOOL_SCHEMA,
         "Unknown build tool",
@@ -601,14 +763,9 @@ def _tool(root):
     for version in runtime["packages"].values():
         _require(isinstance(version, str), "Invalid dependency versions")
         Version(version)
-    from ..orchestration.stage_transfer import TEAM_REPORTS, verify_transfer
-
     result = {"version": tool["version"], "source_sha256": tool["source_sha256"]}
-    # A delivery re-creates the structural-team report from its own receipt; the sealed
-    # native copy stays bound in the admitted capture.
-    provenance = verify_transfer(root, regenerated=TEAM_REPORTS)
-    if provenance is not None:
-        result["transfer"] = provenance
+    if native_receipts is not None:
+        result["transfer"] = _native_receipts_evidence(root, native_receipts)
     return result
 
 
@@ -720,10 +877,7 @@ def _axis(authored, record, components, child_datum):
     reference = authored["axis_reference"]
     _require(isinstance(reference, dict), "Moving joints require a structured native shaft reference")
     _require(record["component"] == reference["component"], "Shaft evidence names another occurrence")
-    if reference.get("kind") == "reference_axis":
-        point, direction = _reference_axis_line(reference, record, components)
-    else:
-        point, direction = _cylinder_axis_line(reference, record, components)
+    point, direction = _axis_line(authored, record, components)
     authored_axis = _vector(authored["axis"])
     _require(abs(float(np.linalg.norm(authored_axis)) - 1) < 1e-8, "Authored joint axis is not a unit vector")
     axis = child_datum[:3, :3] @ authored_axis
@@ -735,6 +889,15 @@ def _axis(authored, record, components, child_datum):
         f"Joint origin/axis misses the native shaft by {offset:.9g} m / {math.degrees(angle):.9g} deg",
     )
     return {"offset_m": offset, "angle_deg": math.degrees(angle), "positive_direction": "author_axis_in_child_datum"}
+
+
+def _axis_line(authored, record, components):
+    """The native shaft line of one moving joint in zero-pose world coordinates."""
+
+    reference = authored["axis_reference"]
+    if reference.get("kind") == "reference_axis":
+        return _reference_axis_line(reference, record, components)
+    return _cylinder_axis_line(reference, record, components)
 
 
 def _reference_axis_line(reference, record, components):
@@ -795,6 +958,99 @@ def _cylinder_axis_line(reference, record, components):
     return point, direction
 
 
+def _motion(authored, joints, components, body_datums, bodies, record):
+    """The motion.{joint} gate: non-zero follow re-derived from the native shaft line.
+
+    The motion owner re-derives, from the shaft evidence alone, where every
+    driven occurrence must be under positive and negative poses inside the
+    authored limits; the delivered graph is forward-kinematicked from its own
+    datums and signed axes.  A statically green delivery whose parent chain,
+    axis binding or frame relations are wrong diverges as soon as a pose is
+    non-zero.
+    """
+
+    from .motion import axis_rotation, evaluate_motion
+
+    name, child = authored["name"], authored["child"]
+    point, direction = _axis_line(authored, record, components)
+    limits = authored["limits"]
+    if authored["type"] == "continuous":
+        samples = (0.3, -0.4)
+    else:
+        middle = (float(limits["lower"]) + float(limits["upper"])) / 2
+        quarter = (float(limits["upper"]) - float(limits["lower"])) / 4
+        samples = (middle + quarter, middle - quarter)
+    parents = {joint["child"]: joint for joint in joints}
+    doc_bodies = [
+        {
+            "id": body["name"],
+            "group": body["name"],
+            "frame": body_datums[body["name"]].tolist(),
+            "leaves": [
+                {"id": component, "world": components[component].tolist()}
+                for component in body["components"]
+            ],
+        }
+        for body in bodies
+    ]
+    doc_joint = {
+        "id": name,
+        "type": authored["type"],
+        "parent": authored["parent"],
+        "child": child,
+        "axis_point": point.tolist(),
+        "axis_dir": direction.tolist(),
+        "stored_direction": direction.tolist(),
+        "limits": dict(limits),
+        "drive": {"effort": float(limits["effort"]), "velocity": float(limits["velocity"])},
+        "origin_parent_child": np.eye(4).ravel().tolist(),
+    }
+    interface = {
+        "name": "IF-" + name,
+        "on_parent": authored["parent"],
+        "on_child": child,
+        "axis_point": point.tolist(),
+        "axis_dir": direction.tolist(),
+    }
+
+    def model_transform(body_name, pose, memo):
+        if body_name in memo:
+            return memo[body_name]
+        if body_name not in parents:
+            value = body_datums[body_name]
+        else:
+            joint = parents[body_name]
+            offset = np.linalg.inv(body_datums[joint["parent"]]) @ body_datums[body_name]
+            if joint["name"] == name:
+                offset = offset.copy()
+                offset[:3, :3] = offset[:3, :3] @ axis_rotation(_vector(joint["axis"]), pose)
+            value = model_transform(joint["parent"], pose, memo) @ offset
+        memo[body_name] = value
+        return value
+
+    worst = 0.0
+    for pose in samples:
+        result = evaluate_motion(
+            bodies=doc_bodies, joints=[doc_joint], interface=interface, poses={name: pose}
+        )
+        _require(
+            result["interface"]["line_distance_m"] <= 1e-9 and result["interface"]["parallelism"] >= 1 - 1e-6,
+            f"{name}: the re-derived interface loses continuity at {pose:g}",
+        )
+        memo = {}
+        for body in bodies:
+            transform = model_transform(body["name"], pose, memo)
+            for component in body["components"]:
+                candidate = transform @ np.linalg.inv(body_datums[body["name"]]) @ components[component]
+                expected = np.asarray(result["world"][component], float)
+                worst = max(worst, float(np.max(np.abs(candidate - expected))))
+    _require(
+        worst <= POSITION_TOL_M,
+        f"{name}: the delivered graph diverges from the re-derived motion by {worst:.9g} m",
+    )
+    return {"samples": list(samples), "worst_m": worst}
+
+
 def _tree(document, base_pose):
     links = {node.attrib["name"] for node in document.findall("link")}
     edges = {}
@@ -832,8 +1088,8 @@ def _qualified_surface_only(root, occurrence: str) -> bool:
     """
 
     try:
-        record = read_data(confined(root / "evidence", "raw/effective_instances.json"))
-        mass_properties = read_data(confined(root / "evidence", "raw/mass_properties.json"))
+        record = evidence.effective_instances(root)
+        mass_properties = evidence.mass_properties(root)
     except (PipelineError, OSError, ValueError):
         return False
     if not isinstance(record, dict) or record.get("schema_version") != EFFECTIVE_INSTANCES_SCHEMA:
@@ -847,9 +1103,7 @@ def _qualified_surface_only(root, occurrence: str) -> bool:
     warnings = record.get("warnings")
     if not isinstance(warnings, list):
         return False
-    qualification = (
-        "cad_authored_effective_instance; not geometry-derived, not independently physically qualified"
-    )
+    qualification = "cad_authored_effective_instance; not geometry-derived, not independently physically qualified"
     qualified = False
     for item in warnings:
         if (
@@ -979,9 +1233,7 @@ def _geometry(root, body, node, model_link, geometry, components, body_pose, urd
             _same_pose(origin, native_pose)
         _same_pose(_pose(shape["xyz"], shape["rpy"]), native_pose)
         _require(
-            stats.volume > 1e-15
-            or occurrence in exclusions
-            or _qualified_surface_only(root, occurrence),
+            stats.volume > 1e-15 or occurrence in exclusions or _qualified_surface_only(root, occurrence),
             "Zero-volume geometry needs a documented exclusion",
         )
         points = stl.vertices(original)
@@ -1012,20 +1264,25 @@ def _geometry(root, body, node, model_link, geometry, components, body_pose, urd
     return used, world_points
 
 
-def evaluate_bundle(root: Path) -> dict:
-    """Recompute the quality report without reading the saved quality decision."""
+def evaluate_bundle(root: Path, *, native_receipts=None) -> dict:
+    """Recompute the quality report without reading the saved quality decision.
+
+    ``native_receipts`` are the immutable receipt bytes resolved by the
+    orchestration adapter; verification validates them independently and never
+    imports the store or treats a stored status as evidence.
+    """
     root = Path(root)
     diagnostics: list[dict] = []
     gates = _Gates()
     subject = gates.add("bundle.subject", lambda: {"sha256": subject_digest(root)})
     definition = gates.add("input.valid", lambda: _input(root, diagnostics))
-    gates.add("source.native_discovery", lambda: _native_discovery(root / "input", diagnostics))
-    gates.add("tool.identity", lambda: _tool(root))
-    manifest = gates.add("source.integrity", lambda: verify_snapshot(root / "evidence"))
+    gates.add("source.native_discovery", lambda: _native_discovery(root, diagnostics))
+    gates.add("tool.identity", lambda: _tool(root, native_receipts))
+    manifest = gates.add("source.integrity", lambda: read_delivery_manifest(root))
     if manifest is not None:
-        gates.add("source.native", lambda: _native(root, manifest))
+        gates.add("source.native", lambda: _native(root))
     model = gates.add("model.schema", lambda: _model(root))
-    raw = gates.add("source.raw", lambda: read_data(confined(root / "evidence", "raw/scene_raw.json")))
+    raw = gates.add("source.raw", lambda: evidence.scene(root))
     gates.add("physics.mass_closure_equality", lambda: _mass_closure_equality(root, definition))
     if definition is not None:
         gates.add("source.dependencies", lambda: _dependencies(root, definition))
@@ -1074,6 +1331,7 @@ def evaluate_bundle(root: Path) -> dict:
         "passed": bool(gates.checks) and all(check["passed"] for check in gates.checks),
         "checks": gates.checks,
         "required_checks": required,
+        "qualifications": qualifications(root, definition, gates.checks) if isinstance(definition, dict) else [],
         "diagnostics": diagnostics,
     }
 
@@ -1097,6 +1355,61 @@ def _model(root):
     return Robot.from_dict(read_data(confined(root, "model/robot.json"))).to_dict()
 
 
+#: The sealed records each qualification fact's conclusion is read from
+#: (relative to the delivery root): every fact binds the sealed input report and
+#: the delivered object record it was decided over.
+_QUALIFICATION_EVIDENCE = {
+    "physics.expected_mass": ("input/handoff.json", "model/robot.json"),
+    "geometry.expected_extent": ("input/handoff.json", "model/robot.json"),
+    "inertia": ("input/handoff.json", "model/robot.json"),
+    "geometry": ("input/handoff.json", "model/robot.json"),
+    "joints": ("input/handoff.json", "urdf/robot.urdf"),
+    "shafts": ("input/handoff.json", "urdf/robot.urdf"),
+    "frames": ("input/handoff.json", "model/robot.json"),
+}
+
+
+def qualifications(root, definition, checks):
+    """The qualification items of the quality report (IF-14).
+
+    Two objects of one fact stay two identities; an absent optional budget is
+    ``out_of_scope``; a fact whose gate did not establish its conclusion is
+    ``unqualified``.  Evidence references bind the sealed records the conclusion
+    is read from; when a required record is absent the item carries no evidence,
+    and the check boundary refuses it as ungrounded rather than downgrading it.
+    """
+
+    rows = {check["id"]: check for check in checks}
+    expectations = definition.get("checks") or {}
+    items = []
+    for fact in qualification_facts(definition):
+        fact_id = fact["fact_id"]
+        budget = {
+            "physics.expected_mass": "expected_mass_kg",
+            "geometry.expected_extent": "expected_extent_m",
+        }.get(fact_id)
+        if budget is not None and budget not in expectations:
+            status = "out_of_scope"
+        else:
+            row = rows.get(fact["check"])
+            status = "established" if row is not None and row["passed"] else "unqualified"
+        records = _QUALIFICATION_EVIDENCE.get(fact_id, ("input/handoff.json",))
+        evidence = []
+        if all((root / record).is_file() for record in records):
+            evidence = [{"record": record, "sha256": file_digest(root / record)} for record in records]
+        items.append(
+            {
+                "schema_version": QUALIFICATION_SCHEMA,
+                "fact_id": fact_id,
+                "scope": fact["scope"],
+                "object_id": fact["object_id"],
+                "status": status,
+                "evidence": evidence,
+            }
+        )
+    return items
+
+
 def _mass_closure_equality(root, definition=None):
     from .solidworks_physics import verify_urdf_mass_equality
 
@@ -1111,9 +1424,7 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
     gates.add("physics.independent", lambda: _physics(root, source, model, verify_physics))
     datums = gates.add(
         "frames.native",
-        lambda: {
-            name: _cad_pose(value) for name, value in read_data(root / "evidence/raw/coordinate_systems.json").items()
-        },
+        lambda: {name: _cad_pose(value) for name, value in evidence.datums(root).items()},
     )
     components = gates.add(
         "frames.components", lambda: {row["name"]: _cad_pose(row["transform"]) for row in raw["components"]}
@@ -1138,11 +1449,7 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
     joints = {node.attrib["name"]: node for node in document.findall("joint")}
     model_links = {link["name"]: link for link in model["links"]}
     model_joints = {joint["name"]: joint for joint in model["joints"]}
-    axes = (
-        read_data(root / "evidence/raw/axis_references.json")
-        if (root / "evidence/raw/axis_references.json").is_file()
-        else []
-    )
+    axes = evidence.axes(root)
     axis_map = {row["joint"]: row for row in axes}
     for authored in source["joints"]:
         name = authored["name"]
@@ -1154,17 +1461,20 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
             gates.add(
                 "shafts." + name, lambda a=authored: _axis(a, axis_map[a["name"]], components, body_datums[a["child"]])
             )
+            gates.add(
+                "motion." + name,
+                lambda a=authored: _motion(
+                    a, source["joints"], components, body_datums, source["bodies"], axis_map[a["name"]]
+                ),
+            )
     for frame in source.get("frames", []):
         gates.add("frames." + frame["name"], lambda f=frame: _frame(f, model, joints, links, datums, body_datums))
-    geometry_rows = read_data(confined(root / "evidence", "raw/geometry.json"))
+    geometry_rows = evidence.geometry(root)
     geometry = {row["component"]: row for row in geometry_rows}
     gates.add("geometry.coverage", lambda: _geometry_coverage(geometry_rows, components))
     points, used = [], []
     # ``checks`` is optional; omission means no documented exclusions.
-    exclusions = {
-        row["component"]
-        for row in (definition.get("checks") or {}).get("documented_exclusions", [])
-    }
+    exclusions = {row["component"] for row in (definition.get("checks") or {}).get("documented_exclusions", [])}
     for body in source["bodies"]:
         name = body["name"]
         gates.add("inertia." + name, lambda n=name: _link_physics(links[n], model_links[n]))
@@ -1215,9 +1525,6 @@ def _physics(root, source, model, verifier):
 
 def _policy(source, model):
     _require(model["name"] == source["robot_name"], "Canonical robot name differs from the author definition")
-    for key in ("actuators", "sensors", "constraints", "contact_excludes"):
-        _require(not model[key], f"v1 does not support {key}")
-    _require(not model.get("control") and not model.get("mechanical_drives"), "Unspecified canonical control extension")
     for key in ("joints", "frames"):
         actual = {(row["id"], row["name"]) for row in model[key]}
         expected = {(row["id"], row["name"]) for row in source.get(key, [])}
@@ -1281,9 +1588,9 @@ def _expectation_bounds(bounds):
     return list(bounds)
 
 
-def check_bundle(root: Path) -> dict:
+def check_bundle(root: Path, *, native_receipts=None) -> dict:
     """Recompute all gates and require an exact binding to the saved report."""
-    report = evaluate_bundle(root)
+    report = evaluate_bundle(root, native_receipts=native_receipts)
     try:
         saved = read_data(confined(Path(root), "reports/quality.json"))
         # The quality report is a JSON document: bind in the JSON data model so a

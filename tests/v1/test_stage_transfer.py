@@ -17,7 +17,7 @@ from packaging.utils import canonicalize_name
 from description_pipeline import __version__ as PIPELINE_VERSION
 from description_pipeline.build.archive import write_zip
 from description_pipeline.delivery import PIPELINE_ID
-from description_pipeline.io import PipelineError, canonical, digest, file_digest, write_json
+from description_pipeline.io import PipelineError, canonical, digest, file_digest, read_data, write_json
 from description_pipeline.orchestration import stage_transfer as transfer
 from description_pipeline.runtime import RUNTIME_VERSIONS, required_packages
 from description_pipeline.sources.snapshot import write_manifest
@@ -67,29 +67,29 @@ def stage_view(
 
 def capture_root(base: Path, *, run_id: str = RUN_ID, handoff: str = HANDOFF, main: str = MAIN_ASSEMBLY) -> Path:
     root = Path(base) / "capture"
-    (root / "input").mkdir(parents=True)
-    write_json(root / "input/robot.yaml", {"hardware_id": "robot"})
-    (root / "input" / main).write_bytes(b"CAD-BYTES")
+    (root / "input" / "cad").mkdir(parents=True)
+    (root / "input" / "cad" / main).write_bytes(b"CAD-BYTES")
+    native_files = {main: file_digest(root / "input" / "cad" / main)}
     write_json(
-        root / "input/discovery/native-discovery.json",
+        root / "evidence/discovery.json",
         {
             "identity": {"main_assembly": main},
             "handoff_sha256": handoff,
-            "native_files": {main: file_digest(root / "input" / main)},
+            "native_files": native_files,
+            "findings": [],
+            "robot_name": "robot",
         },
     )
-    package_files = {
-        name: file_digest(root / "input" / name) for name in ("robot.yaml", main, "discovery/native-discovery.json")
-    }
+    package_files = {"cad/" + main: native_files[main]}
     write_json(
-        root / "reports/input.json",
+        root / "input/handoff.json",
         {
             "passed": True,
-            "input_receipt": {
-                "inventory": [{"path": name, "sha256": sha} for name, sha in sorted(package_files.items())]
-            },
+            "input_receipt": {"inventory": dict(sorted(native_files.items()))},
             "cad_revision": {"revision": "r1"},
-            "package_files": package_files,
+            "package_files": dict(sorted(package_files.items())),
+            "main_assembly": main,
+            "configuration": "Default",
         },
     )
     evidence = root / "evidence"
@@ -98,7 +98,11 @@ def capture_root(base: Path, *, run_id: str = RUN_ID, handoff: str = HANDOFF, ma
     write_json(evidence / "raw/scene_raw.json", {"components": [], "mates": []})
     write_json(evidence / "raw/source_config.json", {})
     (evidence / "evidence").mkdir()
-    identity = {"provider": "solidworks", "assembly": str(root / "input" / main), "dependency_digest": "c" * 64}
+    identity = {
+        "provider": "solidworks",
+        "assembly": str(root / "input" / "cad" / main),
+        "dependency_digest": "c" * 64,
+    }
     write_json(
         evidence / "evidence/collection.json",
         {
@@ -233,7 +237,7 @@ class StageTransferTests(unittest.TestCase):
         self.assertEqual(manifest["run_id"], RUN_ID)
         self.assertEqual(manifest["file_count"], len(manifest["files"]))
         self.assertEqual(manifest["native_stage_scope"], list(transfer.NATIVE_STAGE_SCOPE))
-        self.assertEqual(manifest["main_assembly_sha256"], manifest["files"]["input/" + MAIN_ASSEMBLY])
+        self.assertEqual(manifest["main_assembly_sha256"], manifest["files"]["input/cad/" + MAIN_ASSEMBLY])
 
         destination = self.base / "admitted"
         admitted = admit(self.archive, destination)
@@ -324,10 +328,10 @@ class StageTransferTests(unittest.TestCase):
     def test_edited_or_replaced_member_bytes_are_refused(self) -> None:
         seal(self.root, self.archive)
         with zipfile.ZipFile(self.archive) as archive:
-            original = archive.read("reports/input.json")
+            original = archive.read("input/handoff.json")
         broken = self.base / "edited.zip"
         # Same length so the size invariant still holds and the content hash is what rejects it.
-        raw_copy(self.archive, broken, replace={"reports/input.json": b"X" * len(original)})
+        raw_copy(self.archive, broken, replace={"input/handoff.json": b"X" * len(original)})
         with self.assertRaisesRegex(PipelineError, "hash differs"):
             admit(broken, self.base / "out-edited")
 
@@ -370,10 +374,10 @@ class StageTransferTests(unittest.TestCase):
     def test_self_consistent_input_report_tamper_is_refused(self) -> None:
         seal(self.root, self.archive)
         with zipfile.ZipFile(self.archive) as source:
-            report = json.loads(source.read("reports/input.json"))
+            report = json.loads(source.read("input/handoff.json"))
         report["passed"] = False
         broken = self.base / "input.zip"
-        repack(self.archive, broken, {"reports/input.json": canonical(report)})
+        repack(self.archive, broken, {"input/handoff.json": canonical(report)})
         with self.assertRaisesRegex(PipelineError, "Input report did not pass"):
             admit(broken, self.base / "out-input")
 
@@ -381,15 +385,15 @@ class StageTransferTests(unittest.TestCase):
         seal(self.root, self.archive)
         replacement = b"OTHER-BYTES"
         with zipfile.ZipFile(self.archive) as source:
-            report = json.loads(source.read("reports/input.json"))
-        report["package_files"][MAIN_ASSEMBLY] = hashlib.sha256(replacement).hexdigest()
+            report = json.loads(source.read("input/handoff.json"))
+        report["input_receipt"]["inventory"][MAIN_ASSEMBLY] = hashlib.sha256(replacement).hexdigest()
         broken = self.base / "main.zip"
         repack(
             self.archive,
             broken,
             {
-                "input/" + MAIN_ASSEMBLY: replacement,
-                "reports/input.json": canonical(report),
+                "input/cad/" + MAIN_ASSEMBLY: replacement,
+                "input/handoff.json": canonical(report),
             },
         )
         # The archive is fully self-consistent; only the native discovery inventory still names
@@ -400,34 +404,27 @@ class StageTransferTests(unittest.TestCase):
     def test_native_discovery_binding_is_enforced(self) -> None:
         seal(self.root, self.archive)
         with zipfile.ZipFile(self.archive) as source:
-            record = json.loads(source.read("input/discovery/native-discovery.json"))
-            report = json.loads(source.read("reports/input.json"))
+            record = json.loads(source.read("evidence/discovery.json"))
 
         renamed = {**record, "identity": {**record["identity"], "main_assembly": "other.SLDASM"}}
-        renamed_bytes = canonical(renamed)
-        report["package_files"]["discovery/native-discovery.json"] = hashlib.sha256(renamed_bytes).hexdigest()
         broken = self.base / "discovery-name.zip"
         repack(
             self.archive,
             broken,
             {
-                "input/discovery/native-discovery.json": renamed_bytes,
-                "reports/input.json": canonical(report),
+                "evidence/discovery.json": canonical(renamed),
             },
         )
         with self.assertRaisesRegex(PipelineError, "opened another main assembly"):
             admit(broken, self.base / "out-discovery-name")
 
         rebased = {**record, "handoff_sha256": "b" * 64}
-        rebased_bytes = canonical(rebased)
-        report["package_files"]["discovery/native-discovery.json"] = hashlib.sha256(rebased_bytes).hexdigest()
         broken = self.base / "discovery-handoff.zip"
         repack(
             self.archive,
             broken,
             {
-                "input/discovery/native-discovery.json": rebased_bytes,
-                "reports/input.json": canonical(report),
+                "evidence/discovery.json": canonical(rebased),
             },
         )
         with self.assertRaisesRegex(PipelineError, "bound to another handoff"):
@@ -435,7 +432,7 @@ class StageTransferTests(unittest.TestCase):
 
     def test_structural_zip_tamper_is_refused(self) -> None:
         seal(self.root, self.archive)
-        duplicate = zipfile.ZipInfo("Reports/Input.json")
+        duplicate = zipfile.ZipInfo("Input/Handoff.json")
         duplicate.create_system = 3
         duplicate.external_attr = 0o644 << 16
         link = zipfile.ZipInfo("reports/link.json")
@@ -497,9 +494,9 @@ class StageTransferTests(unittest.TestCase):
     def test_seal_rejects_inconsistent_capture_roots(self) -> None:
         cases = []
 
-        input_report = json.loads((self.root / "reports/input.json").read_text(encoding="utf-8"))
+        input_report = json.loads((self.root / "input/handoff.json").read_text(encoding="utf-8"))
         input_report["passed"] = False
-        cases.append(("input-failed", input_report, "reports/input.json", "Input report did not pass"))
+        cases.append(("input-failed", input_report, "input/handoff.json", "Input report did not pass"))
 
         portable = {**native_tool(), "runtime": {"role": "portable"}}
         cases.append(("portable-tool", portable, "reports/native-tool.json", "runtime.role", portable))
@@ -522,7 +519,7 @@ class StageTransferTests(unittest.TestCase):
                     seal(root, self.base / f"{label}.zip", **({"native_tool": tool} if tool else {}))
 
     def test_seal_rejects_changed_archived_input(self) -> None:
-        (self.root / "input" / MAIN_ASSEMBLY).write_bytes(b"CHANGED")
+        (self.root / "input" / "cad" / MAIN_ASSEMBLY).write_bytes(b"CHANGED")
         with self.assertRaisesRegex(PipelineError, "Archived input differs"):
             seal(self.root, self.archive)
 
@@ -535,13 +532,17 @@ class StageTransferTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "missing"):
             admit(self.base / "absent.zip", self.base / "out-absent")
 
-    def test_live_receipts_are_ignored_at_seal_and_never_transferred(self) -> None:
+    def test_live_receipts_are_ignored_at_seal_and_stray_receipts_are_refused(self) -> None:
         write_json(self.root / "reports/stages.json", stage_view())
-        write_json(self.root / "reports/run.json", {"run_id": RUN_ID})
         manifest = seal(self.root, self.archive)
         self.assertNotIn("reports/stages.json", manifest["files"])
-        self.assertNotIn("reports/run.json", manifest["files"])
         self.assertIn("reports/native-stages.json", manifest["files"])
+
+        # A stray legacy receipt is an unknown member now: the closed payload
+        # inventory refuses it instead of silently ignoring it.
+        write_json(self.root / "reports/run.json", {"run_id": RUN_ID})
+        with self.assertRaisesRegex(PipelineError, "outside the transfer payload"):
+            seal(self.root, self.base / "stray-receipt.zip")
 
         broken = self.base / "live.zip"
         repack(self.archive, broken, {"reports/run.json": b"{}"})
@@ -551,9 +552,9 @@ class StageTransferTests(unittest.TestCase):
     def test_streaming_large_member_roundtrips(self) -> None:
         payload = b"x" * (4 * 1024 * 1024)
         (self.root / "input/big.bin").write_bytes(payload)
-        report = json.loads((self.root / "reports/input.json").read_text(encoding="utf-8"))
+        report = json.loads((self.root / "input/handoff.json").read_text(encoding="utf-8"))
         report["package_files"]["big.bin"] = hashlib.sha256(payload).hexdigest()
-        write_json(self.root / "reports/input.json", report)
+        write_json(self.root / "input/handoff.json", report)
 
         manifest = seal(self.root, self.archive)
         self.assertEqual(manifest["files"]["input/big.bin"], hashlib.sha256(payload).hexdigest())
@@ -579,8 +580,13 @@ class StageTransferTests(unittest.TestCase):
             ("python", {"runtime": {**native_tool()["runtime"], "python": "3.11.9"}}, "Python 3.12"),
             (
                 "pin",
-                {"runtime": {**native_tool()["runtime"], "packages": {"numpy": "0.0.1"}}},
-                "pin numpy",
+                {
+                    "runtime": {
+                        **native_tool()["runtime"],
+                        "packages": {required_packages("native")[0]: "0.0.1"},
+                    }
+                },
+                f"pin {required_packages('native')[0]}",
             ),
             (
                 "mujoco",
@@ -665,34 +671,34 @@ class StageTransferTests(unittest.TestCase):
             freeze(config, snapshot, backend=backend, worker_version="test-worker")
 
             capture = self.base / "real-capture"
-            (capture / "input").mkdir(parents=True)
-            write_json(capture / "input/robot.yaml", {"hardware_id": "robot"})
-            shutil.copyfile(assembly, capture / "input" / assembly.name)
+            (capture / "input" / "cad").mkdir(parents=True)
+            shutil.copyfile(assembly, capture / "input" / "cad" / assembly.name)
             shutil.copytree(snapshot, capture / "evidence")
             native_files = {
                 name: file_digest(work / "cad" / name) for name in ("robot.SLDASM", "base.SLDPRT", "arm.SLDPRT")
             }
             write_json(
-                capture / "input/discovery/native-discovery.json",
+                capture / "evidence/discovery.json",
                 {
                     "identity": {"main_assembly": assembly.name},
                     "handoff_sha256": HANDOFF,
                     "native_files": native_files,
                 },
             )
-            package_files = {
-                name: file_digest(capture / "input" / name)
-                for name in ("robot.yaml", assembly.name, "discovery/native-discovery.json")
-            }
+            manifest = read_data(capture / "evidence" / "manifest.json")
+            manifest["files"]["discovery.json"] = file_digest(capture / "evidence" / "discovery.json")
+            manifest["files"] = dict(sorted(manifest["files"].items()))
+            write_json(capture / "evidence" / "manifest.json", manifest)
+            package_files = {"cad/" + assembly.name: file_digest(capture / "input" / "cad" / assembly.name)}
             write_json(
-                capture / "reports/input.json",
+                capture / "input/handoff.json",
                 {
                     "passed": True,
-                    "input_receipt": {
-                        "inventory": [{"path": name, "sha256": sha} for name, sha in sorted(package_files.items())]
-                    },
+                    "input_receipt": {"inventory": {assembly.name: package_files["cad/" + assembly.name]}},
                     "cad_revision": {"revision": "r1"},
-                    "package_files": package_files,
+                    "package_files": dict(sorted(package_files.items())),
+                    "main_assembly": assembly.name,
+                    "configuration": "Default",
                 },
             )
             write_json(capture / "reports/native-tool.json", native_tool())
@@ -708,14 +714,14 @@ class StageTransferTests(unittest.TestCase):
         finally:
             support.cleanup(work)
 
-    def test_publisher_copies_the_native_provenance_files(self) -> None:
+    def test_publisher_keeps_native_receipts_out_of_the_model_repo(self) -> None:
         from description_pipeline.repository.urdf_pr import _copy_governed
 
         bundle = self.base / "publish-bundle"
         for name in ("input", "evidence", "model", "urdf", "meshes"):
             (bundle / name).mkdir(parents=True)
         (bundle / "README.md").write_text("delivery\n", encoding="utf-8")
-        write_json(bundle / "reports/input.json", {"passed": True})
+        write_json(bundle / "input/handoff.json", {"passed": True})
         write_json(bundle / "reports/tool.json", {"role": "portable"})
         write_json(bundle / "reports/quality.json", {"passed": True})
         write_json(bundle / "reports/native-tool.json", native_tool())
@@ -724,44 +730,44 @@ class StageTransferTests(unittest.TestCase):
 
         worktree = self.base / "publish-worktree"
         _copy_governed(bundle, worktree)
-        self.assertTrue((worktree / "reports/native-tool.json").is_file())
-        self.assertTrue((worktree / "reports/native-stages.json").is_file())
-        self.assertTrue((worktree / transfer.CAPTURE_MANIFEST).is_file())
+        # Receipts live in platform run storage; they never enter the model repo.
+        self.assertFalse((worktree / "reports/native-tool.json").exists())
+        self.assertFalse((worktree / "reports/native-stages.json").exists())
+        self.assertFalse((worktree / transfer.CAPTURE_MANIFEST).exists())
 
         neutral = self.base / "neutral-bundle"
         for name in ("input", "evidence", "model", "urdf", "meshes"):
             (neutral / name).mkdir(parents=True)
         (neutral / "README.md").write_text("delivery\n", encoding="utf-8")
-        write_json(neutral / "reports/input.json", {"passed": True})
+        write_json(neutral / "input/handoff.json", {"passed": True})
         write_json(neutral / "reports/tool.json", {"role": "portable"})
         neutral_worktree = self.base / "neutral-worktree"
         _copy_governed(neutral, neutral_worktree)
         self.assertFalse((neutral_worktree / "reports/native-tool.json").exists())
         self.assertFalse((neutral_worktree / transfer.CAPTURE_MANIFEST).exists())
 
-    def test_subject_includes_transfer_provenance_only_as_a_complete_triplet(self) -> None:
-        from description_pipeline.delivery import subject_digest, subject_inventory
+    def test_transfer_receipts_never_enter_the_delivery_subject(self) -> None:
+        from description_pipeline.delivery import check_layout, subject_inventory
 
         bundle = self.base / "subject-bundle"
         for name in ("input", "evidence", "model", "urdf", "meshes"):
             (bundle / name).mkdir(parents=True)
         (bundle / "README.md").write_text("delivery\n", encoding="utf-8")
-        write_json(bundle / "reports/input.json", {"passed": True})
-        write_json(bundle / "reports/tool.json", {"role": "portable"})
+        write_json(bundle / "input/handoff.json", {"passed": True})
+        write_json(bundle / "tool.json", {"role": "portable"})
 
-        neutral = subject_inventory(bundle)  # no transfer files: neutral fixtures stay valid
-        self.assertNotIn(transfer.CAPTURE_MANIFEST, neutral)
+        subject = subject_inventory(bundle)  # the target subject carries tool.json only
+        self.assertIn("tool.json", subject)
 
         write_json(bundle / "reports/native-tool.json", native_tool())
-        with self.assertRaisesRegex(PipelineError, "provenance is incomplete"):
-            subject_inventory(bundle)
-
         write_json(bundle / "reports/native-stages.json", stage_view())
         write_json(bundle / transfer.CAPTURE_MANIFEST, {"schema_version": transfer.TRANSFER_SCHEMA})
-        complete = subject_inventory(bundle)
         for name in ("reports/native-tool.json", "reports/native-stages.json", transfer.CAPTURE_MANIFEST):
-            self.assertIn(name, complete)
-        self.assertNotEqual(subject_digest(bundle), digest(neutral))
+            self.assertNotIn(name, subject)
+        self.assertEqual(subject_inventory(bundle), subject)  # receipts never bind into the subject
+        (bundle / "README.md").unlink()
+        with self.assertRaisesRegex(PipelineError, "Unregistered delivery"):
+            check_layout(bundle)
 
     def test_verify_transfer_gate_revalidates_resealed_deliveries(self) -> None:
         seal(self.root, self.archive)
@@ -811,13 +817,13 @@ class StageTransferTests(unittest.TestCase):
 
         remade = bundle("gate-main")
         replacement = b"OTHER-BYTES"
-        report = json.loads((remade / "reports/input.json").read_text(encoding="utf-8"))
-        report["package_files"][MAIN_ASSEMBLY] = hashlib.sha256(replacement).hexdigest()
+        report = json.loads((remade / "input/handoff.json").read_text(encoding="utf-8"))
+        report["input_receipt"]["inventory"][MAIN_ASSEMBLY] = hashlib.sha256(replacement).hexdigest()
         reseal(
             remade,
             {
-                "input/" + MAIN_ASSEMBLY: replacement,
-                "reports/input.json": canonical(report),
+                "input/cad/" + MAIN_ASSEMBLY: replacement,
+                "input/handoff.json": canonical(report),
             },
         )
         with self.assertRaisesRegex(PipelineError, "native file inventory"):
@@ -897,10 +903,18 @@ class StageTransferTests(unittest.TestCase):
         admit(archive, destination)
         self.assertEqual(transfer.verify_transfer(destination)["main_assembly"], MAIN_ASSEMBLY)
 
-    def test_git_attributes_protect_the_transfer_sidecar(self) -> None:
+    def test_git_attributes_protect_the_delivered_bytes(self) -> None:
         from description_pipeline.repository.urdf_pr import GIT_ATTRIBUTES
 
-        self.assertIn(b"/transfer-manifest.json -text -filter -working-tree-encoding\n", GIT_ATTRIBUTES)
+        for line in (
+            b"/manifest.json -text -filter -working-tree-encoding\n",
+            b"/input/** -text -filter -working-tree-encoding\n",
+            b"/reports/** -text -filter -working-tree-encoding\n",
+            b"/tool.json -text -filter -working-tree-encoding\n",
+        ):
+            self.assertIn(line, GIT_ATTRIBUTES)
+        # Transfer receipts stay in platform run storage; nothing protects them in the repo.
+        self.assertNotIn(b"transfer-manifest", GIT_ATTRIBUTES)
         if shutil.which("git") is None:
             self.skipTest("git is unavailable")
         repo = self.base / "attr-repo"
@@ -908,9 +922,9 @@ class StageTransferTests(unittest.TestCase):
         subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
         subprocess.run(["git", "-C", str(repo), "config", "core.autocrlf", "true"], check=True, capture_output=True)
         (repo / ".gitattributes").write_bytes(GIT_ATTRIBUTES)
-        (repo / "transfer-manifest.json").write_bytes(b"{}\n")
+        (repo / "tool.json").write_bytes(b"{}\n")
         (repo / "reports").mkdir()
-        (repo / "reports/native-tool.json").write_bytes(b"{}\n")
+        (repo / "reports/quality.json").write_bytes(b"{}\n")
         result = subprocess.run(
             [
                 "git",
@@ -921,8 +935,8 @@ class StageTransferTests(unittest.TestCase):
                 "filter",
                 "working-tree-encoding",
                 "--",
-                "transfer-manifest.json",
-                "reports/native-tool.json",
+                "tool.json",
+                "reports/quality.json",
             ],
             check=True,
             capture_output=True,

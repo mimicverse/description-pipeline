@@ -16,7 +16,7 @@ class StructuralReportTests(unittest.TestCase):
             (root / "urdf").mkdir()
             (root / "urdf/robot.urdf").write_text('<robot name="cad"/>')
             write_json(
-                root / "input/discovery/findings.json",
+                root / "evidence/discovery.json",
                 {
                     "findings": [
                         {
@@ -74,8 +74,8 @@ class StructuralReportTests(unittest.TestCase):
     def test_unreadable_evidence_is_reported_without_masking_the_original_failure(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "reports").mkdir()
-            (root / "reports/input.json").write_text("{invalid json")
+            (root / "input").mkdir()
+            (root / "input/handoff.json").write_text("{invalid json")
             pins = write_structural_report(root, {"error": "original native failure"}, evidence_root=root)
             data = json.loads((root / pins["json"]["path"]).read_text())
             self.assertIn("report.evidence_unreadable", [item["code"] for item in data["findings"]])

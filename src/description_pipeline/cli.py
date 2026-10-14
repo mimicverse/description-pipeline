@@ -12,11 +12,10 @@ from .io import PipelineError, pin_utf8_streams, write_json
 
 
 def _write_report(path: Path, result: dict, bundle: Path) -> None:
-    """Recomputed reports must never overwrite delivered subject files."""
+    """Recomputed reports are maintenance output: only outside the delivery."""
 
-    destination, bundle = path.resolve(), bundle.resolve()
-    if destination.is_relative_to(bundle) and destination != bundle / "reports/quality.json":
-        raise PipelineError("Write reports outside the delivery; only reports/quality.json may be updated inside it")
+    if path.resolve().is_relative_to(bundle.resolve()):
+        raise PipelineError("Write reports outside the delivery; delivered bytes are never rewritten")
     write_json(path, result)
 
 
@@ -33,14 +32,6 @@ def parser() -> argparse.ArgumentParser:
     rebuild = operations.add_parser("rebuild", help="regenerate a verified frozen bundle without SolidWorks")
     rebuild.add_argument("bundle", type=Path)
     rebuild.add_argument("--output", type=Path, required=True)
-    rebuild.add_argument("--repository", type=Path)
-    rebuild.add_argument("--base")
-    rebuild.add_argument("--message")
-    submit = operations.add_parser("submit", help="recheck and submit a frozen delivery on Linux")
-    submit.add_argument("bundle", type=Path)
-    submit.add_argument("--repository", type=Path, required=True)
-    submit.add_argument("--base")
-    submit.add_argument("--message")
     serve = operations.add_parser("serve", help="run the authenticated Windows endpoint used by Apache Airflow")
     serve.add_argument("--config", type=Path, required=True)
     operations.add_parser("doctor", help="check this host's native or portable runtime")
@@ -66,22 +57,7 @@ def main(argv: list[str] | None = None) -> int:
             from . import solidworks
 
             if arguments.operation == "rebuild":
-                if arguments.base and not arguments.repository:
-                    raise PipelineError("--base requires --repository")
-                result = solidworks.rebuild(
-                    arguments.bundle,
-                    arguments.output,
-                    repository=arguments.repository,
-                    base=arguments.base,
-                    message=arguments.message,
-                )
-            elif arguments.operation == "submit":
-                result = solidworks.submit(
-                    arguments.bundle,
-                    arguments.repository,
-                    base=arguments.base,
-                    message=arguments.message,
-                )
+                result = solidworks.rebuild(arguments.bundle, arguments.output)
             else:
                 result = solidworks.doctor()
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))

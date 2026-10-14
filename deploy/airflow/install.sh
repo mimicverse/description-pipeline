@@ -10,6 +10,10 @@
 #
 # Rerunning is safe: the existing Fernet key and [api_auth] jwt_secret in
 # $AIRFLOW_HOME/airflow.cfg are preserved (see render_config.py).
+#
+#   install.sh --stage:  build and verify the generation's runtime only (venv, hash-locked
+#                        dependencies, doctor); no configuration switch and no migration -
+#                        the stage half of the promote protocol.  Other arguments are ignored.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -19,6 +23,7 @@ die() { echo "install.sh: $*" >&2; exit 1; }
 : "${AIRFLOW_HOME:?set AIRFLOW_HOME to the Airflow home directory}"
 : "${PIPELINE_WHEEL:?set PIPELINE_WHEEL to the built mimicverse_description wheel}"
 : "${AIRFLOW_DB_URL:?set AIRFLOW_DB_URL to the dedicated PostgreSQL DSN}"
+: "${AIRFLOW_RUNTIME_DB_URL:?set AIRFLOW_RUNTIME_DB_URL to the least-privilege runtime DSN}"
 : "${AIRFLOW_API_PORT:?set AIRFLOW_API_PORT to the Airflow api-server loopback port}"
 
 for pair in "AIRFLOW_VENV:$AIRFLOW_VENV" "AIRFLOW_HOME:$AIRFLOW_HOME" "PIPELINE_WHEEL:$PIPELINE_WHEEL"; do
@@ -59,11 +64,24 @@ fi
 # installing configuration or migrating the service database.
 "$AIRFLOW_VENV/bin/description" doctor
 
+if [ "${1:-}" = "--stage" ]; then
+  echo "Airflow runtime staged (no configuration switch, no migration): $("$AIRFLOW_VENV/bin/airflow" version)"
+  exit 0
+fi
+
 # Atomic 0600 config; preserves previously generated Fernet/JWT secrets on rerun.
 AIRFLOW_DB_URL="$AIRFLOW_DB_URL" AIRFLOW_API_PORT="$AIRFLOW_API_PORT" "$AIRFLOW_VENV/bin/python" "$HERE/render_config.py" \
   --home "$AIRFLOW_HOME" --venv "$AIRFLOW_VENV" \
   --template "$HERE/airflow.cfg.template" --dags-folder "$HERE/dags"
 
 AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/airflow" db migrate
+# The native stage waits on this pool (six-stage contract / IF-02): create it
+# idempotently so the first run cannot fail on a missing pool.
+AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$HERE/scripts/ensure_pool.py"
+# The migration above ran under the install identity (DDL inside the airflow schema only);
+# the persisted service configuration carries the least-privilege runtime identity.
+AIRFLOW_DB_URL="$AIRFLOW_RUNTIME_DB_URL" AIRFLOW_API_PORT="$AIRFLOW_API_PORT" "$AIRFLOW_VENV/bin/python" "$HERE/render_config.py" \
+  --home "$AIRFLOW_HOME" --venv "$AIRFLOW_VENV" \
+  --template "$HERE/airflow.cfg.template" --dags-folder "$HERE/dags"
 # Installation preserves admission state. Only operatorctl start opens the DAG.
 echo "Airflow installed: $("$AIRFLOW_VENV/bin/airflow" version), home=$AIRFLOW_HOME"

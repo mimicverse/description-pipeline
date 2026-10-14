@@ -124,22 +124,18 @@ class DagTests(unittest.TestCase):
             {
                 "resolve_handoff",
                 "start_job",
-                "wait_for_job",
                 "fetch_capture",
                 "run_generate",
                 "run_verify",
                 "run_publish",
-                "confirm_job",
             },
         )
         edges = {task_id: set(task.upstream_task_ids) for task_id, task in dag.task_dict.items()}
         self.assertEqual(edges["start_job"], {"resolve_handoff"})
-        self.assertEqual(edges["wait_for_job"], {"start_job"})
-        self.assertEqual(edges["fetch_capture"], {"start_job", "wait_for_job"})
+        self.assertEqual(edges["fetch_capture"], {"resolve_handoff", "start_job"})
         self.assertEqual(edges["run_generate"], {"fetch_capture"})
         self.assertEqual(edges["run_verify"], {"run_generate"})
         self.assertEqual(edges["run_publish"], {"run_verify"})
-        self.assertEqual(edges["confirm_job"], {"run_publish"})
         self.assertEqual(
             set(dag.params), {"handoff_path", "main_assembly", "target_hardware", "change_summary"}
         )
@@ -260,17 +256,17 @@ class DagTests(unittest.TestCase):
             }
             with patch.dict(os.environ, {"AIRFLOW_CONN_SOLIDWORKS_WINDOWS": connection}):
                 started = dag.task_dict["start_job"].python_callable(request)
-                self.assertIn(started["status"], {"queued", "running"})
+                self.assertFalse(started)  # first poke submits; the reschedule poll continues
                 polled = False
                 for _ in range(8):
-                    if module._poke(started):
+                    if module._poke(request):
                         polled = True
                         break
                 self.assertTrue(polled)
                 with self.assertRaises(AirflowFailException):
                     # The portable half only starts from the native_complete boundary;
                     # the full split is covered by test_split_workflow/test_linux_split.
-                    dag.task_dict["fetch_capture"].python_callable(started)
+                    dag.task_dict["fetch_capture"].python_callable(request)
             self.assertEqual(len(server.jobs), 1)
             job = next(iter(server.jobs.values()))
             self.assertEqual(
@@ -348,7 +344,7 @@ class DagTests(unittest.TestCase):
             }
             with patch.dict(os.environ, {"AIRFLOW_CONN_SOLIDWORKS_WINDOWS": connection}):
                 started = dag.task_dict["start_job"].python_callable(request)
-                self.assertIn(started["status"], {"queued", "running"})
+                self.assertFalse(started)  # first poke submits; the reschedule poll continues
             self.assertEqual(len(server.jobs), 1)
             job = next(iter(server.jobs.values()))
             self.assertEqual(
@@ -385,7 +381,10 @@ class DagTests(unittest.TestCase):
 
         class Stub:
             def get_job(self, run_id):
-                return parent_job
+                if run_id == parent_run_id:
+                    # resolve_handoff reads the retained parent selection first.
+                    return parent_job
+                raise module.EndpointNotFound("child job is not created yet")
 
             def start_staging_job(self, **kwargs):
                 submitted.update(kwargs)
@@ -418,7 +417,7 @@ class DagTests(unittest.TestCase):
             self.assertEqual(request["main_assembly"], "3.0 总装1008.SLDASM")
             self.assertEqual(request["resume"], {"parent_run": parent_run_id, "from_stage": "capture"})
             started = dag.task_dict["start_job"].python_callable(request)
-        self.assertEqual(started["status"], "queued")
+        self.assertFalse(started)  # submission happened; the reschedule poll continues
         self.assertEqual(
             submitted,
             {

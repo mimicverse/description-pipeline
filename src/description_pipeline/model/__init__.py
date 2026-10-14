@@ -32,7 +32,7 @@ class Robot:
 
     def _validate(self) -> None:
         data = self._data
-        for key in ("links", "joints", "frames", "actuators", "sensors"):
+        for key in ("links", "joints", "frames"):
             for field in ("id", "name"):
                 values = [obj[field] for obj in data[key]]
                 if len(values) != len(set(values)):
@@ -63,7 +63,7 @@ class Robot:
             if joint["parent"] not in links or joint["child"] not in links:
                 raise PipelineError(f"Unknown joint endpoint: {joint['name']}")
             if joint["child"] in children:
-                raise PipelineError(f"Multiple parent joints: {joint['child']}; use explicit constraints")
+                raise PipelineError(f"Multiple parent joints: {joint['child']}")
             children.add(joint["child"])
             graph[joint["parent"]].append(joint["child"])
             if joint["type"] != "fixed":
@@ -103,41 +103,9 @@ class Robot:
                     raise PipelineError("Cyclic mimic dependency")
                 seen.add(reference)
                 reference = mimic[reference]
-        for actuator in data["actuators"]:
-            if actuator["joint"] not in moving:
-                raise PipelineError(f"Unknown actuator joint: {actuator['joint']}")
-            if actuator["gear"] == 0 or actuator["control_range"][0] >= actuator["control_range"][1]:
-                raise PipelineError("Actuator requires nonzero gear and an ordered control range")
-        drives = data.get("mechanical_drives")
-        if drives is not None:
-            if set(drives) != moving:
-                raise PipelineError("Mechanical drives require all movable canonical joint names, not source ids")
-            identities = [drive["id"] for drive in drives.values() if drive["kind"] == "active"]
-            if len(identities) != len(set(identities)):
-                raise PipelineError("Duplicate mechanical drive identity")
-            if any(drives[item["joint"]]["kind"] == "passive" for item in data["actuators"]):
-                raise PipelineError("A passive mechanical joint cannot declare a simulated actuator")
-            joints_by_name = {joint["name"]: joint for joint in data["joints"]}
-            for name, drive in drives.items():
-                if drive["kind"] != "active":
-                    continue
-                joint = joints_by_name[name]
-                stator, rotor = set(drive["stator"]), set(drive["rotor"])
-                parent = set(links[joint["parent"]]["provenance"].get("source_entities", []))
-                child = set(links[joint["child"]]["provenance"].get("source_entities", []))
-                if stator & rotor or not stator <= parent or not rotor <= child:
-                    raise PipelineError(
-                        f"Mechanical drive {name}: stator/rotor must belong to parent/child source instances"
-                    )
         for frame in data["frames"]:
             if frame["parent"] not in links:
                 raise PipelineError(f"Unknown frame parent: {frame['parent']}")
-        for sensor in data["sensors"]:
-            if sensor["frame"] not in frame_names:
-                raise PipelineError(f"Unknown sensor frame: {sensor['frame']}")
-        for pair in data["contact_excludes"]:
-            if pair["body1"] not in links or pair["body2"] not in links:
-                raise PipelineError("Unknown body in contact exclusion")
 
 
 def validate_scene_schema(data: dict) -> None:

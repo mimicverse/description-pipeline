@@ -305,12 +305,18 @@ def submission_identity(
             if isinstance(previous, dict) and isinstance(previous.get("revision"), str):
                 parent = previous["revision"]
     owner = principal if isinstance(principal, str) and principal.strip() else None
+    from ..interface_records import RESOURCE_POLICY_V1, resource_policy_v1_digest
+
     return {
         "hardware_id": target,
         "owner": owner,
         "change_summary": summary or None,
         "parent_revision": parent,
         "as_of": as_of,
+        "resource_policy": {
+            "schema_version": RESOURCE_POLICY_V1["schema_version"],
+            "digest": resource_policy_v1_digest(),
+        },
     }
 
 

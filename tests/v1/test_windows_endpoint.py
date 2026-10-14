@@ -50,7 +50,6 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
 
         def runner(package, output, **kwargs):
             calls.append({"package": Path(package), **kwargs})
-            self.assertEqual("capture", kwargs["stop_after"])
             self.assertEqual(MAIN, kwargs["main_assembly"])
             self.assertTrue(Path(package).is_dir())
             return self.capture_transfer_result(output, run_id=kwargs["run_id"], on_event=kwargs.get("on_event"))

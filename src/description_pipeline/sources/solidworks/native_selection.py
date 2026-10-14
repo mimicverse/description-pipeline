@@ -587,12 +587,19 @@ class NativeSelectionReader:
     session is closed before it returns.  Inject ``walker`` in tests (a
     callable ``(stage_root, main, files) -> readings``); inject ``backend`` to
     reuse a configured ``SolidWorksBackend`` (its staged search pin applies).
-    Admission is fail-closed; see the module docstring for the rules.
+    ``cad_ownership_file`` pinpoints the default backend's CAD ownership
+    ledger, so an endpoint-side reader shares the endpoint's single
+    state-root ledger instead of the library default.  Admission is
+    fail-closed; see the module docstring for the rules.
     """
 
-    def __init__(self, *, walker=None, backend=None, reader_sha256=None):
+    def __init__(self, *, walker=None, backend=None, reader_sha256=None, cad_ownership_file=None):
         if walker is not None and backend is not None:
             raise SelectionError("selection_reader_invalid", "Inject either a walker or a backend, not both")
+        if cad_ownership_file is not None and (walker is not None or backend is not None):
+            raise SelectionError(
+                "selection_reader_invalid", "A CAD ownership file applies only to the default backend"
+            )
         if reader_sha256 is not None and (
             not isinstance(reader_sha256, str) or _SHA.fullmatch(reader_sha256) is None
         ):
@@ -601,7 +608,9 @@ class NativeSelectionReader:
             if backend is None:
                 from .native import SolidWorksBackend
 
-                backend = SolidWorksBackend()
+                backend = SolidWorksBackend(
+                    cad_ownership_file=None if cad_ownership_file is None else Path(cad_ownership_file)
+                )
             walker = backend.closure_readings
         if not callable(walker):
             raise SelectionError("selection_reader_invalid", "The closure walker must be callable")

@@ -13,7 +13,14 @@ from .delivery import PIPELINE_ID
 from .io import PipelineError, digest, file_digest, read_data
 from .schemas import TOOL_SCHEMA
 
-RUNTIME_PACKAGES = ("numpy", "PyYAML", "jsonschema", "packaging", "python-multipart")
+#: The exact runtime dependency closure per role.  The native (Windows) endpoint runs the
+#: staged capture/conversion pipeline: it imports packaging (stage transfer and tool records)
+#: and the pywin32 COM bindings.  numpy, PyYAML, jsonschema and python-multipart belong to
+#: the portable (Linux) surfaces (model derivation, pages, uploads, authored YAML inputs).
+RUNTIME_PACKAGES = {
+    "native": ("packaging", "pywin32"),
+    "portable": ("numpy", "PyYAML", "jsonschema", "packaging", "python-multipart", "mujoco"),
+}
 RUNTIME_VERSIONS = {
     "numpy": "2.5.3",
     "PyYAML": "6.0.3",
@@ -22,6 +29,32 @@ RUNTIME_VERSIONS = {
     "python-multipart": "0.0.32",
     "pywin32": "311",
     "mujoco": "3.13.0",
+}
+#: The one supported interpreter range; pyproject's requires-python and the
+#: release build mirror this line (IF-15 support single source).
+SUPPORTED_PYTHON = ">=3.12,<3.13"
+#: The release target itself - one source for the support matrix, the offline
+#: builder's pip target flags and the verifier's installable tag set:
+#: interpreter and ABI, the Windows platform, and the Linux glibc baseline the
+#: offline archives are built for (older-glibc spellings stay installable, a
+#: newer baseline never enters an archive).
+TARGET_PYTHON = "3.12"
+TARGET_ABI = "cp312"
+WINDOWS_PLATFORMS = ("win_amd64",)
+LINUX_GLIBC_BASELINE = 28
+LINUX_PLATFORMS = (
+    *(f"manylinux_2_{minor}_x86_64" for minor in range(LINUX_GLIBC_BASELINE, 4, -1)),
+    "manylinux2014_x86_64",
+    "manylinux2010_x86_64",
+    "manylinux1_x86_64",
+    "linux_x86_64",
+)
+#: The supported end of each role (IF-15 support matrix): host id, display OS,
+#: CPU architecture and the native API prerequisite.  Qualification binds to a
+#: real Windows/SolidWorks/build outside this structural statement.
+RUNTIME_HOSTS = {
+    "native": {"host": "windows", "os": "Windows", "arch": "x86_64", "api": "SolidWorks COM API"},
+    "portable": {"host": "linux", "os": "Linux", "arch": "x86_64"},
 }
 
 
@@ -33,7 +66,7 @@ def runtime_role(role: str | None = None) -> str:
 
 
 def required_packages(role: str | None = None) -> tuple[str, ...]:
-    return RUNTIME_PACKAGES + (("pywin32",) if runtime_role(role) == "native" else ("mujoco",))
+    return RUNTIME_PACKAGES[runtime_role(role)]
 
 
 def native_readiness() -> dict:

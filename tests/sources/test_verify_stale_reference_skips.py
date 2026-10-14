@@ -10,10 +10,10 @@ from description_pipeline.io import PipelineError, write_json
 from description_pipeline.verification.solidworks_urdf import _stale_stored_reference_skips
 
 #: The real candidate4 stored reference: an author-machine path outside every admitted root.
-LOCATION = r"C:\Users\Mi\Desktop\M3.0\CopyDesignTemp\lowerbody.SLDASM"
+LOCATION = r"C:\Users\operator\Desktop\M3.0\CopyDesignTemp\lowerbody.SLDASM"
 STAGE_ROOT = r"C:\stage"
 STAGED_LOCATION = STAGE_ROOT + r"\lowerbody.SLDASM"
-UNRELATED = r"C:\description-v1-review\native-product4\state\prepared\CopyDesignTemp\lowerbody.SLDASM"
+UNRELATED = r"C:\description-v1-review\native-candidate\state\prepared\CopyDesignTemp\lowerbody.SLDASM"
 
 
 class StaleStoredReferenceSkipTests(unittest.TestCase):
@@ -21,11 +21,11 @@ class StaleStoredReferenceSkipTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="stale-skip-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        (self.root / "input/discovery").mkdir(parents=True)
+        (self.root / "evidence").mkdir(parents=True)
 
     def _write_payload(self, *, files=None, documents=None) -> None:
         write_json(
-            self.root / "input/discovery/native-discovery.json",
+            self.root / "evidence/discovery.json",
             {
                 "raw": {
                     "source_selection": {
@@ -70,7 +70,7 @@ class StaleStoredReferenceSkipTests(unittest.TestCase):
         cases = (
             self._entry(),
             self._entry(resolved_path=LOCATION.replace("CopyDesignTemp", "copyDesigntemp")),
-            self._entry(resolved_path="C:/Users/Mi/Desktop/M3.0/CopyDesignTemp/lowerbody.SLDASM"),
+            self._entry(resolved_path="C:/Users/operator/Desktop/M3.0/CopyDesignTemp/lowerbody.SLDASM"),
         )
         for entry in cases:
             with self.subTest(entry=entry["resolved_path"]):

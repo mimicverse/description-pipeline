@@ -7,11 +7,11 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 from description_pipeline.io import PipelineError
-from description_pipeline.sources.solidworks.revision import package_inventory
 from description_pipeline.verification import solidworks_urdf
+
+from . import support
 
 
 def full_identity():
@@ -32,36 +32,67 @@ def canonical_digest(files):
 
 
 class InputSealReadinessTests(unittest.TestCase):
-    def _root(self, directory, definition, identity):
-        root = Path(directory)
-        input_root = root / "input"
-        (input_root / "discovery").mkdir(parents=True)
-        (input_root / "robot.SLDASM").write_bytes(b"native bytes for the admin-deferral tests")
-        (input_root / "discovery/native-discovery.json").write_text(
-            json.dumps(
-                {
-                    "namespace": "dp",
-                    "raw": {"identity": identity},
-                    "identity": identity,
-                    "native_files": {},
-                }
-            )
+    def _root(self, directory, *, raw_identity, revision):
+        root = Path(directory) / "delivery"
+        content = b"native bytes for the admin-deferral tests"
+        record = support.frozen_discovery_payload(
+            {
+                "namespace": "dp",
+                "raw": {
+                    "identity": raw_identity,
+                    "components": [
+                        {
+                            "name2": "base_part-1",
+                            "document": "robot.SLDPRT",
+                            "suppressed": False,
+                            "lightweight": False,
+                            "suppression_state": 2,
+                        }
+                    ],
+                    "datums": [
+                        {
+                            "name": "CS_base_link",
+                            "owner": "base_part-1",
+                            "array": [
+                                1.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                1.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                1.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                1.0,
+                            ],
+                        }
+                    ],
+                    "mates": [],
+                    "properties": {"components": {}},
+                },
+                "identity": raw_identity,
+            },
+            files={"robot.SLDASM": hashlib.sha256(content).hexdigest()},
         )
-        (root / "reports").mkdir()
-        (root / "reports/input.json").write_text(
-            json.dumps(
-                {
-                    "passed": True,
-                    "input": definition,
-                    "package_files": package_inventory(input_root),
-                }
-            )
+        source = support.default_source_record(
+            main_assembly="robot.SLDASM",
+            configuration="Default",
+            hardware_id="fixture",
+            revision=revision,
         )
-        return root, input_root
-
-    def _run(self, root, definition, diagnostics):
-        with mock.patch.object(solidworks_urdf, "inspect_package", return_value={"passed": True, "input": definition}):
-            return solidworks_urdf._input(root, diagnostics)
+        return support.write_target_delivery(
+            root,
+            capture={"declared_masses": {"items": {}, "evidence": None}},
+            discovery=record,
+            source=source,
+            originals={"robot.SLDASM": content.decode("utf-8")},
+        )
 
     def test_absent_seal_with_incomplete_admin_metadata_is_a_readiness_warning(self):
         # Valid hardware but a missing owner/revision keeps the seal optional.
@@ -69,47 +100,46 @@ class InputSealReadinessTests(unittest.TestCase):
             identity = full_identity()
             identity["revision"] = None
             identity["owner"] = None
-            definition = {"hardware_id": "fixture", "source": {"robot_name": "fixture"}}
-            root, _ = self._root(directory, definition, identity)
+            root = self._root(directory, raw_identity=identity, revision=None)
             diagnostics: list[dict] = []
-            returned = self._run(root, definition, diagnostics)
-            self.assertEqual(returned, definition)
-            self.assertEqual([item["code"] for item in diagnostics], ["input.cad_revision_not_sealed"])
+            returned = solidworks_urdf._input(root, diagnostics)
+            self.assertEqual(returned["source"]["assembly"], "robot.SLDASM")
+            self.assertEqual(returned["hardware_id"], "fixture")
+            self.assertEqual([item["code"] for item in diagnostics], ["input.cad_revision_absent"])
             self.assertEqual(diagnostics[0]["detail"]["missing"], ["revision", "owner"])
             self.assertTrue(all(item["blocking"] is False for item in diagnostics))
 
     def test_absent_seal_with_null_identity_is_a_readiness_warning(self):
         with tempfile.TemporaryDirectory() as directory:
             identity = dict.fromkeys(("hardware_id", "revision", "owner", "change_summary", "control", "robot_name"))
-            definition = {"hardware_id": None, "source": {"robot_name": "robot"}}
-            root, _ = self._root(directory, definition, identity)
+            root = self._root(directory, raw_identity=identity, revision=None)
             diagnostics: list[dict] = []
-            self._run(root, definition, diagnostics)
+            solidworks_urdf._input(root, diagnostics)
             self.assertEqual(
                 diagnostics[0]["detail"]["missing"],
                 ["hardware_id", "revision", "owner", "change_summary", "control"],
             )
 
-    def test_absent_seal_with_complete_admin_metadata_fails(self):
-        with tempfile.TemporaryDirectory() as directory:
-            definition = {"hardware_id": "fixture", "source": {"robot_name": "fixture"}}
-            root, _ = self._root(directory, definition, full_identity())
-            with mock.patch.object(
-                solidworks_urdf, "inspect_package", return_value={"passed": True, "input": definition}
-            ), self.assertRaises(PipelineError):
-                solidworks_urdf._input(root, [])
+    def test_absent_revision_stays_missing_with_complete_admin_metadata(self):
+        """The revision label is optional raw metadata; a complete authored
+        identity does not make its absence blocking."""
 
-    def test_supplied_malformed_seal_keeps_failing_with_incomplete_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._root(directory, raw_identity=full_identity(), revision=None)
+            diagnostics: list[dict] = []
+            returned = solidworks_urdf._input(root, diagnostics)
+            self.assertEqual(returned["source"]["assembly"], "robot.SLDASM")
+            self.assertEqual([item["code"] for item in diagnostics], ["input.cad_revision_absent"])
+            self.assertEqual(diagnostics[0]["detail"]["missing"], [])
+            self.assertTrue(all(item["blocking"] is False for item in diagnostics))
+
+    def test_malformed_revision_metadata_keeps_failing_with_incomplete_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             identity = full_identity()
             identity["revision"] = None
             identity["owner"] = None
-            definition = {"hardware_id": "fixture", "source": {"robot_name": "fixture"}}
-            root, input_root = self._root(directory, definition, identity)
-            (input_root / "cad-revision.json").write_text(json.dumps({"schema_version": "not-the-contract"}))
-            with mock.patch.object(
-                solidworks_urdf, "inspect_package", return_value={"passed": True, "input": definition}
-            ), self.assertRaises(PipelineError):
+            root = self._root(directory, raw_identity=identity, revision="")
+            with self.assertRaises(PipelineError):
                 solidworks_urdf._input(root, [])
 
 
@@ -138,34 +168,21 @@ class UrdfRobotLabelTests(unittest.TestCase):
 
 class HandoffHashBindingTests(unittest.TestCase):
     def _package(self, directory, contents, *, raw_files=None, inventory_digest=None):
-        input_root = Path(directory)
-        (input_root / "discovery").mkdir()
-        for name, data in contents.items():
-            path = input_root / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(data)
+        root = Path(directory) / "delivery"
         native = {name: hashlib.sha256(data).hexdigest() for name, data in contents.items()}
-        payload = {
-            "namespace": "dp",
-            "native_files": native,
-            "raw": {"files": dict(raw_files or {})},
-            "identity": {},
-        }
-        record = json.dumps(payload).encode()
-        (input_root / "discovery/native-discovery.json").write_bytes(record)
-        (input_root / "robot.yaml").write_text(
-            json.dumps(
-                {
-                    "provenance": {
-                        "native_inventory_sha256": inventory_digest
-                        if inventory_digest is not None
-                        else canonical_digest(native),
-                        "discovery_sha256": hashlib.sha256(record).hexdigest(),
-                    }
-                }
-            )
+        payload = support.frozen_discovery_payload(
+            {"namespace": "dp", "raw": {"files": dict(raw_files or {})}, "identity": {}},
+            files=native,
         )
-        return input_root, native
+        if inventory_digest is not None:
+            payload["native_inventory_sha256"] = inventory_digest
+        return support.write_target_delivery(
+            root,
+            capture={},
+            discovery=payload,
+            source=support.default_source_record(),
+            originals={name: data.decode("utf-8") for name, data in contents.items()},
+        ), native
 
     def test_frozen_native_inventory_binds_without_a_seal(self):
         contents = {"a.SLDPRT": b"aaa", "b.SLDPRT": b"bbb"}
@@ -187,7 +204,7 @@ class HandoffHashBindingTests(unittest.TestCase):
     def test_tampered_or_unproven_evidence_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             input_root, _ = self._package(directory, {"a.SLDPRT": b"aaa"})
-            (input_root / "a.SLDPRT").write_bytes(b"tampered")
+            (input_root / "input/cad/a.SLDPRT").write_bytes(b"tampered")
             with self.assertRaises(PipelineError):
                 solidworks_urdf._handoff_native_hashes(input_root)
         with tempfile.TemporaryDirectory() as directory:
@@ -199,9 +216,7 @@ class HandoffHashBindingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, self.assertRaises((PipelineError, OSError)):
             solidworks_urdf._handoff_native_hashes(Path(directory))
         with tempfile.TemporaryDirectory() as directory:
-            input_root = Path(directory)
-            (input_root / "discovery").mkdir()
-            (input_root / "discovery/native-discovery.json").write_text(json.dumps({"native_files": {}}))
+            input_root, _native = self._package(directory, {})
             with self.assertRaises(PipelineError):
                 solidworks_urdf._handoff_native_hashes(input_root)
 

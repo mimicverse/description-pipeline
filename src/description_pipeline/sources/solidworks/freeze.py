@@ -631,7 +631,7 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
     # graph as recorded evidence -- never a broad STEP or name rule.
     # Only genuinely external author links are excluded: an author path that is
     # itself inside the admitted roots is an ordinary delivered dependency and
-    # is never dropped (e.g. NP-F550.step resolving inside the flat package).
+    # is never dropped (e.g. an imported part resolving inside the flat package).
     def _author_link_is_external(value) -> bool:
         roots = cfg.get("allowed_roots") or []
         return bool(roots) and not _under(str(value), roots)

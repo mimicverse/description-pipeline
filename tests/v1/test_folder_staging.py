@@ -171,8 +171,8 @@ class _FakeStaging:
                 "error": "a resolved reference lies outside the staged root",
                 "error_code": "selection_reference_outside_stage",
                 "detail": {
-                    "stored": "C:\\Users\\Mi\\Desktop\\M3.0\\step\\HD-1910-C001-20260902(2).SLDASM",
-                    "resolved": "D:\\archive\\HD-1910-C001-20260902(2).SLDASM",
+                    "stored": "C:\\Users\\Mi\\Desktop\\M3.0\\step\\bracket_a(2).SLDASM",
+                    "resolved": "D:\\archive\\bracket_a(2).SLDASM",
                 },
             }
         return self.snapshot(job)

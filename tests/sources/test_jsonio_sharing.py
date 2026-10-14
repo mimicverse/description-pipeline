@@ -13,6 +13,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
+from description_pipeline import io as io_module
+from description_pipeline.io import PipelineError
 from description_pipeline.sources.solidworks import jsonio
 
 
@@ -29,12 +31,14 @@ class AtomicJsonSharingTests(unittest.TestCase):
                     raise PermissionError(13, "The process cannot access the file")
                 return real_replace(source, destination)
 
-            with mock.patch.object(jsonio.os, "replace", side_effect=replace):
+            # The canonical bytes and the atomic replace are owned by io.write_json;
+            # jsonio keeps only the sharing-violation retry around that write.
+            with mock.patch.object(io_module.os, "replace", side_effect=replace):
                 jsonio.write_json(path, {"job_id": "a", "state": "running"})
 
             self.assertEqual(calls["count"], 2)
             self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["state"], "running")
-            self.assertEqual(list(path.parent.glob("*.tmp")), [])
+            self.assertEqual([entry.name for entry in path.parent.iterdir()], ["job.json"])
 
     def test_read_retries_a_transient_sharing_violation(self):
         with TemporaryDirectory() as temporary:
@@ -44,7 +48,7 @@ class AtomicJsonSharingTests(unittest.TestCase):
             failures = {"count": 0}
 
             def failing_once(file, *args, **kwargs):
-                if str(file) == str(path) and kwargs.get("encoding") == "utf-8" and failures["count"] == 0:
+                if str(file) == str(path) and failures["count"] == 0:
                     failures["count"] += 1
                     raise PermissionError(13, "The process cannot access the file")
                 return real_open(file, *args, **kwargs)
@@ -55,6 +59,17 @@ class AtomicJsonSharingTests(unittest.TestCase):
             self.assertEqual(failures["count"], 1)
             assert isinstance(payload, dict)
             self.assertEqual(payload["state"], "failed")
+
+    def test_read_json_delegates_the_strict_foundation_parse(self):
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "record.json"
+            for payload in ('{"a": 1, "a": 2}', '{"a": NaN}', '{"a": Infinity}', '{"a": 1e999}'):
+                with self.subTest(payload=payload):
+                    path.write_text(payload, encoding="utf-8")
+                    with self.assertRaises(PipelineError):
+                        jsonio.read_json(path)
+            path.write_text('{"a": 1}', encoding="utf-8")
+            self.assertEqual(jsonio.read_json(path), {"a": 1})
 
     def test_a_permanent_violation_still_fails(self):
         with TemporaryDirectory() as temporary:
