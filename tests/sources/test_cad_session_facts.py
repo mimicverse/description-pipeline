@@ -18,21 +18,36 @@ class CadSessionFactsTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.ledger = Path(self.directory.name) / "cad-ownership.json"
 
-    def _record(self, pid: int, *, creation: int = 100, boot: float = 1000.0, owner: str | None = None) -> None:
-        isolation.OwnershipStore(self.ledger).add(
-            {
-                "pid": pid,
-                "creation_time": creation,
-                "boot_epoch": boot,
-                "owner": owner if owner is not None else isolation._OWNER_TOKEN,
-            }
-        )
+    def _record(
+        self,
+        pid: int,
+        *,
+        creation: int = 100,
+        boot: float = 1000.0,
+        owner: str | None = None,
+        executable: str | None = None,
+        owner_pid: int | None = 99,
+        owner_creation: int | None = 555,
+    ) -> None:
+        payload = {
+            "pid": pid,
+            "creation_time": creation,
+            "boot_epoch": boot,
+            "owner": owner if owner is not None else isolation._OWNER_TOKEN,
+            "executable": executable if executable is not None else EXE,
+        }
+        if owner_pid is not None:
+            payload["owner_pid"] = owner_pid
+        if owner_creation is not None:
+            payload["owner_creation_time"] = owner_creation
+        isolation.OwnershipStore(self.ledger).add(payload)
 
-    def _facts(self, *, table, creation=lambda pid: 100, boot: float = 1000.0):
+    def _facts(self, *, table, creation=None, boot: float = 1000.0):
+        reader = creation if creation is not None else (lambda pid: 555 if pid == 99 else 100)
         return isolation.cad_session_facts(
             EXE,
             process_table=table,
-            creation_time=creation,
+            creation_time=reader,
             boot_epoch=lambda: boot,
             ownership_file=self.ledger,
         )
@@ -91,6 +106,34 @@ class CadSessionFactsTests(unittest.TestCase):
             facts,
             {"owned_sessions": 0, "lease_held": False, "external_session_detected": False, "problems": []},
         )
+
+    def test_our_token_without_the_owner_identity_is_never_owned(self) -> None:
+        self._record(7, owner_pid=None)
+        facts = self._facts(table=[(7, EXE)])
+        self.assertEqual(facts["owned_sessions"], 0)
+        self.assertFalse(facts["lease_held"])
+        self.assertTrue(facts["external_session_detected"])
+        self.assertIn("cad_identity_unverified", facts["problems"])
+
+    def test_a_swapped_owner_pid_is_never_owned(self) -> None:
+        self._record(7, owner_pid=1000)
+        facts = self._facts(table=[(7, EXE)])
+        self.assertEqual(facts["owned_sessions"], 0)
+        self.assertTrue(facts["external_session_detected"])
+        self.assertIn("cad_identity_unverified", facts["problems"])
+
+    def test_a_swapped_owner_creation_time_is_never_owned(self) -> None:
+        self._record(7, owner_creation=999)
+        facts = self._facts(table=[(7, EXE)])
+        self.assertEqual(facts["owned_sessions"], 0)
+        self.assertIn("cad_identity_unverified", facts["problems"])
+
+    def test_a_record_for_another_executable_is_never_owned(self) -> None:
+        self._record(7, executable="/fixture/OTHER.exe")
+        facts = self._facts(table=[(7, EXE)])
+        self.assertEqual(facts["owned_sessions"], 0)
+        self.assertTrue(facts["external_session_detected"])
+        self.assertIn("cad_identity_unverified", facts["problems"])
 
 
 if __name__ == "__main__":

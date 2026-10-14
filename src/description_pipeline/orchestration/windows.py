@@ -379,7 +379,7 @@ def health_payload(jobs) -> dict:
     else:
         reason_code = "unresolved_operations"
     usage = shutil.disk_usage(Path(config["output_root"]))
-    return {
+    payload = {
         "schema_version": HEALTH_SCHEMA,
         "pipeline_id": PIPELINE_ID,
         "native_platform": native_ok,
@@ -397,6 +397,15 @@ def health_payload(jobs) -> dict:
             "native": {"ok": native_ok and not problems, "problems": problems},
         },
     }
+    from ..interface_records import InterfaceRecordError, validate_health
+
+    try:
+        validate_health(payload)
+    except InterfaceRecordError as error:
+        # An incomplete or invalid identity is never a green document: the
+        # same schema owner refuses it, and the handler answers the stable 500.
+        raise PipelineError(f"The endpoint cannot read its complete IF-09 identity: {error}") from error
+    return payload
 
 
 def _default_runner(*args, **kwargs):

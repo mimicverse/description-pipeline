@@ -566,14 +566,29 @@ class SelectionEndpointTests(unittest.TestCase):
         self.addCleanup(server.shutdown)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         base = f"http://127.0.0.1:{server.server_address[1]}"
-        with patch.object(windows_module, "tool_record", return_value=installed):
+        from description_pipeline.sources.solidworks import isolation
+
+        quiet = {
+            "owned_sessions": 0,
+            "lease_held": False,
+            "external_session_detected": False,
+            "problems": [],
+        }
+        # Real normal-OS observation doubles: win32 platform, quiet CAD facts
+        # and a passing native readiness probe.
+        with (
+            patch.object(windows_module, "tool_record", return_value=installed),
+            patch("sys.platform", "win32"),
+            patch("description_pipeline.runtime.native_readiness", return_value={"role": "native"}),
+            patch.object(isolation, "registered_executable", return_value="C:/SW/SLDWORKS.exe"),
+            patch.object(isolation, "cad_session_facts", return_value=quiet),
+        ):
             status, body = self.http_call(base, "GET", "/health", headers={"Authorization": "Bearer " + token})
         self.assertEqual(status, 200, body)
         validated = ir.validate_health(body)  # the real consumer accepts the real producer document
         self.assertEqual(set(body), set(ir.HEALTH_KEYS))
         self.assertNotIn("targets", body)
-        self.assertFalse(validated["ready"])
-        self.assertEqual(validated["readiness"]["reason_code"], "unsupported_platform")
+        self.assertTrue(validated["ready"], body)
         self.assertEqual(body["release"]["role"], "native")
         self.assertEqual(body["install"]["config_digest"], digest(read_data(self.config_path)))
         self.assertEqual(body["install"]["install_id"], self.jobs.install_id)
@@ -585,6 +600,14 @@ class SelectionEndpointTests(unittest.TestCase):
         zeroed = {**body, "install": {**body["install"], "config_digest": "0" * 64}}
         with self.assertRaises(ir.InterfaceRecordError):
             ir.require_endpoint_matches_install_record(zeroed, record)
+        # The owner gate refuses a readable-but-not-ready document; the ready
+        # gate itself is never weakened for the unsupported platform.
+        with patch.object(windows_module, "tool_record", return_value=installed):
+            unready = windows_module.health_payload(self.jobs)
+        self.assertFalse(unready["ready"])
+        with self.assertRaises(ir.InterfaceRecordError) as raised:
+            ir.require_endpoint_matches_install_record(unready, record)
+        self.assertEqual(raised.exception.code, "endpoint_not_ready")
 
     def test_a_queue_without_its_thread_is_never_ready(self) -> None:
         triple = release_identity()

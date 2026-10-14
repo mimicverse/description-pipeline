@@ -119,6 +119,28 @@ def _matching_process_ids(executable: str, table) -> list[int]:
     return matched
 
 
+def _record_owner_status(record, *, present, read_creation) -> str:
+    """Whether the recorded owner process is proven gone, live, or unknown.
+
+    A pid whose live creation moment equals the recorded one is that same
+    owner process: another live capture still owns this CAD server, so the
+    record is never sweepable.  A creation mismatch or an absent pid proves
+    the recorded owner gone.  Anything else cannot decide either way and is
+    not termination authority.
+    """
+
+    owner_pid = record.get("owner_pid")
+    owner_created = record.get("owner_creation_time")
+    if type(owner_pid) is not int or owner_pid <= 0 or type(owner_created) is not int:
+        return "unknown"
+    live_created = read_creation(owner_pid)
+    if live_created is None:
+        return "gone" if owner_pid not in present else "unknown"
+    if type(live_created) is not int:
+        return "unknown"
+    return "live" if live_created == owner_created else "gone"
+
+
 #: FILETIME counts 100 ns ticks from 1601-01-01; pywin32 hands process times
 #: back either as FILETIME structs or as PyTime values (a datetime subclass),
 #: so both shapes normalize to this epoch.
@@ -378,27 +400,6 @@ def terminate_remnant_processes(
     live_owner: list[int] = []
     unverified: list[int] = []
 
-    def owner_status(record) -> str:
-        """Whether the recorded owner process is proven gone, live, or unknown.
-
-        A pid whose live creation moment equals the recorded one is that same
-        owner process: another live capture still owns this CAD server, so
-        the record is never sweepable.  A creation mismatch or an absent pid
-        proves the recorded owner gone.  Anything else cannot decide either
-        way and is not termination authority.
-        """
-
-        owner_pid = record.get("owner_pid")
-        owner_created = record.get("owner_creation_time")
-        if type(owner_pid) is not int or owner_pid <= 0 or type(owner_created) is not int:
-            return "unknown"
-        live_created = read_creation(owner_pid)
-        if live_created is None:
-            return "gone" if owner_pid not in present else "unknown"
-        if type(live_created) is not int:
-            return "unknown"
-        return "live" if live_created == owner_created else "gone"
-
     for pid in _matching_process_ids(executable, table):
         if pid in tracked:
             continue
@@ -431,7 +432,7 @@ def terminate_remnant_processes(
             continue
         if record.get("owner") == _OWNER_TOKEN:
             continue  # this process's own launch; the Windows job owns its cleanup
-        status = owner_status(record)
+        status = _record_owner_status(record, present=present, read_creation=read_creation)
         if status == "live":
             live_owner.append(pid)  # a live pipeline process still owns this CAD server
             continue
@@ -498,6 +499,8 @@ def cad_session_facts(
     read_creation = creation_time if creation_time is not None else _windows_creation_time
     current_boot = boot_epoch() if boot_epoch is not None else _windows_boot_epoch()
     tracked = _tracked_pids()
+    present = {row[0] for row in table}
+    wanted = os.path.normcase(os.path.abspath(str(executable)))
     owned = 0
     external = 0
     problems: list[str] = []
@@ -508,14 +511,17 @@ def cad_session_facts(
             continue
         recorded_creation = record.get("creation_time")
         boot = record.get("boot_epoch")
+        recorded_executable = record.get("executable")
         live_creation = read_creation(pid)
         if (
             type(recorded_creation) is not int
             or not isinstance(boot, (int, float))
             or live_creation is None
             or type(live_creation) is not int
+            or not isinstance(recorded_executable, str)
+            or os.path.normcase(os.path.abspath(recorded_executable)) != wanted
         ):
-            # An unprovable identity is a problem, never a silent zero.
+            # An unprovable or foreign-image identity is a problem, never a silent zero.
             problems.append("cad_identity_unverified")
             external += 1
             continue
@@ -523,8 +529,16 @@ def cad_session_facts(
             # PID reuse or a record from another boot: the recorded launch is gone.
             external += 1
             continue
-        if pid in tracked or record.get("owner") == _OWNER_TOKEN:
+        if pid in tracked:
             owned += 1
+            continue
+        if record.get("owner") == _OWNER_TOKEN:
+            # This process's own launch counts only with its complete owner identity.
+            if _record_owner_status(record, present=present, read_creation=read_creation) == "live":
+                owned += 1
+            else:
+                problems.append("cad_identity_unverified")
+                external += 1
             continue
         external += 1  # verified process, but this endpoint does not own it
     return {
