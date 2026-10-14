@@ -205,6 +205,51 @@ class DistributionTests(unittest.TestCase):
                     verify_release(root, identity)
                 self.assertIn("lock does not pin exactly", str(raised.exception))
 
+    def test_role_locks_refuse_normalized_duplicates(self):
+        for platform in ("linux", "windows"):
+            with tempfile.TemporaryDirectory() as directory, self.subTest(platform=platform):
+                root = Path(directory)
+                identity = complete_release(root)
+                archive_path = root / f"description-{VERSION}-{platform}-cp312-x86_64.zip"
+                with zipfile.ZipFile(archive_path) as source:
+                    members = {name: source.read(name) for name in source.namelist()}
+                lines = members["requirements.lock"].decode().splitlines()
+                corrupted = [f"demo==0.0 --hash=sha256:{'0' * 64}", *lines]
+                members["requirements.lock"] = ("\n".join(corrupted) + "\n").encode()
+                with zipfile.ZipFile(archive_path, "w") as archive:
+                    for name, payload in members.items():
+                        archive.writestr(name, payload)
+                write_json(
+                    root / "release.json", {**identity, "artifacts": inventory(root, exclude=("release.json",))}
+                )
+                with self.assertRaises(PipelineError) as raised:
+                    verify_release(root, identity)
+                self.assertIn("repeats demo", str(raised.exception))
+
+    def test_role_wheels_must_match_the_archive_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            identity = complete_release(root)
+            archive_path = root / f"description-{VERSION}-linux-cp312-x86_64.zip"
+            with zipfile.ZipFile(archive_path) as source:
+                members = {name: source.read(name) for name in source.namelist()}
+            members["wheels/demo-1.0-cp312-cp312-win_amd64.whl"] = members.pop("wheels/demo-1.0-py3-none-any.whl")
+            members["files.json"] = json.dumps(
+                {
+                    name: hashlib.sha256(payload).hexdigest()
+                    for name, payload in members.items()
+                    if name != "files.json"
+                },
+                sort_keys=True,
+            ).encode()
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                for name, payload in members.items():
+                    archive.writestr(name, payload)
+            write_json(root / "release.json", {**identity, "artifacts": inventory(root, exclude=("release.json",))})
+            with self.assertRaises(PipelineError) as raised:
+                verify_release(root, identity)
+            self.assertIn("another target", str(raised.exception))
+
     def test_deployment_inputs_must_match_the_source_archive(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -48,8 +48,30 @@ def _locked_pins(data: bytes) -> dict:
         name, _, version = line.partition("==")
         if not version:
             raise PipelineError(f"Unparsable dependency lock line: {line}")
-        pins[canonicalize_name(name)] = version.strip()
+        key = canonicalize_name(name)
+        if key in pins:
+            raise PipelineError(f"Dependency lock repeats {key}")
+        pins[key] = version.strip()
     return pins
+
+
+def _wheel_target_compatible(tags, system: str) -> bool:
+    """Python/ABI/OS/architecture compatibility of a wheel's parsed tags."""
+
+    interpreters = {"cp312", "py3", "py312"}
+    abis = {"cp312", "abi3", "none"}
+    for tag in tags:
+        if tag.interpreter not in interpreters or tag.abi not in abis:
+            continue
+        if system == "windows":
+            if tag.platform in {"win_amd64", "any"}:
+                return True
+        elif (
+            tag.platform in {"any", "linux_x86_64"}
+            or (tag.platform.startswith("manylinux") and tag.platform.endswith("x86_64"))
+        ):
+            return True
+    return False
 
 
 def verify_release(directory, identity):
@@ -150,7 +172,11 @@ def verify_release(directory, identity):
                     ]
                     wheels = {}
                     for wheel_member in wheel_members:
-                        parsed, wheel_version, _, _ = parse_wheel_filename(Path(wheel_member).name)
+                        parsed, wheel_version, _, tags = parse_wheel_filename(Path(wheel_member).name)
+                        if not _wheel_target_compatible(tags, roles[name]):
+                            raise PipelineError(
+                                f"Role archive {name} carries a wheel for another target: {wheel_member}"
+                            )
                         wheels[canonicalize_name(parsed)] = (str(wheel_version), wheel_member)
                     if (
                         {key: value[0] for key, value in wheels.items()} != expected
@@ -169,7 +195,17 @@ def verify_release(directory, identity):
                             continue
                         spec, separator, checksum = line.partition(" --hash=sha256:")
                         pin_name, _, pin_version = spec.partition("==")
-                        pins[canonicalize_name(pin_name)] = (pin_version.strip(), checksum.strip() if separator else "")
+                        key = canonicalize_name(pin_name)
+                        if (
+                            not separator
+                            or len(checksum.strip()) != 64
+                            or any(character not in "0123456789abcdef" for character in checksum.strip())
+                            or not pin_version.strip()
+                        ):
+                            raise PipelineError(f"Role archive {name} lock line is not an exact requirement: {line}")
+                        if key in pins:
+                            raise PipelineError(f"Role archive {name} lock repeats {key}")
+                        pins[key] = (pin_version.strip(), checksum.strip())
                     if {key: value[0] for key, value in pins.items()} != expected or len(pins) != len(expected):
                         raise PipelineError(f"Role archive {name} lock does not pin exactly its locked wheel set")
                     for key, (_, checksum) in pins.items():
