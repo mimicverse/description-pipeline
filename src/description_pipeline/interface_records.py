@@ -879,7 +879,6 @@ def validate_config_snapshot(snapshot) -> dict:
             "auth",
             "targets",
             "specifications",
-            "execution",
             "retention",
             "derived",
         },
@@ -969,13 +968,6 @@ def validate_config_snapshot(snapshot) -> dict:
         _absolute_path(value, code, f"resolved.specifications.record_roots[{index}]")
         for index, value in enumerate(record_roots)
     ]
-    execution = resolved["execution"]
-    _exact_keys(execution, {"linux_concurrency"}, code, "resolved.execution")
-    _require(
-        type(execution["linux_concurrency"]) is int and execution["linux_concurrency"] >= 1,
-        code,
-        {"where": "resolved.execution.linux_concurrency"},
-    )
     retention = resolved["retention"]
     _exact_keys(retention, {"unreferenced_evidence_days"}, code, "resolved.retention")
     days = retention["unreferenced_evidence_days"]
