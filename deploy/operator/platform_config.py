@@ -58,7 +58,7 @@ _PLATFORM_REQUIRED_KEYS = {
     "targets",
     "specifications",
 }
-_PLATFORM_ALLOWED_KEYS = _PLATFORM_REQUIRED_KEYS | {"execution", "retention"}
+_PLATFORM_ALLOWED_KEYS = _PLATFORM_REQUIRED_KEYS | {"retention"}
 _OPERATOR_KEYS = {"origin", "certificate_file", "private_key_file"}
 _STORAGE_KEYS = ("state_root", "handoff_root", "artifact_root", "workspace_root", "release_root")
 _DATABASE_KEYS = {"dsn_file"}
@@ -67,7 +67,6 @@ _INSTANCE_KEYS = {"task_name", "package_root", "output_root", "state_root"}
 _AUTH_KEYS = {"feishu_secret_file", "tenant_keys", "admin_open_ids"}
 _TARGET_KEYS = {"repository_slug", "base"}
 _SPECIFICATION_KEYS = {"record_roots"}
-_EXECUTION_KEYS = {"linux_concurrency"}
 _RETENTION_KEYS = {"unreferenced_evidence_days"}
 
 _ORIGIN = re.compile(r"\Ahttps://([A-Za-z0-9][A-Za-z0-9.-]*)(?::([0-9]{1,5}))?\Z")
@@ -232,11 +231,6 @@ def validate_platform(document) -> dict:
         absolute_path(root, f"specifications.record_roots[{index}]") for index, root in enumerate(record_roots)
     ]
 
-    execution = document.get("execution", {"linux_concurrency": 1})
-    require_keys(execution, allowed=_EXECUTION_KEYS, required=_EXECUTION_KEYS, where="execution")
-    concurrency = execution["linux_concurrency"]
-    require(type(concurrency) is int and concurrency >= 1, "execution.linux_concurrency must be a positive integer")
-
     retention = document.get("retention", {"unreferenced_evidence_days": None})
     require_keys(retention, allowed=_RETENTION_KEYS, required=_RETENTION_KEYS, where="retention")
     days = retention["unreferenced_evidence_days"]
@@ -297,7 +291,6 @@ def validate_platform(document) -> dict:
             for hardware, target in targets.items()
         },
         "specifications": {"record_roots": list(record_roots)},
-        "execution": {"linux_concurrency": concurrency},
         "retention": {"unreferenced_evidence_days": days},
         "derived": {
             "store_root": str(store_root),

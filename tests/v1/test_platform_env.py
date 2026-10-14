@@ -321,9 +321,6 @@ class PlatformEnvTests(unittest.TestCase):
         outside = json.loads(json.dumps(self.snapshot))
         outside["resolved"]["derived"]["store_root"] = "/elsewhere/runs"
         cases.append(("store root outside state", outside, "gen-1"))
-        no_concurrency = json.loads(json.dumps(self.snapshot))
-        no_concurrency["resolved"]["execution"]["linux_concurrency"] = 0
-        cases.append(("execution zero", no_concurrency, "gen-1"))
         for label, snapshot, install_id in cases:
             with self.subTest(label):
                 before = tree_digest(state)
