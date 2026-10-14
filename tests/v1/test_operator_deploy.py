@@ -1859,6 +1859,11 @@ class InstallOrderingTests(unittest.TestCase):
                 {"certificate", "private_key", "database_dsn", "feishu_secret", "endpoint_token"}
                 <= set(closure["captured_secrets"])
             )
+            self.assertEqual(
+                set(closure["not_captured"]),
+                {"workspace_root", "store_root", "release_root"},
+                "every uncaptured reference is declared",
+            )
             tampered = Path(tmp) / "tampered.enc"
             forged = bytearray(sealed.read_bytes())
             forged[-1] ^= 1

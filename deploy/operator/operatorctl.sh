@@ -791,7 +791,8 @@ for key, value in (
             "captured_secrets": sorted(captured_secrets),
             "not_captured": {
                 "workspace_root": "scratch working copies are rebuilt on demand",
-                "store_root": "model store roots are reconstructible from the release archives",
+                "store_root": "model store roots (derived.repositories) are reconstructible from the release archives and the repository origins",
+                "release_root": "installed release runtimes are reconstructible from the fixed release archives bound in the manifest",
             },
         },
         indent=2,
