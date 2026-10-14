@@ -334,7 +334,7 @@ class SplitRoundtripTests(unittest.TestCase):
         events: list[dict] = []
         prepared_package, _target, prepared_files = self._prepare(events)
         seed, _sealed_receipt = self._windows_resume_seed(events, prepared_package, prepared_files)
-        altered = seed / "input/cad/base.SLDPRT"
+        altered = seed / "input" / "cad" / "cad" / "base.SLDPRT"
         altered.write_bytes(altered.read_bytes() + b"tamper")
 
         output = self.root / "portable-generate-tampered"
@@ -348,7 +348,7 @@ class SplitRoundtripTests(unittest.TestCase):
         # A refused continuation returns the failed receipt and installs nothing.
         self.assertEqual(result.get("state"), "failed")
         self.assertIs(result.get("passed"), False)
-        self.assertIn("Retained native inputs no longer pass static validation", str(result.get("error")))
+        self.assertIn("Retained input bytes do not match the recorded inspection receipt", str(result.get("error")))
         self.assertFalse(output.exists())
 
 

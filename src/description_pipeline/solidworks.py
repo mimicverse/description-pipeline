@@ -122,9 +122,20 @@ def _replay_seeded_inputs(staging: Path) -> tuple[dict, dict]:
     # producing host's absolute root (a Windows path on a portable continuation).
     # The equality checks above already bound the replay to the frozen report and
     # its inventory rows, so no inventory check is skipped.
-    from .sources.solidworks.input import resolve_package
-
-    return resolve_package(replayed), input_report
+    frozen = read_data(staging / "evidence" / "discovery.json")
+    identity = frozen.get("identity") if isinstance(frozen.get("identity"), dict) else {}
+    return {
+        "source": {
+            "robot_name": frozen.get("robot_name")
+            or identity.get("robot_name")
+            or identity.get("robot_name_technical")
+            or "robot"
+        },
+        "hardware_id": identity.get("hardware_id"),
+        "provenance": {
+            "native_inventory_sha256": frozen.get("native_inventory_sha256") or frozen.get("handoff_sha256")
+        },
+    }, input_report
 
 
 def _require_subject(staging: Path, expected_subject: str | None) -> str:

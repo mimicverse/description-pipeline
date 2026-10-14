@@ -205,10 +205,6 @@ class StageBoundaryTests(unittest.TestCase):
             patch.object(steps, "verify_delivery", side_effect=forbid(calls, "verify")),
             patch.object(steps, "publish_model", side_effect=forbid(calls, "publish")),
             patch.object(steps, "inspect_prepared_input", return_value=REPLAYED_INSPECTION),
-            patch(
-                "description_pipeline.sources.solidworks.input.resolve_package",
-                return_value={"hardware_id": "arm"},
-            ),
         ):
             result = solidworks.generate(
                 seed,
@@ -262,10 +258,6 @@ class StageBoundaryTests(unittest.TestCase):
         with (
             patch.object(steps, "generate_model", side_effect=fake_generate),
             patch.object(steps, "inspect_prepared_input", return_value=REPLAYED_INSPECTION),
-            patch(
-                "description_pipeline.sources.solidworks.input.resolve_package",
-                return_value={"hardware_id": "arm"},
-            ),
         ):
             first = solidworks.generate(seed, self.output)
             before = {
@@ -310,10 +302,6 @@ class StageBoundaryTests(unittest.TestCase):
             patch.object(steps, "generate_model", side_effect=fake_generate),
             patch.object(steps, "verify_delivery", side_effect=fake_verify),
             patch.object(steps, "inspect_prepared_input", return_value=REPLAYED_INSPECTION),
-            patch(
-                "description_pipeline.sources.solidworks.input.resolve_package",
-                return_value={"hardware_id": "arm"},
-            ),
         ):
             checkpoint = solidworks.generate(seed, generated)
             result = solidworks.verify(generated, self.output, expected_subject=checkpoint["subject_sha256"])
@@ -343,10 +331,6 @@ class StageBoundaryTests(unittest.TestCase):
             patch.object(steps, "generate_model", side_effect=fake_generate),
             patch.object(steps, "verify_delivery", side_effect=fake_verify),
             patch.object(steps, "inspect_prepared_input", return_value=REPLAYED_INSPECTION),
-            patch(
-                "description_pipeline.sources.solidworks.input.resolve_package",
-                return_value={"hardware_id": "arm"},
-            ),
         ):
             result = solidworks.generate(seed, self.output, handoff_sha256=HANDOFF)
         self.assertEqual(result["state"], "generated")

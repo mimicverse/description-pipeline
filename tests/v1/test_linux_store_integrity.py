@@ -249,9 +249,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         report_path = source / "input/handoff.json"
         report = json.loads(report_path.read_text())
         report["package_files"]["discovery/native-discovery.json"] = file_digest(record_path)
-        report["input_receipt"]["inventory"] = [
-            {"path": name, "sha256": checksum} for name, checksum in sorted(report["package_files"].items())
-        ]
+        report["input_receipt"]["inventory"] = dict(sorted(report["package_files"].items()))
         write_json(report_path, report)
         archive = self.tmp / "foreign-inventory.zip"
         seal_capture(

@@ -15,7 +15,7 @@ from pathlib import Path
 
 from . import __version__
 from .delivery import PIPELINE_ID, read_source_record, subject_digest, subject_inventory
-from .io import PipelineError, confined, digest, file_digest, read_data, write_json
+from .io import PipelineError, confined, digest, file_digest, inventory, read_data, write_json
 from .runtime import tool_record
 from .sources.snapshot import verify_snapshot
 from .sources.solidworks.revision import package_inventory
@@ -247,13 +247,22 @@ def inspect_prepared_input(package: Path) -> dict:
         )
         return report
     try:
-        files = package_inventory(package)
         source = validate_source_record(read_data(path))
+        record_path = package / "discovery/native-discovery.json"
+        if record_path.is_file():
+            record = read_data(record_path)
+            receipt = {str(name): str(value) for name, value in (record.get("native_files") or {}).items()}
+        elif (package / "cad").is_dir():
+            receipt = dict(inventory(package / "cad"))
+        else:
+            receipt = dict(package_inventory(package))
     except (PipelineError, OSError, ValueError) as error:
         report["passed"] = False
         report["errors"].append({"code": "input.source_identity", "message": str(error), "detail": None})
         return report
     identity, metadata = source["identity"], source["metadata"]
+    report["main_assembly"] = identity["main_assembly"]
+    report["configuration"] = identity["configuration"]
     report["input"] = {
         "hardware_id": identity["hardware_id"],
         "source": {"assembly": identity["main_assembly"], "configuration": identity["configuration"]},
@@ -266,21 +275,109 @@ def inspect_prepared_input(package: Path) -> dict:
         "change_summary": metadata["change_summary"],
     }
     report["input_receipt"] = {
-        "inventory": [{"path": name, "sha256": checksum} for name, checksum in sorted(files.items())],
+        "inventory": dict(sorted(receipt.items())),
     }
     return report
 
 
 def _archive_input(package: Path, staging: Path) -> None:
-    """Archive the original handoff; evidence/source holds the relinked CAD copy."""
+    """Archive the frozen input as the delivery tree: identity, CAD originals, records.
 
+    The prepared package keeps its own layout while it is the CAD read source;
+    the delivered tree is the target layout - the content identity at
+    ``input/source.json``, the CAD originals under ``input/cad`` at their
+    frozen-relative paths and the embedded controlled records under
+    ``input/records``.  Nothing is duplicated.
+    """
+
+    from .sources.solidworks.discovery import DISCOVERY_FILE
+
+    payload = read_data(package / DISCOVERY_FILE)
+    native_files = payload.get("native_files") if isinstance(payload.get("native_files"), dict) else {}
     destination = staging / "input"
-    destination.mkdir(exist_ok=True)
-    for name in package_inventory(package):
-        original = confined(package, name)
-        target = confined(destination, name, exists=False)
+    (destination / "cad").mkdir(parents=True, exist_ok=True)
+    (destination / "records").mkdir(parents=True, exist_ok=True)
+    archived: dict[str, str] = {}
+    for relative in sorted(native_files):
+        target = confined(destination / "cad", relative, exists=False)
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(original, target)
+        shutil.copyfile(confined(package, relative), target)
+        archived[relative] = file_digest(target)
+    if archived != {name: str(value) for name, value in native_files.items()}:
+        raise PipelineError("Archived CAD originals differ from the frozen inventory")
+    entries = list(payload.get("records") or [])
+    if isinstance(payload.get("budget"), dict):
+        entries.append(payload["budget"])
+    copied_records: set[str] = set()
+    for entry in entries:
+        package_file = str(entry.get("package_file") or "")
+        if not package_file or package_file in copied_records:
+            continue
+        copied_records.add(package_file)
+        target = confined(destination / "records", package_file, exists=False)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(confined(package, package_file), target)
+    source_path = package / "source.json"
+    if source_path.is_file():
+        shutil.copyfile(source_path, destination / "source.json")
+
+
+def _rehome_evidence(staging: Path, package: Path) -> None:
+    """Write the frozen delivery evidence: capture, runtime and discovery records.
+
+    The freeze keeps its own snapshot beside these records; the delivery reads
+    one capture record (the verbatim blocks), one runtime record (the capture
+    environment) and the frozen discovery record with its capture additions.
+    """
+
+    from .sources.solidworks.discovery import DISCOVERY_FILE
+
+    evidence = staging / "evidence"
+    blocks = {
+        "scene": "raw/scene_raw.json",
+        "mass_closure": "raw/mass_closure.json",
+        "material_provenance": "raw/material_provenance.json",
+        "declared_masses": "raw/declared_masses.json",
+        "dependency_closure": "raw/dependency_closure.json",
+        "link_group_mass_properties": "raw/link_group_mass_properties.json",
+        "effective_instances": "raw/effective_instances.json",
+        "geometry": "raw/geometry.json",
+        "axes": "raw/axis_references.json",
+        "collection": "evidence/collection.json",
+    }
+    capture = {name: read_data(evidence / relative) for name, relative in blocks.items()}
+    capture["components"] = [
+        {"name": str(name), "mass_properties": value}
+        for name, value in sorted((read_data(evidence / "raw/mass_properties.json") or {}).items())
+    ]
+    capture["datums"] = [
+        {"name": str(name), "matrix": matrix}
+        for name, matrix in sorted((read_data(evidence / "raw/coordinate_systems.json") or {}).items())
+    ]
+    write_json(evidence / "capture.json", capture)
+    write_json(evidence / "native-runtime.json", read_data(evidence / "evidence/environment.json"))
+    payload = read_data(package / DISCOVERY_FILE)
+    identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
+    rows = [
+        {"path": name, "sha256": checksum}
+        for name, checksum in sorted((payload.get("native_files") or {}).items())
+    ]
+    write_json(
+        evidence / "discovery.json",
+        {
+            **payload,
+            "files": rows,
+            "native_inventory_sha256": digest(rows),
+            "robot_name": identity.get("robot_name") or identity.get("robot_name_technical") or "robot",
+        },
+    )
+    manifest_path = evidence / "manifest.json"
+    manifest = read_data(manifest_path)
+    files = dict(manifest.get("files") or {})
+    for name in ("capture.json", "discovery.json", "native-runtime.json"):
+        files[name] = file_digest(evidence / name)
+    manifest["files"] = dict(sorted(files.items()))
+    write_json(manifest_path, manifest)
 
 
 def _snapshot_details(staging, manifest):
@@ -317,8 +414,9 @@ def capture_evidence(
     ``on_activity`` optionally observes best-effort capture progress records for the
     live-activity view; it never changes the snapshot, its checks or a failure path.
     """
+    from .sources.solidworks.discovery import source_definition
     from .sources.solidworks.freeze import freeze
-    from .sources.solidworks.input import native_source_closure, resolve_package
+    from .sources.solidworks.input import native_source_closure
 
     _state(on_event, "capture", "running")
 
@@ -326,30 +424,21 @@ def capture_evidence(
         if expected_inputs is not None:
             _require(package_inventory(package) == expected_inputs, "Prepared inputs changed after discovery")
         report = inspect_prepared_input(package)
-        write_json(staging / "input/handoff.json", report)
         if report.get("passed") is not True:
+            write_json(staging / "input/handoff.json", report)
             error = PipelineError("The CAD package does not meet the input specification")
             error.details = {"errors": report.get("errors", [])}
             raise error
-        definition = resolve_package(report)
-        if (definition.get("provenance") or {}).get("generator") == "native-discovery":
-            definition["source"]["closure"] = native_source_closure(package, report["input"])
-        files = {row["path"]: row["sha256"] for row in report["input_receipt"]["inventory"]}
-        if expected_inputs is not None:
-            _require(files == expected_inputs, "Inspected inputs differ from native discovery")
+        source = source_definition(package)
+        source["closure"] = native_source_closure(package)
+        definition = {"source": source}
+        prepared_files = package_inventory(package)
         _archive_input(package, staging)
-        archived = {
-            path: checksum
-            for path, checksum in package_inventory(staging / "input").items()
-            if path != "handoff.json"
-        }
-        if archived != files:
-            raise PipelineError("Archived input differs from its supplied package")
-        report["package_files"] = files
+        report["package_files"] = dict(sorted(inventory(staging / "input").items()))
         write_json(staging / "input/handoff.json", report)
-        return definition, report
+        return definition, report, prepared_files
 
-    definition, input_report = checked(
+    definition, input_report, original_files = checked(
         on_event,
         "capture",
         "input",
@@ -364,7 +453,6 @@ def capture_evidence(
             "files": {"input/" + path: checksum for path, checksum in value[1]["package_files"].items()},
         },
     )
-    original_files = input_report["package_files"]
 
     def ready():
         if backend is None and sys.platform != "win32":
@@ -392,6 +480,7 @@ def capture_evidence(
         lambda: verify_snapshot(staging / "evidence"),
         describe=lambda value: _snapshot_details(staging, value),
     )
+    _rehome_evidence(staging, package)
 
     def stable_inputs():
         if package_inventory(package) != original_files:

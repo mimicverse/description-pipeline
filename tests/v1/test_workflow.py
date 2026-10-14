@@ -115,7 +115,11 @@ class WorkflowTests(unittest.TestCase):
         author = read_data(self.package / "robot.yaml")
         author["hardware_id"] = None
         author["source"]["robot_name"] = "robot"
-        files = {name: checksum for name, checksum in package_inventory(self.package).items() if name != "robot.yaml"}
+        files = {
+            name: checksum
+            for name, checksum in package_inventory(self.package).items()
+            if name not in ("robot.yaml", "source.json")
+        }
         identity = {
             "hardware_id": None, "revision": None, "owner": None, "change_summary": None,
             "control": None, "robot_name": None, "main_assembly": "assembly.SLDASM",
@@ -166,10 +170,16 @@ class WorkflowTests(unittest.TestCase):
 
     def test_linux_never_opens_native_cad_and_keeps_failure_evidence(self):
         self.seal()
+        self.acquisition_without_admin()
         events = []
         with (
             patch.object(solidworks.sys, "platform", "linux"),
             patch("description_pipeline.sources.solidworks.freeze.freeze") as native,
+            patch(
+                "description_pipeline.sources.solidworks.discovery.source_definition",
+                return_value={"provider": "solidworks", "assembly": "assembly.SLDASM"},
+            ),
+            patch("description_pipeline.sources.solidworks.input.native_source_closure", return_value={}),
         ):
             result = solidworks.capture(self.package, self.output, on_event=events.append)
         native.assert_not_called()
@@ -192,12 +202,18 @@ class WorkflowTests(unittest.TestCase):
 
     def test_native_preflight_failure_blocks_capture_and_retains_diagnostics(self):
         self.seal()
+        self.acquisition_without_admin()
         error = PipelineError("Native readiness failed")
         error.details = {"reason": "SolidWorks registration unavailable"}
         with (
             patch.object(solidworks.sys, "platform", "win32"),
             patch("description_pipeline.runtime.native_readiness", side_effect=error),
             patch("description_pipeline.sources.solidworks.freeze.freeze") as capture,
+            patch(
+                "description_pipeline.sources.solidworks.discovery.source_definition",
+                return_value={"provider": "solidworks", "assembly": "assembly.SLDASM"},
+            ),
+            patch("description_pipeline.sources.solidworks.input.native_source_closure", return_value={}),
         ):
             result = solidworks.capture(self.package, self.output)
         capture.assert_not_called()
@@ -226,31 +242,37 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(check["state"], "failed")
 
     def test_static_inspection_is_consumed_once_and_changed_inspected_bytes_are_rejected(self):
-        from description_pipeline.sources.solidworks.input import inspect_package
-
         self.seal()
+        self.acquisition_without_admin()
         inspect_prepared = steps.inspect_prepared_input
+        calls: list = []
 
         def change_after_inspection(package):
             report = inspect_prepared(package)
+            calls.append(package)
             (package / "part.SLDPRT").write_bytes(b"Changed after inspection")
             return report
 
         with (
-            patch("description_pipeline.sources.solidworks.input.inspect_package", wraps=inspect_package) as inspect,
             patch.object(steps, "inspect_prepared_input", side_effect=change_after_inspection),
+            patch(
+                "description_pipeline.sources.solidworks.discovery.source_definition",
+                return_value={"provider": "solidworks", "assembly": "assembly.SLDASM"},
+            ),
+            patch("description_pipeline.sources.solidworks.input.native_source_closure", return_value={}),
             patch("description_pipeline.sources.solidworks.freeze.freeze") as native,
         ):
             result = solidworks.capture(self.package, self.output)
-        inspect.assert_called_once()
+        self.assertEqual(len(calls), 1)
         native.assert_not_called()
-        self.assertIn("static validation", result["error"])
+        self.assertIn("Archived CAD originals differ from the frozen inventory", result["error"])
         self.assertFalse(result["passed"])
 
     def test_capture_input_qc_records_handoff_and_frozen_file_binding(self):
         from description_pipeline.verification.consumer import ConsumerError
 
         self.seal()
+        self.acquisition_without_admin()
         expected = package_inventory(self.package)
         handoff = "c" * 64
         error = ConsumerError("Consumer loading failed", stderr="ImportError: control")
@@ -258,6 +280,11 @@ class WorkflowTests(unittest.TestCase):
             patch.object(solidworks.sys, "platform", "win32"),
             patch("description_pipeline.runtime.native_readiness", side_effect=error),
             patch("description_pipeline.sources.solidworks.freeze.freeze") as native,
+            patch(
+                "description_pipeline.sources.solidworks.discovery.source_definition",
+                return_value={"provider": "solidworks", "assembly": "assembly.SLDASM"},
+            ),
+            patch("description_pipeline.sources.solidworks.input.native_source_closure", return_value={}),
         ):
             result = solidworks.capture(self.package, self.output, expected_inputs=expected, handoff_sha256=handoff)
         native.assert_not_called()
@@ -267,8 +294,13 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(check["state"], "passed")
         self.assertTrue(check["details"]["passed"])
         self.assertEqual(check["details"]["handoff_sha256"], handoff)
-        self.assertEqual(check["details"]["files_sha256"], digest(expected))
-        self.assertEqual(check["details"]["files"], {"input/" + path: value for path, value in expected.items()})
+        delivered = {
+            "cad/assembly.SLDASM": file_digest(self.package / "assembly.SLDASM"),
+            "cad/part.SLDPRT": file_digest(self.package / "part.SLDPRT"),
+            "source.json": file_digest(self.package / "source.json"),
+        }
+        self.assertEqual(check["details"]["files_sha256"], digest(delivered))
+        self.assertEqual(check["details"]["files"], {"input/" + path: value for path, value in delivered.items()})
 
     def test_snapshot_details_rejects_a_manifest_changed_after_verification(self):
         from description_pipeline import steps
@@ -314,6 +346,11 @@ class WorkflowTests(unittest.TestCase):
         import shutil
 
         shutil.copytree(self.package, bundle / "input")
+        (bundle / "input" / "discovery").mkdir()
+        write_json(
+            bundle / "input" / "discovery" / "native-discovery.json",
+            {"identity": {"hardware_id": "arm"}, "handoff_sha256": "d" * 64},
+        )
         input_files = inventory(bundle / "input")
         write_json(
             bundle / "input" / "handoff.json",
@@ -327,6 +364,10 @@ class WorkflowTests(unittest.TestCase):
         )
         (bundle / "evidence").mkdir()
         (bundle / "evidence/raw.json").write_text('"Synthetic driver fixture"')
+        write_json(
+            bundle / "evidence" / "discovery.json",
+            {"identity": {"hardware_id": "arm"}, "handoff_sha256": "d" * 64},
+        )
         for name in ("model", "urdf", "meshes"):
             (bundle / name).mkdir()
         (bundle / "README.md").write_text("Synthetic driver fixture")
@@ -356,14 +397,6 @@ class WorkflowTests(unittest.TestCase):
                     "input": None,
                     "cad_revision": {"revision": "r1"},
                     "input_receipt": None,
-                },
-            ),
-            patch(
-                "description_pipeline.sources.solidworks.input.resolve_package",
-                return_value={
-                    "hardware_id": "arm",
-                    "source": {"robot_name": "arm"},
-                    "provenance": {"native_inventory_sha256": "d" * 64},
                 },
             ),
         ):
@@ -460,11 +493,12 @@ class WorkflowTests(unittest.TestCase):
 
     def test_original_cad_is_archived_without_editing(self):
         self.seal()
+        self.acquisition_without_admin()
         target = self.root / "staging"
         target.mkdir()
         original = (self.package / "assembly.SLDASM").read_bytes()
         steps._archive_input(self.package, target)
-        self.assertEqual(original, (target / "input/assembly.SLDASM").read_bytes())
+        self.assertEqual(original, (target / "input/cad/assembly.SLDASM").read_bytes())
         self.assertEqual(original, (self.package / "assembly.SLDASM").read_bytes())
         self.assertTrue((target / "input/source.json").is_file())
 

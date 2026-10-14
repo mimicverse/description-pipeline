@@ -38,6 +38,7 @@ def make_seed(root: Path) -> Path:
     )
     (seed / "evidence").mkdir()
     (seed / "evidence" / "manifest.json").write_text("{}\n", encoding="utf-8")
+    write_json(seed / "evidence" / "discovery.json", {"identity": {"hardware_id": "arm"}})
     (seed / "model").mkdir()
     (seed / "model" / "robot.json").write_text("{}\n", encoding="utf-8")
     (seed / "urdf").mkdir()
@@ -89,10 +90,6 @@ class StageEntryTests(unittest.TestCase):
         with (
             patch.object(steps, "generate_model", side_effect=fake_generate),
             patch.object(steps, "inspect_prepared_input", return_value=REPLAYED_INSPECTION),
-            patch(
-                "description_pipeline.sources.solidworks.input.resolve_package",
-                return_value={"hardware_id": "arm"},
-            ),
         ):
             result = solidworks.generate(
                 seed,
@@ -123,10 +120,6 @@ class StageEntryTests(unittest.TestCase):
         with (
             patch.object(steps, "inspect_prepared_input", return_value=REPLAYED_INSPECTION),
             patch.object(steps, "verify_delivery", side_effect=fake_verify),
-            patch(
-                "description_pipeline.sources.solidworks.input.resolve_package",
-                return_value={"hardware_id": "arm"},
-            ),
         ):
             ok = solidworks.verify(seed, self.output, expected_subject=expected)
             self.assertEqual(ok["state"], "verified")
@@ -161,10 +154,6 @@ class StageEntryTests(unittest.TestCase):
                 solidworks_urdf,
                 "require_qualified_report",
                 side_effect=lambda report, definition, root=None: {"passed": True, "subject_sha256": subject},
-            ),
-            patch(
-                "description_pipeline.sources.solidworks.input.resolve_package",
-                return_value={"hardware_id": "arm"},
             ),
         ):
             result = solidworks.publish(
