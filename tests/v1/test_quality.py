@@ -1979,7 +1979,7 @@ class QualifiedReportInventoryTests(unittest.TestCase):
                 "scope": fact["scope"],
                 "object_id": fact["object_id"],
                 "status": "established",
-                "evidence": [{"record": "reports/input.json", "sha256": "0" * 64}],
+                "evidence": [{"record": "input/handoff.json", "sha256": "0" * 64}],
             }
             for fact in quality.qualification_facts(definition)
         ]
@@ -2039,10 +2039,10 @@ class QualificationItemTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
-        (root / "reports").mkdir()
+        (root / "input").mkdir()
         (root / "model").mkdir()
         (root / "urdf").mkdir()
-        write_json(root / "reports/input.json", {"probe": "sealed input"})
+        write_json(root / "input/handoff.json", {"probe": "sealed input"})
         write_json(root / "model/robot.json", {"probe": "model"})
         (root / "urdf/robot.urdf").write_text("<robot/>", encoding="utf-8")
         return root
@@ -2115,11 +2115,11 @@ class QualificationItemTests(unittest.TestCase):
             "qualifications": items,
         }
         quality.require_qualified_report(report, definition, root=root)
-        (root / "reports/input.json").write_bytes(b"tampered input")
+        (root / "input/handoff.json").write_bytes(b"tampered input")
         with self.assertRaises(PipelineError):
             quality.require_qualified_report(report, definition, root=root)
-        write_json(root / "reports/input.json", {"probe": "sealed input"})
-        items[0]["evidence"] = [{"record": "reports/input.json", "sha256": "0" * 64}]
+        write_json(root / "input/handoff.json", {"probe": "sealed input"})
+        items[0]["evidence"] = [{"record": "input/handoff.json", "sha256": "0" * 64}]
         with self.assertRaises(PipelineError):
             quality.require_qualified_report(report, definition, root=root)
 

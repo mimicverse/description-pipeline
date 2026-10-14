@@ -160,7 +160,7 @@ class StageEntryTests(unittest.TestCase):
             patch.object(
                 solidworks_urdf,
                 "require_qualified_report",
-                side_effect=lambda report, definition: {"passed": True, "subject_sha256": subject},
+                side_effect=lambda report, definition, root=None: {"passed": True, "subject_sha256": subject},
             ),
             patch(
                 "description_pipeline.sources.solidworks.input.resolve_package",

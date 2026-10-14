@@ -681,14 +681,17 @@ class DeclarationConsumerTests(unittest.TestCase):
             raw["datums"].append(self._interface("TCP_tool_tcp", "module-1/tool_part"))
 
         with tempfile.TemporaryDirectory() as directory:
-            definition = solidworks_urdf._input(self._delivery(directory, inject), [])
-        required = set(solidworks_urdf.required_checks(definition))
-        self.assertIn("frames.tool_tcp", required)
-        complete = {
-            "passed": True,
-            "required_checks": sorted(required),
-            "checks": [{"id": name, "state": "passed", "passed": True} for name in sorted(required)],
-        }
+            root = self._delivery(directory, inject)
+            definition = solidworks_urdf._input(root, [])
+            required = set(solidworks_urdf.required_checks(definition))
+            self.assertIn("frames.tool_tcp", required)
+            checks = [{"id": name, "state": "passed", "passed": True} for name in sorted(required)]
+            complete = {
+                "passed": True,
+                "required_checks": sorted(required),
+                "checks": checks,
+                "qualifications": solidworks_urdf.qualifications(root, definition, checks),
+            }
         solidworks_urdf.require_qualified_report(complete, definition)
         fixed = required & set(CHECK_POLICY_V1["fixed_checks"])
         self.assertNotEqual(fixed, required)

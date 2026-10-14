@@ -1260,13 +1260,13 @@ def _model(root):
 #: (relative to the delivery root): every fact binds the sealed input report and
 #: the delivered object record it was decided over.
 _QUALIFICATION_EVIDENCE = {
-    "physics.expected_mass": ("reports/input.json", "model/robot.json"),
-    "geometry.expected_extent": ("reports/input.json", "model/robot.json"),
-    "inertia": ("reports/input.json", "model/robot.json"),
-    "geometry": ("reports/input.json", "model/robot.json"),
-    "joints": ("reports/input.json", "urdf/robot.urdf"),
-    "shafts": ("reports/input.json", "urdf/robot.urdf"),
-    "frames": ("reports/input.json", "model/robot.json"),
+    "physics.expected_mass": ("input/handoff.json", "model/robot.json"),
+    "geometry.expected_extent": ("input/handoff.json", "model/robot.json"),
+    "inertia": ("input/handoff.json", "model/robot.json"),
+    "geometry": ("input/handoff.json", "model/robot.json"),
+    "joints": ("input/handoff.json", "urdf/robot.urdf"),
+    "shafts": ("input/handoff.json", "urdf/robot.urdf"),
+    "frames": ("input/handoff.json", "model/robot.json"),
 }
 
 
@@ -1294,7 +1294,7 @@ def qualifications(root, definition, checks):
         else:
             row = rows.get(fact["check"])
             status = "established" if row is not None and row["passed"] else "unqualified"
-        records = _QUALIFICATION_EVIDENCE.get(fact_id, ("reports/input.json",))
+        records = _QUALIFICATION_EVIDENCE.get(fact_id, ("input/handoff.json",))
         evidence = []
         if all((root / record).is_file() for record in records):
             evidence = [{"record": record, "sha256": file_digest(root / record)} for record in records]

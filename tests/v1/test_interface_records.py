@@ -1046,7 +1046,7 @@ class QualificationKeyTests(unittest.TestCase):
             "scope": "",
             "object_id": "base",
             "status": "established",
-            "evidence": [{"record": "reports/input.json", "sha256": HEX}],
+            "evidence": [{"record": "input/handoff.json", "sha256": HEX}],
         }
         item.update(overrides)
         return item
@@ -1071,8 +1071,8 @@ class QualificationKeyTests(unittest.TestCase):
         cases = (
             {"status": "qualified"},
             {"evidence": []},
-            {"evidence": [{"record": "reports/input.json"}]},
-            {"evidence": [{"record": "reports/input.json", "sha256": "0"}]},
+            {"evidence": [{"record": "input/handoff.json"}]},
+            {"evidence": [{"record": "input/handoff.json", "sha256": "0"}]},
             {"fact_id": ""},
             {"display": "可用运动"},
         )
@@ -1084,12 +1084,12 @@ class QualificationKeyTests(unittest.TestCase):
     def test_resolver_refuses_missing_records_and_digest_mismatches(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "reports").mkdir()
-            record = root / "reports/input.json"
+            (root / "input").mkdir()
+            record = root / "input/handoff.json"
             record.write_bytes(b"sealed input")
             item = self._item(
                 evidence=[
-                    {"record": "reports/input.json", "sha256": hashlib.sha256(b"sealed input").hexdigest()}
+                    {"record": "input/handoff.json", "sha256": hashlib.sha256(b"sealed input").hexdigest()}
                 ]
             )
             ir.validate_qualification(item, resolve=root)

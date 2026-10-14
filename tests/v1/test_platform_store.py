@@ -317,11 +317,15 @@ class PlatformStoreTests(unittest.TestCase):
 
     def qualified_quality(self, **overrides) -> dict:
         expected = required_checks(self.definition)
+        checks = [{"id": name, "state": "passed", "passed": True, "details": {}} for name in expected]
         payload = {
             "passed": True,
             "subject_sha256": self.subject,
-            "checks": [{"id": name, "state": "passed", "passed": True, "details": {}} for name in expected],
+            "checks": checks,
             "required_checks": expected,
+            # The qualification inventory is assembled by the same owner the
+            # production report uses, with evidence bound to the sealed tree.
+            "qualifications": solidworks_urdf.qualifications(self.delivery, self.definition, checks),
         }
         payload.update(overrides)
         return payload
